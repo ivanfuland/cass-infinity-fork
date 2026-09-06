@@ -152,6 +152,25 @@ fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
 
     let storage = FrankenStorage::open_writer(to).with_context(|| format!("opening/ensuring fresh v5 target at {}", to.display()))?;
 
+    // R1-B5 (exec92): the whole design ("copy only, never merge content
+    // into an existing db") assumes `to` is a freshly-built, empty v5
+    // target -- `open_writer` above happily opens an *existing* db with
+    // real content too. Without this check, copying into an already-
+    // populated target let every conflicting row through the `OR IGNORE`
+    // below (see next comment) silently keep its stale pre-existing
+    // content while still reporting a matching row count and exit 0.
+    let existing_conversations: i64 =
+        storage.raw().query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0))?;
+    let existing_messages: i64 =
+        storage.raw().query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+    anyhow::ensure!(
+        existing_conversations == 0 && existing_messages == 0,
+        "target {} is not empty ({existing_conversations} conversation(s), {existing_messages} message(s)) -- \
+         w4_content_copy only supports copying into a freshly-built, empty v5 target, never merging into or \
+         overwriting an existing one",
+        to.display()
+    );
+
     let from_uri = format!("file:{}?mode=ro", from.display());
     storage
         .raw()
@@ -168,15 +187,20 @@ fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
         shared.sort();
         anyhow::ensure!(!shared.is_empty(), "table {table:?} has zero shared columns between src and target");
         let col_list = shared.join(", ");
-        // `OR IGNORE`: a fresh v5 target built by `schema::ensure` already
-        // seeds a handful of well-known rows (e.g. the `sources` table's
-        // `local` row) -- the source db was built the same way and carries
-        // an identical seed row, which would otherwise collide on `INSERT`
-        // with a `UNIQUE`/primary-key violation before any real content
-        // copies. Ignoring a duplicate seed row is safe (seed rows are
-        // schema-fixed, not user content); the returned row count still
-        // reflects only rows that were actually newly inserted.
-        let sql = format!("INSERT OR IGNORE INTO main.{table} ({col_list}) SELECT {col_list} FROM src.{table}");
+        // R1-B5 (exec92): `OR IGNORE` must stay scoped to `sources` -- a
+        // fresh v5 target built by `schema::ensure` already seeds that
+        // table's well-known `local` row, and the source db (built the
+        // same way) carries an identical seed row that would otherwise
+        // collide on `INSERT` with a `UNIQUE`/primary-key violation before
+        // any real content copies. Applying `OR IGNORE` to every table
+        // (the pre-fix behavior) silently discarded any *real* content-row
+        // conflict too -- with the empty-target check above in place this
+        // is no longer reachable for a fresh target, but a plain `INSERT`
+        // on every non-seed table still fails loudly (a real defect,
+        // rather than a silently-dropped row) if that invariant is ever
+        // violated by a future caller.
+        let ignore_clause = if table == "sources" { " OR IGNORE" } else { "" };
+        let sql = format!("INSERT{ignore_clause} INTO main.{table} ({col_list}) SELECT {col_list} FROM src.{table}");
         let rows_copied = storage.raw().execute(&sql, &[]).with_context(|| format!("copying content-layer table {table:?}"))?;
         tables_report.push(TableCopyReport { table: table.clone(), rows_copied: rows_copied as i64 });
     }
@@ -323,5 +347,30 @@ mod tests {
 
         let (code, message) = run(&from, &to);
         assert_eq!(code, 2, "missing source db must be a precondition error (exit 2): {message}");
+    }
+
+    /// R1-B5 (exec92): copying into the *same* target a second time must
+    /// refuse (not silently keep the target's already-copied content while
+    /// still reporting `match=true`/exit 0) -- pre-fix, `INSERT OR IGNORE`
+    /// on every table let every conflicting row from the second copy be
+    /// silently dropped, so a source mutated between the two copies (same
+    /// message ids, edited content) would report success while the
+    /// target's stale pre-existing rows never got updated.
+    #[test]
+    fn copying_into_an_already_populated_target_is_refused_exit_2() {
+        let dir = TempDir::new().unwrap();
+        let from = seed_source_db(dir.path(), 3, 5);
+        let to = dir.path().join("target").join("fresh.db");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+
+        let (first_code, first_message) = run(&from, &to);
+        assert_eq!(first_code, 0, "the first copy into a fresh target must succeed: {first_message}");
+
+        let (second_code, second_message) = run(&from, &to);
+        assert_eq!(second_code, 2, "a second copy into the now-populated target must be refused as a precondition error: {second_message}");
+        assert!(
+            second_message.contains("not empty"),
+            "the refusal must name the target as non-empty, not report a false match: {second_message}"
+        );
     }
 }

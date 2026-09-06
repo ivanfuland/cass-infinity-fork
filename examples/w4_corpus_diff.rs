@@ -37,7 +37,13 @@ struct Cli {
     json: PathBuf,
 }
 
-type SessionKey = (String, Option<String>); // (agent_slug, external_id)
+// R1-B4 (exec92): must match `idx_conversations_provenance`'s real unique
+// key -- (agent_slug, external_id) alone collapses two sessions from
+// different sources (a real, reachable shape once a corpus has more than
+// one `sources` row) into a single map entry, so an entire missing session
+// can go undetected whenever the surviving source happens to share the
+// same (agent_slug, external_id).
+type SessionKey = (String, String, Option<String>); // (source_id, agent_slug, external_id)
 
 struct ConvRecord {
     id: i64,
@@ -64,14 +70,14 @@ impl CorpusDiffReport {
 }
 
 fn load_conversations(storage: &FrankenStorage) -> anyhow::Result<HashMap<SessionKey, ConvRecord>> {
-    let rows: Vec<(i64, String, Option<String>, String)> = storage.raw().query_all_map(
-        "SELECT c.id, a.slug, c.external_id, c.source_path FROM conversations c JOIN agents a ON a.id = c.agent_id",
+    let rows: Vec<(i64, String, String, Option<String>, String)> = storage.raw().query_all_map(
+        "SELECT c.id, c.source_id, a.slug, c.external_id, c.source_path FROM conversations c JOIN agents a ON a.id = c.agent_id",
         &[],
-        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?)),
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
     )?;
     let mut map = HashMap::with_capacity(rows.len());
-    for (id, agent_slug, external_id, source_path) in rows {
-        map.insert((agent_slug, external_id), ConvRecord { id, source_path });
+    for (id, source_id, agent_slug, external_id, source_path) in rows {
+        map.insert((source_id, agent_slug, external_id), ConvRecord { id, source_path });
     }
     Ok(map)
 }
@@ -312,6 +318,72 @@ mod tests {
         let report = report.unwrap();
         assert_eq!(report.conversations_missing, 0);
         assert_eq!(report.messages_missing, 1);
+    }
+
+    /// R1-B4 (exec92): two sessions from *different* sources sharing the
+    /// same `(agent_slug, external_id)` are a real, distinct-identity shape
+    /// (`idx_conversations_provenance`'s actual unique key adds
+    /// `source_id`) -- the old `(agent_slug, external_id)`-only key
+    /// collapsed both into one `HashMap` entry, so deleting one of them
+    /// from `--new` went entirely undetected (whichever side survived the
+    /// collision "matched" the deleted one).
+    fn seed_cross_source_pair(path: &std::path::Path) {
+        let storage = FrankenStorage::open(path).unwrap();
+        let agent = Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: Some("0.1".into()), kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let make = |source_id: &str, path_suffix: &str| Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("dup-ext-id".into()),
+            title: Some("cross-source collision fixture".into()),
+            source_path: PathBuf::from(format!("/tmp/{path_suffix}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_005),
+            approx_tokens: Some(64),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_000),
+                content: format!("cross-source fixture message for {source_id}"),
+                extra_json: serde_json::json!({}),
+                snippets: Vec::new(),
+            }],
+            source_id: source_id.into(),
+            origin_host: None,
+        };
+        let conversations = vec![make(LOCAL_SOURCE_ID, "local-session"), make("work-laptop", "work-laptop-session")];
+        let batch: Vec<(i64, Option<i64>, &Conversation)> = conversations.iter().map(|c| (agent_id, None, c)).collect();
+        storage.insert_conversations_batched(&batch).unwrap();
+    }
+
+    #[test]
+    fn cross_source_same_agent_and_external_id_collision_is_detected_exit_1() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+        seed_cross_source_pair(&old);
+        seed_cross_source_pair(&new);
+
+        // Delete the "work-laptop" side entirely from the new corpus. Under
+        // the old (agent_slug, external_id)-only key this pair had already
+        // collapsed to a single `HashMap` entry, so this deletion produced
+        // `conversations_missing=0` -- a real session loss that passed the
+        // gate silently.
+        let writer = FrankenStorage::open_writer(&new).unwrap();
+        writer.raw().execute("DELETE FROM conversations WHERE source_id = 'work-laptop'", &[]).unwrap();
+        drop(writer);
+
+        let (code, report, message) = run(&old, &new);
+        assert_eq!(code, 1, "a whole session lost behind a cross-source (agent, external_id) collision must fail the gate: {message}");
+        let report = report.unwrap();
+        assert_eq!(
+            report.conversations_missing, 1,
+            "the deleted work-laptop session must be counted, not masked by the surviving local session sharing the same (agent, external_id): {report:?}"
+        );
     }
 
     #[test]

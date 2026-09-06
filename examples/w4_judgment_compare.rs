@@ -161,7 +161,19 @@ fn compute_report(cases: &[JudgmentCase], baseline: &BaselineFile, search: &dyn 
         let baseline_channels = baseline.results.get(&case.case).ok_or_else(|| anyhow::anyhow!("case {:?} missing from baseline", case.case))?;
         let mut channel_verdicts = HashMap::new();
         for &channel in &CHANNELS {
-            let baseline_rank = baseline_channels.get(channel).copied().flatten();
+            // R1-B7 (exec92): a baseline case missing a channel key
+            // entirely (e.g. `{}`, or a case whose object simply never got
+            // that channel recorded) is not the same thing as that
+            // channel's rank being explicitly recorded as `null` (a real
+            // "not found in the baseline run" -- correctly treated as
+            // +infinity below). `.copied().flatten()` collapsed both into
+            // the same `None`, so a missing channel silently became "any
+            // candidate rank passes" (a real regression on that channel is
+            // `Some(rank) <= +infinity`, always true) instead of a
+            // reported precondition error.
+            let baseline_rank: Option<usize> = *baseline_channels.get(channel).ok_or_else(|| {
+                anyhow::anyhow!("case {:?} baseline lacks channel {channel:?}", case.case)
+            })?;
             let candidate_rank = search.rank_of_source_path(channel, &case.query, &case.a_source_path)?;
             channel_verdicts.insert(channel.to_string(), channel_verdict(baseline_rank, candidate_rank));
         }
@@ -349,6 +361,31 @@ mod tests {
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 2, "case absent from baseline must be a precondition error: {message}");
         assert!(report.is_none());
+    }
+
+    /// R1-B7 (exec92): a baseline case whose object simply has no
+    /// `semantic` key at all (e.g. `{}` or `{"lexical": 5}`) is a distinct
+    /// shape from that channel being recorded as explicit `null` --
+    /// [`baseline_null_treated_as_infinity_any_candidate_rank_passes`]
+    /// above already proves explicit `null` legitimately passes as +inf; a
+    /// *missing* key must instead be a precondition error, not silently
+    /// collapse into the same "any candidate rank passes" outcome.
+    #[test]
+    fn missing_channel_key_in_baseline_case_is_precondition_error_exit_2() {
+        let dir = TempDir::new().unwrap();
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        // "c1" exists but its object never records a "semantic" key.
+        let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({"c1": {"lexical": 5, "hybrid": 5}})));
+        let mut ranks = HashMap::new();
+        ranks.insert(("lexical".to_string(), "foo".to_string()), Some(3));
+        ranks.insert(("semantic".to_string(), "foo".to_string()), None); // would trivially "pass" against a missing-key-as-null bug
+        ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(3));
+        let search = FakeSearch { ranks };
+
+        let (code, report, message) = run(&fixture, &baseline, &search);
+        assert_eq!(code, 2, "a channel missing from the baseline case's object must be a precondition error, not a silent pass: {message}");
+        assert!(report.is_none());
+        assert!(message.contains("semantic"), "the error should name the missing channel: {message}");
     }
 
     /// Real-shape regression guard: loads the actual `tests/fixtures/

@@ -106,21 +106,41 @@ run_stage() {
 
   local peak_hwm_kb="${PEAK_HWM_KB:-0}"
   local min_rss_kb="${MIN_RSS_KB:-0}"
-  local verdict
-  verdict=$(judge "$peak_hwm_kb" "$min_rss_kb" "$startup_rss" "$max_message_bytes")
+
+  # R1-B6 (exec92): rc != 0 or a zero peak_hwm_kb means no real /proc/<pid>/
+  # status sample was ever read for this stage (the command didn't exist,
+  # or exited/crashed before poll_and_wait's first 50ms poll caught a
+  # reading) -- there is no measurement to judge. Feeding a bare 0 into
+  # judge() below trivially satisfies both budget comparisons (0 is never
+  # over budget), so a stage that never ran at all used to report a clean
+  # PASS. `measurement_valid=false` makes that distinguishable from a real
+  # in-budget pass; the stage itself is judged false regardless of what
+  # judge() would have said.
+  local measurement_valid="true"
+  if [ "$rc" -ne 0 ] || [ "$peak_hwm_kb" -eq 0 ]; then
+    measurement_valid="false"
+  fi
+
   local pass_absolute pass_relative
-  pass_absolute=$(echo "$verdict" | awk '{print $1}')
-  pass_relative=$(echo "$verdict" | awk '{print $2}')
+  if [ "$measurement_valid" = "true" ]; then
+    local verdict
+    verdict=$(judge "$peak_hwm_kb" "$min_rss_kb" "$startup_rss" "$max_message_bytes")
+    pass_absolute=$(echo "$verdict" | awk '{print $1}')
+    pass_relative=$(echo "$verdict" | awk '{print $2}')
+  else
+    pass_absolute="false"
+    pass_relative="false"
+  fi
 
   local peak_hwm_bytes=$((peak_hwm_kb * 1024))
   local min_rss_bytes=$((min_rss_kb * 1024))
 
   local json
-  json=$(printf '{"shape":"%s","stage":"%s","pid":%d,"startup_rss":%d,"min_rss":%d,"peak_hwm":%d,"max_message_bytes":%d,"pass_absolute":%s,"pass_relative":%s,"exit_code":%d}' \
-    "$shape" "$stage" "$pid" "$startup_rss" "$min_rss_bytes" "$peak_hwm_bytes" "$max_message_bytes" "$pass_absolute" "$pass_relative" "$rc")
+  json=$(printf '{"shape":"%s","stage":"%s","pid":%d,"startup_rss":%d,"min_rss":%d,"peak_hwm":%d,"max_message_bytes":%d,"pass_absolute":%s,"pass_relative":%s,"exit_code":%d,"measurement_valid":%s}' \
+    "$shape" "$stage" "$pid" "$startup_rss" "$min_rss_bytes" "$peak_hwm_bytes" "$max_message_bytes" "$pass_absolute" "$pass_relative" "$rc" "$measurement_valid")
   echo "$json" | tee "$out_json"
 
-  if [ "$pass_absolute" = "true" ] && [ "$pass_relative" = "true" ]; then
+  if [ "$measurement_valid" = "true" ] && [ "$pass_absolute" = "true" ] && [ "$pass_relative" = "true" ]; then
     return 0
   else
     return 1
