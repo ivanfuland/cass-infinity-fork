@@ -41,6 +41,22 @@ type ParamValue = crate::storage::api::Value;
 const FS_CASS_SCHEMA_HASH: &str =
     "tantivy-schema-v8-hyphen-cjk-bigrams-bounded-content-prefix-preview-stored-content-external";
 
+/// R2-#8 (exec94): term extraction result for the KU3 LIKE fallback
+/// ([`SearchClient::ku3_like_fallback_terms`]). `positive` terms must all
+/// appear (AND) unless `or_only` says they should be OR'd instead;
+/// `negative` terms (the term immediately after a `NOT`) must not appear.
+/// `mixed_operators` means the query combined `OR` with `AND`/`NOT` in a
+/// way this fallback cannot faithfully express as a LIKE clause -- callers
+/// must ignore `positive`/`negative`/`or_only` and fall back to the
+/// whole-string LIKE path when it is set.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Ku3LikeTerms {
+    positive: Vec<String>,
+    negative: Vec<String>,
+    mixed_operators: bool,
+    or_only: bool,
+}
+
 /// Token types for cass-style boolean query parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FsCassQueryToken {
@@ -5003,19 +5019,25 @@ impl SearchClient {
     /// fall back to [`lex_docs_like_candidates_query`] on the untouched raw
     /// query when term extraction yields nothing usable).
     fn lex_docs_like_candidates_query_multi_term(
-        terms: &[String],
+        terms: &Ku3LikeTerms,
         cap: usize,
     ) -> (String, Vec<ParamValue>) {
-        debug_assert!(!terms.is_empty(), "caller must not pass an empty term list");
-        let mut params: Vec<ParamValue> = Vec::with_capacity(terms.len() * 2 + 1);
-        let mut score_parts: Vec<String> = Vec::with_capacity(terms.len());
-        let mut where_parts: Vec<String> = Vec::with_capacity(terms.len());
-        for (i, term) in terms.iter().enumerate() {
+        debug_assert!(
+            !terms.positive.is_empty() || !terms.negative.is_empty(),
+            "caller must not pass an empty term list"
+        );
+        let total_terms = terms.positive.len() + terms.negative.len();
+        let mut params: Vec<ParamValue> = Vec::with_capacity(total_terms * 2 + 1);
+        let mut score_parts: Vec<String> = Vec::with_capacity(terms.positive.len());
+        let mut positive_where_parts: Vec<String> = Vec::with_capacity(terms.positive.len());
+        let mut idx = 0usize;
+        for term in &terms.positive {
             // Two placeholders per term: one for the raw term (occurrence
             // count / LENGTH denominator), one for its `%...%`-wrapped LIKE
             // pattern -- same split `lex_docs_like_candidates_query` uses.
-            let term_idx = i * 2 + 1;
-            let pattern_idx = i * 2 + 2;
+            let term_idx = idx + 1;
+            let pattern_idx = idx + 2;
+            idx += 2;
             score_parts.push(format!(
                 "CAST( \
                     (LENGTH(content) - LENGTH(REPLACE(content, ?{term_idx}, ''))) + \
@@ -5025,7 +5047,7 @@ impl SearchClient {
                     (LENGTH(source_path) - LENGTH(REPLACE(source_path, ?{term_idx}, ''))) \
                 AS REAL) / LENGTH(?{term_idx})"
             ));
-            where_parts.push(format!(
+            positive_where_parts.push(format!(
                 "(content LIKE ?{pattern_idx} ESCAPE '\\' \
                   OR title LIKE ?{pattern_idx} ESCAPE '\\' \
                   OR agent LIKE ?{pattern_idx} ESCAPE '\\' \
@@ -5035,7 +5057,26 @@ impl SearchClient {
             params.push(ParamValue::from(term.as_str()));
             params.push(ParamValue::from(like_substring_pattern(term)));
         }
-        let cap_idx = terms.len() * 2 + 1;
+        // R2-#8 (exec94): `or_only` means the positive terms are joined by
+        // OR, not AND (e.g. `alpha OR io`) -- wrapped in parens so a
+        // trailing `AND content NOT LIKE ...` exclusion below binds to the
+        // whole disjunction, not just its last operand.
+        let positive_clause = if terms.or_only {
+            format!("({})", positive_where_parts.join(" OR "))
+        } else {
+            positive_where_parts.join(" AND ")
+        };
+        let mut where_parts: Vec<String> = vec![positive_clause];
+        // Each negative term only excludes on `content` -- narrower than
+        // the positive OR-of-5-columns match on purpose (R2-#8 review
+        // scope; not widened to the other 4 columns).
+        for term in &terms.negative {
+            let pattern_idx = idx + 1;
+            idx += 1;
+            where_parts.push(format!("content NOT LIKE ?{pattern_idx} ESCAPE '\\'"));
+            params.push(ParamValue::from(like_substring_pattern(term)));
+        }
+        let cap_idx = idx + 1;
         let sql = format!(
             "SELECT doc_id, ({}) AS occurrence_score FROM lex_docs WHERE {} LIMIT ?{}",
             score_parts.join(" + "),
@@ -5068,46 +5109,72 @@ impl SearchClient {
     /// one. For `NOT`, that silently flipped an exclusion into a required
     /// term: `alpha NOT io` produced `["alpha", "io"]`, ANDed together by
     /// [`lex_docs_like_candidates_query_multi_term`] -- the fallback then
-    /// selected exactly the rows it was supposed to exclude. `OR` cannot
-    /// be expressed as an AND-of-LIKE list *at all* (there is no
-    /// disjunctive form here), so a query containing one falls all the way
-    /// back to the pre-T11.11 whole-string LIKE path instead of silently
-    /// ANDing its operands together.
-    fn ku3_like_fallback_terms(raw_query: &str) -> Vec<String> {
+    /// selected exactly the rows it was supposed to exclude.
+    ///
+    /// R2-#8 (exec94): the fix above still collapsed *every* query
+    /// containing `OR` to the single whole-string path, including
+    /// `alpha OR io` (no `AND`/`NOT` in sight) -- a query FTS5 could
+    /// perfectly well split into a real 2-term OR-of-LIKE, but this
+    /// fallback silently downgraded to "must contain the literal
+    /// substring `alpha OR io`" instead. Now the term extraction always
+    /// runs; a `Not`-preceded term/phrase goes to `negative` (excluded)
+    /// rather than being dropped or ANDed in; `or_only` records "the
+    /// query used `OR` and nothing else" (positive terms should be
+    /// OR'd, not AND'd); `mixed_operators` records "the query mixed `OR`
+    /// with `AND`/`NOT`" (e.g. `alpha OR io NOT beta`) -- that priority
+    /// mix has no faithful LIKE-of-terms rendering, so the caller falls
+    /// all the way back to the pre-T11.11 whole-string LIKE path for it,
+    /// same as it always did for any `OR`.
+    fn ku3_like_fallback_terms(raw_query: &str) -> Ku3LikeTerms {
         let tokens = fs_cass_parse_boolean_query(raw_query);
-        if tokens.iter().any(|t| matches!(t, FsCassQueryToken::Or)) {
-            let trimmed = raw_query.trim();
-            return if trimmed.is_empty() { Vec::new() } else { vec![trimmed.to_string()] };
-        }
-        let mut terms: Vec<String> = Vec::new();
-        let mut skip_next_term = false;
+        let has_or = tokens.iter().any(|t| matches!(t, FsCassQueryToken::Or));
+        let has_and_or_not =
+            tokens.iter().any(|t| matches!(t, FsCassQueryToken::And | FsCassQueryToken::Not));
+        let mixed_operators = has_or && has_and_or_not;
+        let or_only = has_or && !has_and_or_not;
+
+        let mut positive: Vec<String> = Vec::new();
+        let mut negative: Vec<String> = Vec::new();
+        let mut negate_next = false;
         for token in tokens {
             match token {
-                FsCassQueryToken::Not => skip_next_term = true,
-                FsCassQueryToken::And => {}
-                FsCassQueryToken::Or => unreachable!("queries containing OR return above"),
+                FsCassQueryToken::Not => negate_next = true,
+                FsCassQueryToken::And | FsCassQueryToken::Or => {}
                 FsCassQueryToken::Term(t) => {
-                    if std::mem::take(&mut skip_next_term) {
-                        continue;
+                    let negate = std::mem::take(&mut negate_next);
+                    let parts = normalize_term_parts(&t);
+                    if negate {
+                        negative.extend(parts);
+                    } else {
+                        positive.extend(parts);
                     }
-                    terms.extend(normalize_term_parts(&t));
                 }
                 FsCassQueryToken::Phrase(p) => {
-                    if std::mem::take(&mut skip_next_term) {
-                        continue;
-                    }
+                    let negate = std::mem::take(&mut negate_next);
                     let trimmed = p.trim();
                     if !trimmed.is_empty() {
-                        terms.push(trimmed.to_string());
+                        if negate {
+                            negative.push(trimmed.to_string());
+                        } else {
+                            positive.push(trimmed.to_string());
+                        }
                     }
                 }
             }
         }
-        terms
-            .into_iter()
-            .map(|t| t.trim_matches('*').to_string())
-            .filter(|t| !t.is_empty())
-            .collect()
+        let clean = |terms: Vec<String>| -> Vec<String> {
+            terms
+                .into_iter()
+                .map(|t| t.trim_matches('*').to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        Ku3LikeTerms {
+            positive: clean(positive),
+            negative: clean(negative),
+            mixed_operators,
+            or_only,
+        }
     }
 
     /// Disk sidecar for [`lexical_corpus_stats`], next to the sqlite DB
@@ -5344,8 +5411,19 @@ impl SearchClient {
             // benefit -- there is no second term to protect from a bad
             // first one. An empty extraction (no usable terms at all)
             // falls back the same way, rather than searching for nothing.
+            //
+            // R2-#8 (exec94): `mixed_operators` (e.g. `alpha OR io NOT
+            // beta`) has no faithful LIKE rendering -- fall back to the
+            // whole-string path unconditionally. Otherwise route to the
+            // multi-term path whenever there is a negative term to exclude
+            // (a single-term-with-NOT query, e.g. `alpha NOT io`, still
+            // needs its `NOT` honored) or 2+ positive terms; a lone
+            // positive term with no exclusion has nothing to AND/OR
+            // against and goes through the old single-term path unchanged.
             let like_terms = Self::ku3_like_fallback_terms(raw_query);
-            if like_terms.len() < 2 {
+            if like_terms.mixed_operators
+                || (like_terms.negative.is_empty() && like_terms.positive.len() < 2)
+            {
                 let like_term = raw_query.trim().replace('*', "");
                 Self::lex_docs_like_candidates_query(&like_term, cap)
             } else {
@@ -16570,10 +16648,12 @@ mod tests {
     fn ku3_like_fallback_terms_splits_multi_word_query_with_short_subterm() {
         let terms = SearchClient::ku3_like_fallback_terms("cleanupPeriodDays 3650 建议");
         assert_eq!(
-            terms,
+            terms.positive,
             vec!["cleanupPeriodDays".to_string(), "3650".to_string(), "建议".to_string()],
-            "must extract each word as an independent term, not glue them into one phrase"
+            "must extract each word as an independent positive term, not glue them into one phrase"
         );
+        assert!(terms.negative.is_empty(), "no NOT in this query");
+        assert!(!terms.mixed_operators && !terms.or_only, "no OR in this query");
 
         let (sql, params) = SearchClient::lex_docs_like_candidates_query_multi_term(&terms, 10_000);
         // Three independent AND'd OR-of-columns groups -- not one glued
@@ -16599,41 +16679,55 @@ mod tests {
         );
     }
 
-    /// R1-N6 (exec92): `NOT` negates the term immediately following it --
-    /// that term must be dropped, not folded into the AND-of-LIKE list as
-    /// a required positive term (which would select exactly the rows the
-    /// query asked to exclude).
+    /// R1-N6 (exec92) / R2-#8 (exec94): `NOT` negates the term immediately
+    /// following it -- that term must move to `negative` (excluded), not
+    /// be dropped or folded into `positive` (which would select exactly
+    /// the rows the query asked to exclude).
     #[test]
     fn ku3_like_fallback_terms_drops_term_after_not() {
+        let terms = SearchClient::ku3_like_fallback_terms("alpha NOT io");
+        assert_eq!(terms.positive, vec!["alpha".to_string()]);
         assert_eq!(
-            SearchClient::ku3_like_fallback_terms("alpha NOT io"),
-            vec!["alpha".to_string()],
-            "the term following NOT must be excluded, not ANDed in as a required term"
+            terms.negative,
+            vec!["io".to_string()],
+            "the term following NOT must be excluded via `negative`, not ANDed in as a required term"
         );
+        assert!(!terms.mixed_operators && !terms.or_only);
     }
 
-    /// R1-N6 (exec92): `OR` cannot be expressed as an AND-of-LIKE term
-    /// list, so the whole query must fall back to the single whole-string
-    /// path (the pre-T11.11 behavior for this shape) instead of silently
-    /// dropping the OR and ANDing its operands.
+    /// R2-#8 (exec94): a bare `OR` (no `AND`/`NOT` alongside it) can be
+    /// expressed as an OR-of-LIKE over the extracted positive terms --
+    /// `or_only` records that so the caller joins them with OR instead of
+    /// AND, rather than collapsing the whole query to one whole-string
+    /// substring (the R1-N6 behavior this replaces).
     #[test]
-    fn ku3_like_fallback_terms_falls_back_to_whole_string_on_or() {
-        assert_eq!(
-            SearchClient::ku3_like_fallback_terms("alpha OR io"),
-            vec!["alpha OR io".to_string()],
-            "a query containing OR must fall back to the single whole-string term, not split+AND its operands"
-        );
+    fn ku3_like_fallback_terms_marks_or_only_for_bare_or_query() {
+        let terms = SearchClient::ku3_like_fallback_terms("alpha OR io");
+        assert_eq!(terms.positive, vec!["alpha".to_string(), "io".to_string()]);
+        assert!(terms.negative.is_empty());
+        assert!(terms.or_only, "a bare OR with no AND/NOT must set or_only");
+        assert!(!terms.mixed_operators);
+    }
+
+    /// R2-#8 (exec94): mixing `OR` with `AND`/`NOT` has no faithful
+    /// LIKE-of-terms rendering (the priority between them is ambiguous),
+    /// so `mixed_operators` must be set and the caller must fall back to
+    /// the whole-string path instead of guessing a precedence.
+    #[test]
+    fn ku3_like_fallback_terms_marks_mixed_operators_for_or_with_not() {
+        let terms = SearchClient::ku3_like_fallback_terms("alpha OR io NOT beta");
+        assert!(terms.mixed_operators, "OR combined with NOT must set mixed_operators");
     }
 
     /// R1-N6 (exec92): a plain multi-word query with no boolean operators
     /// must be unaffected by the NOT/OR handling above -- every word still
-    /// becomes its own AND'd term.
+    /// becomes its own AND'd positive term.
     #[test]
     fn ku3_like_fallback_terms_unaffected_by_boolean_handling_when_no_operators() {
-        assert_eq!(
-            SearchClient::ku3_like_fallback_terms("alpha io"),
-            vec!["alpha".to_string(), "io".to_string()],
-        );
+        let terms = SearchClient::ku3_like_fallback_terms("alpha io");
+        assert_eq!(terms.positive, vec!["alpha".to_string(), "io".to_string()]);
+        assert!(terms.negative.is_empty());
+        assert!(!terms.mixed_operators && !terms.or_only);
     }
 
     /// T11.11 (mission #105 修2, test ②): fixture proof that the fallback
@@ -16690,6 +16784,113 @@ mod tests {
             vec!["all-terms-scattered", "verbatim-phrase"],
             "must recall the scattered-terms message and the verbatim-phrase message, \
              but not the partial-terms message: got {titles:?}"
+        );
+    }
+
+    /// R2-#8 (exec94), test ①: `alpha NOT io` end-to-end -- a document
+    /// containing the positive term without the excluded one must hit; one
+    /// containing both must not (proving the exclusion is actually wired
+    /// into the generated SQL, not just extracted and discarded).
+    #[test]
+    fn search_ku3_fallback_not_excludes_matching_term() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "has-alpha-no-io", "this document contains alpha content");
+        insert_v2_lex_message(&storage, agent_id, "has-alpha-and-io", "this document contains alpha and io content");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
+        assert!(query_has_short_subterm_after_normalization("alpha NOT io"));
+
+        let hits = client.search("alpha NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(titles, vec!["has-alpha-no-io"], "must exclude the doc containing io: got {titles:?}");
+    }
+
+    /// R2-#8 (exec94), test ②: `alpha beta NOT io` end-to-end -- three
+    /// buckets: both positives present without io (hit), both positives
+    /// with io (excluded), and only one positive present (must still miss
+    /// -- proving the positive terms stay AND'd, not loosened).
+    #[test]
+    fn search_ku3_fallback_not_excludes_with_multiple_positive_terms() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "both-positive-no-io", "alpha and beta appear here");
+        insert_v2_lex_message(&storage, agent_id, "both-positive-and-io", "alpha and beta and io appear here");
+        insert_v2_lex_message(&storage, agent_id, "only-alpha", "alpha appears here alone");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
+
+        let hits = client.search("alpha beta NOT io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(titles, vec!["both-positive-no-io"], "positives must stay AND'd and io must be excluded: got {titles:?}");
+    }
+
+    /// R2-#8 (exec94), test ③: `alpha OR io` end-to-end -- a document
+    /// containing either positive term alone must hit (OR, not AND); one
+    /// containing neither must not.
+    #[test]
+    fn search_ku3_fallback_or_only_matches_either_term() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "has-alpha-only", "alpha appears here alone");
+        insert_v2_lex_message(&storage, agent_id, "has-io-only", "io appears here alone");
+        insert_v2_lex_message(&storage, agent_id, "has-neither", "gamma appears here alone");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
+
+        let mut hits = client.search("alpha OR io", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        hits.sort_by(|a, b| a.title.cmp(&b.title));
+        let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(titles, vec!["has-alpha-only", "has-io-only"], "OR must match either operand alone: got {titles:?}");
+    }
+
+    /// R2-#8 (exec94), test ④: `alpha OR io NOT beta` mixes OR with NOT --
+    /// `mixed_operators` must be set, and the search must route to the old
+    /// whole-string LIKE path (a doc containing only "alpha", which an
+    /// OR-of-positives would incorrectly match, must miss; only a doc
+    /// containing the literal phrase verbatim hits).
+    #[test]
+    fn ku3_like_fallback_mixed_operators_routes_to_whole_string_path() {
+        let terms = SearchClient::ku3_like_fallback_terms("alpha OR io NOT beta");
+        assert!(terms.mixed_operators, "OR combined with NOT must set mixed_operators");
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        insert_v2_lex_message(&storage, agent_id, "verbatim-phrase-hit", "the exact text alpha OR io NOT beta appears here");
+        insert_v2_lex_message(&storage, agent_id, "alpha-only-must-miss", "alpha appears here alone");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path)).unwrap().expect("sqlite-only client should still open");
+
+        let hits = client.search("alpha OR io NOT beta", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["verbatim-phrase-hit"],
+            "mixed OR/NOT must fall back to whole-string LIKE, not an OR-of-positives: got {titles:?}"
         );
     }
 

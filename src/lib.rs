@@ -25661,7 +25661,13 @@ impl SearchModeMeta {
 /// through the one shared code path, not a second copy of the sync logic.
 fn sync_search_mode_meta_after_hybrid(mode_meta: &mut SearchModeMeta, result: &crate::search::query::SearchResult) {
     if result.semantic_degraded {
-        mode_meta.fall_back_to_lexical("hybrid semantic leg degraded (fail-open to lexical-only results)");
+        // R2-#9 (exec94): this is a runtime fail-open, not a policy
+        // decision -- the old wording's "lexical-only" substring made
+        // `classify_fallback_reason` (search_mode_metadata.rs) misclassify
+        // it as `SemanticPolicyDisabled`. Keep "hybrid execution" so it
+        // classifies as `HybridExecutionError`, same bucket as the `Err`
+        // branch's degradation reason.
+        mode_meta.fall_back_to_lexical("hybrid execution unavailable: semantic leg degraded, fail-open to lexical results");
     }
 }
 
@@ -99076,6 +99082,13 @@ mod subcommand_robot_output_tests {
         assert_eq!(meta.fallback_tier, Some("lexical"));
         assert!(meta.fallback_reason.is_some());
         assert!(!meta.semantic_refinement());
+        // R2-#9 (exec94): a runtime fail-open must classify as
+        // HybridExecutionError, not SemanticPolicyDisabled -- nothing here
+        // disabled semantic search by policy.
+        assert_eq!(
+            meta.semantic_fallback_reason(),
+            Some(crate::search::search_mode_metadata::SemanticFallbackReason::HybridExecutionError)
+        );
     }
 
     /// The normal (non-degraded) hybrid path must be left untouched.
