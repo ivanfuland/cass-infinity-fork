@@ -153,15 +153,26 @@ fn assert_semantic_provenance(hit: &Json) {
     assert_eq!(hit.get("winning_chunk_hash").and_then(Json::as_str), Some(CONTENT_HASH), "winning_chunk_hash: {hit:#?}");
 }
 
-fn assert_no_provenance(hit: &Json) {
-    for key in ["message_id", "winning_chunk_idx", "winning_chunk_span", "winning_chunk_hash"] {
+/// T11.11 (mission #105, rootcause report §0): a lexical hit *does* carry
+/// `message_id` now (`search_fts_lex_domain` fills it from
+/// `candidate.doc_id`, which is exactly `lex_docs.doc_id` / `messages.id`)
+/// -- but never the three `winning_chunk_*` fields, since a lexical-only
+/// message (no `message_chunks` row at all, per this fixture's message 2)
+/// has no chunk-domain provenance to report.
+fn assert_lexical_hit_carries_message_id_only(hit: &Json, expected_message_id: i64) {
+    assert_eq!(
+        hit.get("message_id").and_then(Json::as_i64),
+        Some(expected_message_id),
+        "message_id: {hit:#?}"
+    );
+    for key in ["winning_chunk_idx", "winning_chunk_span", "winning_chunk_hash"] {
         assert!(hit.get(key).is_none(), "expected no {key:?} key on a lexical-only hit: {hit:#?}");
     }
 }
 
 #[test]
 #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
-fn bare_json_semantic_hit_has_provenance_lexical_hit_does_not() {
+fn bare_json_semantic_hit_has_provenance_lexical_hit_has_message_id_only() {
     let dir = tempfile::tempdir().expect("tempdir");
     let data_dir = dir.path().join("data");
     build_fixture(&data_dir);
@@ -175,7 +186,7 @@ fn bare_json_semantic_hit_has_provenance_lexical_hit_does_not() {
     // than falling through to lexical -- explicit `--mode lexical` is the
     // only way to reliably reach message 2's lexical-only hit.
     let lexical_payload = run_search(&data_dir, dir.path(), &["--json", "--mode", "lexical"], LEXICAL_ONLY_QUERY);
-    assert_no_provenance(first_hit(&lexical_payload, "bare --json lexical-only query"));
+    assert_lexical_hit_carries_message_id_only(first_hit(&lexical_payload, "bare --json lexical-only query"), 2);
 }
 
 #[test]

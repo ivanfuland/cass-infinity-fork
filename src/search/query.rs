@@ -4969,6 +4969,102 @@ impl SearchClient {
         (sql, params)
     }
 
+    /// T11.11 (mission #105, rootcause report §2): multi-term sibling of
+    /// [`lex_docs_like_candidates_query`] for the KU3-short-subterm fallback.
+    /// The single-term version glues the *entire* raw query into one LIKE
+    /// substring pattern; when the fallback triggers because just one word
+    /// in an otherwise-normal multi-word query falls below the trigram
+    /// floor (a 2-codepoint CJK word, a bare 1-2 digit number split off by
+    /// punctuation like `SWAP=1`), that collapses "AND of words" into "the
+    /// whole sentence must appear verbatim, in that exact order and
+    /// spacing" -- far *stricter* than the primary FTS5 path it stands in
+    /// for, and in practice only matches documents that happen to quote the
+    /// raw query text itself (rootcause report §2's corpus-self-reference
+    /// finding: the only hits were this project's own manifest-drafting
+    /// messages, which quote every LC query verbatim in a table). This
+    /// builds one `LIKE '%term%'` clause per normalized term and `AND`s
+    /// them together, mirroring FTS5's own implicit-AND-of-terms semantics
+    /// instead of degrading past it. `terms` must be non-empty (callers
+    /// fall back to [`lex_docs_like_candidates_query`] on the untouched raw
+    /// query when term extraction yields nothing usable).
+    fn lex_docs_like_candidates_query_multi_term(
+        terms: &[String],
+        cap: usize,
+    ) -> (String, Vec<ParamValue>) {
+        debug_assert!(!terms.is_empty(), "caller must not pass an empty term list");
+        let mut params: Vec<ParamValue> = Vec::with_capacity(terms.len() * 2 + 1);
+        let mut score_parts: Vec<String> = Vec::with_capacity(terms.len());
+        let mut where_parts: Vec<String> = Vec::with_capacity(terms.len());
+        for (i, term) in terms.iter().enumerate() {
+            // Two placeholders per term: one for the raw term (occurrence
+            // count / LENGTH denominator), one for its `%...%`-wrapped LIKE
+            // pattern -- same split `lex_docs_like_candidates_query` uses.
+            let term_idx = i * 2 + 1;
+            let pattern_idx = i * 2 + 2;
+            score_parts.push(format!(
+                "CAST( \
+                    (LENGTH(content) - LENGTH(REPLACE(content, ?{term_idx}, ''))) + \
+                    (LENGTH(title) - LENGTH(REPLACE(title, ?{term_idx}, ''))) + \
+                    (LENGTH(agent) - LENGTH(REPLACE(agent, ?{term_idx}, ''))) + \
+                    (LENGTH(workspace) - LENGTH(REPLACE(workspace, ?{term_idx}, ''))) + \
+                    (LENGTH(source_path) - LENGTH(REPLACE(source_path, ?{term_idx}, ''))) \
+                AS REAL) / LENGTH(?{term_idx})"
+            ));
+            where_parts.push(format!(
+                "(content LIKE ?{pattern_idx} ESCAPE '\\' \
+                  OR title LIKE ?{pattern_idx} ESCAPE '\\' \
+                  OR agent LIKE ?{pattern_idx} ESCAPE '\\' \
+                  OR workspace LIKE ?{pattern_idx} ESCAPE '\\' \
+                  OR source_path LIKE ?{pattern_idx} ESCAPE '\\')"
+            ));
+            params.push(ParamValue::from(term.as_str()));
+            params.push(ParamValue::from(like_substring_pattern(term)));
+        }
+        let cap_idx = terms.len() * 2 + 1;
+        let sql = format!(
+            "SELECT doc_id, ({}) AS occurrence_score FROM lex_docs WHERE {} LIMIT ?{}",
+            score_parts.join(" + "),
+            where_parts.join(" AND "),
+            cap_idx,
+        );
+        params.push(ParamValue::from(cap as i64));
+        (sql, params)
+    }
+
+    /// T11.11: term list for [`lex_docs_like_candidates_query_multi_term`],
+    /// extracted the same way [`query_has_short_subterm_after_normalization`]
+    /// already tokenizes the raw query (same `fs_cass_parse_boolean_query`
+    /// + `normalize_term_parts` pipeline) -- so "why did this term trip the
+    /// fallback" and "what does the fallback actually search for" stay in
+    /// sync by construction, not by two independently-maintained
+    /// tokenizations agreeing by luck. Boolean operators (`AND`/`OR`/`NOT`)
+    /// are intentionally *not* honored here: this fallback only exists for
+    /// queries FTS5 could never index correctly in the first place, and the
+    /// safest degradation is "all extracted terms must appear" (AND), same
+    /// as it always implicitly was before this change (the old whole-
+    /// string LIKE also ignored any boolean structure in the raw text). A
+    /// trailing bare `*` is stripped per-term, mirroring the existing
+    /// single-term path's `raw_query.trim().replace('*', "")`.
+    fn ku3_like_fallback_terms(raw_query: &str) -> Vec<String> {
+        fs_cass_parse_boolean_query(raw_query)
+            .into_iter()
+            .flat_map(|token| match token {
+                FsCassQueryToken::Term(t) => normalize_term_parts(&t),
+                FsCassQueryToken::Phrase(p) => {
+                    let trimmed = p.trim();
+                    if trimmed.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![trimmed.to_string()]
+                    }
+                }
+                FsCassQueryToken::And | FsCassQueryToken::Or | FsCassQueryToken::Not => Vec::new(),
+            })
+            .map(|t| t.trim_matches('*').to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
     /// Disk sidecar for [`lexical_corpus_stats`], next to the sqlite DB
     /// file (`.lexical-avgdl-cache.json`, following the same dot-prefixed
     /// sidecar convention as `.lexical-rebuild-state.json` in
@@ -5179,8 +5275,37 @@ impl SearchClient {
             // itself -- that routing decision is already computed above off
             // the untouched `raw_query` (exec37 案⑦: routing measures
             // trimmed-length, not the stripped term).
-            let like_term = raw_query.trim().replace('*', "");
-            Self::lex_docs_like_candidates_query(&like_term, cap)
+            //
+            // T11.11 (mission #105, rootcause report §2): a whole-string
+            // LIKE collapses multi-word queries down to "the entire
+            // sentence, verbatim, in order" -- stricter than the FTS5 AND
+            // path it replaces, and in practice only matches text that
+            // happens to quote the raw query back (this project's own
+            // manifest-drafting messages, for the six-case gate). Extract
+            // per-term parts with the same tokenizer
+            // `query_has_short_subterm_after_normalization` already uses to
+            // decide *whether* to degrade, and AND one `LIKE '%term%'` per
+            // term instead -- but only when that split actually yields 2+
+            // independent terms. A single-term query (whether short, like
+            // "事务"/"ok", or long-but-meta-character-laden, like "中%")
+            // routes back to the old whole-string substring unchanged:
+            // `normalize_term_parts` drops any character that is not
+            // alphanumeric/`_`/an internal hyphen/a trailing `*` (it exists
+            // to find AND-able word boundaries, not to preserve a literal
+            // pattern), so collapsing a *single*-term query through it
+            // would silently strip meaningful punctuation (e.g. "中%" -> a
+            // bare "中", breaking `ku3_like_fallback_handles_meta_
+            // character_query`'s ESCAPE-clause proof) for zero AND-ing
+            // benefit -- there is no second term to protect from a bad
+            // first one. An empty extraction (no usable terms at all)
+            // falls back the same way, rather than searching for nothing.
+            let like_terms = Self::ku3_like_fallback_terms(raw_query);
+            if like_terms.len() < 2 {
+                let like_term = raw_query.trim().replace('*', "");
+                Self::lex_docs_like_candidates_query(&like_term, cap)
+            } else {
+                Self::lex_docs_like_candidates_query_multi_term(&like_terms, cap)
+            }
         } else {
             let fts_query = match transpile_to_fts5(raw_query) {
                 Some(q) if !q.trim().is_empty() => q,
@@ -5384,7 +5509,15 @@ impl SearchClient {
                 source_id,
                 origin_kind,
                 origin_host,
-                message_id: None,
+                // T11.11 (mission #105, rootcause report §0): `lex_docs.doc_id`
+                // is a straight `REFERENCES messages(id)` (T5 keeps lex_docs
+                // synced per-message), so `candidate.doc_id` IS this hit's
+                // message id -- it was sitting right here, already resolved,
+                // and simply never got threaded into the field T9 added for
+                // exactly this purpose. `winning_chunk_*` stays `None`: those
+                // three only ever mean something for a chunk-domain
+                // (semantic) hit, and this path never touches message_chunks.
+                message_id: Some(candidate.doc_id),
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
@@ -6974,6 +7107,59 @@ mod tests {
         // One chunk per message in this fixture -- always chunk_idx=0.
         assert_eq!(hits[0].winning_chunk_idx, Some(0));
         Ok(())
+    }
+
+    /// T11.11 (mission #105 修1, rootcause report §0): the lexical FTS
+    /// path's sibling of `search_hits_carry_message_id` above -- a pure
+    /// lexical hit (no chunk-domain provenance to give) must still carry
+    /// its `message_id` (`candidate.doc_id`, i.e. `lex_docs.doc_id` /
+    /// `messages.id`), while all three `winning_chunk_*` fields correctly
+    /// stay `None` (`search_fts_lex_domain` never touches `message_chunks`).
+    #[test]
+    fn lexical_search_hits_carry_message_id_but_no_winning_chunk_fields() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_v2_lex_message(
+            &storage,
+            agent_id,
+            "lexical-provenance",
+            "distinctive lexical provenance marker phrase",
+        );
+        let expected_message_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages LIMIT 1", &[], |row| row.get_typed(0))
+            .unwrap();
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        let hits = client
+            .search(
+                "distinctive lexical provenance marker",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "fixture seeds exactly one lexically-findable message");
+        assert_eq!(hits[0].message_id, Some(expected_message_id), "lexical hit must carry its message_id");
+        assert!(hits[0].winning_chunk_idx.is_none(), "lexical hit has no chunk-domain provenance");
+        assert!(hits[0].winning_chunk_span.is_none(), "lexical hit has no chunk-domain provenance");
+        assert!(hits[0].winning_chunk_hash.is_none(), "lexical hit has no chunk-domain provenance");
     }
 
     /// T9 part 2 (mission #93/#93b Step 1): hybrid RRF fusion must not
@@ -16321,6 +16507,100 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1, "ESCAPE must treat '%' as a literal, not a wildcard");
         assert_eq!(hits[0].title, "meta-hit");
+    }
+
+    /// T11.11 (mission #105 修2, test ①): a multi-word query whose KU3
+    /// degrade is triggered by one short subterm (`建议`, 2 CJK codepoints)
+    /// must generate a per-term AND-of-LIKE candidate SQL, not the old
+    /// single whole-string substring.
+    #[test]
+    fn ku3_like_fallback_terms_splits_multi_word_query_with_short_subterm() {
+        let terms = SearchClient::ku3_like_fallback_terms("cleanupPeriodDays 3650 建议");
+        assert_eq!(
+            terms,
+            vec!["cleanupPeriodDays".to_string(), "3650".to_string(), "建议".to_string()],
+            "must extract each word as an independent term, not glue them into one phrase"
+        );
+
+        let (sql, params) = SearchClient::lex_docs_like_candidates_query_multi_term(&terms, 10_000);
+        // Three independent AND'd OR-of-columns groups -- not one glued
+        // substring pattern.
+        assert_eq!(
+            sql.matches(" AND (content LIKE").count(),
+            2,
+            "3 terms must produce 2 ANDs joining 3 per-term groups, got sql: {sql}"
+        );
+        assert_eq!(sql.matches("LIKE ?").count(), 3 * 5, "each of the 3 terms must get its own OR-of-5-columns LIKE group, got sql: {sql}");
+        // 2 params per term (raw term for occurrence-score, %pattern% for
+        // the LIKE) + 1 cap param.
+        assert_eq!(params.len(), 3 * 2 + 1, "param count must scale with term count, got params: {params:?}");
+        // The old code path would have produced exactly this single glued
+        // substring as its *one* LIKE pattern -- assert it is NOT what we
+        // built (mutation-style self-check: this is the exact string the
+        // pre-fix `raw_query.trim().replace('*', "")` would have passed to
+        // the single-term function).
+        let whole_string_pattern = like_substring_pattern("cleanupPeriodDays 3650 建议");
+        assert!(
+            !params.iter().any(|p| format!("{p:?}").contains(&whole_string_pattern)),
+            "must not fall back to one whole-string LIKE pattern when terms.len() >= 2"
+        );
+    }
+
+    /// T11.11 (mission #105 修2, test ②): fixture proof that the fallback
+    /// now finds a message whose terms are scattered (not adjacent, in a
+    /// different order than the query) -- which the retired whole-string
+    /// LIKE could never do -- while still rejecting a message that only
+    /// contains *some* of the terms (proving this is a real AND, not an
+    /// accidental OR-of-any-term widening).
+    #[test]
+    fn search_finds_scattered_terms_via_and_of_like_not_partial_match() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        // All 3 terms present, but scattered across the message (not the
+        // query's literal word order/spacing) -- the retired whole-string
+        // `LIKE '%G61 40 孤儿%'` could never match this.
+        insert_v2_lex_message(
+            &storage,
+            agent_id,
+            "all-terms-scattered",
+            "编号 G61 的记录里，孤儿数据大约有 40 条，需要清理",
+        );
+        // Only 2 of the 3 terms ("G61", "40") -- must NOT match: this is
+        // what proves the fallback is still an AND, not a widened OR.
+        insert_v2_lex_message(&storage, agent_id, "partial-terms-only", "G61 编号今天处理了 40 条记录");
+        // The exact query string appears verbatim -- the case the old
+        // whole-string LIKE already handled; must keep matching too.
+        insert_v2_lex_message(&storage, agent_id, "verbatim-phrase", "本次要查的是 G61 40 孤儿 这几个词");
+        storage.close().unwrap();
+
+        let missing_index_path = dir.path().join("no-such-index");
+        let client = SearchClient::open(&missing_index_path, Some(&db_path))
+            .unwrap()
+            .expect("sqlite-only client should still open");
+
+        // Sanity: this query still trips the KU3 degrade (short "40"
+        // subterm digit, short "孤儿" CJK subterm), same routing as before.
+        assert!(query_has_short_subterm_after_normalization("G61 40 孤儿"));
+
+        let mut hits = client.search("G61 40 孤儿", SearchFilters::default(), 10, 0, FieldMask::FULL).unwrap();
+        hits.sort_by(|a, b| a.title.cmp(&b.title));
+        let titles: Vec<&str> = hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["all-terms-scattered", "verbatim-phrase"],
+            "must recall the scattered-terms message and the verbatim-phrase message, \
+             but not the partial-terms message: got {titles:?}"
+        );
     }
 
     #[test]
