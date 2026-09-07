@@ -129,6 +129,30 @@ READ_TOOL_IDENTITIES = {
 
 
 # ---------------------------------------------------------------------------
+# R1 (v4.4, Ivan 2026-09-07 裁; T2a 落地, 任务书 #113): connector cass-mcp
+# tool-identity aliases. `claude_code` recognizes any full name under its
+# MCP server's `mcp__cass-mcp__` prefix; `codex` registers/calls these tools
+# under BARE names instead (T1b full-corpus run: `cass_search` 5x,
+# `cass_expand` 3x, 0 occurrences under the `mcp__cass-mcp__` prefix) --
+# see docs/excluded-rules.md R1/R11. No other connector matches (宁漏勿误).
+# ---------------------------------------------------------------------------
+CASS_RECALL_PREFIX = "mcp__cass-mcp__"
+CASS_RECALL_BARE_NAMES = {
+    "codex": {"cass_search", "cass_expand"},
+}
+
+
+def is_cass_recall_tool(tool_name: str, agent_slug: str) -> bool:
+    """R1 identity check, replacing the old universal
+    `tool_name.startswith("mcp__cass-mcp__")` (which wrongly missed codex's
+    bare-name calls and would wrongly match if some other connector ever
+    reused the prefix)."""
+    if agent_slug == "claude_code":
+        return tool_name.startswith(CASS_RECALL_PREFIX)
+    return tool_name in CASS_RECALL_BARE_NAMES.get(agent_slug, frozenset())
+
+
+# ---------------------------------------------------------------------------
 # R2 谓词 P.
 # ---------------------------------------------------------------------------
 def _normalize_path(p: str) -> str:
@@ -222,6 +246,18 @@ def bash_readonly_paths(command: str):
                 paths = rest[2:]
                 if paths and all(not t.startswith("-") for t in paths):
                     return paths
+        return None
+
+    if head == "nl":
+        # R2 sixth form (v4.4, Ivan 加): `nl [-ba] <paths>` -- codex's
+        # dominant read-with-line-numbers shape (docs/excluded-rules.md
+        # R2-i, T1b full-corpus run: 1,003 occurrences).
+        if rest and rest[0] == "-ba":
+            paths = rest[1:]
+        else:
+            paths = rest
+        if paths and all(not t.startswith("-") for t in paths):
+            return paths
         return None
 
     return None
@@ -493,7 +529,7 @@ def decide_r1_r2_for_call(call, agent_slug, paths_cfg):
     share one judgment implementation."""
     if not call.tool_name:
         return None
-    if call.tool_name.startswith("mcp__cass-mcp__"):
+    if is_cass_recall_tool(call.tool_name, agent_slug):
         return {
             "reason": "cass_recall",
             "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": None, "shell": None},
@@ -563,13 +599,17 @@ def _mk(role, **kw):
 def selftest_cases(paths_cfg):
     cases = []
 
-    # 1. R1-a positive
+    # 1. R1-a positive (claude_code full name; v4.4 scopes the
+    # `mcp__cass-mcp__` prefix match to claude_code only -- codex's own R1
+    # identity is bare names, see case 13/14 below and R1-d in the Rust
+    # `exclusion.rs` unit tests, not duplicated here per advisor guidance
+    # to keep this file's case count at 14)
     cands = [_mk("tool_call", tool_call_id="t1", tool_name="mcp__cass-mcp__cass_search"), _mk("tool_result", tool_call_id="t1")]
-    cases.append(("R1-a cass_recall positive", cands, 1, 0, "codex", "cass_recall"))
+    cases.append(("R1-a cass_recall positive", cands, 1, 0, "claude_code", "cass_recall"))
 
     # 2. R1-b negative (same suffix, wrong prefix)
     cands = [_mk("tool_call", tool_call_id="t1", tool_name="mcp__other-mcp__cass_search"), _mk("tool_result", tool_call_id="t1")]
-    cases.append(("R1-b wrong mcp prefix", cands, 1, 0, "codex", None))
+    cases.append(("R1-b wrong mcp prefix", cands, 1, 0, "claude_code", None))
 
     # 3. R2-a positive (Read, cc-workspace root)
     cands = [
@@ -643,7 +683,7 @@ def selftest_cases(paths_cfg):
 
     # 13. R4 pairing: exactly 1 unpaired candidate -> paired (and it's cass_recall)
     cands = [_mk("user"), _mk("tool_call", tool_name="mcp__cass-mcp__cass_search"), _mk("tool_result")]
-    cases.append(("R4 exactly one unpaired candidate", cands, 2, 0, "codex", "cass_recall"))
+    cases.append(("R4 exactly one unpaired candidate", cands, 2, 0, "claude_code", "cass_recall"))
 
     # 14. R4 pairing: 2 unpaired candidates -> no match
     cands = [
@@ -652,7 +692,7 @@ def selftest_cases(paths_cfg):
         _mk("tool_call", tool_name="mcp__cass-mcp__cass_expand"),
         _mk("tool_result"),
     ]
-    cases.append(("R4 two unpaired candidates", cands, 3, 0, "codex", None))
+    cases.append(("R4 two unpaired candidates", cands, 3, 0, "claude_code", None))
 
     return cases
 
@@ -1148,11 +1188,10 @@ def write_report(report_path, stats, manifest, session_count):
         lines.append(f"- `{p}`\n")
     nl_count = stats["bash_subset_out"].get("nl", 0)
     lines.append(
-        f"\n**`nl` 单列披露**（advisor 2026-09-07 指出）：Bash 子集外前 10 分桶里 `nl` 有 {nl_count} 条——"
-        "codex 用 `nl -ba <file>`（带行号读文件）是实测中量级很高的一种只读形态，spec 冻结的五形态（cat/head/"
-        "tail/sed -n）没有覆盖它。这是**已知漏排**，不是探针 bug：`nl` 命中的会话若确实读了清单内文件，本轮"
-        "不会排除，原文只留在镜像，不会进 manifest 也不会进 DB 正文——不影响「宁漏勿误」安全性，但会拉低"
-        "锚点 2 的召回。是否把 `nl` 加进 R2 只读子集六形态，留给控制面裁（不在本轮修复批授权范围内）。\n"
+        f"\n**`nl` 单列披露**（advisor 2026-09-07 指出；v4.4 Ivan 已裁并入 R2 六形态，T2a 落地，任务书 #113）："
+        f"Bash 子集外前 10 分桶里 `nl` 有 {nl_count} 条（本次 `--selftest` 后的常量表已识别 `nl [-ba] <paths>`；"
+        "本报告若来自尚未按 v4.4 重跑的 `run_full`，这里的计数仍是六形态生效**前**的旧口径，子集内/外分布"
+        "以下一次控制面重跑探针出的 manifest v2 为准，见 docs/excluded-rules.md R2-i）。\n"
     )
 
     lines.append("\n## ⑥ codex 全部 tool_name 频次（advisor 2026-09-07：核对有无可疑的 cass-mcp 调用名）\n")

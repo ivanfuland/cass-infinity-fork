@@ -8,11 +8,12 @@
 
 ## R1 · 锚点 1 `cass_recall`
 
-`role = tool_result`，且按 **R4 配对** 规则配对到的 tool_call 的 `tool_name` 以 `mcp__cass-mcp__` 为前缀。
+`role = tool_result`，且按 **R4 配对** 规则配对到的 tool_call 的 `tool_name` 属于**该连接器在 R11 别名表里登记的 cass-mcp 工具身份**（v4.4，Ivan 2026-09-07 裁；本轮 T2a 落地，替换原「统一按 `mcp__cass-mcp__` 前缀判」口径）：只匹配 R11 表内完整身份，不做前缀猜测——`claude_code` 认全名 `mcp__cass-mcp__*`；`codex` 认裸名 `cass_search`/`cass_expand`（T1b 实测 codex 调 cass-mcp 工具不带前缀，8 次：`cass_search` 5 次、`cass_expand` 3 次）。
 
-- **R1-a**（正例）：配对 tool_call `tool_name = "mcp__cass-mcp__cass_search"` → 命中。
+- **R1-a**（正例）：claude_code 配对 tool_call `tool_name = "mcp__cass-mcp__cass_search"` → 命中。
 - **R1-b**（反例）：配对 tool_call `tool_name = "mcp__other-mcp__cass_search"`（同名非 cass-mcp 前缀）→ 不命中。
 - **R1-c**（反例）：cass-mcp tool_result 的 hits JSON 解析失败 → 仍按 R1 命中（`reason = cass_recall`），但 `excluded.src = null`、`excluded.parse_error = Some(<原因>)`（spec §一 发挥空间）。
+- **R1-d**（正例，v4.4 新增）：codex 配对 tool_call `tool_name = "cass_search"`（裸名，R11 别名表登记）→ 命中；`tool_name = "search"`（裸名但不在别名表内）→ 不命中。
 
 ## R2 · 锚点 2 `context_file_read`
 
@@ -21,8 +22,8 @@
 1. 工具属于读取类三选一：
    - `Read`，参数 `file_path`；
    - `mcp__ccw-control-plane__project_read`，参数 `document`；
-   - `Bash`，参数 `command` 属于**只读语法子集**（五形态，逐字匹配，参数为路径列表）：
-     `cat <paths>` / `head [-n N] <paths>` / `tail [-n N] <paths>` / `sed -n '<N>p' <paths>` / `sed -n '<N>,<M>p' <paths>`。
+   - `Bash`，参数 `command` 属于**只读语法子集**（**六形态**，逐字匹配，参数为路径列表）：
+     `cat <paths>` / `head [-n N] <paths>` / `tail [-n N] <paths>` / `sed -n '<N>p' <paths>` / `sed -n '<N>,<M>p' <paths>` / **`nl [-ba] <paths>`**（v4.4 新增，Ivan 裁：codex 读文件的主要形态，冻结副本 1,003 次；带行号输出与 cat 同类）。
      带 `e`/`w`/`s` 命令的 sed 脚本、换行分隔的多命令、命令替换 `$(…)`/反引号、变量展开、通配符 —— 一律不排除。
 2. 从参数提取的路径集合 `S` 非空，且 `S` 的**每个**元素都满足谓词 P（见下）——`cat A B` 只要有一个不满足即整条不排除（混合输出保留）。
 3. `Bash` 命令含管道 / `;` / `&&` / `||` / 重定向的复合形态一律不排除（**R2-e**）。
@@ -51,6 +52,7 @@ OR (tool = mcp__ccw-control-plane__project_read
 - **R2-f**（正例，多路径混合）：`Bash(command="cat /home/ivan/projects/cc-workspace/MEMORY.md /tmp/notes.txt")` → 不命中（`S` 含一个不满足 P 的路径，整条保留）；`Bash(command="cat /home/ivan/projects/cc-workspace/MEMORY.md /home/ivan/projects/cc-workspace/USER.md")` → 命中（`S` 全部满足 P）。
 - **R2-g**（正例）：`mcp__ccw-control-plane__project_read(document="exec")` → 命中。
 - **R2-h**（反例）：`Bash(command="sed -n '1e date' file.md")` → 不命中（sed 脚本含 `e` 命令，非只读子集；首词 `sed -n` 合法但整体非允许语法）。
+- **R2-i**（正例，v4.4 新增）：`Bash(command="nl -ba /home/ivan/projects/cc-workspace/MEMORY.md")` → 命中（第六形态 `nl [-ba] <paths>`）；codex `exec_command(cmd="nl -ba /home/ivan/projects/cc-workspace/MEMORY.md")` 同样命中（codex 参数键是 `cmd` 不是 `command`，见 R11）。
 
 ## R3 · 锚点 3 `codex_host_shell`
 
@@ -153,16 +155,15 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 
 ## R11 · 连接器工具身份别名表（T1b Step 3 回填并冻结）
 
-每连接器列出 `Read` / `mcp__ccw-control-plane__project_read` / `Bash` 在其 `tool_name` 字段中出现的**完整身份**，只匹配表内全名（不匹配裸名/别名）。
+每连接器列出 `Read` / `mcp__ccw-control-plane__project_read` / `Bash` / cass-mcp（R1）在其 `tool_name` 字段中出现的**完整身份**，只匹配表内全名（不匹配裸名/别名，除非该连接器一栏本身登记的就是裸名）。
 
-| 连接器 | `Read` | `project_read` | `Bash` |
-|---|---|---|---|
-| `claude_code` | `Read` | `mcp__ccw-control-plane__project_read`（冻结副本 1,586 次调用用此全名，裸名 `project_read` 0 次出现） | `Bash` |
-| `codex` | **无独立 Read 工具**（不启用该分支；读操作全部经 `exec_command` shell 执行） | **`project_read`（裸名，不带 `mcp__ccw-control-plane__` 前缀！）**——T1b.2 全量跑发现与 claude_code 不同：codex 把 MCP 工具注册/调用成裸名，实测直接 grep blob 命中工具 schema `{"type":"function","name":"project_read","description":"Serve one byte-bounded control document chunk..."}`（与该工具真实 description 一致），且 `build_candidates_codex` 统计到 610 次真实调用（非 schema 声明）用此裸名。**T1 初版误写成沿用 claude_code 全名，已订正** | `exec_command`（**参数键名是 `cmd`，不是 `command`**——T1b 探针实测 codex tool_name 频次分布 `exec_command` 40,729 次 tool_call 中最高频之一；R2 只读子集判定对 `cmd` 字段值做同样的两步语法判定） |
+| 连接器 | `Read` | `project_read` | `Bash` | cass-mcp（R1） |
+|---|---|---|---|---|
+| `claude_code` | `Read` | `mcp__ccw-control-plane__project_read`（冻结副本 1,586 次调用用此全名，裸名 `project_read` 0 次出现） | `Bash` | `mcp__cass-mcp__cass_search` / `mcp__cass-mcp__cass_expand`（全名） |
+| `codex` | **无独立 Read 工具**（不启用该分支；读操作全部经 `exec_command` shell 执行） | **`project_read`（裸名，不带 `mcp__ccw-control-plane__` 前缀！）**——T1b.2 全量跑发现与 claude_code 不同：codex 把 MCP 工具注册/调用成裸名，实测直接 grep blob 命中工具 schema `{"type":"function","name":"project_read","description":"Serve one byte-bounded control document chunk..."}`（与该工具真实 description 一致），且 `build_candidates_codex` 统计到 610 次真实调用（非 schema 声明）用此裸名。**T1 初版误写成沿用 claude_code 全名，已订正** | `exec_command`（**参数键名是 `cmd`，不是 `command`**——T1b 探针实测 codex tool_name 频次分布 `exec_command` 40,729 次 tool_call 中最高频之一；R2 只读子集判定对 `cmd` 字段值做同样的两步语法判定） | **`cass_search` / `cass_expand`（裸名，不带 `mcp__cass-mcp__` 前缀）**——T1b 全量跑发现 codex 同样把 cass-mcp 工具注册/调用成裸名：`cass_search` 5 次、`cass_expand` 3 次，共 8 条（R1-d） |
+| 其它连接器（`gemini`、`openclaw/*` 各分身、`pi_agent`） | 待盘点（同 R7：零覆盖率数据，不启用） | 同左 | 同左 | 同左 |
 
-**R1 已知缺口（本轮未修，供 T2/控制面裁）**：codex 同样把 cass-mcp 工具注册/调用成裸名——全量跑发现 `cass_search`（5 次）与 `cass_expand`（3 次）真实调用，共 8 条，均不带 `mcp__cass-mcp__` 前缀。R1 的判定逻辑（`tool_name.startswith("mcp__cass-mcp__")`）是 spec §2.1 锚点 1 的原文定义，改动需回到 spec 层面裁定（是否给 codex 加一条裸名例外），不在本轮「清单是配置」的修复批边界内——本轮按「宁漏勿误」处理：这 8 条不排除，原文仍在镜像。
-| 其它连接器（`gemini`、`openclaw/*` 各分身、`pi_agent`） | 待盘点（同 R7：零覆盖率数据，不启用） | 同左 | 同左 |
-| 其它连接器 | 待 T1b 盘点 | 待 T1b 盘点 | 待 T1b 盘点 |
+**R1 落地纪律（v4.4，Ivan 2026-09-07 裁，本轮 T2a 生效）**：R1 判定改为「按上表精确匹配」，不做前缀判断——`claude_code` 只认全名，`codex` 只认裸名。曾经的「T1 已知缺口：codex 8 条 cass-mcp 调用不带前缀、按宁漏勿误不排除」在本轮改判为**命中**（`decide` 的常量表按 `agent_slug` 索引，`codex` 分支登记这两个裸名）。
 
 ## R12 · 锁保证边界
 
