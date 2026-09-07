@@ -213,6 +213,30 @@ fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<String>> {
     Ok(text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
 }
 
+/// Mirrors `franken_agent_detection::connectors::claude_code`'s content-block
+/// splitting (pinned rev `bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8`,
+/// `split_content_blocks` in `connectors/utils.rs` + the projection loop in
+/// `connectors/claude_code.rs`), T2b.2 (任务书 #115) control-plane fix
+/// 2026-09-07: the original version pushed at most one duplicate `RawEvent`
+/// per line (only for a `tool_result` mixed with another block kind on the
+/// same line), but the connector actually splits EVERY content-block array
+/// into up to `1 (concatenated prose text, if non-empty) + 1 per
+/// tool_use/tool_result/thinking block that matches the line's own role`
+/// separate `NormalizedMessage`s -- so a common `[text, tool_use]` assistant
+/// turn (one JSONL line) reparses into TWO messages but was only ever one
+/// raw event, silently failing `events.len() == reparsed.messages.len()`
+/// and skipping judgment for the whole session (`EVENT_ALIGN_FAILED`,
+/// 宁漏勿误 -- but a false-negative-heavy one, since claude_code sessions
+/// mix text + tool_use in nearly every tool-using assistant turn). Fixed by
+/// counting/duplicating per the same split rule instead of only the
+/// tool_result-mixed case.
+///
+/// Each pushed copy carries the event's FULL block list (not narrowed to
+/// "the blocks this particular output message corresponds to"): `decide`'s
+/// pairing (`tool_result_block_indices`, anchor 3's Text-kind filter) all
+/// filter `event.blocks` by block `kind`/`tool_use_id`, never by the
+/// duplicate's position, so a full block list is sufficient and exactly
+/// matches what the pre-existing tool_result-mixed duplication already did.
 fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
     let lines = read_jsonl_lines(blob_path)?;
     let mut events = Vec::with_capacity(lines.len());
@@ -220,83 +244,184 @@ fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEven
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         let event_key =
             value.get("uuid").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{}", line_no + 1));
-        let mut blocks = Vec::new();
-        let mut has_tool_result = false;
-        let mut has_other = false;
-        if let Some(content) = value.pointer("/message/content").and_then(|v| v.as_array()) {
-            for (i, block) in content.iter().enumerate() {
-                let block_type = block.get("type").and_then(|v| v.as_str());
-                let kind = match block_type {
-                    Some("tool_use") => BlockKind::ToolUse,
-                    Some("tool_result") => BlockKind::ToolResult,
-                    Some("text") => BlockKind::Text,
-                    _ => BlockKind::Other,
-                };
-                if kind == BlockKind::ToolResult {
-                    has_tool_result = true;
-                } else {
-                    has_other = true;
-                }
-                let tool_use_id = block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
-                    .map(str::to_string);
-                let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
-                let args = block.get("input").cloned();
-                blocks.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
+
+        // Role resolution (claude_code.rs's `message_role`): only a
+        // user/assistant envelope (explicit `message.role`, or an implicit
+        // top-level `type` of "user"/"assistant" with no nested role) ever
+        // emits a message; `system`'s `away_summary` subtype is the one
+        // exception (handled separately, no content-block splitting).
+        let entry_type = value.get("type").and_then(|v| v.as_str());
+        let inner_role = value.pointer("/message/role").and_then(|v| v.as_str());
+        let role: Option<&str> = match (entry_type, inner_role) {
+            (Some("user" | "assistant" | "message"), Some(r)) if r == "user" || r == "assistant" => Some(r),
+            (Some(r @ ("user" | "assistant")), None) => Some(r),
+            _ => None,
+        };
+        let is_system_away_summary =
+            entry_type == Some("system") && value.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
+
+        let content_val = value.pointer("/message/content").or_else(|| value.get("content"));
+
+        if is_system_away_summary {
+            let has_content = content_val.and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+            if has_content {
+                events.push(RawEvent { event_key, blocks: Vec::new() });
             }
+            continue;
         }
-        let event = RawEvent { event_key, blocks };
-        // Documented split shape (see doc comment): mixed tool_result + other
-        // content projects into two consecutive rows sharing this event.
-        if has_tool_result && has_other {
-            events.push(event.clone());
+        let Some(role) = role else { continue };
+
+        match content_val {
+            Some(serde_json::Value::Array(content)) => {
+                let mut blocks = Vec::with_capacity(content.len());
+                for (i, block) in content.iter().enumerate() {
+                    let block_type = block.get("type").and_then(|v| v.as_str());
+                    let kind = match block_type {
+                        Some("text" | "input_text" | "output_text") if block.get("text").and_then(|v| v.as_str()).is_some() => BlockKind::Text,
+                        Some("tool_use") if block.get("name").and_then(|v| v.as_str()).is_some() => BlockKind::ToolUse,
+                        Some("tool_result") => BlockKind::ToolResult,
+                        // `thinking` blocks (need `thinking` or `text` as a
+                        // string) never participate in any decision filter,
+                        // so BlockKind::Other is sufficient here.
+                        Some("thinking")
+                            if block.get("thinking").and_then(|v| v.as_str()).or_else(|| block.get("text").and_then(|v| v.as_str())).is_some() =>
+                        {
+                            BlockKind::Other
+                        }
+                        _ => continue, // split_content_blocks drops malformed/unknown blocks entirely
+                    };
+                    let tool_use_id = block
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
+                        .map(str::to_string);
+                    let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                    let args = block.get("input").cloned();
+                    blocks.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
+                }
+                let event = RawEvent { event_key, blocks };
+
+                let prose: String = event
+                    .blocks
+                    .iter()
+                    .zip(content.iter())
+                    .filter(|(b, _)| b.kind == BlockKind::Text)
+                    .filter_map(|(_, block)| block.get("text").and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !prose.trim().is_empty() {
+                    events.push(event.clone());
+                }
+                for b in &event.blocks {
+                    let matches_role = match b.kind {
+                        BlockKind::ToolUse | BlockKind::Other => role == "assistant",
+                        BlockKind::ToolResult => role == "user",
+                        BlockKind::Text => false, // already accounted for as prose above
+                    };
+                    if matches_role && b.kind != BlockKind::Text {
+                        events.push(event.clone());
+                    }
+                }
+            }
+            Some(other) => {
+                let content_str = match other {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => String::new(),
+                };
+                if !content_str.trim().is_empty() {
+                    events.push(RawEvent { event_key, blocks: Vec::new() });
+                }
+            }
+            None => {}
         }
-        events.push(event);
     }
     Ok(events)
 }
 
+/// Mirrors `franken_agent_detection::connectors::codex` (pinned rev
+/// `bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8`, `connectors/codex.rs`'s
+/// projection loop), T2b.2 (任务书 #115) control-plane fix 2026-09-07: the
+/// original version pushed exactly one `RawEvent` per JSONL line
+/// unconditionally, but the real connector's outer `type` dispatch is
+/// `"session_meta"`/`"turn_context"` (metadata only, 0 messages),
+/// `"response_item"` (payload-type-gated: a `message` with `role="developer"`
+/// -- or any role other than user/assistant -- or empty content is dropped;
+/// `agent_message`/`reasoning` need non-empty content or, for reasoning, an
+/// `encrypted_content`; `function_call`/`custom_tool_call`/
+/// `function_call_output`/`custom_tool_call_output` always emit one),
+/// `"event_msg"` (an `agent_message` sub-payload is dropped as a duplicate
+/// of the response-item version; `user_message`/`agent_reasoning`/`tool_call`
+/// need non-empty text; `token_count` attaches to an existing message and
+/// emits none of its own), and any other outer `type` is dropped entirely.
+/// Every codex line still produces at most ONE message (unlike claude_code),
+/// so this only needed to stop over-counting lines that produce zero --
+/// every codex session has at least one dropped `developer`-role line, so
+/// the prior always-push-one behavior meant `EVENT_ALIGN_FAILED` on
+/// essentially every codex session, not just an edge case.
 fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
     let lines = read_jsonl_lines(blob_path)?;
     let mut events = Vec::with_capacity(lines.len());
     for (line_no, line) in lines.iter().enumerate() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let Some(payload) = value.get("payload") else { continue };
         let event_key =
             payload.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{}", line_no + 1));
-        let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or_default();
         let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
         let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
-        let blocks = match payload_type {
-            "function_call" | "custom_tool_call" => {
-                let args = payload.get("arguments").or_else(|| payload.get("input")).cloned();
-                vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }]
-            }
-            "function_call_output" | "custom_tool_call_output" => {
-                vec![RawBlock { index: 0, kind: BlockKind::ToolResult, tool_use_id: call_id, tool_name: None, args: None }]
-            }
-            "message" => {
-                // R6: "codex payload.output 整体记单块索引 0" -- one Text
-                // block regardless of how many `content[]`/`output[]`
-                // elements the message actually carries, since R3's
-                // target_blocks is "all Text blocks" and apply's field map
-                // (`payload.content[*].text`/`payload.output[*].text`)
-                // replaces the whole array per matched index anyway.
-                let has_text = payload
-                    .get("content")
-                    .or_else(|| payload.get("output"))
-                    .and_then(|v| v.as_array())
-                    .is_some_and(|arr| !arr.is_empty());
-                if has_text {
-                    vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]
-                } else {
-                    Vec::new()
+
+        let text_nonempty = |key: &str| payload.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+        let content_array_nonempty = || {
+            payload.get("content").or_else(|| payload.get("output")).and_then(|v| v.as_array()).is_some_and(|arr| !arr.is_empty())
+        };
+
+        let blocks: Option<Vec<RawBlock>> = match entry_type {
+            "response_item" => {
+                let payload_type = payload.get("type").and_then(|v| v.as_str());
+                match payload_type {
+                    Some("message") | None => {
+                        let role = payload.get("role").and_then(|v| v.as_str());
+                        if matches!(role, Some("user" | "assistant")) && content_array_nonempty() {
+                            Some(vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
+                        } else {
+                            None
+                        }
+                    }
+                    Some("agent_message") => content_array_nonempty()
+                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                    Some("reasoning") => (payload.get("summary").and_then(|v| v.as_array()).is_some_and(|arr| !arr.is_empty())
+                        || payload.get("encrypted_content").is_some())
+                    .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                    Some("function_call" | "custom_tool_call") => {
+                        let args = payload.get("arguments").or_else(|| payload.get("input")).cloned();
+                        Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
+                    }
+                    Some("function_call_output" | "custom_tool_call_output") => {
+                        Some(vec![RawBlock { index: 0, kind: BlockKind::ToolResult, tool_use_id: call_id, tool_name: None, args: None }])
+                    }
+                    Some(_) => None,
                 }
             }
-            _ => Vec::new(),
+            "event_msg" => {
+                let event_type = payload.get("type").and_then(|v| v.as_str());
+                match event_type {
+                    Some("agent_message") => None, // duplicates the response_item version
+                    Some("user_message") => text_nonempty("message")
+                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                    Some("agent_reasoning") => text_nonempty("text")
+                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                    Some("tool_call") => {
+                        let args = payload.get("input").or_else(|| payload.get("arguments")).cloned();
+                        Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
+                    }
+                    // "token_count" attaches to an existing message, no message of its own.
+                    _ => None,
+                }
+            }
+            // "session_meta" / "turn_context" / anything else: metadata only.
+            _ => None,
         };
+        let Some(blocks) = blocks else { continue };
         events.push(RawEvent { event_key, blocks });
     }
     Ok(events)
@@ -1013,7 +1138,7 @@ mod tests {
     #[test]
     fn events_from_blob_claude_code_single_text_event_positive() {
         let dir = tempfile::tempdir().unwrap();
-        let line = r#"{"uuid":"ek1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
+        let line = r#"{"type":"assistant","uuid":"ek1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
         let path = write_blob(&dir, "s.jsonl", &[line]);
         let events = events_from_blob("claude_code", &path);
         assert_eq!(events.len(), 1, "one JSONL line with no tool_result must produce exactly one RawEvent");
@@ -1033,9 +1158,9 @@ mod tests {
         // this common shape.
         let dir = tempfile::tempdir().unwrap();
         let lines = [
-            r#"{"uuid":"ek1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
-            r#"{"uuid":"ek2","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/x"}}]}}"#,
-            r#"{"uuid":"ek3","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"file contents"}]}]}}"#,
+            r#"{"type":"user","uuid":"ek1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"assistant","uuid":"ek2","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/x"}}]}}"#,
+            r#"{"type":"user","uuid":"ek3","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"file contents"}]}]}}"#,
         ];
         let path = write_blob(&dir, "s.jsonl", &lines);
         let events = events_from_blob("claude_code", &path);
@@ -1053,7 +1178,7 @@ mod tests {
         // so `prepare_conversation_for_ingest`'s alignment self-check does
         // NOT skip judgment for this documented split.
         let dir = tempfile::tempdir().unwrap();
-        let line = r#"{"uuid":"ek-shared","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"result"}]},{"type":"text","text":"<fork-boilerplate>..."}]}}"#;
+        let line = r#"{"type":"user","uuid":"ek-shared","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"result"}]},{"type":"text","text":"<fork-boilerplate>..."}]}}"#;
         let path = write_blob(&dir, "s.jsonl", &[line]);
         let events = events_from_blob("claude_code", &path);
         assert_eq!(events.len(), 2, "mixed tool_result+text event must produce two aligned RawEvent entries");
@@ -1067,7 +1192,7 @@ mod tests {
     #[test]
     fn events_from_blob_claude_code_missing_uuid_falls_back_to_line_number_negative() {
         let dir = tempfile::tempdir().unwrap();
-        let line = r#"{"message":{"role":"user","content":[]}}"#;
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
         let path = write_blob(&dir, "s.jsonl", &[line]);
         let events = events_from_blob("claude_code", &path);
         assert_eq!(events[0].event_key, "line:1", "missing top-level uuid falls back to 1-based line number");
@@ -1077,8 +1202,8 @@ mod tests {
     fn events_from_blob_codex_function_call_and_output_pairing_positive() {
         let dir = tempfile::tempdir().unwrap();
         let call =
-            r#"{"payload":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_abc","name":"exec","input":{"cmd":"cat x"}}}"#;
-        let result = r#"{"payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_abc","output":[{"type":"input_text","text":"hi"}]}}"#;
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_abc","name":"exec","input":{"cmd":"cat x"}}}"#;
+        let result = r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_abc","output":[{"type":"input_text","text":"hi"}]}}"#;
         let path = write_blob(&dir, "s.jsonl", &[call, result]);
         let events = events_from_blob("codex", &path);
         assert_eq!(events.len(), 2, "codex response_items are 1:1 with events (no splitting)");
@@ -1094,7 +1219,7 @@ mod tests {
     #[test]
     fn events_from_blob_codex_message_type_produces_single_text_block_positive() {
         let dir = tempfile::tempdir().unwrap();
-        let line = r#"{"payload":{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"<environment_context>...</environment_context>"}]}}"#;
+        let line = r#"{"type":"response_item","payload":{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"<environment_context>...</environment_context>"}]}}"#;
         let path = write_blob(&dir, "s.jsonl", &[line]);
         let events = events_from_blob("codex", &path);
         assert_eq!(events.len(), 1);
@@ -1108,6 +1233,100 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_blob(&dir, "s.jsonl", &[r#"{"uuid":"x"}"#]);
         assert!(events_from_blob("openclaw", &path).is_empty(), "R7/R11 不启用的连接器不产结构事实");
+    }
+
+    // -- events_from_blob alignment lock against the REAL connector (T2b.2,
+    // 任务书 #115, control-plane fix 2026-09-07) ---------------------------
+    //
+    // The tests above assert `events_from_blob`'s own internal shape; these
+    // assert it against what `franken_agent_detection`'s real connector
+    // actually reparses a blob into, closing the loop the original
+    // `EVENT_ALIGN_FAILED` bug slipped through (self-consistent unit tests
+    // that never called the real parser).
+
+    fn real_reparse_message_count(connector_key: &'static str, dir: &tempfile::TempDir, file_name: &str) -> usize {
+        let (_name, factory) = crate::connectors::get_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == connector_key)
+            .unwrap_or_else(|| panic!("no registered connector factory named {connector_key:?}"));
+        let connector = factory();
+        let file_path = dir.path().join(file_name);
+        let scan_root = crate::connectors::ScanRoot::local(file_path.clone());
+        let ctx = crate::connectors::ScanContext::with_roots(dir.path().to_path_buf(), vec![scan_root], None);
+        let convs = connector.scan(&ctx).expect("real connector scan must succeed for a well-formed fixture");
+        assert!(convs.len() <= 1, "fixture must reparse into at most one conversation, got {}", convs.len());
+        // A fixture whose only content produces zero real messages may
+        // legitimately scan to zero conversations (the connector drops an
+        // empty session rather than emitting one with `messages: []`).
+        convs.into_iter().next().map(|c| c.messages.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn events_from_blob_claude_code_thinking_text_tool_use_one_line_matches_real_reparse_positive() {
+        // Real shape: one assistant JSONL record whose content array mixes
+        // thinking + text + tool_use -- three blocks, but (thinking ->
+        // reasoning message) + (text -> prose message) + (tool_use ->
+        // tool_call message) = THREE separate NormalizedMessages from the
+        // real connector, not one.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","uuid":"ek-ttt","message":{"role":"assistant","content":[{"type":"thinking","thinking":"considering the read"},{"type":"text","text":"Let me check that file."},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/foo.txt"}}]}}"#;
+        write_blob(&dir, "session.jsonl", &[line]);
+        let real_count = real_reparse_message_count("claude", &dir, "session.jsonl");
+        let events = events_from_blob("claude_code", &dir.path().join("session.jsonl"));
+        assert_eq!(events.len(), real_count, "thinking+text+tool_use on one line must produce 3 aligned RawEvent entries, matching the real connector's 3 messages");
+        assert_eq!(real_count, 3);
+        assert!(events.iter().all(|e| e.event_key == "ek-ttt"));
+    }
+
+    #[test]
+    fn events_from_blob_claude_code_pure_multi_text_blocks_collapse_to_one_matches_real_reparse_positive() {
+        // Real shape: multiple `text` blocks in one content array collapse
+        // into ONE prose message (newline-joined), not one message per
+        // block.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","uuid":"ek-multitext","message":{"role":"assistant","content":[{"type":"text","text":"part one"},{"type":"text","text":"part two"}]}}"#;
+        write_blob(&dir, "session.jsonl", &[line]);
+        let real_count = real_reparse_message_count("claude", &dir, "session.jsonl");
+        let events = events_from_blob("claude_code", &dir.path().join("session.jsonl"));
+        assert_eq!(events.len(), real_count, "multiple text blocks on one line must collapse to a single aligned RawEvent, matching the real connector's single prose message");
+        assert_eq!(real_count, 1);
+    }
+
+    #[test]
+    fn events_from_blob_claude_code_developer_style_empty_content_produces_zero_matches_real_reparse_negative() {
+        // Real shape: an assistant record whose only content block fails
+        // its own required-field check (a `text` block with no string
+        // `text`) produces zero messages, not one.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","uuid":"ek-empty","message":{"role":"assistant","content":[{"type":"text"}]}}"#;
+        write_blob(&dir, "session.jsonl", &[line]);
+        let real_count = real_reparse_message_count("claude", &dir, "session.jsonl");
+        let events = events_from_blob("claude_code", &dir.path().join("session.jsonl"));
+        assert_eq!(events.len(), real_count, "a malformed/empty content-only line must produce zero aligned RawEvent entries, matching the real connector's zero messages");
+        assert_eq!(real_count, 0);
+    }
+
+    #[test]
+    fn events_from_blob_codex_developer_dropped_and_reasoning_sequence_matches_real_reparse_positive() {
+        // Real shape (T2b.2 root cause): a `developer`-role response_item
+        // (the system prompt line every real codex session has) is dropped
+        // by the connector entirely -- zero messages -- while `reasoning`,
+        // `function_call`, `function_call_output`, and a normal `user`
+        // message each produce exactly one.
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            r#"{"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, a coding agent."}]}}"#,
+            r#"{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}}"#,
+            r#"{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I should run ls."}]}}"#,
+            r#"{"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\"cmd\":\"ls\"}","call_id":"call_1"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-01-01T00:00:04Z","payload":{"type":"function_call_output","call_id":"call_1","output":"README.md\n"}}"#,
+            r#"{"type":"response_item","timestamp":"2026-01-01T00:00:05Z","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Found README.md."}]}}"#,
+        ];
+        write_blob(&dir, "rollout-w6-test.jsonl", &lines);
+        let real_count = real_reparse_message_count("codex", &dir, "rollout-w6-test.jsonl");
+        let events = events_from_blob("codex", &dir.path().join("rollout-w6-test.jsonl"));
+        assert_eq!(events.len(), real_count, "the dropped developer line must not be counted, matching the real connector's message count");
+        assert_eq!(real_count, 5, "developer dropped; user/reasoning/function_call/function_call_output/assistant each kept");
     }
 
     // -- R1 -------------------------------------------------------------

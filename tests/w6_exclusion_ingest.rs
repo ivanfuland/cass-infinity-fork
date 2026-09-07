@@ -245,25 +245,22 @@ fn prune_without_an_outer_lock_leaves_the_window_open_for_a_racing_writer() {
 // file (B.10's codex fixture).
 // =============================================================================
 
-/// Writes a `claude_code` session JSONL with: a plain user question, a
-/// `tool_use`-only turn calling the `cass-mcp` recall tool whose
-/// `tool_result` is anchor-1 excluded, a plain assistant text turn, a
-/// `tool_use`-only turn reading a cc-workspace memory file whose
+/// Writes a `claude_code` session JSONL with: a plain user question, an
+/// assistant turn mixing prose + the `cass-mcp` recall tool_use on one
+/// JSONL line whose `tool_result` is anchor-1 excluded, an assistant turn
+/// mixing prose + a memory-file `Read` tool_use on one line whose
 /// `tool_result` is anchor-2 excluded, and a closing assistant summary.
 /// Returns the file path.
 ///
-/// Each JSONL line carries exactly ONE content-block kind (never a mixed
-/// `text` + `tool_use` turn). `events_from_blob`'s claude_code duplication
-/// rule (`exclusion.rs::claude_code_events_from_blob`) only doubles a raw
-/// event when a single line mixes `tool_result` with another block kind --
-/// it does not (and per its own doc comment, by design does not try to)
-/// model the connector's *own* text+tool_use turn splitting. A line mixing
-/// `text` and `tool_use` reparses into two `NormalizedMessage`s but only
-/// one raw event, so `events.len() != reparsed.messages.len()` and the
-/// whole session's judgment is skipped (`EVENT_ALIGN_FAILED`, 宁漏勿误) --
-/// verified against this binary while writing this fixture. Kept
-/// one-block-per-line here so this equivalence test actually exercises the
-/// exclusion path instead of vacuously passing on zero excluded rows.
+/// This is the realistic wire shape (a mixed `[text, tool_use]` content
+/// array on one line) `events_from_blob`'s claude_code rule now handles
+/// (T2b.2, 任务书 #115, control-plane fix 2026-09-07): earlier in this same
+/// mission round it did not -- the fix and its own unit-level alignment
+/// tests against the real connector live in `exclusion.rs`
+/// (`events_from_blob_claude_code_thinking_text_tool_use_one_line_matches_real_reparse_positive`
+/// et al.); this CLI-level test exercising the same shape end to end is
+/// what proves the fix actually closes the loop for real ingestion, not
+/// just for `events_from_blob` in isolation.
 fn write_two_anchor_claude_session(home: &std::path::Path) -> std::path::PathBuf {
     let project_dir = home.join(".claude/projects/w6-transport-equiv");
     std::fs::create_dir_all(&project_dir).expect("mkdir claude project dir");
@@ -292,6 +289,7 @@ fn write_two_anchor_claude_session(home: &std::path::Path) -> std::path::PathBuf
         serde_json::json!({
             "type": "assistant", "timestamp": "2026-09-07T10:00:04.000Z", "uuid": "w6-evt-001a",
             "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Let me search prior sessions."},
                 {"type": "tool_use", "id": "toolu_w6_recall_001", "name": "mcp__cass-mcp__cass_search", "input": {"query": "prior decision about worktrees"}}
             ]}
         }),
@@ -302,12 +300,9 @@ fn write_two_anchor_claude_session(home: &std::path::Path) -> std::path::PathBuf
             ]}
         }),
         serde_json::json!({
-            "type": "assistant", "timestamp": "2026-09-07T10:00:09.000Z", "uuid": "w6-evt-003pre",
-            "message": {"role": "assistant", "content": "Now let me check your memory file."}
-        }),
-        serde_json::json!({
             "type": "assistant", "timestamp": "2026-09-07T10:00:10.000Z", "uuid": "w6-evt-003",
             "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "Now let me check your memory file."},
                 {"type": "tool_use", "id": "toolu_w6_read_001", "name": "Read", "input": {"file_path": home.join("cc-workspace/USER.md").display().to_string()}}
             ]}
         }),

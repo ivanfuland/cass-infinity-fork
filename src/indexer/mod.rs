@@ -15250,6 +15250,33 @@ fn judge_and_redact_reparsed(
     markers
 }
 
+/// Shared by [`prepare_conversation_for_ingest`] and
+/// [`prepare_conversation_for_restore`] (T2b.2, control-plane approved
+/// 2026-09-07): the event/message-count alignment self-check that guards
+/// [`judge_and_redact_reparsed`] was previously inlined only in the ingest
+/// path. Extracted here so restore's reparse-then-judge step gets the same
+/// `EVENT_ALIGN_FAILED` accounting (宁漏勿误) instead of a second,
+/// independently-maintained copy of the same three lines.
+pub(crate) fn judge_reparsed_conversation(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::RawEvent],
+    blob_relative_path: &str,
+) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
+    // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
+    // disclosed positional approximation (see events_from_blob's own doc
+    // comment) -- when the flat event count doesn't even match the
+    // reparsed message count, positional indexing can't be trusted at
+    // all for this session, so skip judgment entirely (宁漏勿误: no
+    // exclusion rather than a wrong one) instead of silently judging
+    // against misaligned events.
+    if events.len() == conv.messages.len() {
+        judge_and_redact_reparsed(conv, events, blob_relative_path)
+    } else {
+        record_event_align_failed();
+        vec![None; conv.messages.len()]
+    }
+}
+
 /// `connector` is the *same* connector instance the caller already used for
 /// the first scan pass (streaming/batch/watch each hold one in scope), not a
 /// fresh lookup by `connector_name` in `crate::connectors::get_connector_factories()`
@@ -15325,19 +15352,7 @@ fn prepare_conversation_for_ingest(
         }
 
         let events = crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
-        // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
-        // disclosed positional approximation (see events_from_blob's own doc
-        // comment) -- when the flat event count doesn't even match the
-        // reparsed message count, positional indexing can't be trusted at
-        // all for this session, so skip judgment entirely (宁漏勿误: no
-        // exclusion rather than a wrong one) instead of silently judging
-        // against misaligned events.
-        let markers = if events.len() == reparsed.messages.len() {
-            judge_and_redact_reparsed(&mut reparsed, &events, &record.blob_relative_path)
-        } else {
-            record_event_align_failed();
-            vec![None; reparsed.messages.len()]
-        };
+        let markers = judge_reparsed_conversation(&mut reparsed, &events, &record.blob_relative_path);
 
         conv = reparsed;
         excluded = markers;
