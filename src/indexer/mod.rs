@@ -15117,6 +15117,19 @@ pub(crate) fn canonicalize_claude_external_id(
     }
 }
 
+/// T2b R1 (control-plane 裁定): count of sessions where `events_from_blob`'s
+/// flat event count didn't match the reparsed message count, so judgment was
+/// skipped entirely for that session (see the `judge_and_redact_reparsed`
+/// call site). **Not yet wired into any scan report or `cass status --json`
+/// field** -- that's T5's job (the plan's `codex_host_shell_hits`-style
+/// meta-key persistence); this counter exists so the behavior is observable
+/// (tests, `EVENT_ALIGN_FAILED.load(Ordering::Relaxed)`) before that lands.
+static EVENT_ALIGN_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_event_align_failed() {
+    EVENT_ALIGN_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// PR6 T2b (任务书 #114): whether a scanned [`NormalizedConversation`] came
 /// from a real filesystem path (must exist at capture time; `NotFound`/
 /// `NotADirectory` is a hard `CaptureFailed`) or a connector-internal
@@ -15294,7 +15307,19 @@ fn prepare_conversation_for_ingest(
         }
 
         let events = crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
-        let markers = judge_and_redact_reparsed(&mut reparsed, &events, &record.blob_relative_path);
+        // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
+        // disclosed positional approximation (see events_from_blob's own doc
+        // comment) -- when the flat event count doesn't even match the
+        // reparsed message count, positional indexing can't be trusted at
+        // all for this session, so skip judgment entirely (宁漏勿误: no
+        // exclusion rather than a wrong one) instead of silently judging
+        // against misaligned events.
+        let markers = if events.len() == reparsed.messages.len() {
+            judge_and_redact_reparsed(&mut reparsed, &events, &record.blob_relative_path)
+        } else {
+            record_event_align_failed();
+            vec![None; reparsed.messages.len()]
+        };
 
         conv = reparsed;
         excluded = markers;
@@ -24540,6 +24565,19 @@ mod tests {
         .expect("done message should send");
     }
 
+    // T2b (任务书 #114, control-plane 裁定 (a)(b)): `prepare_conversation_for_ingest`
+    // now reparses the captured raw-mirror blob via this same connector
+    // instance before a session can survive ingest, so any synthetic
+    // conversation this connector hands back needs a *real* backing file at
+    // `source_path` for `attach_raw_mirror_capture` to actually capture --
+    // the old code tolerated a missing file (warn + continue with no
+    // mirror), the new `CaptureSourceKind::File` contract treats it as a
+    // hard `CaptureFailed` (session dropped) by design. `ConnectorFactory`
+    // is a bare fn pointer (no closure capture), so the test-owned tempdir
+    // path is threaded in via this static, same pattern as
+    // `FAILING_EXPLICIT_FILE_ROOT`/`DISCONNECT_TEST_COUNTER` below.
+    static DEFERRED_BATCH_SOURCE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
     struct DeferredBatchConnector;
 
     impl Connector for DeferredBatchConnector {
@@ -24555,13 +24593,20 @@ mod tests {
             &self,
             _ctx: &crate::connectors::ScanContext,
         ) -> anyhow::Result<Vec<NormalizedConversation>> {
-            Ok(vec![norm_conv(
+            let source_path = DEFERRED_BATCH_SOURCE_PATH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("deferred batch source path should be configured");
+            let mut conv = norm_conv(
                 Some("deferred-batch"),
                 vec![
                     norm_msg(0, 1_700_000_000_000),
                     norm_msg(1, 1_700_000_000_100),
                 ],
-            )])
+            );
+            conv.source_path = source_path;
+            Ok(vec![conv])
         }
 
         fn scan_with_callback(
@@ -24779,8 +24824,36 @@ mod tests {
     }
 
     static DISCONNECT_TEST_COUNTER: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+    // T2b (任务书 #114, control-plane 裁定 (a)(b)): same reasoning as
+    // `DEFERRED_BATCH_SOURCE_PATH` above -- `prepare_conversation_for_ingest`
+    // reparses via this connector's own `scan()`, so both `scan()` and
+    // `scan_with_callback()`'s conversations need a real backing file. The
+    // two methods were already inconsistent before this round (`scan()`
+    // returned an empty Vec while `scan_with_callback()` produced three
+    // conversations independently) -- `scan()` now returns one conversation
+    // matching what `scan_with_callback()` emits for the same `ctx`
+    // (`external_id: Some(scope)` is identical across all three of its
+    // iterations, so any one of them is a valid single-match reparse result).
+    static DISCONNECT_TEST_SOURCE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
     struct DisconnectAwareConnector;
+
+    impl DisconnectAwareConnector {
+        fn oversized_conv(scope: &str) -> NormalizedConversation {
+            let source_path = DISCONNECT_TEST_SOURCE_PATH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("disconnect test source path should be configured");
+            let oversized = NormalizedMessage {
+                content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
+                ..norm_msg(0, 2_000)
+            };
+            let mut conv = norm_conv(Some(scope), vec![oversized]);
+            conv.source_path = source_path;
+            conv
+        }
+    }
 
     impl Connector for DisconnectAwareConnector {
         fn detect(&self) -> DetectionResult {
@@ -24793,9 +24866,10 @@ mod tests {
 
         fn scan(
             &self,
-            _ctx: &crate::connectors::ScanContext,
+            ctx: &crate::connectors::ScanContext,
         ) -> anyhow::Result<Vec<NormalizedConversation>> {
-            Ok(Vec::new())
+            let scope = if ctx.scan_roots.is_empty() { "local" } else { "remote" };
+            Ok(vec![Self::oversized_conv(scope)])
         }
 
         fn scan_with_callback(
@@ -24814,13 +24888,9 @@ mod tests {
                 "remote"
             };
 
-            for idx in 0..3 {
+            for _ in 0..3 {
                 counter.fetch_add(1, Ordering::Relaxed);
-                let oversized = NormalizedMessage {
-                    content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
-                    ..norm_msg(idx, 2_000 + idx)
-                };
-                on_conversation(norm_conv(Some(scope), vec![oversized]))?;
+                on_conversation(Self::oversized_conv(scope))?;
             }
 
             Ok(())
@@ -28156,6 +28226,16 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
+        // T2b (任务书 #114): `DeferredBatchConnector` now needs a real
+        // backing file for its canned conversation's `source_path` --
+        // `attach_raw_mirror_capture` (now hard-fails on a missing file)
+        // reads and hashes these bytes, but the connector's `scan()` itself
+        // ignores the file's content entirely (returns canned data
+        // regardless), so any non-empty content suffices.
+        let source_path = tmp.path().join("deferred-batch-source.jsonl");
+        std::fs::write(&source_path, b"{}\n").unwrap();
+        *DEFERRED_BATCH_SOURCE_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(source_path);
+
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
@@ -28231,6 +28311,12 @@ mod tests {
         *DISCONNECT_TEST_COUNTER
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(counter.clone());
+        // T2b (任务书 #114): real backing file so `attach_raw_mirror_capture`
+        // (now hard-fails on a missing file) and reparse both succeed --
+        // content is irrelevant, `DisconnectAwareConnector::scan()` ignores it.
+        let source_path = tmp.path().join("disconnect-source.jsonl");
+        std::fs::write(&source_path, b"{}\n").unwrap();
+        *DISCONNECT_TEST_SOURCE_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(source_path);
 
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
         drop(rx);

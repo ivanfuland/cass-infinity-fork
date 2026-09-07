@@ -1022,10 +1022,35 @@ mod tests {
     }
 
     #[test]
+    fn events_from_blob_claude_code_fully_aligned_session_matches_message_count_positive() {
+        // T2b R1 (control-plane 裁定) alignment lock, "全对齐" shape: a
+        // plain sequence of events with no mixed tool_result+text content
+        // reparses 1:1 (one connector message per JSONL line), so
+        // `events.len()` must equal the session's real message count and
+        // `prepare_conversation_for_ingest`'s `events.len() ==
+        // reparsed.messages.len()` self-check must NOT skip judgment for
+        // this common shape.
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            r#"{"uuid":"ek1","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"uuid":"ek2","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/x"}}]}}"#,
+            r#"{"uuid":"ek3","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"file contents"}]}]}}"#,
+        ];
+        let path = write_blob(&dir, "s.jsonl", &lines);
+        let events = events_from_blob("claude_code", &path);
+        assert_eq!(events.len(), 3, "3 non-mixed events must produce exactly 3 aligned RawEvent entries (1:1, no splitting)");
+        assert_eq!(events[2].blocks.len(), 1, "a tool_result-only event has no `has_other` content, so it does not split");
+    }
+
+    #[test]
     fn events_from_blob_claude_code_mixed_tool_result_and_text_splits_into_two_positive() {
         // T1b/T2a documented shape (messages 1287477/1287478): one event
         // whose `message.content` mixes a `tool_result` block with a `text`
         // block projects into two consecutive rows sharing the same event.
+        // Doubles as the T2b R1 alignment lock for this shape: `events.len()
+        // == 2` must equal the session's real message count (idx 1 + idx 2)
+        // so `prepare_conversation_for_ingest`'s alignment self-check does
+        // NOT skip judgment for this documented split.
         let dir = tempfile::tempdir().unwrap();
         let line = r#"{"uuid":"ek-shared","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"result"}]},{"type":"text","text":"<fork-boilerplate>..."}]}}"#;
         let path = write_blob(&dir, "s.jsonl", &[line]);
