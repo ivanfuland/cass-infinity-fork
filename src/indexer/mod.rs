@@ -15385,20 +15385,40 @@ fn prepare_conversation_for_ingest(
 /// 前三步（`inject_provenance` / `canonicalize_claude_external_id` /
 /// `apply_workspace_rewrite`）与 ingest 版逐字相同：三者只读 `conv` 自身与封存的 root
 /// 集合，是纯函数。
+/// T2b.3 (B段，control-plane 裁定 2026-09-07)：加 `materialized: &Path` 入参，
+/// **不二次物化** —— 两个调用点（`phase3_restore.rs:2716`/`:2849`）已经用
+/// `scan_materialized_file`/等价路径从这份 `materialized` 解析出了 `conv`，
+/// 这里只需要对同一份字节跑 [`crate::indexer::exclusion::events_from_blob`]
+/// 取结构，再与 ingest 共用 [`judge_reparsed_conversation`]。返回
+/// `PreparedConversation`（不是 `Result`：没有第二次 `connector.scan` 这个可能
+/// 失败的步骤）。占位 record（`consumed_manifest.manifest_relative_path` 为空，
+/// E5 摘要比对子系统的合成 provenance）短路成全 `None`（capture_na 语义），
+/// 不经 events_from_blob/judge —— 空路径喂给它只会产生一个恒不对齐的
+/// `RawEvent` 列表。顺序：provenance → judge → compact → attach（judge 必须
+/// 在 compact 之前，否则 `tool_name`/参数已被压缩白名单丢弃，判定拿不到结构）。
 pub(crate) fn prepare_conversation_for_restore(
     connector_name: &str,
     origin: &Origin,
     workspace_rewrite_root: Option<&ScanRoot>,
     sealed_source_size_bytes: u64,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
-    conv: &mut NormalizedConversation,
-) {
-    inject_provenance(conv, origin);
-    canonicalize_claude_external_id(connector_name, conv);
+    materialized: &Path,
+    mut conv: NormalizedConversation,
+) -> crate::indexer::exclusion::PreparedConversation {
+    inject_provenance(&mut conv, origin);
+    canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
-        apply_workspace_rewrite(conv, root);
+        apply_workspace_rewrite(&mut conv, root);
     }
-    compact_large_connector_extras_for_size(connector_name, conv, Some(sealed_source_size_bytes));
+
+    let excluded = if consumed_manifest.manifest_relative_path.is_empty() {
+        vec![None; conv.messages.len()]
+    } else {
+        let events = crate::indexer::exclusion::events_from_blob(&conv.agent_slug, materialized);
+        judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path)
+    };
+
+    compact_large_connector_extras_for_size(connector_name, &mut conv, Some(sealed_source_size_bytes));
     // §A.1.1 第 3 条是**两句话**：排除 `attach_raw_mirror_capture`（它会 `capture_source_file`
     // 产生文件系统写副作用），**并且**「`metadata.cass.raw_mirror` 由 restore 按被消费的那份
     // manifest 直接填写，字段取值以该 manifest 为准」。只做前半句会让恢复出来的会话查不出
@@ -15406,7 +15426,9 @@ pub(crate) fn prepare_conversation_for_restore(
     //
     // **复用既有的 `attach_raw_mirror_metadata`，不在消费侧重拼那八个键**：那八个键的形状
     // 只能有一处定义，否则基线下次加一个键时两处静默分叉。
-    attach_raw_mirror_metadata(conv, consumed_manifest);
+    attach_raw_mirror_metadata(&mut conv, consumed_manifest);
+
+    crate::indexer::exclusion::PreparedConversation { conv, excluded }
 }
 
 fn capture_connector_sources_before_parse(

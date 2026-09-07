@@ -6804,18 +6804,23 @@ impl FrankenStorage {
         &self,
         conversation_id: i64,
     ) -> Result<Vec<Message>> {
-        let hinted_sql = "SELECT id, idx, role, author, created_at, content \
+        // T2b.3 (B段): 第三条候选 SELECT — 之前两条 SQL 都没有 select `excluded`
+        // 列（不是解码遗漏，是列本身没进查询），下游 lexical rebuild 消费者
+        // 因此永远读不到排除 marker。补 `json(excluded)`，与 `fetch_messages`
+        // 同一解码函数 `franken_decode_excluded_column`。
+        let hinted_sql = "SELECT id, idx, role, author, created_at, content, json(excluded) \
                  FROM messages INDEXED BY sqlite_autoindex_messages_1 \
                  WHERE conversation_id = ?1 ORDER BY idx";
-        let fallback_sql = "SELECT id, idx, role, author, created_at, content \
+        let fallback_sql = "SELECT id, idx, role, author, created_at, content, json(excluded) \
                  FROM messages \
                  WHERE conversation_id = ?1 ORDER BY idx";
 
         self.conn
             .query_all_map(hinted_sql, fparams![conversation_id], |row| {
                 let role: String = row.get_typed(2)?;
+                let excluded_json: Option<String> = row.get_typed(6)?;
                 Ok(Message {
-                    excluded: None,
+                    excluded: franken_decode_excluded_column(excluded_json)?,
                     id: Some(row.get_typed(0)?),
                     idx: row.get_typed(1)?,
                     role: role_from_str(&role),
@@ -6836,8 +6841,9 @@ impl FrankenStorage {
                         fparams![conversation_id],
                         |row| {
                             let role: String = row.get_typed(2)?;
+                            let excluded_json: Option<String> = row.get_typed(6)?;
                             Ok(Message {
-                                excluded: None,
+                                excluded: franken_decode_excluded_column(excluded_json)?,
                                 id: Some(row.get_typed(0)?),
                                 idx: row.get_typed(1)?,
                                 role: role_from_str(&role),
@@ -22510,6 +22516,94 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blob, "blobs/blake3/ab/abcd.raw", "json_extract must work directly against the stored JSONB column");
+    }
+
+    /// T2b.3 (B段, mission #116 授权项⑤): `fetch_messages_for_conversation`
+    /// (the lexical-rebuild message loader) is the third candidate SELECT --
+    /// prior to this fix its SQL didn't even project the `excluded` column
+    /// (two hardcoded `excluded: None` construction sites, not a decode
+    /// omission). Round-trips the same marker shape as the `fetch_messages`
+    /// test above through this second reader. The `.or_else` fallback branch
+    /// (no `sqlite_autoindex_messages_1`) is not independently exercised
+    /// here: SQLite refuses `DROP INDEX` on an index backing a UNIQUE
+    /// constraint (`"index associated with a UNIQUE or PRIMARY KEY
+    /// constraint cannot be dropped"`), so there is no way to force that
+    /// branch short of a second, hand-rolled schema fixture; the fallback
+    /// SQL string is mechanically identical to the hinted one (same column
+    /// list, same decode call) and covered by inspection/compile-check.
+    #[test]
+    fn fetch_messages_for_conversation_round_trips_excluded_marker() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("excluded-lexical-roundtrip.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CodexHostShell,
+            rule_version: 1,
+            bytes: 7,
+            sha256: "c".repeat(64),
+            fingerprint_blake3: "d".repeat(64),
+            anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: Some(crate::indexer::exclusion::ShellAnchor { opener: "<environment_context>".into(), closer: "</environment_context>".into() }) },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/cd/cdef.raw".into(), idx: 0, event_key: "ek-lexical".into(), blocks: vec![0] },
+        };
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("excluded-lexical-roundtrip".into()),
+            title: Some("excluded lexical roundtrip".into()),
+            source_path: PathBuf::from("/tmp/excluded-lexical-roundtrip.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    excluded: Some(marker.clone()),
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: String::new(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: "not excluded".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let conversation_id = inserted.conversation_id;
+
+        let lexical = storage.fetch_messages_for_conversation(conversation_id).unwrap();
+        assert_eq!(lexical.len(), 2);
+        assert_eq!(
+            lexical[0].excluded,
+            Some(marker),
+            "excluded marker must round-trip through fetch_messages_for_conversation's json(excluded) projection"
+        );
+        assert_eq!(lexical[1].excluded, None, "unexcluded row must stay None");
     }
 
     /// franken 6-role normalization contract (task 2.1): `"assistant"` must

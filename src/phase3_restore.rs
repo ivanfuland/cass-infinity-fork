@@ -2406,9 +2406,17 @@ fn materialize_sealed_blob(
 /// `PartialEq`，而「为了下游方便去给冻结的上游加 trait」正是 E4 记档过的那个口子
 /// （消费者的便利不构成动上游的理由）。测试用模式匹配比对，不用 `==`。
 #[derive(Debug, Clone)]
-pub enum SealedProjection {
+// T2b.3 (B段)：`pub` → `pub(crate)`，同 T2b.2 commit A 对 `IndexMessage` 的处理
+// ——`Projected` 的 payload 改成 `pub(crate)` 的 `PreparedConversation` 后，
+// `private_interfaces` 会警告这个变体比它的载荷更公开；grep 全仓确认
+// `SealedProjection`/`project_sealed_source` 只在本模块内消费，无外部依赖。
+pub(crate) enum SealedProjection {
     /// 落在有效定义域内（三家的现代生产 JSONL），投影完成。
-    Projected(Box<NormalizedConversation>),
+    /// T2b.3 (B段)：payload 从 `Box<NormalizedConversation>` 改为
+    /// `Box<PreparedConversation>` 把恢复链的 `excluded` marker 传到底
+    /// （`NormalizedMessage` 本身不能加字段）——`restore_project_plan_item`
+    /// 之外的消费点只读 `.conv`，属机械传播。
+    Projected(Box<crate::indexer::exclusion::PreparedConversation>),
     /// §B.0.1 命中：立即 HOLD 并另立范围。**census 侧仍须枚举它**，这里只管处置。
     Held {
         reason: crate::phase3_bundle::HoldReason,
@@ -2621,6 +2629,10 @@ pub(crate) enum DigestScope {
 fn compact_invariant_message_digest_scoped(
     message: &franken_agent_detection::types::NormalizedMessage,
     scope: DigestScope,
+    // R2-B1（v4.3）："恢复摘要纳入清空前身份"：两份仅排除正文不同的镜像版本必须摘要不等，
+    // 否则恢复器会把它们判成同一版本而 `Skip`。未排除消息传空串（与 marker 未命中时的
+    // 既有摘要行为一致，不引入新分支）。
+    excluded_sha256: &str,
 ) -> CanonicalMessageDigest {
     let mut hasher = blake3::Hasher::new();
     let mut field = |label: &str, bytes: &[u8]| {
@@ -2629,6 +2641,7 @@ fn compact_invariant_message_digest_scoped(
         hasher.update(&(bytes.len() as u64).to_le_bytes());
         hasher.update(bytes);
     };
+    field("excluded_sha256", excluded_sha256.as_bytes());
     field("role", message.role.as_bytes());
     field("author", message.author.as_deref().unwrap_or("").as_bytes());
     field(
@@ -2699,10 +2712,12 @@ impl SealedMessageProjector<'_> {
                 },
             ));
         }
-        let mut conv = conversations.into_iter().next().expect("len checked above");
+        let conv = conversations.into_iter().next().expect("len checked above");
 
         // 与 restore 侧走**同一条**准备链（含 compact 判据取封存值），差异只可能来自实现 bug。
-        // provenance 在比较场景无意义，用一份指向本次被投影版本的最小记录。
+        // provenance 在比较场景无意义，用一份指向本次被投影版本的最小记录 ——
+        // `manifest_relative_path` 恒空，`prepare_conversation_for_restore` 按此短路成
+        // 全 `None`（capture_na 语义），不经 events_from_blob/judge。
         let provenance = crate::raw_mirror::RawMirrorCaptureRecord {
             manifest_id: String::new(),
             manifest_relative_path: String::new(),
@@ -2713,19 +2728,25 @@ impl SealedMessageProjector<'_> {
             source_mtime_ms: None,
             already_present: true,
         };
-        crate::indexer::prepare_conversation_for_restore(
+        let prepared = crate::indexer::prepare_conversation_for_restore(
             connector_name_for(self.agent),
             &franken_agent_detection::types::Origin::local(),
             None,
             self.sealed_source_size_bytes,
             &provenance,
-            &mut conv,
+            &materialized,
+            conv,
         );
 
-        Ok(conv
+        Ok(prepared
+            .conv
             .messages
             .iter()
-            .map(|m| compact_invariant_message_digest_scoped(m, scope))
+            .zip(prepared.excluded.iter())
+            .map(|(m, exc)| {
+                let excluded_sha256 = exc.as_ref().map(|e| e.sha256.as_str()).unwrap_or("");
+                compact_invariant_message_digest_scoped(m, scope, excluded_sha256)
+            })
             .collect())
     }
 }
@@ -2766,7 +2787,7 @@ impl MessageSequenceProjector for CandidateComparableProjector<'_> {
 /// 2. **Desktop sidecar 路径门**——§B.0.1 第一行，判据是路径分量，必须先于 parser；
 /// 3. **whole-file 形态分类**——复用 E2 冻结的分类器，零第二定义；
 /// 4. **JSONL 主路径**：pin parser 扫 → 恰好一个会话 → 跑 restore 侧的 ③。
-pub fn project_sealed_source(
+pub(crate) fn project_sealed_source(
     scratch_root: &Path,
     input: &SealedSource<'_>,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
@@ -2846,16 +2867,17 @@ fn project_from_materialized(
     // 附录 §A.4 与 plan Step 1 都点名「`source_path` 逐条 == manifest `original_path`」。
     conv.source_path = PathBuf::from(input.canonical_original_path);
 
-    crate::indexer::prepare_conversation_for_restore(
+    let prepared = crate::indexer::prepare_conversation_for_restore(
         connector_name_for(input.agent),
         &franken_agent_detection::types::Origin::local(),
         None,
         input.source_size_bytes,
         consumed_manifest,
-        &mut conv,
+        materialized,
+        conv,
     );
 
-    Ok(SealedProjection::Projected(Box::new(conv)))
+    Ok(SealedProjection::Projected(Box::new(prepared)))
 }
 
 #[cfg(test)]
@@ -3560,7 +3582,7 @@ mod e5_materialization_tests {
         );
         match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => {
-                assert_eq!(conv.messages.len(), 2, "两条消息都要在");
+                assert_eq!(conv.conv.messages.len(), 2, "两条消息都要在");
             }
             other => panic!("精确小写 `.jsonl` 是 JSONL 主路径，期望 Projected，实得 {other:?}"),
         }
@@ -3606,7 +3628,7 @@ mod e5_materialization_tests {
         .unwrap();
 
         let (a, b) = match (a, b) {
-            (SealedProjection::Projected(a), SealedProjection::Projected(b)) => (a, b),
+            (SealedProjection::Projected(a), SealedProjection::Projected(b)) => (a.conv, b.conv),
             other => panic!("两侧都该 Projected，实得 {other:?}"),
         };
         assert_eq!(a.source_path, b.source_path);
@@ -3654,7 +3676,7 @@ mod e5_materialization_tests {
                 "先证明 mtime 真的被改了 —— 不然这条测试又是个失效探针"
             );
             match project_from_materialized(&materialized, &input, &test_provenance()).unwrap() {
-                SealedProjection::Projected(conv) => seen.push(conv),
+                SealedProjection::Projected(conv) => seen.push(conv.conv),
                 other => panic!("期望 Projected，实得 {other:?}"),
             }
         }
@@ -3733,6 +3755,7 @@ mod e5_materialization_tests {
         let extras_outside_kept = |proj: SealedProjection| -> usize {
             match proj {
                 SealedProjection::Projected(conv) => conv
+                    .conv
                     .messages
                     .iter()
                     .filter_map(|m| m.extra.as_object())
@@ -3762,6 +3785,7 @@ mod e5_materialization_tests {
         let above = project_from_materialized(&materialized, &big, &test_provenance()).unwrap();
         if let SealedProjection::Projected(conv) = &above {
             let present: std::collections::BTreeSet<&str> = conv
+                .conv
                 .messages
                 .iter()
                 .filter_map(|m| m.extra.as_object())
@@ -3806,7 +3830,7 @@ mod e5_materialization_tests {
             CLAUDE_JSONL,
         );
         let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
-            SealedProjection::Projected(conv) => conv,
+            SealedProjection::Projected(conv) => conv.conv,
             other => panic!("期望 Projected，实得 {other:?}"),
         };
 
@@ -4110,6 +4134,7 @@ mod e5_materialization_tests {
             };
             match project_from_materialized(&m, &below, &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => conv
+                    .conv
                     .messages
                     .iter()
                     .filter_map(|m| m.extra.as_object())
@@ -4171,7 +4196,7 @@ mod e5_materialization_tests {
         let bytes = CLAUDE_ALL_BLOCKS.as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
         match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
-            SealedProjection::Projected(conv) => conv,
+            SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
     }
@@ -4342,7 +4367,7 @@ mod e5_materialization_tests {
         .as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
         let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
-            SealedProjection::Projected(conv) => conv,
+            SealedProjection::Projected(conv) => conv.conv,
             other => panic!("期望 Projected，实得 {other:?}"),
         };
         let roles: Vec<&str> = conv.messages.iter().map(|m| m.role.as_str()).collect();
@@ -4394,7 +4419,7 @@ mod e5_materialization_tests {
             blob: bytes,
         };
         match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
-            SealedProjection::Projected(conv) => conv,
+            SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
     }
@@ -4455,7 +4480,7 @@ mod e5_materialization_tests {
         let bytes = raw.as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
         match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
-            SealedProjection::Projected(conv) => conv,
+            SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
     }
@@ -4716,7 +4741,7 @@ mod e5_materialization_tests {
             blob: bytes,
         };
         match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
-            SealedProjection::Projected(conv) => conv,
+            SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
     }
@@ -4960,7 +4985,7 @@ mod e5_materialization_tests {
             };
             match project_from_materialized(&materialized, &sized, &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => {
-                    conv.messages.iter().map(|m| m.extra.clone()).collect()
+                    conv.conv.messages.iter().map(|m| m.extra.clone()).collect()
                 }
                 other => panic!("期望 Projected，实得 {other:?}"),
             }
@@ -5462,7 +5487,7 @@ mod e5_p30_blob_read_tests {
                 blob: &blob,
             };
             let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
-                Ok(SealedProjection::Projected(conv)) => *conv,
+                Ok(SealedProjection::Projected(conv)) => conv.conv,
                 other => panic!("封存投影未产出会话：{other:?}"),
             };
 
@@ -5600,7 +5625,7 @@ mod e5_p30_blob_read_tests {
         };
         match project_sealed_source(scratch, &sealed, &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
-                crate::indexer::persist::map_to_internal(&conv)
+                crate::indexer::persist::map_to_internal(&conv.conv)
             }
             other => panic!("live 文件的投影未产出会话：{other:?}"),
         }
@@ -8365,8 +8390,10 @@ fn restore_project_plan_item(
         blob: &blob,
     };
     match project_sealed_source(&journal.scratch_dir, &sealed, &provenance) {
-        Ok(SealedProjection::Projected(conv)) => {
-            Ok(crate::indexer::persist::map_to_internal(&conv))
+        Ok(SealedProjection::Projected(prepared)) => {
+            // T2b.3 (B段)：恢复链的落库端点，`excluded` marker 必须传到底
+            // ——不许再经 `map_to_internal` 的 all-None 包装（会把 marker 吞掉）。
+            Ok(crate::indexer::persist::map_to_internal_with_redactor(&prepared, None))
         }
         Ok(other) => anyhow::bail!("sealed projection produced no conversation: {other:?}"),
         Err(err) => anyhow::bail!("sealed projection failed: {err:?}"),
@@ -10602,7 +10629,7 @@ mod e7_restore_journal_tests {
         };
         match project_sealed_source(scratch, &sealed, &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
-                crate::indexer::persist::map_to_internal(&conv)
+                crate::indexer::persist::map_to_internal(&conv.conv)
             }
             other => panic!("封存投影未产出会话：{other:?}"),
         }
@@ -13492,9 +13519,12 @@ fn candidate_versions_from_db(
         let digests: Vec<CanonicalMessageDigest> = messages
             .iter()
             .map(|m| {
+                let excluded_sha256 =
+                    m.excluded.as_ref().map(|e| e.sha256.as_str()).unwrap_or("");
                 compact_invariant_message_digest_scoped(
                     &normalized_from_db_message(m),
                     DigestScope::CandidateComparable,
+                    excluded_sha256,
                 )
             })
             .collect();
@@ -14400,7 +14430,7 @@ mod e8_dry_run_planner_tests {
         };
         match project_sealed_source(scratch, &sealed, &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
-                crate::indexer::persist::map_to_internal(&conv)
+                crate::indexer::persist::map_to_internal(&conv.conv)
             }
             other => panic!("投影未产出会话：{other:?}"),
         }
@@ -14476,6 +14506,7 @@ mod e8_dry_run_planner_tests {
         // **存在型断言先数可满足元素**：没有这一条，下面两条断言可能是在一个
         // 「根本没有 invocation」的样本上空转。
         let with_invocations = projected
+            .conv
             .messages
             .iter()
             .filter(|m| !m.invocations.is_empty())
@@ -14485,15 +14516,24 @@ mod e8_dry_run_planner_tests {
             "fixture 必须至少有一条带 invocation 的消息，否则两个 scope 恒等、本用例空转"
         );
 
+        // T2b.3 (B段)：`projected.excluded` 与 DB 侧必须同源 ——
+        // 下面用 `map_to_internal_with_redactor` 而不是 `map_to_internal` 写库，
+        // 否则 marker 在 DB 侧被吞成全 None，projection 侧却可能真有排除命中，
+        // 让 ① 的逐条相等断言看运气（取决于 fixture 是否恰好不碰任何锚点）。
         let projection_side = |scope| -> Vec<CanonicalMessageDigest> {
             projected
+                .conv
                 .messages
                 .iter()
-                .map(|m| compact_invariant_message_digest_scoped(m, scope))
+                .zip(projected.excluded.iter())
+                .map(|(m, exc)| {
+                    let excluded_sha256 = exc.as_ref().map(|e| e.sha256.as_str()).unwrap_or("");
+                    compact_invariant_message_digest_scoped(m, scope, excluded_sha256)
+                })
                 .collect()
         };
 
-        let internal = crate::indexer::persist::map_to_internal(&projected);
+        let internal = crate::indexer::persist::map_to_internal_with_redactor(&projected, None);
         let db_path = data_dir.join("closure.sqlite");
         let storage = crate::storage::sqlite::FrankenStorage::open(&db_path).unwrap();
         let agent_id = storage
@@ -14532,9 +14572,12 @@ mod e8_dry_run_planner_tests {
             messages
                 .iter()
                 .map(|m| {
+                    let excluded_sha256 =
+                        m.excluded.as_ref().map(|e| e.sha256.as_str()).unwrap_or("");
                     compact_invariant_message_digest_scoped(
                         &normalized_from_db_message(m),
                         DigestScope::Projection,
+                        excluded_sha256,
                     )
                 })
                 .collect()
