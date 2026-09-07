@@ -7117,7 +7117,7 @@ fn spawn_connector_producer(
                 if should_skip_subagent_source(&conversation.source_path) {
                     return Ok(());
                 }
-                let source_kind = CaptureSourceKind::File(conversation.source_path.clone());
+                let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
                 match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
                     Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
@@ -7226,7 +7226,7 @@ fn spawn_connector_producer(
                 if should_skip_subagent_source(&conversation.source_path) {
                     return Ok(());
                 }
-                let source_kind = CaptureSourceKind::File(conversation.source_path.clone());
+                let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
                 let prepared =
                     prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conversation);
 
@@ -8121,7 +8121,7 @@ fn run_batch_index_with_connector_factories(
                                 )
                             });
                             for conv in local_convs {
-                                let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+                                let source_kind = capture_source_kind_for(name, conv.source_path.clone());
                                 match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conv) {
                                     Ok(prepared) => convs.push(prepared),
                                     Err(error) => {
@@ -8183,7 +8183,7 @@ fn run_batch_index_with_connector_factories(
                                     )
                                 });
                                 for conv in remote_convs {
-                                    let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+                                    let source_kind = capture_source_kind_for(name, conv.source_path.clone());
                                     match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conv) {
                                         Ok(prepared) => convs.push(prepared),
                                         Err(error) => {
@@ -14165,7 +14165,7 @@ fn reindex_paths_with_semantic_delta(
         let mut prepared_convs: Vec<crate::indexer::exclusion::PreparedConversation> =
             Vec::with_capacity(convs.len());
         for conv in convs {
-            let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+            let source_kind = capture_source_kind_for(kind.slug(), conv.source_path.clone());
             match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
                 Ok(prepared) => prepared_convs.push(prepared),
                 Err(error) => {
@@ -15361,6 +15361,53 @@ pub(crate) enum CaptureSourceKind {
     Logical,
 }
 
+/// R1-N6 (任务书 #118a): connector slugs whose `source_path` is not a real
+/// filesystem path at all (a DB-derived key, a synthetic id, etc.) -- their
+/// sessions must be classified `CaptureSourceKind::Logical`, not `File`. The
+/// upstream `Connector` trait (`franken_agent_detection`, a pinned external
+/// dependency) cannot be given a new method from this repo, so this is the
+/// fallback the mission anticipated: a static table keyed by `connector_name`,
+/// consulted at every capture-source-classifying call site instead. Confirmed
+/// via the pinned dependency (`opencode.rs:522`): `OpenCodeConnector` builds
+/// `source_path` as `db_path.join(session_id)`, which is never a readable
+/// file on its own.
+const LOGICAL_SOURCE_CONNECTORS: &[&str] = &["opencode"];
+
+fn capture_source_kind_for(connector_name: &str, source_path: std::path::PathBuf) -> CaptureSourceKind {
+    if LOGICAL_SOURCE_CONNECTORS.contains(&connector_name) {
+        CaptureSourceKind::Logical
+    } else {
+        CaptureSourceKind::File(source_path)
+    }
+}
+
+#[cfg(test)]
+mod capture_source_kind_for_tests {
+    use super::*;
+
+    /// R1-N6 (任务书 #118a) positive: a connector on the logical-source
+    /// table must classify Logical regardless of what its `source_path`
+    /// looks like.
+    #[test]
+    fn opencode_is_classified_logical() {
+        let kind = capture_source_kind_for("opencode", std::path::PathBuf::from("/data/opencode.db/session-abc"));
+        assert!(matches!(kind, CaptureSourceKind::Logical), "opencode must be Logical, not File");
+    }
+
+    /// Mutation for the above: reverting to the pre-fix unconditional
+    /// `CaptureSourceKind::File(source_path)` (no table lookup at all)
+    /// would make this assert fail -- confirmed by inspection, the pre-fix
+    /// code had no branch that could ever produce `Logical` in production.
+    #[test]
+    fn claude_code_stays_file_with_its_own_path() {
+        let path = std::path::PathBuf::from("/home/u/.claude/projects/x/session.jsonl");
+        match capture_source_kind_for("claude_code", path.clone()) {
+            CaptureSourceKind::File(p) => assert_eq!(p, path),
+            CaptureSourceKind::Logical => panic!("claude_code must stay File, not Logical"),
+        }
+    }
+}
+
 /// PR6 T2b: session-wide R4 pairing candidates, derived directly from the
 /// reparsed connector's own `role`/`invocations`/`extra.tool_call_id`
 /// (already connector-normalized, uncompacted at this point in the
@@ -15618,6 +15665,15 @@ fn prepare_conversation_for_ingest(
 
         conv = reparsed;
         excluded = markers;
+        // R1-N4 (任务书 #118a): `attach_raw_mirror_capture` above put
+        // `record` on the FIRST parse's `conv.metadata` -- the `conv =
+        // reparsed` reassignment just above discards that object wholesale
+        // (reparsed is a fresh scan of the scratch file, never attached).
+        // Without this, `record_persisted_raw_mirror_db_link` finds no
+        // `metadata.cass.raw_mirror` on the conversation that actually gets
+        // persisted and early-returns, leaving the manifest's `db_links`
+        // stale for every normal (non-restore) ingest.
+        attach_raw_mirror_metadata(&mut conv, record);
 
         if excluded.iter().any(Option::is_some) {
             invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync);
@@ -33306,6 +33362,45 @@ mod tests {
         assert_eq!(
             prepared.conv.messages[0].content, original_content,
             "Logical sources must not be touched by redaction/exclusion"
+        );
+    }
+
+    /// R1-N4 (任务书 #118a): `attach_raw_mirror_capture` attaches `record`
+    /// to the FIRST parse's `conv.metadata`; the reparse step's `conv =
+    /// reparsed` then discards that object entirely by replacing it with a
+    /// fresh scan of the scratch file that was never attached. Without
+    /// re-attaching after reparse, the persisted conversation's
+    /// `metadata.cass.raw_mirror` is missing and
+    /// `record_persisted_raw_mirror_db_link` early-returns, leaving the
+    /// manifest's `db_links` stale for every normal (non-restore) ingest.
+    #[test]
+    fn prepare_conversation_for_ingest_reattaches_raw_mirror_metadata_after_reparse() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118a-n4.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("n4-fixture"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert!(
+            prepared.conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes").is_some(),
+            "raw_mirror metadata must survive the `conv = reparsed` reassignment: {:?}",
+            prepared.conv.metadata
         );
     }
 

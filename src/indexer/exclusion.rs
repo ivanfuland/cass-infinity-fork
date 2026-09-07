@@ -322,12 +322,21 @@ fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEven
                 }
                 let event = RawEvent { event_key, blocks };
 
+                // N14 (任务书 #118a): index by each block's own `.index`
+                // field, not by zipping `event.blocks` positionally against
+                // `content` -- `blocks` already dropped unrecognized
+                // elements (the `_ => continue` above), so a leading skipped
+                // block (e.g. `[image, text]`) shifts every later block's
+                // Vec position out of sync with its `content` position; a
+                // straight positional zip would then pair the surviving
+                // `text` block descriptor with the WRONG `content` element
+                // and silently fail to find its `text` field.
                 let prose: String = event
                     .blocks
                     .iter()
-                    .zip(content.iter())
-                    .filter(|(b, _)| b.kind == BlockKind::Text)
-                    .filter_map(|(_, block)| block.get("text").and_then(|v| v.as_str()))
+                    .filter(|b| b.kind == BlockKind::Text)
+                    .filter_map(|b| content.get(b.index as usize))
+                    .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !prose.trim().is_empty() {
@@ -392,8 +401,18 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
         let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
 
         let text_nonempty = |key: &str| payload.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
-        let content_array_nonempty = || {
-            payload.get("content").or_else(|| payload.get("output")).and_then(|v| v.as_array()).is_some_and(|arr| !arr.is_empty())
+        // R1-B2/N1 (任务书 #118a): mirrors the real connector's
+        // `flatten_content` (pin `codex.rs:773`), which accepts a bare
+        // non-empty STRING `payload.content`/`payload.output` (not just an
+        // array), and for an array form drops blocks with no non-empty
+        // `text` before deciding whether anything survived -- an array of
+        // only empty-text blocks produces zero real messages, not one.
+        let content_nonempty = || match payload.get("content").or_else(|| payload.get("output")) {
+            Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+            Some(serde_json::Value::Array(arr)) => {
+                arr.iter().any(|block| block.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty()))
+            }
+            _ => false,
         };
 
         let blocks: Option<Vec<RawBlock>> = match entry_type {
@@ -402,13 +421,13 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
                 match payload_type {
                     Some("message") | None => {
                         let role = payload.get("role").and_then(|v| v.as_str());
-                        if matches!(role, Some("user" | "assistant")) && content_array_nonempty() {
+                        if matches!(role, Some("user" | "assistant")) && content_nonempty() {
                             Some(vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
                         } else {
                             None
                         }
                     }
-                    Some("agent_message") => content_array_nonempty()
+                    Some("agent_message") => content_nonempty()
                         .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
                     Some("reasoning") => (payload.get("summary").and_then(|v| v.as_array()).is_some_and(|arr| !arr.is_empty())
                         || payload.get("encrypted_content").is_some())
@@ -1234,6 +1253,26 @@ mod tests {
         assert_eq!(events[0].event_key, "line:1", "missing top-level uuid falls back to 1-based line number");
     }
 
+    /// N14 (任务书 #118a): a leading unrecognized block (`image`, which
+    /// `split_content_blocks` drops entirely -- no `BlockKind` matches it)
+    /// must not shift the surviving `text` block's position out of sync
+    /// with its own `content[]` index. Pre-fix, `event.blocks.iter().zip
+    /// (content.iter())` paired `blocks[0]` (the text block, `.index == 1`)
+    /// against `content[0]` (the image block) and silently found no
+    /// `.text` field, producing zero prose for an event that plainly has
+    /// prose.
+    #[test]
+    fn events_from_blob_claude_code_leading_unrecognized_block_does_not_misalign_prose_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"assistant","uuid":"ek-img-text","message":{"role":"assistant","content":[{"type":"image","source":{"data":"..."}},{"type":"text","text":"the actual prose"}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("claude_code", &path);
+        assert_eq!(events.len(), 1, "the surviving text block must still produce a prose event, not silently zero");
+        assert_eq!(events[0].blocks.len(), 1, "only the text block survives split_content_blocks; the image block is dropped");
+        assert_eq!(events[0].blocks[0].index, 1, "the surviving block keeps its ORIGINAL content[] index");
+        assert_eq!(events[0].blocks[0].kind, BlockKind::Text);
+    }
+
     #[test]
     fn events_from_blob_codex_function_call_and_output_pairing_positive() {
         let dir = tempfile::tempdir().unwrap();
@@ -1262,6 +1301,36 @@ mod tests {
         assert_eq!(events[0].blocks.len(), 1, "R6: payload.output/content 整体记单块索引 0");
         assert_eq!(events[0].blocks[0].kind, BlockKind::Text);
         assert_eq!(events[0].blocks[0].index, 0);
+    }
+
+    /// R1-B2 (任务书 #118a), review反例①: the real connector accepts a bare
+    /// non-empty STRING `payload.content`/`payload.output`, not just an
+    /// array -- the pre-fix `content_array_nonempty` (`.and_then(|v|
+    /// v.as_array())`) returned `None`/`false` for a string, silently
+    /// dropping this event and misaligning every event after it against the
+    /// real connector's message count.
+    #[test]
+    fn events_from_blob_codex_string_form_payload_content_counts_as_one_event_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"response_item","payload":{"type":"message","id":"msg_str","role":"user","content":"a bare string host-shell body"}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("codex", &path);
+        assert_eq!(events.len(), 1, "a non-empty STRING payload.content must still produce one event");
+        assert_eq!(events[0].event_key, "msg_str");
+    }
+
+    /// R1-B2 (任务书 #118a), review反例②: an array whose only element has no
+    /// non-empty `text` produces ZERO real messages (the real connector
+    /// drops empty text blocks before deciding), not one -- the pre-fix
+    /// `content_array_nonempty` only checked `!arr.is_empty()`, so this
+    /// shape wrongly counted as an event.
+    #[test]
+    fn events_from_blob_codex_array_of_only_empty_text_blocks_produces_zero_events_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"response_item","payload":{"type":"message","id":"msg_empty","role":"user","content":[{"type":"input_text","text":""}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("codex", &path);
+        assert!(events.is_empty(), "an array of only empty-text blocks must produce zero events, matching the real connector dropping them");
     }
 
     #[test]
