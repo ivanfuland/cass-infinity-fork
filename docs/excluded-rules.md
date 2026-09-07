@@ -117,15 +117,17 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 - `codex_host_shell`：`anchor.shell = {"opener": "…", "closer": "</environment_context>"}`，`src = null`。
 - 字段缺一不得写入。
 
-## R7 · 连接器正文字段映射（初稿，仅 claude_code / codex 两族；其余「待 T1b 盘点」）
+## R7 · 连接器正文字段映射（T1b Step 3 回填并冻结）
 
 落地形态是**代码内常量表**（`src/indexer/exclusion.rs` 的 `EXTRA_FIELD_MAP: &[(&str /*agent_slug*/, &[&str /*路径*/])]`，T2 范围），**不是配置文件**——spec 只把 R2 的路径清单点名为「配置」这一项（修复批边界令）。路径写法是小 DSL：段用 `.` 分隔、数组通配 `[*]`。
 
 | 连接器 | 承载正文的 JSON 路径 |
 |---|---|
-| `claude_code` | `message.content[*].content`、`message.content[*].text`、`toolUseResult.file.content`；`historical_raw_json` 封装（`sqlite.rs:2046`）内的同名路径同样替换（先解包字符串内 JSON，按同表路径替换，再序列化写回） |
-| `codex` | `payload.output`、`content[*].text` |
-| 其它连接器 | 待 T1b 盘点（T1b 收尾按结构探针覆盖率回填并冻结，无 `tool_name` 的连接器标「锚点 1/2 不启用」，宁漏勿误） |
+| `claude_code` | `message.content[*].content`、`message.content[*].text`、`toolUseResult.file.content`；`historical_raw_json` 封装（`sqlite.rs:2046`）内的同名路径同样替换（先解包字符串内 JSON，按同表路径替换，再序列化写回）。另有 `message.content[*].thinking`（`thinking` 块，独立成 `role='reasoning'` 行）与顶层 `content`（`type=system,subtype=away_summary` 事件，独立成 `role='assistant'` 行）——两者是 T1b 探针为对齐 DB `(idx,role)` 序列而发现的正文承载点，供 T2 参考，不在 spec 原始四类锚点范围内，本身不参与排除判定 |
+| `codex` | `payload.output[*].text`（`function_call_output`/`custom_tool_call_output`）、`payload.content[*].text`（`message`）、`payload.arguments`/`payload.input`（tool_call 参数，`function_call`/`custom_tool_call`） |
+| 其它连接器（`gemini`、`openclaw/*` 各分身、`pi_agent`） | **锚点 1/2 不启用**：T1b 探针本轮未实现这些连接器的候选解析器（零覆盖率数据，`t1b-probe-report.md` §⑦ 对应行 `镜像可得=0`），无法确认其 `tool_name`/路径参数结构，按「宁漏勿误」不启用，非「已核实无结构」 |
+
+**T1b 探针实测覆盖率**（`copy/` 全量 5,046 会话，见 `t1b-probe-report.md` §⑦）：`claude_code` 2,400 会话 / 98,030 条 tool_call 候选，100% 有 `tool_call_id`+`tool_name`，90.3% 有 path 类参数；`codex` 1,688 会话 / 28,678 条 tool_call 候选，100% 有 `call_id`+`name`，64.3% 有 path 类参数。
 
 处理顺序以 **R5** 为准：判定 → redactor → hash（不是「先压缩再判定」）。
 
@@ -149,14 +151,15 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 
 正文项：排除行取 `excluded.fingerprint_blake3`（清空前、脱敏后正文的 BLAKE3 hex）；未排除行取 `blake3(content)`（现状算法字节级不变，**不是** `content_hash_hex` 的 SHA-256）。保证行数不变、tool_call ↔ tool_result 配对不断（含既有会话增量合并路径）。
 
-## R11 · 连接器工具身份别名表（初稿，仅 claude_code / codex 两族；其余「待 T1b 盘点」）
+## R11 · 连接器工具身份别名表（T1b Step 3 回填并冻结）
 
 每连接器列出 `Read` / `mcp__ccw-control-plane__project_read` / `Bash` 在其 `tool_name` 字段中出现的**完整身份**，只匹配表内全名（不匹配裸名/别名）。
 
 | 连接器 | `Read` | `project_read` | `Bash` |
 |---|---|---|---|
 | `claude_code` | `Read` | `mcp__ccw-control-plane__project_read`（冻结副本 1,586 次调用用此全名，裸名 `project_read` 0 次出现） | `Bash` |
-| `codex` | 待 T1b 盘点 | 待 T1b 盘点 | 待 T1b 盘点 |
+| `codex` | **无独立 Read 工具**（不启用该分支；读操作全部经 `exec_command` shell 执行） | `mcp__ccw-control-plane__project_read`（MCP 代理工具保留注册全名，与 claude_code 相同） | `exec_command`（**参数键名是 `cmd`，不是 `command`**——T1b 探针实测 codex tool_name 频次分布 `exec_command` 1,081/1,341 次 tool_call 中最高频，两个数量级领先于第二名 `write_stdin`；R2 只读子集判定对 `cmd` 字段值做同样的两步语法判定） |
+| 其它连接器（`gemini`、`openclaw/*` 各分身、`pi_agent`） | 待盘点（同 R7：零覆盖率数据，不启用） | 同左 | 同左 |
 | 其它连接器 | 待 T1b 盘点 | 待 T1b 盘点 | 待 T1b 盘点 |
 
 ## R12 · 锁保证边界
