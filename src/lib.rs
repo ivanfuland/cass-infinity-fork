@@ -17987,6 +17987,16 @@ struct StateDbSnapshot {
     /// regular-file metadata alone in that case; callers needing the actual
     /// open-success signal use `cass diag` / `cass doctor`.
     open_skipped: bool,
+    /// T2b.3 (B段, mission #116⑥): `last_index.*` meta keys -- same cheap
+    /// single-row-per-key reads as `last_scan_ts`/`last_indexed_at` above,
+    /// so read unconditionally (not gated on `include_counts`). `None`
+    /// when the key was never written (no run has completed since PR6
+    /// landed, or every run since has failed and left the prior value in
+    /// place -- indistinguishable from "never written" without a separate
+    /// existence marker, and `cass status --json` surfaces both as null).
+    codex_host_shell_hits: Option<u64>,
+    codex_idx0_user_total: Option<u64>,
+    event_align_failed: Option<u64>,
 }
 
 fn probe_state_db(
@@ -18066,6 +18076,30 @@ fn probe_state_db_modes(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
+    snapshot.codex_host_shell_hits = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.codex_host_shell_hits'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.codex_idx0_user_total = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.codex_idx0_user_total'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.event_align_failed = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.event_align_failed'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -18766,6 +18800,9 @@ fn state_meta_json_inner(
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
+    let codex_host_shell_hits = db_snapshot.codex_host_shell_hits;
+    let codex_idx0_user_total = db_snapshot.codex_idx0_user_total;
+    let event_align_failed = db_snapshot.event_align_failed;
 
     let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
@@ -19044,6 +19081,15 @@ fn state_meta_json_inner(
     };
 
     serde_json::json!({
+        // T2b.3 (B段, mission #116⑥): `last_index.*` meta three keys --
+        // null when the key was never written (no run has landed the
+        // meta-write since PR6, or the most recent run failed and left the
+        // prior value, indistinguishable from "never written" here).
+        "last_index": {
+            "codex_host_shell_hits": codex_host_shell_hits,
+            "codex_idx0_user_total": codex_idx0_user_total,
+            "event_align_failed": event_align_failed,
+        },
         "index": {
             "exists": lexical.exists,
             "status": lexical.status,

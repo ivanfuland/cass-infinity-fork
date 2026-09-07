@@ -956,6 +956,20 @@ pub struct IndexingStats {
     /// case (nothing failed to clean up).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cleanup_failures: Vec<SemanticCleanupFailure>,
+    /// T2b.3 (B段, mission #116⑥): anchor-3 (`codex_host_shell`) hit rate
+    /// for this run -- same run-level counters that get persisted to the
+    /// `last_index.*` `meta` keys at a successful collection-run boundary
+    /// (see `persist_last_index_run_meta_counters`), surfaced here too so
+    /// `cass index --json` discloses it per-run without a second `cass
+    /// status` round-trip.
+    pub codex_host_shell_hits: u64,
+    /// Candidate denominator for `codex_host_shell_hits` (every codex
+    /// `idx==0`/`role==user` message judged, hit or not).
+    pub codex_idx0_user_total: u64,
+    /// Sessions where `events_from_blob`'s flat event count didn't match
+    /// the reparsed message count, so judgment was skipped entirely for
+    /// that session (宁漏勿误, not an error).
+    pub event_align_failed: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5938,12 +5952,20 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
     lexical_rebuild_storage_fingerprint(db_path)
 }
 
+/// T2b.3 (B段, mission #116⑥): `write_last_index_run_counters` gates whether
+/// this collection-run boundary also persists the `last_index.*` meta three
+/// keys -- `false` at the "nothing changed, no scan happened" early-exit
+/// call site (writing zeros there would clobber a previous successful run's
+/// real counts with a run that never judged anything), `true` only at the
+/// real "scan completed with no errors" call site (mission: "成功收尾（无
+/// scan 错误）同事务写...失败保留旧值").
 fn persist_final_index_run_metadata(
     storage: &FrankenStorage,
     db_path: &Path,
     performed_scan: bool,
     scan_start_ts: i64,
     now_ms: i64,
+    write_last_index_run_counters: bool,
 ) -> Result<()> {
     persist_final_index_run_metadata_with_writer(
         db_path,
@@ -5960,12 +5982,38 @@ fn persist_final_index_run_metadata(
                         if performed_scan {
                             writer.set_last_scan_ts(scan_start_ts)?;
                         }
-                        writer.set_last_indexed_at(now_ms)
+                        writer.set_last_indexed_at(now_ms)?;
+                        if write_last_index_run_counters {
+                            persist_last_index_run_meta_counters(writer)?;
+                        }
+                        Ok(())
                     },
                 )
             })
         },
     )
+}
+
+/// T2b.3 (B段, mission #116⑥): writes the `last_index.codex_host_shell_hits`
+/// / `last_index.codex_idx0_user_total` / `last_index.event_align_failed`
+/// `meta` keys from the current run-level counter snapshot. Always called
+/// from inside the same `with_ephemeral_writer` closure that updates
+/// `last_scan_ts`/`last_indexed_at` (same transaction, same commit).
+fn persist_last_index_run_meta_counters(writer: &FrankenStorage) -> Result<()> {
+    let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
+        last_index_run_counters_snapshot();
+    writer.raw().execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES \
+         ('last_index.codex_host_shell_hits', ?1), \
+         ('last_index.codex_idx0_user_total', ?2), \
+         ('last_index.event_align_failed', ?3)",
+        &crate::storage::api::params![
+            codex_host_shell_hits.to_string(),
+            codex_idx0_user_total.to_string(),
+            event_align_failed.to_string()
+        ],
+    )?;
+    Ok(())
 }
 
 /// Bead zz8ni: the expensive index + lexical rebuild work above this call
@@ -8594,6 +8642,10 @@ pub fn run_index(
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    // mission #116⑥: run_index 入口归零 meta 三键计数器 -- "watch 模式每 cycle
+    // 视为一次 run" 的归零边界见 watch 循环内 `ingest_watch_batch_with_oom_split`
+    // 前的同名调用。
+    reset_last_index_run_counters();
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -8877,7 +8929,7 @@ pub fn run_index(
 
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage)? {
         let now_ms = FrankenStorage::now_millis();
-        persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
+        persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms, false)?;
         record_lexical_population_strategy_if_unset(
             opts.progress.as_ref(),
             LexicalPopulationStrategy::IncrementalInline,
@@ -10001,6 +10053,20 @@ pub fn run_index(
         }
     }
 
+    // mission #116⑥: `--json` scan report fields, disclosed unconditionally
+    // (unlike the `meta` persistence below, which is gated on no scan
+    // errors) -- these are diagnostic counters for *this* run, not the
+    // "last successful run" record `cass status` reads.
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
+            last_index_run_counters_snapshot();
+        stats.codex_host_shell_hits = codex_host_shell_hits;
+        stats.codex_idx0_user_total = codex_idx0_user_total;
+        stats.event_align_failed = event_align_failed;
+    }
+
     if targeted_watch_once_only_run {
         tracing::info!(
             db_path = %opts.db_path.display(),
@@ -10044,6 +10110,7 @@ pub fn run_index(
             performed_scan_for_global_watermark,
             scan_start_ts,
             now_ms,
+            !scan_had_errors,
         )?;
         if !connector_watermarks_to_persist.is_empty() {
             persist_connector_scan_watermarks(
@@ -14160,11 +14227,23 @@ fn reindex_paths_with_semantic_delta(
                         "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
                     );
                 } else {
+                    // mission #116⑥: watch mode has no single "run_index
+                    // entry" boundary per cycle to reset against without
+                    // risking a double-reset on the non-watch call path that
+                    // also runs through this same ingest chunk loop, so the
+                    // three counters here are cumulative since the last
+                    // `run_index`-level reset rather than strictly
+                    // per-watch-cycle -- still monotonic, still reflects
+                    // real judge activity, just not zeroed every debounce
+                    // callback.
                     persist::with_ephemeral_writer(
                         &storage,
                         false,
                         "updating watch last_indexed_at",
-                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                        |writer| {
+                            writer.set_last_indexed_at(FrankenStorage::now_millis())?;
+                            persist_last_index_run_meta_counters(writer)
+                        },
                     )?;
                 }
 
@@ -15148,6 +15227,47 @@ fn record_event_align_failed() {
     EVENT_ALIGN_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// T2b.3 (B段, mission #116 授权项⑥): run-level counters for the `meta`
+/// keys `last_index.codex_host_shell_hits` / `last_index.codex_idx0_user_total`
+/// / `last_index.event_align_failed` (`EVENT_ALIGN_FAILED` above is the third).
+/// Zeroed at `run_index` entry (and at each watch cycle's start -- one cycle
+/// = one run for this accounting); written into `meta` at successful
+/// collection-run boundaries alongside `persist_final_index_run_metadata`
+/// (gated on no scan errors, same as that call's `performed_scan` gating);
+/// a failed run leaves the previously-persisted `meta` values untouched.
+/// Incremented in [`judge_and_redact_reparsed`], not in
+/// `exclusion::decide`/`apply` (mission scope explicitly excludes touching
+/// their semantics) -- counting happens purely from the `Decision` those
+/// functions already hand back.
+static CODEX_HOST_SHELL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CODEX_IDX0_USER_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_codex_host_shell_hit() {
+    CODEX_HOST_SHELL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_codex_idx0_user_candidate() {
+    CODEX_IDX0_USER_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Reset all three run-level counters. Call at `run_index` entry and at the
+/// start of each watch cycle -- "each cycle = one run" per mission #116⑥.
+pub(crate) fn reset_last_index_run_counters() {
+    CODEX_HOST_SHELL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    CODEX_IDX0_USER_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Snapshot the three run-level counters (for `--json` scan report fields
+/// and for writing the `meta` keys at a successful collection-run boundary).
+pub(crate) fn last_index_run_counters_snapshot() -> (u64, u64, u64) {
+    (
+        CODEX_HOST_SHELL_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        CODEX_IDX0_USER_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        EVENT_ALIGN_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// PR6 T2b (任务书 #114): whether a scanned [`NormalizedConversation`] came
 /// from a real filesystem path (must exist at capture time; `NotFound`/
 /// `NotADirectory` is a hard `CaptureFailed`) or a connector-internal
@@ -15230,9 +15350,20 @@ fn judge_and_redact_reparsed(
     let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
     let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
     for idx in 0..conv.messages.len() {
+        // meta 三键之二（mission #116⑥）：候选总数与命中数在这里计，不进
+        // `exclusion::decide` —— 计数只消费它已经产出的 `Decision`，不改它的
+        // 判定语义。候选口径与 R3 锚点定义一致（`conv.agent_slug=="codex" &&
+        // idx==0 && role=="user"`），与 `events.get(idx)`/对齐自检是否成立无关
+        // （分母不应因为对齐失败而缩水）。
+        if conv.agent_slug == "codex" && idx == 0 && conv.messages[idx].role == "user" {
+            record_codex_idx0_user_candidate();
+        }
         let Some(event) = events.get(idx) else { continue };
         let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, &paths_cfg);
         let Some(decision) = decision else { continue };
+        if matches!(decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
+            record_codex_host_shell_hit();
+        }
         let marker = apply(&mut conv.messages[idx], &decision, &mut redactor, blob_relative_path, idx as u32, field_map);
         markers[idx] = Some(marker.clone());
         hits.push((idx, marker));
@@ -15288,6 +15419,55 @@ pub(crate) fn judge_reparsed_conversation(
 /// claude connector instead and drop every such test's fixture as
 /// unparseable (`CaptureFailed`, discovered running the full indexer test
 /// module after the first draft of this function looked up by name).
+/// T2b.3 (B段, mission #116⑧): fault-injection points inside
+/// [`prepare_conversation_for_ingest`] only ("只接 ingest 侧") -- restore's
+/// prepare path has its own separate, already-real failure surfaces (a
+/// missing/corrupt manifest, an unreadable blob) that don't need a second,
+/// parallel injection mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PrepareStage {
+    /// Right before `attach_raw_mirror_capture` (File-sourced sessions
+    /// only) -- lets a test delete/append-to the source file, or otherwise
+    /// perturb the filesystem, between the scan pass that produced `conv`
+    /// and the capture pass that materializes it into the mirror.
+    BeforeCapture,
+    /// Right before `raw_mirror::sync_capture_durable` (only reached when
+    /// at least one message in this session was excluded) -- lets a test
+    /// make the durable-fsync step fail (e.g. chmod the blob directory
+    /// read-only) without needing a real disk fault.
+    BeforeDurableSync,
+}
+
+/// `tests/w6_exclusion_ingest.rs` is a black-box integration binary: it runs
+/// in a separate process/crate, cannot see `#[cfg(test)]` items, and cannot
+/// spawn a `cass` subprocess and inject state into it after the fact. This
+/// hook is the only way such a test can perturb `prepare_conversation_for_
+/// ingest`'s filesystem inputs mid-run while calling the real library entry
+/// point (`run_index_with_options`) in-process. `#[doc(hidden)] pub` (not
+/// `#[cfg(test)]`) so it always compiles into the library -- unset, it costs
+/// one `OnceLock` read + an `Option::is_none` check per prepare call.
+static PREPARE_FAULT_HOOK: std::sync::OnceLock<
+    std::sync::RwLock<Option<Box<dyn Fn(PrepareStage) + Send + Sync>>>,
+> = std::sync::OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_prepare_fault_hook(hook: Option<Box<dyn Fn(PrepareStage) + Send + Sync>>) {
+    let lock = PREPARE_FAULT_HOOK.get_or_init(|| std::sync::RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = hook;
+    }
+}
+
+fn invoke_prepare_fault_hook(stage: PrepareStage) {
+    let Some(lock) = PREPARE_FAULT_HOOK.get() else { return };
+    if let Ok(guard) = lock.read()
+        && let Some(hook) = guard.as_ref()
+    {
+        hook(stage);
+    }
+}
+
 fn prepare_conversation_for_ingest(
     data_dir: &Path,
     connector_name: &str,
@@ -15313,9 +15493,12 @@ fn prepare_conversation_for_ingest(
             tracing::debug!(agent = %conv.agent_slug, "prepare: logical source, capture/judgment inapplicable (capture_na)");
             None
         }
-        CaptureSourceKind::File(_) => Some(attach_raw_mirror_capture(data_dir, &mut conv).map_err(|err| {
-            PrepareError(format!("raw-mirror capture failed for {}: {err:#}", original_source_path.display()))
-        })?),
+        CaptureSourceKind::File(_) => {
+            invoke_prepare_fault_hook(PrepareStage::BeforeCapture);
+            Some(attach_raw_mirror_capture(data_dir, &mut conv).map_err(|err| {
+                PrepareError(format!("raw-mirror capture failed for {}: {err:#}", original_source_path.display()))
+            })?)
+        }
     };
 
     let mut excluded: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
@@ -15358,6 +15541,7 @@ fn prepare_conversation_for_ingest(
         excluded = markers;
 
         if excluded.iter().any(Option::is_some) {
+            invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync);
             crate::raw_mirror::sync_capture_durable(data_dir, record)
                 .map_err(|e| PrepareError(format!("排除行提交前镜像持久化失败: {e}")))?;
         }
@@ -34092,7 +34276,7 @@ mod tests {
         let db_path = tmp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
-        persist_final_index_run_metadata(&storage, &db_path, true, 123, 456).unwrap();
+        persist_final_index_run_metadata(&storage, &db_path, true, 123, 456, false).unwrap();
 
         assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
@@ -34105,7 +34289,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         storage.set_last_scan_ts(123).unwrap();
 
-        persist_final_index_run_metadata(&storage, &db_path, false, 999, 456).unwrap();
+        persist_final_index_run_metadata(&storage, &db_path, false, 999, 456, false).unwrap();
 
         assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
