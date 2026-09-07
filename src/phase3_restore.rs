@@ -6290,6 +6290,7 @@ mod e6_replace_commit_tests {
 
     fn message(idx: i64, role: MessageRole, content: &str) -> Message {
         Message {
+            excluded: None,
             id: None,
             idx,
             role,
@@ -8701,7 +8702,7 @@ mod w3_4_step2_4_db_vector_domain_invalidation_tests {
             ended_at: Some(TS + 60_000),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(TS), content: "already embedded".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            messages: vec![Message { excluded: None, id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(TS), content: "already embedded".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
             source_id: "local".into(),
             origin_host: None,
         };
@@ -11195,6 +11196,7 @@ mod e7_restore_journal_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,

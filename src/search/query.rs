@@ -7129,6 +7129,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: json!({"fixture": "semantic_search"}),
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -8827,6 +8828,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -8891,6 +8893,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -8971,6 +8974,7 @@ mod tests {
                 approx_tokens: Some(42),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -9114,6 +9118,7 @@ mod tests {
                     approx_tokens: Some(16),
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -9233,6 +9238,7 @@ mod tests {
                     approx_tokens: Some(16),
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -9298,6 +9304,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -9370,6 +9377,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -9396,6 +9404,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -9479,6 +9488,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -9570,6 +9580,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -9597,6 +9608,7 @@ mod tests {
                 approx_tokens: Some(16),
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -11836,6 +11848,7 @@ mod tests {
                 approx_tokens: Some(8),
                 metadata_json: json!({}),
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -16533,6 +16546,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,

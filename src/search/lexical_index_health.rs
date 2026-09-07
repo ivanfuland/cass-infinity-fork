@@ -302,6 +302,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,

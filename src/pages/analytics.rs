@@ -1109,6 +1109,7 @@ mod tests {
                 messages: msg_rows
                     .into_iter()
                     .map(|(idx, role, content, created_at)| Message {
+                        excluded: None,
                         id: None,
                         idx,
                         role: role_from_str(&role),

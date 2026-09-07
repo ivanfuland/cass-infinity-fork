@@ -1136,7 +1136,7 @@ mod tests {
             ended_at: Some(0),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            messages: vec![Message { excluded: None, id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
             source_id: "local".into(),
             origin_host: None,
         };

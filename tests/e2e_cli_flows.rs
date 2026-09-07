@@ -90,6 +90,7 @@ fn pack_agent(slug: &str, name: &str) -> Agent {
 
 fn pack_message(idx: i64, role: MessageRole, created_at: i64, content: &str) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role,

@@ -437,6 +437,7 @@ mod tests {
                 origin_host: None,
             },
             messages: vec![Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,

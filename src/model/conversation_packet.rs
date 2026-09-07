@@ -825,6 +825,7 @@ mod tests {
             origin_host: None,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: Some(100),
                     idx: 0,
                     role: MessageRole::User,
@@ -842,6 +843,7 @@ mod tests {
                     }],
                 },
                 Message {
+                    excluded: None,
                     id: Some(101),
                     idx: 1,
                     // Post-fix, an ingested "assistant" turn is stored (and
@@ -900,6 +902,7 @@ mod tests {
         let mut canonical = canonical_conversation();
         canonical.messages[0].content = format!("build {} packet", "\u{2603}");
         canonical.messages.push(Message {
+            excluded: None,
             id: Some(102),
             idx: 2,
             role: MessageRole::System,

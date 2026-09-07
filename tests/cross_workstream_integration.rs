@@ -1749,6 +1749,7 @@ fn inline_analytics_badges_match_detail_modal_metrics() {
     // Seed cached detail analytics with matching totals.
     let messages = vec![
         Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: MessageRole::User,
@@ -1759,6 +1760,7 @@ fn inline_analytics_badges_match_detail_modal_metrics() {
             snippets: Vec::new(),
         },
         Message {
+            excluded: None,
             id: None,
             idx: 1,
             role: MessageRole::Agent,

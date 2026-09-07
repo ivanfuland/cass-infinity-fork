@@ -57,6 +57,7 @@ fn conv(external_id: &str, messages: Vec<Message>) -> Conversation {
 
 fn msg(idx: i64, content: &str) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role: MessageRole::User,

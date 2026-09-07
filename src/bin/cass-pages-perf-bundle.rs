@@ -226,6 +226,7 @@ fn generate_db(
             };
             let content = format!("conv={} msg={} {}", conv_idx, msg_idx, filler);
             let msg = Message {
+                excluded: None,
                 id: None,
                 idx: msg_idx as i64,
                 role,

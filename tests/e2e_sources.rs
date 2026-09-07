@@ -66,6 +66,7 @@ fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
         metadata_json: serde_json::Value::Null,
         messages: vec![
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -76,6 +77,7 @@ fn seed_archive_conversation(db_path: &Path, agent_slug: &str, marker: &str) {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 1,
                 role: MessageRole::Agent,

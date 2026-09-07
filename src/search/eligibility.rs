@@ -327,6 +327,7 @@ mod tests {
                     break;
                 }
                 messages.push(Message {
+                    excluded: None,
                     id: None,
                     idx: messages.len() as i64,
                     role: MessageRole::User,

@@ -1925,6 +1925,7 @@ mod chunk_catchup_v5_tests {
             .iter()
             .enumerate()
             .map(|(idx, content)| Message {
+                excluded: None,
                 id: None,
                 idx: idx as i64,
                 role: MessageRole::User,
@@ -3270,6 +3271,7 @@ mod chunk_catchup_v5_tests {
                 approx_tokens: None,
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,

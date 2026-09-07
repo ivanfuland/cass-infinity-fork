@@ -138,6 +138,7 @@ fn search_hit(
 
 fn message(idx: i64, role: MessageRole, content: &str, snippets: Vec<Snippet>) -> Message {
     Message {
+        excluded: None,
         id: Some(idx + 1),
         idx,
         role,

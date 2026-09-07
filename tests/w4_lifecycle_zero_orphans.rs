@@ -58,6 +58,7 @@ fn ensure_test_agent(storage: &FrankenStorage) -> i64 {
 
 fn message(idx: i64, role: MessageRole, content: impl Into<String>, created_at: i64) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role,

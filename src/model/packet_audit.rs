@@ -368,6 +368,7 @@ mod tests {
             origin_host: None,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: Some(70),
                     idx: 0,
                     role: MessageRole::User,
@@ -385,6 +386,7 @@ mod tests {
                     }],
                 },
                 Message {
+                    excluded: None,
                     id: Some(71),
                     idx: 1,
                     // Post-fix, an ingested "assistant" turn is stored (and
@@ -431,6 +433,7 @@ mod tests {
 
         let mut canonical_data = canonical_conversation();
         canonical_data.messages.push(Message {
+            excluded: None,
             id: Some(72),
             idx: 2,
             role: MessageRole::Tool,

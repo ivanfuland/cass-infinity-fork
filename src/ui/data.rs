@@ -1305,6 +1305,7 @@ mod tests {
                 origin_host: None,
             },
             messages: vec![Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,
@@ -1711,6 +1712,7 @@ mod tests {
                 origin_host: Some("user@laptop".to_string()),
             },
             messages: vec![Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,
@@ -1768,6 +1770,7 @@ mod tests {
                 origin_host: None,
             },
             messages: vec![Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,
@@ -1825,6 +1828,7 @@ mod tests {
                 origin_host: None,
             },
             messages: vec![Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,
@@ -1882,6 +1886,7 @@ mod tests {
                 origin_host: None,
             },
             messages: vec![Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,

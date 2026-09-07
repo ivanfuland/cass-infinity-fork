@@ -140,6 +140,7 @@ fn sample_agent(slug: &str, name: &str) -> Agent {
 
 fn sample_message(idx: i64, role: MessageRole, ts: i64, content: &str) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role,

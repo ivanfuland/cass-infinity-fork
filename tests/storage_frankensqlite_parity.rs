@@ -56,6 +56,7 @@ fn make_conversation(
 
 fn make_message(idx: i64, role: MessageRole, content: &str) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role,
@@ -69,6 +70,7 @@ fn make_message(idx: i64, role: MessageRole, content: &str) -> Message {
 
 fn make_message_with_snippet(idx: i64, content: &str, snippet_text: &str) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role: MessageRole::Agent,
@@ -663,6 +665,7 @@ fn parity_null_handling() {
         approx_tokens: None,
         metadata_json: json!(null),
         messages: vec![Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: MessageRole::User,
