@@ -15488,9 +15488,9 @@ impl SearchService for TantivySearchService {
                     )
                     .map_err(|e| e.to_string()),
                 SearchMode::Semantic => {
-                    let hits = self
+                    let (hits, candidate_meta) = self
                         .client
-                        .search_semantic(&params.query, params.filters.clone(), limit, offset, field_mask)
+                        .search_semantic_with_meta(&params.query, params.filters.clone(), limit, offset, field_mask)
                         .map_err(|e| e.to_string())?;
                     Ok(crate::search::query::SearchResult {
                         hits,
@@ -15498,6 +15498,8 @@ impl SearchService for TantivySearchService {
                         cache_stats: crate::search::query::CacheStats::default(),
                         suggestions: Vec::new(),
                         total_count: None,
+                        candidates: Some(candidate_meta),
+                        semantic_degraded: false,
                     })
                 }
                 SearchMode::Hybrid => self
@@ -26865,6 +26867,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 agent: "codex".into(),
@@ -26883,6 +26889,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 agent: "claude_code".into(),
@@ -26901,6 +26911,10 @@ mod tests {
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
         let _ = app.update(CassMsg::SearchCompleted {
@@ -28080,6 +28094,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         for mode in [
             DensityMode::Compact,
@@ -28139,6 +28157,10 @@ mod tests {
                     origin_kind: "local".into(),
                     origin_host: None,
                     conversation_id: None,
+                    message_id: None,
+                    winning_chunk_idx: None,
+                    winning_chunk_span: None,
+                    winning_chunk_hash: None,
                 },
                 SearchHit {
                     title: "B".into(),
@@ -28157,6 +28179,10 @@ mod tests {
                     origin_kind: "local".into(),
                     origin_host: None,
                     conversation_id: None,
+                    message_id: None,
+                    winning_chunk_idx: None,
+                    winning_chunk_span: None,
+                    winning_chunk_hash: None,
                 },
                 SearchHit {
                     title: "C".into(),
@@ -28175,6 +28201,10 @@ mod tests {
                     origin_kind: "local".into(),
                     origin_host: None,
                     conversation_id: None,
+                    message_id: None,
+                    winning_chunk_idx: None,
+                    winning_chunk_span: None,
+                    winning_chunk_hash: None,
                 },
             ],
             selected: 0,
@@ -28230,6 +28260,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }];
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
@@ -28265,6 +28299,10 @@ mod tests {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let queued_item = ResultItem {
             index: 1,
@@ -31900,6 +31938,10 @@ not jsonl",
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }
     }
 
@@ -35284,6 +35326,10 @@ not jsonl",
             source_id: "local".into(),
             origin_kind: "local".into(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }
     }
 
@@ -35307,6 +35353,10 @@ not jsonl",
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Search ranking tuning notes".into(),
@@ -35325,6 +35375,10 @@ not jsonl",
                 origin_kind: "ssh".into(),
                 origin_host: Some("workstation-west".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Theme audit and contrast findings".into(),
@@ -35343,6 +35397,10 @@ not jsonl",
                 origin_kind: "remote".into(),
                 origin_host: Some("runner-17".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Multi-agent coordination transcript".into(),
@@ -35361,6 +35419,10 @@ not jsonl",
                 origin_kind: "ssh".into(),
                 origin_host: Some("laptop-east".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Large-snippet rendering edge case".into(),
@@ -35379,6 +35441,10 @@ not jsonl",
                 origin_kind: "remote".into(),
                 origin_host: Some("ci-linux".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "JSON payload decode failure".into(),
@@ -35397,6 +35463,10 @@ not jsonl",
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Legacy migration checklist".into(),
@@ -35415,6 +35485,10 @@ not jsonl",
                 origin_kind: "remote".into(),
                 origin_host: Some("docs-host".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "Background telemetry heartbeat".into(),
@@ -35433,6 +35507,10 @@ not jsonl",
                 origin_kind: "service".into(),
                 origin_host: Some("daemon-1".into()),
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ]
     }
@@ -39045,6 +39123,10 @@ not jsonl",
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "second".into(),
@@ -39063,6 +39145,10 @@ not jsonl",
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
             SearchHit {
                 title: "other".into(),
@@ -39081,6 +39167,10 @@ not jsonl",
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             },
         ];
         app.panes.push(AgentPane {
@@ -42603,6 +42693,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         }];
         app.panes = vec![AgentPane {
             agent: "test".into(),
@@ -47377,6 +47471,10 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 origin_kind: "local".into(),
                 origin_host: None,
                 conversation_id: None,
+                message_id: None,
+                winning_chunk_idx: None,
+                winning_chunk_span: None,
+                winning_chunk_hash: None,
             })
             .collect();
         app.panes.push(AgentPane {

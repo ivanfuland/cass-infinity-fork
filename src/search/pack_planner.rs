@@ -2541,6 +2541,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let candidate = PackCandidate::from_search_hit(&hit, 1, 0);

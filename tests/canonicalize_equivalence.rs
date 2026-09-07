@@ -11,7 +11,7 @@
 //! or verify determinism within a single mode.
 
 use coding_agent_search::search::canonicalize::{
-    MAX_EMBED_CHARS, canonicalize_for_embedding, content_hash, content_hash_hex,
+    canonicalize_for_embedding, content_hash, content_hash_hex,
 };
 use proptest::prelude::*;
 
@@ -101,14 +101,18 @@ proptest! {
     }
 
     #[test]
-    fn proptest_truncation_bound(input in ".{0,10000}") {
+    fn proptest_no_truncation_bound(input in ".{0,10000}") {
+        // v2: the ingest path no longer truncates -- output length is
+        // bounded only by the input's own length (whitespace collapsing
+        // can only shrink, never grow, so canonical <= input char count).
+        let input_char_count = input.chars().count();
         let canonical = canonicalize_for_embedding(&input);
         let char_count = canonical.chars().count();
         prop_assert!(
-            char_count <= MAX_EMBED_CHARS,
-            "Output exceeded MAX_EMBED_CHARS: {} > {}",
+            char_count <= input_char_count,
+            "Output grew beyond input length: {} > {}",
             char_count,
-            MAX_EMBED_CHARS
+            input_char_count
         );
     }
 
@@ -150,7 +154,8 @@ proptest! {
     }
 
     #[test]
-    fn proptest_links_text_preserved(link_text in "[a-zA-Z]{3,20}", url in "https?://[a-z]{5,15}\\.com") {
+    fn proptest_links_text_and_url_preserved(link_text in "[a-zA-Z]{3,20}", url in "https?://[a-z]{5,15}\\.com") {
+        // v2: both link text AND URL are kept (v1 dropped the URL).
         let input = format!("See [{link_text}]({url}) for details.");
         let canonical = canonicalize_for_embedding(&input);
         prop_assert!(
@@ -160,8 +165,8 @@ proptest! {
             canonical
         );
         prop_assert!(
-            !canonical.contains(&url),
-            "URL '{}' should be removed from: {}",
+            canonical.contains(&url),
+            "URL '{}' should be kept in: {}",
             url,
             canonical
         );
@@ -224,17 +229,23 @@ fn test_edge_single_character() {
 
 #[test]
 fn test_edge_only_code_blocks() {
-    let inputs = vec![
-        "```\ncode\n```",
-        "```rust\nfn main() {}\n```",
-        "```python\nprint('hi')\n```\n\n```js\nconsole.log('bye')\n```",
+    // v2: no "[code: lang]" label (that was tied to the removed collapse
+    // formatter) -- fence lines are dropped and the code content itself is
+    // kept verbatim.
+    let cases = vec![
+        ("```\ncode\n```", "code"),
+        ("```rust\nfn main() {}\n```", "fn main()"),
+        (
+            "```python\nprint('hi')\n```\n\n```js\nconsole.log('bye')\n```",
+            "print('hi')",
+        ),
     ];
 
-    for input in inputs {
+    for (input, expect_contains) in cases {
         let canonical = canonicalize_for_embedding(input);
         assert!(
-            canonical.contains("[code"),
-            "Code block input should produce [code] marker: input={:?}, output={}",
+            canonical.contains(expect_contains) && !canonical.contains("```"),
+            "Code block content should survive verbatim, fence markers dropped: input={:?}, output={}",
             input,
             canonical
         );
@@ -246,9 +257,10 @@ fn test_edge_unclosed_code_block() {
     let input = "```python\nprint('hello')\nprint('world')";
     let canonical = canonicalize_for_embedding(input);
 
-    // Should handle unclosed code block gracefully
+    // v2: unclosed fence still streams its content verbatim (no special
+    // flush step needed -- each code line is emitted as it's seen).
     assert!(
-        canonical.contains("[code: python]") || canonical.contains("print"),
+        canonical.contains("print('hello')") && canonical.contains("print('world')"),
         "Unclosed code block not handled: {}",
         canonical
     );
@@ -357,26 +369,27 @@ fn test_edge_emoji() {
 
 #[test]
 fn test_edge_very_long_input() {
-    // Input significantly longer than MAX_EMBED_CHARS
-    let long_input = "a".repeat(MAX_EMBED_CHARS * 3);
+    // v2: no truncation. An input well past the old 2000-char cap (v1's
+    // MAX_EMBED_CHARS) must survive at full length.
+    let long_input = "a".repeat(6000);
     let canonical = canonicalize_for_embedding(&long_input);
 
-    assert!(
-        canonical.chars().count() <= MAX_EMBED_CHARS,
-        "Long input not truncated: {} chars",
+    assert_eq!(
+        canonical.chars().count(),
+        6000,
+        "v2 must not truncate long input: got {} chars",
         canonical.chars().count()
     );
 }
 
 #[test]
-fn test_edge_exactly_max_chars() {
-    let exact_input = "x".repeat(MAX_EMBED_CHARS);
+fn test_edge_length_at_old_cap_boundary() {
+    // v2: input exactly at the old 2000-char cap must survive unchanged --
+    // there is no cap to bump against any more.
+    let exact_input = "x".repeat(2000);
     let canonical = canonicalize_for_embedding(&exact_input);
 
-    assert!(
-        canonical.chars().count() <= MAX_EMBED_CHARS,
-        "Exact-length input exceeded limit"
-    );
+    assert_eq!(canonical.chars().count(), 2000, "old-cap-length input altered");
 }
 
 #[test]
@@ -429,44 +442,42 @@ fn test_edge_low_signal_not_substring() {
 }
 
 #[test]
-fn test_edge_code_block_exactly_boundary() {
-    // Code block with exactly CODE_HEAD_LINES + CODE_TAIL_LINES (should not collapse)
-    use coding_agent_search::search::canonicalize::{CODE_HEAD_LINES, CODE_TAIL_LINES};
-
-    let total_lines = CODE_HEAD_LINES + CODE_TAIL_LINES;
+fn test_edge_code_block_at_old_boundary_not_collapsed() {
+    // v1 collapsed a fenced block once it exceeded CODE_HEAD_LINES(20) +
+    // CODE_TAIL_LINES(10) = 30 lines. v2 has no such boundary at all -- a
+    // block at exactly that old threshold must keep every line.
+    let total_lines = 30;
     let lines: Vec<String> = (0..total_lines).map(|i| format!("line {i}")).collect();
     let code = format!("```rust\n{}\n```", lines.join("\n"));
 
     let canonical = canonicalize_for_embedding(&code);
 
-    // Should NOT contain "lines omitted" since it's exactly at boundary
     assert!(
         !canonical.contains("lines omitted"),
-        "Boundary-length code block should not be collapsed"
+        "v2 must never collapse code blocks"
     );
-
-    // All lines should be present
     assert!(canonical.contains("line 0"));
     assert!(canonical.contains(&format!("line {}", total_lines - 1)));
 }
 
 #[test]
-fn test_edge_code_block_one_over_boundary() {
-    // Code block with one more than boundary (should collapse)
-    use coding_agent_search::search::canonicalize::{CODE_HEAD_LINES, CODE_TAIL_LINES};
-
-    let total_lines = CODE_HEAD_LINES + CODE_TAIL_LINES + 1;
+fn test_edge_code_block_past_old_boundary_still_not_collapsed() {
+    // v2: a block well past the old 30-line collapse threshold must still
+    // keep every line, including the middle ones the old head/tail
+    // collapse would have omitted.
+    let total_lines = 31;
     let lines: Vec<String> = (0..total_lines).map(|i| format!("line {i}")).collect();
     let code = format!("```rust\n{}\n```", lines.join("\n"));
 
     let canonical = canonicalize_for_embedding(&code);
 
-    // Should contain "lines omitted" since it's over boundary
     assert!(
-        canonical.contains("lines omitted") || canonical.contains("1 lines omitted"),
-        "Over-boundary code block should be collapsed: {}",
+        !canonical.contains("lines omitted"),
+        "v2 must never collapse code blocks: {}",
         canonical
     );
+    assert!(canonical.contains("line 25"), "middle line must survive");
+    assert!(canonical.contains(&format!("line {}", total_lines - 1)));
 }
 
 #[test]
@@ -634,9 +645,9 @@ See [PR #123](https://github.com/example/repo/pull/123) for details.
     // Should handle code block
     assert!(canonical.contains("[code: rust]") || canonical.contains("is_expired"));
 
-    // Link text should be preserved, URL removed
+    // v2: link text AND URL are both preserved (v1 dropped the URL).
     assert!(canonical.contains("PR #123") || canonical.contains("PR"));
-    assert!(!canonical.contains("https://"));
+    assert!(canonical.contains("https://"));
 
     // Should be deterministic
     let canonical2 = canonicalize_for_embedding(log_entry);

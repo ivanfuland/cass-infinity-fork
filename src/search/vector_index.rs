@@ -8,7 +8,7 @@
 //! still needed to read `.fsvi`, and hash being the "always-on" fallback
 //! embedder) both no longer hold: W3-2 itself was cancelled, and the hash
 //! embedder's own write path was retired in 4064e8fc. The DB-vector-domain
-//! (`message_embeddings` + sqlite-vec) engine is the sole vector search
+//! (`message_chunks` + sqlite-vec) engine is the sole vector search
 //! path now. This module keeps the still-live cass-specific helpers (doc_id
 //! encoding, role codes, portable-SIMD dot product) in one place.
 
@@ -163,11 +163,29 @@ pub fn parse_semantic_doc_id(doc_id: &str) -> Option<SemanticDocId> {
     Some(parsed)
 }
 
-/// Collapsed semantic search hit (best chunk per message).
+/// Collapsed semantic search hit (best chunk per message) -- T9 (plan
+/// v5.1): the sole carrier of winning-chunk provenance from the
+/// chunk-domain KNN candidate search all the way through to `SearchHit`'s
+/// `winning_chunk_idx`/`winning_chunk_span`/`winning_chunk_hash` fields.
+/// `chunk_idx` widened `u8` -> `u32` (T9, control-plane 2026-09-04
+/// ruling): a message's chunk count is not bounded by 255 (volume-stats.
+/// json's real corpus has messages with 900+ chunks), so `u8` would
+/// silently truncate/wrap the winning chunk's real index. Deliberately one
+/// struct, not a struct plus a side `HashMap<message_id, provenance>`
+/// keyed lookup carried in parallel -- two data paths for the same fact
+/// is exactly the "field exists, nothing keeps it populated" drift shape
+/// T8's own hand-off flagged (control-plane 2026-09-04 ruling).
 #[derive(Debug, Clone)]
 pub struct VectorSearchResult {
     pub message_id: u64,
-    pub chunk_idx: u8,
+    pub chunk_idx: u32,
+    /// `(byte_start, byte_end)` of the winning chunk in the message's
+    /// normalized text. `None` only for callers that never had chunk-level
+    /// data to begin with (pre-chunk-domain construction sites); every
+    /// live chunk-domain KNN result carries `Some`.
+    pub chunk_span: Option<(usize, usize)>,
+    /// `content_hash` of the winning chunk (`message_chunks.content_hash`).
+    pub chunk_hash: Option<String>,
     pub score: f32,
 }
 

@@ -994,7 +994,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps(
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
     let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+        storage.fetch_messages_for_conversations_batch(&conversation_ids)?;
     let CheckpointCappedSelection {
         conversations,
         last_conversation_id,
@@ -1155,7 +1155,7 @@ where
 
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
     let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+        storage.fetch_messages_for_conversations_batch(conversation_ids)?;
     Ok(
         packet_embedding_inputs_from_materialized_canonical_messages(
             &conversations,
@@ -2101,7 +2101,12 @@ mod tests {
         // implementation are all byte-preserving. If you intentionally
         // changed any of those, update this value AND record the reason
         // in the commit message.
-        const EXPECTED: &str = "22d9ae7076925a4b70a194b0f519dfb1d465cc757368c296ef24055a02038c2c";
+        //
+        // Re-captured 2026-09-04 (plan v5.1 T5.5): T1's canonicalize v2
+        // change intentionally shifted the digest (control-plane bisection
+        // confirmed T1/T3/T5 all reproduce this same new value, so it is
+        // stable, not still-drifting).
+        const EXPECTED: &str = "dcbe640f1f4d6084955e027c2a9432b7fa218ab58612773f457b33715f050865";
         assert_eq!(
             digest, EXPECTED,
             "embed_messages golden digest drifted; if this was intentional, \
@@ -3452,7 +3457,7 @@ mod tests {
         )?;
         let envelopes = fetch_canonical_embedding_conversations(&storage, &conversation_ids)?;
         let mut grouped_messages =
-            storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+            storage.fetch_messages_for_conversations_batch(&conversation_ids)?;
         let mut packets: Vec<ConversationPacket> = Vec::with_capacity(envelopes.len());
         let mut contexts: Vec<SemanticPacketContext> = Vec::with_capacity(envelopes.len());
         for envelope in &envelopes {

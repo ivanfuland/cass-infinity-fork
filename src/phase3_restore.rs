@@ -6046,7 +6046,16 @@ pub(crate) fn commit_replace_in_tx(
     // workspace 落定)之后调用——早于此处会用旧值同步（W2-0 remeasure 报告曾误
     // 记「该 UPDATE 由 franken_replace_conversation_messages_in_tx 调用」，实为
     // 本函数按步骤9独立调用，两者是同一编排下的兄弟步骤而非调用关系，已订正）。
-    crate::storage::sqlite::sync_lexical_domain_for_conversation_in_tx(tx, input.conversation_id)?;
+    //
+    // T5 (plan v5.1): 拆两类。② 消息内容变化——步骤2-7整体 replace 掉了旧消息、
+    // 插入了新消息集（`replaced.inserted_message_ids`），对新集合做消息级同步。
+    // ② 会话 envelope 变化——步骤9刚把 title/workspace 落定，对该会话现有全部
+    // lex_docs 行重投影四列（content 不动，此处不重复同步内容）。旧消息行随
+    // `messages.id ... ON DELETE CASCADE` 物理删除时，其 `lex_docs` 行按同一
+    // 外键级联清除；`fts_lex` 侧无需在此额外处理——message 级同步只需覆盖
+    // 「当前会话最终应该有哪些行」，与旧版整会话重算达到同一末态。
+    crate::storage::sqlite::sync_lexical_docs_for_messages_in_tx(tx, &replaced.inserted_message_ids)?;
+    crate::storage::sqlite::resync_lexical_envelope_for_conversation_in_tx(tx, input.conversation_id)?;
 
     // 10 · 推进 generation
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
@@ -7476,6 +7485,102 @@ mod e6_replace_commit_tests {
              用另一套分桶公式的表，被重算路径顺手重写就等于让它被两套公式各写一遍"
         );
     }
+
+    /// T5 (plan v5.1) Step 1: `commit_replace_in_tx` must dispatch BOTH
+    /// lexical sync categories in one call -- message content changed
+    /// (steps 2-7 wholesale-replace the message set) -> message-level sync
+    /// on the new set; envelope changed (step 9's title/workspace update)
+    /// -> envelope-level resync on every resulting row. Needs `pub(crate)`
+    /// access to `commit_replace_in_tx` itself, so this lives here (inline,
+    /// same module as `e6_replace_writes_back_the_recomputed_external_id`)
+    /// rather than in the external `tests/w4_lexical_incremental.rs` file --
+    /// a deviation from the plan's single-file Files listing, documented in
+    /// the T5 terminal report.
+    #[test]
+    fn lexical_replace_path_dispatches_message_and_envelope() {
+        let dir = TempDir::new().unwrap();
+        let (storage, agent_id) = open(&dir);
+        let workspace_old = storage.ensure_workspace(std::path::Path::new("/tmp/replace-ws-old"), None).unwrap();
+        let workspace_new = storage.ensure_workspace(std::path::Path::new("/tmp/replace-ws-new"), None).unwrap();
+
+        let original = conversation_titled(
+            "oldtitletermxyz replace fixture",
+            vec![
+                message(0, MessageRole::User, "replaceAoriginaltermxyz body"),
+                message(1, MessageRole::Assistant, "replaceBoriginaltermxyz body"),
+            ],
+        );
+        storage
+            .insert_conversations_batched(&[(agent_id, Some(workspace_old), &original)])
+            .unwrap();
+        let conv_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                &[ParamValue::from(EXTERNAL_ID)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+
+        let replaced_conv = conversation_titled(
+            "newtitletermxyz replace fixture",
+            vec![message(0, MessageRole::User, "replaceCnewtermxyz body")],
+        );
+
+        let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+        let replaced = {
+            let tx = storage.raw().transaction().unwrap();
+            let outcome = commit_replace_in_tx(
+                &tx,
+                &ReplaceCommitInput {
+                    conversation_id: conv_id,
+                    agent_id,
+                    workspace_id: Some(workspace_new),
+                    conv: &replaced_conv,
+                    identity: &identity(),
+                    snapshot_root: "lexical-replace-root",
+                    generation: "lexical-replace-gen",
+                },
+                &pricing,
+                TS,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            outcome
+        };
+        assert_eq!(replaced.inserted_message_ids.len(), 1, "the replacement set has exactly one message");
+
+        let match_count = |term: &str| -> i64 {
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM fts_lex WHERE fts_lex MATCH ?1", &[ParamValue::from(term)], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap()
+        };
+        // Message-level dispatch: old messages' terms gone (their lex_docs
+        // rows were cascade-deleted with the old messages), new message's
+        // term indexed.
+        assert_eq!(match_count("replaceAoriginaltermxyz"), 0, "old message A's term must not survive the replace");
+        assert_eq!(match_count("replaceBoriginaltermxyz"), 0, "old message B's term must not survive the replace");
+        assert_eq!(match_count("replaceCnewtermxyz"), 1, "the new message's term must be indexed");
+
+        // Envelope-level dispatch: the surviving row's projection columns
+        // reflect the new title/workspace.
+        let new_doc_id = replaced.inserted_message_ids[0];
+        let (title, workspace): (String, String) = storage
+            .raw()
+            .query_row_map(
+                "SELECT title, workspace FROM lex_docs WHERE doc_id = ?1",
+                &[ParamValue::from(new_doc_id)],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "newtitletermxyz replace fixture");
+        assert_eq!(workspace, "/tmp/replace-ws-new");
+        assert_eq!(match_count("newtitletermxyz"), 1, "the new title term must be recallable via fts_lex");
+        assert_eq!(match_count("oldtitletermxyz"), 0, "the old title term must not survive the replace");
+    }
 }
 
 // ===========================================================================
@@ -8470,20 +8575,19 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
     Ok(())
 }
 
-/// DB 向量域侧的显式作废（W3-4 Step2-4，task book #62）。上面两段 fsvi 侧的
-/// 作废在 W3-3..W3-5 共存期间原样保留；这里补的是 exec50 点名的唯一真生产
-/// 自愈路径缺的那一半。第 1 格（db-committed）真正写候选库内容的生产入口
-/// （`franken_replace_conversation_messages_in_tx`/`insert_conversation_tree`）
-/// 已经在同一事务里做过一次"新 doc_id 登记洞账 + 代际就绪失效"（W3-3 Step3
-/// 布线,`register_embedding_hole_for_new_message_in_tx`/
+/// DB 向量域侧的显式作废（W3-4 Step2-4，task book #62；T11 收窄为纯 v5
+/// chunk 域）。上面两段 fsvi 侧的作废在 W3-3..W3-5 共存期间原样保留；这里补
+/// 的是 exec50 点名的唯一真生产自愈路径缺的那一半。第 1 格（db-committed）
+/// 真正写候选库内容的生产入口（`franken_replace_conversation_messages_in_tx`/
+/// `insert_conversation_tree`）已经在同一事务里做过一次"新 doc_id 登记洞账 +
+/// 代际就绪失效"（`register_chunk_holes_for_message_in_tx`/
 /// `demote_active_generation_readiness_in_tx`）——但那是深埋在写路径里的
 /// 副作用,第 3 格自己的"作废"语义不该只靠隐式继承它托底。这里显式再跑一遍
 /// 资格链重扫 + 洞账补种 + 就绪失效,让 DB 向量域的作废是这一格自己站得住
-/// 的动作。全部复用既有生产原语（`scan_eligible_message_ids`/
-/// `seed_embedding_holes`/`demote_active_generation_readiness_in_tx`）,
-/// 零第二定义；`seed_embedding_holes` 本身 `INSERT OR IGNORE` +
-/// `NOT EXISTS`，`demote_active_generation_readiness_in_tx` 本身
-/// no-op-safe,整体重跑幂等。
+/// 的动作。全部复用既有生产原语（`for_each_expected_chunk`/
+/// `register_chunk_holes_for_message_in_tx`/
+/// `demote_active_generation_readiness_in_tx`）,零第二定义；两者都是
+/// `INSERT OR IGNORE`/no-op-safe,整体重跑幂等。
 #[cfg(feature = "infinity")]
 fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Result<()> {
     let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
@@ -8502,22 +8606,32 @@ fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Resu
         return Ok(());
     }
 
-    let eligible_ids = crate::indexer::db_vector_catchup::scan_eligible_message_ids(&storage).map_err(|e| {
-        anyhow::anyhow!("re-scanning semantic eligibility for db-vector-domain invalidation: {e}")
-    })?;
+    // Stream every live message's expected v5 chunks -- restore
+    // invalidation must re-seed `chunk_holes` for the chunk domain
+    // (`message_chunks`/`chunk_holes`), the sole vector domain since T11.
+    // `for_each_expected_chunk` pages through `messages` (bounded per-page
+    // memory at the source, T3), so only its lightweight `ExpectedChunk`
+    // output is accumulated here, outside the write transaction below.
+    let mut expected_chunks: Vec<crate::search::eligibility::ExpectedChunk> = Vec::new();
+    crate::search::eligibility::for_each_expected_chunk(&storage, 500, |chunk| {
+        expected_chunks.push(chunk);
+        Ok(())
+    })
+    .map_err(|e| anyhow::anyhow!("streaming expected chunks for db-vector-domain invalidation: {e}"))?;
+
     let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
     storage
         .raw()
         .with_tx(crate::storage::api::TxMode::Immediate, |tx| {
-            let generation_id: i64 = tx.query_row_map(
-                "SELECT id FROM embedding_generations WHERE is_active = 1",
-                &[],
-                |row| row.get_typed(0),
+            crate::storage::schema::register_chunk_holes_for_message_in_tx(
+                tx,
+                &expected_chunks,
+                now_ms,
+                "restore-invalidation",
             )?;
-            crate::storage::schema::seed_embedding_holes(tx, generation_id, &eligible_ids, now_ms, "restore-invalidation")?;
             crate::storage::schema::demote_active_generation_readiness_in_tx(tx)
         })
-        .map_err(|e| anyhow::anyhow!("re-seeding embedding_holes / demoting readiness after restore: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("re-seeding chunk_holes / demoting readiness after restore: {e}"))?;
     Ok(())
 }
 
@@ -8603,11 +8717,29 @@ mod w3_4_step2_4_db_vector_domain_invalidation_tests {
 
         let gen_id = storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "BAAI/bge-m3", 4, 1, TS))
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                schema::create_embedding_generation(tx, "BAAI/bge-m3", 4, 1, 1, b"test-fingerprint", TS)
+            })
             .unwrap();
         storage
             .raw()
-            .with_tx_no_replay(TxMode::Immediate, |tx| schema::insert_message_embedding(tx, gen_id, doc_a, conv_id, &[1.0, 0.0, 0.0, 0.0], "seed-hash", None, TS))
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                schema::insert_chunk_row_in_tx(
+                    tx,
+                    &schema::ChunkRow {
+                        generation_id: gen_id,
+                        message_id: doc_a,
+                        conversation_id: conv_id,
+                        chunk_idx: 0,
+                        byte_start: 0,
+                        byte_end: "already embedded".len(),
+                        content_hash: "seed-hash".into(),
+                        embedding: vec![1.0, 0.0, 0.0, 0.0],
+                        norm: 1.0,
+                        created_at_ms: TS,
+                    },
+                )
+            })
             .unwrap();
         storage.raw().execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &params![gen_id]).unwrap();
 
@@ -8631,11 +8763,23 @@ mod w3_4_step2_4_db_vector_domain_invalidation_tests {
         let journal = minimal_journal(db_path.clone());
         restore_invalidate_db_vector_domain(&journal).expect("db-vector-domain invalidation must succeed");
 
-        let hole_doc_ids: Vec<i64> = storage
+        // `register_chunk_holes_for_message_in_tx` registers a hole key for
+        // every live message's expected chunks unconditionally (`ON
+        // CONFLICT DO NOTHING`, no `NOT EXISTS message_chunks` filter --
+        // unlike the retired v4 primitive) -- deduping "already has a
+        // matching chunk row" is the T8 drain loop's job at catch-up time,
+        // not this registration step's. So both doc_a (already chunked)
+        // and doc_b (unhooked) get a `chunk_holes` row here; the real
+        // regression this test guards is doc_b -- the unhooked write --
+        // getting one at all.
+        let mut hole_doc_ids: Vec<i64> = storage
             .raw()
-            .query_all_map("SELECT doc_id FROM embedding_holes WHERE generation_id = ?1", &params![gen_id], |row| row.get_typed(0))
+            .query_all_map("SELECT message_id FROM chunk_holes WHERE generation_id = ?1", &params![gen_id], |row| row.get_typed(0))
             .unwrap();
-        assert_eq!(hole_doc_ids, vec![doc_b], "the unhooked doc_id must get a hole; the already-embedded one must not");
+        hole_doc_ids.sort_unstable();
+        let mut expected = vec![doc_a, doc_b];
+        expected.sort_unstable();
+        assert_eq!(hole_doc_ids, expected, "both the already-chunked and the unhooked doc_id must get a chunk_holes row");
 
         let audit_status: String = storage
             .raw()

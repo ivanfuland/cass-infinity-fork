@@ -112,15 +112,111 @@ fn isolated_search_demo_data() -> Result<TempDir, Box<dyn Error>> {
     Ok(tmp)
 }
 
+/// Task book #98 Step 5 (T11 leftover, control plane 2026-09-05 ruling):
+/// a fresh, empty temp dir with a v5-schema `agent_search.db` built via
+/// the production write path (`insert_conversation_tree`), not a copy of
+/// the checked-in `search_demo_data` fixture -- that shared fixture's own
+/// `agent_search.db` predates the v5 schema (`PRAGMA user_version = 1`)
+/// and is relied on unchanged, byte-for-byte, by 18 other test files
+/// (`spec_*`/`golden_*`/`metamorphic_*` contract tests asserting exact
+/// values against it); regenerating it here would put every one of those
+/// at risk for a fix this one test alone needs. This helper's own
+/// `FrankenStorage::open` call is the only consumer of
+/// `isolated_search_demo_data_for_current_workspace` in the whole test
+/// suite (verified: `grep -rn` finds exactly the one call site below),
+/// so building its database directly, isolated from the shared fixture,
+/// carries zero risk to anything else.
+///
+/// Same corpus as the original fixture (2 conversations, 6 messages, one
+/// `aider` agent) recovered by reading the fixture's `conversations`/
+/// `messages` tables with a plain `sqlite3` connection (schema-version
+/// checks are a `FrankenStorage::open`-level concern, not a SQL-level
+/// one, so the old v1 file's rows are readable regardless) and re-created
+/// through today's production write path: conversation 1's workspace is
+/// pinned to the test's actual current working directory (what `current`/
+/// `current-session` must resolve to), conversation 2 stays at an
+/// unrelated subdirectory workspace, preserving the original test's
+/// proposition that `current` must pick exactly the one matching session
+/// out of more than one on disk.
 fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn Error>> {
-    let tmp = isolated_search_demo_data()?;
+    use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+
+    let tmp = TempDir::new()?;
     let current_workspace = std::env::current_dir()?.to_string_lossy().into_owned();
     let db_path = tmp.path().join("agent_search.db");
-    let conn = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path)?.into_raw();
-    conn.execute(
-        "UPDATE workspaces SET path = ?1 WHERE id = 1",
-        &[coding_agent_search::storage::api::Value::from(current_workspace)],
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path)?;
+
+    let agent_id = storage.ensure_agent(&Agent { id: None, slug: "aider".into(), name: "aider".into(), version: None, kind: AgentKind::Cli })?;
+    let current_workspace_id = storage.ensure_workspace(Path::new(&current_workspace), None)?;
+    let other_workspace_path = format!("{current_workspace}/tests/fixtures/aider");
+    let other_workspace_id = storage.ensure_workspace(Path::new(&other_workspace_path), None)?;
+
+    storage.insert_conversation_tree(
+        agent_id,
+        Some(current_workspace_id),
+        &Conversation {
+            id: None,
+            agent_slug: "aider".into(),
+            workspace: None,
+            external_id: Some(format!("{current_workspace}/.aider.chat.history.md")),
+            title: Some("Aider Chat: coding_agent_session_search".into()),
+            source_path: PathBuf::from(format!("{current_workspace}/.aider.chat.history.md")),
+            started_at: Some(1_764_619_673_394),
+            ended_at: Some(1_764_619_673_394),
+            approx_tokens: None,
+            metadata_json: Value::Null,
+            messages: vec![
+                Message {
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::System,
+                    author: Some("system".into()),
+                    created_at: None,
+                    content: "# aider chat started at 2025-12-01 20:07:47".into(),
+                    extra_json: Value::Null,
+                    snippets: vec![],
+                },
+                Message {
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: None,
+                    content: "/data/projects/coding_agent_session_search/.venv/bin/aider --no-git --message hello world\nUsing openrouter/deepseek/deepseek-r1:free model with API key from environment.\nAider v0.86.1\nModel: openrouter/deepseek/deepseek-r1:free with diff edit format, prompt cache, infinite output\nGit repo: none\nRepo-map: disabled\nhttps://aider.chat/HISTORY.html#release-notes".into(),
+                    extra_json: Value::Null,
+                    snippets: vec![],
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        },
     )?;
+
+    storage.insert_conversation_tree(
+        agent_id,
+        Some(other_workspace_id),
+        &Conversation {
+            id: None,
+            agent_slug: "aider".into(),
+            workspace: None,
+            external_id: Some(format!("{other_workspace_path}/.aider.chat.history.md")),
+            title: Some("Aider Chat: aider".into()),
+            source_path: PathBuf::from(format!("{other_workspace_path}/.aider.chat.history.md")),
+            started_at: Some(1_764_621_401_399),
+            ended_at: Some(1_764_621_401_399),
+            approx_tokens: None,
+            metadata_json: Value::Null,
+            messages: vec![
+                Message { id: None, idx: 0, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "/add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { id: None, idx: 1, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Added src/main.rs to the chat.\n\n#### /add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { id: None, idx: 2, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "Please refactor.".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { id: None, idx: 3, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Sure, here is the code.".into(), extra_json: Value::Null, snippets: vec![] },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        },
+    )?;
+
     Ok(tmp)
 }
 

@@ -21,11 +21,13 @@
 pub mod asset_state;
 pub(crate) mod bounded_discovery;
 pub mod canonicalize;
+pub mod chunking;
 pub(crate) mod command_envelope;
 pub(crate) mod contention_diagnostics;
 pub mod daemon_client;
 pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;
+pub mod eligibility;
 pub mod embedder;
 pub mod embedder_registry;
 pub mod fastembed_embedder;

@@ -32,6 +32,10 @@ fn exact_hits_rank_above_wildcards_at_equal_recency_and_score() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let prefix = SearchHit {
@@ -86,6 +90,10 @@ fn recency_boost_can_outweigh_quality_when_far_newer() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let newer_suffix = SearchHit {
@@ -105,6 +113,10 @@ fn recency_boost_can_outweigh_quality_when_far_newer() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let max_created = newer_suffix.created_at.unwrap();
@@ -140,6 +152,10 @@ fn relevance_heavy_mode_prefers_quality_over_recency() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let newer_substring = SearchHit {
@@ -159,6 +175,10 @@ fn relevance_heavy_mode_prefers_quality_over_recency() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let older_score = blended_score(&older_exact, max_created, alpha);
@@ -195,6 +215,10 @@ fn match_quality_heavy_mode_balances_quality_and_recency() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let implicit = SearchHit {
@@ -243,6 +267,10 @@ fn ranking_handles_missing_created_at() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let hit_without_date = SearchHit {
@@ -262,6 +290,10 @@ fn ranking_handles_missing_created_at() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let with_date_score = blended_score(&hit_with_date, max_created, alpha);
@@ -299,6 +331,10 @@ fn ranking_handles_zero_max_created() {
         origin_kind: "local".into(),
         origin_host: None,
         conversation_id: None,
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     };
 
     let score = blended_score(&hit, max_created, alpha);
@@ -334,6 +370,10 @@ fn all_ranking_modes_maintain_quality_ordering_at_equal_inputs() {
             origin_kind: "local".into(),
             origin_host: None,
             conversation_id: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let exact_score = blended_score(&base, max_created, alpha);

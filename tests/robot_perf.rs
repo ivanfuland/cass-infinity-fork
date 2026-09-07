@@ -111,6 +111,10 @@ fn answer_pack_perf_hit(idx: usize) -> SearchHit {
             .is_multiple_of(7)
             .then(|| format!("worker-{}.local", idx % 3)),
         conversation_id: Some(idx as i64),
+        message_id: None,
+        winning_chunk_idx: None,
+        winning_chunk_span: None,
+        winning_chunk_hash: None,
     }
 }
 

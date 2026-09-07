@@ -1740,6 +1740,10 @@ mod tests {
             source_id: "   ".to_string(),
             origin_kind: "remote".to_string(),
             origin_host: Some("user@laptop".to_string()),
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         assert!(conversation_view_matches_hit(&view, &hit));
@@ -1793,6 +1797,10 @@ mod tests {
             source_id: "  LOCAL  ".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         assert!(conversation_view_matches_hit(&view, &hit));
@@ -1846,6 +1854,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         assert!(conversation_view_matches_hit(&view, &hit));
@@ -1899,6 +1911,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         assert!(!conversation_view_matches_hit(&view, &hit));
@@ -2064,6 +2080,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2113,6 +2133,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2157,6 +2181,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
         let loaded = load_conversation_for_hit(&storage, &hit)
             .expect("load attempt succeeds")
@@ -2211,6 +2239,10 @@ mod tests {
             source_id: "   ".to_string(),
             origin_kind: "remote".to_string(),
             origin_host: Some("user@laptop".to_string()),
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2263,6 +2295,10 @@ mod tests {
             source_id: "remote-laptop".to_string(),
             origin_kind: "remote".to_string(),
             origin_host: Some("dev@laptop".to_string()),
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2315,6 +2351,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2371,6 +2411,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2428,6 +2472,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2484,6 +2532,10 @@ mod tests {
             source_id: "local".to_string(),
             origin_kind: "local".to_string(),
             origin_host: None,
+            message_id: None,
+            winning_chunk_idx: None,
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit).expect("load attempt succeeds");
