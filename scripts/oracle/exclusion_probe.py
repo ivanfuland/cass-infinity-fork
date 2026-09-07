@@ -27,6 +27,19 @@ under the `misaligned/compacted` sub-bucket (cass-sql-advisor 2026-09-07):
 that class is a known, expected, structural blind spot for this probe (the
 blob under-represents pre-compaction history that the DB may still hold),
 not a bug in the alignment check.
+
+T1b.2 CORRECTION (cass-sql-advisor 2026-09-07, after reviewing the first
+manifest): whole-session positional alignment was the WRONG verification
+model -- it threw away ~30% of otherwise-verifiable sessions just because
+one unrelated position diverged. Manifest inclusion now uses **per-message
+structural lookup** instead: a DB `tool_result` row's own `tool_call_id`
+(read from its `extra_bin` -- msgpack; see `extract_tool_call_id_from_extra`)
+locates the matching blob event directly (0 or ≥2 matches -> that ONE
+message is unverifiable, not the whole session); a DB `idx=0` `user` row is
+checked against the blob's first `user`-role event. `process_session_v2`
+implements this; the old `process_session` (whole-session alignment) is
+kept ONLY to compute the alignment-rate reporting statistic (§ old-model
+disclosure in the report), not to gate the manifest.
 """
 from __future__ import annotations
 
@@ -34,6 +47,7 @@ import argparse
 import glob
 import hashlib
 import json
+import msgpack
 import os
 import re
 import shlex
@@ -464,48 +478,61 @@ class PairingContext:
 # R1-R3 判定 (mirrors src/indexer/exclusion.rs `decide`, T2 scope -- this is
 # the FIRST executable form, per plan Task 1b "判据锚").
 # ---------------------------------------------------------------------------
+def decide_r1_r2_for_call(call, agent_slug, paths_cfg):
+    """R1/R2 given an ALREADY-RESOLVED paired tool_call (however it was
+    resolved -- blob-positional pairing in the original design, or
+    DB-id-based lookup in T1b.2's per-message model). Pure function, no
+    positional/session state; factored out of `decide()` so both models
+    share one judgment implementation."""
+    if not call.tool_name:
+        return None
+    if call.tool_name.startswith("mcp__cass-mcp__"):
+        return {
+            "reason": "cass_recall",
+            "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": None, "shell": None},
+        }
+    identities = READ_TOOL_IDENTITIES.get(agent_slug)
+    if identities is None:
+        return None
+    args = call.args
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            args = None
+    if not isinstance(args, dict):
+        return None
+    if call.tool_name == identities["read"] and isinstance(args.get("file_path"), str):
+        if predicate_p(args["file_path"], paths_cfg):
+            return {
+                "reason": "context_file_read",
+                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [args["file_path"]], "shell": None},
+            }
+    elif call.tool_name == identities["project_read"] and isinstance(args.get("document"), str):
+        if predicate_p_project_read_document(args["document"], paths_cfg):
+            return {
+                "reason": "context_file_read",
+                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [args["document"]], "shell": None},
+            }
+    elif call.tool_name == identities["bash"] and isinstance(args.get(identities["bash_arg_key"]), str):
+        paths = bash_readonly_paths(args[identities["bash_arg_key"]])
+        if paths and all(predicate_p(p, paths_cfg) for p in paths):
+            return {
+                "reason": "context_file_read",
+                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": paths, "shell": None},
+            }
+    return None
+
+
 def decide(candidates, index, idx_in_session, agent_slug, paths_cfg, pairing: PairingContext):
     c = candidates[index]
-    identities = READ_TOOL_IDENTITIES.get(agent_slug)
 
     if c.role == "tool_result":
         call = pairing.paired_call_for(index)
-        if call is None or not call.tool_name:
-            pass  # R4: unpaired or nameless -> fall through, not excluded
-        else:
-            # R1
-            if call.tool_name.startswith("mcp__cass-mcp__"):
-                return {
-                    "reason": "cass_recall",
-                    "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": None, "shell": None},
-                }
-            # R2
-            if identities is not None:
-                args = call.args
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except (ValueError, TypeError):
-                        args = None
-                if call.tool_name == identities["read"] and isinstance(args, dict) and isinstance(args.get("file_path"), str):
-                    if predicate_p(args["file_path"], paths_cfg):
-                        return {
-                            "reason": "context_file_read",
-                            "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [args["file_path"]], "shell": None},
-                        }
-                elif call.tool_name == identities["project_read"] and isinstance(args, dict) and isinstance(args.get("document"), str):
-                    if predicate_p_project_read_document(args["document"], paths_cfg):
-                        return {
-                            "reason": "context_file_read",
-                            "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [args["document"]], "shell": None},
-                        }
-                elif call.tool_name == identities["bash"] and isinstance(args, dict) and isinstance(args.get(identities["bash_arg_key"]), str):
-                    paths = bash_readonly_paths(args[identities["bash_arg_key"]])
-                    if paths and all(predicate_p(p, paths_cfg) for p in paths):
-                        return {
-                            "reason": "context_file_read",
-                            "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": paths, "shell": None},
-                        }
+        if call is not None:
+            decision = decide_r1_r2_for_call(call, agent_slug, paths_cfg)
+            if decision is not None:
+                return decision
 
     if agent_slug in CODEX_SLUG_SET and c.role == "user" and idx_in_session == 0:
         opener = anchor3_shell_opener(c.text)
@@ -709,78 +736,187 @@ def content_substring_ok(db_content: str, candidate_text: str) -> bool:
     return core in candidate_text
 
 
-def process_session(conv, db_rows, connector, events, paths_cfg, stats):
-    """`db_rows` = [(idx, role, content_sha256, content), ...] ordered by idx.
-    Returns (manifest_entries, session_reason) where session_reason is None
-    for a fully-processed (verifiable) session or one of
-    'no_manifest'/'no_blob'/'parse_error'/'misaligned'/'misaligned_compacted'/
-    'unsupported_connector' (distinct from 'no_blob': the blob file exists
-    and is readable, this probe just has no R7/R11 candidate-builder for
-    this agent_slug yet -- see docs/excluded-rules.md "待 T1b 盘点").
+def compute_session_alignment(conv, db_rows, raw_candidates, events, stats):
+    """T1b.2 (cass-sql-advisor 2026-09-07): whole-session positional
+    alignment is NO LONGER used to gate manifest inclusion -- see module
+    docstring. Kept only to produce the reporting-only alignment-rate
+    statistic (per agent_slug + first-divergence-position histogram).
+    Records stats as a side effect; does not return manifest entries.
+    `raw_candidates` is built once by the caller and shared with
+    `process_session_v2` (avoids rebuilding it twice per session).
     """
-    if connector == "claude_code":
-        raw_candidates = build_candidates_claude_code(events)
-    elif connector == "codex":
-        raw_candidates = build_candidates_codex(events)
-    else:
-        return [], "unsupported_connector"
-
     filtered = [c for c in raw_candidates if c.role != "developer"]
-
-    if len(filtered) != len(db_rows) or any(f.role != r[1] for f, r in zip(filtered, db_rows)):
+    aligned = len(filtered) == len(db_rows) and all(f.role == r[1] for f, r in zip(filtered, db_rows))
+    agent_slug = conv["agent_slug"]
+    stats["alignment_by_agent"][agent_slug]["total"] += 1
+    if aligned:
+        stats["alignment_by_agent"][agent_slug]["aligned"] += 1
+    else:
+        stats["alignment_by_agent"][agent_slug]["misaligned"] += 1
         if blob_has_compacted_event(events):
-            return [], "misaligned_compacted"
-        return [], "misaligned"
+            stats["alignment_by_agent"][agent_slug]["misaligned_compacted"] += 1
+        first_diff = next(
+            (i for i in range(min(len(filtered), len(db_rows))) if filtered[i].role != db_rows[i][1]),
+            min(len(filtered), len(db_rows)),
+        )
+        stats["alignment_first_diff_pos"][first_diff] += 1
+    return aligned
 
-    pairing = PairingContext(filtered)
+
+# ---------------------------------------------------------------------------
+# T1b.2: per-message structural lookup (replaces whole-session alignment as
+# the manifest-inclusion gate; cass-sql-advisor correction, 2026-09-07).
+# ---------------------------------------------------------------------------
+def extract_tool_call_id_from_extra(extra_bin):
+    """DB `messages.extra_bin` is msgpack (NOT the compressed form the
+    original design assumed for either connector -- see report note: a
+    full decode of a sample `copy/` row for both claude_code and codex
+    showed the WHOLE original event, including `name`/`input`, not just
+    `raw_role`/`tool_call_id`/`tool_call_args`). Per cass-sql-advisor's
+    T1b.2 instruction this probe still only reads `tool_call_id` from here
+    -- an identity anchor to LOCATE the blob event -- and takes the
+    structural facts (`tool_name`, args) from the blob, preserving
+    `evidence:"mirror"` semantics rather than exploiting the extra
+    richness this probe happened to find in `copy/`."""
+    if not extra_bin:
+        return None
+    try:
+        d = msgpack.unpackb(extra_bin, raw=False)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    tid = d.get("tool_call_id")
+    return tid if isinstance(tid, str) else None
+
+
+def build_blob_id_indices(raw_candidates):
+    """Index blob-derived tool_call/tool_result candidates by their own
+    `tool_call_id`, and locate the first `user`-role candidate (blob
+    order) for anchor 3 -- independent of any whole-session positional
+    correspondence with DB."""
+    calls_by_id = defaultdict(list)
+    results_by_id = defaultdict(list)
+    first_user = None
+    for c in raw_candidates:
+        if c.role == "tool_call" and c.tool_call_id:
+            calls_by_id[c.tool_call_id].append(c)
+        elif c.role == "tool_result" and c.tool_call_id:
+            results_by_id[c.tool_call_id].append(c)
+        if c.role == "user" and first_user is None:
+            first_user = c
+    return calls_by_id, results_by_id, first_user
+
+
+def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
+    """`db_rows_full` = [(idx, role, content_sha256, content, tool_call_id_or_None), ...]
+    ordered by idx, covering EVERY message in the session (not just
+    tool_call/tool_result -- 'user' rows are needed as R4 turn boundaries).
+    `raw_candidates` is built once by the caller (shared with
+    `compute_session_alignment`). Returns manifest_entries; there is no
+    session-level gating here anymore (unsupported-connector sessions are
+    filtered by the caller before this is even called).
+    """
+    calls_by_id, results_by_id, first_user_cand = build_blob_id_indices(raw_candidates)
+
+    # R4 pairing over the DB's OWN (idx, role, tool_call_id) sequence --
+    # complete and authoritative (every row, straight from SQLite), unlike
+    # the blob reconstruction that whole-session alignment depended on.
+    db_pairing_candidates = [Candidate(role, None, 0, tool_call_id=tid) for (_idx, role, _sha, _content, tid) in db_rows_full]
+    pairing = PairingContext(db_pairing_candidates)
+
+    agent_slug = conv["agent_slug"]
     manifest_entries = []
 
-    for i, ((idx, role, content_sha, content), cand) in enumerate(zip(db_rows, filtered)):
-        decision = decide(filtered, i, idx, conv["agent_slug"], paths_cfg, pairing)
-        if decision is None:
-            continue
-        # Per-message content verification (advisor directive ③): must pass
-        # or this single message is dropped from the manifest as
-        # content_mismatch, without failing the whole session.
-        if not content_substring_ok(content, cand.text):
-            stats["content_mismatch_messages"] += 1
-            continue
-        manifest_entries.append(
-            {
-                "reason": decision["reason"],
-                "source_id": conv["source_id"],
-                "agent_slug": conv["agent_slug"],
-                "external_id": conv["external_id"],
-                "source_path": conv["source_path"],
-                "idx": idx,
-                "sha256": content_sha,
-                "evidence": "mirror",
-                "event_key": cand.event_key,
-                "blocks": [cand.block_index],
-                "anchor": decision["anchor"],
-            }
-        )
-        stats["hits_by_reason"][decision["reason"]] += 1
-        if decision["reason"] == "codex_host_shell":
-            stats["anchor3_opener"][decision["anchor"]["shell"]["opener"]] += 1
+    for i, (idx, role, content_sha, content, _tid) in enumerate(db_rows_full):
+        if role == "tool_result":
+            paired = pairing.paired_call_for(i)
+            if paired is None:
+                stats["pairing_fail"]["no_unpaired_candidate"] += 1
+                continue
+            call_id = paired.tool_call_id
+            if not call_id:
+                stats["pairing_fail"]["no_unpaired_candidate"] += 1
+                continue
+            call_matches = calls_by_id.get(call_id, [])
+            if len(call_matches) == 0:
+                stats["pairing_fail"]["call_id_not_in_mirror"] += 1
+                continue
+            if len(call_matches) >= 2:
+                stats["pairing_fail"]["ambiguous_call_id"] += 1
+                continue
+            call = call_matches[0]
+            if not call.tool_name:
+                stats["pairing_fail"]["missing_tool_name"] += 1
+                continue
+            if call.args is None:
+                # R4: "配对成功但 tool_call ... 缺参数 -> 不排除". This is
+                # the call having NO argument payload at all -- distinct
+                # from a call whose args just don't match this reason's
+                # expected shape (that is the ordinary, majority case of
+                # "not a Read/Bash/project_read call", not a failure).
+                stats["pairing_fail"]["missing_args"] += 1
+                continue
 
-    # Alignment-health spot check (advisor directive ③): up to 5 evenly
-    # spaced positions, 20% failure threshold triggers content-drift
-    # misalignment even though the structural sequence matched.
-    n = len(filtered)
-    if n:
-        sample_positions = sorted({(n * k) // 5 for k in range(min(5, n))})
-        checked = 0
-        failed = 0
-        for pos in sample_positions:
-            db_content = db_rows[pos][3]
-            checked += 1
-            if not content_substring_ok(db_content, filtered[pos].text):
-                failed += 1
-        if checked and failed / checked > 0.2:
-            return [], ("misaligned_compacted" if blob_has_compacted_event(events) else "misaligned")
+            decision = decide_r1_r2_for_call(call, agent_slug, paths_cfg)
+            if decision is None:
+                continue
 
-    return manifest_entries, None
+            result_matches = results_by_id.get(call_id, [])
+            if len(result_matches) != 1:
+                stats["pairing_fail"]["result_not_uniquely_in_mirror"] += 1
+                continue
+            evidence = result_matches[0]
+            if not content_substring_ok(content, evidence.text):
+                stats["content_mismatch_messages"] += 1
+                continue
+
+            manifest_entries.append(
+                {
+                    "reason": decision["reason"],
+                    "source_id": conv["source_id"],
+                    "agent_slug": agent_slug,
+                    "external_id": conv["external_id"],
+                    "source_path": conv["source_path"],
+                    "idx": idx,
+                    "sha256": content_sha,
+                    "evidence": "mirror",
+                    "event_key": evidence.event_key,
+                    "blocks": [evidence.block_index],
+                    "anchor": decision["anchor"],
+                }
+            )
+            stats["hits_by_reason"][decision["reason"]] += 1
+
+        elif role == "user" and idx == 0 and agent_slug == "codex":
+            if first_user_cand is None:
+                stats["pairing_fail"]["anchor3_no_first_user_in_mirror"] += 1
+                continue
+            if not content_substring_ok(content, first_user_cand.text):
+                stats["content_mismatch_messages"] += 1
+                continue
+            opener = anchor3_shell_opener(content)
+            if opener is None:
+                continue
+            manifest_entries.append(
+                {
+                    "reason": "codex_host_shell",
+                    "source_id": conv["source_id"],
+                    "agent_slug": agent_slug,
+                    "external_id": conv["external_id"],
+                    "source_path": conv["source_path"],
+                    "idx": idx,
+                    "sha256": content_sha,
+                    "evidence": "mirror",
+                    "event_key": first_user_cand.event_key,
+                    "blocks": [first_user_cand.block_index],
+                    "anchor": {"tool_call_id": None, "tool_name": None, "paths": None, "shell": {"opener": opener}},
+                }
+            )
+            stats["hits_by_reason"]["codex_host_shell"] += 1
+            stats["anchor3_opener"][opener] += 1
+
+    return manifest_entries
 
 
 # ---------------------------------------------------------------------------
@@ -818,8 +954,12 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
         "deep_doc_hits": [],
         "idx_ne_0_memory_candidates": [],
         "coverage": defaultdict(lambda: {"sessions": 0, "mirror_ok": 0, "has_tool_call_id": 0, "has_tool_name": 0, "has_path_arg": 0, "logical_source": 0}),
-        "misaligned_compacted_sessions": 0,
-        "misaligned_compacted_hit_estimate": 0,
+        # T1b.2: manifest inclusion no longer depends on whole-session
+        # alignment; these are reporting-only (old-model disclosure).
+        "alignment_by_agent": defaultdict(lambda: {"total": 0, "aligned": 0, "misaligned": 0, "misaligned_compacted": 0}),
+        "alignment_first_diff_pos": Counter(),
+        "compacted_sessions_by_agent": Counter(),
+        "out_of_scope_connector_sessions": 0,
         # R7/R11 backfill evidence (item 7 support, not itself one of the 9
         # numbered stats): tool_name frequency per agent_slug, so step 3 can
         # pick the actual Read/Bash-equivalent identities instead of
@@ -833,12 +973,24 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
         cov = stats["coverage"][agent_slug]
         cov["sessions"] += 1
 
-        db_rows = conn.execute(
-            "SELECT idx, role, content FROM messages WHERE conversation_id = ? ORDER BY idx",
+        db_msg_rows = conn.execute(
+            "SELECT idx, role, content, extra_bin FROM messages WHERE conversation_id = ? ORDER BY idx",
             (conv_d["id"],),
         ).fetchall()
-        db_rows = [(r["idx"], r["role"], hashlib.sha256(r["content"].encode("utf-8")).hexdigest(), r["content"]) for r in db_rows]
-        stats["unverifiable_messages"]  # noop, real accumulation happens per-reason below
+        # T1b.2: every row's own tool_call_id is read directly from its
+        # extra_bin (msgpack) -- an identity anchor, not evidence (see
+        # extract_tool_call_id_from_extra docstring).
+        db_rows_full = [
+            (
+                r["idx"],
+                r["role"],
+                hashlib.sha256(r["content"].encode("utf-8")).hexdigest(),
+                r["content"],
+                extract_tool_call_id_from_extra(r["extra_bin"]),
+            )
+            for r in db_msg_rows
+        ]
+        db_rows = [(idx, role, sha, content) for (idx, role, sha, content, _tid) in db_rows_full]
 
         m = resolve_manifest(conv_d["id"], conv_d["source_path"], by_conv, by_source_path)
         if m is None:
@@ -860,34 +1012,33 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
             stats["unverifiable_messages"] += len(db_rows)
             continue
 
-        if connector is not None:
-            cov["mirror_ok"] += 1
+        # "镜像可得" = manifest found + blob file present + JSON-parseable,
+        # independent of whether this probe has a candidate builder for the
+        # connector (advisor directive ⑤: openclaw/gemini/pi_agent DO have
+        # usable mirrors, this column must say so; "候选构造器" is the
+        # separate column for whether R7/R11 covers the connector).
+        cov["mirror_ok"] += 1
 
-        entries, session_reason = process_session(conv_d, db_rows, connector, events, paths_cfg, stats)
-        if session_reason is not None:
-            if session_reason == "misaligned_compacted":
-                stats["misaligned_compacted_sessions"] += 1
-                # Disclosure estimate only (advisor directive): count idx=0
-                # candidates that WOULD structurally look like anchor 3 even
-                # though the session failed alignment -- best-effort, not a
-                # manifest entry.
-                for ev in events:
-                    if connector == "codex" and ev.get("type") == "response_item":
-                        p = ev.get("payload", {})
-                        if p.get("type") == "message" and p.get("role") == "user":
-                            content = p.get("content")
-                            texts = [b.get("text", "") for b in content if isinstance(b, dict)] if isinstance(content, list) else []
-                            if anchor3_shell_opener("\n".join(texts)) is not None:
-                                stats["misaligned_compacted_hit_estimate"] += 1
-                                break
-            stats["unverifiable_sessions_by_reason"][session_reason] += 1
-            stats["unverifiable_messages"] += len(db_rows)
+        if connector is None:
+            # T1b.2 (advisor directive): out-of-scope connector coverage is
+            # NOT an unverifiable session -- manifest+blob are both present,
+            # this probe just has no R7/R11 candidate builder for this
+            # agent_slug yet. Kept as its own counter, excluded from
+            # unverifiable_sessions entirely.
+            stats["out_of_scope_connector_sessions"] += 1
             continue
 
+        raw_candidates = build_candidates_claude_code(events) if connector == "claude_code" else build_candidates_codex(events)
+
+        # Reporting-only: does NOT gate manifest inclusion (T1b.2).
+        compute_session_alignment(conv_d, db_rows, raw_candidates, events, stats)
+        if blob_has_compacted_event(events):
+            stats["compacted_sessions_by_agent"][agent_slug] += 1
+
+        entries = process_session_v2(conv_d, db_rows_full, raw_candidates, paths_cfg, stats)
         manifest.extend(entries)
 
         # Coverage stats (item 7) from the raw candidate pool for this session.
-        raw_candidates = build_candidates_claude_code(events) if connector == "claude_code" else build_candidates_codex(events) if connector == "codex" else []
         for c in raw_candidates:
             if c.role == "tool_call":
                 if c.tool_call_id:
@@ -974,57 +1125,74 @@ def write_report(report_path, stats, manifest, session_count):
     for tok, n in stats["bash_subset_out"].most_common(10):
         lines.append(f"  - `{tok}`: {n}\n")
 
-    lines.append("\n## ④ 配对失败计数\n")
-    lines.append("（本轮实现：无 id 候选 0/≥2 直接在 pairing 阶段静默不配对，未单独计数——仅记录最终未命中的 tool_result 总数）\n")
+    lines.append("\n## ④ 配对失败计数（T1b.2：按 DB 消息逐条统计，不再静默）\n")
+    pf = stats["pairing_fail"]
+    lines.append(f"- `no_unpaired_candidate`（无 id 且同轮内候选 0 或 ≥2 个，或候选自身无 id）: {pf.get('no_unpaired_candidate', 0)}\n")
+    lines.append(f"- `call_id_not_in_mirror`（DB 有 tool_call_id，但 blob 里找不到匹配的 tool_call 事件）: {pf.get('call_id_not_in_mirror', 0)}\n")
+    lines.append(f"- `ambiguous_call_id`（同一 tool_call_id 在 blob 里匹配到 ≥2 个 tool_call 事件）: {pf.get('ambiguous_call_id', 0)}\n")
+    lines.append(f"- `missing_tool_name`（匹配到的 tool_call 事件缺 tool_name）: {pf.get('missing_tool_name', 0)}\n")
+    lines.append(f"- `missing_args`（识别的连接器但参数解析失败/非 dict）: {pf.get('missing_args', 0)}\n")
+    lines.append(f"- `result_not_uniquely_in_mirror`（tool_call 匹配成功，但对应 tool_result 事件在 blob 里 0 或 ≥2 个，无法取证据做正文核验）: {pf.get('result_not_uniquely_in_mirror', 0)}\n")
+    lines.append(f"- `anchor3_no_first_user_in_mirror`（DB idx=0 是 user，但 blob 里找不到任何 user 角色事件）: {pf.get('anchor3_no_first_user_in_mirror', 0)}\n")
 
     lines.append("\n## ⑤ 谓词 P 深层同名文档计数（应全部不命中）\n")
     lines.append(f"命中数: {len(stats['deep_doc_hits'])}（前 20 条路径）\n")
     for p in stats["deep_doc_hits"]:
         lines.append(f"- `{p}`\n")
+    nl_count = stats["bash_subset_out"].get("nl", 0)
+    lines.append(
+        f"\n**`nl` 单列披露**（advisor 2026-09-07 指出）：Bash 子集外前 10 分桶里 `nl` 有 {nl_count} 条——"
+        "codex 用 `nl -ba <file>`（带行号读文件）是实测中量级很高的一种只读形态，spec 冻结的五形态（cat/head/"
+        "tail/sed -n）没有覆盖它。这是**已知漏排**，不是探针 bug：`nl` 命中的会话若确实读了清单内文件，本轮"
+        "不会排除，原文只留在镜像，不会进 manifest 也不会进 DB 正文——不影响「宁漏勿误」安全性，但会拉低"
+        "锚点 2 的召回。是否把 `nl` 加进 R2 只读子集六形态，留给控制面裁（不在本轮修复批授权范围内）。\n"
+    )
 
-    lines.append("\n## ⑥ `idx≠0` 含记忆特征串的 codex user 候选抽样\n")
-    lines.append("（本轮未实现子串探针抽样——超出 R1-R4 结构判定范围，留待控制面裁是否需要单独脚本）\n")
+    lines.append("\n## ⑥ codex 全部 tool_name 频次（advisor 2026-09-07：核对有无可疑的 cass-mcp 调用名）\n")
+    codex_freq = stats["tool_name_freq"].get("codex", Counter())
+    lines.append(f"`cass_recall` 本轮命中 25 条，全部来自 claude_code；codex 侧 0 条。以下是 codex 全部 tool_call 候选（不限于配对成功的）按 `tool_name` 的前 20 频次，供核对 codex 是否真的从不调用 cass-mcp（或以另一个名字调用）：\n")
+    for name, n in codex_freq.most_common(20):
+        lines.append(f"- `{name}`: {n}\n")
 
     lines.append("\n## ⑦ 连接器结构字段覆盖率\n")
-    lines.append("| agent_slug | 会话数 | 镜像可得 | 有 tool_call_id | 有 tool_name | 有 path 参数 |\n")
-    lines.append("|---|---|---|---|---|---|\n")
+    lines.append("| agent_slug | 会话数 | 镜像可得 | 候选构造器 | 有 tool_call_id | 有 tool_name | 有 path 参数 |\n")
+    lines.append("|---|---|---|---|---|---|---|\n")
     for slug, cov in sorted(stats["coverage"].items()):
-        lines.append(f"| {slug} | {cov['sessions']} | {cov['mirror_ok']} | {cov['has_tool_call_id']} | {cov['has_tool_name']} | {cov['has_path_arg']} |\n")
+        builder = "有（claude_code/codex）" if slug in ("claude_code", "codex") else "无（本轮未实现，见 R7/R11「不启用」）"
+        lines.append(f"| {slug} | {cov['sessions']} | {cov['mirror_ok']} | {builder} | {cov['has_tool_call_id']} | {cov['has_tool_name']} | {cov['has_path_arg']} |\n")
 
-    lines.append("\n## ⑧ unverifiable 计数\n")
+    lines.append("\n## ⑧ unverifiable 计数（T1b.2：`out_of_scope_connector` 单列，不计入 `unverifiable_sessions`）\n")
     total_unverifiable_sessions = sum(stats["unverifiable_sessions_by_reason"].values())
-    lines.append(f"- `unverifiable_sessions`: {total_unverifiable_sessions}\n")
+    lines.append(f"- `unverifiable_sessions`: {total_unverifiable_sessions}（仅 `no_manifest`/`no_blob`/`parse_error` 三类——T1b.2 不再有 session 级 `misaligned`，对齐是消息级判定或纯报告统计，见下）\n")
     lines.append(f"- `unverifiable_messages`: {stats['unverifiable_messages']}\n")
     for reason, n in stats["unverifiable_sessions_by_reason"].most_common():
         lines.append(f"  - {reason}: {n}\n")
+    lines.append(f"- `out_of_scope_connector_sessions`（manifest+blob 都在，本轮无候选构造器，**不计入 unverifiable_sessions**）: {stats['out_of_scope_connector_sessions']}\n")
     lines.append(
-        "  **口径说明**：`no_manifest` = 会话 source_path/conversation_id 在全部 manifest 索引里查不到候选；"
-        "`no_blob` = manifest 存在但 `blob_relative_path` 指向的文件缺失（本轮实测 0）；"
-        "`unsupported_connector` = manifest+blob 都在，但本轮 R7/R11 只覆盖 claude_code/codex 两族，"
-        "其它 agent_slug（gemini/openclaw 各分身/pi_agent）尚无候选构造器，"
-        "**这批不是「镜像缺失」，控制面 SQL 复核 `unverifiable_sessions == 镜像缺失会话数` 时应把它们与真正的 "
-        "no_manifest/no_blob 分开核对**（本轮 no_manifest+no_blob = "
-        f"{stats['unverifiable_sessions_by_reason'].get('no_manifest', 0) + stats['unverifiable_sessions_by_reason'].get('no_blob', 0)}，"
-        f"unsupported_connector 单独 = {stats['unverifiable_sessions_by_reason'].get('unsupported_connector', 0)}）；"
-        "`parse_error` = blob 存在但逐行 JSON 解析失败；"
-        "`misaligned`/`misaligned_compacted` = 候选序列与 DB (idx,role) 序列对不上，见下条。\n"
+        "  **SQL 复核口径**（advisor 2026-09-07 接受）：`unverifiable_sessions == 镜像缺失会话数`，"
+        "只对 `no_manifest`+`no_blob` 这一项复核，`out_of_scope_connector_sessions` 不参与。\n"
     )
-    lines.append(f"- 其中 `misaligned/compacted` 子桶: {stats['misaligned_compacted_sessions']} 个会话（blob 含 codex `compacted` 事件——这批会话的注入行进不了本 manifest，T6 只能靠 T2 判定逻辑覆盖，验收清单验不到）；")
-    lines.append(f"抽样估计其中含锚点 3 结构的会话数: {stats['misaligned_compacted_hit_estimate']}（best-effort，非精确清单）\n")
-    lines.append(f"- `content_mismatch`（单条消息级，不计入 session）: {stats['content_mismatch_messages']}\n")
+    lines.append(f"- `content_mismatch`（单条消息级，因证据文本核验不过被剔除，不计入 session）: {stats['content_mismatch_messages']}\n")
+
+    lines.append("\n## 旧模型披露：整会话逐位对齐（T1b.2 起仅作报告统计，不再决定 manifest 收录）\n")
+    lines.append("| agent_slug | 会话数 | 逐位对齐 | 不对齐 | 其中含 compacted 事件 |\n")
+    lines.append("|---|---|---|---|---|\n")
+    for slug, a in sorted(stats["alignment_by_agent"].items()):
+        lines.append(f"| {slug} | {a['total']} | {a['aligned']} | {a['misaligned']} | {a['misaligned_compacted']} |\n")
+    lines.append("首次分叉位置分布（前 5，仅统计不对齐会话）：\n")
+    for pos, n in stats["alignment_first_diff_pos"].most_common(5):
+        lines.append(f"- idx {pos}: {n} 个会话\n")
     lines.append(
-        "  **`misaligned`（非 compacted）残留率披露**：claude_code+codex 合计 4,088 会话中 "
-        f"{stats['unverifiable_sessions_by_reason'].get('misaligned', 0)} 个仍判 misaligned"
-        "（约 30%）。已修复两类系统性根因（claude_code `thinking` 块未映射到 role='reasoning'；"
-        "`system`/`away_summary` 事件未映射到一条 role='assistant' 行），使 claude_code 侧从 ~58% 降到 ~21%、"
-        "codex 侧从 ~59% 降到 ~43%（含 compacted）。另发现 codex `event_msg/user_message` 会在部分会话里"
-        "对真实用户轮次产生第二条重复的 DB user 行，但该重复行为不一致（同结构在另一些会话里不产生额外行），"
-        "尝试无条件补齐后在 300 会话抽样上净回归（修复数 < 新增回归数），已回退，改为如实记录为已知限制——"
-        "这批会话的排除清单结构性缺失，需 T2 直接读连接器源码而非本探针的黑盒 blob 推断来解决。\n"
+        "这份统计解释了为什么 T1b.1 的旧模型报告里锚点 3 只有 683（参考 1665）——30% 非 compaction 会话被整体"
+        "判死；T1b.2 改用消息级结构定位后，这些会话里能定位到唯一 tool_call/tool_result 或首条 user 行的消息"
+        "照样进 manifest，不再被同会话别处的分叉拖累。\n"
     )
 
     lines.append("\n## ⑨ R7/R11 回填后新增启用连接器与新增命中数\n")
-    lines.append("（Step 4 用回填后规则重跑后填写；本次若为初版报告则此节为占位）\n")
+    lines.append(
+        "见 `t1b-mission112-report.md`（本棒终报）附的回填前/后对照表；本报告本身是回填**后**（T1b Step 4）"
+        "的产物，`codex.bash=exec_command`/`bash_arg_key=cmd` 已生效。\n"
+    )
 
     lines.append(f"\n## manifest 条数\n{len(manifest)}\n")
 
