@@ -15490,7 +15490,24 @@ fn judge_and_redact_reparsed(
         if matches!(decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
             record_codex_host_shell_hit();
         }
+        // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
+        // `apply()` clears `msg.content` -- saved just above so the
+        // redacted-text recomputation below (same `MemoizingRedactor`,
+        // memoized -> effectively free) matches byte-for-byte what `apply`
+        // hashed internally (spec §2.2: sha/title 判定都用脱敏后正文口径).
+        // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
+        // `apply()` clears `msg.content` -- saved just above so the
+        // redacted-text recomputation below (same `MemoizingRedactor`,
+        // memoized -> effectively free) matches byte-for-byte what `apply`
+        // hashed internally (spec §2.2: sha/title 判定都用脱敏后正文口径).
+        let pre_redaction_content = conv.messages[idx].content.clone();
         let marker = apply(&mut conv.messages[idx], &decision, &mut redactor, blob_relative_path, idx as u32, field_map);
+        if let Some(title) = conv.title.as_ref().filter(|t| !t.is_empty()) {
+            let redacted_content = redactor.redact_text(&pre_redaction_content);
+            if redacted_content.contains(title.as_str()) {
+                conv.title = Some(String::new());
+            }
+        }
         markers[idx] = Some(marker.clone());
         hits.push((idx, marker));
     }
@@ -33401,6 +33418,79 @@ mod tests {
             prepared.conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes").is_some(),
             "raw_mirror metadata must survive the `conv = reparsed` reassignment: {:?}",
             prepared.conv.metadata
+        );
+    }
+
+    /// R1-N2 (任务书 #118a): a session `title` that is a substring of an
+    /// excluded row's (redacted) content must be cleared -- plan T2 named
+    /// this explicitly (`:16691-16700`), but nothing in the diff ever
+    /// checked `conv.title` against excluded content; the frozen corpus's
+    /// 1,665 codex host-shell titles all satisfy this exact condition.
+    #[test]
+    fn judge_clears_title_that_is_substring_of_excluded_host_shell_content() {
+        use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+
+        let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+        let mut conv = norm_conv(
+            Some("n2-fixture"),
+            vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(0),
+                content: host_shell_text.to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        );
+        conv.agent_slug = "codex".to_string();
+        conv.title = Some("AGENTS.md instructions for X".to_string());
+
+        let events = vec![RawEvent {
+            event_key: "ek1".to_string(),
+            blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
+        }];
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2.raw");
+
+        assert!(markers[0].is_some(), "the host-shell row must be excluded (anchor 3)");
+        assert_eq!(conv.title, Some(String::new()), "title matching the excluded row's redacted content must be cleared");
+    }
+
+    /// Sibling to the above: a normal session whose title is NOT a
+    /// substring of any excluded content must be left untouched.
+    #[test]
+    fn judge_leaves_unrelated_title_untouched() {
+        use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+
+        let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+        let mut conv = norm_conv(
+            Some("n2-negative-fixture"),
+            vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(0),
+                content: host_shell_text.to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        );
+        conv.agent_slug = "codex".to_string();
+        conv.title = Some("Fix the flaky retry test".to_string());
+
+        let events = vec![RawEvent {
+            event_key: "ek1".to_string(),
+            blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
+        }];
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2neg.raw");
+
+        assert!(markers[0].is_some(), "the host-shell row must still be excluded");
+        assert_eq!(
+            conv.title,
+            Some("Fix the flaky retry test".to_string()),
+            "an unrelated title must not be cleared just because SOME row in the session was excluded"
         );
     }
 

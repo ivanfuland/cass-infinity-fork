@@ -2715,12 +2715,20 @@ impl SealedMessageProjector<'_> {
         let conv = conversations.into_iter().next().expect("len checked above");
 
         // 与 restore 侧走**同一条**准备链（含 compact 判据取封存值），差异只可能来自实现 bug。
-        // provenance 在比较场景无意义，用一份指向本次被投影版本的最小记录 ——
-        // `manifest_relative_path` 恒空，`prepare_conversation_for_restore` 按此短路成
-        // 全 `None`（capture_na 语义），不经 events_from_blob/judge。
+        // provenance 在比较场景无意义，用一份指向本次被投影版本的最小记录。
+        //
+        // R1-N3 (任务书 #118a，收回 #116 ③ 的短路裁定): `manifest_relative_path`
+        // 曾恒空，`prepare_conversation_for_restore` 按此短路成全 `None`
+        // （capture_na 语义），不经 events_from_blob/judge -- 但这条投影路径
+        // 永远有一份真实 `materialized` 字节，短路本应只留给「压根没有
+        // materialized 输入」的情形。两版本仅排除正文不同时，镜像侧摘要用
+        // 空 `excluded_sha256`、DB 侧摘要用真实 marker sha，摘要必判不等
+        // （`CandidateDiverged`），即便内容完全一致也判不出 `Skip`。用一个
+        // 非空占位串跳过短路即可让 judge 正常跑；这份 marker 本身从不落盘
+        // （`raw.blob` 按 R6 占位传空），占位串本身的取值无意义。
         let provenance = crate::raw_mirror::RawMirrorCaptureRecord {
             manifest_id: String::new(),
-            manifest_relative_path: String::new(),
+            manifest_relative_path: "__digest_projection_not_persisted__".to_string(),
             blob_relative_path: String::new(),
             blob_blake3: blake3::hash(normalized_bytes).to_hex().to_string(),
             blob_size_bytes: normalized_bytes.len() as u64,
@@ -4088,6 +4096,79 @@ mod e5_materialization_tests {
             Relation::Diverged,
             "第二条消息内容真的不同 —— 这必须是分叉，不能被摘要口径抹平"
         );
+    }
+
+    /// R1-N3 (任务书 #118a，收回 #116 ③ 的短路裁定): `project_with_scope`
+    /// feeds `prepare_conversation_for_restore` a `RawMirrorCaptureRecord`
+    /// whose `manifest_relative_path` is a non-persisted placeholder (never
+    /// resolves to a real manifest); pre-fix that field was an empty
+    /// string, and `prepare_conversation_for_restore`'s own short-circuit
+    /// (`consumed_manifest.manifest_relative_path.is_empty()`) treated
+    /// empty-vs-non-empty as "no materialized input at all" and skipped
+    /// `events_from_blob`/judge entirely -- even though this path always
+    /// DOES have a real `materialized` file. Exercised directly against
+    /// `prepare_conversation_for_restore` (the actual locus of the bug)
+    /// rather than through `compare_versions`: a byte-divergent host-shell
+    /// wrapper diverges at the `Relation` level for either reason (redacted
+    /// mismatched `excluded_sha256`, or -- if judge never ran at all --
+    /// simply mismatched raw content), so `compare_versions` alone cannot
+    /// distinguish "judge ran and correctly diverged" from "judge never ran
+    /// and content itself still differs"; asserting `excluded[0].is_some()`
+    /// can.
+    #[test]
+    fn prepare_conversation_for_restore_runs_judge_with_placeholder_manifest_path() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let materialized = sessions_dir.join("rollout-n3-direct.jsonl");
+        let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_0", "role": "user", "content": [{"type": "input_text", "text": host_shell_text}]}
+        })
+        .to_string();
+        std::fs::write(&materialized, line + "\n").expect("write codex fixture");
+
+        use crate::connectors::Connector as _;
+        let connector = crate::connectors::codex::CodexConnector::new();
+        let ctx = crate::connectors::ScanContext::with_roots(
+            temp.path().to_path_buf(),
+            vec![crate::connectors::ScanRoot::local(materialized.clone())],
+            None,
+        );
+        let mut convs = connector.scan(&ctx).expect("real codex connector must parse this fixture");
+        assert_eq!(convs.len(), 1, "fixture must reparse into exactly one conversation");
+        let conv = convs.pop().expect("checked len above");
+
+        // Same shape `project_with_scope` builds: no real manifest/blob on
+        // disk, `already_present: true`, a non-empty placeholder in the
+        // field that gates the short-circuit.
+        let record = crate::raw_mirror::RawMirrorCaptureRecord {
+            manifest_id: String::new(),
+            manifest_relative_path: "__digest_projection_not_persisted__".to_string(),
+            blob_relative_path: String::new(),
+            blob_blake3: String::new(),
+            blob_size_bytes: 0,
+            captured_at_ms: 0,
+            source_mtime_ms: None,
+            already_present: true,
+        };
+
+        let prepared = crate::indexer::prepare_conversation_for_restore(
+            "codex",
+            &franken_agent_detection::types::Origin::local(),
+            None,
+            4096,
+            &record,
+            &materialized,
+            conv,
+        );
+
+        assert!(
+            prepared.excluded[0].is_some(),
+            "judge must run for this materialized-but-non-persisted comparison path, not short-circuit to capture_na just because manifest_relative_path never resolves to a real file"
+        );
+        assert_eq!(prepared.conv.messages[0].content, "", "the host-shell row's content must actually be redacted once judge runs");
     }
 
     #[test]
@@ -8455,7 +8536,29 @@ fn restore_project_plan_item(
         Ok(SealedProjection::Projected(prepared)) => {
             // T2b.3 (B段)：恢复链的落库端点，`excluded` marker 必须传到底
             // ——不许再经 `map_to_internal` 的 all-None 包装（会把 marker 吞掉）。
-            Ok(crate::indexer::persist::map_to_internal_with_redactor(&prepared, None))
+            let conv = crate::indexer::persist::map_to_internal_with_redactor(&prepared, None);
+            // R1-B3 (任务书 #118a): the durability barrier for an excluded
+            // session must fire on this entry point too, not just on
+            // `prepare_conversation_for_ingest`'s normal-ingest path -- a
+            // mirror written before B3 existed (or interrupted mid-write)
+            // is not durable just because THIS run happens to be a restore
+            // reading it back; the DB commit right after this call must not
+            // be allowed to land an empty `content` whose sole original is
+            // still one crash away from being lost.
+            if conv.messages.iter().any(|m| m.excluded.is_some()) {
+                let record = crate::raw_mirror::RawMirrorCaptureRecord {
+                    manifest_id: view.manifest_id.clone(),
+                    manifest_relative_path: view.manifest_relative_path.clone(),
+                    blob_relative_path: view.blob_relative_path.clone(),
+                    blob_blake3: view.blob_blake3.clone(),
+                    blob_size_bytes: view.blob_size_bytes,
+                    captured_at_ms: view.captured_at_ms,
+                    source_mtime_ms: None,
+                    already_present: true,
+                };
+                crate::raw_mirror::sync_capture_durable(&journal.data_dir, &record)?;
+            }
+            Ok(conv)
         }
         Ok(other) => anyhow::bail!("sealed projection produced no conversation: {other:?}"),
         Err(err) => anyhow::bail!("sealed projection failed: {err:?}"),

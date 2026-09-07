@@ -1468,8 +1468,19 @@ pub(crate) fn sync_capture_durable(data_dir: &Path, record: &RawMirrorCaptureRec
 
     force_sync_file(&blob_path)?;
     force_sync_file(&manifest_path)?;
-    force_sync_parent(&blob_path)?;
-    force_sync_parent(&manifest_path)?;
+
+    // R1-B3 (任务书 #118a): fsync the FULL directory chain up to the mirror
+    // root, not just each file's immediate parent -- a freshly-created
+    // `blobs/blake3/<prefix>/` needs its own entry fsynced in `blake3/`,
+    // and (if also new) `blake3/`'s entry fsynced in `blobs/`, or a crash
+    // can lose an intermediate directory's entry even though the leaf file
+    // itself is durable, making the blob unreachable despite `sync_all`
+    // having "succeeded". `synced_dirs` dedupes across the blob/manifest
+    // chains (they usually share ancestors) within this one call only --
+    // no state carries across separate `sync_capture_durable` invocations.
+    let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
+    force_sync_dir_chain(&blob_path, &root, &mut synced_dirs)?;
+    force_sync_dir_chain(&manifest_path, &root, &mut synced_dirs)?;
     Ok(())
 }
 
@@ -1481,16 +1492,33 @@ fn force_sync_file(path: &Path) -> Result<()> {
     options.open(path).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror file {}", path.display()))
 }
 
-#[cfg(not(windows))]
-fn force_sync_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
+/// Walk `path`'s parent directory upward through `root` (inclusive),
+/// force-syncing each level not already covered by an earlier call within
+/// the same `synced_dirs` set. Stops at `root` even if further ancestors
+/// exist (never fsyncs outside the mirror tree).
+fn force_sync_dir_chain(path: &Path, root: &Path, synced_dirs: &mut HashSet<PathBuf>) -> Result<()> {
+    let Some(start) = path.parent() else {
         return Ok(());
     };
-    File::open(parent).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror parent {}", parent.display()))
+    for dir in start.ancestors() {
+        if !synced_dirs.insert(dir.to_path_buf()) {
+            break;
+        }
+        force_sync_dir(dir)?;
+        if dir == root {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn force_sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror directory {}", dir.display()))
 }
 
 #[cfg(windows)]
-fn force_sync_parent(_path: &Path) -> Result<()> {
+fn force_sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2338,6 +2366,39 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// R1-B3 (任务书 #118a): a freshly-captured blob lives several
+    /// directory levels deep (`raw-mirror/v1/blobs/blake3/<prefix>/`) under
+    /// a mirror root that itself didn't exist before this capture -- every
+    /// one of those levels is a brand-new directory. `sync_capture_durable`
+    /// must walk and fsync the full chain up to the mirror root without
+    /// erroring, not just the blob/manifest's immediate parent.
+    #[test]
+    fn sync_capture_durable_walks_full_directory_chain_to_root() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b3-fixture.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b3\"}\n").expect("write source");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+
+        sync_capture_durable(&data_dir, &record)
+            .expect("sync_capture_durable must succeed across a freshly-created multi-level directory chain");
     }
 
     #[test]
