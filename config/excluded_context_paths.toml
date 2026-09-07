@@ -1,0 +1,21 @@
+# PR6 T1 (任务书 #111) -- default excluded-context path lists, embedded into
+# the `cass` binary via `include_str!` and used as the fallback tier when no
+# `$XDG_CONFIG_HOME/cass/excluded_context_paths.toml` (or platform config dir
+# equivalent) override exists. See `docs/excluded-rules.md` R2 for the match
+# semantics (predicate P) that consume these four arrays.
+#
+# memory_files: six global memory filenames, matched only under the
+# cc-workspace repo root or one of its `.worktrees/<x>/` roots.
+memory_files = ["USER.md", "SOUL.md", "MEMORY.md", "IDENTITY.md", "TOOLS.md", "WORKSPACE.md"]
+
+# injection_only_files: filenames that only ever appear in the injection
+# chain, matched at any path.
+injection_only_files = ["CLAUDE.local.md", "claude-system.md"]
+
+# workspace_scoped_files: filenames that are project docs elsewhere but
+# injection artifacts under the cc-workspace repo/worktree root.
+workspace_scoped_files = ["CLAUDE.md", "AGENTS.md"]
+
+# project_read_documents: mcp__ccw-control-plane__project_read `document`
+# parameter values the control-plane gateway serves.
+project_read_documents = ["exec", "status", "memory", "user", "soul", "identity", "tools", "workspace"]

@@ -680,6 +680,153 @@ fn config_path_from_parts(
     platform_path.ok_or(ConfigError::NoConfigDir)
 }
 
+fn default_memory_files() -> Vec<String> {
+    [
+        "USER.md",
+        "SOUL.md",
+        "MEMORY.md",
+        "IDENTITY.md",
+        "TOOLS.md",
+        "WORKSPACE.md",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+fn default_injection_only_files() -> Vec<String> {
+    ["CLAUDE.local.md", "claude-system.md"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn default_workspace_scoped_files() -> Vec<String> {
+    ["CLAUDE.md", "AGENTS.md"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+fn default_project_read_documents() -> Vec<String> {
+    [
+        "exec", "status", "memory", "user", "soul", "identity", "tools", "workspace",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// Path allow-list for锚点2 `context_file_read` (PR6 spec v4.3 §2.1, plan v4
+/// 参数冻结; 任务书 #111). Loaded via [`ExcludedContextPaths::load`] --
+/// matching logic (predicate P) lives in `docs/excluded-rules.md` R2 and
+/// `src/indexer/exclusion.rs` (T2), not here: this module only loads the
+/// four path/document-name arrays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExcludedContextPaths {
+    /// Global memory filenames, matched only under the cc-workspace repo
+    /// root or a `.worktrees/<x>/` root beneath it.
+    #[serde(default = "default_memory_files")]
+    pub memory_files: Vec<String>,
+
+    /// Filenames that only ever appear in the injection chain, matched at
+    /// any path.
+    #[serde(default = "default_injection_only_files")]
+    pub injection_only_files: Vec<String>,
+
+    /// Filenames that are ordinary project docs elsewhere but injection
+    /// artifacts under the cc-workspace repo/worktree root.
+    #[serde(default = "default_workspace_scoped_files")]
+    pub workspace_scoped_files: Vec<String>,
+
+    /// `mcp__ccw-control-plane__project_read` `document` parameter values
+    /// the control-plane gateway serves.
+    #[serde(default = "default_project_read_documents")]
+    pub project_read_documents: Vec<String>,
+}
+
+impl Default for ExcludedContextPaths {
+    fn default() -> Self {
+        Self {
+            memory_files: default_memory_files(),
+            injection_only_files: default_injection_only_files(),
+            workspace_scoped_files: default_workspace_scoped_files(),
+            project_read_documents: default_project_read_documents(),
+        }
+    }
+}
+
+const EXCLUDED_CONTEXT_PATHS_FILENAME: &str = "excluded_context_paths.toml";
+const EXCLUDED_CONTEXT_PATHS_BUILTIN_DEFAULT: &str =
+    include_str!("../../config/excluded_context_paths.toml");
+
+impl ExcludedContextPaths {
+    /// Load the excluded-context path lists.
+    ///
+    /// Lookup order (same as [`SourcesConfig::config_path`]):
+    /// `$XDG_CONFIG_HOME/cass/excluded_context_paths.toml` -> platform
+    /// config dir equivalent -> built-in default (the four arrays embedded
+    /// from `config/excluded_context_paths.toml` at compile time). A field
+    /// omitted from an override file falls back to its built-in default
+    /// value (per-field `serde(default = ...)`); a file that fails to parse
+    /// as TOML, or that gives a field the wrong shape (e.g. a string where
+    /// an array is required), is a [`ConfigError`].
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::load_from_candidate(excluded_context_paths_path(
+            dotenvy::var("XDG_CONFIG_HOME").ok().map(PathBuf::from),
+            dirs::config_dir(),
+            dirs::home_dir(),
+        ))
+    }
+
+    fn load_from_candidate(candidate: Option<PathBuf>) -> Result<Self, ConfigError> {
+        let content = match candidate {
+            Some(path) if path.exists() => std::fs::read_to_string(&path)?,
+            _ => EXCLUDED_CONTEXT_PATHS_BUILTIN_DEFAULT.to_string(),
+        };
+
+        let parsed: Self = toml::from_str(&content)?;
+        Ok(parsed)
+    }
+}
+
+/// Resolve the excluded-context path config file location. Mirrors
+/// [`config_path_from_parts`] exactly except for the filename and the
+/// "nothing found" case: `SourcesConfig::config_path` errors with
+/// `NoConfigDir` there (a sources.toml is meaningful when absent -- an empty
+/// config), but for the excluded-context list "nothing found" is not an
+/// error, it is the built-in-default tier, so this returns `Option` instead
+/// of `Result` and lets the caller fall through.
+fn excluded_context_paths_path(
+    xdg_config_home: Option<PathBuf>,
+    platform_config_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(xdg_config) = xdg_config_home {
+        return Some(xdg_config.join("cass").join(EXCLUDED_CONTEXT_PATHS_FILENAME));
+    }
+
+    let platform_path =
+        platform_config_dir.map(|p| p.join("cass").join(EXCLUDED_CONTEXT_PATHS_FILENAME));
+    if let Some(ref path) = platform_path
+        && path.exists()
+    {
+        return Some(path.clone());
+    }
+
+    if let Some(home) = home_dir {
+        let dot_config_path = home
+            .join(".config")
+            .join("cass")
+            .join(EXCLUDED_CONTEXT_PATHS_FILENAME);
+        if dot_config_path.exists() {
+            return Some(dot_config_path);
+        }
+    }
+
+    platform_path
+}
+
 /// Get preset paths for a given platform.
 ///
 /// These are the default agent session directories for each platform.
@@ -1642,6 +1789,86 @@ paths = ["/mnt/histories/laptop"]
             config_path_from_parts(None, Some(platform_config_dir), Some(home_dir))
                 .expect("existing dot-config path"),
             dot_config_path
+        );
+    }
+
+    // PR6 T1 (任务书 #111): ExcludedContextPaths::load.
+
+    #[test]
+    fn excluded_context_paths_default_values_match_frozen_table() {
+        // No candidate resolved (as if XDG/platform/home all miss) -> falls
+        // straight to the built-in default embedded from
+        // config/excluded_context_paths.toml.
+        let paths =
+            ExcludedContextPaths::load_from_candidate(None).expect("built-in default parses");
+
+        assert_eq!(
+            paths.memory_files,
+            vec!["USER.md", "SOUL.md", "MEMORY.md", "IDENTITY.md", "TOOLS.md", "WORKSPACE.md"]
+        );
+        assert_eq!(
+            paths.injection_only_files,
+            vec!["CLAUDE.local.md", "claude-system.md"]
+        );
+        assert_eq!(paths.workspace_scoped_files, vec!["CLAUDE.md", "AGENTS.md"]);
+        assert_eq!(
+            paths.project_read_documents,
+            vec![
+                "exec", "status", "memory", "user", "soul", "identity", "tools", "workspace"
+            ]
+        );
+        // Default::default() must agree (used when no load() call is made).
+        assert_eq!(paths, ExcludedContextPaths::default());
+    }
+
+    #[test]
+    fn excluded_context_paths_xdg_override_only_changes_specified_field() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_config_home = temp.path().join("xdg-config");
+
+        // Exercise the SAME lookup function load() uses, not a hand-built
+        // path, so the mutation described in the task book (deleting the
+        // XDG branch) actually turns this test red.
+        let candidate = excluded_context_paths_path(Some(xdg_config_home.clone()), None, None)
+            .expect("xdg candidate resolved");
+        std::fs::create_dir_all(candidate.parent().expect("candidate parent")).unwrap();
+        std::fs::write(&candidate, "memory_files = [\"CUSTOM.md\"]\n").unwrap();
+
+        let paths = ExcludedContextPaths::load_from_candidate(Some(candidate))
+            .expect("partial override parses");
+
+        assert_eq!(paths.memory_files, vec!["CUSTOM.md"]);
+        // Everything not specified in the override file falls back to the
+        // same frozen defaults as the built-in-default case.
+        let defaults = ExcludedContextPaths::default();
+        assert_eq!(paths.injection_only_files, defaults.injection_only_files);
+        assert_eq!(paths.workspace_scoped_files, defaults.workspace_scoped_files);
+        assert_eq!(paths.project_read_documents, defaults.project_read_documents);
+    }
+
+    #[test]
+    fn excluded_context_paths_bad_file_reports_config_error() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let not_toml = temp.path().join("not-toml.toml");
+        std::fs::write(&not_toml, "this is not valid toml [[[").unwrap();
+        let err = ExcludedContextPaths::load_from_candidate(Some(not_toml))
+            .expect_err("syntactically invalid TOML must error");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected ConfigError::Parse, got {err:?}"
+        );
+
+        // "缺数组" (任务书 #111): a field that must be an array given the
+        // wrong shape -- not merely omitted (that falls back to default per
+        // the override test above), but present with an incompatible type.
+        let wrong_shape = temp.path().join("wrong-shape.toml");
+        std::fs::write(&wrong_shape, "memory_files = \"not-an-array\"\n").unwrap();
+        let err = ExcludedContextPaths::load_from_candidate(Some(wrong_shape))
+            .expect_err("a scalar where an array is required must error");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected ConfigError::Parse, got {err:?}"
         );
     }
 
