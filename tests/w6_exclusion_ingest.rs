@@ -677,6 +677,11 @@ fn capture_failed_before_capture_hook_making_source_unreadable_skips_session() {
         0,
         "a capture-failed session must not land any rows; run_index result={result:?}"
     );
+    // R1-B1 (任务书 #118a): the watermark-preserving soft-fail semantics are
+    // for the continuous `--watch` loop's self-healing retry; this is an
+    // explicit `--watch-once` invocation with nothing else to retry it, so
+    // it must surface as a hard Err.
+    assert!(result.is_err(), "a capture-failed --watch-once run must return Err: {result:?}");
 }
 
 /// Judge case B.10 #4, capture-failure ②: `PrepareStage::BeforeCapture`
@@ -708,6 +713,8 @@ fn capture_failed_before_capture_hook_deleting_source_file_skips_session() {
         0,
         "a session whose source vanished before capture must not land any rows; run_index result={result:?}"
     );
+    // R1-B1 (任务书 #118a): see the sibling test above for why Err, not Ok.
+    assert!(result.is_err(), "a capture-failed --watch-once run must return Err: {result:?}");
 }
 
 /// Judge case B.10 #4, capture-failure ③: `PrepareStage::BeforeDurableSync`
@@ -752,6 +759,8 @@ fn capture_failed_before_durable_sync_hook_readonly_blob_dir_skips_session() {
         0,
         "a session whose durable-sync step failed must not land any rows; run_index result={result:?}"
     );
+    // R1-B1 (任务书 #118a): see the first capture-failure test above for why Err, not Ok.
+    assert!(result.is_err(), "a capture-failed --watch-once run must return Err: {result:?}");
 }
 
 /// Judge case B.10 #5: `PrepareStage::BeforeCapture` appends a second,
@@ -851,9 +860,14 @@ fn status_json_last_index_counters_survive_a_failed_run() {
     let second_run_result = run_index_in_process(&data_dir, second_session_path.clone());
     coding_agent_search::indexer::set_prepare_fault_hook(None);
     std::fs::set_permissions(&second_session_path, std::fs::Permissions::from_mode(0o600)).ok();
+    // R1-B1 (任务书 #118a): reversed from the pre-fix `is_ok()` assertion --
+    // that assertion had pinned the exact bug this test exists to catch
+    // (a capture failure silently swallowed, reported as a successful run).
+    // An explicit `--watch-once` invocation with no other cycle to retry it
+    // must now surface the failure as a hard `Err`.
     assert!(
-        second_run_result.is_ok(),
-        "run_index itself returns Ok even when an individual session's capture fails (it logs and skips that session, matching the CLI's own observed behavior); a hard Err here would mean something else broke: {second_run_result:?}"
+        second_run_result.is_err(),
+        "a capture-failed --watch-once run must return Err, not silently report success: {second_run_result:?}"
     );
     assert_eq!(
         message_row_count(&data_dir.join("agent_search.db")),

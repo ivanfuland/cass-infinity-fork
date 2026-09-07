@@ -7121,7 +7121,17 @@ fn spawn_connector_producer(
                 match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
                     Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
+                        // R1-B1 (任务书 #118a): a prepare failure must be a
+                        // real ScanError, not a silent warn+skip -- otherwise
+                        // `Done`'s `scan_succeeded` stays true and the
+                        // watermark advances past a session that never
+                        // landed a single row.
                         tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                        scan_succeeded = false;
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!("prepare_conversation_for_ingest failed: {error}"),
+                        });
                         Ok(())
                     }
                 }
@@ -7231,7 +7241,14 @@ fn spawn_connector_producer(
                 match prepared {
                     Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
+                        // R1-B1 (任务书 #118a): same fix as the local-sources
+                        // callback above.
                         tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                        scan_succeeded = false;
+                        let _ = tx.send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!("prepare_conversation_for_ingest failed: {error}"),
+                        });
                         Ok(())
                     }
                 }
@@ -13964,6 +13981,15 @@ fn reindex_paths_with_semantic_delta(
     let mut pending_watch_watermarks: HashMap<ConnectorKind, i64> = HashMap::new();
     let mut watch_preserve_by_kind: HashMap<ConnectorKind, bool> = HashMap::new();
     let mut remaining_triggers_by_kind: HashMap<ConnectorKind, usize> = HashMap::new();
+    // R1-B1 (任务书 #118a): an explicit `--watch-once <path>` invocation has
+    // no "next cycle" to self-heal on -- the watermark-preserve mechanism
+    // that makes a prepare failure a soft, retryable no-op for the
+    // continuous `--watch` loop would otherwise make a one-shot invocation
+    // report success while silently landing zero rows for the one path it
+    // was asked to index. Scoped to `explicit_watch_once` only: the
+    // continuous loop's existing soft-fail-and-retry semantics are
+    // untouched.
+    let mut explicit_watch_once_prepare_failures: usize = 0;
     for (kind, _, _, _) in &triggers {
         *remaining_triggers_by_kind.entry(*kind).or_default() += 1;
     }
@@ -14134,11 +14160,6 @@ fn reindex_paths_with_semantic_delta(
             );
         }
         let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
-        // No-ledger holdbacks poison the whole kind's watermark publication
-        // (deferrals are added at the end of the iteration when known).
-        if !explicit_watch_once && (scan_failed || active_sources_skipped > 0) {
-            watch_preserve_by_kind.insert(kind, true);
-        }
 
         // Provenance injection, path rewriting, capture + exclusion judgment.
         let mut prepared_convs: Vec<crate::indexer::exclusion::PreparedConversation> =
@@ -14148,9 +14169,24 @@ fn reindex_paths_with_semantic_delta(
             match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
                 Ok(prepared) => prepared_convs.push(prepared),
                 Err(error) => {
+                    // R1-B1 (任务书 #118a): a prepare failure must poison
+                    // this kind's watermark the same way a scan-level
+                    // failure already does (`scan_failed` below) -- the
+                    // watermark-preserve check was moved from before this
+                    // loop to after it so a prepare failure discovered here
+                    // is not missed by a check that already ran.
                     tracing::warn!(?kind, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                    scan_failed = true;
+                    if explicit_watch_once {
+                        explicit_watch_once_prepare_failures += 1;
+                    }
                 }
             }
+        }
+        // No-ledger holdbacks poison the whole kind's watermark publication
+        // (deferrals are added at the end of the iteration when known).
+        if !explicit_watch_once && (scan_failed || active_sources_skipped > 0) {
+            watch_preserve_by_kind.insert(kind, true);
         }
         let mut convs = prepared_convs;
         if !explicit_watch_once {
@@ -14417,6 +14453,16 @@ fn reindex_paths_with_semantic_delta(
 
     // Reset phase to idle if progress exists
     reset_progress_to_idle(opts.progress.as_ref());
+
+    // R1-B1 (任务书 #118a): see the counter's declaration comment above --
+    // an explicit `--watch-once` invocation that failed to prepare every
+    // requested session must return a hard `Err`, not `Ok` with rows silently
+    // missing and no other cycle to retry it.
+    if explicit_watch_once_prepare_failures > 0 {
+        anyhow::bail!(
+            "cass index --watch-once: {explicit_watch_once_prepare_failures} session(s) failed capture/prepare and were skipped without landing any rows"
+        );
+    }
 
     Ok(total_indexed)
 }

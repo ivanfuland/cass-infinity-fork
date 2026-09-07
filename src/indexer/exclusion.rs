@@ -127,8 +127,29 @@ impl ExcludedMarker {
 
     /// Inverse of [`Self::to_json_string`], for reading a JSONB column back
     /// via `json(excluded)`.
+    ///
+    /// R1-B4 (任务书 #118a): validates `sha256`/`fingerprint_blake3` as
+    /// 64-char lowercase hex *here*, at deserialization -- not left for
+    /// `storage::sqlite`'s `fingerprint_hash_for` to discover downstream.
+    /// `apply()` always writes both fields that way, so a well-formed row
+    /// never trips this; a malformed one (corrupted DB, hand-built test
+    /// fixture, future writer bug) becomes a plain `Err` a caller can turn
+    /// into a per-session `ScanError`, instead of surviving into a
+    /// `Message` whose `fingerprint_hash(msg).expect(...)` would abort the
+    /// whole process (release builds are `panic = "abort"`).
     pub fn from_json_str(s: &str) -> anyhow::Result<Self> {
-        Ok(serde_json::from_str(s)?)
+        let marker: Self = serde_json::from_str(s)?;
+        validate_hex64_field(&marker.sha256, "sha256")?;
+        validate_hex64_field(&marker.fingerprint_blake3, "fingerprint_blake3")?;
+        Ok(marker)
+    }
+}
+
+fn validate_hex64_field(value: &str, field: &str) -> anyhow::Result<()> {
+    if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        anyhow::bail!("excluded.{field} must be 64 lowercase hex chars, got {value:?}")
     }
 }
 
@@ -493,11 +514,26 @@ pub struct PairingContext {
 
 impl PairingContext {
     pub fn build(candidates: &[PairingCandidate]) -> Self {
+        // R1-B5 (任务书 #118a): a `tool_call_id` reused by two different
+        // `ToolCall`s (T1b measured 416 such `ambiguous_call_id` cases) must
+        // resolve to NO entry at all, not "whichever one `insert` saw last" --
+        // an ordinary tool call's result getting silently bound to a later,
+        // unrelated call with the same id (and then judged/cleared as that
+        // call's result) is data corruption, not a pairing nuance. Once an id
+        // is seen twice it's marked ambiguous and permanently excluded from
+        // `by_id` (a third+ occurrence must not resurrect it either).
         let mut by_id: HashMap<&str, &PairedTool> = HashMap::new();
+        let mut ambiguous_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for c in candidates {
             if let PairingCandidate::ToolCall(pt) = c {
                 if let Some(id) = pt.tool_call_id.as_deref() {
-                    by_id.insert(id, pt);
+                    if ambiguous_ids.contains(id) {
+                        continue;
+                    }
+                    if by_id.insert(id, pt).is_some() {
+                        by_id.remove(id);
+                        ambiguous_ids.insert(id);
+                    }
                 }
             }
         }
@@ -1687,6 +1723,37 @@ mod tests {
         assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(), "missing args must not match R2");
     }
 
+    /// R1-B5 (任务书 #118a): two different `ToolCall`s reusing the same
+    /// `tool_call_id` (T1b measured 416 real `ambiguous_call_id` cases) must
+    /// leave BOTH of their results unpaired (宁漏勿误), never bind an
+    /// ordinary result to the wrong call's identity.
+    #[test]
+    fn r4_duplicate_tool_call_id_leaves_both_results_unpaired_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1")), tool_result_block(1, Some("t1"))] };
+        let ctx = ctx_from(&[
+            // Call A: an ordinary, non-excluded tool.
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: Some("t1".into()), tool_name: "SomeOtherTool".into(), args: Some(serde_json::json!({})) }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+            // Call B: reuses the SAME id, and is itself a cass-mcp recall call.
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "mcp__cass-mcp__cass_search".into(),
+                args: Some(serde_json::json!({})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let result_a = msg("tool_result", "ordinary result A, must never be excluded");
+        let result_b = msg("tool_result", "recall result B");
+        assert!(
+            decide(&result_a, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
+            "call A's result must not be excluded just because a later call reused its id"
+        );
+        assert!(
+            decide(&result_b, 3, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
+            "call B's own result must ALSO stay unpaired once its id is ambiguous (宁漏勿误), not just A's"
+        );
+    }
+
     #[test]
     fn r1_c_mutation_removing_codex_alias_breaks_r1_d() {
         // Mutation for R1-d: without codex in the bare-name table, the R1-d
@@ -1945,5 +2012,35 @@ mod tests {
         assert!(json.contains("\"reason\":\"context_file_read\""));
         let round_tripped = ExcludedMarker::from_json_str(&json).unwrap();
         assert_eq!(round_tripped, marker);
+    }
+
+    /// R1-B4 (任务书 #118a): a malformed `fingerprint_blake3` (structurally
+    /// valid JSON, invalid hex/length) must be a plain `Err` from
+    /// `from_json_str` itself -- never a `Message` that later `.expect()`s
+    /// its way into a process abort inside `storage::sqlite`'s merge/replay
+    /// fingerprint helpers (release builds are `panic = "abort"`).
+    #[test]
+    fn from_json_str_rejects_malformed_fingerprint_blake3() {
+        let json = format!(
+            r#"{{"reason":"context_file_read","rule_version":1,"bytes":4,"sha256":"{}","fingerprint_blake3":"zz","anchor":{{}},"raw":{{"blob":"blobs/blake3/ab/abcd.raw","idx":0,"event_key":"ek","blocks":[]}}}}"#,
+            "a".repeat(64)
+        );
+        let err = ExcludedMarker::from_json_str(&json).expect_err("length/hex-invalid fingerprint_blake3 must be rejected, not silently accepted");
+        assert!(err.to_string().contains("fingerprint_blake3"), "error must name the offending field: {err}");
+    }
+
+    /// Mutation for the above: reverting `from_json_str` to a bare
+    /// `serde_json::from_str` (no hex/length validation) would make this
+    /// malformed marker parse successfully -- confirmed by inspection of
+    /// the pre-fix code (`Ok(serde_json::from_str(s)?)`), which has no way
+    /// to fail on a structurally-valid-but-wrong-length string field.
+    #[test]
+    fn from_json_str_rejects_wrong_length_sha256() {
+        let json = format!(
+            r#"{{"reason":"context_file_read","rule_version":1,"bytes":4,"sha256":"deadbeef","fingerprint_blake3":"{}","anchor":{{}},"raw":{{"blob":"blobs/blake3/ab/abcd.raw","idx":0,"event_key":"ek","blocks":[]}}}}"#,
+            "b".repeat(64)
+        );
+        let err = ExcludedMarker::from_json_str(&json).expect_err("short sha256 must be rejected");
+        assert!(err.to_string().contains("sha256"), "error must name the offending field: {err}");
     }
 }
