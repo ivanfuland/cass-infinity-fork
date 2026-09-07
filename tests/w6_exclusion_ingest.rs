@@ -432,3 +432,452 @@ fn transport_chain_equivalence_across_ingestion_modes() {
         "streaming (default) and --watch-once must produce identical exclusion rows"
     );
 }
+
+// =============================================================================
+// T2b.3 (B段, 任务书 #116) B.10 CLI 级判例: codex host-shell 正例（含合成秘密）+
+// 捕获失败三例 + 追加判例 + status 判例。
+//
+// The fault-hook cases (`PrepareStage::BeforeCapture` / `BeforeDurableSync`)
+// must run in-process, not as a `cass` subprocess: `set_prepare_fault_hook`
+// is a single process-global slot (same reasoning as `HOOK_TEST_SERIALIZE`
+// above for the prune hook), so a spawned subprocess would never see a hook
+// this test process installs. `run_index` is the exact library entry point
+// the CLI itself calls (`src/lib.rs`'s index-command handler spawns it in a
+// thread with an `IndexOptions` built from the same flags), so calling it
+// directly here with `watch_once_paths` set (bypassing `$HOME`-based
+// connector auto-discovery, which would race other tests' env vars in this
+// multi-threaded test binary) exercises the real prepare path.
+// =============================================================================
+
+/// codex `rollout-*.jsonl` fixture: idx=0 host-shell wrapper (anchor 3,
+/// excluded), idx=1 a `cass_search` tool_call (not itself excluded) whose
+/// idx=2 `tool_result` embeds a synthetic Anthropic-shaped API key (anchor
+/// 1, bare codex name per R11) so the excluded row's `sha256` can be proven
+/// to hash the *redacted* text, not the raw secret, idx=3 a real user
+/// follow-up (not excluded). Filename must start with `rollout-`
+/// (`CodexConnector::is_rollout_file` filters on this even for an explicit
+/// single-file `ScanRoot::local` scan, T2b.2 finding); the path must ALSO
+/// sit under a `.codex/sessions/` ancestor -- `classify_paths`
+/// (`src/indexer/mod.rs`, `classify_paths_hints_codex_connector_for_
+/// explicit_codex_paths`) matches an explicit `--watch-once`/in-process
+/// path to a connector by that directory shape, not filename alone; a flat
+/// tempdir path is silently classified as "no connector" and produces zero
+/// rows with no error. Returns the file path and the raw (pre-redaction)
+/// `function_call_output` string so callers can independently compute the
+/// expected redacted hash.
+fn write_codex_host_shell_session(dir: &std::path::Path) -> (std::path::PathBuf, String) {
+    let sessions_dir = dir.join(".codex").join("sessions").join("2026").join("09");
+    std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+    let file = sessions_dir.join("rollout-w6-hostshell.jsonl");
+    let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+    let recall_output = serde_json::json!({
+        "query": "prior secret rotation note", "limit": 5, "offset": 0, "count": 1, "total_matches": 1,
+        "hits": [{
+            "agent": "codex", "content": "rotate the key sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij before Friday",
+            "created_at": 1700000000000i64, "line_number": 3, "match_type": "exact",
+            "origin_kind": "local", "score": 0.8, "snippet": "rotate the key",
+            "source_id": 7, "source_path": "/logs/other-session.jsonl",
+            "title": "key rotation", "workspace": "/ws/demo"
+        }],
+        "cursor": null, "hits_clamped": false, "max_tokens": 8000, "request_id": "req-w6-codex-1"
+    })
+    .to_string();
+
+    let events: Vec<serde_json::Value> = vec![
+        serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_0","role":"user","content":[{"type":"input_text","text":host_shell_text}]}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"cass_search","arguments":"{\"query\":\"prior secret rotation note\"}","call_id":"call_1"}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":recall_output}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"what did you find?"}]}}),
+    ];
+    let body = events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(&file, &body).expect("write codex session fixture");
+    (file, recall_output)
+}
+
+/// `(idx, role, content, excluded_is_some, reason, sha256, raw_blob,
+/// raw_event_key, raw_blocks_json)` rows, ordered by `idx`, from the first
+/// (only) conversation in `db_path`.
+fn read_message_rows_single_conversation(
+    db_path: &std::path::Path,
+) -> Vec<(i64, String, String, bool, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> {
+    let conn = rusqlite::Connection::open(db_path).expect("open candidate db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.idx, m.role, m.content, (m.excluded IS NOT NULL), \
+                    json_extract(m.excluded,'$.reason'), json_extract(m.excluded,'$.sha256'), \
+                    json_extract(m.excluded,'$.raw.blob'), json_extract(m.excluded,'$.raw.event_key'), \
+                    json_extract(m.excluded,'$.raw.blocks') \
+             FROM messages m ORDER BY m.idx",
+        )
+        .expect("prepare message-rows query");
+    stmt.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+            r.get(8)?,
+        ))
+    })
+    .expect("query message rows")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("collect message rows")
+}
+
+/// Judge case B.10 #1 (codex half): the CLI subprocess ingests the codex
+/// host-shell fixture; both anchors fire (idx0 anchor 3, idx2 anchor 1),
+/// the tool_call row (idx1) and the trailing user follow-up (idx3) survive
+/// byte-for-byte, row count is preserved (4 in, 4 out), and the anchor-1
+/// row's `excluded.sha256` is the hash of the *redacted* recall output, not
+/// the raw one (proving a real secret got scrubbed, not a no-op pass).
+#[test]
+fn normal_ingest_codex_host_shell_and_bare_name_recall_positive() {
+    use sha2::{Digest, Sha256};
+
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let home = home_tmp.path();
+    let data_dir = home.join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, raw_recall_output) = write_codex_host_shell_session(session_dir.path());
+
+    let output = cass_cmd(&data_dir, home)
+        .args(["index", "--watch-once", session_path.to_str().expect("utf8 session path"), "--json"])
+        .output()
+        .expect("spawn cass index --watch-once");
+    assert!(
+        output.status.success(),
+        "codex ingest must succeed; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rows = read_message_rows_single_conversation(&data_dir.join("agent_search.db"));
+    assert_eq!(rows.len(), 4, "row count must equal projected message count; rows={rows:?}");
+
+    // idx0: host-shell wrapper, excluded via anchor 3.
+    let (idx0_idx, _role0, content0, excluded0, reason0, sha0, blob0, event_key0, blocks0) = &rows[0];
+    assert_eq!(*idx0_idx, 0);
+    assert!(*excluded0, "idx0 must be excluded (anchor 3): {:?}", rows[0]);
+    assert_eq!(reason0.as_deref(), Some("codex_host_shell"));
+    assert_eq!(content0, "", "excluded content must be empty: {:?}", rows[0]);
+    assert!(sha0.as_deref().is_some_and(|s| !s.is_empty()), "sha256 must be non-empty: {:?}", rows[0]);
+    assert!(blob0.as_deref().is_some_and(|b| !b.is_empty()), "raw.blob must be a non-empty manifest-relative path: {:?}", rows[0]);
+    assert!(event_key0.as_deref().is_some_and(|e| !e.is_empty()), "raw.event_key must be non-empty: {:?}", rows[0]);
+    assert_ne!(blocks0.as_deref(), Some("[]"), "raw.blocks must be non-empty: {:?}", rows[0]);
+
+    // idx1: the tool_call itself is never the exclusion target.
+    let (idx1_idx, _role1, _content1, excluded1, ..) = &rows[1];
+    assert_eq!(*idx1_idx, 1);
+    assert!(!excluded1, "tool_call row must not itself be excluded: {:?}", rows[1]);
+
+    // idx2: tool_result carrying the synthetic secret, excluded via anchor 1.
+    let (idx2_idx, _role2, content2, excluded2, reason2, sha2_hex, ..) = &rows[2];
+    assert_eq!(*idx2_idx, 2);
+    assert!(*excluded2, "idx2 (tool_result) must be excluded (anchor 1): {:?}", rows[2]);
+    assert_eq!(reason2.as_deref(), Some("cass_recall"));
+    assert_eq!(content2, "", "excluded content must be empty: {:?}", rows[2]);
+    let redacted = coding_agent_search::indexer::redact_secrets::redact_text(&raw_recall_output).into_owned();
+    assert_ne!(redacted, raw_recall_output, "fixture sanity: the synthetic secret must actually get redacted, otherwise this assertion is vacuous");
+    let expected_sha = format!("{:x}", Sha256::digest(redacted.as_bytes()));
+    let raw_sha = format!("{:x}", Sha256::digest(raw_recall_output.as_bytes()));
+    assert_eq!(sha2_hex.as_deref(), Some(expected_sha.as_str()), "excluded.sha256 must hash the redacted text");
+    assert_ne!(sha2_hex.as_deref(), Some(raw_sha.as_str()), "excluded.sha256 must NOT equal the raw (unredacted) text's hash");
+
+    // idx3: trailing follow-up, untouched byte-for-byte.
+    let (idx3_idx, _role3, content3, excluded3, ..) = &rows[3];
+    assert_eq!(*idx3_idx, 3);
+    assert!(!excluded3, "idx3 must not be excluded: {:?}", rows[3]);
+    assert_eq!(content3, "what did you find?", "unexcluded row content must be byte-for-byte unchanged");
+}
+
+/// In-process `run_index` call using `watch_once_paths` (bypasses `$HOME`
+/// connector auto-discovery -- see the fault-hook cases' module doc above).
+fn run_index_in_process(
+    data_dir: &std::path::Path,
+    watch_once_path: std::path::PathBuf,
+) -> anyhow::Result<()> {
+    let opts = coding_agent_search::indexer::IndexOptions {
+        full: false,
+        force_rebuild: false,
+        watch: false,
+        watch_once_paths: Some(vec![watch_once_path]),
+        db_path: data_dir.join("agent_search.db"),
+        data_dir: data_dir.to_path_buf(),
+        semantic: false,
+        embedder: "hash".to_string(),
+        progress: None,
+        watch_interval_secs: 30,
+    };
+    coding_agent_search::indexer::run_index(opts, None)
+}
+
+fn message_row_count(db_path: &std::path::Path) -> i64 {
+    if !db_path.exists() {
+        return 0;
+    }
+    let conn = rusqlite::Connection::open(db_path).expect("open db for row count");
+    conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap_or(0)
+}
+
+/// Judge case B.10 #4, capture-failure ①: `PrepareStage::BeforeCapture`
+/// makes the source file unreadable (mode `0o000`, not deleted -- the
+/// permission-denied sibling of the delete-based case ② right below)
+/// between the connector's own scan pass and `attach_raw_mirror_capture`'s
+/// independent re-read of the same bytes -- the resulting permission error
+/// must be a hard `CaptureFailed`, same as `NotFound`.
+///
+/// **Not a subprocess/exit-code test**, despite this judge case's
+/// mission-text name ("只读镜像目录/退出码非零") -- two things that sound
+/// simple both turned out not to hold empirically in this codebase:
+/// (a) chmod'ing the *mirror* directory read-only does nothing, because
+/// `raw_mirror.rs` explicitly `set_permissions(..., 0o700)`s every
+/// directory it creates/ensures as part of normal capture setup (defensive
+/// against a restrictive umask) -- confirmed empirically, a session
+/// ingests cleanly straight through a pre-chmod'd 0o500 mirror root;
+/// (b) chmod'ing the *source* file unreadable **before the CLI process
+/// even starts** doesn't produce a capture failure either, because the
+/// connector's own scan step can't read it at all and treats "not a
+/// parseable session" as zero-conversations-found (exit 0), never
+/// reaching `attach_raw_mirror_capture` in the first place -- confirmed
+/// empirically (`cass index --watch-once` on a pre-`chmod 0o000`'d file:
+/// `"success":true`, `"conversations":0`). The hook is what makes this a
+/// genuine `CaptureFailed` rather than an invisible "no session" no-op:
+/// it fires only *after* the connector's scan already produced a real
+/// `NormalizedConversation` from the still-readable file, so the
+/// permission change lands exactly in the window between that successful
+/// scan and raw-mirror's independent re-read.
+#[test]
+fn capture_failed_before_capture_hook_making_source_unreadable_skips_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serialize = HOOK_TEST_SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let data_dir = home_tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
+
+    let to_lock_down = session_path.clone();
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+        if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
+            std::fs::set_permissions(&to_lock_down, std::fs::Permissions::from_mode(0o000)).ok();
+        }
+    })));
+    let result = run_index_in_process(&data_dir, session_path.clone());
+    coding_agent_search::indexer::set_prepare_fault_hook(None);
+    std::fs::set_permissions(&session_path, std::fs::Permissions::from_mode(0o600)).ok();
+
+    assert_eq!(
+        message_row_count(&data_dir.join("agent_search.db")),
+        0,
+        "a capture-failed session must not land any rows; run_index result={result:?}"
+    );
+}
+
+/// Judge case B.10 #4, capture-failure ②: `PrepareStage::BeforeCapture`
+/// deletes the source file between the first scan pass and
+/// `attach_raw_mirror_capture` -- the resulting `NotFound` must be a hard
+/// `CaptureFailed` (Global Constraints: `SourceKind::File` capture-time
+/// absence is never treated as a logical source), so the session lands
+/// zero rows.
+#[test]
+fn capture_failed_before_capture_hook_deleting_source_file_skips_session() {
+    let _serialize = HOOK_TEST_SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let data_dir = home_tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
+
+    let to_delete = session_path.clone();
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+        if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
+            std::fs::remove_file(&to_delete).ok();
+        }
+    })));
+    let result = run_index_in_process(&data_dir, session_path);
+    coding_agent_search::indexer::set_prepare_fault_hook(None);
+
+    assert_eq!(
+        message_row_count(&data_dir.join("agent_search.db")),
+        0,
+        "a session whose source vanished before capture must not land any rows; run_index result={result:?}"
+    );
+}
+
+/// Judge case B.10 #4, capture-failure ③: `PrepareStage::BeforeDurableSync`
+/// chmods the raw-mirror `blobs` directory to `0o000` (no read, no
+/// execute -- blocking *traversal* into it, not just writes) right before
+/// `sync_capture_durable` -- its `force_sync_parent` opens the blob's
+/// parent directory (a subdirectory *under* `blobs`) purely to fsync it,
+/// so only blocking traversal through `blobs` itself makes that open fail;
+/// `0o500` (blocks writes, keeps read+execute) does not, since nothing
+/// under `sync_capture_durable` ever tries to create anything inside
+/// `blobs` -- everything it touches was already written during capture,
+/// earlier in the same prepare call, before this hook fires. The R2-B1
+/// fsync-before-commit step must fail closed (排除行提交前镜像必须持久化),
+/// so the session lands zero rows rather than committing empty content
+/// with no durable original.
+#[test]
+fn capture_failed_before_durable_sync_hook_readonly_blob_dir_skips_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serialize = HOOK_TEST_SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let data_dir = home_tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
+
+    let blobs_dir = data_dir.join("raw-mirror").join("v1").join("blobs");
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+        if stage == coding_agent_search::indexer::PrepareStage::BeforeDurableSync {
+            std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o000)).ok();
+        }
+    })));
+    let result = run_index_in_process(&data_dir, session_path);
+    coding_agent_search::indexer::set_prepare_fault_hook(None);
+
+    // Restore permissions unconditionally before the tempdir is torn down.
+    let blobs_dir_restore = data_dir.join("raw-mirror").join("v1").join("blobs");
+    std::fs::set_permissions(&blobs_dir_restore, std::fs::Permissions::from_mode(0o700)).ok();
+
+    assert_eq!(
+        message_row_count(&data_dir.join("agent_search.db")),
+        0,
+        "a session whose durable-sync step failed must not land any rows; run_index result={result:?}"
+    );
+}
+
+/// Judge case B.10 #5: `PrepareStage::BeforeCapture` appends a second,
+/// complete synthetic event to the source file right before capture --
+/// capture/reparse must pick up the appended event too (the reparse is
+/// from the just-captured blob, which necessarily includes it), landing
+/// N+1 rows with no error, not N (stale first-pass count) and not a
+/// CaptureFailed.
+#[test]
+fn before_capture_hook_appending_a_complete_event_lands_n_plus_one_rows() {
+    let _serialize = HOOK_TEST_SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let data_dir = home_tmp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
+
+    let to_append = session_path.clone();
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+        if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
+            use std::io::Write;
+            let appended = serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_appended","role":"user","content":[{"type":"input_text","text":"appended after first parse"}]}});
+            let mut f = std::fs::OpenOptions::new().append(true).open(&to_append).expect("open source for append");
+            writeln!(f, "{appended}").expect("append event");
+        }
+    })));
+    let result = run_index_in_process(&data_dir, session_path);
+    coding_agent_search::indexer::set_prepare_fault_hook(None);
+    result.expect("run_index must succeed when the appended tail is a well-formed event");
+
+    assert_eq!(
+        message_row_count(&data_dir.join("agent_search.db")),
+        5,
+        "the fixture's 4 messages plus the appended 5th must all land, not just the pre-append 4"
+    );
+}
+
+/// Judge case B.10 #7: `cass status --json`'s `last_index.*` three keys
+/// reflect the most recent successful run's counters, and a subsequent
+/// failed run must leave them unchanged rather than clobbering them with
+/// zeros.
+///
+/// The second (failing) run uses the same `BeforeCapture`-hook technique as
+/// `capture_failed_before_capture_hook_making_source_unreadable_skips_
+/// session` above, in-process, sharing `data_dir` with the first
+/// (subprocess) run's DB -- neither a subprocess-level "只读镜像目录" nor
+/// an unreadable-before-launch source file actually fails this CLI (see
+/// that test's doc comment for the empirical findings), so there is no
+/// real subprocess invocation that reliably fails here to assert a
+/// "退出码非零" half of this judge case against.
+#[test]
+fn status_json_last_index_counters_survive_a_failed_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _serialize = HOOK_TEST_SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let home = home_tmp.path();
+    let data_dir = home.join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
+
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
+
+    let output = cass_cmd(&data_dir, home)
+        .args(["index", "--watch-once", session_path.to_str().expect("utf8 session path"), "--json"])
+        .output()
+        .expect("spawn cass index --watch-once");
+    assert!(output.status.success(), "seed ingest must succeed; stderr={}", String::from_utf8_lossy(&output.stderr));
+
+    let status_after_success = cass_cmd(&data_dir, home)
+        .args(["status", "--json"])
+        .output()
+        .expect("spawn cass status --json");
+    assert!(status_after_success.status.success(), "cass status must succeed");
+    let status_value: serde_json::Value =
+        serde_json::from_slice(&status_after_success.stdout).expect("parse cass status --json output");
+    let last_index_after_success = status_value.get("last_index").cloned().unwrap_or(serde_json::Value::Null);
+    let hits_after_success = last_index_after_success.get("codex_host_shell_hits").and_then(serde_json::Value::as_u64);
+    let total_after_success = last_index_after_success.get("codex_idx0_user_total").and_then(serde_json::Value::as_u64);
+    assert_eq!(hits_after_success, Some(1), "codex_host_shell_hits must reflect this run's one anchor-3 hit: {status_value}");
+    assert_eq!(total_after_success, Some(1), "codex_idx0_user_total must reflect this run's one idx0/user candidate: {status_value}");
+    let event_align_failed_after_success =
+        last_index_after_success.get("event_align_failed").and_then(serde_json::Value::as_u64);
+    assert_eq!(event_align_failed_after_success, Some(0), "the fixture is a real mixed shape, alignment must not fail: {status_value}");
+
+    // Now run a genuinely capture-failed session (in-process hook) against
+    // the SAME data_dir -- a failed run must not clobber the counters the
+    // successful subprocess run above just wrote.
+    let second_session_dir = tempfile::TempDir::new().expect("second session dir");
+    let (second_session_path, _raw2) = write_codex_host_shell_session(second_session_dir.path());
+    let to_lock_down = second_session_path.clone();
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+        if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
+            std::fs::set_permissions(&to_lock_down, std::fs::Permissions::from_mode(0o000)).ok();
+        }
+    })));
+    let second_run_result = run_index_in_process(&data_dir, second_session_path.clone());
+    coding_agent_search::indexer::set_prepare_fault_hook(None);
+    std::fs::set_permissions(&second_session_path, std::fs::Permissions::from_mode(0o600)).ok();
+    assert!(
+        second_run_result.is_ok(),
+        "run_index itself returns Ok even when an individual session's capture fails (it logs and skips that session, matching the CLI's own observed behavior); a hard Err here would mean something else broke: {second_run_result:?}"
+    );
+    assert_eq!(
+        message_row_count(&data_dir.join("agent_search.db")),
+        4,
+        "the failed second session must not have added any rows on top of the first run's 4"
+    );
+
+    let status_after_failure = cass_cmd(&data_dir, home)
+        .args(["status", "--json"])
+        .output()
+        .expect("spawn cass status --json after failure");
+    assert!(status_after_failure.status.success(), "cass status must succeed even after a failed index run");
+    let status_value_after_failure: serde_json::Value =
+        serde_json::from_slice(&status_after_failure.stdout).expect("parse cass status --json output after failure");
+    let last_index_after_failure =
+        status_value_after_failure.get("last_index").cloned().unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        last_index_after_failure.get("codex_host_shell_hits").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "a failed run must preserve the previous successful run's codex_host_shell_hits, not zero it: {status_value_after_failure}"
+    );
+    assert_eq!(
+        last_index_after_failure.get("codex_idx0_user_total").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "a failed run must preserve the previous successful run's codex_idx0_user_total, not zero it: {status_value_after_failure}"
+    );
+}

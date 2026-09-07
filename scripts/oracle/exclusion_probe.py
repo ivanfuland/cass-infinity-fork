@@ -271,6 +271,15 @@ _CLOSER = "</environment_context>"
 
 
 def anchor3_shell_opener(text: str):
+    # mission #116⑦: mirrors src/indexer/exclusion.rs::anchor3_shell_opener
+    # exactly -- once closer/open/cwd all match, the match condition is
+    # satisfied (CONTAINS, not STARTS-WITH; see that function's doc comment),
+    # so this must never fall back to None here. `startswith` only picks
+    # which of the 3 known constants to *record* as `anchor.shell.opener`;
+    # when the message doesn't start with any of them (R3-f: a real request
+    # with a full env-context block pasted at its own end, "已知漏判方向"),
+    # it still matches and falls back to recording the structural tag
+    # `<environment_context>` itself, since some value must be written.
     trimmed = text.strip()
     if not trimmed.endswith(_CLOSER):
         return None
@@ -279,7 +288,7 @@ def anchor3_shell_opener(text: str):
     for opener in _OPENERS:
         if trimmed.startswith(opener):
             return opener
-    return None
+    return "<environment_context>"
 
 
 def _tool_call_display_text(name, args) -> str:
@@ -694,12 +703,23 @@ def selftest_cases(paths_cfg):
     ]
     cases.append(("R4 two unpaired candidates", cands, 3, 0, "claude_code", None))
 
+    # 15. R3-f positive, fallback opener (mission #116⑦): a real user request
+    # with a full <environment_context>...<cwd>...</environment_context>
+    # block pasted at the end. Doesn't start with any of the 3 known
+    # openers, but still satisfies closer+open+cwd -- CONTAINS, not
+    # STARTS-WITH (see anchor3_shell_opener's doc comment / Rust's own
+    # R3-f). Must still match, falling back to recording
+    # "<environment_context>" as the opener rather than returning None.
+    text3 = "please do X\n<environment_context>\n<cwd>/x</cwd>\n</environment_context>"
+    cands = [_mk("user", text=text3)]
+    cases.append(("R3-f known-opener-miss still matches (fallback opener)", cands, 0, 0, "codex", "codex_host_shell"))
+
     return cases
 
 
 def run_selftest(paths_cfg) -> bool:
     cases = selftest_cases(paths_cfg)
-    assert len(cases) == 14, f"selftest must have exactly 14 cases, got {len(cases)}"
+    assert len(cases) == 15, f"selftest must have exactly 15 cases, got {len(cases)}"
     passed = 0
     for name, cands, index, idx_in_session, agent_slug, expect in cases:
         pairing = PairingContext(cands)

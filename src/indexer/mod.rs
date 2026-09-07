@@ -14246,6 +14246,25 @@ fn reindex_paths_with_semantic_delta(
                         },
                     )?;
                 }
+                // mission #116⑥: `--json` scan report disclosure. `run_index`'s
+                // own copy of this same three-line block (right before its
+                // `targeted_watch_once_only_run`/meta-persist branch) only
+                // covers the broad-scan path -- watch/watch-once ingestion
+                // happens later, in this function, called from inside
+                // `watch_sources`'s callback, so it needs its own copy or
+                // `cass index --watch-once --json`'s `indexing_stats` never
+                // picks up a non-zero count (confirmed empirically: the `meta`
+                // table write above landed real counts while `indexing_stats`
+                // still showed zeros before this fix).
+                if let Some(p) = &opts.progress
+                    && let Ok(mut stats) = p.stats.lock()
+                {
+                    let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
+                        last_index_run_counters_snapshot();
+                    stats.codex_host_shell_hits = codex_host_shell_hits;
+                    stats.codex_idx0_user_total = codex_idx0_user_total;
+                    stats.event_align_failed = event_align_failed;
+                }
 
                 // Deferred check is CUMULATIVE, not per-chunk: once any earlier
                 // chunk deferred a conversation, a later successful chunk must

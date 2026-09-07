@@ -70915,6 +70915,12 @@ fn run_status(
             "warnings": warnings,
             "data_dir": data_dir.display().to_string(),
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            // T2b.3 (B段, mission #116⑦): `run_status` builds this payload by
+            // selectively copying named keys out of `state` (`state_meta_json_
+            // inner`'s full output), not by merging it wholesale -- `last_index`
+            // needs its own explicit copy here or it never reaches `cass status
+            // --json`, same as every other `state.get("...")` line in this block.
+            "last_index": state.get("last_index").cloned().unwrap_or(serde_json::Value::Null),
             "database": serde_json::json!({
                 "exists": db_exists,
                 "opened": db_opened,
