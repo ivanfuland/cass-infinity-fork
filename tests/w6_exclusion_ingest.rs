@@ -222,3 +222,218 @@ fn prune_without_an_outer_lock_leaves_the_window_open_for_a_racing_writer() {
         "MUTATION: without the outer lock, a concurrent writer's lock attempt wrongly succeeds mid-prune"
     );
 }
+
+// =============================================================================
+// T2b.2 (任务书 #115) A.4: transport-chain equivalence across the four
+// ingestion entry points (streaming default / batch / force-rebuild /
+// watch-once). The same `claude_code` session file is scanned by each into
+// its own fresh `--data-dir`; if `PreparedConversation.excluded` markers
+// really do survive every one of `IndexMessage::Batch` /
+// `PendingBatchScan.convs` / `prepared_convs` (watch) /
+// `persist_conversations_batched_*` to `map_to_internal_with_redactor`, the
+// four resulting databases must agree, message-for-message, on which rows
+// got excluded and what they hashed to.
+//
+// Disclosure: the mission text says "claude_code JSONL 含三锚点各一" but
+// anchor 3 (`codex_host_shell`) is structurally codex-only (spec §2.1: the
+// judgment looks at a codex session's `idx=0` message) -- there is no
+// claude_code shape that can trigger it. This fixture carries the two
+// anchors that DO apply to claude_code (R11: `cass_recall` via the
+// `mcp__cass-mcp__*` full-name alias, `context_file_read` via `Read`) plus
+// two non-excluded control messages, and the codex-specific anchor 3 case
+// is covered separately in the CLI-level judgments added later in this
+// file (B.10's codex fixture).
+// =============================================================================
+
+/// Writes a `claude_code` session JSONL with: a plain user question, a
+/// `tool_use`-only turn calling the `cass-mcp` recall tool whose
+/// `tool_result` is anchor-1 excluded, a plain assistant text turn, a
+/// `tool_use`-only turn reading a cc-workspace memory file whose
+/// `tool_result` is anchor-2 excluded, and a closing assistant summary.
+/// Returns the file path.
+///
+/// Each JSONL line carries exactly ONE content-block kind (never a mixed
+/// `text` + `tool_use` turn). `events_from_blob`'s claude_code duplication
+/// rule (`exclusion.rs::claude_code_events_from_blob`) only doubles a raw
+/// event when a single line mixes `tool_result` with another block kind --
+/// it does not (and per its own doc comment, by design does not try to)
+/// model the connector's *own* text+tool_use turn splitting. A line mixing
+/// `text` and `tool_use` reparses into two `NormalizedMessage`s but only
+/// one raw event, so `events.len() != reparsed.messages.len()` and the
+/// whole session's judgment is skipped (`EVENT_ALIGN_FAILED`, 宁漏勿误) --
+/// verified against this binary while writing this fixture. Kept
+/// one-block-per-line here so this equivalence test actually exercises the
+/// exclusion path instead of vacuously passing on zero excluded rows.
+fn write_two_anchor_claude_session(home: &std::path::Path) -> std::path::PathBuf {
+    let project_dir = home.join(".claude/projects/w6-transport-equiv");
+    std::fs::create_dir_all(&project_dir).expect("mkdir claude project dir");
+    let file = project_dir.join("session.jsonl");
+
+    let recall_response = serde_json::json!({
+        "query": "prior decision about worktrees",
+        "limit": 5, "offset": 0, "count": 1, "total_matches": 1,
+        "hits": [{
+            "agent": "claude_code", "content": "we decided to use per-feature worktrees",
+            "created_at": 1700000000000i64, "line_number": 7, "match_type": "exact",
+            "origin_kind": "local", "score": 0.91, "snippet": "per-feature worktrees",
+            "source_id": 42, "source_path": "/logs/prior-session.jsonl",
+            "title": "worktree decision", "workspace": "/ws/demo"
+        }],
+        "cursor": null, "hits_clamped": false, "max_tokens": 8000, "request_id": "req-w6-1"
+    })
+    .to_string();
+    let memory_file_echo = "# USER.md\n\n- test-only synthetic memory line for T2b.2 A.4 fixture\n";
+
+    let events: Vec<serde_json::Value> = vec![
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-07T10:00:00.000Z", "uuid": "w6-evt-000",
+            "message": {"role": "user", "content": "search my past sessions, then check my memory notes"}
+        }),
+        serde_json::json!({
+            "type": "assistant", "timestamp": "2026-09-07T10:00:04.000Z", "uuid": "w6-evt-001a",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_w6_recall_001", "name": "mcp__cass-mcp__cass_search", "input": {"query": "prior decision about worktrees"}}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-07T10:00:06.000Z", "uuid": "w6-evt-002",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_w6_recall_001", "content": recall_response}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "assistant", "timestamp": "2026-09-07T10:00:09.000Z", "uuid": "w6-evt-003pre",
+            "message": {"role": "assistant", "content": "Now let me check your memory file."}
+        }),
+        serde_json::json!({
+            "type": "assistant", "timestamp": "2026-09-07T10:00:10.000Z", "uuid": "w6-evt-003",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_w6_read_001", "name": "Read", "input": {"file_path": home.join("cc-workspace/USER.md").display().to_string()}}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "user", "timestamp": "2026-09-07T10:00:11.000Z", "uuid": "w6-evt-004",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_w6_read_001", "content": memory_file_echo}
+            ]}
+        }),
+        serde_json::json!({
+            "type": "assistant", "timestamp": "2026-09-07T10:00:15.000Z", "uuid": "w6-evt-005",
+            "message": {"role": "assistant", "content": "Found the prior worktree decision and confirmed your memory file preferences."}
+        }),
+    ];
+    let body = events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(&file, body).expect("write claude_code session fixture");
+    file
+}
+
+/// `(external_id, source_path, idx, excluded_is_some, excluded_sha256)` rows
+/// from `messages` joined to `conversations`, ordered for stable comparison.
+#[derive(Debug, PartialEq, Eq, Clone)]
+struct ExclusionRow {
+    external_id: Option<String>,
+    source_path: String,
+    idx: i64,
+    excluded_is_some: bool,
+    excluded_sha256: Option<String>,
+}
+
+fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
+    let conn = rusqlite::Connection::open(db_path).expect("open candidate db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.external_id, c.source_path, m.idx, \
+                    (m.excluded IS NOT NULL), json_extract(m.excluded, '$.sha256') \
+             FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+             ORDER BY c.external_id, c.source_path, m.idx",
+        )
+        .expect("prepare exclusion-rows query");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ExclusionRow {
+                external_id: row.get(0)?,
+                source_path: row.get(1)?,
+                idx: row.get(2)?,
+                excluded_is_some: row.get(3)?,
+                excluded_sha256: row.get(4)?,
+            })
+        })
+        .expect("query exclusion rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect exclusion rows");
+    rows
+}
+
+/// A.4: the same fixture ingested via streaming (default), batch
+/// (`CASS_STREAMING_INDEX=0`), `--force-rebuild`, and `--watch-once` must
+/// produce identical `(stable key, idx, excluded?, excluded.sha256)` sets,
+/// and that set must be non-empty (the two anchors must actually have
+/// fired in all four).
+#[test]
+fn transport_chain_equivalence_across_ingestion_modes() {
+    let home_tmp = tempfile::TempDir::new().expect("home tempdir");
+    let home = home_tmp.path();
+    let session_path = write_two_anchor_claude_session(home);
+
+    let data_root = tempfile::TempDir::new().expect("data-dir root tempdir");
+
+    let streaming_default_dir = data_root.path().join("streaming-default");
+    let batch_dir = data_root.path().join("batch-mode");
+    let force_rebuild_dir = data_root.path().join("force-rebuild");
+    let watch_once_dir = data_root.path().join("watch-once");
+
+    let run = |data_dir: &std::path::Path, extra_env: Option<(&str, &str)>, extra_args: &[&str]| {
+        std::fs::create_dir_all(data_dir).expect("mkdir data_dir");
+        let mut cmd = cass_cmd(data_dir, home);
+        cmd.args(["index"]).args(extra_args).args(["--json"]);
+        if let Some((k, v)) = extra_env {
+            cmd.env(k, v);
+        }
+        let output = cmd.output().expect("spawn cass index");
+        assert!(
+            output.status.success(),
+            "cass index (args={extra_args:?}, env={extra_env:?}) must succeed; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        data_dir.join("agent_search.db")
+    };
+
+    let streaming_default_db = run(&streaming_default_dir, None, &["--full"]);
+    let batch_db = run(&batch_dir, Some(("CASS_STREAMING_INDEX", "0")), &["--full"]);
+    let force_rebuild_db = run(&force_rebuild_dir, None, &["--force-rebuild"]);
+    let watch_once_db = run(
+        &watch_once_dir,
+        None,
+        &["--watch-once", session_path.to_str().expect("utf8 session path")],
+    );
+
+    let streaming_default_rows = read_exclusion_rows(&streaming_default_db);
+    let batch_rows = read_exclusion_rows(&batch_db);
+    let force_rebuild_rows = read_exclusion_rows(&force_rebuild_db);
+    let watch_once_rows = read_exclusion_rows(&watch_once_db);
+
+    let excluded_count = streaming_default_rows.iter().filter(|r| r.excluded_is_some).count();
+    assert!(
+        excluded_count >= 2,
+        "fixture must trigger both anchors (recall + context-file-read); got {excluded_count} excluded rows in {streaming_default_rows:?}"
+    );
+    for row in streaming_default_rows.iter().filter(|r| r.excluded_is_some) {
+        assert!(
+            row.excluded_sha256.as_deref().is_some_and(|s| !s.is_empty()),
+            "excluded row must carry a non-empty excluded.sha256: {row:?}"
+        );
+    }
+
+    assert_eq!(
+        streaming_default_rows, batch_rows,
+        "streaming (default) and batch (CASS_STREAMING_INDEX=0) must produce identical exclusion rows"
+    );
+    assert_eq!(
+        streaming_default_rows, force_rebuild_rows,
+        "streaming (default) and --force-rebuild must produce identical exclusion rows"
+    );
+    assert_eq!(
+        streaming_default_rows, watch_once_rows,
+        "streaming (default) and --watch-once must produce identical exclusion rows"
+    );
+}

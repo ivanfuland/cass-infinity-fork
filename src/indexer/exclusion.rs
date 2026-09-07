@@ -312,6 +312,7 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
 /// the ingest transport chain and the restore chain unpacked exactly once, at
 /// `map_to_internal_with_redactor` -- `NormalizedMessage` itself cannot carry
 /// `excluded` (pinned upstream type, no new fields allowed).
+#[derive(Debug, Clone)]
 pub(crate) struct PreparedConversation {
     pub conv: NormalizedConversation,
     pub excluded: Vec<Option<ExcludedMarker>>,

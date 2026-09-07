@@ -1582,7 +1582,8 @@ struct RobotIngestTraceSpan {
 
 fn robot_trace_ingest_start(
     stage: &'static str,
-    convs: &[NormalizedConversation],
+    batch_conversations: usize,
+    batch_msgs: usize,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
 ) -> Option<RobotIngestTraceSpan> {
@@ -1597,8 +1598,8 @@ fn robot_trace_ingest_start(
         stage,
         lexical_strategy: lexical_strategy.as_str(),
         defer_checkpoints,
-        batch_conversations: convs.len(),
-        batch_msgs: convs.iter().map(|conv| conv.messages.len()).sum(),
+        batch_conversations,
+        batch_msgs,
         started: Instant::now(),
         lookup_before: crate::storage::sqlite::message_lookup_trace_snapshot(),
     })
@@ -6427,13 +6428,13 @@ fn should_repair_daily_stats_after_historical_salvage(
 ///
 /// Producers (connector scan threads) send batches of conversations through
 /// the channel. The consumer (main indexing thread) receives and ingests them.
-pub enum IndexMessage {
+pub(crate) enum IndexMessage {
     /// A batch of conversations from a connector scan.
     Batch {
         /// Connector name (e.g., "claude", "codex")
         connector_name: &'static str,
-        /// Scanned conversations
-        conversations: Vec<NormalizedConversation>,
+        /// Scanned conversations (with per-message exclusion markers from prepare)
+        conversations: Vec<crate::indexer::exclusion::PreparedConversation>,
         /// Whether this connector was newly discovered
         is_discovered: bool,
         /// Message count in this batch (for stats)
@@ -6704,7 +6705,7 @@ struct StreamingBatchSender<'a> {
     flow_limiter: Arc<StreamingByteLimiter>,
     connector_name: &'static str,
     next_batch_is_discovered: bool,
-    conversations: Vec<NormalizedConversation>,
+    conversations: Vec<crate::indexer::exclusion::PreparedConversation>,
     message_count: usize,
     char_count: usize,
     byte_reservation: usize,
@@ -6739,8 +6740,8 @@ impl<'a> StreamingBatchSender<'a> {
         self.next_batch_is_discovered = true;
     }
 
-    fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
-        let (message_count, char_count) = conversation_batch_footprint(&conversation);
+    fn push(&mut self, conversation: crate::indexer::exclusion::PreparedConversation) -> Result<()> {
+        let (message_count, char_count) = conversation_batch_footprint(&conversation.conv);
         let would_exceed_limits = !self.conversations.is_empty()
             && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
                 || self.message_count.saturating_add(message_count)
@@ -6829,8 +6830,12 @@ fn send_conversation_batches(
         is_discovered,
     );
     for conversation in conversations {
+        let n = conversation.messages.len();
         sender
-            .push(conversation)
+            .push(crate::indexer::exclusion::PreparedConversation {
+                conv: conversation,
+                excluded: vec![None; n],
+            })
             .expect("test batch sender should deliver to in-memory receiver");
     }
     sender
@@ -7066,14 +7071,7 @@ fn spawn_connector_producer(
                 }
                 let source_kind = CaptureSourceKind::File(conversation.source_path.clone());
                 match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
-                    // TEMPORARY (T2b checkpoint): the `PreparedConversation.excluded`
-                    // markers are dropped here until the transport-chain wiring
-                    // (Batch/StreamingBatchSender -> map_to_internal_with_redactor)
-                    // lands in a follow-up round -- `prepared.conv` is already
-                    // correctly redacted (content/extra/snippets), only the
-                    // `messages.excluded` column stays unset for these rows in the
-                    // meantime. Disclosed known gap, not a silent regression.
-                    Ok(prepared) => batch_sender.push(prepared.conv),
+                    Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
                         tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
                         Ok(())
@@ -7182,11 +7180,8 @@ fn spawn_connector_producer(
                     batch_sender.mark_next_batch_discovered();
                 }
 
-                // TEMPORARY (T2b checkpoint): see the local-scan call site above --
-                // `excluded` markers are dropped at this push boundary until the
-                // transport chain is wired in a follow-up round.
                 match prepared {
-                    Ok(prepared) => batch_sender.push(prepared.conv),
+                    Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
                         tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
                         Ok(())
@@ -7418,7 +7413,7 @@ fn run_streaming_consumer(
                 byte_reservation,
             }) => {
                 // Accumulators start with the first-received batch.
-                let mut combined_conversations: Vec<NormalizedConversation> = conversations;
+                let mut combined_conversations: Vec<crate::indexer::exclusion::PreparedConversation> = conversations;
                 let mut combined_message_count = message_count;
                 let mut combined_byte_reservation = byte_reservation;
                 let mut combined_batch_size = combined_conversations.len();
@@ -7984,7 +7979,7 @@ fn run_batch_index_with_connector_factories(
 
     struct PendingBatchScan {
         name: &'static str,
-        convs: Vec<NormalizedConversation>,
+        convs: Vec<crate::indexer::exclusion::PreparedConversation>,
         is_discovered: bool,
         scan_succeeded: bool,
         scan_error: Option<String>,
@@ -8060,14 +8055,10 @@ fn run_batch_index_with_connector_factories(
                                     &conv.source_path,
                                 )
                             });
-                            // TEMPORARY (T2b checkpoint): `excluded` markers are
-                            // dropped at this `convs.extend` boundary until the
-                            // batch-mode transport chain is wired in a follow-up
-                            // round -- see the streaming-path call sites above.
                             for conv in local_convs {
                                 let source_kind = CaptureSourceKind::File(conv.source_path.clone());
                                 match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conv) {
-                                    Ok(prepared) => convs.push(prepared.conv),
+                                    Ok(prepared) => convs.push(prepared),
                                     Err(error) => {
                                         scan_succeeded = false;
                                         scan_errors.push(error.to_string());
@@ -8126,13 +8117,10 @@ fn run_batch_index_with_connector_factories(
                                         &conv.source_path,
                                     )
                                 });
-                                // TEMPORARY (T2b checkpoint): see the local-scan
-                                // branch above -- `excluded` markers dropped here
-                                // pending the batch-mode transport-chain wiring.
                                 for conv in remote_convs {
                                     let source_kind = CaptureSourceKind::File(conv.source_path.clone());
                                     match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conv) {
-                                        Ok(prepared) => convs.push(prepared.conv),
+                                        Ok(prepared) => convs.push(prepared),
                                         Err(error) => {
                                             scan_succeeded = false;
                                             scan_errors.push(error.to_string());
@@ -8221,7 +8209,7 @@ fn run_batch_index_with_connector_factories(
             pending
                 .convs
                 .iter()
-                .map(|c| c.messages.len())
+                .map(|c| c.conv.messages.len())
                 .sum::<usize>()
         })
         .sum();
@@ -8229,7 +8217,7 @@ fn run_batch_index_with_connector_factories(
         .iter()
         .filter(|pending| !pending.convs.is_empty() || pending.scan_error.is_some())
         .map(|pending| {
-            let msgs: usize = pending.convs.iter().map(|c| c.messages.len()).sum();
+            let msgs: usize = pending.convs.iter().map(|c| c.conv.messages.len()).sum();
             ConnectorStats {
                 name: pending.name.to_string(),
                 conversations: pending.convs.len(),
@@ -11651,10 +11639,17 @@ fn ingest_batch(
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
 ) -> Result<CanonicalMutationCounts> {
+    let prepared: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+        .iter()
+        .map(|conv| {
+            let n = conv.messages.len();
+            crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] }
+        })
+        .collect();
     let outcome = ingest_batch_detailed(
         storage,
         data_dir,
-        convs,
+        &prepared,
         progress,
         lexical_strategy,
         defer_checkpoints,
@@ -11667,14 +11662,19 @@ fn ingest_batch(
 fn ingest_batch_detailed(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    let trace_span =
-        robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
+    let trace_span = robot_trace_ingest_start(
+        "ingest_batch",
+        convs.len(),
+        convs.iter().map(|p| p.conv.messages.len()).sum(),
+        lexical_strategy,
+        defer_checkpoints,
+    );
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
     // on older the legacy embedded engine builds that ignore autocommit_retain.
@@ -11733,7 +11733,7 @@ fn ingest_batch_detailed(
 fn ingest_non_watch_batch_with_oom_split(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
@@ -11791,13 +11791,13 @@ fn ingest_non_watch_batch_with_oom_split(
 fn ingest_non_watch_batch_once(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    if should_inject_non_watch_ingest_test_oom(convs) {
+    if should_inject_non_watch_ingest_test_oom(convs.iter().map(|p| &p.conv)) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
         // of relying on the plain-string fallback.
@@ -11817,7 +11817,7 @@ fn ingest_non_watch_batch_once(
         data_dir,
         INDEX_INGEST_POISON_FILE,
         "index-ingest-out-of-memory",
-        convs,
+        convs.iter().map(|p| &p.conv),
     );
     Ok(outcome)
 }
@@ -11826,7 +11826,7 @@ fn ingest_non_watch_batch_once(
 fn ingest_non_watch_oom_retry_or_quarantine(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     _lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
@@ -11865,7 +11865,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         return Ok(left);
     }
 
-    let conv = &convs[0];
+    let conv = &convs[0].conv;
 
     // #298: mirror the watch-path plausibility gate. the legacy embedded engine raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
@@ -11931,7 +11931,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
 fn ingest_batch_with_semantic_delta(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
@@ -11939,7 +11939,8 @@ fn ingest_batch_with_semantic_delta(
 ) -> Result<persist::PersistBatchOutcome> {
     let trace_span = robot_trace_ingest_start(
         "ingest_batch_with_semantic_delta",
-        convs,
+        convs.len(),
+        convs.iter().map(|p| p.conv.messages.len()).sum(),
         lexical_strategy,
         defer_checkpoints,
     );
@@ -11972,7 +11973,7 @@ fn ingest_batch_with_semantic_delta(
         data_dir,
         WATCH_INGEST_POISON_FILE,
         "watch-ingest-out-of-memory",
-        convs,
+        convs.iter().map(|p| &p.conv),
     );
 
     if let Some(p) = progress {
@@ -12041,7 +12042,7 @@ enum WatchOomIngestMode {
 fn ingest_watch_batch_with_oom_split(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
@@ -12061,7 +12062,7 @@ fn ingest_watch_batch_with_oom_split(
 fn ingest_watch_batch_with_oom_split_inner(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
@@ -12070,7 +12071,9 @@ fn ingest_watch_batch_with_oom_split_inner(
     debug_assert!(!convs.is_empty());
 
     let batch_result =
-        if mode == WatchOomIngestMode::Standard && should_inject_watch_ingest_test_oom(convs) {
+        if mode == WatchOomIngestMode::Standard
+            && should_inject_watch_ingest_test_oom(convs.iter().map(|p| &p.conv))
+        {
             // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
             // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
             // of relying on the plain-string fallback.
@@ -12094,7 +12097,9 @@ fn ingest_watch_batch_with_oom_split_inner(
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
             deferred_conversations: 0,
-            max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+            max_payload_watermark_ms: conversations_payload_watermark_ms(
+                convs.iter().map(|p| &p.conv),
+            ),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
             let split_at = convs.len() / 2;
@@ -12135,7 +12140,8 @@ fn ingest_watch_batch_with_oom_split_inner(
                 return Err(error);
             }
 
-            let conv = &convs[0];
+            let prepared_conv = &convs[0];
+            let conv = &prepared_conv.conv;
 
             // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
             // path is NOT proof of real host memory exhaustion — the legacy embedded engine
@@ -12161,7 +12167,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 ingest_watch_batch_with_oom_split_inner(
                     storage,
                     data_dir,
-                    std::slice::from_ref(conv),
+                    std::slice::from_ref(prepared_conv),
                     progress,
                     defer_checkpoints,
                     capture_semantic_delta,
@@ -12275,19 +12281,23 @@ fn quarantine_single_watch_conversation(
     })
 }
 
-fn conversations_payload_watermark_ms(convs: &[NormalizedConversation]) -> Option<i64> {
+fn conversations_payload_watermark_ms<'a>(
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> Option<i64> {
     convs
-        .iter()
+        .into_iter()
         .filter_map(conversation_payload_watermark_ms)
         .max()
 }
 
-fn sort_watch_conversations_for_watermark(convs: &mut [NormalizedConversation]) {
+fn sort_watch_conversations_for_watermark(
+    convs: &mut [crate::indexer::exclusion::PreparedConversation],
+) {
     convs.sort_by(|left, right| {
-        conversation_payload_watermark_ms(left)
-            .cmp(&conversation_payload_watermark_ms(right))
-            .then_with(|| left.source_path.cmp(&right.source_path))
-            .then_with(|| left.external_id.cmp(&right.external_id))
+        conversation_payload_watermark_ms(&left.conv)
+            .cmp(&conversation_payload_watermark_ms(&right.conv))
+            .then_with(|| left.conv.source_path.cmp(&right.conv.source_path))
+            .then_with(|| left.conv.external_id.cmp(&right.conv.external_id))
     });
 }
 
@@ -12796,19 +12806,19 @@ fn mark_stale_index_ingest_structured_retry_attempted(data_dir: &Path) -> usize 
     marked
 }
 
-fn clear_poison_conversations_after_successful_ingest(
+fn clear_poison_conversations_after_successful_ingest<'a>(
     data_dir: &Path,
     file_name: &str,
     reason: &str,
-    convs: &[NormalizedConversation],
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
 ) {
-    if convs.is_empty() {
-        return;
-    }
     let conversation_ids = convs
-        .iter()
+        .into_iter()
         .map(poison_conversation_id)
         .collect::<BTreeSet<_>>();
+    if conversation_ids.is_empty() {
+        return;
+    }
 
     let jsonl_cleared =
         match clear_poison_jsonl_records(data_dir, file_name, reason, &conversation_ids) {
@@ -13400,7 +13410,10 @@ fn ingest_quarantine_circuit_limit() -> usize {
 }
 
 #[cfg(test)]
-fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+fn should_inject_watch_ingest_test_oom<'a>(
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
+    let convs: Vec<&NormalizedConversation> = convs.into_iter().collect();
     // Selective variant: OOM only the chunk containing this external id, so
     // multi-chunk ordering tests can defer one conversation while letting
     // later chunks succeed.
@@ -13418,7 +13431,9 @@ fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool
 }
 
 #[cfg(not(test))]
-fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
+fn should_inject_watch_ingest_test_oom<'a>(
+    _convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
     false
 }
 
@@ -13437,15 +13452,20 @@ fn should_force_watch_solo_retry_oom() -> bool {
 }
 
 #[cfg(test)]
-fn should_inject_non_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+fn should_inject_non_watch_ingest_test_oom<'a>(
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
+    let count = convs.into_iter().count();
     dotenvy::var("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|min| min > 0 && convs.len() >= min)
+        .is_some_and(|min| min > 0 && count >= min)
 }
 
 #[cfg(not(test))]
-fn should_inject_non_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
+fn should_inject_non_watch_ingest_test_oom<'a>(
+    _convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
     false
 }
 
@@ -14040,14 +14060,12 @@ fn reindex_paths_with_semantic_delta(
         }
 
         // Provenance injection, path rewriting, capture + exclusion judgment.
-        // TEMPORARY (T2b checkpoint): `excluded` markers dropped at this
-        // rebuild boundary until the watch-path transport chain is wired in
-        // a follow-up round -- see the streaming/batch call sites above.
-        let mut prepared_convs = Vec::with_capacity(convs.len());
+        let mut prepared_convs: Vec<crate::indexer::exclusion::PreparedConversation> =
+            Vec::with_capacity(convs.len());
         for conv in convs {
             let source_kind = CaptureSourceKind::File(conv.source_path.clone());
             match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
-                Ok(prepared) => prepared_convs.push(prepared.conv),
+                Ok(prepared) => prepared_convs.push(prepared),
                 Err(error) => {
                     tracing::warn!(?kind, error = %error, "prepare_conversation_for_ingest failed; skipping session");
                 }
@@ -14188,7 +14206,7 @@ fn reindex_paths_with_semantic_delta(
         {
             let connector_name = convs
                 .first()
-                .map(|conv| conv.agent_slug.clone())
+                .map(|conv| conv.conv.agent_slug.clone())
                 .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
             stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
             stats.index_ms = stats.index_ms.saturating_add(index_ms);
@@ -16112,15 +16130,15 @@ pub mod persist {
         }
     }
 
-    fn record_persisted_raw_mirror_db_links(
+    fn record_persisted_raw_mirror_db_links<'a>(
         data_dir: Option<&Path>,
-        convs: &[NormalizedConversation],
+        convs: impl IntoIterator<Item = &'a NormalizedConversation>,
         outcomes: &[InsertOutcome],
     ) {
         let Some(data_dir) = data_dir else {
             return;
         };
-        for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
+        for (conv, outcome) in convs.into_iter().zip(outcomes.iter()) {
             record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
         }
     }
@@ -16552,20 +16570,21 @@ pub mod persist {
     fn persist_chunk_with_writer(
         franken: &FrankenStorage,
         base_idx: usize,
-        chunk: &[NormalizedConversation],
+        chunk: &[crate::indexer::exclusion::PreparedConversation],
         internal_chunk: &[Conversation],
         max_retries: usize,
     ) -> Result<ChunkPersistResult> {
         debug_assert_eq!(
             chunk.len(),
             internal_chunk.len(),
-            "parallel pre-map must produce one Conversation per NormalizedConversation"
+            "parallel pre-map must produce one Conversation per PreparedConversation"
         );
         let mut outcomes = Vec::with_capacity(chunk.len());
         let mut agent_cache: HashMap<String, i64> = HashMap::new();
         let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
 
-        for (offset, (conv, internal)) in chunk.iter().zip(internal_chunk.iter()).enumerate() {
+        for (offset, (prepared, internal)) in chunk.iter().zip(internal_chunk.iter()).enumerate() {
+            let conv = &prepared.conv;
             let idx = base_idx + offset;
 
             // Wrap the entire ensure_agent + ensure_workspace +
@@ -16626,7 +16645,7 @@ pub mod persist {
     fn persist_chunk_serial_fallback(
         writer_handle: &crate::storage::api::WriterHandle<FrankenStorage>,
         base_idx: usize,
-        chunk: &[NormalizedConversation],
+        chunk: &[crate::indexer::exclusion::PreparedConversation],
         internal_chunk: &[Conversation],
         max_retries: usize,
     ) -> Result<Vec<(usize, InsertOutcome)>> {
@@ -16662,8 +16681,10 @@ pub mod persist {
         ))
     }
 
-    fn duplicate_conversation_keys_present(convs: &[NormalizedConversation]) -> bool {
-        let mut seen = HashSet::with_capacity(convs.len());
+    fn duplicate_conversation_keys_present<'a>(
+        convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+    ) -> bool {
+        let mut seen = HashSet::new();
         for conv in convs {
             let (source_id, _) = extract_provenance(&conv.metadata);
             let key = if let Some(external_id) = conv.external_id.as_deref() {
@@ -16694,7 +16715,7 @@ pub mod persist {
     fn persist_conversations_batched_begin_concurrent(
         storage: &FrankenStorage,
         db_path: &Path,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         _lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
@@ -16822,8 +16843,8 @@ pub mod persist {
         ordered.sort_by_key(|(idx, _)| *idx);
         if let Some(data_dir) = raw_mirror_data_dir {
             for (idx, outcome) in &ordered {
-                if let Some(conv) = convs.get(*idx) {
-                    record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
+                if let Some(prepared) = convs.get(*idx) {
+                    record_persisted_raw_mirror_db_link(data_dir, &prepared.conv, outcome);
                 }
             }
         }
@@ -16876,13 +16897,24 @@ pub mod persist {
     /// Applies secret redaction to message content and extra_json before storage
     /// (security fix for #112: tool-result secrets were persisted unredacted).
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
-        map_to_internal_with_redactor(conv, None)
+        // Mechanical propagation boundary (T2b.2, control-plane approved
+        // 2026-09-07): this entry point only carries a bare
+        // `NormalizedConversation` (single-conversation restore/test paths,
+        // not the batch transport chain), so there is no exclusion marker
+        // to thread through -- wrap it as an all-`None` `PreparedConversation`
+        // rather than duplicating `map_to_internal_with_redactor`'s body.
+        let n = conv.messages.len();
+        map_to_internal_with_redactor(
+            &crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] },
+            None,
+        )
     }
 
     pub(crate) fn map_to_internal_with_redactor(
-        conv: &NormalizedConversation,
+        prepared: &crate::indexer::exclusion::PreparedConversation,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
     ) -> Conversation {
+        let conv = &prepared.conv;
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
         let should_redact = super::redact_secrets::redaction_enabled();
@@ -16919,7 +16951,8 @@ pub mod persist {
             messages: conv
                 .messages
                 .iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(msg_idx, m)| {
                     let content = if should_redact {
                         if let Some(r) = redactor.as_mut() {
                             r.redact_text(&m.content)
@@ -16939,7 +16972,7 @@ pub mod persist {
                         m.extra.clone()
                     };
                     Message {
-                        excluded: None,
+                        excluded: prepared.excluded.get(msg_idx).cloned().flatten(),
                         id: None,
                         idx: m.idx,
                         role: map_role(&m.role),
@@ -17017,9 +17050,21 @@ pub mod persist {
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
+        // Test-only convenience wrapper (T2b.2, control-plane approved
+        // 2026-09-07): callers in this module's unit tests build plain
+        // `NormalizedConversation` fixtures and have no exclusion markers to
+        // thread through, so wrap them as all-`None` `PreparedConversation`s
+        // here rather than pushing that boilerplate into every test.
+        let prepared: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+            .iter()
+            .map(|conv| {
+                let n = conv.messages.len();
+                crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] }
+            })
+            .collect();
         persist_conversations_batched_inner(
             storage,
-            convs,
+            &prepared,
             lexical_strategy,
             defer_checkpoints,
             false,
@@ -17030,7 +17075,7 @@ pub mod persist {
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
         storage: &FrankenStorage,
         data_dir: &Path,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
@@ -17047,7 +17092,7 @@ pub mod persist {
     pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
         storage: &FrankenStorage,
         data_dir: &Path,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
@@ -17063,7 +17108,7 @@ pub mod persist {
 
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
@@ -17074,8 +17119,8 @@ pub mod persist {
         }
 
         let begin_concurrent_enabled = begin_concurrent_writes_enabled();
-        let duplicate_keys_present =
-            begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
+        let duplicate_keys_present = begin_concurrent_enabled
+            && duplicate_conversation_keys_present(convs.iter().map(|p| &p.conv));
 
         if begin_concurrent_enabled && !duplicate_keys_present {
             let db_path = storage
@@ -17131,7 +17176,8 @@ pub mod persist {
                 let mut prepared: Vec<(i64, Option<i64>, Conversation)> =
                     Vec::with_capacity(convs.len());
 
-                for (conv, internal_conv) in convs.iter().zip(internal_convs) {
+                for (prepared_conv, internal_conv) in convs.iter().zip(internal_convs) {
+                    let conv = &prepared_conv.conv;
                     let agent = Agent {
                         id: None,
                         slug: conv.agent_slug.clone(),
@@ -17186,7 +17232,11 @@ pub mod persist {
             },
         )?;
         let mut batch_outcome = PersistBatchOutcome::default();
-        record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
+        record_persisted_raw_mirror_db_links(
+            raw_mirror_data_dir,
+            convs.iter().map(|p| &p.conv),
+            &outcomes,
+        );
         for outcome in &outcomes {
             batch_outcome.record_insert_outcome(outcome);
         }
@@ -17702,6 +17752,13 @@ pub mod persist {
 
             // Set chunk size < conversation count to exercise multiple parallel writers
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "3");
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
@@ -17815,6 +17872,13 @@ pub mod persist {
                     }
                 })
                 .collect();
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "2");
             // The caller-supplied `storage` handle below is a pre-existing,
@@ -17892,6 +17956,13 @@ pub mod persist {
                     invocations: Vec::new(),
                 }],
             }];
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
@@ -18343,6 +18414,13 @@ pub mod persist {
                     },
                 ],
             }];
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
@@ -22745,6 +22823,15 @@ mod tests {
         }
     }
 
+    /// Wrap a bare test fixture as a `PreparedConversation` with no
+    /// exclusion markers -- the marker-less shape every unit test that
+    /// predates T2b's transport-chain change needs at the `push`/persist
+    /// boundary.
+    fn prep_conv(conv: NormalizedConversation) -> crate::indexer::exclusion::PreparedConversation {
+        let n = conv.messages.len();
+        crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+    }
+
     fn seed_lexical_rebuild_fixture(storage: &FrankenStorage) {
         let agent = Agent {
             id: None,
@@ -24992,9 +25079,10 @@ mod tests {
             ..norm_msg(0, 1_000)
         };
         let conversation = norm_conv(Some("huge"), vec![oversized]);
+        let n = conversation.messages.len();
 
         sender
-            .push(conversation)
+            .push(crate::indexer::exclusion::PreparedConversation { conv: conversation, excluded: vec![None; n] })
             .expect("oversized conversation should still flush even in tests");
 
         match rx
@@ -25010,7 +25098,7 @@ mod tests {
             } => {
                 assert_eq!(connector_name, "gemini");
                 assert_eq!(conversations.len(), 1);
-                assert_eq!(conversations[0].external_id.as_deref(), Some("huge"));
+                assert_eq!(conversations[0].conv.external_id.as_deref(), Some("huge"));
                 assert_eq!(message_count, 1);
                 assert_eq!(
                     byte_reservation,
@@ -25046,8 +25134,9 @@ mod tests {
             }],
         );
 
+        let n = conversation.messages.len();
         sender
-            .push(conversation)
+            .push(crate::indexer::exclusion::PreparedConversation { conv: conversation, excluded: vec![None; n] })
             .expect("pending conversation should fit in the streaming budget");
 
         assert_eq!(
@@ -25071,7 +25160,7 @@ mod tests {
             } => {
                 assert_eq!(connector_name, "codex");
                 assert_eq!(conversations.len(), 1);
-                assert_eq!(conversations[0].external_id.as_deref(), Some("pending"));
+                assert_eq!(conversations[0].conv.external_id.as_deref(), Some("pending"));
                 assert_eq!(message_count, 1);
                 assert_eq!(byte_reservation, expected_bytes);
                 assert_eq!(limiter.bytes_in_flight(), expected_bytes);
@@ -25095,13 +25184,13 @@ mod tests {
         {
             let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "cursor", false);
             sender
-                .push(norm_conv(
+                .push(prep_conv(norm_conv(
                     Some("unflushed"),
                     vec![NormalizedMessage {
                         content,
                         ..norm_msg(0, 1_000)
                     }],
-                ))
+                )))
                 .expect("pending conversation should reserve bytes");
 
             assert_eq!(limiter.bytes_in_flight(), expected_bytes);
@@ -25128,13 +25217,13 @@ mod tests {
         let expected_bytes = content.len();
 
         sender
-            .push(norm_conv(
+            .push(prep_conv(norm_conv(
                 Some("disconnected"),
                 vec![NormalizedMessage {
                     content,
                     ..norm_msg(0, 1_000)
                 }],
-            ))
+            )))
             .expect("push should only reserve bytes before flush");
         assert_eq!(limiter.bytes_in_flight(), expected_bytes);
 
@@ -26651,10 +26740,12 @@ mod tests {
         })
         .collect();
 
+        let prepared_conversations: Vec<crate::indexer::exclusion::PreparedConversation> =
+            conversations.iter().cloned().map(prep_conv).collect();
         let outcome = ingest_non_watch_batch_with_oom_split(
             &storage,
             &data_dir,
-            &conversations,
+            &prepared_conversations,
             &progress,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             true,
@@ -31779,17 +31870,20 @@ mod tests {
             }
         }
 
-        let mut convs = vec![
+        let mut convs: Vec<crate::indexer::exclusion::PreparedConversation> = vec![
             conv("/tmp/c", "c", Some(30)),
             conv("/tmp/a", "a", None),
             conv("/tmp/b", "b", Some(10)),
-        ];
+        ]
+        .into_iter()
+        .map(prep_conv)
+        .collect();
 
         sort_watch_conversations_for_watermark(&mut convs);
 
         let ordered: Vec<_> = convs
             .iter()
-            .map(|conv| conv.external_id.as_deref().unwrap())
+            .map(|conv| conv.conv.external_id.as_deref().unwrap())
             .collect();
         assert_eq!(ordered, vec!["a", "b", "c"]);
     }
