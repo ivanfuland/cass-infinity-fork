@@ -136,20 +136,22 @@ READ_TOOL_IDENTITIES = {
 # `cass_expand` 3x, 0 occurrences under the `mcp__cass-mcp__` prefix) --
 # see docs/excluded-rules.md R1/R11. No other connector matches (宁漏勿误).
 # ---------------------------------------------------------------------------
-CASS_RECALL_PREFIX = "mcp__cass-mcp__"
-CASS_RECALL_BARE_NAMES = {
+
+
+CASS_RECALL_ALIAS_TABLE = {
+    "claude_code": {"mcp__cass-mcp__cass_search", "mcp__cass-mcp__cass_expand"},
     "codex": {"cass_search", "cass_expand"},
 }
 
 
 def is_cass_recall_tool(tool_name: str, agent_slug: str) -> bool:
-    """R1 identity check, replacing the old universal
-    `tool_name.startswith("mcp__cass-mcp__")` (which wrongly missed codex's
-    bare-name calls and would wrongly match if some other connector ever
-    reused the prefix)."""
-    if agent_slug == "claude_code":
-        return tool_name.startswith(CASS_RECALL_PREFIX)
-    return tool_name in CASS_RECALL_BARE_NAMES.get(agent_slug, frozenset())
+    """R1/R11 identity check (任务书 #118b N12 收紧, mirrors
+    src/indexer/exclusion.rs::is_cass_recall_tool): matches ONLY the exact
+    full identities R11's alias table registers per connector -- replacing
+    the old `claude_code` PREFIX match (`startswith("mcp__cass-mcp__")`),
+    which would also match a hypothetical `mcp__cass-mcp__anything_else`
+    tool never registered in R11."""
+    return tool_name in CASS_RECALL_ALIAS_TABLE.get(agent_slug, frozenset())
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +188,21 @@ def _anchored_under_cc_workspace(normalized: str, base: str) -> bool:
 
 def predicate_p(raw_path: str, paths_cfg: dict) -> bool:
     """R2 谓词 P. `raw_path` is a single path string already extracted from
-    a tool-call argument (not yet normalized)."""
+    a tool-call argument (not yet normalized).
+
+    任务书 #118b N9: a path still relative AFTER normalization (no
+    resolvable repo-root/worktree-root anchor) only matches
+    `injection_only_files`, never `memory_files`/`workspace_scoped_files` --
+    `_anchored_under_cc_workspace` does a raw regex search for a
+    `cc-workspace` path SEGMENT and doesn't care whether the input was
+    absolute, so `cc-workspace/USER.md` (any relative path a caller could
+    construct from ANY cwd) must not be treated as proof it resolves under
+    the real cc-workspace root."""
     normalized = _normalize_path(raw_path)
     base = normalized.rsplit("/", 1)[-1]
+
+    if not normalized.startswith("/"):
+        return base in paths_cfg["injection_only_files"]
 
     if base in paths_cfg["memory_files"] and _anchored_under_cc_workspace(normalized, base):
         return True
@@ -208,7 +222,12 @@ def predicate_p_project_read_document(document: str, paths_cfg: dict) -> bool:
 # Step 1: reject any compound-shell form outright (R2-e). Step 2: shlex the
 # survivors and match against the five literal shapes.
 # ---------------------------------------------------------------------------
-_COMPOUND_SHELL_CHARS_RE = re.compile(r"[|;&<>`*?\[\]]|\$")
+# 任务书 #118b N10: `\n`/`\r` added -- `shlex.split` treats a newline as an
+# ordinary token separator (same as a space), so a newline-joined
+# multi-command string was parsed as one command's multiple path arguments
+# instead of being rejected as the two separate shell commands a real shell
+# would execute.
+_COMPOUND_SHELL_CHARS_RE = re.compile(r"[|;&<>`*?\[\]\n\r]|\$")
 
 
 def bash_readonly_paths(command: str):
@@ -280,10 +299,17 @@ def anchor3_shell_opener(text: str):
     # with a full env-context block pasted at its own end, "已知漏判方向"),
     # it still matches and falls back to recording the structural tag
     # `<environment_context>` itself, since some value must be written.
+    # 任务书 #118b N11: `<cwd>` must be INSIDE the `<environment_context>`
+    # block (after its open tag), not merely present somewhere in the
+    # message -- the old independent `in` checks would match
+    # `"<cwd>/x</cwd> real request<environment_context></environment_context>"`.
     trimmed = text.strip()
     if not trimmed.endswith(_CLOSER):
         return None
-    if "<environment_context>" not in trimmed or "<cwd>" not in trimmed:
+    open_pos = trimmed.find("<environment_context>")
+    if open_pos == -1:
+        return None
+    if "<cwd>" not in trimmed[open_pos + len("<environment_context>"):]:
         return None
     for opener in _OPENERS:
         if trimmed.startswith(opener):
@@ -536,16 +562,14 @@ def decide_r1_r2_for_call(call, agent_slug, paths_cfg):
     DB-id-based lookup in T1b.2's per-message model). Pure function, no
     positional/session state; factored out of `decide()` so both models
     share one judgment implementation."""
+    # 任务书 #118b N12: the cass-mcp identity check now runs AFTER the
+    # args-presence gate below -- R4's general "配对成功但 tool_call 缺
+    # tool_name 或缺参数 → 不排除" is not an R2-only rule; a cass-mcp call
+    # with no captured arguments at all must not match, even though R1's
+    # own condition never reads any argument value.
     if not call.tool_name:
         return None
-    if is_cass_recall_tool(call.tool_name, agent_slug):
-        return {
-            "reason": "cass_recall",
-            "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": None, "shell": None},
-        }
     identities = READ_TOOL_IDENTITIES.get(agent_slug)
-    if identities is None:
-        return None
     args = call.args
     if isinstance(args, str):
         try:
@@ -554,11 +578,20 @@ def decide_r1_r2_for_call(call, agent_slug, paths_cfg):
             args = None
     if not isinstance(args, dict):
         return None
+    if is_cass_recall_tool(call.tool_name, agent_slug):
+        return {
+            "reason": "cass_recall",
+            "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": None, "shell": None},
+        }
+    if identities is None:
+        return None
     if call.tool_name == identities["read"] and isinstance(args.get("file_path"), str):
         if predicate_p(args["file_path"], paths_cfg):
             return {
                 "reason": "context_file_read",
-                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [args["file_path"]], "shell": None},
+                # 任务书 #118b N9: `anchor.paths` stores the NORMALIZED
+                # path, not the raw string the tool call carried.
+                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [_normalize_path(args["file_path"])], "shell": None},
             }
     elif call.tool_name == identities["project_read"] and isinstance(args.get("document"), str):
         if predicate_p_project_read_document(args["document"], paths_cfg):
@@ -571,7 +604,7 @@ def decide_r1_r2_for_call(call, agent_slug, paths_cfg):
         if paths and all(predicate_p(p, paths_cfg) for p in paths):
             return {
                 "reason": "context_file_read",
-                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": paths, "shell": None},
+                "anchor": {"tool_call_id": call.tool_call_id, "tool_name": call.tool_name, "paths": [_normalize_path(p) for p in paths], "shell": None},
             }
     return None
 
@@ -613,7 +646,7 @@ def selftest_cases(paths_cfg):
     # identity is bare names, see case 13/14 below and R1-d in the Rust
     # `exclusion.rs` unit tests, not duplicated here per advisor guidance
     # to keep this file's case count at 14)
-    cands = [_mk("tool_call", tool_call_id="t1", tool_name="mcp__cass-mcp__cass_search"), _mk("tool_result", tool_call_id="t1")]
+    cands = [_mk("tool_call", tool_call_id="t1", tool_name="mcp__cass-mcp__cass_search", args={}), _mk("tool_result", tool_call_id="t1")]
     cases.append(("R1-a cass_recall positive", cands, 1, 0, "claude_code", "cass_recall"))
 
     # 2. R1-b negative (same suffix, wrong prefix)
@@ -691,14 +724,14 @@ def selftest_cases(paths_cfg):
     cases.append(("R4 zero unpaired candidates", cands, 1, 0, "codex", None))
 
     # 13. R4 pairing: exactly 1 unpaired candidate -> paired (and it's cass_recall)
-    cands = [_mk("user"), _mk("tool_call", tool_name="mcp__cass-mcp__cass_search"), _mk("tool_result")]
+    cands = [_mk("user"), _mk("tool_call", tool_name="mcp__cass-mcp__cass_search", args={}), _mk("tool_result")]
     cases.append(("R4 exactly one unpaired candidate", cands, 2, 0, "claude_code", "cass_recall"))
 
     # 14. R4 pairing: 2 unpaired candidates -> no match
     cands = [
         _mk("user"),
-        _mk("tool_call", tool_name="mcp__cass-mcp__cass_search"),
-        _mk("tool_call", tool_name="mcp__cass-mcp__cass_expand"),
+        _mk("tool_call", tool_name="mcp__cass-mcp__cass_search", args={}),
+        _mk("tool_call", tool_name="mcp__cass-mcp__cass_expand", args={}),
         _mk("tool_result"),
     ]
     cases.append(("R4 two unpaired candidates", cands, 3, 0, "claude_code", None))
@@ -714,12 +747,47 @@ def selftest_cases(paths_cfg):
     cands = [_mk("user", text=text3)]
     cases.append(("R3-f known-opener-miss still matches (fallback opener)", cands, 0, 0, "codex", "codex_host_shell"))
 
+    # 16. N9 negative (任务书 #118b): a RELATIVE path (no leading `/`) that
+    # merely contains a `cc-workspace` segment must not match a
+    # memory_files name -- only the injection-only branch may match a
+    # relative path.
+    cands = [
+        _mk("tool_call", tool_call_id="t1", tool_name="Read", args={"file_path": "cc-workspace/USER.md"}),
+        _mk("tool_result", tool_call_id="t1"),
+    ]
+    cases.append(("N9 relative cc-workspace-prefixed memory file not anchored", cands, 1, 0, "claude_code", None))
+
+    # 17. N10 negative (任务书 #118b): a newline-joined "command" is two
+    # separate shell commands to a real shell, not `cat`'s two path args.
+    cands = [
+        _mk(
+            "tool_call",
+            tool_call_id="t1",
+            tool_name="Bash",
+            args={"command": "cat /home/ivan/projects/cc-workspace/USER.md\n/home/ivan/projects/cc-workspace/TOOLS.md"},
+        ),
+        _mk("tool_result", tool_call_id="t1"),
+    ]
+    cases.append(("N10 bash newline-separated commands rejected", cands, 1, 0, "claude_code", None))
+
+    # 18. N11 negative (任务书 #118b): `<cwd>` outside the
+    # `<environment_context>` block must not count.
+    text4 = "<cwd>/home/u/project</cwd> please look at this real request\n<environment_context>\n</environment_context>"
+    cands = [_mk("user", text=text4)]
+    cases.append(("N11 cwd outside environment_context block", cands, 0, 0, "codex", None))
+
+    # 19. N12 negative (任务书 #118b): a cass-mcp call with NO captured
+    # arguments at all must not match (R4's general "缺参数不排" applies to
+    # R1 too), even though R1's own match condition never reads args.
+    cands = [_mk("tool_call", tool_call_id="t1", tool_name="mcp__cass-mcp__cass_search"), _mk("tool_result", tool_call_id="t1")]
+    cases.append(("N12 cass_recall with no args does not match", cands, 1, 0, "claude_code", None))
+
     return cases
 
 
 def run_selftest(paths_cfg) -> bool:
     cases = selftest_cases(paths_cfg)
-    assert len(cases) == 15, f"selftest must have exactly 15 cases, got {len(cases)}"
+    assert len(cases) == 19, f"selftest must have exactly 19 cases, got {len(cases)}"
     passed = 0
     for name, cands, index, idx_in_session, agent_slug, expect in cases:
         pairing = PairingContext(cands)

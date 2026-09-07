@@ -235,9 +235,15 @@ pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEve
     }
 }
 
-fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<String>> {
+/// R1-N15 (任务书 #118b): pairs each surviving non-blank line with its
+/// 1-based PHYSICAL line number in the original file. Pre-fix, callers
+/// `enumerate()`d the already-filtered `Vec<String>`, so `line:N` (the
+/// `event_key` fallback for a line with no `uuid`/`id`) was off by however
+/// many blank lines preceded it -- wrong by construction whenever a blank
+/// line appears anywhere earlier in the file.
+fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<(usize, String)>> {
     let text = std::fs::read_to_string(blob_path)?;
-    Ok(text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+    Ok(text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()).map(|(i, l)| (i + 1, l.to_string())).collect())
 }
 
 /// Mirrors `franken_agent_detection::connectors::claude_code`'s content-block
@@ -267,10 +273,9 @@ fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<String>> {
 fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
     let lines = read_jsonl_lines(blob_path)?;
     let mut events = Vec::with_capacity(lines.len());
-    for (line_no, line) in lines.iter().enumerate() {
+    for (line_no, line) in &lines {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let event_key =
-            value.get("uuid").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{}", line_no + 1));
+        let event_key = value.get("uuid").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{line_no}"));
 
         // Role resolution (claude_code.rs's `message_role`): only a
         // user/assistant envelope (explicit `message.role`, or an implicit
@@ -397,12 +402,11 @@ fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEven
 fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
     let lines = read_jsonl_lines(blob_path)?;
     let mut events = Vec::with_capacity(lines.len());
-    for (line_no, line) in lines.iter().enumerate() {
+    for (line_no, line) in &lines {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
         let Some(payload) = value.get("payload") else { continue };
-        let event_key =
-            payload.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{}", line_no + 1));
+        let event_key = payload.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{line_no}"));
         let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
         let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
 
@@ -606,25 +610,25 @@ impl PairingContext {
 // universal prefix).
 // ============================================================================
 
-const CASS_RECALL_PREFIX: &str = "mcp__cass-mcp__";
-
-fn cass_recall_bare_names(agent_slug: &str) -> &'static [&'static str] {
+fn cass_recall_alias_table(agent_slug: &str) -> &'static [&'static str] {
     match agent_slug {
+        "claude_code" => &["mcp__cass-mcp__cass_search", "mcp__cass-mcp__cass_expand"],
         "codex" => &["cass_search", "cass_expand"],
         _ => &[],
     }
 }
 
-/// R1 (v4.4, Ivan 2026-09-07 裁): `claude_code` matches any full name under
-/// the `mcp__cass-mcp__` prefix; `codex` matches only its registered bare
-/// names (R11: `cass_search`/`cass_expand`, T1b found 8 such calls). No
-/// other connector matches (宁漏勿误).
+/// R1/R11 (v4.4, Ivan 2026-09-07 裁; 任务书 #118b N12 收紧): matches ONLY the
+/// exact full identities R11's alias table registers per connector --
+/// `claude_code`: `mcp__cass-mcp__cass_search`/`mcp__cass-mcp__cass_expand`
+/// (full names); `codex`: `cass_search`/`cass_expand` (bare names, T1b found
+/// 8 such calls). Pre-fix, `claude_code` matched by PREFIX
+/// (`starts_with("mcp__cass-mcp__")`), which would also match a
+/// hypothetical `mcp__cass-mcp__anything_else` tool never registered in
+/// R11 -- R11 says "只匹配表内完整身份", not "any name under this prefix".
+/// No other connector matches (宁漏勿误).
 fn is_cass_recall_tool(tool_name: &str, agent_slug: &str) -> bool {
-    if agent_slug == "claude_code" {
-        tool_name.starts_with(CASS_RECALL_PREFIX)
-    } else {
-        cass_recall_bare_names(agent_slug).contains(&tool_name)
-    }
+    cass_recall_alias_table(agent_slug).contains(&tool_name)
 }
 
 // ============================================================================
@@ -711,9 +715,23 @@ fn anchored_under_cc_workspace(normalized: &str, base: &str) -> bool {
 }
 
 /// R2 谓词 P.
+///
+/// R1-N9 (任务书 #118b): a path still relative AFTER normalization (no
+/// resolvable repo-root/worktree-root anchor -- `anchored_under_cc_workspace`
+/// does a raw substring search for a `cc-workspace` path SEGMENT and doesn't
+/// care whether the input was absolute) must only match the two
+/// injection-only file names (spec R2-d), never `memory_files`/
+/// `workspace_scoped_files` -- `cc-workspace/USER.md` is not the same claim
+/// as `/home/u/projects/cc-workspace/USER.md`; the former is any relative
+/// path a caller could construct from ANY cwd and does not prove it resolves
+/// under the real cc-workspace root at all.
 fn predicate_p(raw_path: &str, paths_cfg: &ExcludedContextPaths) -> bool {
     let normalized = normalize_path(raw_path);
     let base = normalized.rsplit('/').next().unwrap_or(&normalized);
+
+    if !normalized.starts_with('/') {
+        return paths_cfg.injection_only_files.iter().any(|f| f == base);
+    }
 
     if paths_cfg.memory_files.iter().any(|f| f == base) && anchored_under_cc_workspace(&normalized, base) {
         return true;
@@ -737,7 +755,13 @@ fn predicate_p_project_read_document(document: &str, paths_cfg: &ExcludedContext
 /// path list, or `None` when the command doesn't match / is complex enough
 /// that the caller must treat it as "not excluded" (R2-e/宁漏勿误).
 fn bash_readonly_paths(command: &str) -> Option<Vec<String>> {
-    if command.contains(['|', ';', '&', '<', '>', '`', '*', '?', '[', ']', '$']) {
+    // R1-N10 (任务书 #118b): `\n`/`\r` were missing from the reject set --
+    // `shell_words::split` treats a newline as an ordinary token separator
+    // (same as a space), so a newline-joined multi-command string like
+    // `"cat /a/USER.md\n/a/TOOLS.md"` parsed as `cat` with TWO path
+    // arguments instead of being rejected as the two separate shell
+    // commands a real shell would execute.
+    if command.contains(['|', ';', '&', '<', '>', '`', '*', '?', '[', ']', '$', '\n', '\r']) {
         return None;
     }
     let tokens = shell_words::split(command).ok()?;
@@ -801,12 +825,23 @@ const ANCHOR3_OPENERS: [&str; 3] = ["# AGENTS.md instructions", "<recommended_pl
 /// user's own words -- falls back to recording the structural tag itself
 /// as the opener in that case, since some value must be written and
 /// claiming it started with one of the other two openers would be a lie.
+/// R1-N11 (任务书 #118b): `<cwd>` must actually be INSIDE the
+/// `<environment_context>` block (after its open tag), not merely present
+/// somewhere in the message -- the pre-fix independent `contains()` checks
+/// would match `"<cwd>/x</cwd> real request<environment_context></environment_context>"`
+/// (a real request that happens to mention `<cwd>` earlier, followed by an
+/// empty env-context block), which is not the structural host-shell shape
+/// R3 exists to detect.
 fn anchor3_shell_opener(text: &str) -> Option<&'static str> {
     let trimmed = text.trim();
     if !trimmed.ends_with(ENVIRONMENT_CONTEXT_CLOSE) {
         return None;
     }
-    if !trimmed.contains(ENVIRONMENT_CONTEXT_OPEN) || !trimmed.contains("<cwd>") {
+    let Some(open_pos) = trimmed.find(ENVIRONMENT_CONTEXT_OPEN) else {
+        return None;
+    };
+    let after_open = &trimmed[open_pos + ENVIRONMENT_CONTEXT_OPEN.len()..];
+    if !after_open.contains("<cwd>") {
         return None;
     }
     Some(ANCHOR3_OPENERS.iter().find(|o| trimmed.starts_with(**o)).copied().unwrap_or(ENVIRONMENT_CONTEXT_OPEN))
@@ -829,25 +864,43 @@ pub struct Decision {
 
 /// Indices of `event`'s `ToolResult`-kind blocks that this decision should
 /// clear: when `tool_call_id` is known, only the block(s) whose own
-/// `tool_use_id` matches it; when pairing was id-less (R4's "exactly one
-/// unpaired" branch), every `ToolResult` block without its own id is
-/// presumed to belong to the row currently being judged.
+/// `tool_use_id` matches it EXACTLY; when pairing was id-less (R4's "exactly
+/// one unpaired" branch), only when there is likewise exactly ONE id-less
+/// `ToolResult` block in this event is it presumed to belong to the row
+/// being judged -- ≥2 such blocks is the same ambiguity R4 already treats
+/// as "don't pair" and must not select any of them (宁漏勿误).
+///
+/// R1-N13 (任务书 #118b): the pre-fix `(None, _) => true` arm swept every
+/// id-less `ToolResult` block into `target_blocks` regardless of what
+/// `tool_call_id` this decision was actually resolved for -- a `Some(id)`
+/// decision would then also clear an unrelated sibling result block that
+/// happens to carry no id of its own.
 fn tool_result_block_indices(event: &RawEvent, tool_call_id: Option<&str>) -> Vec<u32> {
-    event
-        .blocks
-        .iter()
-        .filter(|b| b.kind == BlockKind::ToolResult)
-        .filter(|b| match (b.tool_use_id.as_deref(), tool_call_id) {
-            (Some(bid), Some(id)) => bid == id,
-            (None, _) => true,
-            (Some(_), None) => false,
-        })
-        .map(|b| b.index)
-        .collect()
+    match tool_call_id {
+        Some(id) => event
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::ToolResult && b.tool_use_id.as_deref() == Some(id))
+            .map(|b| b.index)
+            .collect(),
+        None => {
+            let candidates: Vec<u32> =
+                event.blocks.iter().filter(|b| b.kind == BlockKind::ToolResult && b.tool_use_id.is_none()).map(|b| b.index).collect();
+            if candidates.len() == 1 { candidates } else { Vec::new() }
+        }
+    }
 }
 
+/// R1-N12 (任务书 #118b): the cass-mcp identity check now runs AFTER the
+/// args-presence gate (`call.args.as_ref()?`, right below) -- R4's general
+/// "配对成功但 tool_call 缺 tool_name 或缺参数 → 不排除" is not an R2-only
+/// rule; a cass-mcp call with no captured arguments at all is exactly the
+/// kind of incomplete pairing 宁漏勿误 exists for, even though R1's own
+/// match condition never reads any argument value.
 fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, paths_cfg: &ExcludedContextPaths) -> Option<Decision> {
     let tool_name = call.tool_name.as_str();
+    let identities = read_tool_identities(agent_slug)?;
+    let args = call.args.as_ref()?;
 
     if is_cass_recall_tool(tool_name, agent_slug) {
         return Some(Decision {
@@ -863,9 +916,6 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
         });
     }
 
-    let identities = read_tool_identities(agent_slug)?;
-    let args = call.args.as_ref()?;
-
     if identities.read == Some(tool_name) {
         let file_path = args.get("file_path")?.as_str()?;
         if !predicate_p(file_path, paths_cfg) {
@@ -876,7 +926,11 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
             anchor: ExclusionAnchor {
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: Some(tool_name.to_string()),
-                paths: Some(vec![file_path.to_string()]),
+                // R1-N9 (任务书 #118b): store the NORMALIZED path, not the
+                // raw string the tool call carried -- `anchor.paths` is an
+                // audit field, and an unnormalized `../`-laden path would
+                // silently misrepresent what predicate P actually matched.
+                paths: Some(vec![normalize_path(file_path)]),
                 shell: None,
             },
             event_key: event.event_key.clone(),
@@ -913,7 +967,7 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
             anchor: ExclusionAnchor {
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: Some(tool_name.to_string()),
-                paths: Some(bash_paths),
+                paths: Some(bash_paths.iter().map(|p| normalize_path(p)).collect()),
                 shell: None,
             },
             event_key: event.event_key.clone(),
@@ -1285,6 +1339,20 @@ mod tests {
         assert_eq!(events[0].event_key, "line:1", "missing top-level uuid falls back to 1-based line number");
     }
 
+    /// R1-N15 (任务书 #118b): `line:N` must be the PHYSICAL 1-based line
+    /// number in the original file, not the position among only the
+    /// non-blank lines -- pre-fix, `enumerate()` ran on the already-filtered
+    /// `Vec<String>`, so a leading blank line shifted every fallback
+    /// `line:N` down by one.
+    #[test]
+    fn events_from_blob_claude_code_missing_uuid_after_blank_line_uses_physical_line_number_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &["", line]);
+        let events = events_from_blob("claude_code", &path);
+        assert_eq!(events[0].event_key, "line:2", "the event is on physical line 2 (line 1 is blank), not line 1");
+    }
+
     /// N14 (任务书 #118a): a leading unrecognized block (`image`, which
     /// `split_content_blocks` drops entirely -- no `BlockKind` matches it)
     /// must not shift the surviving `text` block's position out of sync
@@ -1469,16 +1537,31 @@ mod tests {
     // -- R1 -------------------------------------------------------------
 
     #[test]
-    fn r1_a_claude_code_full_name_prefix_match_positive() {
+    fn r1_a_claude_code_full_name_exact_match_positive() {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
         let ctx = ctx_from(&[
-            PairingCandidate::ToolCall(PairedTool { tool_call_id: Some("t1".into()), tool_name: "mcp__cass-mcp__cass_search".into(), args: None }),
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: Some("t1".into()), tool_name: "mcp__cass-mcp__cass_search".into(), args: Some(serde_json::json!({})) }),
             PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
         ]);
         let m = msg("tool_result", "{}");
         let decision = decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).expect("R1-a must match");
         assert_eq!(decision.reason, ExclusionReason::CassRecall);
         assert_eq!(decision.target_blocks, vec![0]);
+    }
+
+    /// R1-N12 (任务书 #118b): R4's general "缺参数不排" applies to R1 too --
+    /// a cass-mcp call with NO captured arguments at all must not be
+    /// excluded just because its `tool_name` matches, even though R1's own
+    /// match condition never reads any argument value.
+    #[test]
+    fn r1_a_mutation_missing_args_does_not_match_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        let ctx = ctx_from(&[
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: Some("t1".into()), tool_name: "mcp__cass-mcp__cass_search".into(), args: None }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let m = msg("tool_result", "{}");
+        assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(), "R4: missing args must not match, even for R1");
     }
 
     #[test]
@@ -1492,11 +1575,50 @@ mod tests {
         assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(), "R1-b must not match");
     }
 
+    /// R1-N13 (任务书 #118b): an event with a matched, ID-bearing
+    /// `ToolResult` (A, `tool_use_id="t1"`) AND a sibling ID-LESS
+    /// `ToolResult` (B) must only select A's block -- pre-fix,
+    /// `(None, _) => true` swept B in too regardless of what id this
+    /// decision resolved for.
+    #[test]
+    fn r1_target_blocks_excludes_unrelated_id_less_sibling_result() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1")), tool_result_block(1, None)] };
+        let ctx = ctx_from(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "mcp__cass-mcp__cass_search".into(),
+                args: Some(serde_json::json!({})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let m = msg("tool_result", "{}");
+        let decision = decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).expect("must match");
+        assert_eq!(decision.target_blocks, vec![0], "the id-less sibling block (index 1) must NOT be swept in");
+    }
+
+    /// R1-N13: when pairing itself was id-less (R4's "exactly one unpaired"
+    /// branch), selecting a block ALSO requires the event to have exactly
+    /// one id-less `ToolResult` block -- two or more is the same ambiguity
+    /// R4 already refuses to pair on, and must select none (宁漏勿误), not
+    /// silently sweep every one of them in.
+    #[test]
+    fn r1_target_blocks_empty_when_multiple_id_less_result_blocks_are_ambiguous() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, None), tool_result_block(1, None)] };
+        let ctx = ctx_from(&[
+            PairingCandidate::TurnBoundary,
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: None, tool_name: "mcp__cass-mcp__cass_search".into(), args: Some(serde_json::json!({})) }),
+            PairingCandidate::ToolResult { tool_call_id: None },
+        ]);
+        let m = msg("tool_result", "{}");
+        let decision = decide(&m, 2, &event, &ctx, "claude_code", &paths_cfg()).expect("id-less pairing must still succeed (R4-b)");
+        assert!(decision.target_blocks.is_empty(), "two id-less ToolResult blocks in the same event is ambiguous -- select none (宁漏勿误)");
+    }
+
     #[test]
     fn r1_d_codex_bare_name_positive() {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
         let ctx = ctx_from(&[
-            PairingCandidate::ToolCall(PairedTool { tool_call_id: Some("t1".into()), tool_name: "cass_search".into(), args: None }),
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: Some("t1".into()), tool_name: "cass_search".into(), args: Some(serde_json::json!({})) }),
             PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
         ]);
         let m = msg("tool_result", "{}");
@@ -1641,6 +1763,26 @@ mod tests {
         assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(), "compound command must not match (R2-e)");
     }
 
+    /// R1-N10 (任务书 #118b): a newline-joined "command" is two separate
+    /// shell commands to a real shell, not `cat`'s two path arguments --
+    /// `shell_words::split` treats `\n` as an ordinary token separator, so
+    /// this must be explicitly rejected the same way `|`/`;`/`&&` already
+    /// are.
+    #[test]
+    fn r2_bash_newline_separated_commands_rejected_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        let ctx = ctx_from(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "Bash".into(),
+                args: Some(serde_json::json!({"command": "cat /home/ivan/projects/cc-workspace/USER.md\n/home/ivan/projects/cc-workspace/TOOLS.md"})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let m = msg("tool_result", "file contents");
+        assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(), "newline-joined commands must not match (R2-e)");
+    }
+
     #[test]
     fn r2_h_sed_e_command_rejected_negative() {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
@@ -1665,6 +1807,52 @@ mod tests {
         ]);
         let m = msg("tool_result", "file contents");
         assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_some(), "R2-d: relative injection-only filename matches at any path");
+    }
+
+    /// R1-N9 (任务书 #118b): `cc-workspace/USER.md` and `../cc-workspace/USER.md`
+    /// are RELATIVE paths (no leading `/`) -- `predicate_p` must only match
+    /// them against `injection_only_files` (R2-d), never `memory_files`,
+    /// even though `anchored_under_cc_workspace`'s raw substring search
+    /// would otherwise find a `cc-workspace` segment in either string. A
+    /// relative path proves nothing about which real directory it resolves
+    /// under.
+    #[test]
+    fn r2_relative_cc_workspace_prefixed_memory_file_not_anchored_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        for relative_path in ["cc-workspace/USER.md", "../cc-workspace/USER.md"] {
+            let ctx = ctx_from(&[
+                PairingCandidate::ToolCall(PairedTool {
+                    tool_call_id: Some("t1".into()),
+                    tool_name: "Read".into(),
+                    args: Some(serde_json::json!({"file_path": relative_path})),
+                }),
+                PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+            ]);
+            let m = msg("tool_result", "file contents");
+            assert!(
+                decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
+                "relative path {relative_path:?} must not match a memory_files name via a bare substring search"
+            );
+        }
+    }
+
+    /// R1-N9 (任务书 #118b): `anchor.paths` must store the NORMALIZED path
+    /// (forward slashes, `..` resolved), not the raw string the tool call
+    /// carried.
+    #[test]
+    fn r2_anchor_paths_stores_normalized_path() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        let ctx = ctx_from(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "Read".into(),
+                args: Some(serde_json::json!({"file_path": "/home/ivan/projects/cc-workspace/sub/../MEMORY.md"})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let m = msg("tool_result", "file contents");
+        let decision = decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).expect("must match after `..` resolves to the repo root");
+        assert_eq!(decision.anchor.paths, Some(vec!["/home/ivan/projects/cc-workspace/MEMORY.md".to_string()]));
     }
 
     #[test]
@@ -1738,6 +1926,19 @@ mod tests {
         assert!(decide(&m, 0, &event, &ctx, "codex", &paths_cfg()).is_none(), "hand-written shell without env block must not match (R3-d)");
     }
 
+    /// R1-N11 (任务书 #118b): `<cwd>` must be INSIDE the
+    /// `<environment_context>` block, not merely present somewhere earlier
+    /// in the message -- a real request that happens to mention `<cwd>` on
+    /// its own, followed by an unrelated empty env-context block, must not
+    /// match.
+    #[test]
+    fn r3_cwd_outside_environment_context_block_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![text_block(0)] };
+        let ctx = PairingContext::default();
+        let m = msg("user", "<cwd>/home/u/project</cwd> please look at this real request\n<environment_context>\n</environment_context>");
+        assert!(decide(&m, 0, &event, &ctx, "codex", &paths_cfg()).is_none(), "cwd outside the environment_context block must not match (R3)");
+    }
+
     #[test]
     fn r3_e_idx_ne_0_negative() {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![text_block(0)] };
@@ -1789,7 +1990,7 @@ mod tests {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, None)] };
         let ctx = ctx_from(&[
             PairingCandidate::TurnBoundary,
-            PairingCandidate::ToolCall(PairedTool { tool_call_id: None, tool_name: "mcp__cass-mcp__cass_search".into(), args: None }),
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: None, tool_name: "mcp__cass-mcp__cass_search".into(), args: Some(serde_json::json!({})) }),
             PairingCandidate::ToolResult { tool_call_id: None },
         ]);
         let m = msg("tool_result", "{}");
