@@ -9336,24 +9336,74 @@ fn run_mirror_prune(
     let max_size_bytes = max_size.as_deref().map(parse_size_bytes).transpose()?;
     let safety_hold_down_ms = parse_duration_millis(&safety_hold_down)?;
 
-    if apply
-        && let Some(active_index) =
-            active_index_run_details(&data_dir, &data_dir.join("agent_search.db"))
-    {
-        return Err(CliError {
-            code: 7,
-            kind: "lock-busy",
+    // PR6 T2c (任务书 #113, R1-B1/R9): `--apply` takes `index-run.lock`
+    // exclusively and HOLDS it (not a point-in-time check like the old
+    // `active_index_run_details` probe -- see this same file's `git blame`
+    // for that prior form) until this function returns, i.e. through both
+    // the referenced-blob read below and the whole `prune()` call.
+    // `dry-run` never takes the lock.
+    let db_path = data_dir.join("agent_search.db");
+    let _index_run_lock_guard = if apply {
+        match crate::indexer::acquire_index_run_lock(
+            &data_dir,
+            &db_path,
+            crate::search::asset_state::SearchMaintenanceMode::Index,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(_err) => {
+                return Err(CliError {
+                    code: 2,
+                    kind: "lock-busy",
+                    message: format!(
+                        "refusing to apply raw-mirror prune while an index run is active in {}",
+                        data_dir.display()
+                    ),
+                    hint: Some(
+                        "Wait for indexing/watch work to finish, then rerun `cass mirror prune --apply`."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // R9: read the reference set only after the lock is held (apply path)
+    // -- a failure to read here must NOT silently degrade to "nothing
+    // referenced" (that would let prune delete a blob the caller can't
+    // currently see is still in use). Dry-run has no such stake and stays
+    // best-effort.
+    let referenced_blobs: HashSet<String> = if apply && db_path.exists() {
+        let conn = crate::storage::api::Conn::open_read(&db_path).map_err(|err| CliError {
+            code: 9,
+            kind: "raw-mirror",
             message: format!(
-                "refusing to apply raw-mirror prune while an index run is active in {}",
-                active_index.data_dir.display()
+                "opening {} to read excluded.raw.blob references before prune --apply: {err}",
+                db_path.display()
             ),
-            hint: Some(
-                "Wait for indexing/watch work to finish, then rerun `cass mirror prune --apply`."
-                    .to_string(),
-            ),
-            retryable: true,
-        });
-    }
+            hint: None,
+            retryable: false,
+        })?;
+        conn.query_all_map(
+            "SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL",
+            &[],
+            |row| row.get_typed::<Option<String>>(0),
+        )
+        .map_err(|err| CliError {
+            code: 9,
+            kind: "raw-mirror",
+            message: format!("reading excluded.raw.blob references from {}: {err}", db_path.display()),
+            hint: None,
+            retryable: false,
+        })?
+        .into_iter()
+        .flatten()
+        .collect()
+    } else {
+        HashSet::new()
+    };
 
     let report = crate::raw_mirror::prune(
         &data_dir,
@@ -9363,6 +9413,7 @@ fn run_mirror_prune(
             keep_tags,
             safety_hold_down_ms,
             apply,
+            referenced_blobs,
         },
     )
     .map_err(|err| CliError {
@@ -22529,6 +22580,7 @@ mod search_lexical_self_heal_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -41977,6 +42029,7 @@ fn doctor_candidate_parse_raw_mirror_messages(
             Ok(value) => {
                 let content = doctor_candidate_json_message_content(&value);
                 messages.push(crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: messages.len() as i64,
                     role: doctor_candidate_message_role(&value),
@@ -42008,6 +42061,7 @@ fn doctor_candidate_parse_raw_mirror_messages(
                     "raw_content_included": false
                 }));
                 messages.push(crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: messages.len() as i64,
                     role: crate::model::types::MessageRole::Other(
@@ -42034,6 +42088,7 @@ fn doctor_candidate_parse_raw_mirror_messages(
     }
     if messages.is_empty() {
         messages.push(crate::model::types::Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: crate::model::types::MessageRole::Other("raw_mirror_blob".to_string()),
@@ -72289,7 +72344,7 @@ mod cli_read_db_tests {
             ended_at: Some(0),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status json fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            messages: vec![Message { excluded: None, id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status json fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
             source_id: "local".into(),
             origin_host: None,
         };
@@ -90694,6 +90749,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90768,6 +90824,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90796,6 +90853,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90864,6 +90922,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90929,6 +90988,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90957,6 +91017,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91027,6 +91088,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91103,6 +91165,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91284,6 +91347,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91347,6 +91411,7 @@ local second line
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91410,6 +91475,7 @@ local second line
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91475,6 +91541,7 @@ This is not JSONL.
             metadata_json: serde_json::json!({}),
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -91485,6 +91552,7 @@ This is not JSONL.
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -91572,6 +91640,7 @@ This is not JSONL.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91642,6 +91711,7 @@ This should stay behind the indexed export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91709,6 +91779,7 @@ This should stay behind the indexed export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91789,6 +91860,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91866,6 +91938,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91923,6 +91996,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91981,6 +92055,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -92039,6 +92114,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -97805,6 +97881,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                 metadata_json: serde_json::json!(null),
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -97815,6 +97892,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                         snippets: vec![],
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,

@@ -1,5 +1,6 @@
 #[cfg(feature = "infinity")]
 pub mod db_vector_catchup;
+pub mod exclusion;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
@@ -2457,7 +2458,7 @@ fn lexical_rebuild_db_state_matches_legacy(
 }
 
 #[derive(Debug)]
-struct IndexRunLockGuard {
+pub(crate) struct IndexRunLockGuard {
     // Keep the file handle alive for the lifetime of the lock.
     file: File,
     _path: PathBuf,
@@ -3568,6 +3569,7 @@ fn lexical_rebuild_contract_from_grouped_messages(
     let canonical_messages = messages
         .iter()
         .map(|message| crate::model::types::Message {
+            excluded: None,
             id: None,
             idx: message.idx,
             // Preserve the full 6-role string via the unified codec instead
@@ -4181,7 +4183,7 @@ impl LexicalRebuildState {
     }
 }
 
-fn acquire_index_run_lock(
+pub(crate) fn acquire_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
     mode: SearchMaintenanceMode,
@@ -16735,6 +16737,7 @@ pub mod persist {
                         m.extra.clone()
                     };
                     Message {
+                        excluded: None,
                         id: None,
                         idx: m.idx,
                         role: map_role(&m.role),
@@ -17278,6 +17281,7 @@ pub mod persist {
                 metadata_json: serde_json::json!({}),
                 messages: vec![
                     crate::model::types::Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -17288,6 +17292,7 @@ pub mod persist {
                         snippets: Vec::new(),
                     },
                     crate::model::types::Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -19982,6 +19987,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -20117,6 +20123,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -22582,6 +22589,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -22592,6 +22600,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -22679,6 +22688,7 @@ mod tests {
             metadata_json: raw_conv.metadata.clone(),
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -22689,6 +22699,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -22794,6 +22805,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::role_from_str("user"),
@@ -22804,6 +22816,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::role_from_str("assistant"),
@@ -22814,6 +22827,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: crate::model::types::role_from_str("tool_call"),
@@ -22824,6 +22838,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 3,
                     role: crate::model::types::role_from_str("tool_result"),
@@ -22834,6 +22849,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 4,
                     role: crate::model::types::role_from_str("reasoning"),
@@ -22978,6 +22994,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::role_from_str("user"),
@@ -22988,6 +23005,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::role_from_str("assistant"),
@@ -22998,6 +23016,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     // "already up to date" is a tool-result acknowledgement that
@@ -23760,6 +23779,7 @@ mod tests {
             1_700_000_000_000,
             vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -23770,6 +23790,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -23786,6 +23807,7 @@ mod tests {
             "planner-utf8",
             1_700_000_002_000,
             vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Tool,
@@ -23843,6 +23865,7 @@ mod tests {
             let external_id = format!("footprint-plan-{conversation_idx}");
             let messages = (0..4)
                 .map(|message_idx| Message {
+                    excluded: None,
                     id: None,
                     idx: message_idx,
                     role: MessageRole::User,
@@ -28548,6 +28571,7 @@ mod tests {
                         .messages
                         .iter()
                         .map(|m| crate::model::types::Message {
+                            excluded: None,
                             id: None,
                             idx: m.idx,
                             role: crate::model::types::MessageRole::User,
@@ -28669,6 +28693,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -28738,6 +28763,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -28835,6 +28861,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::MessageRole::User,
@@ -28845,6 +28872,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::MessageRole::Tool,
@@ -28855,6 +28883,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: crate::model::types::MessageRole::Agent,
@@ -28881,6 +28910,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::MessageRole::System,
@@ -28891,6 +28921,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::MessageRole::Other("narrator".into()),
@@ -28901,6 +28932,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: crate::model::types::MessageRole::User,
@@ -28963,6 +28995,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -29298,6 +29331,7 @@ mod tests {
                             .messages
                             .iter()
                             .map(|m| crate::model::types::Message {
+                                excluded: None,
                                 id: None,
                                 idx: m.idx,
                                 role: crate::model::types::MessageRole::User,
@@ -29386,6 +29420,7 @@ mod tests {
                             .messages
                             .iter()
                             .map(|m| crate::model::types::Message {
+                                excluded: None,
                                 id: None,
                                 idx: m.idx,
                                 role: crate::model::types::MessageRole::User,
@@ -30235,6 +30270,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -33626,6 +33662,7 @@ mod tests {
                         .messages
                         .iter()
                         .map(|m| crate::model::types::Message {
+                            excluded: None,
                             id: None,
                             idx: m.idx,
                             role: crate::model::types::MessageRole::User,

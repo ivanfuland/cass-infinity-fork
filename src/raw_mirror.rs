@@ -21,6 +21,30 @@ static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirr
     OnceLock::new();
 static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// PR6 T2c (任务书 #113): prune/摄入互斥判例②的注入点-- fires inside
+/// [`prune`] after the referenced-blob protection set has been computed
+/// (R9 check already passed) but before any file is actually removed, so a
+/// test can, from inside the hook, attempt a concurrent write that
+/// references one of prune's about-to-be-deleted unreferenced blobs and
+/// observe whether `index-run.lock` correctly serializes the two. Always
+/// compiled (not `#[cfg(test)]`, since the integration test lives in a
+/// separate `tests/` crate); zero-cost when unset (`OnceLock` + `Option`
+/// check, no allocation on the hot path).
+static PRUNE_FAULT_HOOK: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_prune_fault_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *PRUNE_FAULT_HOOK.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
+}
+
+fn fire_prune_fault_hook() {
+    if let Some(lock) = PRUNE_FAULT_HOOK.get()
+        && let Some(hook) = lock.lock().unwrap().as_ref()
+    {
+        hook();
+    }
+}
+
 fn raw_mirror_fsync_enabled() -> bool {
     dotenvy::var("CASS_RAW_MIRROR_FSYNC")
         .ok()
@@ -178,6 +202,14 @@ pub struct RawMirrorPruneOptions {
     pub keep_tags: Vec<String>,
     pub safety_hold_down_ms: i64,
     pub apply: bool,
+    /// PR6 T2c (任务书 #113, R9): blob identities referenced by
+    /// `messages.excluded.raw.blob` in the caller's database (manifest-
+    /// relative paths, same encoding as [`RawMirrorPruneManifest::blob_relative_path`]).
+    /// Never pruned, nor is any manifest that captured one of them --
+    /// the caller reads this set via
+    /// `SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL`
+    /// while holding `index-run.lock` (R1-B1).
+    pub referenced_blobs: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -294,20 +326,36 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .fold(0u64, u64::saturating_add);
 
     let now = now_ms();
-    let pinned_manifests = pinned_prune_manifest_ids(
+    let mut pinned_manifests = pinned_prune_manifest_ids(
         data_dir,
         &manifests,
         &options.keep_tags,
         options.safety_hold_down_ms,
         now,
     )?;
+    // R9 (任务书 #113): a manifest that captured a still-referenced blob is
+    // protected regardless of age/keep-tags -- the mirror retention
+    // contract (spec's "镜像保留契约") outranks ordinary retention policy.
+    for manifest in &manifests {
+        if options.referenced_blobs.contains(&manifest.blob_relative_path) {
+            pinned_manifests.insert(manifest.manifest_id.clone());
+        }
+    }
     report.pinned_manifest_count = pinned_manifests.len() as u64;
     let pinned_blobs: HashSet<String> = blob_to_manifests
         .iter()
         .filter(|(_, manifest_ids)| manifest_ids.iter().any(|id| pinned_manifests.contains(id)))
         .map(|(blob_relative_path, _)| blob_relative_path.clone())
+        .chain(options.referenced_blobs.iter().cloned())
         .collect();
     report.pinned_blob_count = pinned_blobs.len() as u64;
+
+    if options.apply && !options.referenced_blobs.is_subset(&pinned_blobs) {
+        anyhow::bail!(
+            "raw mirror prune refused: {} referenced blob(s) are not in the protected set (R9 invariant violated)",
+            options.referenced_blobs.difference(&pinned_blobs).count()
+        );
+    }
 
     let mut selected_manifests: HashSet<String> = HashSet::new();
     let mut manifest_reasons: HashMap<String, String> = HashMap::new();
@@ -434,6 +482,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .fold(0, u64::saturating_add);
 
     if options.apply {
+        fire_prune_fault_hook();
         for entry in &mut entries {
             let path = root.join(&entry.path);
             let removed = remove_prune_target_file(&path)
@@ -2492,6 +2541,7 @@ mod tests {
         let err = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2508,6 +2558,116 @@ mod tests {
         assert!(manifest_path.exists());
         assert!(blob_path.exists());
         assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    /// R9 (任务书 #113): a blob referenced by `messages.excluded.raw.blob`,
+    /// and the manifest that captured it, both survive an otherwise-total
+    /// prune (`--older-than 0 --safety-hold-down 0`); an unreferenced blob
+    /// with no such protection is deleted as usual.
+    #[test]
+    fn prune_protects_referenced_blob_and_its_manifest_r9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+
+        let referenced_source = temp.path().join("referenced.jsonl");
+        fs::write(&referenced_source, b"{\"type\":\"message\",\"text\":\"still referenced\"}\n").expect("write referenced source");
+        let referenced = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &referenced_source,
+            db_links: &[],
+        })
+        .expect("capture referenced source");
+
+        let unreferenced_source = temp.path().join("unreferenced.jsonl");
+        fs::write(&unreferenced_source, b"{\"type\":\"message\",\"text\":\"no longer referenced\"}\n").expect("write unreferenced source");
+        let unreferenced = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &unreferenced_source,
+            db_links: &[],
+        })
+        .expect("capture unreferenced source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let referenced_manifest_path = root.join(&referenced.manifest_relative_path);
+        let referenced_blob_path = root.join(&referenced.blob_relative_path);
+        let unreferenced_manifest_path = root.join(&unreferenced.manifest_relative_path);
+        let unreferenced_blob_path = root.join(&unreferenced.blob_relative_path);
+        assert!(referenced_blob_path.exists() && unreferenced_blob_path.exists(), "both blobs must exist before pruning");
+
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert(referenced.blob_relative_path.clone());
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect("prune with a protected reference must succeed");
+
+        assert!(referenced_manifest_path.exists(), "referenced manifest must survive prune");
+        assert!(referenced_blob_path.exists(), "referenced blob must survive prune");
+        assert!(!unreferenced_manifest_path.exists(), "unreferenced expired manifest must be pruned");
+        assert!(!unreferenced_blob_path.exists(), "unreferenced expired blob must be pruned");
+        assert_eq!(report.applied_blob_count, 1, "exactly the unreferenced blob should be deleted");
+    }
+
+    /// R9 mutation half of the pair above: the SAME two captures, but
+    /// `referenced_blobs` left empty (as if the caller had forgotten to
+    /// read `messages.excluded.raw.blob` before pruning, or the manifest-
+    /// level protection union were missing) -- the blob that would
+    /// otherwise have been protected now gets deleted too, proving the
+    /// protection in the positive test is actually load-bearing.
+    #[test]
+    fn prune_without_referenced_blobs_deletes_what_would_have_been_protected_r9_mutation() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+
+        let source = temp.path().join("would-be-referenced.jsonl");
+        fs::write(&source, b"{\"type\":\"message\",\"text\":\"would be referenced\"}\n").expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .expect("capture source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+
+        prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(), // mutation: no reference set
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect("prune without a reference set must still succeed (nothing left to protect)");
+
+        assert!(!manifest_path.exists(), "MUTATION: without referenced_blobs, this manifest is wrongly deleted");
+        assert!(!blob_path.exists(), "MUTATION: without referenced_blobs, this blob is wrongly deleted");
     }
 
     #[test]
@@ -2531,6 +2691,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2586,6 +2747,7 @@ mod tests {
         let err = match prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2647,6 +2809,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2712,6 +2875,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(86_400_000),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2788,6 +2952,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: Some(0),
                 keep_tags: vec!["keep".to_string()],
@@ -2832,6 +2997,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: None,
                 max_size_bytes: Some(0),
                 keep_tags: Vec::new(),
