@@ -117,7 +117,14 @@ READ_TOOL_IDENTITIES = {
     # `command`; no other codex tool_name matched a Read/Bash shape).
     # project_read keeps its registered full name verbatim since it is
     # MCP-proxied, not codex-native.
-    "codex": {"read": None, "project_read": "mcp__ccw-control-plane__project_read", "bash": "exec_command", "bash_arg_key": "cmd"},
+    # codex registers/calls this MCP tool under its BARE name "project_read"
+    # (confirmed: grep of a real blob shows the tool schema
+    # `{"type":"function","name":"project_read","description":"Serve one
+    # byte-bounded control document chunk..."}` -- the same tool's real
+    # description -- and build_candidates_codex's tool_name_freq showed 610
+    # actual invocations under this bare name), NOT the
+    # `mcp__ccw-control-plane__` prefixed full name claude_code uses.
+    "codex": {"read": None, "project_read": "project_read", "bash": "exec_command", "bash_arg_key": "cmd"},
 }
 
 

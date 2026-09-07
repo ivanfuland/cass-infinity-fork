@@ -158,7 +158,9 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 | 连接器 | `Read` | `project_read` | `Bash` |
 |---|---|---|---|
 | `claude_code` | `Read` | `mcp__ccw-control-plane__project_read`（冻结副本 1,586 次调用用此全名，裸名 `project_read` 0 次出现） | `Bash` |
-| `codex` | **无独立 Read 工具**（不启用该分支；读操作全部经 `exec_command` shell 执行） | `mcp__ccw-control-plane__project_read`（MCP 代理工具保留注册全名，与 claude_code 相同） | `exec_command`（**参数键名是 `cmd`，不是 `command`**——T1b 探针实测 codex tool_name 频次分布 `exec_command` 1,081/1,341 次 tool_call 中最高频，两个数量级领先于第二名 `write_stdin`；R2 只读子集判定对 `cmd` 字段值做同样的两步语法判定） |
+| `codex` | **无独立 Read 工具**（不启用该分支；读操作全部经 `exec_command` shell 执行） | **`project_read`（裸名，不带 `mcp__ccw-control-plane__` 前缀！）**——T1b.2 全量跑发现与 claude_code 不同：codex 把 MCP 工具注册/调用成裸名，实测直接 grep blob 命中工具 schema `{"type":"function","name":"project_read","description":"Serve one byte-bounded control document chunk..."}`（与该工具真实 description 一致），且 `build_candidates_codex` 统计到 610 次真实调用（非 schema 声明）用此裸名。**T1 初版误写成沿用 claude_code 全名，已订正** | `exec_command`（**参数键名是 `cmd`，不是 `command`**——T1b 探针实测 codex tool_name 频次分布 `exec_command` 40,729 次 tool_call 中最高频之一；R2 只读子集判定对 `cmd` 字段值做同样的两步语法判定） |
+
+**R1 已知缺口（本轮未修，供 T2/控制面裁）**：codex 同样把 cass-mcp 工具注册/调用成裸名——全量跑发现 `cass_search`（5 次）与 `cass_expand`（3 次）真实调用，共 8 条，均不带 `mcp__cass-mcp__` 前缀。R1 的判定逻辑（`tool_name.startswith("mcp__cass-mcp__")`）是 spec §2.1 锚点 1 的原文定义，改动需回到 spec 层面裁定（是否给 codex 加一条裸名例外），不在本轮「清单是配置」的修复批边界内——本轮按「宁漏勿误」处理：这 8 条不排除，原文仍在镜像。
 | 其它连接器（`gemini`、`openclaw/*` 各分身、`pi_agent`） | 待盘点（同 R7：零覆盖率数据，不启用） | 同左 | 同左 |
 | 其它连接器 | 待 T1b 盘点 | 待 T1b 盘点 | 待 T1b 盘点 |
 
