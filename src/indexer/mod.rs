@@ -13926,6 +13926,20 @@ fn reindex_paths_with_semantic_delta(
         return Ok(0);
     }
 
+    // mission #117③: this function is called exactly once per watch/watch-once
+    // *cycle* (the three call sites are the three mutually-exclusive branches
+    // of the single `watch_sources` callback invoked once per debounced
+    // cycle; the non-watch broad-scan path in `run_index` never calls this
+    // function). A single cycle can still iterate over *multiple*
+    // `(kind, root)` triggers below, so the reset must happen here -- once,
+    // before that loop -- not inside it (which would zero out an earlier
+    // kind's counts from this same cycle). `run_index`'s own entry-point
+    // reset (`reset_last_index_run_counters` at its top) covers the
+    // non-watch case and this function's first cycle; this call is what
+    // makes every *subsequent* cycle of a long-running `--watch` process
+    // "视为一次 run" instead of accumulating across the whole process.
+    reset_last_index_run_counters();
+
     let mut total_indexed = 0usize;
 
     let mut semantic_delta = semantic_delta;
@@ -30329,6 +30343,81 @@ mod tests {
         assert_eq!(message_count, 2);
     }
 
+    /// 任务书 #117③: `reindex_paths_with_semantic_delta` is called exactly once
+    /// per watch/watch-once *cycle* (confirmed by code-path tracing: its three
+    /// call sites are the three mutually-exclusive branches of the single
+    /// `watch_sources` callback, invoked once per debounced cycle -- see the
+    /// `reset_last_index_run_counters()` call added at this function's top).
+    /// Two direct calls to `reindex_paths` here simulate two such cycles of a
+    /// single long-running `--watch` process without needing a real
+    /// filesystem-watcher/timer loop: cycle 1's codex fixture trips anchor 3
+    /// (`codex_host_shell`); cycle 2's fixture has no anchors at all. If the
+    /// per-cycle reset were missing (this test's mutation), cycle 2's snapshot
+    /// would still show cycle 1's hit -- "cumulative across the whole
+    /// process" instead of "视为一次 run" per cycle.
+    #[test]
+    #[serial]
+    fn reindex_paths_zeroes_codex_host_shell_hits_between_watch_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let sessions_dir = tmp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Cycle 1 fixture: idx0 is a real host-shell wrapper (anchor 3).
+        let cycle1_session = sessions_dir.join("rollout-w117-cycle1-hostshell.jsonl");
+        std::fs::write(
+            &cycle1_session,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for X\\nbe nice\\n<environment_context>\\n<cwd>/home/u/project</cwd>\\n</environment_context>\"}]}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"real follow-up\"}]}}\n",
+        )
+        .unwrap();
+
+        // Cycle 2 fixture: a completely different session, no anchors at all
+        // (plain idx0 user message, no environment-context wrapper).
+        let cycle2_session = sessions_dir.join("rollout-w117-cycle2-plain.jsonl");
+        std::fs::write(
+            &cycle2_session,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"just a normal question, no wrapper here\"}]}}\n",
+        )
+        .unwrap();
+
+        let opts = |watch_once_path: PathBuf| super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![watch_once_path]),
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let storage = FrankenStorage::open(&data_dir.join("agent_search.db")).unwrap();
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+
+        // Cycle 1: the host-shell hit must be visible right after this call.
+        let cycle1_opts = opts(cycle1_session.clone());
+        reindex_paths(&cycle1_opts, vec![cycle1_session], &[], &state, &storage, false).unwrap();
+        let (cycle1_hits, _total, _align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(cycle1_hits, 1, "cycle 1's fixture must trip anchor 3 exactly once");
+
+        // Cycle 2: a second, independent call simulating the *next* watch
+        // cycle. Its fixture has zero anchors, so if the reset genuinely runs
+        // once per cycle (not once per whole `run_index` process lifetime),
+        // the snapshot right after this call must show 0, not cycle 1's 1.
+        let cycle2_opts = opts(cycle2_session.clone());
+        reindex_paths(&cycle2_opts, vec![cycle2_session], &[], &state, &storage, false).unwrap();
+        let (cycle2_hits, _total2, _align_failed2) = last_index_run_counters_snapshot();
+        assert_eq!(
+            cycle2_hits, 0,
+            "cycle 2 has no anchors; a genuinely per-cycle reset must show 0 here, not cycle 1's leftover count"
+        );
+    }
+
     #[test]
     #[serial]
     fn run_index_watch_once_reindexes_changed_explicit_codex_path_already_in_db() {
@@ -33131,6 +33220,46 @@ mod tests {
             Some(&serde_json::json!(
                 CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
             ))
+        );
+    }
+
+    #[test]
+    fn prepare_conversation_for_ingest_logical_source_skips_capture_and_judgment() {
+        // 任务书 #117④: `CaptureSourceKind::Logical` is pub(crate), so a
+        // black-box `tests/w6_exclusion_ingest.rs` case can't construct it --
+        // this is the "对照" the mission asks for, driven inline instead.
+        //
+        // `data_dir` is deliberately never created: if the `Logical` branch
+        // ever mistakenly fell through to `attach_raw_mirror_capture` (the
+        // `File` branch's capture step), that call would fail fast on the
+        // missing directory and this test would see `Err`, not `Ok`. Seeing
+        // `Ok` with an untouched `data_dir` is therefore proof capture was
+        // never attempted, not just an assumption about the `match` arm.
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data-never-created");
+
+        let conv = norm_conv(Some("logical-src"), vec![norm_msg(0, 100)]);
+        let original_content = conv.messages[0].content.clone();
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &codex_connector,
+            &Origin::local(),
+            None,
+            CaptureSourceKind::Logical,
+            conv,
+        )
+        .expect("Logical source must succeed without touching data_dir");
+
+        assert!(
+            prepared.excluded.iter().all(Option::is_none),
+            "capture_na: Logical sources skip judgment entirely, so every \
+             marker slot must be None"
+        );
+        assert_eq!(
+            prepared.conv.messages[0].content, original_content,
+            "Logical sources must not be touched by redaction/exclusion"
         );
     }
 

@@ -3999,6 +3999,68 @@ mod e5_materialization_tests {
         assert_eq!(verdict.layer, RelationLayer::MessageSequence);
     }
 
+    /// R2-B1 / 任务书 #117② 恢复分叉反例：同会话两个镜像版本，调用 id/角色/created_at
+    /// 全同，仅一条应排除的 `tool_result` 正文不同——排除后两版本正文字节都是 `""`
+    /// （逐字节相等），所以第一层（`compare_bytes_layer`）与不纳入 `excluded_sha256` 的
+    /// 摘要都会把它们判成 `Equal`；只有把清空前的 `excluded.sha256` 纳入摘要才能让两版本
+    /// 分叉，避免恢复器 `Skip` 掉本该保留的另一版本的排除溯源。
+    ///
+    /// 锁的是 `compact_invariant_message_digest_scoped`/`digest_prefix_relation` 这一层
+    /// 本身（不经 `SealedMessageProjector`/真实字节投影——那条路径在本文件另一批「real_*」
+    /// 测试里已覆盖），构造上直接对应 `apply` 产出的排除行形态：`content` 已清空，
+    /// `excluded_sha256` 是清空前脱敏后正文的 BLAKE3 hex（两版本不同）。
+    #[test]
+    fn recovery_fork_counterexample_excluded_sha256_prevents_false_equal() {
+        fn redacted_tool_result() -> franken_agent_detection::types::NormalizedMessage {
+            franken_agent_detection::types::NormalizedMessage {
+                idx: 0,
+                role: "tool_result".to_string(),
+                author: None,
+                created_at: Some(1_700_000_000),
+                content: String::new(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }
+        }
+
+        let digest_a = compact_invariant_message_digest_scoped(
+            &redacted_tool_result(),
+            DigestScope::Projection,
+            "sha-of-secret-a",
+        );
+        let digest_b = compact_invariant_message_digest_scoped(
+            &redacted_tool_result(),
+            DigestScope::Projection,
+            "sha-of-secret-b",
+        );
+        assert_ne!(
+            digest_a, digest_b,
+            "排除后正文字节相同（都是空串），但清空前的 excluded_sha256 不同——摘要必须不同"
+        );
+        assert_ne!(
+            digest_prefix_relation(&[digest_a], &[digest_b]),
+            Some(Relation::Equal),
+            "分叉版本不得判 Equal——判 Equal 会让恢复规划器 Skip 掉另一版本的排除溯源"
+        );
+
+        // 变异对照：把 excluded_sha256 改回恒空串（未排除消息的既有摘要行为，R2-B1 之前
+        // 的形态）——两版本会被判「假等」，正是 R2-B1 要堵的洞。
+        let digest_a_mutated =
+            compact_invariant_message_digest_scoped(&redacted_tool_result(), DigestScope::Projection, "");
+        let digest_b_mutated =
+            compact_invariant_message_digest_scoped(&redacted_tool_result(), DigestScope::Projection, "");
+        assert_eq!(
+            digest_a_mutated, digest_b_mutated,
+            "变异证据：摘要不纳入 excluded_sha256 时两个分叉版本会被判假等"
+        );
+        assert_eq!(
+            digest_prefix_relation(&[digest_a_mutated], &[digest_b_mutated]),
+            Some(Relation::Equal),
+            "变异证据：假等的摘要会让 digest_prefix_relation 判 Equal，恢复器据此 Skip"
+        );
+    }
+
     #[test]
     fn real_projection_reports_genuine_content_divergence_as_diverged() {
         let root = scratch("real-diverged");

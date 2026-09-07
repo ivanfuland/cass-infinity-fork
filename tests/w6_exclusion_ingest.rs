@@ -881,3 +881,141 @@ fn status_json_last_index_counters_survive_a_failed_run() {
         "a failed run must preserve the previous successful run's codex_idx0_user_total, not zero it: {status_value_after_failure}"
     );
 }
+
+// =============================================================================
+// 任务书 #117 (T2d): mirror-restore two-stage CLI judgment (①) and the
+// recovery-fork counterexample's black-box half (②'s CLI-level evidence --
+// the digest-function-level lock lives inline in
+// `phase3_restore.rs::e5_materialization_tests`).
+// =============================================================================
+
+/// Writes (or overwrites) a codex `rollout-*.jsonl` fixture at a FIXED path:
+/// idx0 host-shell wrapper (anchor 3), idx1 `cass_search` tool_call, idx2
+/// its `tool_result` carrying `recall_content` (anchor 1, bare codex name),
+/// idx3 a real user follow-up. Unlike `write_codex_host_shell_session`
+/// (which picks its own path under a caller-given directory), this variant
+/// takes the full path so two calls can target the exact same session
+/// identity while varying only the excluded tool_result's body -- both
+/// judgments below need that (① re-captures the identical fixture across
+/// two directories; ②'s divergence case needs two *content-different*
+/// versions of the *same* identity).
+fn write_codex_host_shell_session_at(path: &std::path::Path, recall_content: &str) {
+    std::fs::create_dir_all(path.parent().expect("fixture path must have a parent")).expect("mkdir fixture parent");
+    let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+    let recall_output = serde_json::json!({
+        "query": "prior secret rotation note", "limit": 5, "offset": 0, "count": 1, "total_matches": 1,
+        "hits": [{
+            "agent": "codex", "content": recall_content,
+            "created_at": 1700000000000i64, "line_number": 3, "match_type": "exact",
+            "origin_kind": "local", "score": 0.8, "snippet": "rotate the key",
+            "source_id": 7, "source_path": "/logs/other-session.jsonl",
+            "title": "key rotation", "workspace": "/ws/demo"
+        }],
+        "cursor": null, "hits_clamped": false, "max_tokens": 8000, "request_id": "req-w6-codex-1"
+    })
+    .to_string();
+    let events: Vec<serde_json::Value> = vec![
+        serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_0","role":"user","content":[{"type":"input_text","text":host_shell_text}]}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"cass_search","arguments":"{\"query\":\"prior secret rotation note\"}","call_id":"call_1"}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":recall_output}}),
+        serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"what did you find?"}]}}),
+    ];
+    let body = events.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(path, &body).expect("write codex session fixture");
+}
+
+/// Judgment ①: `cass mirror-restore` two-stage CLI (plan → `--apply
+/// --generation <label> --journal <path>`) against a real raw-mirror
+/// produced by a normal ingest, carrying `excluded` markers through to a
+/// brand-new candidate DB via `restore_project_plan_item`.
+///
+/// `--generation` is a caller-chosen label, not something the dry-run
+/// step returns for the apply step to echo back: `plan_mirror_restore` is
+/// re-run fresh inside the `--apply` branch too (same `options`), and
+/// `restore_apply_journaled` writes the journal for the first time only at
+/// apply time -- confirmed by reading `src/lib.rs`'s `MirrorRestore` match
+/// arm (the dry-run summary JSON carries no `generation` field at all). So
+/// this test gives the same arbitrary string to both invocations rather
+/// than parsing one out of the plan step's output.
+#[test]
+fn mirror_restore_apply_carries_excluded_marker_through_to_candidate_db() {
+    let root = tempfile::TempDir::new().expect("root tempdir");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+
+    let session_path = home.join(".codex").join("sessions").join("2026").join("09").join("rollout-w117-mirror-restore.jsonl");
+    write_codex_host_shell_session_at(&session_path, "MIRROR-RESTORE-POSITIVE-RECALL-BODY");
+
+    // A: normal ingest producing both a DB and the raw-mirror it will be
+    // restored from.
+    let data_dir_a = root.path().join("data-a");
+    std::fs::create_dir_all(&data_dir_a).expect("mkdir data_dir_a");
+    let ingest_output = cass_cmd(&data_dir_a, &home)
+        .args(["index", "--watch-once", session_path.to_str().expect("utf8 session path"), "--json"])
+        .output()
+        .expect("spawn cass index --watch-once (A)");
+    assert!(ingest_output.status.success(), "seed ingest into A must succeed; stderr={}", String::from_utf8_lossy(&ingest_output.stderr));
+
+    let a_db = data_dir_a.join("agent_search.db");
+    let a_rows = read_message_rows_single_conversation(&a_db);
+    assert_eq!(a_rows.len(), 4, "sanity: A must have the fixture's 4 rows: {a_rows:?}");
+    let a_excluded_count = a_rows.iter().filter(|r| r.3).count();
+    assert_eq!(a_excluded_count, 2, "sanity: both anchors (3 and 1) must have fired in A: {a_rows:?}");
+
+    // B: a brand-new, empty candidate DB (current schema, zero rows) --
+    // `plan_mirror_restore` opens it read-only, so it must already exist as
+    // a valid (if empty) database, not merely a path.
+    let candidate_db = root.path().join("candidate.db");
+    coding_agent_search::storage::sqlite::FrankenStorage::open(&candidate_db).expect("initialize empty candidate db B");
+
+    let scratch_dir = root.path().join("scratch");
+    let journal_path = root.path().join("journal.json");
+    let generation_label = "t2d-mirror-restore-1";
+
+    // Stage 1: dry-run plan. Sanity: exactly one brand-new session -> `restore`.
+    let plan_output = cass_cmd(&data_dir_a, &home)
+        .args([
+            "mirror-restore",
+            "--data-dir", data_dir_a.to_str().expect("utf8 data_dir_a"),
+            "--candidate-db", candidate_db.to_str().expect("utf8 candidate_db"),
+            "--scratch", scratch_dir.to_str().expect("utf8 scratch_dir"),
+            "--snapshot-root", generation_label,
+            "--json",
+        ])
+        .output()
+        .expect("spawn cass mirror-restore dry-run");
+    assert!(plan_output.status.success(), "dry-run plan must succeed; stderr={}", String::from_utf8_lossy(&plan_output.stderr));
+    let plan_summary: serde_json::Value = serde_json::from_slice(&plan_output.stdout).expect("parse dry-run json");
+    assert_eq!(
+        plan_summary.get("restore").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "a brand-new session against an empty candidate db must plan RestoreNew: {plan_summary}"
+    );
+
+    // Stage 2: apply.
+    let apply_output = cass_cmd(&data_dir_a, &home)
+        .args([
+            "mirror-restore",
+            "--data-dir", data_dir_a.to_str().expect("utf8 data_dir_a"),
+            "--candidate-db", candidate_db.to_str().expect("utf8 candidate_db"),
+            "--scratch", scratch_dir.to_str().expect("utf8 scratch_dir"),
+            "--snapshot-root", generation_label,
+            "--apply",
+            "--generation", generation_label,
+            "--journal", journal_path.to_str().expect("utf8 journal_path"),
+            "--json",
+        ])
+        .output()
+        .expect("spawn cass mirror-restore --apply");
+    assert!(apply_output.status.success(), "apply must succeed; stderr={}", String::from_utf8_lossy(&apply_output.stderr));
+
+    // The restored candidate DB must match A row-for-row, `excluded` markers
+    // included -- proof `restore_project_plan_item` really did go through
+    // `map_to_internal_with_redactor`, not the marker-dropping single-arg
+    // `map_to_internal`.
+    let b_rows = read_message_rows_single_conversation(&candidate_db);
+    assert_eq!(
+        a_rows, b_rows,
+        "restored candidate DB rows must equal the source mirror's rows byte-for-byte, including excluded.{{reason,sha256,raw.blob,raw.event_key,raw.blocks}}"
+    );
+}
