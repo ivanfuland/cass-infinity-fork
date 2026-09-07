@@ -148,14 +148,16 @@ a message reaches `canonicalize()` at all).
 - **Whole-text low-signal filter** (inside `canonicalize()`, stage 4 --
   part of `normalize()`'s own pipeline, applied *after* stages ①②③): if
   the entire already-normalized text, trimmed and lowercased, exactly
-  equals one of 15 short acknowledgement phrases (`FS_LOW_SIGNAL_CONTENT`
+  equals one of 17 short acknowledgement phrases (`FS_LOW_SIGNAL_CONTENT`
   in the slow path, byte-identical `LOW_SIGNAL_CONTENT` in the fast path),
   the canonicalized output is the empty string. Full frozen list + the
   Rust sync guard: `scripts/oracle/hard_noise_phrases.json` key
   `canonicalize_low_signal` / test `low_signal_phrases_json_matches_source`
   (this list was originally *not* frozen by T1 -- filled in as a T1
-  rules-doc gap fix folded into T2, plan v5.1).
+  rules-doc gap fix folded into T2, plan v5.1; PR6 T1 added `"wait timed
+  out"` and `"bash completed with no output"`, task book #111).
   - Input: `"OK"` → Output: `""`
+  - Input: `"Bash completed with no output"` → Output: `""`
 - **Whole-message tool-acknowledgement filter** (`is_hard_message_noise`,
   called by the indexer before a message even reaches `canonicalize()`,
   exposed to the T2 oracle as `is_hard_noise(role, text)`): a broader,
@@ -165,7 +167,12 @@ a message reaches `canonicalize()` at all).
   `short_tool_acks` / `prefixed_tool_acks`). See that file for the exact
   phrase/prefix lists and match rules (trim/case/length/role conditions),
   and `hard_noise_phrases_json_matches_source` (Rust test) for the sync
-  guard.
+  guard. PR6 T1 (任务书 #111) added two role-gated tool receipts to
+  `short_tool_acks` (Rust: `is_tool_acknowledgement`'s `short_tool_ack`
+  local; python: `SHORT_TOOL_ACKS`): `"wait timed out"` and `"bash
+  completed with no output"`, both requiring a tool-class role (or a
+  `"file"`/`"match"` substring) to fire, matching the existing six.
+  - Input: `is_hard_noise("tool_result", "Wait timed out")` → `True`
 
 ## ⑤ No truncation, no code-block collapsing, no base64/binary stripping
 

@@ -58,6 +58,8 @@ const FS_LOW_SIGNAL_CONTENT: &[&str] = &[
     "thanks.",
     "thank you",
     "thank you.",
+    "wait timed out",
+    "bash completed with no output",
 ];
 
 /// Trait for text preprocessing before embedding.
@@ -440,6 +442,8 @@ const LOW_SIGNAL_CONTENT: &[&str] = &[
     "thanks.",
     "thank you",
     "thank you.",
+    "wait timed out",
+    "bash completed with no output",
 ];
 
 /// Return `Some(canonical)` when `text` can be processed by the cheap
@@ -618,7 +622,9 @@ pub fn is_tool_acknowledgement(role: Option<&str>, text: &str) -> bool {
         || lower == "no changes"
         || lower == "already up to date"
         || lower == "up to date"
-        || lower == "file written";
+        || lower == "file written"
+        || lower == "wait timed out"
+        || lower == "bash completed with no output";
     if short_tool_ack && (toolish || lower.contains("file") || lower.contains("match")) {
         return true;
     }
@@ -1189,6 +1195,47 @@ See [docs](http://docs.rs) for more.
         );
     }
 
+    /// PR6 T1 (任务书 #111): two new hard-noise receipts must be recognized
+    /// on both sides -- the lexical/word-level side (`is_hard_message_noise`,
+    /// whose real source is `is_short_acknowledgement` at :558) and the
+    /// block/embedding side (`canonicalize_for_embedding`, which must hit the
+    /// pure-ASCII fast path since both phrases contain no markdown
+    /// discriminator bytes or non-ASCII bytes).
+    #[test]
+    fn hard_noise_two_receipts_are_noise_on_both_sides() {
+        assert!(
+            is_hard_message_noise(Some("tool_result"), "Wait timed out"),
+            "lexical side: \"Wait timed out\" must be hard message noise"
+        );
+        assert!(
+            is_hard_message_noise(Some("tool_result"), "Bash completed with no output"),
+            "lexical side: \"Bash completed with no output\" must be hard message noise"
+        );
+
+        assert_eq!(
+            canonicalize_for_embedding("Wait timed out"),
+            "",
+            "block side: \"Wait timed out\" must canonicalize to empty"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("Bash completed with no output"),
+            "",
+            "block side: \"Bash completed with no output\" must canonicalize to empty"
+        );
+
+        // Both phrases must be fast-path eligible (pure ASCII, no markdown
+        // discriminator bytes) so this test actually exercises the fast path,
+        // not a fallthrough to the slow pipeline.
+        assert!(
+            canonicalize_fast_path("Wait timed out").is_some(),
+            "\"Wait timed out\" must be fast-path eligible"
+        );
+        assert!(
+            canonicalize_fast_path("Bash completed with no output").is_some(),
+            "\"Bash completed with no output\" must be fast-path eligible"
+        );
+    }
+
     /// T1 (plan v5.1, Step 6b): `scripts/oracle/hard_noise_phrases.json` must
     /// stay in sync with the actual `is_short_acknowledgement` /
     /// `is_tool_acknowledgement` source logic it transcribes. This can't
@@ -1225,7 +1272,7 @@ See [docs](http://docs.rs) for more.
             .expect("short_tool_acks.phrases must be an array");
         assert_eq!(
             short_tool_acks.len(),
-            6,
+            8,
             "short_tool_acks count drifted from source"
         );
         for phrase in short_tool_acks {

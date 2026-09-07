@@ -62,7 +62,12 @@ _TOOL_CLASS_ROLES = {"tool_call", "tool_result"}
 # ---------------------------------------------------------------------------
 # is_hard_noise: whole-message tool-acknowledgement filter
 # (scripts/oracle/hard_noise_phrases.json: short_acknowledgements [20] +
-# short_tool_acks [6] + prefixed_tool_acks [8] = 34 phrases/prefixes).
+# short_tool_acks [8] + prefixed_tool_acks [8] = 36 phrases/prefixes).
+# PR6 T1 (任务书 #111): SHORT_TOOL_ACKS and CANONICALIZE_LOW_SIGNAL below each
+# gained two hard-noise receipts ("wait timed out", "bash completed with no
+# output"), mirroring the Rust `is_tool_acknowledgement` short_tool_ack gate
+# and FS_LOW_SIGNAL_CONTENT/LOW_SIGNAL_CONTENT additions -- manual sync since
+# these two lists are NOT loaded from hard_noise_phrases.json.
 # `role` here is the CANONICAL role string (canonical_role's return value,
 # or None), matching the Rust call site `is_hard_message_noise(Some(role.as_str()), ...)`.
 # ---------------------------------------------------------------------------
@@ -78,6 +83,7 @@ SHORT_ACKNOWLEDGEMENTS = [
 SHORT_TOOL_ACKS = [
     "no matches found", "no changes made", "no changes",
     "already up to date", "up to date", "file written",
+    "wait timed out", "bash completed with no output",
 ]
 
 PREFIXED_TOOL_ACKS = [
@@ -92,6 +98,7 @@ CANONICALIZE_LOW_SIGNAL = [
     "ok", "done", "done.", "got it", "got it.",
     "understood", "understood.", "sure", "sure.",
     "yes", "no", "thanks", "thanks.", "thank you", "thank you.",
+    "wait timed out", "bash completed with no output",
 ]
 
 
