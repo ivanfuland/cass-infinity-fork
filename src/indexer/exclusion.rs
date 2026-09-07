@@ -15,10 +15,11 @@
 //! then do the actual content/extra replacement once a [`Decision`] exists.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::connectors::NormalizedMessage;
+use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::indexer::redact_secrets::MemoizingRedactor;
 use crate::sources::config::ExcludedContextPaths;
 
@@ -59,12 +60,24 @@ pub struct ShellAnchor {
     pub closer: String,
 }
 
-/// R1-c: cass-mcp tool_result hits, parsed from the (pre-redaction) content
-/// when parsing succeeds. `sessions`/`message_ids` per R6's example.
+/// R1-c: one cass-mcp recall hit (spec v4.5 shape -- real cass-mcp responses
+/// carry no `session_id`/`message_id`, only `source_id`/`source_path`/
+/// `line_number` per hit).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RecallHit {
+    pub source_id: i64,
+    pub source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_number: Option<u64>,
+}
+
+/// R1-c: cass-mcp tool_result hits, parsed from the (pre-redaction) content
+/// when parsing succeeds (spec v4.5 T2b replacement of T2a's placeholder
+/// shape). `sessions` is the distinct `source_path` set across `hits`.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RecallSrc {
     pub sessions: Vec<String>,
-    pub message_ids: Vec<i64>,
+    pub hits: Vec<RecallHit>,
 }
 
 /// R6 `raw` sub-object: locates the message inside the raw-mirror blob and
@@ -153,6 +166,171 @@ pub struct RawEvent {
     pub event_key: String,
     pub blocks: Vec<RawBlock>,
 }
+
+// ============================================================================
+// T2b (任务书 #114): `RawEvent` production from a raw-mirror blob.
+// ============================================================================
+
+/// Build the raw event/block facts for one connector's raw-mirror blob file
+/// (already materialized back into its original directory shape by
+/// `materialize_capture_to_scratch`, then reparsed by that connector's own
+/// file parser -- `events_from_blob` reads the *same bytes* directly,
+/// independently of the connector parser, since the connector's own
+/// `NormalizedMessage`/`NormalizedConversation` output drops the raw event
+/// identity (claude_code's per-line `uuid`, codex's `payload.id`) entirely --
+/// neither field survives into any `NormalizedMessage` field.
+///
+/// **Disclosed alignment judgment call** (spec/plan describe this as
+/// "`Vec<Option<RawEvent>>`按消息序对齐"; this round implements the
+/// empirically-verified case, not a full reimplementation of each
+/// connector's own message-splitting logic): claude_code normally emits one
+/// event = one message, **except** when one JSONL line's `message.content[]`
+/// mixes a `tool_result` block with other (`text`/`tool_use`) blocks -- T1b's
+/// documented example (messages 1287477/1287478: one event, `content` =
+/// `[tool_result, text]`, projected into a `user` row (idx N, the non-
+/// `tool_result` content) followed by a `tool_result` row (idx N+1)) -- in
+/// which case this function pushes the *same* `RawEvent` (identical
+/// `event_key`, full `blocks`) twice in a row, so positional alignment with
+/// the connector's own two emitted rows holds for this documented shape.
+/// Rarer shapes (multiple `tool_result` blocks in one event, `tool_use` mixed
+/// with `tool_result`, etc.) are not modeled and fall back to a single
+/// emitted entry -- `decide` only ever looks at `event.blocks` by kind/id,
+/// never by the calling message's own position within a split event, so a
+/// coarser split only risks *under*-splitting the vector length (宁漏勿误:
+/// the caller's `events.get(idx)` degrades to `None` for a short vector,
+/// never to a wrong event). Connectors other than `claude_code`/`codex`
+/// return an empty vec (no structural facts -- R7/R11 "不启用").
+pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEvent> {
+    match agent_slug {
+        "claude_code" => claude_code_events_from_blob(blob_path).unwrap_or_default(),
+        "codex" => codex_events_from_blob(blob_path).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<String>> {
+    let text = std::fs::read_to_string(blob_path)?;
+    Ok(text.lines().filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+}
+
+fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
+    let lines = read_jsonl_lines(blob_path)?;
+    let mut events = Vec::with_capacity(lines.len());
+    for (line_no, line) in lines.iter().enumerate() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let event_key =
+            value.get("uuid").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{}", line_no + 1));
+        let mut blocks = Vec::new();
+        let mut has_tool_result = false;
+        let mut has_other = false;
+        if let Some(content) = value.pointer("/message/content").and_then(|v| v.as_array()) {
+            for (i, block) in content.iter().enumerate() {
+                let block_type = block.get("type").and_then(|v| v.as_str());
+                let kind = match block_type {
+                    Some("tool_use") => BlockKind::ToolUse,
+                    Some("tool_result") => BlockKind::ToolResult,
+                    Some("text") => BlockKind::Text,
+                    _ => BlockKind::Other,
+                };
+                if kind == BlockKind::ToolResult {
+                    has_tool_result = true;
+                } else {
+                    has_other = true;
+                }
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
+                    .map(str::to_string);
+                let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                let args = block.get("input").cloned();
+                blocks.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
+            }
+        }
+        let event = RawEvent { event_key, blocks };
+        // Documented split shape (see doc comment): mixed tool_result + other
+        // content projects into two consecutive rows sharing this event.
+        if has_tool_result && has_other {
+            events.push(event.clone());
+        }
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
+    let lines = read_jsonl_lines(blob_path)?;
+    let mut events = Vec::with_capacity(lines.len());
+    for (line_no, line) in lines.iter().enumerate() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Some(payload) = value.get("payload") else { continue };
+        let event_key =
+            payload.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{}", line_no + 1));
+        let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
+        let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
+        let blocks = match payload_type {
+            "function_call" | "custom_tool_call" => {
+                let args = payload.get("arguments").or_else(|| payload.get("input")).cloned();
+                vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }]
+            }
+            "function_call_output" | "custom_tool_call_output" => {
+                vec![RawBlock { index: 0, kind: BlockKind::ToolResult, tool_use_id: call_id, tool_name: None, args: None }]
+            }
+            "message" => {
+                // R6: "codex payload.output 整体记单块索引 0" -- one Text
+                // block regardless of how many `content[]`/`output[]`
+                // elements the message actually carries, since R3's
+                // target_blocks is "all Text blocks" and apply's field map
+                // (`payload.content[*].text`/`payload.output[*].text`)
+                // replaces the whole array per matched index anyway.
+                let has_text = payload
+                    .get("content")
+                    .or_else(|| payload.get("output"))
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|arr| !arr.is_empty());
+                if has_text {
+                    vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => Vec::new(),
+        };
+        events.push(RawEvent { event_key, blocks });
+    }
+    Ok(events)
+}
+
+// ============================================================================
+// T2b: prepare-pipeline carrier types.
+// ============================================================================
+
+/// The output of `prepare_conversation_for_ingest`/`_for_restore`: the
+/// projected conversation plus its per-message exclusion markers, aligned by
+/// index (`excluded[i]` corresponds to `conv.messages[i]`). Threaded through
+/// the ingest transport chain and the restore chain unpacked exactly once, at
+/// `map_to_internal_with_redactor` -- `NormalizedMessage` itself cannot carry
+/// `excluded` (pinned upstream type, no new fields allowed).
+pub(crate) struct PreparedConversation {
+    pub conv: NormalizedConversation,
+    pub excluded: Vec<Option<ExcludedMarker>>,
+}
+
+/// Prepare-time failure that must abort ingestion of the whole session
+/// (Global Constraints: "捕获失败 → 该会话整体跳过...不落行、水位不越过、
+/// 计 ScanError、CLI 末尾退出码非零"). Carries a human-readable reason for
+/// logging; callers do not match on failure kind.
+#[derive(Debug, Clone)]
+pub(crate) struct PrepareError(pub String);
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PrepareError {}
 
 // ============================================================================
 // R4: pairing.
@@ -689,18 +867,35 @@ fn blake3_hex(text: &str) -> String {
 /// (string) and `message_id` (integer). Any other shape, or invalid JSON,
 /// is a parse failure (`src = None`, `parse_error = Some(reason)`) --
 /// `decide` already committed to `reason = CassRecall` regardless, per R1-c.
+/// R1-c (spec v4.5): a real cass-mcp tool_result is one of two legitimate
+/// JSON shapes -- a hits envelope, or `{"error": ...}` when the underlying
+/// `cass` invocation itself failed. Both are "parsed successfully" (no
+/// `parse_error`); only non-JSON, or JSON that is neither shape, is a parse
+/// failure. `line_number` is the only optional per-hit field (real
+/// responses always carry `source_id`/`source_path`).
 fn parse_recall_hits(content: &str) -> Result<RecallSrc, String> {
     let value: serde_json::Value = serde_json::from_str(content).map_err(|e| format!("invalid JSON: {e}"))?;
-    let hits = value.get("hits").and_then(|v| v.as_array()).ok_or_else(|| "missing `hits` array".to_string())?;
-    let mut sessions = Vec::with_capacity(hits.len());
-    let mut message_ids = Vec::with_capacity(hits.len());
-    for (i, hit) in hits.iter().enumerate() {
-        let session_id = hit.get("session_id").and_then(|v| v.as_str()).ok_or_else(|| format!("hits[{i}] missing session_id"))?;
-        let message_id = hit.get("message_id").and_then(|v| v.as_i64()).ok_or_else(|| format!("hits[{i}] missing message_id"))?;
-        sessions.push(session_id.to_string());
-        message_ids.push(message_id);
+    if value.get("error").is_some() {
+        // Error-shaped response (`{"error":"cass_exit","code","stderr"}`):
+        // a legitimate cass-mcp answer with no hits to report.
+        return Ok(RecallSrc::default());
     }
-    Ok(RecallSrc { sessions, message_ids })
+    let hits = value
+        .get("hits")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "neither `hits` array nor `error` field present".to_string())?;
+    let mut sessions: Vec<String> = Vec::new();
+    let mut out_hits = Vec::with_capacity(hits.len());
+    for (i, hit) in hits.iter().enumerate() {
+        let source_id = hit.get("source_id").and_then(|v| v.as_i64()).ok_or_else(|| format!("hits[{i}] missing source_id"))?;
+        let source_path = hit.get("source_path").and_then(|v| v.as_str()).ok_or_else(|| format!("hits[{i}] missing source_path"))?.to_string();
+        let line_number = hit.get("line_number").and_then(|v| v.as_u64());
+        if !sessions.iter().any(|s| s == &source_path) {
+            sessions.push(source_path.clone());
+        }
+        out_hits.push(RecallHit { source_id, source_path, line_number });
+    }
+    Ok(RecallSrc { sessions, hits: out_hits })
 }
 
 /// Apply a [`Decision`] to the row it was computed for: redact `content`,
@@ -804,6 +999,89 @@ mod tests {
 
     fn ctx_from(candidates: &[PairingCandidate]) -> PairingContext {
         PairingContext::build(candidates)
+    }
+
+    // -- events_from_blob (T2b) ------------------------------------------
+
+    fn write_blob(dir: &tempfile::TempDir, name: &str, lines: &[&str]) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn events_from_blob_claude_code_single_text_event_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"uuid":"ek1","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("claude_code", &path);
+        assert_eq!(events.len(), 1, "one JSONL line with no tool_result must produce exactly one RawEvent");
+        assert_eq!(events[0].event_key, "ek1");
+        assert_eq!(events[0].blocks.len(), 1);
+        assert_eq!(events[0].blocks[0].kind, BlockKind::Text);
+    }
+
+    #[test]
+    fn events_from_blob_claude_code_mixed_tool_result_and_text_splits_into_two_positive() {
+        // T1b/T2a documented shape (messages 1287477/1287478): one event
+        // whose `message.content` mixes a `tool_result` block with a `text`
+        // block projects into two consecutive rows sharing the same event.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"uuid":"ek-shared","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"result"}]},{"type":"text","text":"<fork-boilerplate>..."}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("claude_code", &path);
+        assert_eq!(events.len(), 2, "mixed tool_result+text event must produce two aligned RawEvent entries");
+        assert_eq!(events[0].event_key, "ek-shared");
+        assert_eq!(events[1].event_key, "ek-shared");
+        assert_eq!(events[0].blocks.len(), 2, "both entries carry the full event's block list");
+        let tool_result_block = events[0].blocks.iter().find(|b| b.kind == BlockKind::ToolResult).expect("tool_result block present");
+        assert_eq!(tool_result_block.tool_use_id.as_deref(), Some("toolu_1"));
+    }
+
+    #[test]
+    fn events_from_blob_claude_code_missing_uuid_falls_back_to_line_number_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"message":{"role":"user","content":[]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("claude_code", &path);
+        assert_eq!(events[0].event_key, "line:1", "missing top-level uuid falls back to 1-based line number");
+    }
+
+    #[test]
+    fn events_from_blob_codex_function_call_and_output_pairing_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let call =
+            r#"{"payload":{"type":"custom_tool_call","id":"ctc_1","call_id":"call_abc","name":"exec","input":{"cmd":"cat x"}}}"#;
+        let result = r#"{"payload":{"type":"custom_tool_call_output","id":"ctco_1","call_id":"call_abc","output":[{"type":"input_text","text":"hi"}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[call, result]);
+        let events = events_from_blob("codex", &path);
+        assert_eq!(events.len(), 2, "codex response_items are 1:1 with events (no splitting)");
+        assert_eq!(events[0].event_key, "ctc_1");
+        assert_eq!(events[0].blocks[0].kind, BlockKind::ToolUse);
+        assert_eq!(events[0].blocks[0].tool_use_id.as_deref(), Some("call_abc"));
+        assert_eq!(events[0].blocks[0].tool_name.as_deref(), Some("exec"));
+        assert_eq!(events[1].event_key, "ctco_1");
+        assert_eq!(events[1].blocks[0].kind, BlockKind::ToolResult);
+        assert_eq!(events[1].blocks[0].tool_use_id.as_deref(), Some("call_abc"));
+    }
+
+    #[test]
+    fn events_from_blob_codex_message_type_produces_single_text_block_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"payload":{"type":"message","id":"msg_1","role":"user","content":[{"type":"input_text","text":"<environment_context>...</environment_context>"}]}}"#;
+        let path = write_blob(&dir, "s.jsonl", &[line]);
+        let events = events_from_blob("codex", &path);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].blocks.len(), 1, "R6: payload.output/content 整体记单块索引 0");
+        assert_eq!(events[0].blocks[0].kind, BlockKind::Text);
+        assert_eq!(events[0].blocks[0].index, 0);
+    }
+
+    #[test]
+    fn events_from_blob_unknown_connector_returns_empty_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_blob(&dir, "s.jsonl", &[r#"{"uuid":"x"}"#]);
+        assert!(events_from_blob("openclaw", &path).is_empty(), "R7/R11 不启用的连接器不产结构事实");
     }
 
     // -- R1 -------------------------------------------------------------
@@ -1353,17 +1631,49 @@ mod tests {
 
     #[test]
     fn apply_r1_c_hits_parse_success_sets_src() {
-        let mut m = msg("tool_result", r#"{"hits": [{"session_id": "s1", "message_id": 42}]}"#);
+        let mut m = msg(
+            "tool_result",
+            r#"{"hits": [{"source_id": 3, "source_path": "/home/x/session.jsonl", "line_number": 214}]}"#,
+        );
         let decision = decision_cass_recall(vec![]);
         let mut redactor = MemoizingRedactor::new();
         let marker = apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));
-        assert_eq!(marker.src, Some(RecallSrc { sessions: vec!["s1".to_string()], message_ids: vec![42] }));
+        assert_eq!(
+            marker.src,
+            Some(RecallSrc {
+                sessions: vec!["/home/x/session.jsonl".to_string()],
+                hits: vec![RecallHit { source_id: 3, source_path: "/home/x/session.jsonl".to_string(), line_number: Some(214) }],
+            })
+        );
+        assert!(marker.parse_error.is_none());
+    }
+
+    #[test]
+    fn apply_r1_c_error_shaped_response_sets_empty_src_not_parse_error() {
+        // R1-c v4.5: `{"error":"cass_exit",...}` is a legitimate cass-mcp
+        // answer (the underlying `cass` invocation failed) -- empty src,
+        // no parse_error.
+        let mut m = msg("tool_result", r#"{"error": "cass_exit", "code": 127, "stderr": "not found"}"#);
+        let decision = decision_cass_recall(vec![]);
+        let mut redactor = MemoizingRedactor::new();
+        let marker = apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));
+        assert_eq!(marker.src, Some(RecallSrc::default()));
         assert!(marker.parse_error.is_none());
     }
 
     #[test]
     fn apply_r1_c_hits_parse_failure_sets_parse_error_not_src() {
         let mut m = msg("tool_result", "not json at all");
+        let decision = decision_cass_recall(vec![]);
+        let mut redactor = MemoizingRedactor::new();
+        let marker = apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));
+        assert!(marker.src.is_none());
+        assert!(marker.parse_error.is_some());
+    }
+
+    #[test]
+    fn apply_r1_c_json_without_hits_or_error_sets_parse_error() {
+        let mut m = msg("tool_result", r#"{"query": "x", "count": 0}"#);
         let decision = decision_cass_recall(vec![]);
         let mut redactor = MemoizingRedactor::new();
         let marker = apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));

@@ -1440,6 +1440,60 @@ fn ensure_raw_mirror_root(data_dir: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// PR6 T2b (任务书 #114): resolve a just-captured [`RawMirrorCaptureRecord`]
+/// back to `(original_path, blob_bytes)` for `reparse_from_capture` to hand
+/// to the connector's own file parser. Manifest-relative-path validation is
+/// the same `raw_mirror_manifest_path_from_relative` every other manifest
+/// reader uses -- no second path-safety implementation.
+pub(crate) fn read_capture_for_reparse(data_dir: &Path, record: &RawMirrorCaptureRecord) -> Result<(String, Vec<u8>)> {
+    let root = raw_mirror_root(data_dir);
+    let manifest_path = raw_mirror_manifest_path_from_relative(&root, &record.manifest_relative_path)?;
+    let manifest = read_raw_mirror_manifest(&manifest_path)?;
+    let blob_path = root.join(&record.blob_relative_path);
+    let blob = fs::read(&blob_path).with_context(|| format!("read raw mirror blob {}", blob_path.display()))?;
+    Ok((manifest.original_path, blob))
+}
+
+/// PR6 T2b (任务书 #114, R2-B3): force-fsync a session's captured blob and
+/// manifest (plus their parent directories) *unconditionally* -- unlike
+/// [`sync_file`]/[`sync_parent`], this does **not** consult
+/// `CASS_RAW_MIRROR_FSYNC` (Global Constraints: "排除行提交前镜像必须持久化
+/// ...不受 CASS_RAW_MIRROR_FSYNC 默认关闭影响"). Called only when the
+/// session being prepared has at least one exclusion marker; sessions with
+/// none keep the existing (default-off) fsync behavior untouched.
+pub(crate) fn sync_capture_durable(data_dir: &Path, record: &RawMirrorCaptureRecord) -> Result<()> {
+    let root = raw_mirror_root(data_dir);
+    let manifest_path = raw_mirror_manifest_path_from_relative(&root, &record.manifest_relative_path)?;
+    let blob_path = root.join(&record.blob_relative_path);
+
+    force_sync_file(&blob_path)?;
+    force_sync_file(&manifest_path)?;
+    force_sync_parent(&blob_path)?;
+    force_sync_parent(&manifest_path)?;
+    Ok(())
+}
+
+fn force_sync_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options.open(path).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror file {}", path.display()))
+}
+
+#[cfg(not(windows))]
+fn force_sync_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror parent {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn force_sync_parent(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn raw_mirror_blob_cache_key(
     input: &RawMirrorCaptureInput<'_>,
     source_metadata: &fs::Metadata,

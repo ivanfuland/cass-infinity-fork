@@ -2458,6 +2458,38 @@ const fn connector_name_for(agent: Origin) -> &'static str {
     }
 }
 
+/// PR6 T2b (任务书 #114): materialize a just-captured raw-mirror blob back
+/// into its ancestor directory shape under `scratch`, so a connector's own
+/// file parser (which detects file type by extension/filename and derives
+/// `external_id` by walking up from the file to its root, see the next doc
+/// comment) can reparse it correctly. This is the **same** "祖先形状重建"
+/// logic `project_sealed_source`/`project_from_materialized` below already
+/// use via [`materialize_sealed_blob`] -- reused verbatim, not duplicated:
+/// this function only adds the one step those callers don't need (resolving
+/// `(original_path, blob_bytes)` from a real on-disk raw-mirror record via
+/// `data_dir`, instead of already holding the bytes in hand).
+///
+/// `agent` is required by [`SealedSource`]'s shape but is not read by
+/// [`materialize_sealed_blob`] itself (only by the later connector-dispatch
+/// step, which `reparse_from_capture` does on its own via the string-keyed
+/// connector registry, not via this file's `Origin`-keyed
+/// [`scan_materialized_file`]) -- `Origin::ClaudeCode` is passed as an inert
+/// placeholder.
+pub(crate) fn materialize_capture_to_scratch(
+    data_dir: &Path,
+    record: &crate::raw_mirror::RawMirrorCaptureRecord,
+    scratch: &Path,
+) -> anyhow::Result<PathBuf> {
+    let (canonical_original_path, blob) = crate::raw_mirror::read_capture_for_reparse(data_dir, record)?;
+    let input = SealedSource {
+        agent: Origin::ClaudeCode,
+        canonical_original_path: &canonical_original_path,
+        source_size_bytes: blob.len() as u64,
+        blob: &blob,
+    };
+    materialize_sealed_blob(scratch, &input).map_err(|fault| anyhow::anyhow!("{fault}"))
+}
+
 /// 拿 pin parser 扫**恰好一个已物化的文件**。
 ///
 /// **root 指到文件本身而不是 scratch 目录**，三家都支持这条显式文件路径

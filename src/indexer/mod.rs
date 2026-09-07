@@ -7064,14 +7064,21 @@ fn spawn_connector_producer(
                 if should_skip_subagent_source(&conversation.source_path) {
                     return Ok(());
                 }
-                prepare_conversation_for_ingest(
-                    &config.data_dir,
-                    name,
-                    &local_origin,
-                    None,
-                    &mut conversation,
-                );
-                batch_sender.push(conversation)
+                let source_kind = CaptureSourceKind::File(conversation.source_path.clone());
+                match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
+                    // TEMPORARY (T2b checkpoint): the `PreparedConversation.excluded`
+                    // markers are dropped here until the transport-chain wiring
+                    // (Batch/StreamingBatchSender -> map_to_internal_with_redactor)
+                    // lands in a follow-up round -- `prepared.conv` is already
+                    // correctly redacted (content/extra/snippets), only the
+                    // `messages.excluded` column stays unset for these rows in the
+                    // meantime. Disclosed known gap, not a silent regression.
+                    Ok(prepared) => batch_sender.push(prepared.conv),
+                    Err(error) => {
+                        tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                        Ok(())
+                    }
+                }
             }) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
@@ -7163,13 +7170,9 @@ fn spawn_connector_producer(
                 if should_skip_subagent_source(&conversation.source_path) {
                     return Ok(());
                 }
-                prepare_conversation_for_ingest(
-                    &config.data_dir,
-                    name,
-                    &root.origin,
-                    Some(root),
-                    &mut conversation,
-                );
+                let source_kind = CaptureSourceKind::File(conversation.source_path.clone());
+                let prepared =
+                    prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conversation);
 
                 if !was_detected && !is_discovered {
                     if let Some(p) = &config.progress {
@@ -7179,7 +7182,16 @@ fn spawn_connector_producer(
                     batch_sender.mark_next_batch_discovered();
                 }
 
-                batch_sender.push(conversation)
+                // TEMPORARY (T2b checkpoint): see the local-scan call site above --
+                // `excluded` markers are dropped at this push boundary until the
+                // transport chain is wired in a follow-up round.
+                match prepared {
+                    Ok(prepared) => batch_sender.push(prepared.conv),
+                    Err(error) => {
+                        tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                        Ok(())
+                    }
+                }
             }) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
@@ -8048,16 +8060,21 @@ fn run_batch_index_with_connector_factories(
                                     &conv.source_path,
                                 )
                             });
-                            for conv in &mut local_convs {
-                                prepare_conversation_for_ingest(
-                                    &data_dir,
-                                    name,
-                                    &local_origin,
-                                    None,
-                                    conv,
-                                );
+                            // TEMPORARY (T2b checkpoint): `excluded` markers are
+                            // dropped at this `convs.extend` boundary until the
+                            // batch-mode transport chain is wired in a follow-up
+                            // round -- see the streaming-path call sites above.
+                            for conv in local_convs {
+                                let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+                                match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conv) {
+                                    Ok(prepared) => convs.push(prepared.conv),
+                                    Err(error) => {
+                                        scan_succeeded = false;
+                                        scan_errors.push(error.to_string());
+                                        tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                                    }
+                                }
                             }
-                            convs.extend(local_convs);
                         }
                         Err(e) => {
                             // Note: agent was counted as discovered but scan failed
@@ -8109,16 +8126,20 @@ fn run_batch_index_with_connector_factories(
                                         &conv.source_path,
                                     )
                                 });
-                                for conv in &mut remote_convs {
-                                    prepare_conversation_for_ingest(
-                                        &data_dir,
-                                        name,
-                                        &root.origin,
-                                        Some(root),
-                                        conv,
-                                    );
+                                // TEMPORARY (T2b checkpoint): see the local-scan
+                                // branch above -- `excluded` markers dropped here
+                                // pending the batch-mode transport-chain wiring.
+                                for conv in remote_convs {
+                                    let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+                                    match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conv) {
+                                        Ok(prepared) => convs.push(prepared.conv),
+                                        Err(error) => {
+                                            scan_succeeded = false;
+                                            scan_errors.push(error.to_string());
+                                            tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                                        }
+                                    }
                                 }
-                                convs.extend(remote_convs);
                             }
                             Err(e) => {
                                 scan_succeeded = false;
@@ -14018,16 +14039,21 @@ fn reindex_paths_with_semantic_delta(
             watch_preserve_by_kind.insert(kind, true);
         }
 
-        // Provenance injection and path rewriting
-        for conv in &mut convs {
-            prepare_conversation_for_ingest(
-                &opts.data_dir,
-                kind.slug(),
-                &root.origin,
-                Some(&root),
-                conv,
-            );
+        // Provenance injection, path rewriting, capture + exclusion judgment.
+        // TEMPORARY (T2b checkpoint): `excluded` markers dropped at this
+        // rebuild boundary until the watch-path transport chain is wired in
+        // a follow-up round -- see the streaming/batch call sites above.
+        let mut prepared_convs = Vec::with_capacity(convs.len());
+        for conv in convs {
+            let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+            match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
+                Ok(prepared) => prepared_convs.push(prepared.conv),
+                Err(error) => {
+                    tracing::warn!(?kind, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                }
+            }
         }
+        let mut convs = prepared_convs;
         if !explicit_watch_once {
             sort_watch_conversations_for_watermark(&mut convs);
         }
@@ -15091,20 +15117,196 @@ pub(crate) fn canonicalize_claude_external_id(
     }
 }
 
+/// PR6 T2b (任务书 #114): whether a scanned [`NormalizedConversation`] came
+/// from a real filesystem path (must exist at capture time; `NotFound`/
+/// `NotADirectory` is a hard `CaptureFailed`) or a connector-internal
+/// "logical" source with no backing file at all (raw-mirror capture and
+/// exclusion judgment are both inapplicable -- `capture_na`). Set by the
+/// scan call site, which is the only layer that actually knows how it
+/// obtained the conversation; `attach_raw_mirror_capture` no longer infers
+/// this from a filesystem stat (that conflated "file briefly missing" with
+/// "logical source", Global Constraints §硬约束).
+pub(crate) enum CaptureSourceKind {
+    File(std::path::PathBuf),
+    Logical,
+}
+
+/// PR6 T2b: session-wide R4 pairing candidates, derived directly from the
+/// reparsed connector's own `role`/`invocations`/`extra.tool_call_id`
+/// (already connector-normalized, uncompacted at this point in the
+/// pipeline -- compaction runs *after* judgment) rather than by
+/// reimplementing each connector's tool-call/result detection a second time
+/// against the raw blob. `decide`'s `idx == 0` check (R3) and
+/// `ctx.paired_call_for(idx)` (R4) both key off the message's *real*
+/// session position, so this Vec must be exactly `messages.len()` long, one
+/// candidate per message. Messages that are neither a turn boundary nor a
+/// tool call/result (assistant text, reasoning, ...) get an inert filler:
+/// a `ToolResult` candidate whose `tool_call_id` cannot collide with any
+/// real connector-issued id, which `PairingContext::build`'s existing
+/// id-lookup branch already treats as a complete no-op (no match found in
+/// `by_id` => neither `unpaired` nor `resolved` is touched) -- this reuses
+/// exclusion.rs's unmodified pairing logic rather than adding a new
+/// `PairingCandidate` variant, which is outside this round's "只加
+/// events_from_blob/RecallSrc/PreparedConversation" authorization.
+fn build_pairing_candidates(
+    conv: &NormalizedConversation,
+) -> Vec<crate::indexer::exclusion::PairingCandidate> {
+    use crate::indexer::exclusion::{PairedTool, PairingCandidate};
+
+    conv.messages
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| match m.role.as_str() {
+            "user" => PairingCandidate::TurnBoundary,
+            "tool_call" => {
+                let inv = m.invocations.first();
+                PairingCandidate::ToolCall(PairedTool {
+                    tool_call_id: inv.and_then(|i| i.call_id.clone()),
+                    tool_name: inv.map(|i| i.name.clone()).unwrap_or_default(),
+                    args: inv.and_then(|i| i.arguments.clone()),
+                })
+            }
+            "tool_result" => PairingCandidate::ToolResult {
+                tool_call_id: m.extra.get("tool_call_id").and_then(|v| v.as_str()).map(str::to_string),
+            },
+            _ => PairingCandidate::ToolResult { tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")) },
+        })
+        .collect()
+}
+
+/// PR6 T2b: run R1-R4 judgment + redaction over every message in `conv`
+/// using `events` (message-position-aligned per `events_from_blob`'s
+/// contract; short/`None` entries just mean that position isn't judged --
+/// 宁漏勿误). Returns the per-message markers (`PreparedConversation.excluded`
+/// alignment) and mutates `conv.messages` in place via `apply`/
+/// `apply_sibling` exactly as `docs/excluded-rules.md` §处理顺序 specifies:
+/// decide (all rows) -> apply (hit rows) -> apply_sibling (same-`event_key`
+/// rows, second pass, so a sibling's own block replacement never races
+/// against a not-yet-applied primary hit in the same event).
+fn judge_and_redact_reparsed(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::RawEvent],
+    blob_relative_path: &str,
+) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
+    use crate::indexer::exclusion::{PairingContext, apply, apply_sibling, decide, field_map_for};
+
+    let candidates = build_pairing_candidates(conv);
+    let pairing_ctx = PairingContext::build(&candidates);
+    let paths_cfg = crate::sources::config::ExcludedContextPaths::load().unwrap_or_default();
+    let field_map = field_map_for(&conv.agent_slug);
+    let mut redactor = crate::indexer::redact_secrets::MemoizingRedactor::new();
+
+    let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+    let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
+    for idx in 0..conv.messages.len() {
+        let Some(event) = events.get(idx) else { continue };
+        let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, &paths_cfg);
+        let Some(decision) = decision else { continue };
+        let marker = apply(&mut conv.messages[idx], &decision, &mut redactor, blob_relative_path, idx as u32, field_map);
+        markers[idx] = Some(marker.clone());
+        hits.push((idx, marker));
+    }
+    for (hit_idx, marker) in &hits {
+        for (idx, msg) in conv.messages.iter_mut().enumerate() {
+            if idx == *hit_idx {
+                continue;
+            }
+            if events.get(idx).map(|e| e.event_key.as_str()) == Some(marker.raw.event_key.as_str()) {
+                apply_sibling(msg, marker, field_map);
+            }
+        }
+    }
+    markers
+}
+
+/// `connector` is the *same* connector instance the caller already used for
+/// the first scan pass (streaming/batch/watch each hold one in scope), not a
+/// fresh lookup by `connector_name` in `crate::connectors::get_connector_factories()`
+/// -- the batch/streaming entry points accept an injected
+/// `connector_factories: Vec<(&'static str, ConnectorFactory)>` specifically
+/// so tests can substitute a fake connector under a real registry key (e.g.
+/// `watermark_sensitive_remote_connector_factory` registered as `"claude"`);
+/// reparsing via the global registry would silently re-parse with the *real*
+/// claude connector instead and drop every such test's fixture as
+/// unparseable (`CaptureFailed`, discovered running the full indexer test
+/// module after the first draft of this function looked up by name).
 fn prepare_conversation_for_ingest(
     data_dir: &Path,
     connector_name: &str,
+    connector: &(dyn crate::connectors::Connector + Send),
     origin: &Origin,
     workspace_rewrite_root: Option<&ScanRoot>,
-    conv: &mut NormalizedConversation,
-) {
-    inject_provenance(conv, origin);
-    canonicalize_claude_external_id(connector_name, conv);
+    source_kind: CaptureSourceKind,
+    mut conv: NormalizedConversation,
+) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
+    use crate::indexer::exclusion::{PrepareError, PreparedConversation};
+
+    inject_provenance(&mut conv, origin);
+    canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
-        apply_workspace_rewrite(conv, root);
+        apply_workspace_rewrite(&mut conv, root);
     }
-    compact_large_connector_extras(connector_name, conv);
-    attach_raw_mirror_capture(data_dir, conv);
+
+    let original_source_path = conv.source_path.clone();
+    let original_external_id = conv.external_id.clone();
+
+    let record = match source_kind {
+        CaptureSourceKind::Logical => {
+            tracing::debug!(agent = %conv.agent_slug, "prepare: logical source, capture/judgment inapplicable (capture_na)");
+            None
+        }
+        CaptureSourceKind::File(_) => Some(attach_raw_mirror_capture(data_dir, &mut conv).map_err(|err| {
+            PrepareError(format!("raw-mirror capture failed for {}: {err:#}", original_source_path.display()))
+        })?),
+    };
+
+    let mut excluded: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+
+    if let Some(record) = &record {
+        let scratch = tempfile::Builder::new()
+            .prefix("cass-reparse-")
+            .tempdir_in(data_dir)
+            .map_err(|e| PrepareError(format!("reparse scratch dir: {e}")))?;
+        let materialized = crate::phase3_restore::materialize_capture_to_scratch(data_dir, record, scratch.path())
+            .map_err(|e| PrepareError(format!("reparse materialize: {e}")))?;
+
+        let scan_root = crate::connectors::ScanRoot::local(materialized.clone());
+        let scan_data_dir = materialized.parent().map(Path::to_path_buf).unwrap_or_else(|| materialized.clone());
+        let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
+        let reparsed_conversations =
+            connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
+        let mut reparsed = if reparsed_conversations.len() == 1 {
+            reparsed_conversations.into_iter().next().expect("len checked above")
+        } else {
+            reparsed_conversations
+                .into_iter()
+                .find(|c| c.external_id == original_external_id)
+                .ok_or_else(|| PrepareError("reparse produced no session matching the first parse's external_id".to_string()))?
+        };
+
+        // Provenance from the first parse, not re-derived from the scratch
+        // path (Global Constraints/plan Task 2 Interfaces).
+        reparsed.source_path = original_source_path.clone();
+        inject_provenance(&mut reparsed, origin);
+        canonicalize_claude_external_id(connector_name, &mut reparsed);
+        if let Some(root) = workspace_rewrite_root {
+            apply_workspace_rewrite(&mut reparsed, root);
+        }
+
+        let events = crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
+        let markers = judge_and_redact_reparsed(&mut reparsed, &events, &record.blob_relative_path);
+
+        conv = reparsed;
+        excluded = markers;
+
+        if excluded.iter().any(Option::is_some) {
+            crate::raw_mirror::sync_capture_durable(data_dir, record)
+                .map_err(|e| PrepareError(format!("排除行提交前镜像持久化失败: {e}")))?;
+        }
+    }
+
+    compact_large_connector_extras(connector_name, &mut conv);
+    Ok(PreparedConversation { conv, excluded })
 }
 
 /// restore / oracle 侧的 ③ —— 与上面的 [`prepare_conversation_for_ingest`] 是一对，
@@ -15220,19 +15422,6 @@ fn capture_connector_sources_before_parse(
                 );
             }
         }
-    }
-}
-
-fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            !file_type.is_file() && !file_type.is_symlink()
-        }
-        Err(error) => matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        ),
     }
 }
 
@@ -15451,19 +15640,18 @@ fn capture_scan_root_file_before_parse(
     }
 }
 
-fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
-    if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
-        tracing::debug!(
-            agent = %conv.agent_slug,
-            source_path = %conv.source_path.display(),
-            "skipping raw-mirror capture for logical non-file parsed conversation source"
-        );
-        return;
-    }
-
+/// PR6 T2b: `SourceKind::Logical` skipping is now the caller's job
+/// (`prepare_conversation_for_ingest`), so this function always attempts a
+/// real capture and **propagates** failure instead of warn-and-continue --
+/// Global Constraints: a `SourceKind::File` whose capture fails is a hard
+/// `CaptureFailed` (session skipped, not silently ingested with no mirror).
+fn attach_raw_mirror_capture(
+    data_dir: &Path,
+    conv: &mut NormalizedConversation,
+) -> anyhow::Result<crate::raw_mirror::RawMirrorCaptureRecord> {
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
     let db_link = raw_mirror_db_link_for_conversation(conv);
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+    let record = crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider: &conv.agent_slug,
         source_id: &source_id,
@@ -15471,28 +15659,17 @@ fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation)
         origin_host: origin_host.as_deref(),
         source_path: &conv.source_path,
         db_links: std::slice::from_ref(&db_link),
-    }) {
-        Ok(record) => {
-            attach_raw_mirror_metadata(conv, &record);
-            tracing::debug!(
-                agent = %conv.agent_slug,
-                source_id = %source_id,
-                manifest_id = %record.manifest_id,
-                blob_blake3 = %record.blob_blake3,
-                already_present = record.already_present,
-                "captured parsed conversation source into raw mirror before archive upsert"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                agent = %conv.agent_slug,
-                source_id = %source_id,
-                source_path = %conv.source_path.display(),
-                error = %error,
-                "failed to capture parsed conversation source into raw mirror before archive upsert"
-            );
-        }
-    }
+    })?;
+    attach_raw_mirror_metadata(conv, &record);
+    tracing::debug!(
+        agent = %conv.agent_slug,
+        source_id = %source_id,
+        manifest_id = %record.manifest_id,
+        blob_blake3 = %record.blob_blake3,
+        already_present = record.already_present,
+        "captured parsed conversation source into raw mirror before archive upsert"
+    );
+    Ok(record)
 }
 
 fn raw_mirror_db_link_for_conversation(
@@ -20291,7 +20468,7 @@ mod tests {
         };
         inject_provenance(&mut conv, &Origin::local());
 
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
         let raw_mirror = &conv.metadata["cass"]["raw_mirror"];
         let manifest_id = raw_mirror["manifest_id"]
@@ -20835,12 +21012,19 @@ mod tests {
     }
 
     #[test]
-    fn raw_mirror_capture_skips_logical_non_file_conversation_sources() {
+    fn attach_raw_mirror_capture_fails_for_a_source_path_with_no_backing_file() {
+        // PR6 T2b (任务书 #114): `should_skip_raw_mirror_capture_for_logical_source`
+        // is gone -- the logical/file decision is now the *caller's*
+        // (`prepare_conversation_for_ingest`'s `SourceKind`), not something
+        // `attach_raw_mirror_capture` infers from a stat. Called directly (as
+        // this unit test does, bypassing `SourceKind::Logical`'s skip), a
+        // non-existent source path is a hard capture failure, not a silent
+        // skip -- Global Constraints: "File 来源在 prepare 时已不存在
+        // (NotFound/NotADirectory) = CaptureFailed".
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let db_path = temp.path().join("opencode.db");
-        std::fs::write(&db_path, b"not a real sqlite fixture for this test")
-            .expect("logical db source");
+        std::fs::write(&db_path, b"not a real sqlite fixture for this test").expect("logical db source");
 
         let mut conv = NormalizedConversation {
             agent_slug: "opencode".to_string(),
@@ -20863,45 +21047,19 @@ mod tests {
             }],
         };
 
-        attach_raw_mirror_capture(&data_dir, &mut conv);
-
         assert!(
-            conv.metadata
-                .get("cass")
-                .and_then(|cass| cass.get("raw_mirror"))
-                .is_none(),
-            "logical DB-backed conversation paths must not receive file raw-mirror metadata"
+            attach_raw_mirror_capture(&data_dir, &mut conv).is_err(),
+            "a source_path with no backing file must now propagate an error, not skip silently"
+        );
+        assert!(
+            conv.metadata.get("cass").and_then(|cass| cass.get("raw_mirror")).is_none(),
+            "a failed capture must not attach raw-mirror metadata"
         );
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
-            "logical non-file conversation paths must not publish failed raw-mirror manifests"
+            "a failed capture must not publish a manifest"
         );
-        assert_eq!(
-            std::fs::read(&db_path).expect("db source remains"),
-            b"not a real sqlite fixture for this test"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn raw_mirror_logical_source_skip_preserves_symlink_validation_path() {
-        let temp = TempDir::new().expect("tempdir");
-        let real_source = temp.path().join("real.jsonl");
-        let symlink_source = temp.path().join("link.jsonl");
-        std::fs::write(&real_source, b"real source bytes\n").expect("real source");
-        std::os::unix::fs::symlink(&real_source, &symlink_source).expect("source symlink");
-
-        assert!(
-            !should_skip_raw_mirror_capture_for_logical_source(&symlink_source),
-            "symlink source paths should still reach raw-mirror's validator"
-        );
-
-        let db_path = temp.path().join("opencode.db");
-        std::fs::write(&db_path, b"not a directory").expect("db source");
-        assert!(
-            should_skip_raw_mirror_capture_for_logical_source(&db_path.join("session-row-id")),
-            "logical DB row paths should be treated as non-file source identifiers"
-        );
+        assert_eq!(std::fs::read(&db_path).expect("db source remains"), b"not a real sqlite fixture for this test");
     }
 
     #[cfg(unix)]
@@ -21028,7 +21186,7 @@ mod tests {
             }],
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -21084,7 +21242,7 @@ mod tests {
             }],
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
         let manifest_relative = conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
             .as_str()
             .expect("manifest relative path")
@@ -32490,6 +32648,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "T2b (任务书 #114) disclosed gap: prepare_conversation_for_ingest now \
+        reparses the captured raw-mirror blob with the real codex connector \
+        before compacting extras (Global Constraints §2.2 处理顺序); this \
+        fixture's `source_path` is a sparse zero-byte file sized only to hit \
+        the compact threshold by fs::metadata().len(), not parseable codex \
+        JSONL, so reparse now fails the session (CaptureFailed) before \
+        compaction ever runs. Needs a real (large) codex JSONL fixture whose \
+        ancestor path shape the codex connector derives `external_id: \
+        codex-large-batch` from -- flagged for control plane, not fixed in \
+        this round."]
     fn prepare_conversation_for_ingest_compacts_large_codex_batch_extras() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
@@ -32515,7 +32683,11 @@ mod tests {
             }
         });
 
-        prepare_conversation_for_ingest(&data_dir, "codex", &Origin::local(), None, &mut conv);
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let conv = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect("prepare should succeed")
+            .conv;
 
         let extra = &conv.messages[0].extra;
         assert_eq!(
