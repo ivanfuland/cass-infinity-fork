@@ -63,9 +63,15 @@ pub struct ShellAnchor {
 /// R1-c: one cass-mcp recall hit (spec v4.5 shape -- real cass-mcp responses
 /// carry no `session_id`/`message_id`, only `source_id`/`source_path`/
 /// `line_number` per hit).
+///
+/// R1-N7 (任务书 #118a): `source_id` is a STRING in every real cass-mcp
+/// response (T1b's frozen exclusion clist: 176/176 real recall hits carry a
+/// string like `"local"`, never an integer) -- an `i64` field rejected every
+/// real response as a parse failure, losing `src` entirely for genuine
+/// cass_recall exclusions.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RecallHit {
-    pub source_id: i64,
+    pub source_id: String,
     pub source_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_number: Option<u64>,
@@ -968,9 +974,35 @@ pub(crate) fn decide(
 /// `__cass_historical_raw_json__` sentinel) is handled separately in
 /// [`apply_extra`] since it wraps the *entire* `extra` value, not a
 /// sub-field the DSL can address.
+/// R1-N1 (任务书 #118a): the bare (non-`[*]`) codex entries below replace
+/// `payload.output`/`payload.content`/`payload.message` WHOLESALE whenever
+/// `apply` runs for a codex row -- codex's `RawBlock`s are always
+/// constructed at `index: 0` (one block per event, `codex_events_from_blob`),
+/// so `target_blocks` for a codex decision is always `[]` or `[0]`; R6's
+/// "codex `payload.output` 整体记 `[0]`" note means the whole field is one
+/// logical block, not element 0 of an array -- the pre-fix `[*].text`-only
+/// entries left a STRING-form `payload.content`/`payload.output` untouched
+/// entirely (`.and_then(|v| v.as_array_mut())` returns `None` for a string),
+/// and for array form only cleared each element's `.text` sub-field,
+/// leaving every other element (and the array's own shape) intact.
+/// `payload.message` covers the separate `event_msg`/`user_message` shape
+/// (`codex_events_from_blob`'s `text_nonempty("message")` branch), which
+/// carries its text directly on `payload.message`, not `payload.content`/
+/// `.output` at all.
 pub const EXTRA_FIELD_MAP: &[(&str, &[&str])] = &[
     ("claude_code", &["message.content[*].content", "message.content[*].text", "toolUseResult.file.content"]),
-    ("codex", &["payload.output[*].text", "payload.content[*].text", "payload.arguments", "payload.input"]),
+    (
+        "codex",
+        &[
+            "payload.output[*].text",
+            "payload.content[*].text",
+            "payload.arguments",
+            "payload.input",
+            "payload.output",
+            "payload.content",
+            "payload.message",
+        ],
+    ),
 ];
 
 /// Resolved per-connector path list -- what `apply`/`apply_sibling` actually
@@ -1068,7 +1100,7 @@ fn parse_recall_hits(content: &str) -> Result<RecallSrc, String> {
     let mut sessions: Vec<String> = Vec::new();
     let mut out_hits = Vec::with_capacity(hits.len());
     for (i, hit) in hits.iter().enumerate() {
-        let source_id = hit.get("source_id").and_then(|v| v.as_i64()).ok_or_else(|| format!("hits[{i}] missing source_id"))?;
+        let source_id = hit.get("source_id").and_then(|v| v.as_str()).ok_or_else(|| format!("hits[{i}] missing source_id"))?.to_string();
         let source_path = hit.get("source_path").and_then(|v| v.as_str()).ok_or_else(|| format!("hits[{i}] missing source_path"))?.to_string();
         let line_number = hit.get("line_number").and_then(|v| v.as_u64());
         if !sessions.iter().any(|s| s == &source_path) {
@@ -1899,13 +1931,47 @@ mod tests {
 
     #[test]
     fn apply_replaces_codex_payload_output_text() {
+        // N1 (任务书 #118a): array-form `payload.output` is replaced
+        // WHOLESALE (R6: "整体记 [0]"), not just element 0's `.text`
+        // sub-field -- a second array element (or any other sibling field
+        // on the array itself) would otherwise survive redaction.
         let mut m = msg("tool_result", "codex output text");
-        m.extra = serde_json::json!({"payload": {"output": [{"text": "codex output text"}]}});
+        m.extra = serde_json::json!({"payload": {"output": [{"text": "codex output text"}, {"text": "a second element must also be gone"}]}});
         let decision = decision_cass_recall(vec![0]);
         let mut redactor = MemoizingRedactor::new();
         apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("codex"));
 
-        assert_eq!(m.extra["payload"]["output"][0]["text"]["redacted"], serde_json::json!(true));
+        assert_eq!(m.extra["payload"]["output"]["redacted"], serde_json::json!(true), "the whole array must be replaced, not just element 0");
+        assert!(m.extra["payload"]["output"].get(1).is_none(), "no array element may survive under the replaced value");
+    }
+
+    /// N1 (任务书 #118a): a bare non-array STRING `payload.output` (T1b:
+    /// 49,718 real codex tool-result outputs use this shape) was completely
+    /// unmapped pre-fix -- `.and_then(|v| v.as_array_mut())` returns `None`
+    /// for a string, so the field silently survived redaction untouched.
+    #[test]
+    fn apply_replaces_codex_string_form_payload_output() {
+        let mut m = msg("tool_result", "README.md\n");
+        m.extra = serde_json::json!({"payload": {"output": "README.md\n"}});
+        let decision = decision_cass_recall(vec![0]);
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("codex"));
+
+        assert_eq!(m.extra["payload"]["output"]["redacted"], serde_json::json!(true));
+    }
+
+    /// N1 (任务书 #118a): the separate `event_msg`/`user_message` shape
+    /// carries its text on `payload.message`, not `payload.content`/
+    /// `.output` -- entirely unmapped pre-fix.
+    #[test]
+    fn apply_replaces_codex_event_msg_user_message_payload_message() {
+        let mut m = msg("user", "please rotate the leaked key");
+        m.extra = serde_json::json!({"type": "event_msg", "payload": {"type": "user_message", "message": "please rotate the leaked key"}});
+        let decision = decision_cass_recall(vec![0]);
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("codex"));
+
+        assert_eq!(m.extra["payload"]["message"]["redacted"], serde_json::json!(true));
     }
 
     #[test]
@@ -2012,9 +2078,11 @@ mod tests {
 
     #[test]
     fn apply_r1_c_hits_parse_success_sets_src() {
+        // R1-N7 (任务书 #118a): `source_id` is a string in every real
+        // cass-mcp response (T1b: 176/176 real hits, e.g. `"local"`).
         let mut m = msg(
             "tool_result",
-            r#"{"hits": [{"source_id": 3, "source_path": "/home/x/session.jsonl", "line_number": 214}]}"#,
+            r#"{"hits": [{"source_id": "local", "source_path": "/home/x/session.jsonl", "line_number": 214}]}"#,
         );
         let decision = decision_cass_recall(vec![]);
         let mut redactor = MemoizingRedactor::new();
@@ -2023,10 +2091,24 @@ mod tests {
             marker.src,
             Some(RecallSrc {
                 sessions: vec!["/home/x/session.jsonl".to_string()],
-                hits: vec![RecallHit { source_id: 3, source_path: "/home/x/session.jsonl".to_string(), line_number: Some(214) }],
+                hits: vec![RecallHit { source_id: "local".to_string(), source_path: "/home/x/session.jsonl".to_string(), line_number: Some(214) }],
             })
         );
         assert!(marker.parse_error.is_none());
+    }
+
+    /// Mutation for N7: an INTEGER `source_id` (the pre-fix assumption --
+    /// no real cass-mcp response has ever used this shape) must now be a
+    /// parse failure, proving the old `i64` field would have rejected
+    /// every genuine response.
+    #[test]
+    fn apply_r1_c_integer_source_id_is_a_parse_failure_mutation() {
+        let mut m = msg("tool_result", r#"{"hits": [{"source_id": 3, "source_path": "/home/x/session.jsonl"}]}"#);
+        let decision = decision_cass_recall(vec![]);
+        let mut redactor = MemoizingRedactor::new();
+        let marker = apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));
+        assert!(marker.src.is_none(), "an integer source_id (never seen in real responses) must not parse under the string-typed field");
+        assert!(marker.parse_error.is_some());
     }
 
     #[test]

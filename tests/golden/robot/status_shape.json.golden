@@ -115,6 +115,20 @@
         }
       }
     },
+    "last_index": {
+      "type": "object",
+      "properties": {
+        "codex_host_shell_hits": {
+          "type": "null"
+        },
+        "codex_idx0_user_total": {
+          "type": "null"
+        },
+        "event_align_failed": {
+          "type": "null"
+        }
+      }
+    },
     "database": {
       "type": "object",
       "properties": {
@@ -545,6 +559,9 @@
           }
         }
       }
+    },
+    "db_vector_domain": {
+      "type": "null"
     },
     "ingest_quarantine": {
       "type": "object",

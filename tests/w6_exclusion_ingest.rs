@@ -273,7 +273,7 @@ fn write_two_anchor_claude_session(home: &std::path::Path) -> std::path::PathBuf
             "agent": "claude_code", "content": "we decided to use per-feature worktrees",
             "created_at": 1700000000000i64, "line_number": 7, "match_type": "exact",
             "origin_kind": "local", "score": 0.91, "snippet": "per-feature worktrees",
-            "source_id": 42, "source_path": "/logs/prior-session.jsonl",
+            "source_id": "local", "source_path": "/logs/prior-session.jsonl",
             "title": "worktree decision", "workspace": "/ws/demo"
         }],
         "cursor": null, "hits_clamped": false, "max_tokens": 8000, "request_id": "req-w6-1"
@@ -322,15 +322,38 @@ fn write_two_anchor_claude_session(home: &std::path::Path) -> std::path::PathBuf
     file
 }
 
-/// `(external_id, source_path, idx, excluded_is_some, excluded_sha256)` rows
-/// from `messages` joined to `conversations`, ordered for stable comparison.
-#[derive(Debug, PartialEq, Eq, Clone)]
+/// `(external_id, source_path, idx, excluded_is_some, excluded_sha256, ...)`
+/// rows from `messages` joined to `conversations`, ordered for stable
+/// comparison.
+///
+/// R1-N22 (任务书 #118a, partial): pre-fix this struct only carried the
+/// first five fields, so four ingestion paths sharing the SAME `extra`/
+/// `title`/`snippets`/`raw{}` bug (e.g. this very round's B2/N1 gaps) would
+/// have compared "equal" across all four and passed regardless -- equality
+/// alone doesn't verify correctness, only cross-mode agreement, but a bug
+/// that only ONE mode hits (a real, previously-possible failure mode: the
+/// transport chain differs per mode) is exactly what these fields catch.
+/// `extra_json`/`extra_bin` are compared as raw bytes/text (not decoded --
+/// this is a black-box integration binary with no access to the crate's
+/// internal msgpack decoder), which is sufficient for a cross-mode
+/// byte-equality check without needing to understand the payload shape.
+#[derive(Debug, PartialEq, Clone)]
 struct ExclusionRow {
     external_id: Option<String>,
     source_path: String,
     idx: i64,
     excluded_is_some: bool,
     excluded_sha256: Option<String>,
+    extra_json: Option<String>,
+    extra_bin: Option<Vec<u8>>,
+    title: Option<String>,
+    /// JSON array text of this message's `snippets.snippet_text` values, in
+    /// `snippets.id` order (empty array `"[]"` when the message has none).
+    snippet_texts_json: String,
+    raw_blob: Option<String>,
+    raw_idx: Option<i64>,
+    raw_event_key: Option<String>,
+    raw_blocks_json: Option<String>,
 }
 
 fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
@@ -338,7 +361,11 @@ fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
     let mut stmt = conn
         .prepare(
             "SELECT c.external_id, c.source_path, m.idx, \
-                    (m.excluded IS NOT NULL), json_extract(m.excluded, '$.sha256') \
+                    (m.excluded IS NOT NULL), json_extract(m.excluded, '$.sha256'), \
+                    m.extra_json, m.extra_bin, c.title, \
+                    (SELECT json_group_array(snippet_text ORDER BY id) FROM snippets WHERE message_id = m.id), \
+                    json_extract(m.excluded, '$.raw.blob'), json_extract(m.excluded, '$.raw.idx'), \
+                    json_extract(m.excluded, '$.raw.event_key'), json_extract(m.excluded, '$.raw.blocks') \
              FROM messages m JOIN conversations c ON c.id = m.conversation_id \
              ORDER BY c.external_id, c.source_path, m.idx",
         )
@@ -351,6 +378,14 @@ fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
                 idx: row.get(2)?,
                 excluded_is_some: row.get(3)?,
                 excluded_sha256: row.get(4)?,
+                extra_json: row.get(5)?,
+                extra_bin: row.get(6)?,
+                title: row.get(7)?,
+                snippet_texts_json: row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "[]".to_string()),
+                raw_blob: row.get(9)?,
+                raw_idx: row.get(10)?,
+                raw_event_key: row.get(11)?,
+                raw_blocks_json: row.get(12)?,
             })
         })
         .expect("query exclusion rows")
@@ -417,6 +452,13 @@ fn transport_chain_equivalence_across_ingestion_modes() {
             row.excluded_sha256.as_deref().is_some_and(|s| !s.is_empty()),
             "excluded row must carry a non-empty excluded.sha256: {row:?}"
         );
+        // R1-N22 (任务书 #118a, partial): these fields must actually be
+        // populated in this fixture, not just equal-because-empty across
+        // all four modes.
+        assert!(row.raw_blob.as_deref().is_some_and(|b| !b.is_empty()), "raw.blob must be non-empty: {row:?}");
+        assert!(row.raw_idx.is_some(), "raw.idx must be present: {row:?}");
+        assert!(row.raw_event_key.as_deref().is_some_and(|e| !e.is_empty()), "raw.event_key must be non-empty: {row:?}");
+        assert_ne!(row.raw_blocks_json.as_deref(), Some("[]"), "raw.blocks must be non-empty: {row:?}");
     }
 
     assert_eq!(
@@ -476,7 +518,7 @@ fn write_codex_host_shell_session(dir: &std::path::Path) -> (std::path::PathBuf,
             "agent": "codex", "content": "rotate the key sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij before Friday",
             "created_at": 1700000000000i64, "line_number": 3, "match_type": "exact",
             "origin_kind": "local", "score": 0.8, "snippet": "rotate the key",
-            "source_id": 7, "source_path": "/logs/other-session.jsonl",
+            "source_id": "local", "source_path": "/logs/other-session.jsonl",
             "title": "key rotation", "workspace": "/ws/demo"
         }],
         "cursor": null, "hits_clamped": false, "max_tokens": 8000, "request_id": "req-w6-codex-1"
@@ -922,7 +964,7 @@ fn write_codex_host_shell_session_at(path: &std::path::Path, recall_content: &st
             "agent": "codex", "content": recall_content,
             "created_at": 1700000000000i64, "line_number": 3, "match_type": "exact",
             "origin_kind": "local", "score": 0.8, "snippet": "rotate the key",
-            "source_id": 7, "source_path": "/logs/other-session.jsonl",
+            "source_id": "local", "source_path": "/logs/other-session.jsonl",
             "title": "key rotation", "workspace": "/ws/demo"
         }],
         "cursor": null, "hits_clamped": false, "max_tokens": 8000, "request_id": "req-w6-codex-1"
