@@ -1263,8 +1263,18 @@ fn publish_manifest_bytes_create_new(
 
     match fs::hard_link(&temp_path, manifest_path) {
         Ok(()) => {
+            // R2-B5b (任务书 #119c): this is the manifest's FIRST-EVER
+            // publish for this capture -- `manifests/` may be the directory
+            // `ensure_private_dir_descendant` above just created, so a
+            // single-level `sync_parent` (only `manifests/` itself) leaves
+            // `manifests/`'s own entry in `v1` unsynced. Same gap, same fix
+            // as `replace_manifest_bytes` (#119b R2-B5 场景二): switch-gated
+            // full chain walk via `sync_dir_chain_if_enabled`, not the
+            // unconditional force barrier (this path runs for every
+            // session, not just excluded ones).
             sync_file(manifest_path)?;
-            sync_parent(manifest_path)?;
+            let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
+            sync_dir_chain_if_enabled(manifest_path, root, &mut synced_dirs)?;
             remove_temp_best_effort(&temp_path);
             remove_empty_temp_dir_best_effort(&temp_dir);
             Ok(false)
@@ -2672,6 +2682,109 @@ mod tests {
             synced.is_empty(),
             "default (switch off) must not fsync anything on manifest db-link merge; \
              synced dirs: {synced:?}"
+        );
+    }
+
+    /// R2-B5b (任务书 #119c, 上一棒 #119b 主动报告的同构缺口): `publish_manifest_
+    /// bytes_create_new` is the manifest's FIRST-EVER publish for a given
+    /// capture -- `manifests/` may be the directory `ensure_private_dir_
+    /// descendant` just created moments earlier in this same call, so (when
+    /// the switch is on) it needs the same full-chain fsync
+    /// `replace_manifest_bytes` (#119b R2-B5 场景二) already got, not the
+    /// single-level `sync_parent` it had before this fix.
+    #[test]
+    fn capture_source_file_first_publish_walks_full_directory_chain_when_fsync_enabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5b-scenario.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5b\"}\n").expect("write source");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        // SAFETY: tests that touch `CASS_RAW_MIRROR_FSYNC` are serialized
+        // via `DIR_SYNC_PROBE_TEST_SERIALIZE`.
+        unsafe {
+            std::env::set_var("CASS_RAW_MIRROR_FSYNC", "1");
+        }
+        let result = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        });
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        set_dir_sync_probe(None);
+        result.expect("capture must succeed with the switch on");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let manifests_dir = v1_dir.join("manifests");
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&manifests_dir),
+            "sanity: manifests/ itself must still be fsynced (pre-existing sync_parent \
+             behavior); synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&v1_dir),
+            "publish_manifest_bytes_create_new must walk the full chain up to v1 on the \
+             manifest's first-ever publish when the switch is on, not just fsync manifests/ \
+             one level; synced dirs: {synced:?}"
+        );
+    }
+
+    /// Negative half: switch off (default) must not trigger any extra fsync
+    /// on the manifest's first-ever publish either -- same "barrier only
+    /// complete when the switch is on" contract as #119b R2-B5.
+    #[test]
+    fn capture_source_file_first_publish_does_not_sync_when_fsync_disabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5b-scenario-off.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5b-off\"}\n").expect("write source");
+
+        // SAFETY: see above -- serialized via DIR_SYNC_PROBE_TEST_SERIALIZE.
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        });
+        set_dir_sync_probe(None);
+        result.expect("capture must succeed with the switch off");
+
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.is_empty(),
+            "default (switch off) must not fsync anything on the manifest's first-ever \
+             publish; synced dirs: {synced:?}"
         );
     }
 
