@@ -1077,3 +1077,99 @@ fn mirror_restore_apply_carries_excluded_marker_through_to_candidate_db() {
         "restored candidate DB rows must equal the source mirror's rows byte-for-byte, including excluded.{{reason,sha256,raw.blob,raw.event_key,raw.blocks}}"
     );
 }
+
+/// R2-B6 (任务书 #119b): a syntactically-broken `excluded_context_paths.toml`
+/// override must fail the whole `mirror-restore --apply` for that session,
+/// not silently widen it to the built-in default exclusion rules and report
+/// success -- same contract `prepare_conversation_for_ingest` already has
+/// (#118b N8). Not just "the apply must fail": the assertion that actually
+/// distinguishes fail-loud from silent-widen-then-succeed is that **nothing
+/// gets committed** -- a bug that only asserted a non-zero exit could still
+/// be "true" for a bug that fails *after* the row got written with the
+/// wrong (wider) exclusion applied.
+#[test]
+fn mirror_restore_apply_fails_loud_on_broken_excluded_context_paths_config() {
+    let root = tempfile::TempDir::new().expect("root tempdir");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+
+    let session_path = home.join(".codex").join("sessions").join("2026").join("09").join("rollout-w119b-b6.jsonl");
+    write_codex_host_shell_session_at(&session_path, "MIRROR-RESTORE-B6-RECALL-BODY");
+
+    // Seed ingest with a WORKING config (no override file exists yet) --
+    // this must produce a raw-mirror with the fixture's two exclusion
+    // markers intact, same as the positive judgment above.
+    let data_dir_a = root.path().join("data-a");
+    std::fs::create_dir_all(&data_dir_a).expect("mkdir data_dir_a");
+    let ingest_output = cass_cmd(&data_dir_a, &home)
+        .args(["index", "--watch-once", session_path.to_str().expect("utf8 session path"), "--json"])
+        .output()
+        .expect("spawn cass index --watch-once (seed)");
+    assert!(ingest_output.status.success(), "seed ingest must succeed; stderr={}", String::from_utf8_lossy(&ingest_output.stderr));
+    let a_rows = read_message_rows_single_conversation(&data_dir_a.join("agent_search.db"));
+    assert_eq!(a_rows.len(), 4, "sanity: seed must have the fixture's 4 rows: {a_rows:?}");
+    assert_eq!(
+        a_rows.iter().filter(|r| r.3).count(),
+        2,
+        "sanity: both anchors must have fired during seed ingest: {a_rows:?}"
+    );
+
+    // NOW break the config, between ingest and restore -- an operator
+    // editing their override file with a syntax error is exactly the
+    // scenario R2-B6 is about.
+    let config_dir = home.join(".config").join("cass");
+    std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+    std::fs::write(
+        config_dir.join("excluded_context_paths.toml"),
+        "memory_files = [\"USER.md\"\n", // unterminated array -- syntactically invalid TOML
+    )
+    .expect("write broken excluded_context_paths.toml");
+
+    let candidate_db = root.path().join("candidate.db");
+    coding_agent_search::storage::sqlite::FrankenStorage::open(&candidate_db).expect("initialize empty candidate db");
+    let scratch_dir = root.path().join("scratch");
+    let journal_path = root.path().join("journal.json");
+    let generation_label = "t119b-b6-broken-config";
+
+    let apply_output = cass_cmd(&data_dir_a, &home)
+        .args([
+            "mirror-restore",
+            "--data-dir", data_dir_a.to_str().expect("utf8 data_dir_a"),
+            "--candidate-db", candidate_db.to_str().expect("utf8 candidate_db"),
+            "--scratch", scratch_dir.to_str().expect("utf8 scratch_dir"),
+            "--snapshot-root", generation_label,
+            "--apply",
+            "--generation", generation_label,
+            "--journal", journal_path.to_str().expect("utf8 journal_path"),
+            "--json",
+        ])
+        .output()
+        .expect("spawn cass mirror-restore --apply against a broken config");
+
+    assert!(
+        !apply_output.status.success(),
+        "apply must fail with a broken excluded_context_paths.toml, not silently widen and succeed"
+    );
+    let stderr = String::from_utf8_lossy(&apply_output.stderr);
+    assert!(
+        stderr.contains("excluded_context_paths.toml"),
+        "error must name the broken config file, not a generic failure: {stderr}"
+    );
+
+    // The load-bearing assertion: the candidate DB must have NOTHING for
+    // this session -- not "restore failed but the row got written with the
+    // wrong (wider, built-in-default) exclusion rules applied first".
+    let conn = coding_agent_search::storage::api::Conn::open_read(&candidate_db).expect("open candidate db read-only");
+    let message_count: i64 = conn
+        .query_all_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
+        .expect("count candidate messages")
+        .into_iter()
+        .next()
+        .expect("COUNT(*) always returns one row");
+    assert_eq!(
+        message_count, 0,
+        "a failed restore must not have written any rows -- a non-zero count here would mean \
+         the session got restored (content cleared under the wrong rule set) before the error \
+         surfaced, i.e. exactly the false-green R2-B6 describes"
+    );
+}

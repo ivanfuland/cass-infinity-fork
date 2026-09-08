@@ -15887,13 +15887,23 @@ fn prepare_conversation_for_ingest(
 /// **不二次物化** —— 两个调用点（`phase3_restore.rs:2716`/`:2849`）已经用
 /// `scan_materialized_file`/等价路径从这份 `materialized` 解析出了 `conv`，
 /// 这里只需要对同一份字节跑 [`crate::indexer::exclusion::events_from_blob`]
-/// 取结构，再与 ingest 共用 [`judge_reparsed_conversation`]。返回
-/// `PreparedConversation`（不是 `Result`：没有第二次 `connector.scan` 这个可能
-/// 失败的步骤）。占位 record（`consumed_manifest.manifest_relative_path` 为空，
-/// E5 摘要比对子系统的合成 provenance）短路成全 `None`（capture_na 语义），
-/// 不经 events_from_blob/judge —— 空路径喂给它只会产生一个恒不对齐的
-/// `RawEvent` 列表。顺序：provenance → judge → compact → attach（judge 必须
-/// 在 compact 之前，否则 `tool_name`/参数已被压缩白名单丢弃，判定拿不到结构）。
+/// 取结构，再与 ingest 共用 [`judge_reparsed_conversation`]。占位 record
+/// （`consumed_manifest.manifest_relative_path` 为空，E5 摘要比对子系统的合成
+/// provenance）短路成全 `None`（capture_na 语义），不经 events_from_blob/judge
+/// —— 空路径喂给它只会产生一个恒不对齐的 `RawEvent` 列表。顺序：provenance →
+/// judge → compact → attach（judge 必须在 compact 之前，否则 `tool_name`/
+/// 参数已被压缩白名单丢弃，判定拿不到结构）。
+///
+/// R2-B6 (任务书 #119b): returns `Result`, not a bare `PreparedConversation`
+/// -- `ExcludedContextPaths::load()` used to be `.unwrap_or_default()` here
+/// ("restore has no fallible step, so it can't propagate"), which meant a
+/// syntactically-broken or unreadable override config silently widened
+/// restore to the built-in default exclusion rules while normal ingest
+/// (`prepare_conversation_for_ingest`, #118b) fails the whole session --
+/// same operator config, two different outcomes depending on which path
+/// happened to read it. Both `phase3_restore.rs` call sites already sit
+/// behind a `Result`-returning function (`ProjectionError`/`ProjectionFault`
+/// respectively), so there is somewhere for this to propagate to now.
 pub(crate) fn prepare_conversation_for_restore(
     connector_name: &str,
     origin: &Origin,
@@ -15902,7 +15912,9 @@ pub(crate) fn prepare_conversation_for_restore(
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
     materialized: &Path,
     mut conv: NormalizedConversation,
-) -> crate::indexer::exclusion::PreparedConversation {
+) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
+    use crate::indexer::exclusion::PrepareError;
+
     inject_provenance(&mut conv, origin);
     canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
@@ -15912,13 +15924,11 @@ pub(crate) fn prepare_conversation_for_restore(
     let excluded = if consumed_manifest.manifest_relative_path.is_empty() {
         vec![None; conv.messages.len()]
     } else {
-        // 任务书 #118b N8 scope is the ingest path (`prepare_conversation_
-        // for_ingest`, which can propagate `Result`); this fn has no
-        // `Result` in its signature (doc comment above: no fallible
-        // `connector.scan` step here) and its callers in phase3_restore.rs
-        // are out of this mission's authorized file set, so restore keeps
-        // its pre-existing `unwrap_or_default()` behavior unchanged.
-        let paths_cfg = crate::sources::config::ExcludedContextPaths::load().unwrap_or_default();
+        // 任务书 #118b N8 同口径 (#119b 收口, R2-B6): 恢复侧与摄入侧共用同一份
+        // 操作者配置，坏配置必须让整条恢复失败，不能静默退回内置默认清单。
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
+            PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
+        })?;
         let events = crate::indexer::exclusion::events_from_blob(&conv.agent_slug, materialized);
         judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path, &paths_cfg)
     };
@@ -15933,7 +15943,7 @@ pub(crate) fn prepare_conversation_for_restore(
     // 只能有一处定义，否则基线下次加一个键时两处静默分叉。
     attach_raw_mirror_metadata(&mut conv, consumed_manifest);
 
-    crate::indexer::exclusion::PreparedConversation { conv, excluded }
+    Ok(crate::indexer::exclusion::PreparedConversation { conv, excluded })
 }
 
 fn capture_connector_sources_before_parse(

@@ -2113,6 +2113,11 @@ pub enum ProjectionFault {
     /// 于是投影出的会话根本不是被恢复的那一份，而后续每一步都自洽。
     /// **判据是「扫到的就是刚物化的那一个」，不是「扫到了至少一个」。**
     ScannedDifferentFile { expected: String, got: String },
+    /// R2-B6 (任务书 #119b): `prepare_conversation_for_restore` 的
+    /// `ExcludedContextPaths::load()` 失败（配置语法错误或不可读）。**不与其他
+    /// I/O 合并归类**（E-6，同上一条 `Materialize` 的注释）：这是排除规则配置
+    /// 特有的故障，跟"物化到 scratch 根"的 I/O 失败是不同的一类。
+    ExcludedContextPathsLoad { detail: String },
 }
 
 impl fmt::Display for ProjectionFault {
@@ -2135,6 +2140,9 @@ impl fmt::Display for ProjectionFault {
                 f,
                 "pinned parser scanned {got} but the materialized sealed blob is {expected}"
             ),
+            Self::ExcludedContextPathsLoad { detail } => {
+                write!(f, "excluded_context_paths.toml 加载失败（不回退内置默认清单）: {detail}")
+            }
         }
     }
 }
@@ -2744,7 +2752,10 @@ impl SealedMessageProjector<'_> {
             &provenance,
             &materialized,
             conv,
-        );
+        )
+        .map_err(|e| {
+            ProjectionError::from_fault(ProjectionFault::ExcludedContextPathsLoad { detail: e.0 })
+        })?;
 
         Ok(prepared
             .conv
@@ -2883,7 +2894,8 @@ fn project_from_materialized(
         consumed_manifest,
         materialized,
         conv,
-    );
+    )
+    .map_err(|e| ProjectionFault::ExcludedContextPathsLoad { detail: e.0 })?;
 
     Ok(SealedProjection::Projected(Box::new(prepared)))
 }
@@ -4162,7 +4174,8 @@ mod e5_materialization_tests {
             &record,
             &materialized,
             conv,
-        );
+        )
+        .expect("valid built-in excluded_context_paths config must not fail prepare");
 
         assert!(
             prepared.excluded[0].is_some(),
