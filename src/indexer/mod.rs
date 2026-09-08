@@ -14017,7 +14017,7 @@ fn reindex_paths_with_semantic_delta(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    let triggers = classify_paths(
+    let mut triggers = classify_paths(
         paths,
         roots,
         opts.watch_once_paths
@@ -14027,6 +14027,25 @@ fn reindex_paths_with_semantic_delta(
     if triggers.is_empty() {
         return Ok(0);
     }
+    // R3-N1 (任务书 #120b): `classify_paths` builds its batch map as a
+    // `HashMap<(ConnectorKind, PathBuf), _>` and returns `.into_iter()`
+    // straight off it -- HashMap iteration order is randomized per
+    // construction (a fresh random seed every time), not input-preserving.
+    // This is a real production concern independent of any test: the same
+    // inputs and the same fault produce a DIFFERENT processing order (and
+    // therefore different interleaved log lines) on every run, which one
+    // trigger's failure poisons another's persist below depends on, and a
+    // reproducibility gap on top of an already-intermittent failure is
+    // exactly the kind of thing that turns into an expensive "flaky, can't
+    // repro" investigation later (this batch already hit that class of bug
+    // once, in the concurrent probe tests). Sorting by `(kind.slug(),
+    // root.path)` costs nothing meaningful (this list is per-cycle trigger
+    // count, not per-session) and makes a watch cycle's processing order --
+    // and therefore its log trace and its cross-trigger failure/persist
+    // interactions below -- reproducible from the same inputs.
+    triggers.sort_by(|(kind_a, root_a, ..), (kind_b, root_b, ..)| {
+        kind_a.slug().cmp(kind_b.slug()).then_with(|| root_a.path.cmp(&root_b.path))
+    });
 
     // mission #117③: this function is called exactly once per watch/watch-once
     // *cycle* (the three call sites are the three mutually-exclusive branches
@@ -14075,6 +14094,24 @@ fn reindex_paths_with_semantic_delta(
     // continuous loop's existing soft-fail-and-retry semantics are
     // untouched.
     let mut explicit_watch_once_prepare_failures: usize = 0;
+    // R3-N1 (任务书 #120b): `scan_failed` below is declared fresh inside the
+    // `for (kind, root, ...) in triggers` loop, once per trigger -- it only
+    // ever reflects THIS trigger's own scan/prepare outcome. R2-N4 (#119c)
+    // already made a later chunk within the SAME trigger not clobber an
+    // earlier chunk's failure in the same trigger; this is the other half:
+    // across DIFFERENT triggers in the same cycle. Root A failing (its own
+    // `scan_failed = true`) does not stop root B's iteration from starting
+    // fresh with `scan_failed = false` and persisting `last_indexed_at`/the
+    // run counters as if the whole cycle succeeded, silently discarding
+    // A's failure. `cycle_had_failure` accumulates across the whole loop
+    // (never reset inside it) so the persist-skip check below can see A's
+    // failure even while processing B. Deliberately NOT a per-`ConnectorKind`
+    // map like `watch_preserve_by_kind`: that map governs which kind's
+    // WATERMARK may advance (legitimately per-kind, since watermarks are
+    // per-kind), but `last_indexed_at` and the run counters are single,
+    // cycle-wide values -- whether writing them this cycle is trustworthy
+    // is a cycle-level question, not a per-kind one.
+    let mut cycle_had_failure = false;
     for (kind, _, _, _) in &triggers {
         *remaining_triggers_by_kind.entry(*kind).or_default() += 1;
     }
@@ -14221,6 +14258,11 @@ fn reindex_paths_with_semantic_delta(
                 // "nothing new" — flag it so this kind's shared watermark is
                 // not advanced past whatever the scan failed to see.
                 scan_failed = true;
+                // R3-N1 (任务书 #120b): see this cycle-level flag's own doc
+                // comment above the `for` loop -- a later trigger in this
+                // same cycle must not persist as if this failure never
+                // happened.
+                cycle_had_failure = true;
                 Vec::new()
             }
         };
@@ -14262,6 +14304,9 @@ fn reindex_paths_with_semantic_delta(
                     // is not missed by a check that already ran.
                     tracing::warn!(?kind, error = %error, "prepare_conversation_for_ingest failed; skipping session");
                     scan_failed = true;
+                    // R3-N1 (任务书 #120b): see `cycle_had_failure`'s own
+                    // doc comment above the `for` loop.
+                    cycle_had_failure = true;
                     if explicit_watch_once {
                         explicit_watch_once_prepare_failures += 1;
                     }
@@ -14370,9 +14415,18 @@ fn reindex_paths_with_semantic_delta(
                 // A's failure happened in the very same cycle -- the
                 // previous successful run's real counts get clobbered by a
                 // run that didn't actually complete cleanly.
-                if lexical_update_deferred || scan_failed {
+                //
+                // R3-N1 (任务书 #120b): `scan_failed` alone only catches a
+                // failure within THIS SAME trigger (root A failing does not
+                // make root B's own `scan_failed` true -- it's reset fresh
+                // per trigger). `cycle_had_failure` is the other half: it
+                // accumulates across every trigger this cycle has processed
+                // so far, so root B's otherwise-clean persist still skips
+                // when an earlier root A in the same cycle failed.
+                if lexical_update_deferred || scan_failed || cycle_had_failure {
                     tracing::warn!(
                         scan_failed,
+                        cycle_had_failure,
                         "skipping watch last_indexed_at update after a deferred lexical update or \
                          a prepare/scan failure this cycle so health/status report stale lexical assets"
                     );
@@ -27077,13 +27131,16 @@ mod tests {
     /// `Err`'s formatted message contains both "capture/prepare" and "index
     /// run" -- i.e. it checks the bail message names the failure kind AND
     /// the run context, not a generic string. It does **not** switch to the
-    /// old unconditional-`Ok` implementation, and it cannot make
-    /// `streaming_capture_failure_returns_err_not_ok` (a different test)
-    /// run or go red from inside this Rust unit test -- a single `#[test]`
-    /// fn has no mechanism to invoke another test fn as a sub-check. The
-    /// original doc comment here claimed both of those things; neither is
-    /// true of what the test body actually does, so it overstated this
-    /// test's evidentiary weight. The real manual mutation verification
+    /// old unconditional-`Ok` implementation, and it does not call
+    /// `streaming_capture_failure_returns_err_not_ok` (a different test) --
+    /// this test's body only calls `run_index` once and checks its error
+    /// message, nothing else. (A `#[test]` fn is still an ordinary function
+    /// and CAN be called directly like any other; that would just make its
+    /// assertions part of the caller's own pass/fail, not spawn a second,
+    /// independent test-framework result -- this test's body does not do
+    /// that either way.) The original doc comment here claimed both of
+    /// those things; neither is true of what the test body actually does,
+    /// so it overstated this test's evidentiary weight. The real manual mutation verification
     /// (reverting the fix and confirming `streaming_capture_failure_returns_
     /// err_not_ok` goes red) was done once, by hand, during development,
     /// and is recorded in `W6_ARTIFACTS/r2fix-mission119a-report.md` -- this
@@ -32242,6 +32299,143 @@ mod tests {
             .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |row| row.get_typed(0))
             .unwrap();
         assert!(message_count > 0, "conversation B must have been ingested despite A's prepare failure");
+    }
+
+    /// R3-N1 (任务书 #120b): the OTHER half of R2-N4 above -- that test put
+    /// A and B under the SAME root, so both land in the same `for (kind,
+    /// root, ...) in triggers` loop iteration and share that iteration's
+    /// one `scan_failed` local, which is exactly why it couldn't have
+    /// caught this. Here A and B are under two DIFFERENT root directories
+    /// (still the same `ConnectorKind::Amp`, per control-plane's ruling
+    /// that same-kind-different-root already exercises the bug -- it lives
+    /// in "does a failure survive across trigger loop ITERATIONS", not in
+    /// cross-`ConnectorKind` behavior), so `classify_paths` (keyed by
+    /// `(kind, root.path)`) produces two SEPARATE trigger tuples. Directory
+    /// names are chosen (`amp-a` < `amp-b`) so the deterministic sort added
+    /// alongside this fix (see the comment on `triggers.sort_by` above)
+    /// puts A's trigger BEFORE B's, matching this test's fixture order --
+    /// without that sort this would depend on `HashMap` iteration order.
+    ///
+    /// **Known one-directional limitation (not fixed by this test or this
+    /// batch, control-plane tracked for T6)**: `cycle_had_failure` only
+    /// looks backward -- it can only make a LATER trigger's persist see an
+    /// EARLIER trigger's failure. If the sort order instead put the
+    /// succeeding root before the failing one, the succeeding root's
+    /// persist would still land before the failure is known, and this
+    /// invariant would NOT hold. A fully symmetric "any failure anywhere in
+    /// the cycle blocks every persist in the cycle" guarantee would require
+    /// deferring all persistence to the end of the trigger loop, which
+    /// control-plane ruled out of this batch's scope (it would change the
+    /// deliberate "keep `last_indexed_at` fresh mid-cycle" behavior). This
+    /// test only proves the direction the review actually named: an
+    /// earlier failure is no longer invisible to a later trigger's persist.
+    #[test]
+    #[serial]
+    fn watch_reindex_cross_root_prepare_failure_does_not_clobber_last_index_counters() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-r3n1-cross-root");
+        let amp_dir_a = data_dir.join("amp-a");
+        let amp_dir_b = data_dir.join("amp-b");
+        std::fs::create_dir_all(&amp_dir_a).unwrap();
+        std::fs::create_dir_all(&amp_dir_b).unwrap();
+
+        let file_a = amp_dir_a.join("thread-r3n1-a.json");
+        let file_b = amp_dir_b.join("thread-r3n1-b.json");
+        std::fs::write(
+            &file_a,
+            r#"{"id":"thread-r3n1-a","messages":[{"role":"user","text":"a","createdAt":1700000000000}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &file_b,
+            r#"{"id":"thread-r3n1-b","messages":[{"role":"user","text":"b","createdAt":1700000001000}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.set_last_indexed_at(222).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES \
+                 ('last_index.codex_host_shell_hits', '11'), \
+                 ('last_index.codex_idx0_user_total', '13'), \
+                 ('last_index.event_align_failed', '5')",
+                &[] as &[ParamValue],
+            )
+            .unwrap();
+
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        // R3-N1: two SEPARATE roots, same kind -- classify_paths keys its
+        // batch map by (kind, root.path), so this becomes two distinct
+        // trigger tuples in the `for (kind, root, ...) in triggers` loop,
+        // not one trigger covering both files (which is what R2-N4's test
+        // above exercises instead).
+        let roots = vec![
+            (ConnectorKind::Amp, ScanRoot::local(amp_dir_a.clone())),
+            (ConnectorKind::Amp, ScanRoot::local(amp_dir_b.clone())),
+        ];
+
+        let file_a_for_hook = file_a.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage| {
+            if stage == PrepareStage::BeforeCapture {
+                let _ = std::fs::remove_file(&file_a_for_hook);
+            }
+        })));
+        let result = reindex_paths(&opts, vec![file_a.clone(), file_b.clone()], &roots, &state, &storage, false);
+        set_prepare_fault_hook(None);
+        result.expect("reindex_paths itself must not error -- a prepare failure inside one cycle is a soft, per-conversation skip, not a hard stop");
+
+        let storage = storage.into_inner().unwrap();
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(222),
+            "last_indexed_at must not advance past its pre-cycle baseline when an EARLIER root in \
+             this cycle had a prepare failure, even though a LATER root's own trigger iteration \
+             succeeded cleanly"
+        );
+        for (key, expected) in [
+            ("last_index.codex_host_shell_hits", "11"),
+            ("last_index.codex_idx0_user_total", "13"),
+            ("last_index.event_align_failed", "5"),
+        ] {
+            let value: String = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    &crate::storage::api::params![key],
+                    |row| row.get_typed(0),
+                )
+                .unwrap_or_else(|e| panic!("meta key {key} must still exist: {e}"));
+            assert_eq!(
+                value, expected,
+                "meta key {key} must keep its pre-cycle value, not be overwritten by root B's \
+                 own clean trigger iteration"
+            );
+        }
+
+        // Sanity: B really was ingested this cycle in its own trigger --
+        // the counters not advancing is not because nothing happened.
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |row| row.get_typed(0))
+            .unwrap();
+        assert!(message_count > 0, "conversation B (a different root's own trigger) must have been ingested despite root A's earlier prepare failure this cycle");
     }
 
     /// R2-N4 (任务书 #119c) atomicity variant: `last_indexed_at` and the
