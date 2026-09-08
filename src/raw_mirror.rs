@@ -3026,6 +3026,112 @@ mod tests {
         );
     }
 
+    /// R4-B1 (任务书 #120a) 源码级断言门：全仓扫描 `.rs` 文件，找 `create_dir_all(`
+    /// 后面直接跟 `data_dir`/`&data_dir` 的**字面**命中，断言生产代码里一个都
+    /// 没有——所有新建 `data_dir` 的入口都必须走 `create_dir_all_durable`，否
+    /// 则镜像树/数据目录的祖先目录项不会被持久化（见 R4-B1）。这是把这次的
+    /// 人工穷举（`create_private_dir_all`/`ensure_private_dir`/
+    /// `ensure_private_dir_descendant`/`acquire_index_run_lock`/
+    /// `QuarantineState::save`/`prepare_headless_once_tui_artifacts`/`cass
+    /// doctor --fix`）固化成一条会自己复检的规则，不用等下一轮审查者手工去
+    /// 数：往后谁再写一处裸 `create_dir_all(data_dir)`，本地/CI 跑测试就红。
+    ///
+    /// 白名单本应是"仅 `create_dir_all_durable` 函数体内部那一处"，但该函数
+    /// 的形参命名为 `path`（不是 `data_dir` —— 它本来就不是 `data_dir` 专用
+    /// 的，`quarantine.rs`/`lib.rs` 的调用方各自传入的是自己的 `data_dir` 局
+    /// 部变量，被调函数不该以调用方的变量名自居），所以 `create_dir_all_
+    /// durable` 内部那行 `fs::create_dir_all(path)` 天然不匹配这条字面规
+    /// 则——白名单集合因此是**空集**，不需要在扫描逻辑里显式排除任何一行。
+    ///
+    /// **已知局限**（如实写明，不声称穷尽）：① 只做逐行字面文本匹配，抓不到
+    /// "参数名不叫 `data_dir` 但实参确实是 `data_dir`"的间接情形（例如包一层
+    /// 局部变量改名后传入）；② 不是真正的 Rust 语法解析器，用启发式规则（`fn`/
+    /// `mod` 声明是否被 `#[test]`/`#[cfg(test)]` 直接修饰、或位于已经进入的
+    /// test 作用域内）跳过测试代码，行内注释里的花括号或字符串字面量里的花括
+    /// 号理论上能扰乱花括号计数进而错误分类某一行。失效方向以漏报为主（新入
+    /// 口用了扫描抓不到的形态就会被放过），不是误报——按控制面裁定，这个方向
+    /// 可以接受。
+    #[test]
+    fn no_production_create_dir_all_data_dir_literal_outside_durable_helper() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations: Vec<String> = Vec::new();
+        scan_dir_for_bare_create_dir_all_data_dir(&src_dir, &mut violations);
+        assert!(
+            violations.is_empty(),
+            "found production (non-test) code that creates data_dir via a bare \
+             create_dir_all(data_dir)/create_dir_all(&data_dir) instead of going through \
+             create_dir_all_durable -- see R4-B1 (任务书 #120a): the newly-created directory's \
+             ancestor entries won't be made durable. Violations:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    fn scan_dir_for_bare_create_dir_all_data_dir(dir: &Path, violations: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir_for_bare_create_dir_all_data_dir(&path, violations);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else { continue };
+            scan_file_for_bare_create_dir_all_data_dir(&path, &content, violations);
+        }
+    }
+
+    /// Heuristic test-code detector -- see the door test's doc comment above
+    /// for the documented, accepted limitations. Tracks a brace-depth stack
+    /// of `is_test` flags: a new scope (any `{`) inherits its enclosing
+    /// scope's `is_test` unless the line declaring it was itself directly
+    /// preceded by a pending `#[test]`/`#[cfg(test)]` attribute, in which
+    /// case the new scope (and everything nested inside it, transitively --
+    /// this is what correctly classifies helper functions with no attribute
+    /// of their own, like this file's own `f6_fixture`, as test code purely
+    /// because they're lexically inside a `#[cfg(test)] mod tests { ... }`).
+    fn scan_file_for_bare_create_dir_all_data_dir(path: &Path, content: &str, violations: &mut Vec<String>) {
+        let mut is_test_stack: Vec<bool> = vec![false];
+        let mut pending_test_attr = false;
+
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let currently_test = *is_test_stack.last().unwrap_or(&false);
+
+            if !currently_test
+                && (line.contains("create_dir_all(data_dir)") || line.contains("create_dir_all(&data_dir)"))
+            {
+                violations.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+
+            if trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#[test]") {
+                pending_test_attr = true;
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+                // Blank lines, comments, and other attributes don't clear a
+                // pending test attribute -- several attributes/doc comments
+                // can stack before the item they apply to.
+                continue;
+            }
+
+            let new_scope_is_test = pending_test_attr || currently_test;
+            pending_test_attr = false;
+            for ch in line.chars() {
+                match ch {
+                    '{' => is_test_stack.push(new_scope_is_test),
+                    '}' => {
+                        if is_test_stack.len() > 1 {
+                            is_test_stack.pop();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// R2-B5 场景二 (任务书 #119b): `replace_manifest_bytes`'s post-rename
     /// sync used to be `sync_file` + `sync_parent`, and `sync_parent` only
     /// fsyncs the manifest's IMMEDIATE parent (`manifests/`) -- when the
