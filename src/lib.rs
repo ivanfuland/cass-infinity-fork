@@ -9373,34 +9373,47 @@ fn run_mirror_prune(
     // R9: read the reference set only after the lock is held (apply path)
     // -- a failure to read here must NOT silently degrade to "nothing
     // referenced" (that would let prune delete a blob the caller can't
-    // currently see is still in use). Dry-run has no such stake and stays
-    // best-effort.
-    let referenced_blobs: HashSet<String> = if apply && db_path.exists() {
-        let conn = crate::storage::api::Conn::open_read(&db_path).map_err(|err| CliError {
-            code: 9,
-            kind: "raw-mirror",
-            message: format!(
-                "opening {} to read excluded.raw.blob references before prune --apply: {err}",
-                db_path.display()
-            ),
-            hint: None,
-            retryable: false,
-        })?;
-        conn.query_all_map(
-            "SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL",
-            &[],
-            |row| row.get_typed::<Option<String>>(0),
-        )
-        .map_err(|err| CliError {
-            code: 9,
-            kind: "raw-mirror",
-            message: format!("reading excluded.raw.blob references from {}: {err}", db_path.display()),
-            hint: None,
-            retryable: false,
-        })?
-        .into_iter()
-        .flatten()
-        .collect()
+    // currently see is still in use), so `apply` hard-fails on a read error.
+    // R1-N18 (任务书 #118b): dry-run now reads the same reference set
+    // (previously it always used an empty set, so its preview could report
+    // an actually-protected blob as deletable) -- but a dry-run has no
+    // destructive stake in getting this right, so a read failure there
+    // degrades to an empty set with a warning instead of failing the whole
+    // preview.
+    let referenced_blobs: HashSet<String> = if db_path.exists() {
+        let read_result: Result<HashSet<String>, crate::storage::api::StorageError> = (|| {
+            let conn = crate::storage::api::Conn::open_read(&db_path)?;
+            let blobs = conn.query_all_map(
+                "SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL",
+                &[],
+                |row| row.get_typed::<Option<String>>(0),
+            )?;
+            Ok(blobs.into_iter().flatten().collect())
+        })();
+        match read_result {
+            Ok(blobs) => blobs,
+            Err(err) if apply => {
+                return Err(CliError {
+                    code: 9,
+                    kind: "raw-mirror",
+                    message: format!(
+                        "reading excluded.raw.blob references from {} before prune --apply: {err}",
+                        db_path.display()
+                    ),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    error = %err,
+                    "dry-run: failed to read excluded.raw.blob references; this preview may \
+                     understate which blobs are actually protected"
+                );
+                HashSet::new()
+            }
+        }
     } else {
         HashSet::new()
     };

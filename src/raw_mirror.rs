@@ -342,20 +342,39 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         }
     }
     report.pinned_manifest_count = pinned_manifests.len() as u64;
-    let pinned_blobs: HashSet<String> = blob_to_manifests
+    // R1-N18 (任务书 #118b): computed WITHOUT `referenced_blobs` chained in --
+    // the old code unioned `referenced_blobs` into `pinned_blobs` *before*
+    // checking `referenced_blobs.is_subset(&pinned_blobs)`, which made that
+    // check vacuously true no matter what (a set is always a subset of
+    // itself-plus-more). This set only contains blobs that actually have a
+    // manifest backing them (including any manifest pinned above specifically
+    // *because* it captured a referenced blob, R9's real protection
+    // mechanism) -- a referenced blob with no manifest at all in the
+    // inventory (a dangling `excluded.raw.blob` pointer) is absent from it,
+    // so the subset check below can actually fail.
+    let pinned_blobs_from_manifests: HashSet<String> = blob_to_manifests
         .iter()
         .filter(|(_, manifest_ids)| manifest_ids.iter().any(|id| pinned_manifests.contains(id)))
         .map(|(blob_relative_path, _)| blob_relative_path.clone())
-        .chain(options.referenced_blobs.iter().cloned())
         .collect();
-    report.pinned_blob_count = pinned_blobs.len() as u64;
 
-    if options.apply && !options.referenced_blobs.is_subset(&pinned_blobs) {
+    if options.apply && !options.referenced_blobs.is_subset(&pinned_blobs_from_manifests) {
+        let missing: Vec<&String> =
+            options.referenced_blobs.difference(&pinned_blobs_from_manifests).collect();
         anyhow::bail!(
-            "raw mirror prune refused: {} referenced blob(s) are not in the protected set (R9 invariant violated)",
-            options.referenced_blobs.difference(&pinned_blobs).count()
+            "raw mirror prune refused: {} referenced blob(s) have no protected manifest backing them \
+             (R9 invariant violated): {missing:?}",
+            missing.len()
         );
     }
+
+    // Past the check above, `referenced_blobs` is already a subset of
+    // `pinned_blobs_from_manifests` (or `apply` is false and the check never
+    // ran) -- chaining it in here is the same defensive belt-and-suspenders
+    // union the pre-fix code did, just after the check instead of before it.
+    let pinned_blobs: HashSet<String> =
+        pinned_blobs_from_manifests.into_iter().chain(options.referenced_blobs.iter().cloned()).collect();
+    report.pinned_blob_count = pinned_blobs.len() as u64;
 
     let mut selected_manifests: HashSet<String> = HashSet::new();
     let mut manifest_reasons: HashMap<String, String> = HashMap::new();
@@ -2783,6 +2802,58 @@ mod tests {
 
         assert!(!manifest_path.exists(), "MUTATION: without referenced_blobs, this manifest is wrongly deleted");
         assert!(!blob_path.exists(), "MUTATION: without referenced_blobs, this blob is wrongly deleted");
+    }
+
+    /// R1-N18 (任务书 #118b): `referenced_blobs` used to be unioned into
+    /// `pinned_blobs` BEFORE checking `referenced_blobs.is_subset(&pinned_
+    /// blobs)`, making that check vacuously true no matter what (a set is
+    /// always a subset of itself-plus-more) -- a reference pointing at a
+    /// blob with no manifest at all in the inventory (a dangling
+    /// `excluded.raw.blob` pointer, e.g. from a corrupted/edited DB row)
+    /// would silently pass the "core in the protected set" check instead of
+    /// refusing `--apply`. This session has one real, legitimately-expired,
+    /// UNREFERENCED capture (so the inventory is non-trivial) plus one
+    /// dangling reference to a blob hash that was never captured at all.
+    #[test]
+    fn prune_apply_refuses_dangling_reference_with_no_backing_manifest_r1_n18_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+
+        let source_path = temp.path().join("unrelated.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"unrelated, real capture\"}\n")
+            .expect("write source");
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture unrelated source");
+
+        let dangling_blob = "blobs/blake3/00/dangling-reference-never-captured.raw".to_string();
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert(dangling_blob.clone());
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect_err("a referenced blob with no backing manifest must refuse --apply, not silently pass");
+        let message = err.to_string();
+        assert!(
+            message.contains(&dangling_blob),
+            "error must name the specific missing blob, not just a count: {message}"
+        );
     }
 
     #[test]
