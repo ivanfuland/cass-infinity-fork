@@ -1547,6 +1547,24 @@ pub(crate) fn sync_capture_durable(data_dir: &Path, record: &RawMirrorCaptureRec
     if let Some(root_parent) = root.parent() {
         force_sync_dir(root_parent)?;
     }
+
+    // R3-B1 (任务书 #119d): the fix directly above only carries the chain up
+    // to `raw-mirror/`'s own directory listing -- it never fsyncs `data_dir`
+    // itself, which is `raw-mirror/`'s parent and therefore the directory
+    // that actually holds `raw-mirror/`'s entry. Same gap, one level higher:
+    // a freshly-created `raw-mirror/` (this data_dir's very first capture
+    // ever) is still not durably *reachable from data_dir* even though
+    // everything under it (including `raw-mirror/`'s own listing) is now
+    // durable. `data_dir` itself is NOT fsynced conditionally on whether it
+    // was "just created" -- it never is: the caller already has an open
+    // database that lives inside `data_dir`, so `data_dir` is guaranteed to
+    // predate this call. What's newly created (maybe) is only the
+    // `raw-mirror` entry inside it, and fsyncing the PARENT (not the child)
+    // is what makes a directory entry durable -- same reasoning as the
+    // `root_parent` sync above, one level up. Unconditional and cheap for
+    // the same reason: `data_dir`'s "does it contain raw-mirror/" fact only
+    // changes once, on the first capture ever made against this `data_dir`.
+    force_sync_dir(data_dir)?;
     Ok(())
 }
 
@@ -2502,6 +2520,15 @@ mod tests {
     /// (it is already gated on "session has an exclusion marker" by its one
     /// caller -- the R1-B3 force barrier -- so this extra level costs
     /// nothing extra in the common case).
+    ///
+    /// R3-B1 (任务书 #119d): the same gap exists one level higher -- fsyncing
+    /// `raw-mirror/`'s own listing only makes `v1`'s entry durable, not
+    /// `raw-mirror/`'s OWN entry inside `data_dir`. `data_dir` is guaranteed
+    /// pre-existing (the caller already has an open database inside it), so
+    /// this is unconditional and cheap for the same reason as the level
+    /// below it. This test now also asserts chain completeness: the full
+    /// leaf-to-`data_dir` layer enumeration, derived from the capture's own
+    /// relative paths, must equal exactly what the probe observed.
     #[test]
     fn sync_capture_durable_fsyncs_mirror_root_parent_directory_entry() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
@@ -2552,6 +2579,53 @@ mod tests {
             synced.contains(&raw_mirror_dir),
             "sync_capture_durable must fsync raw-mirror/ itself (v1's own directory entry in \
              its parent), not just v1 and everything below it; synced dirs: {synced:?}"
+        );
+        // R3-B1 (任务书 #119d): `raw-mirror/`'s own listing being durable
+        // only makes V1'S entry durable -- it does nothing for `raw-mirror/`
+        // itself possibly being a brand-new entry in `data_dir`'s listing.
+        // `data_dir` (this test's own `data_dir` binding, guaranteed
+        // pre-existing -- see `sync_capture_durable`'s doc comment) must
+        // also be fsynced.
+        assert!(
+            synced.contains(&data_dir),
+            "sync_capture_durable must also fsync data_dir itself (raw-mirror/'s own directory \
+             entry in ITS parent) -- fsyncing raw-mirror/ alone only makes v1's entry durable, \
+             not raw-mirror/'s own entry inside data_dir; synced dirs: {synced:?}"
+        );
+
+        // R3-B1 chain-completeness judge: derive the FULL enumerated layer
+        // set (every leaf-to-data_dir directory level from the #119d layer
+        // table) from this capture's OWN relative paths -- not a hardcoded
+        // hash prefix -- and assert the probe observed exactly this set,
+        // deduped, no more and no fewer. This is what turns the manual
+        // layer-by-layer enumeration into a standing regression judge: the
+        // next time a level silently drops out of the chain walk, this
+        // assertion goes red instead of waiting for a reviewer to recount.
+        fn walk_up_inclusive(mut dir: PathBuf, stop_at: &Path, into: &mut HashSet<PathBuf>) {
+            loop {
+                into.insert(dir.clone());
+                if dir == stop_at {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+        let mut expected_dirs: HashSet<PathBuf> = HashSet::new();
+        expected_dirs.insert(data_dir.clone());
+        expected_dirs.insert(raw_mirror_dir.clone());
+        let blob_leaf_dir = v1_dir.join(&record.blob_relative_path).parent().expect("blob path has a parent").to_path_buf();
+        let manifest_leaf_dir = v1_dir.join(&record.manifest_relative_path).parent().expect("manifest path has a parent").to_path_buf();
+        walk_up_inclusive(blob_leaf_dir, &v1_dir, &mut expected_dirs);
+        walk_up_inclusive(manifest_leaf_dir, &v1_dir, &mut expected_dirs);
+        let observed_dirs: HashSet<PathBuf> = synced.iter().cloned().collect();
+        assert_eq!(
+            observed_dirs, expected_dirs,
+            "chain completeness: probe-observed synced directory set must exactly equal the \
+             #119d layer enumeration (every leaf-to-data_dir level), derived from this capture's \
+             own relative paths"
         );
     }
 
