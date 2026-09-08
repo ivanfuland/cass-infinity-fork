@@ -1147,6 +1147,30 @@ fn apply_path(value: &mut serde_json::Value, segments: &[&str], target_blocks: &
     }
 }
 
+/// R2-B2 (任务书 #119a): claude_code's top-level `toolUseResult` field takes
+/// TWO distinct shapes depending on which tool produced it -- a nested
+/// object (`{"file":{"content":...}}`, already covered by
+/// `EXTRA_FIELD_MAP`'s `toolUseResult.file.content` sub-path) for
+/// file-editing tools, and a bare STRING carrying the raw tool_result body
+/// verbatim (measured on the frozen corpus: 1,533 `context_file_read` +
+/// 25 `cass_recall` rows where this string is byte-identical to
+/// `message.content`) for others (e.g. `mcp__cass-mcp__*`, `Bash`,
+/// `project_read`). A generic DSL entry can't distinguish the two: adding a
+/// bare `"toolUseResult"` path to `EXTRA_FIELD_MAP` would also nuke the
+/// object shape's sibling metadata (`filePath`/`type`/`oldTodos`/...), which
+/// the sub-path entry deliberately leaves alone. So this is a small,
+/// type-guarded step run alongside the DSL rather than a DSL entry: replace
+/// `toolUseResult` wholesale only when it is currently a JSON string,
+/// leaving the object shape untouched here (the existing sub-path handles
+/// it).
+fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, placeholder: &serde_json::Value) {
+    if let Some(v) = value.get_mut("toolUseResult") {
+        if v.is_string() {
+            *v = placeholder.clone();
+        }
+    }
+}
+
 /// Replace every R7 field map path's leaf value with `placeholder`, only at
 /// `target_blocks` positions for array (`[*]`) segments. Unwraps/rewraps the
 /// `historical_raw_json` string envelope first when present (R7 note): the
@@ -1161,6 +1185,7 @@ fn apply_extra(extra: &mut serde_json::Value, field_map: ExtraFieldMap, target_b
                 let segments: Vec<&str> = path.split('.').collect();
                 apply_path(&mut inner, &segments, target_blocks, placeholder);
             }
+            strip_claude_string_tool_use_result(&mut inner, placeholder);
             let rewritten = serde_json::to_string(&inner).unwrap_or(raw);
             extra[HISTORICAL_RAW_JSON_SENTINEL_KEY] = serde_json::Value::String(rewritten);
         }
@@ -1170,6 +1195,7 @@ fn apply_extra(extra: &mut serde_json::Value, field_map: ExtraFieldMap, target_b
         let segments: Vec<&str> = path.split('.').collect();
         apply_path(extra, &segments, target_blocks, placeholder);
     }
+    strip_claude_string_tool_use_result(extra, placeholder);
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -2303,6 +2329,46 @@ mod tests {
 
         assert_eq!(m.extra["toolUseResult"]["file"]["content"]["redacted"], serde_json::json!(true));
         assert_eq!(m.extra["toolUseResult"]["file"]["numLines"], serde_json::json!(1), "sibling field must stay");
+    }
+
+    /// R2-B2 (任务书 #119a): a top-level STRING `toolUseResult` (distinct
+    /// from the nested-object `.file.content` shape above) carries the raw
+    /// tool_result body directly -- measured on the frozen corpus: 1,533
+    /// `context_file_read` + 25 `cass_recall` rows where this string is
+    /// byte-identical to `message.content`. Pre-fix, `EXTRA_FIELD_MAP`'s
+    /// claude_code entry had no path for this shape at all, so the full
+    /// original body survived in `extra` even though `content` was cleared
+    /// -- violating "原文只在 raw-mirror".
+    #[test]
+    fn apply_replaces_string_form_tool_use_result_for_claude_code() {
+        let mut m = msg("tool_result", "the recall hit body");
+        m.extra = serde_json::json!({"toolUseResult": "the recall hit body"});
+        let decision = decision_cass_recall(vec![]);
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));
+
+        assert_eq!(m.extra["toolUseResult"]["redacted"], serde_json::json!(true), "a string-form toolUseResult must be replaced wholesale");
+    }
+
+    /// R2-B2 mutation guard: the type-guarded string check must NOT touch
+    /// the object shape's sibling metadata -- if a future edit made the
+    /// replacement unconditional on type, this would start nuking
+    /// `filePath`/`numLines`/etc. alongside `.file.content`. Restates the
+    /// sibling-survives assertion from
+    /// `apply_replaces_tool_use_result_file_content_for_claude_code` as its
+    /// own named case so the two shapes' tests can't silently regress
+    /// independently of each other.
+    #[test]
+    fn apply_object_form_tool_use_result_untouched_by_string_only_strip() {
+        let mut m = msg("tool_result", "the file body");
+        m.extra = serde_json::json!({"toolUseResult": {"file": {"content": "the file body"}, "filePath": "/tmp/x", "type": "text"}});
+        let decision = decision_cass_recall(vec![]);
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 0, field_map_for("claude_code"));
+
+        assert_eq!(m.extra["toolUseResult"]["file"]["content"]["redacted"], serde_json::json!(true), "the sub-path entry must still redact the nested content");
+        assert_eq!(m.extra["toolUseResult"]["filePath"], serde_json::json!("/tmp/x"), "non-body metadata sibling to .file must survive");
+        assert_eq!(m.extra["toolUseResult"]["type"], serde_json::json!("text"), "non-body metadata sibling to .file must survive");
     }
 
     #[test]
