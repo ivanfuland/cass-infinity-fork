@@ -14352,9 +14352,24 @@ fn reindex_paths_with_semantic_delta(
 
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
                 let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
-                if lexical_update_deferred {
+                // R2-N4 (任务书 #119c): `scan_failed` (set above this chunk
+                // loop, stable by the time we get here -- the prepare loop
+                // that can set it always finishes before this chunk/ingest
+                // loop starts) tracks whether ANY conversation in this same
+                // trigger's batch failed scan/prepare -- e.g. conversation A
+                // failed prepare, conversation B succeeded and is the one
+                // whose chunk we're persisting right now. Without this
+                // check, B's successful chunk would overwrite the
+                // `last_index.*` counters/`last_indexed_at` with a value
+                // that only reflects B, silently discarding the fact that
+                // A's failure happened in the very same cycle -- the
+                // previous successful run's real counts get clobbered by a
+                // run that didn't actually complete cleanly.
+                if lexical_update_deferred || scan_failed {
                     tracing::warn!(
-                        "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
+                        scan_failed,
+                        "skipping watch last_indexed_at update after a deferred lexical update or \
+                         a prepare/scan failure this cycle so health/status report stale lexical assets"
                     );
                 } else {
                     // mission #116⑥: watch mode has no single "run_index
@@ -14366,13 +14381,24 @@ fn reindex_paths_with_semantic_delta(
                     // per-watch-cycle -- still monotonic, still reflects
                     // real judge activity, just not zeroed every debounce
                     // callback.
+                    //
+                    // R2-N4 (任务书 #119c): both writes now land in ONE
+                    // transaction, same pattern as the non-watch path's own
+                    // `persist_final_index_run_metadata` (R1-N17, #118b) --
+                    // pre-fix, these were two independent autocommitted
+                    // statements, so a crash (or induced failure) between
+                    // them could advance `last_indexed_at` while leaving the
+                    // counters at their previous value, or vice versa.
                     persist::with_ephemeral_writer(
                         &storage,
                         false,
                         "updating watch last_indexed_at",
                         |writer| {
+                            let tx = writer.raw().transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
                             writer.set_last_indexed_at(FrankenStorage::now_millis())?;
-                            persist_last_index_run_meta_counters(writer)
+                            persist_last_index_run_meta_counters(writer)?;
+                            tx.commit()?;
+                            Ok(())
                         },
                     )?;
                 }
@@ -32103,6 +32129,177 @@ mod tests {
                 .join("quarantine/watch_ingest_poison.jsonl")
                 .exists(),
             "watch OOM should still be recorded for operator visibility"
+        );
+    }
+
+    /// R2-N4 (任务书 #119c): within ONE watch cycle, conversation A fails
+    /// prepare (its own source file removed right before ITS capture, via
+    /// the existing `PrepareStage::BeforeCapture` fault hook -- #119a's
+    /// established mechanism, not a new one) while conversation B (an
+    /// untouched, distinct file in the same root) succeeds. B's successful
+    /// chunk write must NOT advance `last_indexed_at`/the three
+    /// `last_index.*` counters past their pre-cycle baseline -- pre-fix,
+    /// the persist branch only checked `lexical_update_deferred`, so B's
+    /// chunk silently overwrote the previous successful run's real counts
+    /// even though A's failure happened in the very same cycle.
+    #[test]
+    #[serial]
+    fn watch_reindex_prepare_failure_does_not_clobber_last_index_counters_from_a_successful_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-n4-clobber");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+
+        let file_a = amp_dir.join("thread-n4-a.json");
+        let file_b = amp_dir.join("thread-n4-b.json");
+        std::fs::write(
+            &file_a,
+            r#"{"id":"thread-n4-a","messages":[{"role":"user","text":"a","createdAt":1700000000000}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &file_b,
+            r#"{"id":"thread-n4-b","messages":[{"role":"user","text":"b","createdAt":1700000001000}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.set_last_indexed_at(111).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES \
+                 ('last_index.codex_host_shell_hits', '7'), \
+                 ('last_index.codex_idx0_user_total', '9'), \
+                 ('last_index.event_align_failed', '3')",
+                &[] as &[ParamValue],
+            )
+            .unwrap();
+
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let file_a_for_hook = file_a.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage| {
+            if stage == PrepareStage::BeforeCapture {
+                let _ = std::fs::remove_file(&file_a_for_hook);
+            }
+        })));
+        let result = reindex_paths(&opts, vec![file_a.clone(), file_b.clone()], &roots, &state, &storage, false);
+        set_prepare_fault_hook(None);
+        result.expect("reindex_paths itself must not error -- a prepare failure inside one cycle is a soft, per-conversation skip, not a hard stop");
+
+        let storage = storage.into_inner().unwrap();
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(111),
+            "last_indexed_at must not advance past its pre-cycle baseline when this cycle had a prepare failure"
+        );
+        for (key, expected) in [
+            ("last_index.codex_host_shell_hits", "7"),
+            ("last_index.codex_idx0_user_total", "9"),
+            ("last_index.event_align_failed", "3"),
+        ] {
+            let value: String = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    &crate::storage::api::params![key],
+                    |row| row.get_typed(0),
+                )
+                .unwrap_or_else(|e| panic!("meta key {key} must still exist: {e}"));
+            assert_eq!(value, expected, "meta key {key} must keep its pre-cycle value, not be overwritten by B's successful chunk");
+        }
+
+        // Sanity: B really was ingested this cycle -- the counters not
+        // advancing is not because nothing happened.
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |row| row.get_typed(0))
+            .unwrap();
+        assert!(message_count > 0, "conversation B must have been ingested despite A's prepare failure");
+    }
+
+    /// R2-N4 (任务书 #119c) atomicity variant: `last_indexed_at` and the
+    /// three `last_index.*` counters must land in ONE transaction on the
+    /// WATCH path too -- R1-N17 (#118b) already proved this for the
+    /// non-watch `persist_final_index_run_metadata` path; this reuses the
+    /// exact same SQL-trigger fault-injection technique (no new hook) to
+    /// prove the watch path (a separate call site, fixed in this same
+    /// commit) now has the same guarantee. A successful single-conversation
+    /// cycle (no prepare failures) is used so the assertion isolates the
+    /// atomicity question from the `scan_failed` gate above.
+    #[test]
+    #[serial]
+    fn watch_reindex_rolls_back_last_indexed_at_when_counters_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-n4-atomicity");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+
+        let file_a = amp_dir.join("thread-n4-atomic.json");
+        std::fs::write(
+            &file_a,
+            r#"{"id":"thread-n4-atomic","messages":[{"role":"user","text":"a","createdAt":1700000000000}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.set_last_indexed_at(222).unwrap();
+        storage
+            .raw()
+            .execute_batch(
+                "CREATE TRIGGER n4_atomicity_guard BEFORE INSERT ON meta \
+                 WHEN NEW.key LIKE 'last_index.%' \
+                 BEGIN SELECT RAISE(FAIL, 'induced failure for N4 watch-path atomicity test'); END;",
+            )
+            .unwrap();
+
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        // The induced trigger failure surfaces as an `Err` from the
+        // ephemeral-writer closure, which `reindex_paths` propagates (this
+        // is a hard storage error, not a soft prepare/scan skip).
+        let result = reindex_paths(&opts, vec![file_a.clone()], &roots, &state, &storage, false);
+        assert!(result.is_err(), "the induced meta-write failure must surface as an error, not be swallowed");
+
+        let storage = storage.into_inner().unwrap();
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(222),
+            "last_indexed_at must roll back to its pre-call value when the same-transaction \
+             counters write fails on the watch path"
         );
     }
 
