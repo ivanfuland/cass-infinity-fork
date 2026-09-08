@@ -899,22 +899,46 @@ const ANCHOR3_OPENERS: [&str; 3] = ["# AGENTS.md instructions", "<recommended_pl
 /// "`<cwd>` must be located after the open tag AND before the close tag" --
 /// the implementation only ever did the first half. Fixed by narrowing the
 /// search window to `[open tag end, nearest following close tag)`.
+///
+/// R3-N3 (任务书 #119d, 回归): the R2-N12 fix above only ever looked at the
+/// FIRST `<environment_context>` open tag in the whole message -- if that
+/// first block didn't contain `<cwd>`, it returned `None` immediately
+/// without ever checking a LATER block. Real shape this misses: an opener
+/// that shows an empty example block before the actual environment context,
+/// e.g. `"# AGENTS.md instructions\nExample: <environment_context></environment_context>\n<environment_context><cwd>/project</cwd></environment_context>"`
+/// -- the first (example) block is empty, but the second (real) block does
+/// contain `<cwd>` and satisfies R3's structural shape. Fixed by walking
+/// ALL open-tag occurrences left to right, checking each one's own
+/// `[open tag end, nearest following close tag)` window in turn, and only
+/// returning `None` once no further open tag remains -- not on the first
+/// block's miss. `opener` recording is unchanged: it is a property of the
+/// WHOLE trimmed message (does it start with one of the 3 known constants),
+/// not of which block happened to match.
 fn anchor3_shell_opener(text: &str) -> Option<&'static str> {
     let trimmed = text.trim();
     if !trimmed.ends_with(ENVIRONMENT_CONTEXT_CLOSE) {
         return None;
     }
-    let Some(open_pos) = trimmed.find(ENVIRONMENT_CONTEXT_OPEN) else {
-        return None;
-    };
-    let after_open = &trimmed[open_pos + ENVIRONMENT_CONTEXT_OPEN.len()..];
-    let Some(close_rel) = after_open.find(ENVIRONMENT_CONTEXT_CLOSE) else {
-        return None;
-    };
-    if !after_open[..close_rel].contains("<cwd>") {
-        return None;
+    let mut search_from = 0usize;
+    loop {
+        let Some(open_rel) = trimmed[search_from..].find(ENVIRONMENT_CONTEXT_OPEN) else {
+            return None;
+        };
+        let open_pos = search_from + open_rel;
+        let after_open = &trimmed[open_pos + ENVIRONMENT_CONTEXT_OPEN.len()..];
+        let Some(close_rel) = after_open.find(ENVIRONMENT_CONTEXT_CLOSE) else {
+            // No close tag anywhere after this open -- given the function's
+            // own `ends_with(CLOSE)` precondition above and that OPEN is not
+            // a substring of CLOSE, this branch is unreachable in practice
+            // (there is always at least the message's own trailing closer
+            // after any open tag position), kept only as a defensive bail.
+            return None;
+        };
+        if after_open[..close_rel].contains("<cwd>") {
+            return Some(ANCHOR3_OPENERS.iter().find(|o| trimmed.starts_with(**o)).copied().unwrap_or(ENVIRONMENT_CONTEXT_OPEN));
+        }
+        search_from = open_pos + ENVIRONMENT_CONTEXT_OPEN.len() + close_rel + ENVIRONMENT_CONTEXT_CLOSE.len();
     }
-    Some(ANCHOR3_OPENERS.iter().find(|o| trimmed.starts_with(**o)).copied().unwrap_or(ENVIRONMENT_CONTEXT_OPEN))
 }
 
 // ============================================================================
@@ -2204,6 +2228,41 @@ mod tests {
             "cwd after the first environment_context block's own close tag must not match, even \
              though a second close tag later satisfies ends_with (R2-N12)"
         );
+    }
+
+    /// R3-N3 (任务书 #119d, 回归): the R2-N12 fix above narrowed the search to
+    /// the FIRST `<environment_context>` block only -- if a message shows an
+    /// empty example block before the real one (a shape codex's own opener
+    /// text produces: "Example: <environment_context></environment_context>"
+    /// followed by the actual `<environment_context><cwd>...`), the fix
+    /// never looked past that first empty block and returned `None`,
+    /// silently un-matching a message that satisfies R3's structural shape
+    /// exactly like `r3_a_opener_agents_md_positive` does. This must match
+    /// (and must NOT be confused with `r3_cwd_after_close_tag_of_first_
+    /// environment_context_block_negative` above, which is deliberately the
+    /// opposite verdict for a superficially similar "empty block first"
+    /// shape -- that one's `<cwd>` sits OUTSIDE any complete block, this
+    /// one's sits INSIDE its own complete second block).
+    ///
+    /// Frozen-corpus check (任务书 #119d, `W6_ARTIFACTS/n3-corpus-compare-119d.txt`):
+    /// old (pre-fix) vs new (this fix) predicate run over all 1,684 codex
+    /// idx=0 role=user messages in the read-only `copy/agent_search.db`
+    /// basis library (spec §2.1's own population) -- 1,665 hits both sides,
+    /// 0 messages differ. This corpus does not happen to contain the
+    /// "empty example block, then real block" shape this fix targets, so
+    /// the fix is a no-op on it; it is not evidence the bug was harmless,
+    /// only that this particular frozen sample doesn't exercise it (mirrors
+    /// the R3 review's own finding on the same population).
+    #[test]
+    fn r3_n3_second_environment_context_block_with_cwd_after_empty_example_block_positive() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![text_block(0)] };
+        let ctx = PairingContext::default();
+        let text = "# AGENTS.md instructions\nExample: <environment_context></environment_context>\n<environment_context><cwd>/project</cwd></environment_context>";
+        let m = msg("user", text);
+        let decision = decide(&m, 0, &event, &ctx, "codex", &paths_cfg())
+            .expect("R3-N3: a later environment_context block containing <cwd> must match even when an earlier block is empty");
+        assert_eq!(decision.reason, ExclusionReason::CodexHostShell);
+        assert_eq!(decision.anchor.shell.as_ref().unwrap().opener, "# AGENTS.md instructions");
     }
 
     #[test]

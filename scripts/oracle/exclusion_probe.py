@@ -324,22 +324,40 @@ def anchor3_shell_opener(text: str):
     # only appears afterward, in text wrapped by a second closer that
     # satisfies the outer `endswith` check). Fixed by narrowing the search
     # window to `[open tag end, nearest following close tag)`.
+    #
+    # 任务书 #119d R3-N3 (回归): the R2-N12 fix above only ever looked at the
+    # FIRST `<environment_context>` open tag -- if that first block didn't
+    # contain `<cwd>`, it returned None immediately without checking any
+    # LATER block. Real shape this misses: an opener that shows an empty
+    # example block before the actual environment context, e.g.
+    # "# AGENTS.md instructions\nExample: <environment_context></environment_context>\n<environment_context><cwd>/project</cwd></environment_context>"
+    # -- the first (example) block is empty, but the second (real) block
+    # does contain `<cwd>` and satisfies R3's structural shape. Fixed by
+    # walking ALL open-tag occurrences left to right, checking each one's
+    # own `[open tag end, nearest following close tag)` window in turn, and
+    # only returning None once no further open tag remains.
     trimmed = text.strip()
     if not trimmed.endswith(_CLOSER):
         return None
-    open_pos = trimmed.find("<environment_context>")
-    if open_pos == -1:
-        return None
-    after_open = trimmed[open_pos + len("<environment_context>"):]
-    close_rel = after_open.find(_CLOSER)
-    if close_rel == -1:
-        return None
-    if "<cwd>" not in after_open[:close_rel]:
-        return None
-    for opener in _OPENERS:
-        if trimmed.startswith(opener):
-            return opener
-    return "<environment_context>"
+    search_from = 0
+    while True:
+        open_pos = trimmed.find("<environment_context>", search_from)
+        if open_pos == -1:
+            return None
+        after_open = trimmed[open_pos + len("<environment_context>"):]
+        close_rel = after_open.find(_CLOSER)
+        if close_rel == -1:
+            # No close tag anywhere after this open -- unreachable in
+            # practice given the `endswith(_CLOSER)` precondition above and
+            # that the opener string is not a substring of the closer
+            # string; kept only as a defensive bail (mirrors the Rust side).
+            return None
+        if "<cwd>" in after_open[:close_rel]:
+            for opener in _OPENERS:
+                if trimmed.startswith(opener):
+                    return opener
+            return "<environment_context>"
+        search_from = open_pos + len("<environment_context>") + close_rel + len(_CLOSER)
 
 
 def _tool_call_display_text(name, args) -> str:
@@ -829,12 +847,27 @@ def selftest_cases(paths_cfg):
     cands = [_mk("user", text=text5)]
     cases.append(("R2-N12 cwd after close tag of first environment_context block", cands, 0, 0, "codex", None))
 
+    # 22. R3-N3 positive (任务书 #119d, 回归): a LATER environment_context
+    # block containing `<cwd>` must match even when an EARLIER block (an
+    # opener's own example text) is empty -- the R2-N12 fix above stopped
+    # checking after the first block's miss. Must not be confused with case
+    # 21 above (same "empty block first" shape, opposite verdict): there
+    # `<cwd>` sits outside any complete block; here it sits inside its own
+    # complete second block. Frozen-corpus check (W6_ARTIFACTS/
+    # n3-corpus-compare-119d.txt): old vs new predicate over all 1,684
+    # codex idx=0 role=user messages in copy/agent_search.db -- 1,665 hits
+    # both sides, 0 differ (this corpus doesn't contain the shape this test
+    # targets).
+    text6 = "# AGENTS.md instructions\nExample: <environment_context></environment_context>\n<environment_context><cwd>/project</cwd></environment_context>"
+    cands = [_mk("user", text=text6)]
+    cases.append(("R3-N3 cwd in second environment_context block after empty first block", cands, 0, 0, "codex", "codex_host_shell"))
+
     return cases
 
 
 def run_selftest(paths_cfg) -> bool:
     cases = selftest_cases(paths_cfg)
-    assert len(cases) == 21, f"selftest must have exactly 21 cases, got {len(cases)}"
+    assert len(cases) == 22, f"selftest must have exactly 22 cases, got {len(cases)}"
     passed = 0
     for name, cands, index, idx_in_session, agent_slug, expect in cases:
         pairing = PairingContext(cands)
