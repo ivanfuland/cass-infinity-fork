@@ -908,12 +908,23 @@ const ANCHOR3_OPENERS: [&str; 3] = ["# AGENTS.md instructions", "<recommended_pl
 /// e.g. `"# AGENTS.md instructions\nExample: <environment_context></environment_context>\n<environment_context><cwd>/project</cwd></environment_context>"`
 /// -- the first (example) block is empty, but the second (real) block does
 /// contain `<cwd>` and satisfies R3's structural shape. Fixed by walking
-/// ALL open-tag occurrences left to right, checking each one's own
-/// `[open tag end, nearest following close tag)` window in turn, and only
-/// returning `None` once no further open tag remains -- not on the first
-/// block's miss. `opener` recording is unchanged: it is a property of the
-/// WHOLE trimmed message (does it start with one of the 3 known constants),
-/// not of which block happened to match.
+/// open-tag occurrences left to right, checking each one's own `[open tag
+/// end, nearest following close tag)` window in turn, resuming the next
+/// search right after that nearest close tag, and only returning `None`
+/// once no further open tag remains -- not on the first block's miss.
+///
+/// R4-N4 (任务书 #120b): after a miss, the search resumes AFTER the nearest
+/// close tag, so a nested open tag that falls BETWEEN the current open and
+/// its own nearest close (e.g. `<environment_context><environment_context>
+/// </environment_context></environment_context>`) is never independently
+/// re-checked -- this does NOT walk every open-tag occurrence in the
+/// message, only the ones not already subsumed by a checked-and-missed
+/// window. This is still correct: such a nested open's own
+/// `[open, nearest close)` window is a SUBSET of the outer window just
+/// checked and confirmed not to contain `<cwd>`, so skipping it cannot miss
+/// a real `<cwd>` hit. `opener` recording is unchanged: it is a property of
+/// the WHOLE trimmed message (does it start with one of the 3 known
+/// constants), not of which block happened to match.
 fn anchor3_shell_opener(text: &str) -> Option<&'static str> {
     let trimmed = text.trim();
     if !trimmed.ends_with(ENVIRONMENT_CONTEXT_CLOSE) {

@@ -333,9 +333,22 @@ def anchor3_shell_opener(text: str):
     # "# AGENTS.md instructions\nExample: <environment_context></environment_context>\n<environment_context><cwd>/project</cwd></environment_context>"
     # -- the first (example) block is empty, but the second (real) block
     # does contain `<cwd>` and satisfies R3's structural shape. Fixed by
-    # walking ALL open-tag occurrences left to right, checking each one's
-    # own `[open tag end, nearest following close tag)` window in turn, and
-    # only returning None once no further open tag remains.
+    # walking open-tag occurrences left to right, checking each one's own
+    # `[open tag end, nearest following close tag)` window in turn, resuming
+    # the next search right after that nearest close tag, and only
+    # returning None once no further open tag remains -- not on the first
+    # block's miss.
+    #
+    # 任务书 #120b R4-N4: after a miss, the search resumes AFTER the nearest
+    # close tag, so a nested open tag that falls BETWEEN the current open
+    # and its own nearest close (e.g. "<environment_context><environment_
+    # context></environment_context></environment_context>") is never
+    # independently re-checked -- this does NOT walk every open-tag
+    # occurrence in the message, only the ones not already subsumed by a
+    # checked-and-missed window. Still correct: such a nested open's own
+    # `[open, nearest close)` window is a SUBSET of the outer window just
+    # checked and confirmed not to contain `<cwd>`, so skipping it cannot
+    # miss a real `<cwd>` hit.
     trimmed = text.strip()
     if not trimmed.endswith(_CLOSER):
         return None
