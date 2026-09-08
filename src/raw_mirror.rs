@@ -51,6 +51,28 @@ fn raw_mirror_fsync_enabled() -> bool {
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+/// R2-B5 (任务书 #119b) test observability: fires once per directory that
+/// [`force_sync_dir`] actually fsyncs -- both `sync_capture_durable`'s
+/// unconditional chain-walk and `replace_manifest_bytes`'s switch-gated one
+/// (via `force_sync_dir_chain`) funnel through `force_sync_dir`, so a single
+/// hook lets tests assert on the exact set of directories synced without
+/// `strace`. Always compiled (zero-cost when unset), same shape as
+/// `PRUNE_FAULT_HOOK` above.
+static DIR_SYNC_PROBE: OnceLock<Mutex<Option<Box<dyn Fn(&Path) + Send + Sync>>>> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_dir_sync_probe(hook: Option<Box<dyn Fn(&Path) + Send + Sync>>) {
+    *DIR_SYNC_PROBE.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
+}
+
+fn fire_dir_sync_probe(dir: &Path) {
+    if let Some(lock) = DIR_SYNC_PROBE.get()
+        && let Some(hook) = lock.lock().unwrap().as_ref()
+    {
+        hook(dir);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RawMirrorCaptureInput<'a> {
     pub data_dir: &'a Path,
@@ -1342,7 +1364,8 @@ fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u
     })?;
     set_private_file_permissions(manifest_path)?;
     sync_file(manifest_path)?;
-    sync_parent(manifest_path)?;
+    let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
+    sync_dir_chain_if_enabled(manifest_path, root, &mut synced_dirs)?;
     remove_empty_temp_dir_best_effort(&temp_dir);
     Ok(())
 }
@@ -1500,6 +1523,20 @@ pub(crate) fn sync_capture_durable(data_dir: &Path, record: &RawMirrorCaptureRec
     let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
     force_sync_dir_chain(&blob_path, &root, &mut synced_dirs)?;
     force_sync_dir_chain(&manifest_path, &root, &mut synced_dirs)?;
+
+    // R2-B5 场景一 (任务书 #119b): `force_sync_dir_chain` stops AT `root`
+    // (inclusive) -- it fsyncs `v1`'s own directory listing but never the
+    // entry FOR `v1` inside `v1`'s parent (`raw-mirror/`). A freshly-created
+    // `v1` (this raw mirror's very first capture) is therefore still not
+    // durable even after both chain-walks above succeed: `raw-mirror/`'s own
+    // directory listing was never fsynced, so `v1`'s directory entry can
+    // still be lost on crash despite everything under it being durable.
+    // Unconditional (same as the rest of this function) and cheap --
+    // `raw-mirror/`'s listing essentially never changes again after the
+    // first capture ever made against this `data_dir`.
+    if let Some(root_parent) = root.parent() {
+        force_sync_dir(root_parent)?;
+    }
     Ok(())
 }
 
@@ -1533,7 +1570,9 @@ fn force_sync_dir_chain(path: &Path, root: &Path, synced_dirs: &mut HashSet<Path
 
 #[cfg(not(windows))]
 fn force_sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror directory {}", dir.display()))
+    File::open(dir).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror directory {}", dir.display()))?;
+    fire_dir_sync_probe(dir);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1913,6 +1952,23 @@ fn sync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// R2-B5 场景二 (任务书 #119b): switch-controlled twin of
+/// [`force_sync_dir_chain`]. `sync_parent` only fsyncs `path`'s immediate
+/// parent -- fine for a file whose parent directory already existed, but
+/// `replace_manifest_bytes` can be the call that creates an intermediate
+/// directory for the first time (e.g. `manifests/`, on this mirror root's
+/// very first manifest write, via its own `ensure_private_dir_descendant`
+/// call), and a single-level sync leaves THAT directory's own entry in
+/// `root` unfsynced. Still a no-op when `CASS_RAW_MIRROR_FSYNC` is unset --
+/// Ivan's ruling is "the barrier is complete when the switch is on", not
+/// "every write gets a hard sync by default".
+fn sync_dir_chain_if_enabled(path: &Path, root: &Path, synced_dirs: &mut HashSet<PathBuf>) -> Result<()> {
+    if !raw_mirror_fsync_enabled() {
+        return Ok(());
+    }
+    force_sync_dir_chain(path, root, synced_dirs)
+}
+
 fn unique_temp_path(dir: &Path, label: &str) -> PathBuf {
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -2269,6 +2325,13 @@ pub fn rebuild_manifest_db_links(
 mod tests {
     use super::*;
 
+    /// Tests that register [`set_dir_sync_probe`] mutate process-global
+    /// state (like `HOOK_TEST_SERIALIZE` in `tests/w6_exclusion_ingest.rs`)
+    /// and must be serialized against each other, or one test's hook can
+    /// observe -- or clobber -- another's while `cargo test` runs them on
+    /// different threads of the same process.
+    static DIR_SYNC_PROBE_TEST_SERIALIZE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn capture_source_file_writes_doctor_compatible_manifest_idempotently() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -2418,6 +2481,198 @@ mod tests {
 
         sync_capture_durable(&data_dir, &record)
             .expect("sync_capture_durable must succeed across a freshly-created multi-level directory chain");
+    }
+
+    /// R2-B5 场景一 (任务书 #119b): `force_sync_dir_chain` stops AT `root`
+    /// (`raw-mirror/v1`) inclusive -- it never fsyncs `v1`'s own directory
+    /// entry inside `v1`'s parent (`raw-mirror/`). This is the durability
+    /// gap: a freshly-created `v1` can vanish from `raw-mirror/`'s listing
+    /// after a crash even though everything under `v1` is itself durable.
+    /// `sync_capture_durable` must fsync `raw-mirror/` too, unconditionally
+    /// (it is already gated on "session has an exclusion marker" by its one
+    /// caller -- the R1-B3 force barrier -- so this extra level costs
+    /// nothing extra in the common case).
+    #[test]
+    fn sync_capture_durable_fsyncs_mirror_root_parent_directory_entry() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5-scenario1.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5-1\"}\n").expect("write source");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        // `capture_source_file` (not under test here) creates `v1` and
+        // everything under it *before* the probe is armed, so only
+        // `sync_capture_durable`'s own fsyncs land in `synced`.
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = sync_capture_durable(&data_dir, &record);
+        set_dir_sync_probe(None);
+        result.expect("sync_capture_durable must succeed");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&v1_dir),
+            "sanity: v1 itself must still be fsynced (R1-B3, unchanged); synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&raw_mirror_dir),
+            "sync_capture_durable must fsync raw-mirror/ itself (v1's own directory entry in \
+             its parent), not just v1 and everything below it; synced dirs: {synced:?}"
+        );
+    }
+
+    /// R2-B5 场景二 (任务书 #119b): `replace_manifest_bytes`'s post-rename
+    /// sync used to be `sync_file` + `sync_parent`, and `sync_parent` only
+    /// fsyncs the manifest's IMMEDIATE parent (`manifests/`) -- when the
+    /// switch is on, it must now walk the full chain up to the mirror root,
+    /// because `manifests/`'s own directory entry inside `v1` may never
+    /// have been synced by any prior call (the unconditional force barrier
+    /// only fires for sessions with an exclusion marker). Exercised through
+    /// `merge_manifest_db_links` -- the real production call site
+    /// (`record_persisted_raw_mirror_db_link` in `indexer/mod.rs`) -- not
+    /// `replace_manifest_bytes` directly (private).
+    #[test]
+    fn merge_manifest_db_links_walks_full_directory_chain_when_fsync_enabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5-scenario2.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5-2\"}\n").expect("write source");
+
+        // Switch off for the initial capture: this test is only about what
+        // `replace_manifest_bytes` (via `merge_manifest_db_links`) does, not
+        // `publish_manifest_bytes_create_new`'s own (separate, out of this
+        // mission's scope) gap.
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        // SAFETY: tests that touch `CASS_RAW_MIRROR_FSYNC` are serialized
+        // via `DIR_SYNC_PROBE_TEST_SERIALIZE`, same pattern as `ENV_LOCK`
+        // elsewhere in this crate (`indexer/semantic_progress.rs`).
+        unsafe {
+            std::env::set_var("CASS_RAW_MIRROR_FSYNC", "1");
+        }
+        let link = RawMirrorDbLink {
+            conversation_id: Some(7),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let result = merge_manifest_db_links(&data_dir, &record.manifest_relative_path, std::slice::from_ref(&link));
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        set_dir_sync_probe(None);
+        result.expect("merge_manifest_db_links must succeed with the switch on");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let manifests_dir = v1_dir.join("manifests");
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&manifests_dir),
+            "sanity: manifests/ itself must still be fsynced (pre-existing sync_parent \
+             behavior); synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&v1_dir),
+            "replace_manifest_bytes must walk the full chain up to v1 when the switch is on, \
+             not just fsync manifests/ one level; synced dirs: {synced:?}"
+        );
+    }
+
+    /// Negative half of the case above: with the switch off (default),
+    /// `merge_manifest_db_links` must not fsync anything at all -- Ivan's
+    /// ruling is "the barrier is complete when the switch is on", not
+    /// "every write gets a hard sync by default" (不改 `CASS_RAW_MIRROR_FSYNC`
+    /// 默认值).
+    #[test]
+    fn merge_manifest_db_links_does_not_sync_when_fsync_disabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5-scenario2-off.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5-2-off\"}\n").expect("write source");
+
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture");
+
+        // SAFETY: see above -- serialized via DIR_SYNC_PROBE_TEST_SERIALIZE.
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let link = RawMirrorDbLink {
+            conversation_id: Some(8),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let result = merge_manifest_db_links(&data_dir, &record.manifest_relative_path, std::slice::from_ref(&link));
+        set_dir_sync_probe(None);
+        result.expect("merge_manifest_db_links must succeed with the switch off");
+
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.is_empty(),
+            "default (switch off) must not fsync anything on manifest db-link merge; \
+             synced dirs: {synced:?}"
+        );
     }
 
     #[test]
