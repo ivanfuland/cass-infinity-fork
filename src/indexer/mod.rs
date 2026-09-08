@@ -5979,6 +5979,12 @@ fn persist_final_index_run_metadata(
                     false,
                     "updating final index run metadata",
                     |writer| {
+                        // R1-N17 (任务书 #118b): `last_scan_ts`/`last_indexed_at`/the
+                        // three `last_index.*` counters must land in one commit --
+                        // three independent autocommitted statements let a crash
+                        // between them leave `last_indexed_at` advanced while the
+                        // counters (or vice versa) still reflect the previous run.
+                        let tx = writer.raw().transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
                         if performed_scan {
                             writer.set_last_scan_ts(scan_start_ts)?;
                         }
@@ -5986,6 +5992,7 @@ fn persist_final_index_run_metadata(
                         if write_last_index_run_counters {
                             persist_last_index_run_meta_counters(writer)?;
                         }
+                        tx.commit()?;
                         Ok(())
                     },
                 )
@@ -15464,28 +15471,25 @@ fn judge_and_redact_reparsed(
     conv: &mut NormalizedConversation,
     events: &[crate::indexer::exclusion::RawEvent],
     blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
 ) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
     use crate::indexer::exclusion::{PairingContext, apply, apply_sibling, decide, field_map_for};
 
     let candidates = build_pairing_candidates(conv);
     let pairing_ctx = PairingContext::build(&candidates);
-    let paths_cfg = crate::sources::config::ExcludedContextPaths::load().unwrap_or_default();
     let field_map = field_map_for(&conv.agent_slug);
     let mut redactor = crate::indexer::redact_secrets::MemoizingRedactor::new();
 
     let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
     let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
     for idx in 0..conv.messages.len() {
-        // meta 三键之二（mission #116⑥）：候选总数与命中数在这里计，不进
-        // `exclusion::decide` —— 计数只消费它已经产出的 `Decision`，不改它的
-        // 判定语义。候选口径与 R3 锚点定义一致（`conv.agent_slug=="codex" &&
-        // idx==0 && role=="user"`），与 `events.get(idx)`/对齐自检是否成立无关
-        // （分母不应因为对齐失败而缩水）。
-        if conv.agent_slug == "codex" && idx == 0 && conv.messages[idx].role == "user" {
-            record_codex_idx0_user_candidate();
-        }
+        // R1-N16 (任务书 #118b): the codex idx0-user candidate count used
+        // to be taken here, but this loop never runs at all when alignment
+        // fails (`judge_reparsed_conversation` short-circuits before
+        // calling this function) -- moved to `judge_reparsed_conversation`
+        // itself so the denominator doesn't shrink on alignment failure.
         let Some(event) = events.get(idx) else { continue };
-        let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, &paths_cfg);
+        let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, paths_cfg);
         let Some(decision) = decision else { continue };
         if matches!(decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
             record_codex_host_shell_hit();
@@ -15535,7 +15539,26 @@ pub(crate) fn judge_reparsed_conversation(
     conv: &mut NormalizedConversation,
     events: &[crate::indexer::exclusion::RawEvent],
     blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
 ) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
+    // R1-N16 (任务书 #118b): meta 三键之二（mission #116⑥）候选总数在这里
+    // 计，与 `events`/`conv.messages` 是否对齐无关（分母不应因为对齐失败而
+    // 缩水）——候选口径与 R3 锚点定义一致（`agent_slug=="codex" && idx==0 &&
+    // role=="user"`），只有 idx 0 能匹配，故直接判第一条消息而不整段循环。
+    if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
+        record_codex_idx0_user_candidate();
+    }
+    // R1-N16 (任务书 #118b): connectors with no exclusion-judgment support
+    // at all (`events_from_blob` returns `Vec::new()` for anything but
+    // claude_code/codex) always have `events.len() == 0`; comparing that
+    // against a non-empty `conv.messages.len()` below would count every
+    // such session as an alignment *failure*, which is a narrower, real
+    // thing this counter tracks (a claude_code/codex session whose events
+    // genuinely don't line up with its messages) -- not "this connector
+    // doesn't have structural facts to align in the first place".
+    if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
+        return vec![None; conv.messages.len()];
+    }
     // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
     // disclosed positional approximation (see events_from_blob's own doc
     // comment) -- when the flat event count doesn't even match the
@@ -15544,7 +15567,7 @@ pub(crate) fn judge_reparsed_conversation(
     // exclusion rather than a wrong one) instead of silently judging
     // against misaligned events.
     if events.len() == conv.messages.len() {
-        judge_and_redact_reparsed(conv, events, blob_relative_path)
+        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg)
     } else {
         record_event_align_failed();
         vec![None; conv.messages.len()]
@@ -15630,6 +15653,16 @@ fn prepare_conversation_for_ingest(
 
     let original_source_path = conv.source_path.clone();
     let original_external_id = conv.external_id.clone();
+    // R1-N5 (任务书 #118b): captured alongside `original_source_path`/
+    // `original_external_id` for the same reason -- once `conv = reparsed`
+    // (below) replaces `conv` wholesale, the first parse's own values are
+    // gone. `workspace` must be the first parse's value, not re-derived
+    // from whatever the connector infers scanning the scratch copy (the
+    // scratch tree's ancestor shape is a *reconstruction*, not guaranteed
+    // identical to the original scan root a real deployment's connector
+    // saw workspace from).
+    let original_agent_slug = conv.agent_slug.clone();
+    let original_workspace = conv.workspace.clone();
 
     let record = match source_kind {
         CaptureSourceKind::Logical => {
@@ -15660,25 +15693,57 @@ fn prepare_conversation_for_ingest(
         let reparsed_conversations =
             connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
         let mut reparsed = if reparsed_conversations.len() == 1 {
-            reparsed_conversations.into_iter().next().expect("len checked above")
+            let candidate = reparsed_conversations.into_iter().next().expect("len checked above");
+            // R1-N5 (任务书 #118b): the single-session branch used to accept
+            // whatever `connector.scan()` produced unconditionally -- if the
+            // source file had been replaced with a *different* session's
+            // content between the first scan and this capture/reparse, the
+            // mismatch went undetected and `raw.event_key`/`raw.blocks`
+            // would end up describing the wrong conversation entirely. Same
+            // identity check the multi-session branch below already does.
+            if candidate.agent_slug != original_agent_slug || candidate.external_id != original_external_id {
+                return Err(PrepareError(format!(
+                    "reparse identity mismatch for {}: first parse was agent={original_agent_slug:?} external_id={original_external_id:?}, reparse produced agent={:?} external_id={:?}",
+                    original_source_path.display(),
+                    candidate.agent_slug,
+                    candidate.external_id
+                )));
+            }
+            candidate
         } else {
             reparsed_conversations
                 .into_iter()
-                .find(|c| c.external_id == original_external_id)
-                .ok_or_else(|| PrepareError("reparse produced no session matching the first parse's external_id".to_string()))?
+                .find(|c| c.agent_slug == original_agent_slug && c.external_id == original_external_id)
+                .ok_or_else(|| PrepareError("reparse produced no session matching the first parse's agent/external_id".to_string()))?
         };
 
         // Provenance from the first parse, not re-derived from the scratch
         // path (Global Constraints/plan Task 2 Interfaces).
         reparsed.source_path = original_source_path.clone();
+        // R1-N5 (任务书 #118b): same rationale -- `workspace` is the first
+        // parse's value, not whatever the connector derived scanning the
+        // scratch copy; `apply_workspace_rewrite` below must run against
+        // this value, not the reparsed one, so this assignment has to land
+        // before that call.
+        reparsed.workspace = original_workspace.clone();
         inject_provenance(&mut reparsed, origin);
         canonicalize_claude_external_id(connector_name, &mut reparsed);
         if let Some(root) = workspace_rewrite_root {
             apply_workspace_rewrite(&mut reparsed, root);
         }
 
+        // R1-N8 (任务书 #118b): `.unwrap_or_default()` used to swallow a
+        // load failure (syntax error, unreadable file) and silently fall
+        // back to the built-in default rule set -- exactly backwards for a
+        // user who edited the config to *narrow* what gets excluded. `?`
+        // here propagates to this function's own `Result`, so a broken
+        // config fails the whole ingest of this session (not a silent
+        // widening of what leaves the mirror).
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
+            PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
+        })?;
         let events = crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
-        let markers = judge_reparsed_conversation(&mut reparsed, &events, &record.blob_relative_path);
+        let markers = judge_reparsed_conversation(&mut reparsed, &events, &record.blob_relative_path, &paths_cfg);
 
         conv = reparsed;
         excluded = markers;
@@ -15750,8 +15815,15 @@ pub(crate) fn prepare_conversation_for_restore(
     let excluded = if consumed_manifest.manifest_relative_path.is_empty() {
         vec![None; conv.messages.len()]
     } else {
+        // 任务书 #118b N8 scope is the ingest path (`prepare_conversation_
+        // for_ingest`, which can propagate `Result`); this fn has no
+        // `Result` in its signature (doc comment above: no fallible
+        // `connector.scan` step here) and its callers in phase3_restore.rs
+        // are out of this mission's authorized file set, so restore keeps
+        // its pre-existing `unwrap_or_default()` behavior unchanged.
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::load().unwrap_or_default();
         let events = crate::indexer::exclusion::events_from_blob(&conv.agent_slug, materialized);
-        judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path)
+        judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path, &paths_cfg)
     };
 
     compact_large_connector_extras_for_size(connector_name, &mut conv, Some(sealed_source_size_bytes));
@@ -33405,7 +33477,13 @@ mod tests {
         .to_string();
         std::fs::write(&source_path, line + "\n").expect("write codex fixture");
 
-        let mut conv = norm_conv(Some("n4-fixture"), vec![norm_msg(0, 10)]);
+        // R1-N5 (任务书 #118b): the first parse's `external_id` must match
+        // what the real codex connector derives when it rescans this same
+        // fixture's ancestor path (`sessions_dir`-relative, extension
+        // stripped) -- otherwise the new reparse-identity check added for
+        // N5 rejects this fixture as a mismatch before N4's own assertion
+        // ever runs.
+        let mut conv = norm_conv(Some("2026/09/rollout-w118a-n4"), vec![norm_msg(0, 10)]);
         conv.agent_slug = "codex".to_string();
         conv.source_path = source_path.clone();
 
@@ -33418,6 +33496,152 @@ mod tests {
             prepared.conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes").is_some(),
             "raw_mirror metadata must survive the `conv = reparsed` reassignment: {:?}",
             prepared.conv.metadata
+        );
+    }
+
+    /// R1-N5 (任务书 #118b) mutation/negative: if the source file were
+    /// replaced with an unrelated session's content between the first scan
+    /// and this capture/reparse, the single-session branch used to accept
+    /// whatever `connector.scan()` produced on the scratch copy
+    /// unconditionally -- `raw.event_key`/`raw.blocks` on any marker
+    /// produced from it would then describe a completely different
+    /// conversation. The first parse's own `external_id` ("totally-
+    /// different-session") deliberately does NOT match what the real codex
+    /// connector derives from this fixture's ancestor path
+    /// ("2026/09/rollout-w118b-n5"), simulating exactly that mismatch.
+    #[test]
+    fn prepare_conversation_for_ingest_rejects_reparse_identity_mismatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118b-n5.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("totally-different-session"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let err = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect_err("a first-parse identity that the reparse doesn't reproduce must be rejected, not silently accepted");
+        assert!(
+            err.0.contains("reparse identity mismatch"),
+            "error must name the mismatch, got: {}",
+            err.0
+        );
+    }
+
+    /// R1-N5 (任务书 #118b) positive: the first parse's `workspace` must
+    /// survive `conv = reparsed`, not be silently re-derived from whatever
+    /// the connector infers scanning the scratch copy. This fixture's raw
+    /// codex event has no `cwd`/`environment_context` at all, so a real
+    /// reparse derives no workspace of its own -- if the first-parse value
+    /// weren't explicitly preserved, it would come out `None` here instead
+    /// of the original `/original/first-parse/workspace`.
+    #[test]
+    fn prepare_conversation_for_ingest_preserves_first_parse_workspace_after_reparse() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118b-n5-workspace.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w118b-n5-workspace"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        conv.workspace = Some(PathBuf::from("/original/first-parse/workspace"));
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert_eq!(
+            prepared.conv.workspace,
+            Some(PathBuf::from("/original/first-parse/workspace")),
+            "first parse's workspace must survive reparse, not be re-derived from the scratch scan"
+        );
+    }
+
+    /// R1-N8 (任务书 #118b): a broken `excluded_context_paths.toml` must
+    /// fail the whole ingest of the session loudly, not be swallowed and
+    /// silently replaced by the built-in default (wider) rule set.
+    /// Control-plane 裁定 2026-09-07 (N8 待裁项): exit-code plumbing is out
+    /// of this mission's mod.rs-only scope (no `CliError` downcast
+    /// mechanism exists anywhere in this crate -- `grep -rn
+    /// "downcast_ref::<CliError>" src/` is empty, and `run_index`'s own
+    /// callers in lib.rs don't preserve a specific numeric code either), so
+    /// this only asserts `prepare_conversation_for_ingest` returns `Err`
+    /// naming the failure, not a process exit code.
+    ///
+    /// `#[serial]`: mutates the process-wide `XDG_CONFIG_HOME` env var,
+    /// which `ExcludedContextPaths::load()` (and `SourcesConfig::load()`)
+    /// read from any thread; serializes against every other `#[serial]`
+    /// test in this crate the same way `reindex_paths_zeroes_codex_host_
+    /// shell_hits_between_watch_cycles` above already does for its own
+    /// global-state mutation.
+    #[test]
+    #[serial]
+    fn prepare_conversation_for_ingest_fails_loud_on_broken_excluded_context_paths_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let xdg_config_home = temp.path().join("xdg-config");
+        let config_dir = xdg_config_home.join("cass");
+        std::fs::create_dir_all(&config_dir).expect("mkdir xdg config dir");
+        std::fs::write(config_dir.join("excluded_context_paths.toml"), "memory_files = [this is not valid toml")
+            .expect("write broken config");
+
+        let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        }
+
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118b-n8.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w118b-n8"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv);
+
+        unsafe {
+            match &prior_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let err = result.expect_err("a broken excluded_context_paths.toml must fail the whole ingest, not silently fall back to defaults");
+        assert!(
+            err.0.contains("excluded_context_paths.toml") && err.0.contains("加载失败"),
+            "error must name the config file and that loading it failed, got: {}",
+            err.0
         );
     }
 
@@ -33451,7 +33675,8 @@ mod tests {
             event_key: "ek1".to_string(),
             blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
         }];
-        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2.raw");
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2.raw", &paths_cfg);
 
         assert!(markers[0].is_some(), "the host-shell row must be excluded (anchor 3)");
         assert_eq!(conv.title, Some(String::new()), "title matching the excluded row's redacted content must be cleared");
@@ -33484,7 +33709,8 @@ mod tests {
             event_key: "ek1".to_string(),
             blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
         }];
-        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2neg.raw");
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2neg.raw", &paths_cfg);
 
         assert!(markers[0].is_some(), "the host-shell row must still be excluded");
         assert_eq!(
@@ -33492,6 +33718,53 @@ mod tests {
             Some("Fix the flaky retry test".to_string()),
             "an unrelated title must not be cleared just because SOME row in the session was excluded"
         );
+    }
+
+    /// R1-N16 (任务书 #118b) positive: the codex idx0-user candidate
+    /// denominator must count a session even when its events end up
+    /// misaligned with its messages -- pre-fix, the count only happened
+    /// inside `judge_and_redact_reparsed`'s loop, which
+    /// `judge_reparsed_conversation` never enters at all once alignment
+    /// fails, so a misaligned codex session with a real idx0 user message
+    /// silently vanished from its own denominator.
+    #[test]
+    #[serial]
+    fn judge_reparsed_conversation_counts_codex_idx0_candidate_even_when_alignment_fails() {
+        reset_last_index_run_counters();
+        let mut conv = norm_conv(Some("n16-misaligned-codex"), vec![norm_msg(0, 10), norm_msg(1, 20)]);
+        conv.agent_slug = "codex".to_string();
+        // One event for two messages: `events.len() != conv.messages.len()`,
+        // a genuine claude_code/codex alignment failure.
+        let events = vec![crate::indexer::exclusion::RawEvent { event_key: "ek1".to_string(), blocks: Vec::new() }];
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n16.raw", &paths_cfg);
+
+        assert!(markers.iter().all(Option::is_none), "misaligned session must judge nothing (宁漏勿误)");
+        let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(codex_idx0_user_total, 1, "denominator must count this session's idx0 user message even though alignment failed");
+        assert_eq!(event_align_failed, 1, "a real claude_code/codex misalignment must still be counted as one");
+    }
+
+    /// R1-N16 (任务书 #118b) mutation/negative: a connector with no
+    /// exclusion-judgment support at all (`events_from_blob` always returns
+    /// `Vec::new()` for it) must NOT be counted as an alignment failure just
+    /// because its empty event list doesn't match its non-empty message
+    /// count -- that mismatch is the connector's normal "not applicable"
+    /// shape, not a real claude_code/codex positional-alignment defect.
+    #[test]
+    #[serial]
+    fn judge_reparsed_conversation_does_not_count_event_align_failed_for_connectors_without_structural_facts() {
+        reset_last_index_run_counters();
+        let mut conv = norm_conv(Some("n16-opencode-session"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "opencode".to_string();
+        let events: Vec<crate::indexer::exclusion::RawEvent> = Vec::new();
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n16b.raw", &paths_cfg);
+
+        assert!(markers.iter().all(Option::is_none));
+        let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(event_align_failed, 0, "a connector with no exclusion-judgment support must not count as an alignment failure");
+        assert_eq!(codex_idx0_user_total, 0, "non-codex sessions must not bump the codex-specific denominator");
     }
 
     #[test]
@@ -34740,8 +35013,47 @@ mod tests {
         );
     }
 
+    /// R1-N17 (任务书 #118b) mutation/negative: `last_scan_ts`/
+    /// `last_indexed_at` and the three `last_index.*` run counters must
+    /// land in ONE commit. A trigger that rejects any `meta` row whose key
+    /// starts with `last_index.` forces `persist_last_index_run_meta_
+    /// counters`'s INSERT to fail while leaving `set_last_scan_ts`/
+    /// `set_last_indexed_at`'s own keys (`last_scan_ts`/`last_indexed_at`,
+    /// which don't match that prefix) untouched by the trigger itself --
+    /// pre-fix (three independent autocommitted statements), those two
+    /// writes would already be durably committed by the time the third
+    /// statement fails, so `last_indexed_at` would advance to the new run's
+    /// value despite the write overall failing. Fixed (one `BEGIN
+    /// IMMEDIATE` transaction), the failing third statement rolls the
+    /// whole transaction back via `Tx`'s `Drop`, so neither earlier write
+    /// survives either. `persist_final_index_run_metadata` itself always
+    /// swallows the writer's `Err` into `Ok(())` regardless (Bead zz8ni,
+    /// unrelated to N17), so this asserts the actual DB state, not the
+    /// call's own return value.
+    #[test]
+    fn persist_final_index_run_metadata_rolls_back_last_scan_ts_and_last_indexed_at_when_counters_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.set_last_indexed_at(111).unwrap();
+        storage
+            .raw()
+            .execute_batch(
+                "CREATE TRIGGER n17_atomicity_guard BEFORE INSERT ON meta \
+                 WHEN NEW.key LIKE 'last_index.%' \
+                 BEGIN SELECT RAISE(FAIL, 'induced failure for N17 atomicity test'); END;",
+            )
+            .unwrap();
 
+        let result = persist_final_index_run_metadata(&storage, &db_path, true, 999, 456, true);
 
+        assert!(result.is_ok(), "the outer function always swallows writer errors into Ok (Bead zz8ni), unrelated to N17");
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(111),
+            "last_indexed_at must roll back to its pre-call value when the same-transaction counters write fails"
+        );
+    }
 
     #[test]
     fn lexical_rebuild_commit_intervals_keep_initial_slice_bounded_before_first_commit() {

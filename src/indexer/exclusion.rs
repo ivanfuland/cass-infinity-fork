@@ -235,6 +235,16 @@ pub(crate) fn events_from_blob(agent_slug: &str, blob_path: &Path) -> Vec<RawEve
     }
 }
 
+/// R1-N16 (任务书 #118b): whether `events_from_blob` has any judgment logic
+/// at all for this connector. A connector outside this set always gets
+/// `Vec::new()` back from `events_from_blob` regardless of its actual
+/// message count -- that is expected "not applicable" behavior (R7: 锚点 1/2
+/// 只对有 `tool_name`/结构字段的连接器启用), not the alignment *failure* the
+/// caller's `event_align_failed` counter is meant to track.
+pub(crate) fn structural_facts_available(agent_slug: &str) -> bool {
+    matches!(agent_slug, "claude_code" | "codex")
+}
+
 /// R1-N15 (任务书 #118b): pairs each surviving non-blank line with its
 /// 1-based PHYSICAL line number in the original file. Pre-fix, callers
 /// `enumerate()`d the already-filtered `Vec<String>`, so `line:N` (the
