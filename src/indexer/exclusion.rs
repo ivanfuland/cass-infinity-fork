@@ -1198,7 +1198,20 @@ pub(crate) fn apply(
     field_map: ExtraFieldMap,
 ) -> ExcludedMarker {
     let original = std::mem::take(&mut msg.content);
-    let redacted = redactor.redact_text(&original);
+    // R1-N25 (任务书 #118b): must agree with the ordinary (non-excluded)
+    // mapping layer's own `redaction_enabled()` gate (`indexer/mod.rs`'s
+    // `should_redact` check) -- `apply` used to call `redact_text`
+    // unconditionally, so with `CASS_REDACT_SECRETS=0` the marker's
+    // sha256/fingerprint_blake3 still corresponded to the REDACTED string
+    // while every unexcluded row's content/dedup fingerprint corresponded
+    // to the ORIGINAL string, breaking both the "sha256 = what should have
+    // been written to content" audit contract and cross-row dedup identity
+    // for that config.
+    let redacted = if crate::indexer::redact_secrets::redaction_enabled() {
+        redactor.redact_text(&original)
+    } else {
+        original.clone()
+    };
 
     let (src, parse_error) = if decision.reason == ExclusionReason::CassRecall {
         match parse_recall_hits(&original) {
@@ -1244,6 +1257,7 @@ pub(crate) fn apply_sibling(msg: &mut NormalizedMessage, marker: &ExcludedMarker
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn paths_cfg() -> ExcludedContextPaths {
         ExcludedContextPaths::default()
@@ -2104,6 +2118,36 @@ mod tests {
         assert_eq!(marker.raw.blob, "blobs/blake3/ab/abcd.raw");
         assert_eq!(marker.raw.idx, 3);
         assert_eq!(marker.raw.event_key, "ek1");
+    }
+
+    /// R1-N25 (任务书 #118b): `apply` used to call `redact_text`
+    /// unconditionally regardless of `CASS_REDACT_SECRETS`, while the
+    /// ordinary (non-excluded) mapping layer gates its own redaction on
+    /// `redaction_enabled()` -- with the env var disabled, marker.sha256
+    /// still corresponded to the redacted string instead of "what should
+    /// have been written to content" (the original, un-redacted string),
+    /// breaking the audit/dedup identity contract for that config. Uses the
+    /// same synthetic-secret fixture as the sibling positive test above
+    /// (`AKIAABCDEFGHIJKLMNOP`, a real AWS-access-key-shaped pattern the
+    /// redactor detects) so the two configs are actually distinguishable --
+    /// a fixture with no detectable secret would hash identically either
+    /// way and prove nothing.
+    #[test]
+    #[serial]
+    fn apply_hashes_original_string_when_redaction_disabled() {
+        unsafe { std::env::set_var("CASS_REDACT_SECRETS", "0") };
+        let mut m = msg("tool_result", "here is my AKIAABCDEFGHIJKLMNOP secret and the rest of the hit");
+        let decision = decision_cass_recall(vec![]);
+        let mut redactor = MemoizingRedactor::new();
+        let marker = apply(&mut m, &decision, &mut redactor, "blobs/blake3/ab/abcd.raw", 3, &[]);
+        unsafe { std::env::remove_var("CASS_REDACT_SECRETS") };
+
+        assert_eq!(m.content, "", "content must still be cleared regardless of redaction config");
+        assert_eq!(
+            marker.sha256,
+            sha256_hex("here is my AKIAABCDEFGHIJKLMNOP secret and the rest of the hit"),
+            "with redaction disabled, sha must be over the ORIGINAL string (what would have been written to content), not a redacted one"
+        );
     }
 
     #[test]

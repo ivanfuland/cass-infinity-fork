@@ -356,42 +356,41 @@ struct ExclusionRow {
     raw_blocks_json: Option<String>,
 }
 
+/// R1-N24 (任务书 #118b): reads via `coding_agent_search::storage::api::Conn`
+/// instead of a bare `rusqlite::Connection::open` -- the repo constraint
+/// (EXEC/plan) is "new code must not use rusqlite directly"; this is a pure
+/// API swap, the SQL text is unchanged.
 fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
-    let conn = rusqlite::Connection::open(db_path).expect("open candidate db");
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.external_id, c.source_path, m.idx, \
-                    (m.excluded IS NOT NULL), json_extract(m.excluded, '$.sha256'), \
-                    m.extra_json, m.extra_bin, c.title, \
-                    (SELECT json_group_array(snippet_text ORDER BY id) FROM snippets WHERE message_id = m.id), \
-                    json_extract(m.excluded, '$.raw.blob'), json_extract(m.excluded, '$.raw.idx'), \
-                    json_extract(m.excluded, '$.raw.event_key'), json_extract(m.excluded, '$.raw.blocks') \
-             FROM messages m JOIN conversations c ON c.id = m.conversation_id \
-             ORDER BY c.external_id, c.source_path, m.idx",
-        )
-        .expect("prepare exclusion-rows query");
-    let rows = stmt
-        .query_map([], |row| {
+    let conn = coding_agent_search::storage::api::Conn::open_read(db_path).expect("open candidate db");
+    conn.query_all_map(
+        "SELECT c.external_id, c.source_path, m.idx, \
+                (m.excluded IS NOT NULL), json_extract(m.excluded, '$.sha256'), \
+                m.extra_json, m.extra_bin, c.title, \
+                (SELECT json_group_array(snippet_text ORDER BY id) FROM snippets WHERE message_id = m.id), \
+                json_extract(m.excluded, '$.raw.blob'), json_extract(m.excluded, '$.raw.idx'), \
+                json_extract(m.excluded, '$.raw.event_key'), json_extract(m.excluded, '$.raw.blocks') \
+         FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+         ORDER BY c.external_id, c.source_path, m.idx",
+        &[],
+        |row| {
             Ok(ExclusionRow {
-                external_id: row.get(0)?,
-                source_path: row.get(1)?,
-                idx: row.get(2)?,
-                excluded_is_some: row.get(3)?,
-                excluded_sha256: row.get(4)?,
-                extra_json: row.get(5)?,
-                extra_bin: row.get(6)?,
-                title: row.get(7)?,
-                snippet_texts_json: row.get::<_, Option<String>>(8)?.unwrap_or_else(|| "[]".to_string()),
-                raw_blob: row.get(9)?,
-                raw_idx: row.get(10)?,
-                raw_event_key: row.get(11)?,
-                raw_blocks_json: row.get(12)?,
+                external_id: row.get_typed(0)?,
+                source_path: row.get_typed(1)?,
+                idx: row.get_typed(2)?,
+                excluded_is_some: row.get_typed(3)?,
+                excluded_sha256: row.get_typed(4)?,
+                extra_json: row.get_typed(5)?,
+                extra_bin: row.get_typed(6)?,
+                title: row.get_typed(7)?,
+                snippet_texts_json: row.get_typed::<Option<String>>(8)?.unwrap_or_else(|| "[]".to_string()),
+                raw_blob: row.get_typed(9)?,
+                raw_idx: row.get_typed(10)?,
+                raw_event_key: row.get_typed(11)?,
+                raw_blocks_json: row.get_typed(12)?,
             })
-        })
-        .expect("query exclusion rows")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect exclusion rows");
-    rows
+        },
+    )
+    .expect("query exclusion rows")
 }
 
 /// A.4: the same fixture ingested via streaming (default), batch
@@ -539,35 +538,35 @@ fn write_codex_host_shell_session(dir: &std::path::Path) -> (std::path::PathBuf,
 /// `(idx, role, content, excluded_is_some, reason, sha256, raw_blob,
 /// raw_event_key, raw_blocks_json)` rows, ordered by `idx`, from the first
 /// (only) conversation in `db_path`.
+/// R1-N24 (任务书 #118b): reads via `coding_agent_search::storage::api::Conn`
+/// instead of a bare `rusqlite::Connection::open` (pure API swap, SQL text
+/// unchanged).
 fn read_message_rows_single_conversation(
     db_path: &std::path::Path,
 ) -> Vec<(i64, String, String, bool, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> {
-    let conn = rusqlite::Connection::open(db_path).expect("open candidate db");
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.idx, m.role, m.content, (m.excluded IS NOT NULL), \
-                    json_extract(m.excluded,'$.reason'), json_extract(m.excluded,'$.sha256'), \
-                    json_extract(m.excluded,'$.raw.blob'), json_extract(m.excluded,'$.raw.event_key'), \
-                    json_extract(m.excluded,'$.raw.blocks') \
-             FROM messages m ORDER BY m.idx",
-        )
-        .expect("prepare message-rows query");
-    stmt.query_map([], |r| {
-        Ok((
-            r.get(0)?,
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-            r.get(5)?,
-            r.get(6)?,
-            r.get(7)?,
-            r.get(8)?,
-        ))
-    })
+    let conn = coding_agent_search::storage::api::Conn::open_read(db_path).expect("open candidate db");
+    conn.query_all_map(
+        "SELECT m.idx, m.role, m.content, (m.excluded IS NOT NULL), \
+                json_extract(m.excluded,'$.reason'), json_extract(m.excluded,'$.sha256'), \
+                json_extract(m.excluded,'$.raw.blob'), json_extract(m.excluded,'$.raw.event_key'), \
+                json_extract(m.excluded,'$.raw.blocks') \
+         FROM messages m ORDER BY m.idx",
+        &[],
+        |r| {
+            Ok((
+                r.get_typed(0)?,
+                r.get_typed(1)?,
+                r.get_typed(2)?,
+                r.get_typed(3)?,
+                r.get_typed(4)?,
+                r.get_typed(5)?,
+                r.get_typed(6)?,
+                r.get_typed(7)?,
+                r.get_typed(8)?,
+            ))
+        },
+    )
     .expect("query message rows")
-    .collect::<Result<Vec<_>, _>>()
-    .expect("collect message rows")
 }
 
 /// Judge case B.10 #1 (codex half): the CLI subprocess ingests the codex
@@ -658,12 +657,15 @@ fn run_index_in_process(
     coding_agent_search::indexer::run_index(opts, None)
 }
 
+/// R1-N24 (任务书 #118b): reads via `coding_agent_search::storage::api::Conn`
+/// instead of a bare `rusqlite::Connection::open` (pure API swap, SQL text
+/// unchanged).
 fn message_row_count(db_path: &std::path::Path) -> i64 {
     if !db_path.exists() {
         return 0;
     }
-    let conn = rusqlite::Connection::open(db_path).expect("open db for row count");
-    conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0)).unwrap_or(0)
+    let conn = coding_agent_search::storage::api::Conn::open_read(db_path).expect("open db for row count");
+    conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0)).unwrap_or(0)
 }
 
 /// Judge case B.10 #4, capture-failure ①: `PrepareStage::BeforeCapture`
