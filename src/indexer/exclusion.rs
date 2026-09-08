@@ -421,6 +421,19 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
         let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
 
         let text_nonempty = |key: &str| payload.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+        // R2-B3 (任务书 #119a): mirrors pin `utils.rs:416`'s
+        // `extract_content_part` FIRST branch (`item.as_str()`) -- a
+        // `payload.content`/`payload.output` array element may itself be a
+        // bare JSON string, not only `{"type":"text","text":...}`; the
+        // pre-fix version only ever read `.get("text")`, so an array like
+        // `["hello"]` counted as empty and a real, non-empty `message`/
+        // `agent_message` event got dropped instead of counted (miscounting
+        // in the OTHER direction from R1-B2/N1's array-of-empty-text case
+        // below -- both are "does this array actually carry visible text").
+        let block_text_nonempty = |block: &serde_json::Value| {
+            block.as_str().is_some_and(|s| !s.trim().is_empty())
+                || block.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty())
+        };
         // R1-B2/N1 (任务书 #118a): mirrors the real connector's
         // `flatten_content` (pin `codex.rs:773`), which accepts a bare
         // non-empty STRING `payload.content`/`payload.output` (not just an
@@ -429,9 +442,7 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
         // only empty-text blocks produces zero real messages, not one.
         let content_nonempty = || match payload.get("content").or_else(|| payload.get("output")) {
             Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
-            Some(serde_json::Value::Array(arr)) => {
-                arr.iter().any(|block| block.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty()))
-            }
+            Some(serde_json::Value::Array(arr)) => arr.iter().any(block_text_nonempty),
             _ => false,
         };
 
@@ -449,9 +460,26 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
                     }
                     Some("agent_message") => content_nonempty()
                         .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
-                    Some("reasoning") => (payload.get("summary").and_then(|v| v.as_array()).is_some_and(|arr| !arr.is_empty())
-                        || payload.get("encrypted_content").is_some())
-                    .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                    Some("reasoning") => {
+                        // R2-B3 (任务书 #119a): mirrors pin `codex.rs:849-853`
+                        // (`reasoning_summary_text` + the keep/drop check
+                        // right after it) -- the real connector judges
+                        // emptiness on the EXTRACTED text (join every
+                        // non-empty `summary[].text` with `\n`), not on
+                        // whether the `summary` array itself is non-empty.
+                        // `summary:[{"type":"summary_text","text":""}]` is a
+                        // non-empty ARRAY whose extracted text is empty; the
+                        // pre-fix version kept it (miscounting an event pin
+                        // would drop), which is the exact "counts equal but
+                        // wrong events" shape R2-B3's alignment-gate report
+                        // describes.
+                        let summary_text_nonempty = payload
+                            .get("summary")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|items| items.iter().any(|item| item.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty())));
+                        (summary_text_nonempty || payload.get("encrypted_content").is_some())
+                            .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
+                    }
                     Some("function_call" | "custom_tool_call") => {
                         let args = payload.get("arguments").or_else(|| payload.get("input")).cloned();
                         Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
@@ -1570,6 +1598,48 @@ mod tests {
         let events = events_from_blob("codex", &dir.path().join("rollout-w6-test.jsonl"));
         assert_eq!(events.len(), real_count, "the dropped developer line must not be counted, matching the real connector's message count");
         assert_eq!(real_count, 5, "developer dropped; user/reasoning/function_call/function_call_output/assistant each kept");
+    }
+
+    /// R2-B3 (任务书 #119a): pin `codex.rs:849-853` judges a `reasoning`
+    /// event's emptiness on the EXTRACTED text (join non-empty
+    /// `summary[].text`), not on whether the `summary` array itself is
+    /// non-empty. `summary:[{"type":"summary_text","text":""}]` is a
+    /// non-empty array whose extracted text is empty and no
+    /// `encrypted_content` -- the real connector drops it (zero messages);
+    /// the pre-fix `events_from_blob` kept it (one event), miscounting in
+    /// the direction R2-B3's alignment-gate report names.
+    #[test]
+    fn events_from_blob_codex_reasoning_empty_summary_text_produces_zero_matches_real_reparse_negative() {
+        // `real_reparse_message_count` -> `CodexConnector::scan` only
+        // recognizes files named `rollout-*.jsonl` (pin
+        // `codex.rs::is_rollout_file`) -- a bare `s.jsonl` name is
+        // invisible to the real connector's own file discovery regardless
+        // of content, which would make this "matches_real_reparse" a
+        // vacuous 0==0 rather than an actual alignment check.
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"reasoning","id":"rs_empty","summary":[{"type":"summary_text","text":""}]}}"#;
+        write_blob(&dir, "rollout-r2-b3-a.jsonl", &[line]);
+        let real_count = real_reparse_message_count("codex", &dir, "rollout-r2-b3-a.jsonl");
+        let events = events_from_blob("codex", &dir.path().join("rollout-r2-b3-a.jsonl"));
+        assert_eq!(events.len(), real_count, "a reasoning summary whose only item has empty text must produce zero events, matching the real connector dropping it");
+        assert_eq!(real_count, 0);
+    }
+
+    /// R2-B3 (任务书 #119a): pin `utils.rs:416`'s `extract_content_part`
+    /// accepts a bare STRING array element (not only `{"type":"text",...}`
+    /// objects) as visible text. `payload.content: ["a bare string"]` on a
+    /// `message`-role event must count as non-empty and produce one event --
+    /// the pre-fix `content_nonempty` only read `.get("text")` per element,
+    /// so this shape counted as empty and the event was wrongly dropped.
+    #[test]
+    fn events_from_blob_codex_message_array_bare_string_element_matches_real_reparse_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = r#"{"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"message","id":"msg_bare","role":"user","content":["a bare string content block"]}}"#;
+        write_blob(&dir, "rollout-r2-b3-b.jsonl", &[line]);
+        let real_count = real_reparse_message_count("codex", &dir, "rollout-r2-b3-b.jsonl");
+        let events = events_from_blob("codex", &dir.path().join("rollout-r2-b3-b.jsonl"));
+        assert_eq!(events.len(), real_count, "a bare-string content array element must produce one event, matching the real connector counting it as visible text");
+        assert_eq!(real_count, 1);
     }
 
     // -- R1 -------------------------------------------------------------
