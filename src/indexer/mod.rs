@@ -15692,6 +15692,30 @@ fn prepare_conversation_for_ingest(
         let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
         let reparsed_conversations =
             connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
+        // R1-N5 safety dependency (R-E-34, control-plane 核实 2026-09-07):
+        // the identity check below is only safe for a genuinely-unchanged
+        // file because of an invariant that lives ELSEWHERE --
+        // `materialize_capture_to_scratch` (via `materialize_sealed_blob`'s
+        // `rebuild_relative_shape(canonical_original_path)`,
+        // `phase3_restore.rs:2164/:2250`) reconstructs the scratch copy's
+        // ancestor directory shape purely from the ORIGINAL file's own real
+        // path (`agent`/`Origin::ClaudeCode` at `:2493` is an inert
+        // placeholder there, documented not to participate in path
+        // reconstruction). Both connectors wired into this crate derive
+        // `external_id` as a pure function of that reconstructed shape --
+        // codex: `source_path.strip_prefix(&sessions_dir)` (pinned
+        // `codex.rs:704-717`); claude_code: `projects_root_for_explicit_
+        // file` (pinned `claude_code.rs:453-458`) -- neither depends on
+        // `ctx.scan_roots`, timestamps, or scan order, so this reparse's id
+        // matches the first parse's id byte-for-byte for either connector.
+        // If shape reconstruction is ever changed to key off anything OTHER
+        // than the original file's own path (e.g. connector/agent kind),
+        // this check will start rejecting every real session of the
+        // affected connector as `CaptureFailed`, with nothing in the error
+        // message pointing back to this dependency -- confirmed NOT
+        // currently the case, but the failure mode is silent and total if
+        // it ever becomes one, hence written down here rather than only at
+        // the definition of `rebuild_relative_shape` itself.
         let mut reparsed = if reparsed_conversations.len() == 1 {
             let candidate = reparsed_conversations.into_iter().next().expect("len checked above");
             // R1-N5 (任务书 #118b): the single-session branch used to accept
@@ -25381,7 +25405,27 @@ mod tests {
                 content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
                 ..norm_msg(0, 2_000)
             };
-            let mut conv = norm_conv(Some(scope), vec![oversized]);
+            // R1-N5 (任务书 #118b, control-plane 核实 2026-09-07): `external_id`
+            // must be stable across the ORIGINAL `scan_with_callback`
+            // iteration and `prepare_conversation_for_ingest`'s own internal
+            // reparse-via-`connector.scan()` call, which always builds a
+            // `ScanContext` with one non-empty local `ScanRoot` pointing at
+            // the materialized scratch copy -- so the `ctx.scan_roots.
+            // is_empty()`-based `scope` this fixture used to compute (this
+            // function's caller) evaluated to "remote" on EVERY reparse
+            // regardless of which real scope ("local" or "remote") the
+            // original scan came from, tripping N5's new identity check on
+            // every "local" iteration. A real connector's `external_id` has
+            // no such dependency (pure function of the file's own path
+            // structure via `materialize_sealed_blob`'s `rebuild_relative_
+            // shape`, confirmed against pinned `codex.rs`/`claude_code.rs`),
+            // so this fixture's scope-in-identity shortcut was never
+            // faithful to production behavior -- it only went unnoticed
+            // because prepare never validated reparse identity before N5.
+            // `scope` is kept in `title` (purely informational, no
+            // assertion reads it) rather than fed into `external_id`.
+            let mut conv = norm_conv(Some("disconnect-test"), vec![oversized]);
+            conv.title = Some(format!("disconnect-test-{scope}"));
             conv.source_path = source_path;
             conv
         }
@@ -33486,11 +33530,26 @@ mod tests {
         let mut conv = norm_conv(Some("2026/09/rollout-w118a-n4"), vec![norm_msg(0, 10)]);
         conv.agent_slug = "codex".to_string();
         conv.source_path = source_path.clone();
+        let expected_external_id = conv.external_id.clone();
+        let expected_agent_slug = conv.agent_slug.clone();
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
         let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
+
+        // R1-N5 (任务书 #118b) explicit coverage: this is the real codex
+        // path-shape (`.codex/sessions/YYYY/MM/rollout-*.jsonl`) case N5's
+        // identity check depends on being byte-stable across first parse
+        // and reparse (see the safety-dependency comment on R-E-34 at the
+        // call site) -- assert it directly rather than relying only on
+        // `prepare` not having returned `Err` above (which N4's own
+        // assertion below doesn't touch at all).
+        assert_eq!(
+            prepared.conv.external_id, expected_external_id,
+            "a real codex session's external_id must reparse to the identical value, not just \"prepare succeeded\""
+        );
+        assert_eq!(prepared.conv.agent_slug, expected_agent_slug);
 
         assert!(
             prepared.conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes").is_some(),
