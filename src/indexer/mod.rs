@@ -15568,22 +15568,32 @@ fn judge_and_redact_reparsed(
             record_codex_host_shell_hit();
         }
         // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
-        // `apply()` clears `msg.content` -- saved just above so the
-        // redacted-text recomputation below (same `MemoizingRedactor`,
-        // memoized -> effectively free) matches byte-for-byte what `apply`
-        // hashed internally (spec §2.2: sha/title 判定都用脱敏后正文口径).
-        // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
-        // `apply()` clears `msg.content` -- saved just above so the
-        // redacted-text recomputation below (same `MemoizingRedactor`,
-        // memoized -> effectively free) matches byte-for-byte what `apply`
-        // hashed internally (spec §2.2: sha/title 判定都用脱敏后正文口径).
+        // `apply()` clears `msg.content` -- `pre_redaction_content` is saved
+        // just above so the comparison below has the excluded row's ORIGINAL
+        // text to compare `title` against.
+        //
+        // R2-N3 (任务书 #119c): this comparison is against `title` on the
+        // LEFT and `pre_redaction_content` on the RIGHT -- both UNREDACTED,
+        // per spec §2.2's own wording ("若 title 是任一被排除消息**原文**的
+        // 子串"). The prior implementation compared against
+        // `redactor.redact_text(&pre_redaction_content)` instead, on the
+        // theory that "sha/title 判定都用脱敏后正文口径" -- but spec §2.2
+        // only says that for sha/bytes (the very next clause: "对象 = 脱敏
+        // 后、本应写入 content 的字符串"); the title clause is separate and
+        // explicitly says 原文. Comparing redacted content against an
+        // unredacted title breaks exactly when it matters most: if the
+        // excluded row (and hence the title derived from it) contains a
+        // secret, redaction removes that secret substring from the
+        // right-hand side, the two no longer match, and the secret-bearing
+        // title is left un-cleared in the database. Comparing both sides
+        // unredacted also means this needs no `redaction_enabled()` check --
+        // there is nothing here for that switch to gate.
         let pre_redaction_content = conv.messages[idx].content.clone();
         let marker = apply(&mut conv.messages[idx], &decision, &mut redactor, blob_relative_path, idx as u32, field_map);
-        if let Some(title) = conv.title.as_ref().filter(|t| !t.is_empty()) {
-            let redacted_content = redactor.redact_text(&pre_redaction_content);
-            if redacted_content.contains(title.as_str()) {
-                conv.title = Some(String::new());
-            }
+        if let Some(title) = conv.title.as_ref().filter(|t| !t.is_empty())
+            && pre_redaction_content.contains(title.as_str())
+        {
+            conv.title = Some(String::new());
         }
         markers[idx] = Some(marker.clone());
         hits.push((idx, marker));
@@ -15729,13 +15739,34 @@ fn prepare_conversation_for_ingest(
     // R1-N5 (任务书 #118b): captured alongside `original_source_path`/
     // `original_external_id` for the same reason -- once `conv = reparsed`
     // (below) replaces `conv` wholesale, the first parse's own values are
-    // gone. `workspace` must be the first parse's value, not re-derived
-    // from whatever the connector infers scanning the scratch copy (the
-    // scratch tree's ancestor shape is a *reconstruction*, not guaranteed
-    // identical to the original scan root a real deployment's connector
-    // saw workspace from).
+    // gone. `workspace` must be the FIRST PARSE'S FINAL value (i.e. already
+    // through `apply_workspace_rewrite` above if a rewrite fired), not
+    // re-derived from whatever the connector infers scanning the scratch
+    // copy (the scratch tree's ancestor shape is a *reconstruction*, not
+    // guaranteed identical to the original scan root a real deployment's
+    // connector saw workspace from). This is a DIFFERENT concept from the
+    // one below.
     let original_agent_slug = conv.agent_slug.clone();
     let original_workspace = conv.workspace.clone();
+    // R2-N2 (任务书 #119c): the PROVENANCE `apply_workspace_rewrite` (just
+    // above) recorded, if it fired -- `metadata.cass.workspace_original`,
+    // the pre-rewrite value. Captured here (before `conv = reparsed` below
+    // discards this `conv.metadata` object entirely) so it can be carried
+    // into `reparsed` directly. Do NOT call `apply_workspace_rewrite` a
+    // second time against `reparsed` to "re-derive" this: `reparsed.
+    // workspace` gets set to `original_workspace` above -- the ALREADY-
+    // rewritten value -- so a second call would run the rewrite logic
+    // against its own output. With a single mapping that's a no-op
+    // (`rewritten == original_workspace`), so the whole "record original"
+    // branch never fires and this provenance is silently lost; with a
+    // second mapping that happens to match the rewritten value (e.g.
+    // `/local -> /archive` on top of `/remote -> /local`), it applies an
+    // unintended SECOND transformation instead.
+    let original_workspace_original_meta = conv
+        .metadata
+        .pointer("/cass/workspace_original")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
 
     let record = match source_kind {
         CaptureSourceKind::Logical => {
@@ -15818,15 +15849,34 @@ fn prepare_conversation_for_ingest(
         // path (Global Constraints/plan Task 2 Interfaces).
         reparsed.source_path = original_source_path.clone();
         // R1-N5 (任务书 #118b): same rationale -- `workspace` is the first
-        // parse's value, not whatever the connector derived scanning the
-        // scratch copy; `apply_workspace_rewrite` below must run against
-        // this value, not the reparsed one, so this assignment has to land
-        // before that call.
+        // parse's FINAL value, not whatever the connector derived scanning
+        // the scratch copy.
         reparsed.workspace = original_workspace.clone();
         inject_provenance(&mut reparsed, origin);
         canonicalize_claude_external_id(connector_name, &mut reparsed);
-        if let Some(root) = workspace_rewrite_root {
-            apply_workspace_rewrite(&mut reparsed, root);
+        // R2-N2 (任务书 #119c): carry the first parse's rewrite provenance
+        // forward directly -- do NOT call `apply_workspace_rewrite` again
+        // here (see the capture site's comment above for why a second call
+        // against the already-rewritten `reparsed.workspace` either loses
+        // the true original or applies an unintended second rewrite).
+        if let Some(original) = &original_workspace_original_meta {
+            if !reparsed.metadata.is_object() {
+                reparsed.metadata = serde_json::json!({});
+            }
+            if let Some(obj) = reparsed.metadata.as_object_mut() {
+                let cass = obj
+                    .entry("cass".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if !cass.is_object() {
+                    *cass = serde_json::json!({});
+                }
+                if let Some(cass_obj) = cass.as_object_mut() {
+                    cass_obj.insert(
+                        "workspace_original".to_string(),
+                        serde_json::Value::String(original.clone()),
+                    );
+                }
+            }
         }
 
         // R1-N8 (任务书 #118b): `.unwrap_or_default()` used to swallow a
@@ -33919,6 +33969,108 @@ mod tests {
         );
     }
 
+    /// R2-N2 (任务书 #119c): a single workspace-rewrite mapping's provenance
+    /// (`metadata.cass.workspace_original`, the PRE-rewrite value) must
+    /// survive the `conv = reparsed` reassignment -- pre-fix, the reparse
+    /// branch called `apply_workspace_rewrite` a SECOND time against the
+    /// already-rewritten `reparsed.workspace`, found "no change" (single
+    /// mapping, already at its fixed point), and never recorded the
+    /// provenance at all.
+    #[test]
+    fn prepare_conversation_for_ingest_preserves_workspace_original_after_reparse_single_mapping() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w119c-n2-single.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w119c-n2-single"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        conv.workspace = Some(PathBuf::from("/remote/projects/app"));
+
+        let mut root = crate::connectors::ScanRoot::local(sessions_dir);
+        root.workspace_rewrites = vec![crate::sources::config::PathMapping::new("/remote", "/local")];
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert_eq!(
+            prepared.conv.workspace,
+            Some(PathBuf::from("/local/projects/app")),
+            "final workspace must be the single-mapping rewrite result"
+        );
+        assert_eq!(
+            prepared.conv.metadata.pointer("/cass/workspace_original").and_then(serde_json::Value::as_str),
+            Some("/remote/projects/app"),
+            "workspace_original metadata must survive reparse, not be silently dropped because \
+             the reparse's second apply_workspace_rewrite call saw an already-rewritten \
+             (no-op) value: {:?}",
+            prepared.conv.metadata
+        );
+    }
+
+    /// R2-N2 (任务书 #119c) chained-mapping variant: pre-fix, calling
+    /// `apply_workspace_rewrite` a second time against the reparsed
+    /// conversation could match a SECOND mapping the already-rewritten
+    /// value happens to satisfy, applying an unintended extra
+    /// transformation the first parse never actually produced.
+    #[test]
+    fn prepare_conversation_for_ingest_does_not_double_rewrite_workspace_after_reparse_chained_mapping() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w119c-n2-chained.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w119c-n2-chained"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        conv.workspace = Some(PathBuf::from("/remote/projects/app"));
+
+        let mut root = crate::connectors::ScanRoot::local(sessions_dir);
+        root.workspace_rewrites = vec![
+            crate::sources::config::PathMapping::new("/remote", "/local"),
+            crate::sources::config::PathMapping::new("/local", "/archive"),
+        ];
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert_eq!(
+            prepared.conv.workspace,
+            Some(PathBuf::from("/local/projects/app")),
+            "must stop at the FIRST parse's rewrite result (/remote -> /local); a second, \
+             unintended application of /local -> /archive must not happen just because reparse \
+             re-derived the rewrite against its own output"
+        );
+        assert_eq!(
+            prepared.conv.metadata.pointer("/cass/workspace_original").and_then(serde_json::Value::as_str),
+            Some("/remote/projects/app"),
+            "workspace_original must be the TRUE original (/remote/...), not the intermediate \
+             /local/... a second rewrite pass would have recorded: {:?}",
+            prepared.conv.metadata
+        );
+    }
+
     /// R1-N5 (任务书 #118b) mutation/negative: if the source file were
     /// replaced with an unrelated session's content between the first scan
     /// and this capture/reparse, the single-session branch used to accept
@@ -34137,6 +34289,56 @@ mod tests {
             conv.title,
             Some("Fix the flaky retry test".to_string()),
             "an unrelated title must not be cleared just because SOME row in the session was excluded"
+        );
+    }
+
+    /// R2-N3 (任务书 #119c): a title that is a substring of the excluded
+    /// row's ORIGINAL (pre-redaction) content must still be cleared even
+    /// when that content contains a secret -- pre-fix, the comparison used
+    /// `redactor.redact_text(&pre_redaction_content)` on the right-hand
+    /// side, so the secret substring was scrubbed out of the comparison
+    /// target while `title` (never itself redacted at this point) still
+    /// carried it, and `.contains()` failed, leaving the secret-bearing
+    /// title un-cleared in the database. `AKIAIOSFODNN7EXAMPLE` is AWS's own
+    /// public documentation example access key ID (also used by this
+    /// crate's own `redact_secrets.rs` tests) -- not a real credential.
+    #[test]
+    fn judge_clears_title_containing_secret_from_excluded_content() {
+        use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+
+        let secret_line = "key AKIAIOSFODNN7EXAMPLE here";
+        let host_shell_text = format!(
+            "# AGENTS.md instructions for X\n{secret_line}\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>"
+        );
+        let mut conv = norm_conv(
+            Some("n3-fixture"),
+            vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(0),
+                content: host_shell_text.clone(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        );
+        conv.agent_slug = "codex".to_string();
+        conv.title = Some(secret_line.to_string());
+
+        let events = vec![RawEvent {
+            event_key: "ek1".to_string(),
+            blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
+        }];
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n3.raw", &paths_cfg);
+
+        assert!(markers[0].is_some(), "the host-shell row must be excluded (anchor 3)");
+        assert_eq!(
+            conv.title,
+            Some(String::new()),
+            "a title containing a secret from the excluded row's original content must still be \
+             cleared, not survive because the redacted comparison target no longer matches it"
         );
     }
 
