@@ -4374,46 +4374,46 @@ fn fingerprint_hash(msg: &Message) -> anyhow::Result<[u8; 32]> {
     fingerprint_hash_for(&msg.content, msg.excluded.as_ref())
 }
 
-/// A `fingerprint_hash` failure means `apply()` (`indexer::exclusion`, T2a)
-/// wrote a malformed `fingerprint_blake3` -- a data-corruption bug upstream
-/// of storage, not a runtime condition (like a missing file or a network
-/// timeout) this merge/dedup path should degrade past silently. Fail loud.
-const FINGERPRINT_HASH_INVARIANT_MSG: &str =
-    "excluded.fingerprint_blake3 must be valid 32-byte hex -- apply() always writes it that way";
-
-fn message_merge_fingerprint(msg: &Message) -> MessageMergeFingerprint {
-    MessageMergeFingerprint {
+/// R2-B7 (任务书 #119a): a `fingerprint_hash` failure means either `apply()`
+/// (`indexer::exclusion`, T2a) wrote a malformed `fingerprint_blake3` (would
+/// be a data-corruption bug upstream of storage), OR -- the actually
+/// reachable case the review round found -- a library caller constructed
+/// `Message.excluded` directly or via `derive(Deserialize)`, both of which
+/// bypass `ExcludedMarker::from_json_str`'s hex-format validation (only that
+/// one constructor validates). Release builds are `panic = "abort"`, so a
+/// `.expect()` here does not unwind into a catchable per-session error --
+/// it terminates the whole process. Propagating `anyhow::Result` instead
+/// lets every caller (all of which already sit inside `Result`-returning
+/// functions, per the R2-B7 call-graph audit) turn this into an ordinary
+/// per-conversation `Err` a session-level `ScanError` can wrap, matching
+/// the design's "该错误传播为会话错误，而不是 panic" requirement. A
+/// well-formed marker (the only kind `apply()` ever produces) hits neither
+/// change: `content_hash`'s value is byte-identical to before.
+fn message_merge_fingerprint(msg: &Message) -> anyhow::Result<MessageMergeFingerprint> {
+    Ok(MessageMergeFingerprint {
         idx: msg.idx,
         created_at: msg.created_at,
         role: msg.role.clone(),
         author: msg.author.clone(),
-        content_hash: fingerprint_hash(msg).expect(FINGERPRINT_HASH_INVARIANT_MSG),
-    }
+        content_hash: fingerprint_hash(msg)?,
+    })
 }
 
-fn message_replay_fingerprint(msg: &Message) -> MessageReplayFingerprint {
-    MessageReplayFingerprint {
+fn message_replay_fingerprint(msg: &Message) -> anyhow::Result<MessageReplayFingerprint> {
+    Ok(MessageReplayFingerprint {
         created_at: msg.created_at,
         role: msg.role.clone(),
         author: msg.author.clone(),
-        content_hash: fingerprint_hash(msg).expect(FINGERPRINT_HASH_INVARIANT_MSG),
-    }
+        content_hash: fingerprint_hash(msg)?,
+    })
 }
 
-fn conversation_message_fingerprints(conv: &Conversation) -> HashSet<MessageMergeFingerprint> {
-    conv.messages
-        .iter()
-        .map(message_merge_fingerprint)
-        .collect()
+fn conversation_message_fingerprints(conv: &Conversation) -> anyhow::Result<HashSet<MessageMergeFingerprint>> {
+    conv.messages.iter().map(message_merge_fingerprint).collect()
 }
 
-fn conversation_message_replay_fingerprints(
-    conv: &Conversation,
-) -> HashSet<MessageReplayFingerprint> {
-    conv.messages
-        .iter()
-        .map(message_replay_fingerprint)
-        .collect()
+fn conversation_message_replay_fingerprints(conv: &Conversation) -> anyhow::Result<HashSet<MessageReplayFingerprint>> {
+    conv.messages.iter().map(message_replay_fingerprint).collect()
 }
 
 fn replay_fingerprint_from_merge(
@@ -4442,14 +4442,14 @@ fn collect_new_messages_for_existing_conversation<'a>(
     existing_messages: &mut HashMap<i64, MessageMergeFingerprint>,
     existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
     replay_skip_log: &'static str,
-) -> ExistingConversationNewMessages<'a> {
+) -> anyhow::Result<ExistingConversationNewMessages<'a>> {
     let mut idx_collision_count = 0usize;
     let mut first_collision_idx: Option<i64> = None;
     let mut new_chars: i64 = 0;
     let mut messages = Vec::new();
 
     for msg in &conv.messages {
-        let incoming_fingerprint = message_merge_fingerprint(msg);
+        let incoming_fingerprint = message_merge_fingerprint(msg)?;
         if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
             if existing_fingerprint != &incoming_fingerprint {
                 idx_collision_count = idx_collision_count.saturating_add(1);
@@ -4475,12 +4475,12 @@ fn collect_new_messages_for_existing_conversation<'a>(
         messages.push(msg);
     }
 
-    ExistingConversationNewMessages {
+    Ok(ExistingConversationNewMessages {
         messages,
         new_chars,
         idx_collision_count,
         first_collision_idx,
-    }
+    })
 }
 
 fn franken_existing_conversation_append_tail_state(
@@ -4852,7 +4852,16 @@ fn collect_append_only_tail_messages<'a>(
             return None;
         }
 
-        let replay_fingerprint = message_replay_fingerprint(msg);
+        // R2-B7 (任务书 #119a): this function returns `Option`, not
+        // `Result` -- `None` here means "this fast path doesn't apply",
+        // not "an error occurred", and the caller (`franken_collect_
+        // batched_existing_new_messages`) falls back to the bounded lookup
+        // path on `None`, which recomputes fingerprints through the
+        // already-`?`-propagating call sites -- a malformed marker still
+        // surfaces as a real `Err` there, just not via this fast path.
+        let Ok(replay_fingerprint) = message_replay_fingerprint(msg) else {
+            return None;
+        };
         if !seen_tail_replay.insert(replay_fingerprint) {
             return None;
         }
@@ -4938,7 +4947,13 @@ fn collect_existing_conversation_tail_from_ended_at<'a>(
     let mut new_chars = 0i64;
     let mut messages = Vec::new();
     for msg in &conv.messages {
-        let replay_fingerprint = message_replay_fingerprint(msg);
+        // R2-B7 (任务书 #119a): see the sibling site in
+        // `collect_append_only_tail_messages` above -- `None` here means
+        // "fast path not applicable", falling back to the bounded lookup
+        // where a real fingerprint failure surfaces as `Err`, not silently.
+        let Ok(replay_fingerprint) = message_replay_fingerprint(msg) else {
+            return None;
+        };
         if !seen_tail_replay.insert(replay_fingerprint) {
             return None;
         }
@@ -8112,7 +8127,7 @@ impl FrankenStorage {
                             &mut existing_messages,
                             &mut existing_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx",
-                        );
+                        )?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
@@ -8196,7 +8211,7 @@ impl FrankenStorage {
                 let mut first_collision_idx: Option<i64> = None;
                 let mut new_messages = Vec::new();
                 for msg in &conv.messages {
-                    let incoming_fingerprint = message_merge_fingerprint(msg);
+                    let incoming_fingerprint = message_merge_fingerprint(msg)?;
                     if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
                         if existing_fingerprint != &incoming_fingerprint {
                             idx_collision_count = idx_collision_count.saturating_add(1);
@@ -8204,7 +8219,7 @@ impl FrankenStorage {
                         }
                         continue;
                     }
-                    let incoming_replay = message_replay_fingerprint(msg);
+                    let incoming_replay = message_replay_fingerprint(msg)?;
                     if pending_replay_fingerprints.contains(&incoming_replay) {
                         tracing::debug!(
                             conversation_id = conv_id,
@@ -8323,7 +8338,7 @@ impl FrankenStorage {
         let mut new_messages = Vec::new();
 
         for msg in &conv.messages {
-            let incoming_fingerprint = message_merge_fingerprint(msg);
+            let incoming_fingerprint = message_merge_fingerprint(msg)?;
             if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
                 if existing_fingerprint != &incoming_fingerprint {
                     idx_collision_count = idx_collision_count.saturating_add(1);
@@ -8332,7 +8347,7 @@ impl FrankenStorage {
                 continue;
             }
 
-            let incoming_replay = message_replay_fingerprint(msg);
+            let incoming_replay = message_replay_fingerprint(msg)?;
             if pending_replay_fingerprints.contains(&incoming_replay) {
                 tracing::debug!(
                     conversation_id = conv_id,
@@ -8475,7 +8490,7 @@ impl FrankenStorage {
                 &mut existing_messages,
                 &mut existing_replay_fingerprints,
                 "skipping replay-equivalent profiled append message with shifted idx",
-            )
+            )?
         };
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
 
@@ -8627,7 +8642,7 @@ impl FrankenStorage {
                 &mut existing_messages,
                 &mut existing_replay_fingerprints,
                 "skipping replay-equivalent recovered message with shifted idx",
-            )
+            )?
         };
 
         let mut inserted_indices = Vec::new();
@@ -9315,13 +9330,13 @@ impl FrankenStorage {
                                     .or_default();
                                 let mut new_messages = Vec::new();
                                 for msg in &conv.messages {
-                                    let incoming_replay = message_replay_fingerprint(msg);
+                                    let incoming_replay = message_replay_fingerprint(msg)?;
                                     if pending_messages.contains_key(&msg.idx)
                                         || pending_replay_fingerprints.contains(&incoming_replay)
                                     {
                                         continue;
                                     }
-                                    pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                                    pending_messages.insert(msg.idx, message_merge_fingerprint(msg)?);
                                     pending_replay_fingerprints.insert(incoming_replay);
                                     new_messages.push(msg);
                                 }
@@ -10311,11 +10326,11 @@ fn franken_find_existing_conversation_by_key_impl(
             let Some(conv) = conv else {
                 return Ok(None);
             };
-            let incoming_fingerprints = conversation_message_fingerprints(conv);
+            let incoming_fingerprints = conversation_message_fingerprints(conv)?;
             if incoming_fingerprints.is_empty() {
                 return Ok(None);
             }
-            let incoming_replay_fingerprints = conversation_message_replay_fingerprints(conv);
+            let incoming_replay_fingerprints = conversation_message_replay_fingerprints(conv)?;
 
             let candidates: Vec<(i64, Option<i64>)> = tx.query_all_map(
                 "SELECT
@@ -11119,7 +11134,7 @@ fn franken_existing_message_lookup(
             // Same-idx messages are skipped by merge policy even when content has
             // diverged. Use the incoming fingerprint as a lightweight presence
             // marker so normal reprocessing does not need to read stored content.
-            by_idx.insert(msg.idx, message_merge_fingerprint(msg));
+            by_idx.insert(msg.idx, message_merge_fingerprint(msg)?);
         } else {
             missing_messages.push(msg);
         }
@@ -11210,9 +11225,16 @@ fn franken_existing_message_lookup_with_pending(
         pending_message_fingerprints.get(&conversation_id),
         pending_message_replay_fingerprints.get(&conversation_id),
     ) {
-        if incoming_messages.iter().all(|msg| {
-            by_idx.contains_key(&msg.idx) || replay.contains(&message_replay_fingerprint(msg))
-        }) {
+        // R2-B7 (任务书 #119a): the `.all(...)` closure below must return
+        // `bool`, so a `?` cannot propagate a fingerprint failure out of it
+        // directly. Treating that failure as "not a replay match" here is
+        // safe, not a silent swallow: it only ever widens `missing_messages`
+        // in the same direction a cache-miss already does, sending this
+        // conversation to the `franken_existing_message_lookup` fallback
+        // just below, which recomputes the SAME fingerprint through the
+        // already-`?`-propagating call at :11122 -- a real malformed marker
+        // surfaces there as an `Err`, never silently as `false` here.
+        if incoming_messages.iter().all(|msg| by_idx.contains_key(&msg.idx) || message_replay_fingerprint(msg).is_ok_and(|fp| replay.contains(&fp))) {
             return Ok(ExistingMessageLookup {
                 by_idx: by_idx.clone(),
                 replay: replay.clone(),
@@ -11266,7 +11288,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .remove(&conversation_id)
             .unwrap_or_default();
         for msg in &tail_plan.messages {
-            let fingerprint = message_merge_fingerprint(msg);
+            let fingerprint = message_merge_fingerprint(msg)?;
             by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
         }
@@ -11301,7 +11323,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .remove(&conversation_id)
             .unwrap_or_default();
         for msg in &tail_plan.messages {
-            let fingerprint = message_merge_fingerprint(msg);
+            let fingerprint = message_merge_fingerprint(msg)?;
             by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
         }
@@ -11324,7 +11346,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .remove(&conversation_id)
             .unwrap_or_default();
         for msg in &tail_plan.messages {
-            let fingerprint = message_merge_fingerprint(msg);
+            let fingerprint = message_merge_fingerprint(msg)?;
             by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
         }
@@ -11354,7 +11376,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
         &mut existing_messages,
         &mut existing_replay_fingerprints,
         replay_skip_log,
-    );
+    )?;
     Ok((
         new_messages,
         existing_messages,
@@ -22516,6 +22538,120 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blob, "blobs/blake3/ab/abcd.raw", "json_extract must work directly against the stored JSONB column");
+    }
+
+    /// R2-B7 (任务书 #119a): `ExcludedMarker` has two construction paths that
+    /// bypass `from_json_str`'s hex-format validation -- public fields
+    /// (direct struct construction, this test) and `derive(Deserialize)`
+    /// (the sibling test below). Before this fix, `message_merge_fingerprint`/
+    /// `message_replay_fingerprint` `.expect()`ed `fingerprint_hash`'s
+    /// result; since release builds are `panic = "abort"`, a caller hitting
+    /// either bypass path with a malformed `fingerprint_blake3` would abort
+    /// the whole process on the very first insert. This asserts the input-
+    /// boundary defect is closed: the same illegal marker now surfaces as an
+    /// ordinary `Err` a caller can turn into a per-session `ScanError`.
+    #[test]
+    fn insert_conversation_tree_returns_err_not_panic_for_directly_constructed_illegal_fingerprint() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("illegal-fingerprint-direct.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        // Public fields, never routed through `ExcludedMarker::from_json_str`
+        // -- this is exactly the "library caller constructs `Message.excluded`
+        // directly" bypass R2-B7 names.
+        let illegal_marker = ExcludedMarker {
+            reason: ExclusionReason::CassRecall,
+            rule_version: 1,
+            bytes: 2,
+            sha256: "a".repeat(64),
+            fingerprint_blake3: "zz".to_string(),
+            anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 0, event_key: "ek-1".into(), blocks: vec![] },
+        };
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("illegal-fingerprint-direct".into()),
+            title: None,
+            source_path: PathBuf::from("/tmp/illegal-fingerprint-direct.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: Some(illegal_marker),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let result = storage.insert_conversation_tree(agent_id, None, &conversation);
+        assert!(result.is_err(), "an illegal fingerprint_blake3 must surface as Err, not panic the process");
+    }
+
+    /// R2-B7 sibling of the test above: the OTHER bypass path,
+    /// `derive(Deserialize)` reading a hand-built JSON payload directly
+    /// (`serde_json::from_str::<ExcludedMarker>`), never touching
+    /// `from_json_str`'s validation wrapper.
+    #[test]
+    fn insert_conversation_tree_returns_err_not_panic_for_deserialize_constructed_illegal_fingerprint() {
+        use crate::indexer::exclusion::ExcludedMarker;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("illegal-fingerprint-deserialize.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let illegal_marker_json = format!(
+            r#"{{"reason":"cass_recall","rule_version":1,"bytes":2,"sha256":"{}","fingerprint_blake3":"zz","anchor":{{}},"raw":{{"blob":"blobs/blake3/ab/abcd.raw","idx":0,"event_key":"ek-1","blocks":[]}}}}"#,
+            "a".repeat(64)
+        );
+        let illegal_marker: ExcludedMarker = serde_json::from_str(&illegal_marker_json).expect("fixture JSON must at least deserialize (only the hex-format check is bypassed)");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("illegal-fingerprint-deserialize".into()),
+            title: None,
+            source_path: PathBuf::from("/tmp/illegal-fingerprint-deserialize.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: Some(illegal_marker),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let result = storage.insert_conversation_tree(agent_id, None, &conversation);
+        assert!(result.is_err(), "an illegal fingerprint_blake3 built via derive(Deserialize) must surface as Err, not panic the process");
     }
 
     /// T2b.3 (B段, mission #116 授权项⑤): `fetch_messages_for_conversation`
