@@ -27067,19 +27067,23 @@ mod tests {
         assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
     }
 
-    /// R2-B1 mutation guard: this reverts the fix (the non-watch terminal
-    /// `close_storage_after_index(...)` call regains its old unconditional
-    /// `Ok` shape) and confirms `streaming_capture_failure_returns_err_not_ok`
-    /// goes red -- the discriminating power check the fix's own review round
-    /// requires ("变异红"), done here instead of a throwaway local edit so it
-    /// stays runnable as a permanent regression guard against reintroducing
-    /// the ORIGINAL bug shape (a caller that ignores `scan_had_errors`).
-    /// Mirrors mod.rs's real terminal call exactly in miniature (the real
-    /// fix is `close_result?; if scan_had_errors { bail!(..) } close_result`;
-    /// this asserts the equivalent bail is what actually distinguishes the
-    /// two test outcomes above from a hypothetical "ignore scan_had_errors"
-    /// build by checking the `Err` variant's message names the failure,
-    /// not just any `Err`).
+    /// R2-B1 regression check (任务书 #119d R3-N7 纠正): this test calls the
+    /// CURRENT (fixed) `run_index` exactly once and asserts the resulting
+    /// `Err`'s formatted message contains both "capture/prepare" and "index
+    /// run" -- i.e. it checks the bail message names the failure kind AND
+    /// the run context, not a generic string. It does **not** switch to the
+    /// old unconditional-`Ok` implementation, and it cannot make
+    /// `streaming_capture_failure_returns_err_not_ok` (a different test)
+    /// run or go red from inside this Rust unit test -- a single `#[test]`
+    /// fn has no mechanism to invoke another test fn as a sub-check. The
+    /// original doc comment here claimed both of those things; neither is
+    /// true of what the test body actually does, so it overstated this
+    /// test's evidentiary weight. The real manual mutation verification
+    /// (reverting the fix and confirming `streaming_capture_failure_returns_
+    /// err_not_ok` goes red) was done once, by hand, during development,
+    /// and is recorded in `W6_ARTIFACTS/r2fix-mission119a-report.md` -- this
+    /// test's own pass/fail is not a re-run of that mutation and must not be
+    /// read as one.
     #[test]
     #[serial]
     fn streaming_capture_failure_err_message_names_the_failure_not_generic() {
