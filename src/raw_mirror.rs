@@ -2486,6 +2486,22 @@ mod tests {
     /// erroring, not just the blob/manifest's immediate parent.
     #[test]
     fn sync_capture_durable_walks_full_directory_chain_to_root() {
+        // R4-N1 (任务书 #120a): this test calls `sync_capture_durable`, which
+        // fires the process-global `DIR_SYNC_PROBE` (via `force_sync_dir`)
+        // just like every other test in this module -- but until now it did
+        // NOT hold `DIR_SYNC_PROBE_TEST_SERIALIZE`. A concurrent test that
+        // has armed the probe (e.g. `..._fsyncs_mirror_root_parent_directory_
+        // entry`) would have this test's fsync calls land in ITS `synced`
+        // collection, corrupting a set-equality assertion made against a
+        // completely different temp tree. This test doesn't install a probe
+        // itself, so holding the lock is a secondary defense only -- the
+        // primary defense is the probe-observer test filtering by its own
+        // `data_dir` prefix (see below), which doesn't depend on every
+        // caller of `sync_capture_durable` remembering to take this lock.
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let temp = tempfile::TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let source_path = temp.path().join("rollout-b3-fixture.jsonl");
@@ -2570,7 +2586,26 @@ mod tests {
 
         let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
         let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        // R4-N1 (任务书 #120a): `DIR_SYNC_PROBE` is process-global (see its
+        // doc comment above) -- ANY concurrently-running test that calls
+        // into `force_sync_dir` (directly or via `sync_capture_durable`)
+        // while this probe is armed lands its own directories in `synced`
+        // too, even though `DIR_SYNC_PROBE_TEST_SERIALIZE` is held here.
+        // Holding that lock only orders this test against OTHER tests that
+        // also remember to take it -- `sync_capture_durable_walks_full_
+        // directory_chain_to_root` didn't (fixed above, but the fix is a
+        // convention that the next new test could just as easily forget
+        // again). Filtering to only this test's own `data_dir` subtree is
+        // the primary defense: it doesn't depend on every future caller of
+        // `sync_capture_durable` remembering to serialize -- a foreign
+        // test's temp directory can never collide with this filter because
+        // each test gets its own `tempfile::TempDir`.
         let synced = synced.lock().unwrap();
+        let synced: Vec<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
         assert!(
             synced.contains(&v1_dir),
             "sanity: v1 itself must still be fsynced (R1-B3, unchanged); synced dirs: {synced:?}"
@@ -2583,9 +2618,13 @@ mod tests {
         // R3-B1 (任务书 #119d): `raw-mirror/`'s own listing being durable
         // only makes V1'S entry durable -- it does nothing for `raw-mirror/`
         // itself possibly being a brand-new entry in `data_dir`'s listing.
-        // `data_dir` (this test's own `data_dir` binding, guaranteed
-        // pre-existing -- see `sync_capture_durable`'s doc comment) must
-        // also be fsynced.
+        // `data_dir` (this test's own `data_dir` binding) must also be
+        // fsynced -- unconditionally, regardless of whether `data_dir`
+        // itself is newly created this run (R4-B1, 任务书 #120a: whether
+        // `data_dir`'s OWN entry in ITS parent needs syncing is a separate,
+        // OUT-OF-SCOPE-for-this-function concern, handled at whoever
+        // actually creates `data_dir` -- see `sync_capture_durable`'s doc
+        // comment).
         assert!(
             synced.contains(&data_dir),
             "sync_capture_durable must also fsync data_dir itself (raw-mirror/'s own directory \
@@ -2626,6 +2665,123 @@ mod tests {
             "chain completeness: probe-observed synced directory set must exactly equal the \
              #119d layer enumeration (every leaf-to-data_dir level), derived from this capture's \
              own relative paths"
+        );
+    }
+
+    /// R4-N1 (任务书 #120a): the chain-completeness `assert_eq!` above is a
+    /// SET-equality judge over `DIR_SYNC_PROBE` observations, and that probe
+    /// is process-global -- a concurrently-running test's directories can
+    /// land in the same observation stream. This test proves the fix (filter
+    /// by this test's own `data_dir` prefix before comparing) actually does
+    /// its job: it manually injects a foreign path -- shaped exactly like
+    /// another test's temp tree, i.e. NOT under this test's `data_dir` --
+    /// into the same probe stream a real concurrent test would pollute it
+    /// with, then asserts the post-filter set still equals the untouched
+    /// expected set. The mutation (commenting out the filter, done by hand
+    /// during R4-N1's real fix -- see the report) turns this from "probably
+    /// works" into "verified": without the filter, the injected path is an
+    /// extra element the equality assertion cannot tolerate.
+    #[test]
+    fn sync_capture_durable_probe_filter_rejects_foreign_test_tree_pollution() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-n1-filter.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello n1\"}\n").expect("write source");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+
+        // Shaped like another concurrent test's own tempdir + data_dir -- a
+        // sibling of `temp`, not a descendant of THIS test's `data_dir`.
+        let foreign_pollution = temp
+            .path()
+            .parent()
+            .expect("tempdir has a parent")
+            .join("other-concurrent-test-tree")
+            .join("cass-data")
+            .join("raw-mirror")
+            .join("v1");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        let foreign_for_hook = foreign_pollution.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            let mut guard = synced_for_hook.lock().unwrap();
+            // Simulate the exact interleaving R4-N1 describes: a foreign
+            // test's `force_sync_dir` call lands in this probe stream
+            // alongside ours, once per real observation.
+            guard.push(foreign_for_hook.clone());
+            guard.push(dir.to_path_buf());
+        })));
+        let result = sync_capture_durable(&data_dir, &record);
+        set_dir_sync_probe(None);
+        result.expect("sync_capture_durable must succeed");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let synced = synced.lock().unwrap();
+        // Positive: the foreign path is present in the RAW probe stream --
+        // this is what a real concurrent-test interleaving would produce.
+        assert!(
+            synced.contains(&foreign_pollution),
+            "test setup sanity: foreign pollution must actually be in the raw probe stream"
+        );
+
+        // R4-N1 fix under test: filtering by this test's own `data_dir`
+        // prefix must drop the foreign path before any equality assertion.
+        let filtered: HashSet<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
+        assert!(
+            !filtered.contains(&foreign_pollution),
+            "R4-N1: filtering by this test's own data_dir prefix must reject a foreign \
+             concurrent test's directory tree, not just happen to not contain it"
+        );
+
+        fn walk_up_inclusive(mut dir: PathBuf, stop_at: &Path, into: &mut HashSet<PathBuf>) {
+            loop {
+                into.insert(dir.clone());
+                if dir == stop_at {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+        let mut expected_dirs: HashSet<PathBuf> = HashSet::new();
+        expected_dirs.insert(data_dir.clone());
+        expected_dirs.insert(raw_mirror_dir.clone());
+        let blob_leaf_dir = v1_dir.join(&record.blob_relative_path).parent().expect("blob path has a parent").to_path_buf();
+        let manifest_leaf_dir = v1_dir.join(&record.manifest_relative_path).parent().expect("manifest path has a parent").to_path_buf();
+        walk_up_inclusive(blob_leaf_dir, &v1_dir, &mut expected_dirs);
+        walk_up_inclusive(manifest_leaf_dir, &v1_dir, &mut expected_dirs);
+        assert_eq!(
+            filtered, expected_dirs,
+            "R4-N1: after filtering out the injected foreign pollution, the chain-completeness \
+             equality judge must still pass exactly as it would with no concurrent interference \
+             (variant without the filter: this assertion fails because `filtered` would still \
+             contain `foreign_pollution`, one extra element `expected_dirs` doesn't have)"
         );
     }
 
@@ -2751,7 +2907,27 @@ mod tests {
         set_dir_sync_probe(None);
         result.expect("merge_manifest_db_links must succeed with the switch off");
 
+        // R4-N1 (任务书 #120a): `DIR_SYNC_PROBE_TEST_SERIALIZE` only excludes
+        // OTHER tests that also hold it before touching the probe -- it does
+        // NOT make `CASS_RAW_MIRROR_FSYNC`'s process-global env var reads
+        // atomic with respect to the many OTHER tests in this module that
+        // call `capture_source_file`/manifest-merge functions without ever
+        // needing this lock at all (they don't assert on `synced`, so they
+        // were never "victims" before, but they're still concurrent readers
+        // of the same global env var `std::env::set_var`/`remove_var` mutate
+        // -- real reproduction on baseline HEAD e29d2400 showed exactly this
+        // test observing a foreign tmp tree's directory under
+        // `--test-threads=8`). Filtering by this test's own `data_dir`
+        // prefix is the same primary defense as the chain-completeness judge
+        // above: it doesn't matter WHY a foreign path appeared in the raw
+        // probe stream, only that it isn't part of what THIS test's own
+        // capture actually touched.
         let synced = synced.lock().unwrap();
+        let synced: Vec<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
         assert!(
             synced.is_empty(),
             "default (switch off) must not fsync anything on manifest db-link merge; \
@@ -2854,7 +3030,19 @@ mod tests {
         set_dir_sync_probe(None);
         result.expect("capture must succeed with the switch off");
 
+        // R4-N1 (任务书 #120a): same defense as the chain-completeness judge
+        // and `merge_manifest_db_links_does_not_sync_when_fsync_disabled`
+        // above -- filter by this test's own `data_dir` prefix before
+        // asserting, so a foreign concurrent test's directories (real
+        // reproduction on baseline HEAD e29d2400 under `--test-threads=8`)
+        // can't make this assertion fail regardless of how they got into
+        // the raw probe stream.
         let synced = synced.lock().unwrap();
+        let synced: Vec<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
         assert!(
             synced.is_empty(),
             "default (switch off) must not fsync anything on the manifest's first-ever \
