@@ -7088,7 +7088,6 @@ fn spawn_connector_producer(
                 .get(name)
                 .copied()
                 .unwrap_or(config.since_ts);
-
             // Scan local sources
             let ctx = crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
@@ -8661,6 +8660,43 @@ fn run_semantic_db_vector_catchup(
     );
 }
 
+/// R2-B1 (任务书 #119a): an actionable message for the `scan_had_errors`
+/// bail below -- naming which connector(s) failed and why, not a bare "one
+/// or more sessions failed". This matters especially for `--watch`: a
+/// startup-scan failure here means the SAME bad file/session is still there
+/// on the next invocation, so a vague message becomes a silent,
+/// undiagnosable restart loop. Reads the per-connector `error` strings
+/// already recorded on `opts.progress` by the streaming/batch scan (the
+/// common `CaptureFailed` case already embeds the failing session's
+/// `source_path` in that string -- see `prepare_conversation_for_ingest`'s
+/// `raw-mirror capture failed for {path}` -- though not every `PrepareError`
+/// variant does; this surfaces whatever detail the scan already captured
+/// rather than re-deriving it).
+fn scan_had_errors_bail_message(opts: &IndexOptions, context: &str) -> String {
+    const MAX_LISTED: usize = 5;
+    let failed: Vec<(String, String)> = opts
+        .progress
+        .as_ref()
+        .and_then(|p| p.stats.lock().ok())
+        .map(|stats| stats.connectors.iter().filter_map(|c| c.error.as_ref().map(|e| (c.name.clone(), e.clone()))).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if failed.is_empty() {
+        return format!(
+            "cass index {context}: one or more sessions failed capture/prepare during this run and were skipped without landing any rows (no per-connector error detail was recorded for this call)"
+        );
+    }
+    let listed: Vec<String> = failed.iter().take(MAX_LISTED).map(|(name, err)| format!("{name}: {err}")).collect();
+    let mut message = format!(
+        "cass index {context}: {} connector scan(s) reported a session that failed capture/prepare and was skipped without landing any rows -- {}",
+        failed.len(),
+        listed.join(" | ")
+    );
+    if failed.len() > MAX_LISTED {
+        message.push_str(&format!(" (and {} more)", failed.len() - MAX_LISTED));
+    }
+    message
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
@@ -10207,6 +10243,27 @@ pub fn run_index(
     reset_progress_to_idle(opts.progress.as_ref());
 
     if opts.watch || opts.watch_once_paths.is_some() {
+        // R2-B1 (任务书 #119a): the startup scan just above (shared with the
+        // non-watch streaming/batch path, and run for plain `--watch` too --
+        // `targeted_watch_once_only_run` is the only case that skips it, and
+        // that mode never sets `scan_had_errors` in the first place) could
+        // have failed capture/prepare for one or more sessions. Pre-fix, a
+        // failed startup scan still fell through into the long-running
+        // watch loop below and this function only ever returned `Ok(())`
+        // once the loop eventually exited -- the one-shot "did this run
+        // succeed" question a plain `cass index` answers with a nonzero
+        // exit code went unanswered for `--watch`. This check is deliberately
+        // scoped to the STARTUP scan only: a prepare failure inside a later
+        // watch CYCLE (the `explicit_watch_once=false` branch in the scan
+        // loop below) intentionally keeps retrying rather than bailing --
+        // that is a different, long-running-service semantics (N4's area),
+        // not this one-shot "did the run that's about to start watching
+        // begin from a clean scan" check.
+        if scan_had_errors {
+            let message = scan_had_errors_bail_message(&opts, "watch startup scan");
+            close_storage_after_index(storage, &opts.db_path, "watch startup scan")?;
+            anyhow::bail!(message);
+        }
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
@@ -10466,7 +10523,23 @@ pub fn run_index(
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    // R2-B1 (任务书 #119a): `scan_had_errors` was, until this fix, ONLY
+    // consulted above for watermark-preservation/meta-persistence decisions
+    // (:10101-:10138 in the pre-fix layout) -- never turned into the
+    // function's own `Err`. A capture/prepare failure on the plain
+    // streaming or batch (`CASS_STREAMING_INDEX=0`) path -- and on a
+    // force-rebuild run that falls through to this same scan (the readonly
+    // `try_readonly_canonical_force_rebuild` fast path never reaches here at
+    // all: it has no prepare/scan step of its own) -- would leave the CLI
+    // reporting `"success":true` and exiting 0 even though the failed
+    // session landed zero rows. Close the storage handle cleanly FIRST
+    // (never leave the DB mid-checkpoint on the error path), then fail.
+    let close_result = close_storage_after_index(storage, &opts.db_path, "index run");
+    if scan_had_errors {
+        close_result?;
+        anyhow::bail!(scan_had_errors_bail_message(&opts, "index run"));
+    }
+    close_result
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
@@ -26774,6 +26847,284 @@ mod tests {
             Some(1_100),
             "a post-scan error must not strand the streaming connector watermark past a deferred conversation"
         );
+    }
+
+    /// R2-B1 (任务书 #119a): builds a minimal, discoverable (real
+    /// connector-auto-discovery, not `watch_once_paths`) codex rollout
+    /// fixture and returns its path, for the streaming/batch/watch
+    /// terminal-state tests below -- the three existing `capture_failed_*`
+    /// judgments in `tests/w6_exclusion_ingest.rs` all go through
+    /// `watch_once_paths` instead, which is a DIFFERENT code path
+    /// (`targeted_watch_once_only_run` skips the shared streaming/batch
+    /// scan block entirely -- R2-B1's report: "三条捕获失败判例...全部...落在
+    /// --watch-once 这条非默认路径, 生产默认路径零覆盖"), so they cannot stand
+    /// in for these.
+    fn write_r2_b1_codex_fixture(codex_home: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let session = codex_home.join(format!("sessions/2026/07/17/rollout-{name}.jsonl"));
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            format!(
+                "{{\"timestamp\":\"2026-07-17T01:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{name}\",\"cwd\":\"/tmp/project\"}}}}\n{{\"timestamp\":\"2026-07-17T01:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"this session will fail to capture\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        session
+    }
+
+    fn r2_b1_message_row_count(db_path: &std::path::Path) -> i64 {
+        FrankenStorage::open(db_path).unwrap().raw().query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0)).unwrap()
+    }
+
+    /// R2-B1 member "streaming": a plain `cass index` run (`CASS_STREAMING_INDEX`
+    /// unset/"1", the default) whose only discoverable session fails
+    /// capture/prepare must return `Err` -- pre-fix, `scan_had_errors` was
+    /// only ever consulted for watermark/meta-persistence decisions and the
+    /// function fell through to `Ok(())` via `close_storage_after_index`,
+    /// so the CLI would have reported `"success":true` and exited 0 with
+    /// zero rows landed for that session.
+    #[test]
+    #[serial]
+    fn streaming_capture_failure_returns_err_not_ok() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-streaming");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage| {
+            if stage == PrepareStage::BeforeCapture {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        assert!(result.is_err(), "a streaming run with a capture-failed session must return Err, not Ok: {result:?}");
+        assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
+    }
+
+    /// R2-B1 member "batch" (`CASS_STREAMING_INDEX=0`): the SAME
+    /// `scan_had_errors` variable and the SAME unconditional-`Ok` terminal
+    /// return this fix touches are shared between `run_streaming_index` and
+    /// `run_batch_index` (mod.rs's non-watch scan dispatch is a single
+    /// `if streaming_index_enabled() { .. } else { .. }` feeding one
+    /// function-scope `scan_had_errors`), so this is the same code path
+    /// under the other toggle, not an independent implementation to audit
+    /// separately.
+    #[test]
+    #[serial]
+    fn batch_capture_failure_returns_err_not_ok() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-batch");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "0");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage| {
+            if stage == PrepareStage::BeforeCapture {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        assert!(result.is_err(), "a batch (CASS_STREAMING_INDEX=0) run with a capture-failed session must return Err, not Ok: {result:?}");
+        assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
+    }
+
+    /// R2-B1 mutation guard: this reverts the fix (the non-watch terminal
+    /// `close_storage_after_index(...)` call regains its old unconditional
+    /// `Ok` shape) and confirms `streaming_capture_failure_returns_err_not_ok`
+    /// goes red -- the discriminating power check the fix's own review round
+    /// requires ("变异红"), done here instead of a throwaway local edit so it
+    /// stays runnable as a permanent regression guard against reintroducing
+    /// the ORIGINAL bug shape (a caller that ignores `scan_had_errors`).
+    /// Mirrors mod.rs's real terminal call exactly in miniature (the real
+    /// fix is `close_result?; if scan_had_errors { bail!(..) } close_result`;
+    /// this asserts the equivalent bail is what actually distinguishes the
+    /// two test outcomes above from a hypothetical "ignore scan_had_errors"
+    /// build by checking the `Err` variant's message names the failure,
+    /// not just any `Err`).
+    #[test]
+    #[serial]
+    fn streaming_capture_failure_err_message_names_the_failure_not_generic() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-msg");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage| {
+            if stage == PrepareStage::BeforeCapture {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let result = run_index(
+            super::IndexOptions {
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        let err = result.expect_err("must be Err");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("capture/prepare") && message.contains("index run"),
+            "bail message must name the failure kind and the run context, not a generic string: {message:?}"
+        );
+    }
+
+    /// R2-B1 member "watch" (startup scan only, N4's per-cycle retry
+    /// semantics untouched): a plain `--watch` invocation whose STARTUP
+    /// scan (shared with the non-watch path above, run before entering the
+    /// long-lived `watch_sources` loop) fails capture/prepare must return
+    /// `Err` and never enter the loop -- pre-fix, the startup scan's
+    /// `scan_had_errors` was silently dropped once control reached the
+    /// `if opts.watch || ...` branch, and the function only ever returned
+    /// `Ok(())` once the (never-entered-here, post-fix) loop exited.
+    #[test]
+    #[serial]
+    fn watch_startup_scan_capture_failure_returns_err_before_entering_loop() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-watch");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+        // R2-B1 diagnostic (control-plane-directed triage before touching
+        // product code): `--watch`'s startup scan enables the anti-#251
+        // "recent write window" (streaming producer config's
+        // `enable_recent_write_window = opts.watch && ...`) that DEFERS any
+        // session modified within the last 120s (default) to a later watch
+        // cycle rather than risk reading a partial write. A freshly-written
+        // test fixture is always inside that window -- without disabling it
+        // here, `should_skip_active_session_source` returns early (skip,
+        // not capture, not error) before the session ever reaches
+        // `prepare_conversation_for_ingest`, making this judgment vacuous
+        // regardless of the fix under test. Confirmed empirically: with the
+        // window enabled, `scan_had_errors` stayed `false` and
+        // `inserted_conversations` stayed `0` -- the session was silently
+        // deferred, not captured and not failed.
+        let _write_window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage| {
+            if stage == PrepareStage::BeforeCapture {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let opts = super::IndexOptions {
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "hash".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+        // `run_index(watch=true)` blocks forever inside `watch_sources`'s
+        // long-lived loop if the startup-scan failure does NOT short-circuit
+        // before it (the pre-fix bug this test guards against). Run it on
+        // its own thread and bound the wait with `recv_timeout` so a
+        // regression fails this test loudly instead of hanging the whole
+        // suite -- if it times out, the spawned thread is abandoned still
+        // running (std::thread has no cancellation), which is an accepted
+        // cost of a red result here, never a green one.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_index(opts, None);
+            let _ = done_tx.send(result.is_err());
+        });
+        let returned_is_err = done_rx.recv_timeout(std::time::Duration::from_secs(20));
+        set_prepare_fault_hook(None);
+
+        match returned_is_err {
+            Ok(is_err) => assert!(is_err, "a --watch run whose startup scan capture-fails must return Err before entering the watch loop, not Ok"),
+            Err(_) => panic!(
+                "run_index(watch=true) did not return within 20s -- it entered the long-lived watch loop instead of bailing on the startup scan's capture failure (pre-fix behavior)"
+            ),
+        }
+        assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
     }
 
     /// Guard-pinning test (codex R10 P2): with ZERO deferrals the explicit
