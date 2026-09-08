@@ -907,23 +907,42 @@ fn tool_result_block_indices(event: &RawEvent, tool_call_id: Option<&str>) -> Ve
 /// rule; a cass-mcp call with no captured arguments at all is exactly the
 /// kind of incomplete pairing 宁漏勿误 exists for, even though R1's own
 /// match condition never reads any argument value.
+/// R2-B4 (任务书 #119a): wraps a would-be [`Decision`]'s `target_blocks`
+/// computation and refuses to return it when the block(s) cannot be
+/// uniquely located -- an empty vec here means "id known but no block in
+/// this event carries it" (including the R4 fallback-paired case where the
+/// call resolved via the id-less "exactly one unpaired" branch but the
+/// actual `ToolResult` block(s) in this event carry no id of their own, so
+/// filtering by the call's id can never match) or "id-less and 0/≥2
+/// candidate blocks" -- both are "cannot uniquely locate the target block",
+/// which per spec §2.1.4/R1-N13's original ruling ("多个无 id 结果块 →
+/// 不排，宁漏") must yield `None`, not a `Decision` whose `apply` would clear
+/// `content` while leaving every block's `extra` copy untouched.
+fn decide_with_located_blocks(
+    reason: ExclusionReason,
+    anchor: ExclusionAnchor,
+    event: &RawEvent,
+    tool_call_id: Option<&str>,
+) -> Option<Decision> {
+    let target_blocks = tool_result_block_indices(event, tool_call_id);
+    if target_blocks.is_empty() {
+        return None;
+    }
+    Some(Decision { reason, anchor, event_key: event.event_key.clone(), target_blocks })
+}
+
 fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, paths_cfg: &ExcludedContextPaths) -> Option<Decision> {
     let tool_name = call.tool_name.as_str();
     let identities = read_tool_identities(agent_slug)?;
     let args = call.args.as_ref()?;
 
     if is_cass_recall_tool(tool_name, agent_slug) {
-        return Some(Decision {
-            reason: ExclusionReason::CassRecall,
-            anchor: ExclusionAnchor {
-                tool_call_id: call.tool_call_id.clone(),
-                tool_name: Some(tool_name.to_string()),
-                paths: None,
-                shell: None,
-            },
-            event_key: event.event_key.clone(),
-            target_blocks: tool_result_block_indices(event, call.tool_call_id.as_deref()),
-        });
+        return decide_with_located_blocks(
+            ExclusionReason::CassRecall,
+            ExclusionAnchor { tool_call_id: call.tool_call_id.clone(), tool_name: Some(tool_name.to_string()), paths: None, shell: None },
+            event,
+            call.tool_call_id.as_deref(),
+        );
     }
 
     if identities.read == Some(tool_name) {
@@ -931,9 +950,9 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
         if !predicate_p(file_path, paths_cfg) {
             return None;
         }
-        return Some(Decision {
-            reason: ExclusionReason::ContextFileRead,
-            anchor: ExclusionAnchor {
+        return decide_with_located_blocks(
+            ExclusionReason::ContextFileRead,
+            ExclusionAnchor {
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: Some(tool_name.to_string()),
                 // R1-N9 (任务书 #118b): store the NORMALIZED path, not the
@@ -943,9 +962,9 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
                 paths: Some(vec![normalize_path(file_path)]),
                 shell: None,
             },
-            event_key: event.event_key.clone(),
-            target_blocks: tool_result_block_indices(event, call.tool_call_id.as_deref()),
-        });
+            event,
+            call.tool_call_id.as_deref(),
+        );
     }
 
     if identities.project_read == tool_name {
@@ -953,17 +972,12 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
         if !predicate_p_project_read_document(document, paths_cfg) {
             return None;
         }
-        return Some(Decision {
-            reason: ExclusionReason::ContextFileRead,
-            anchor: ExclusionAnchor {
-                tool_call_id: call.tool_call_id.clone(),
-                tool_name: Some(tool_name.to_string()),
-                paths: Some(vec![document.to_string()]),
-                shell: None,
-            },
-            event_key: event.event_key.clone(),
-            target_blocks: tool_result_block_indices(event, call.tool_call_id.as_deref()),
-        });
+        return decide_with_located_blocks(
+            ExclusionReason::ContextFileRead,
+            ExclusionAnchor { tool_call_id: call.tool_call_id.clone(), tool_name: Some(tool_name.to_string()), paths: Some(vec![document.to_string()]), shell: None },
+            event,
+            call.tool_call_id.as_deref(),
+        );
     }
 
     if identities.bash == tool_name {
@@ -972,17 +986,17 @@ fn decide_r1_r2_for_call(call: &PairedTool, event: &RawEvent, agent_slug: &str, 
         if bash_paths.is_empty() || !bash_paths.iter().all(|p| predicate_p(p, paths_cfg)) {
             return None;
         }
-        return Some(Decision {
-            reason: ExclusionReason::ContextFileRead,
-            anchor: ExclusionAnchor {
+        return decide_with_located_blocks(
+            ExclusionReason::ContextFileRead,
+            ExclusionAnchor {
                 tool_call_id: call.tool_call_id.clone(),
                 tool_name: Some(tool_name.to_string()),
                 paths: Some(bash_paths.iter().map(|p| normalize_path(p)).collect()),
                 shell: None,
             },
-            event_key: event.event_key.clone(),
-            target_blocks: tool_result_block_indices(event, call.tool_call_id.as_deref()),
-        });
+            event,
+            call.tool_call_id.as_deref(),
+        );
     }
 
     None
@@ -1620,13 +1634,19 @@ mod tests {
         assert_eq!(decision.target_blocks, vec![0], "the id-less sibling block (index 1) must NOT be swept in");
     }
 
-    /// R1-N13: when pairing itself was id-less (R4's "exactly one unpaired"
-    /// branch), selecting a block ALSO requires the event to have exactly
-    /// one id-less `ToolResult` block -- two or more is the same ambiguity
-    /// R4 already refuses to pair on, and must select none (宁漏勿误), not
-    /// silently sweep every one of them in.
+    /// R2-B4 (任务书 #119a, was R1-N13): when pairing itself was id-less
+    /// (R4's "exactly one unpaired" branch), selecting a block ALSO requires
+    /// the event to have exactly one id-less `ToolResult` block -- two or
+    /// more is the same ambiguity R4 already refuses to pair on, and per
+    /// spec §2.1.4/R1-N13's ORIGINAL ruling ("多个无 id 结果块 → 不排，宁漏")
+    /// must make `decide` return `None` entirely, not a `Decision` with an
+    /// empty `target_blocks` -- the pre-fix assertion here
+    /// (`.expect("id-less pairing must still succeed (R4-b)")` +
+    /// `assert!(target_blocks.is_empty())`) locked the WRONG behavior in:
+    /// `apply` would still have cleared `content` for a `Some` decision
+    /// while being unable to locate which block(s) to redact in `extra`.
     #[test]
-    fn r1_target_blocks_empty_when_multiple_id_less_result_blocks_are_ambiguous() {
+    fn r2_b4_decide_is_none_when_multiple_id_less_result_blocks_are_ambiguous() {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, None), tool_result_block(1, None)] };
         let ctx = ctx_from(&[
             PairingCandidate::TurnBoundary,
@@ -1634,8 +1654,39 @@ mod tests {
             PairingCandidate::ToolResult { tool_call_id: None },
         ]);
         let m = msg("tool_result", "{}");
-        let decision = decide(&m, 2, &event, &ctx, "claude_code", &paths_cfg()).expect("id-less pairing must still succeed (R4-b)");
-        assert!(decision.target_blocks.is_empty(), "two id-less ToolResult blocks in the same event is ambiguous -- select none (宁漏勿误)");
+        assert!(
+            decide(&m, 2, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
+            "two id-less ToolResult blocks in the same event is ambiguous -- decide must return None (宁漏勿误), not Some with an empty target_blocks"
+        );
+    }
+
+    /// R2-B4 (任务书 #119a): the OTHER known member -- a call resolved via
+    /// R4's id-less "exactly one unpaired" fallback still carries that
+    /// call's OWN `tool_call_id` (`Some(id)`), but the actual `ToolResult`
+    /// block(s) in this event are themselves id-less (`tool_use_id: None`).
+    /// Filtering `event.blocks` by `tool_use_id == Some(id)` then never
+    /// matches anything -- `target_blocks` comes out empty for a structural
+    /// reason distinct from the ambiguous-candidates case above, and must
+    /// likewise make `decide` return `None`, not `Some` with an empty vec.
+    #[test]
+    fn r2_b4_decide_is_none_when_id_resolved_call_meets_id_less_result_block() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, None)] };
+        let ctx = ctx_from(&[
+            PairingCandidate::TurnBoundary,
+            PairingCandidate::ToolCall(PairedTool { tool_call_id: None, tool_name: "mcp__cass-mcp__cass_search".into(), args: Some(serde_json::json!({})) }),
+            PairingCandidate::ToolResult { tool_call_id: None },
+        ]);
+        // `paired_call_for` resolves via R4's id-less fallback, but the
+        // resolved `PairedTool` here is constructed with a `tool_call_id`
+        // (unlike the fixture above) to model the real-world shape R2-B4
+        // names explicitly: the call itself carries an id (from its own
+        // connector event), yet the paired `ToolResult` block has none.
+        let ctx_with_id = PairingContext { resolved: ctx.resolved.iter().map(|(&idx, pt)| (idx, PairedTool { tool_call_id: Some("t1".into()), ..pt.clone() })).collect() };
+        let m = msg("tool_result", "{}");
+        assert!(
+            decide(&m, 2, &event, &ctx_with_id, "claude_code", &paths_cfg()).is_none(),
+            "call resolved with a tool_call_id but the event's own ToolResult block carries none -- target block cannot be uniquely located, decide must return None"
+        );
     }
 
     #[test]
