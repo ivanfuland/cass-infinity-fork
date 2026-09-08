@@ -752,6 +752,17 @@ fn anchored_under_cc_workspace(normalized: &str, base: &str) -> bool {
     false
 }
 
+/// A Windows drive-letter absolute path AFTER `normalize_path`'s `\` -> `/`
+/// conversion, e.g. `C:/projects/...` (from source `C:\projects\...`).
+/// `normalize_path` already handles the separator conversion; what it does
+/// NOT do is tell the caller the result is still absolute -- it doesn't
+/// start with `/`, so without this check `predicate_p` below would treat it
+/// as a bare relative path (R1-N9's injection-only-only branch).
+fn is_windows_drive_absolute(p: &str) -> bool {
+    let bytes = p.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+}
+
 /// R2 谓词 P.
 ///
 /// R1-N9 (任务书 #118b): a path still relative AFTER normalization (no
@@ -763,11 +774,18 @@ fn anchored_under_cc_workspace(normalized: &str, base: &str) -> bool {
 /// as `/home/u/projects/cc-workspace/USER.md`; the former is any relative
 /// path a caller could construct from ANY cwd and does not prove it resolves
 /// under the real cc-workspace root at all.
+///
+/// R2-N11 (任务书 #119b): a Windows absolute path (`C:\projects\...`)
+/// normalizes to `C:/projects/...`, which does not start with `/` --
+/// pre-fix, that fell into the "still relative" branch above and could only
+/// ever match `injection_only_files`, silently missing `memory_files`/
+/// `workspace_scoped_files` hits like `C:\projects\cc-workspace\USER.md`.
+/// spec v4.5 explicitly requires Windows separator normalization to work.
 fn predicate_p(raw_path: &str, paths_cfg: &ExcludedContextPaths) -> bool {
     let normalized = normalize_path(raw_path);
     let base = normalized.rsplit('/').next().unwrap_or(&normalized);
 
-    if !normalized.starts_with('/') {
+    if !normalized.starts_with('/') && !is_windows_drive_absolute(&normalized) {
         return paths_cfg.injection_only_files.iter().any(|f| f == base);
     }
 
@@ -870,6 +888,17 @@ const ANCHOR3_OPENERS: [&str; 3] = ["# AGENTS.md instructions", "<recommended_pl
 /// (a real request that happens to mention `<cwd>` earlier, followed by an
 /// empty env-context block), which is not the structural host-shell shape
 /// R3 exists to detect.
+///
+/// R2-N12 (任务书 #119b): R1-N11 above only checked "after the open tag" --
+/// it never checked "before the CORRESPONDING close tag", so
+/// `"<environment_context></environment_context><cwd>/x</cwd></environment_context>"`
+/// still matched: the first environment-context block closes immediately
+/// (empty), and `<cwd>` only appears afterward, wrapped in unrelated text
+/// that happens to end with a second `</environment_context>` (satisfying
+/// the outer `ends_with` check). Control-plane's original R1-N11 ruling was
+/// "`<cwd>` must be located after the open tag AND before the close tag" --
+/// the implementation only ever did the first half. Fixed by narrowing the
+/// search window to `[open tag end, nearest following close tag)`.
 fn anchor3_shell_opener(text: &str) -> Option<&'static str> {
     let trimmed = text.trim();
     if !trimmed.ends_with(ENVIRONMENT_CONTEXT_CLOSE) {
@@ -879,7 +908,10 @@ fn anchor3_shell_opener(text: &str) -> Option<&'static str> {
         return None;
     };
     let after_open = &trimmed[open_pos + ENVIRONMENT_CONTEXT_OPEN.len()..];
-    if !after_open.contains("<cwd>") {
+    let Some(close_rel) = after_open.find(ENVIRONMENT_CONTEXT_CLOSE) else {
+        return None;
+    };
+    if !after_open[..close_rel].contains("<cwd>") {
         return None;
     }
     Some(ANCHOR3_OPENERS.iter().find(|o| trimmed.starts_with(**o)).copied().unwrap_or(ENVIRONMENT_CONTEXT_OPEN))
@@ -1856,6 +1888,49 @@ mod tests {
         assert!(decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_some(), "worktree-root CLAUDE.md must match");
     }
 
+    /// R2-N11 (任务书 #119b): a Windows absolute path (backslash separators,
+    /// drive letter) must still match `memory_files` under the cc-workspace
+    /// root, same as its POSIX-style equivalent -- pre-fix, `predicate_p`
+    /// treated `C:/...` (post-normalization) as relative (didn't start with
+    /// `/`) and could only ever match `injection_only_files`.
+    #[test]
+    fn r2_n11_windows_absolute_path_memory_file_positive() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        let ctx = ctx_from(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "Read".into(),
+                args: Some(serde_json::json!({"file_path": "C:\\projects\\cc-workspace\\USER.md"})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let m = msg("tool_result", "file contents");
+        let decision = decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).expect("R2-N11 Windows absolute path must match");
+        assert_eq!(decision.reason, ExclusionReason::ContextFileRead);
+    }
+
+    /// Reverse of the positive above: a Windows absolute path OUTSIDE
+    /// cc-workspace must still be rejected -- proves the fix widened
+    /// "recognized as absolute" without also widening "anchored under
+    /// cc-workspace" to match anything.
+    #[test]
+    fn r2_n11_windows_absolute_path_outside_cc_workspace_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        let ctx = ctx_from(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "Read".into(),
+                args: Some(serde_json::json!({"file_path": "C:\\other\\USER.md"})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        let m = msg("tool_result", "file contents");
+        assert!(
+            decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
+            "Windows absolute path outside cc-workspace must not match (R2-N11 must not widen matching itself)"
+        );
+    }
+
     #[test]
     fn r2_project_read_document_positive() {
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
@@ -2108,6 +2183,27 @@ mod tests {
         let ctx = PairingContext::default();
         let m = msg("user", "<cwd>/home/u/project</cwd> please look at this real request\n<environment_context>\n</environment_context>");
         assert!(decide(&m, 0, &event, &ctx, "codex", &paths_cfg()).is_none(), "cwd outside the environment_context block must not match (R3)");
+    }
+
+    /// R2-N12 (任务书 #119b): the negative case above puts `<cwd>` BEFORE the
+    /// open tag; this one is the R2 report's actual reproduction -- `<cwd>`
+    /// appears AFTER the open tag but also after that SAME block's close tag
+    /// (the first environment-context block closes empty immediately), with
+    /// a second unrelated close tag trailing the message to satisfy the
+    /// outer `ends_with` check. The two tests exercise different code paths
+    /// in `anchor3_shell_opener` (one fails the `contains("<cwd>")` check
+    /// entirely; this one needs the close-tag boundary specifically) and
+    /// must not be treated as the same coverage.
+    #[test]
+    fn r3_cwd_after_close_tag_of_first_environment_context_block_negative() {
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![text_block(0)] };
+        let ctx = PairingContext::default();
+        let m = msg("user", "<environment_context></environment_context><cwd>/x</cwd></environment_context>");
+        assert!(
+            decide(&m, 0, &event, &ctx, "codex", &paths_cfg()).is_none(),
+            "cwd after the first environment_context block's own close tag must not match, even \
+             though a second close tag later satisfies ends_with (R2-N12)"
+        );
     }
 
     #[test]

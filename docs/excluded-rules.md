@@ -53,12 +53,13 @@ OR (tool = mcp__ccw-control-plane__project_read
 - **R2-g**（正例）：`mcp__ccw-control-plane__project_read(document="exec")` → 命中。
 - **R2-h**（反例）：`Bash(command="sed -n '1e date' file.md")` → 不命中（sed 脚本含 `e` 命令，非只读子集；首词 `sed -n` 合法但整体非允许语法）。
 - **R2-i**（正例，v4.4 新增）：`Bash(command="nl -ba /home/ivan/projects/cc-workspace/MEMORY.md")` → 命中（第六形态 `nl [-ba] <paths>`）；codex `exec_command(cmd="nl -ba /home/ivan/projects/cc-workspace/MEMORY.md")` 同样命中（codex 参数键是 `cmd` 不是 `command`，见 R11）。
+- **R2-j**（正例，R2-N11 任务书 #119b 补）：`Read(file_path="C:\\projects\\cc-workspace\\USER.md")`（Windows 绝对路径，反斜杠分隔符 + 盘符）→ 命中（谓词 P 规范化时先把 `\` 转 `/`，再按 `C:/...` 形态判定为绝对路径，与 POSIX 绝对路径同一支判）；`Read(file_path="C:\\other\\USER.md")`（同样是 Windows 绝对路径但不在 cc-workspace 下）→ 不命中（判定为绝对路径本身不放宽锚定要求）。
 
 ## R3 · 锚点 3 `codex_host_shell`
 
 codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白后）**同时满足**：
 
-- 含 `<environment_context>` 开标记，且其内含 `<cwd>` 元素；
+- 含 `<environment_context>` 开标记，且其**对应闭标记之前**含 `<cwd>` 元素（R2-N12 任务书 #119b 明确：不是"开标记之后任意位置"——若该环境块自身已经闭合，`<cwd>` 落在闭合之后不算命中，即便消息末尾另有一个不相关的 `</environment_context>` 满足下一条）；
 - 以 `</environment_context>` 结尾（末尾无任何后续文本）。
 
 `anchor.shell.opener` 记实际开头三种之一：`# AGENTS.md instructions`、`<recommended_plugins>`、`<environment_context>`（不伪填）。`anchor.shell.closer = "</environment_context>"`。
@@ -69,6 +70,7 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 - **R3-d**（反例）：用户手写 `<INSTRUCTIONS>…</INSTRUCTIONS>` 外壳，无 `<environment_context>`/`<cwd>` 结构 → 不命中。
 - **R3-e**（反例，`idx≠0`）：同样结构但出现在 `idx=1` 及以后 → 不命中（锚点只认 `idx=0`）。
 - **R3-f**（反例，已知漏判方向）：用户把完整 `<environment_context>…</environment_context>` 块粘贴在真实首条请求（`idx=0`）末尾 → **命中**（谓词无法区分，原文仍在镜像；接受此风险，见 spec §2.1 已知取舍）。此判例标注为**已知漏判方向**，不算 bug。
+- **R3-g**（反例，R2-N12 任务书 #119b 补）：`"<environment_context></environment_context><cwd>/x</cwd></environment_context>"` → **不命中**——第一个 `<environment_context>` 块紧接着就闭合（空块），`<cwd>` 出现在该闭标记**之后**的无关文本里，即便消息末尾另有一个 `</environment_context>` 满足"以闭标记结尾"这一条。与 R1-N11 那条（#118b，`<cwd>` 在开标记**之前**）不是同一条代码路径，两条都要各自有判例盯着，不能互相代替覆盖。
 
 ## R4 · 配对规则
 

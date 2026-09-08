@@ -186,6 +186,13 @@ def _anchored_under_cc_workspace(normalized: str, base: str) -> bool:
     return pat.search(normalized) is not None
 
 
+def _is_windows_drive_absolute(p: str) -> bool:
+    """Mirrors `exclusion.rs::is_windows_drive_absolute` exactly: a
+    Windows drive-letter absolute path AFTER `_normalize_path`'s `\\` ->
+    `/` conversion, e.g. `C:/projects/...`."""
+    return len(p) >= 3 and p[0].isalpha() and p[1] == ":" and p[2] == "/"
+
+
 def predicate_p(raw_path: str, paths_cfg: dict) -> bool:
     """R2 谓词 P. `raw_path` is a single path string already extracted from
     a tool-call argument (not yet normalized).
@@ -197,11 +204,18 @@ def predicate_p(raw_path: str, paths_cfg: dict) -> bool:
     `cc-workspace` path SEGMENT and doesn't care whether the input was
     absolute, so `cc-workspace/USER.md` (any relative path a caller could
     construct from ANY cwd) must not be treated as proof it resolves under
-    the real cc-workspace root."""
+    the real cc-workspace root.
+
+    任务书 #119b R2-N11: a Windows absolute path (`C:\\projects\\...`)
+    normalizes to `C:/projects/...`, which does not start with `/` --
+    without `_is_windows_drive_absolute`, that fell into the "still
+    relative" branch above and could only ever match
+    `injection_only_files`, silently missing `memory_files`/
+    `workspace_scoped_files` hits."""
     normalized = _normalize_path(raw_path)
     base = normalized.rsplit("/", 1)[-1]
 
-    if not normalized.startswith("/"):
+    if not normalized.startswith("/") and not _is_windows_drive_absolute(normalized):
         return base in paths_cfg["injection_only_files"]
 
     if base in paths_cfg["memory_files"] and _anchored_under_cc_workspace(normalized, base):
@@ -303,13 +317,24 @@ def anchor3_shell_opener(text: str):
     # block (after its open tag), not merely present somewhere in the
     # message -- the old independent `in` checks would match
     # `"<cwd>/x</cwd> real request<environment_context></environment_context>"`.
+    # 任务书 #119b R2-N12: N11 above only checked "after the open tag" --
+    # never "before the CORRESPONDING close tag", so
+    # `"<environment_context></environment_context><cwd>/x</cwd></environment_context>"`
+    # still matched (the first block closes empty immediately; `<cwd>`
+    # only appears afterward, in text wrapped by a second closer that
+    # satisfies the outer `endswith` check). Fixed by narrowing the search
+    # window to `[open tag end, nearest following close tag)`.
     trimmed = text.strip()
     if not trimmed.endswith(_CLOSER):
         return None
     open_pos = trimmed.find("<environment_context>")
     if open_pos == -1:
         return None
-    if "<cwd>" not in trimmed[open_pos + len("<environment_context>"):]:
+    after_open = trimmed[open_pos + len("<environment_context>"):]
+    close_rel = after_open.find(_CLOSER)
+    if close_rel == -1:
+        return None
+    if "<cwd>" not in after_open[:close_rel]:
         return None
     for opener in _OPENERS:
         if trimmed.startswith(opener):
@@ -782,12 +807,34 @@ def selftest_cases(paths_cfg):
     cands = [_mk("tool_call", tool_call_id="t1", tool_name="mcp__cass-mcp__cass_search"), _mk("tool_result", tool_call_id="t1")]
     cases.append(("N12 cass_recall with no args does not match", cands, 1, 0, "claude_code", None))
 
+    # 20. R2-N11 positive (任务书 #119b): a Windows absolute path
+    # (backslash separators, drive letter) must still match `memory_files`
+    # under the cc-workspace root -- pre-fix, `predicate_p` treated the
+    # post-normalization `C:/...` as relative (didn't start with `/`) and
+    # could only ever match `injection_only_files`.
+    cands = [
+        _mk("tool_call", tool_call_id="t1", tool_name="Read", args={"file_path": "C:\\projects\\cc-workspace\\USER.md"}),
+        _mk("tool_result", tool_call_id="t1"),
+    ]
+    cases.append(("R2-N11 Windows absolute path memory file positive", cands, 1, 0, "claude_code", "context_file_read"))
+
+    # 21. R2-N12 negative (任务书 #119b): `<cwd>` appears AFTER the open tag
+    # but also after that SAME block's own close tag (the first
+    # environment-context block closes empty immediately); a second,
+    # unrelated close tag trailing the message satisfies the outer
+    # `endswith` check. Case 18 above (N11, #118b) puts `<cwd>` BEFORE the
+    # open tag -- a different code path than this one, which needs the
+    # close-tag boundary specifically.
+    text5 = "<environment_context></environment_context><cwd>/x</cwd></environment_context>"
+    cands = [_mk("user", text=text5)]
+    cases.append(("R2-N12 cwd after close tag of first environment_context block", cands, 0, 0, "codex", None))
+
     return cases
 
 
 def run_selftest(paths_cfg) -> bool:
     cases = selftest_cases(paths_cfg)
-    assert len(cases) == 19, f"selftest must have exactly 19 cases, got {len(cases)}"
+    assert len(cases) == 21, f"selftest must have exactly 21 cases, got {len(cases)}"
     passed = 0
     for name, cands, index, idx_in_session, agent_slug, expect in cases:
         pairing = PairingContext(cands)

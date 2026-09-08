@@ -779,10 +779,24 @@ impl ExcludedContextPaths {
         ))
     }
 
+    /// R2-N10 (任务书 #119b): `Path::exists()` returns `false` both for "the
+    /// file genuinely does not exist" and for "an ancestor directory is not
+    /// traversable" (permission denied) -- indistinguishable to the caller,
+    /// so a config file that exists but sits behind an unreadable directory
+    /// silently fell back to the built-in default rule list, exactly the
+    /// false-widening `ExcludedContextPaths` exists to prevent (same
+    /// fail-loud contract as #118b's N8). `fs::metadata` surfaces the two
+    /// cases separately: `NotFound` still falls through to the built-in
+    /// default (that tier is real, not an error); every other error (most
+    /// commonly `PermissionDenied`) is now a `ConfigError`.
     fn load_from_candidate(candidate: Option<PathBuf>) -> Result<Self, ConfigError> {
         let content = match candidate {
-            Some(path) if path.exists() => std::fs::read_to_string(&path)?,
-            _ => EXCLUDED_CONTEXT_PATHS_BUILTIN_DEFAULT.to_string(),
+            Some(path) => match std::fs::metadata(&path) {
+                Ok(_) => std::fs::read_to_string(&path)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => EXCLUDED_CONTEXT_PATHS_BUILTIN_DEFAULT.to_string(),
+                Err(e) => return Err(e.into()),
+            },
+            None => EXCLUDED_CONTEXT_PATHS_BUILTIN_DEFAULT.to_string(),
         };
 
         let parsed: Self = toml::from_str(&content)?;
@@ -1869,6 +1883,47 @@ paths = ["/mnt/histories/laptop"]
         assert!(
             matches!(err, ConfigError::Parse(_)),
             "expected ConfigError::Parse, got {err:?}"
+        );
+    }
+
+    /// R2-N10 (任务书 #119b): the override file EXISTS and is well-formed,
+    /// but its parent directory is not traversable -- `Path::exists()`
+    /// can't tell that apart from "genuinely missing" and pre-fix silently
+    /// fell back to the built-in default rule list (a narrower operator
+    /// override getting silently widened, same false-green shape as N8).
+    /// `chmod 000` on a NON-root user; this environment runs as uid 1000
+    /// (confirmed at write time), so the permission bit actually blocks
+    /// traversal here -- if this ever runs as root, `metadata()` would
+    /// still succeed and this test would need a different unreadable
+    /// construction (task book's own documented caveat).
+    #[test]
+    #[cfg(unix)]
+    fn excluded_context_paths_unreadable_parent_dir_reports_config_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let locked_dir = temp.path().join("locked");
+        std::fs::create_dir_all(&locked_dir).unwrap();
+        let candidate = locked_dir.join("excluded_context_paths.toml");
+        std::fs::write(&candidate, "memory_files = [\"CUSTOM.md\"]\n").unwrap();
+
+        // Strip traverse (execute) permission from the parent dir so
+        // stat-ing the file inside it fails with PermissionDenied, not
+        // NotFound.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = ExcludedContextPaths::load_from_candidate(Some(candidate));
+        // Restore permissions unconditionally so the tempdir's own Drop
+        // cleanup doesn't itself fail trying to remove a locked directory.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err = result.expect_err(
+            "an unreadable parent directory must surface as a ConfigError, not a silent \
+             fallback to the built-in default rule list",
+        );
+        assert!(
+            matches!(err, ConfigError::Read(_)),
+            "expected ConfigError::Read (io::Error passthrough, not NotFound-shaped default \
+             fallback), got {err:?}"
         );
     }
 
