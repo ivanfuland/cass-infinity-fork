@@ -165,7 +165,12 @@ impl QuarantineState {
     /// Atomically write the quarantine state to disk via temp file + rename,
     /// so partial writes can never produce a corrupt quarantine_state.json.
     pub fn save(&self, data_dir: &Path) -> std::io::Result<()> {
-        std::fs::create_dir_all(data_dir)?;
+        // R4-B1 (任务书 #120a): `data_dir` can be newly created here (e.g. a
+        // quarantine save before any index run has ever created it) --
+        // `create_dir_all_durable` fsyncs the parent of every ancestor it
+        // actually creates, closing the same durability gap
+        // `acquire_index_run_lock` closes for the normal index-run path.
+        crate::raw_mirror::create_dir_all_durable(data_dir).map_err(std::io::Error::other)?;
         let final_path = Self::path(data_dir);
         let tmp_path = data_dir.join(format!("{}.tmp", Self::FILENAME));
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;

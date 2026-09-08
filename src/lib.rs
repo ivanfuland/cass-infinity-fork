@@ -20172,7 +20172,12 @@ fn prepare_headless_once_tui_artifacts(
     data_dir: &Path,
     asciicast_path: Option<&Path>,
 ) -> Result<()> {
-    std::fs::create_dir_all(data_dir).map_err(|e| {
+    // R4-B1 (任务书 #120a): this TUI headless `--once` entry point creates
+    // `data_dir` and opens a DB inside it moments later, independent of
+    // `acquire_index_run_lock` -- `create_dir_all_durable` fsyncs the parent
+    // of every ancestor it actually creates, so a fresh `data_dir` here is
+    // just as durable as one created via the normal index-run path.
+    crate::raw_mirror::create_dir_all_durable(data_dir).map_err(|e| {
         anyhow::anyhow!(
             "create headless --once data directory {}: {e}",
             data_dir.display()
@@ -74301,7 +74306,12 @@ pub(crate) fn run_doctor_impl(
             );
         }
     } else if fix_can_mutate {
-        if std::fs::create_dir_all(&data_dir).is_ok() {
+        // R4-B1 (任务书 #120a): `cass doctor --fix` can be the thing that
+        // creates `data_dir` on this machine -- a later `cass index` in the
+        // same power-on cycle would otherwise commit into a `data_dir` whose
+        // own directory entry was never made durable. `create_dir_all_durable`
+        // fsyncs the parent of every ancestor it actually creates.
+        if crate::raw_mirror::create_dir_all_durable(&data_dir).is_ok() {
             checks.push(Check {
                 name: "data_directory".to_string(),
                 status: "pass".to_string(),

@@ -1555,15 +1555,24 @@ pub(crate) fn sync_capture_durable(data_dir: &Path, record: &RawMirrorCaptureRec
     // a freshly-created `raw-mirror/` (this data_dir's very first capture
     // ever) is still not durably *reachable from data_dir* even though
     // everything under it (including `raw-mirror/`'s own listing) is now
-    // durable. `data_dir` itself is NOT fsynced conditionally on whether it
-    // was "just created" -- it never is: the caller already has an open
-    // database that lives inside `data_dir`, so `data_dir` is guaranteed to
-    // predate this call. What's newly created (maybe) is only the
-    // `raw-mirror` entry inside it, and fsyncing the PARENT (not the child)
-    // is what makes a directory entry durable -- same reasoning as the
-    // `root_parent` sync above, one level up. Unconditional and cheap for
-    // the same reason: `data_dir`'s "does it contain raw-mirror/" fact only
-    // changes once, on the first capture ever made against this `data_dir`.
+    // durable. Unconditional and cheap regardless of whether `data_dir`
+    // itself happens to be newly created this run -- `data_dir`'s "does it
+    // contain raw-mirror/" fact only changes once, on the first capture ever
+    // made against this `data_dir`.
+    //
+    // R4-B1 (任务书 #120a): this function has no way to create `data_dir`
+    // itself and therefore no way to know whether it was just created --
+    // that's `create_dir_all_durable`'s job, at whichever call site actually
+    // creates `data_dir` (`acquire_index_run_lock` for a normal index run;
+    // `QuarantineState::save`, `prepare_headless_once_tui_artifacts`, and
+    // `cass doctor --fix`'s data-directory auto-repair for the other
+    // production entry points that can create it). Each of those closes
+    // `data_dir`'s OWN durability (its entry in ITS OWN parent) at creation
+    // time, immediately, before any capture can run -- so by the time this
+    // function is ever called, that half of the chain is already someone
+    // else's discharged responsibility. This line's only job is the half
+    // BELOW `data_dir`: making `raw-mirror/`'s entry inside `data_dir`
+    // durable, which is unconditional and cheap for the reason above.
     force_sync_dir(data_dir)?;
     Ok(())
 }
@@ -1596,15 +1605,70 @@ fn force_sync_dir_chain(path: &Path, root: &Path, synced_dirs: &mut HashSet<Path
     Ok(())
 }
 
+// R4-B1 (任务书 #120a): `pub(crate)` so `create_dir_all_durable`'s callers
+// outside this module (`acquire_index_run_lock`, `QuarantineState::save`,
+// `prepare_headless_once_tui_artifacts`, `cass doctor --fix`) share the same
+// fsync-a-directory primitive AND the same `DIR_SYNC_PROBE` test hook --
+// visibility change only, behavior unchanged.
 #[cfg(not(windows))]
-fn force_sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn force_sync_dir(dir: &Path) -> Result<()> {
     File::open(dir).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror directory {}", dir.display()))?;
     fire_dir_sync_probe(dir);
     Ok(())
 }
 
 #[cfg(windows)]
-fn force_sync_dir(_dir: &Path) -> Result<()> {
+pub(crate) fn force_sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// R4-B1 (任务书 #120a): create `path` and any missing ancestors (exactly
+/// like `fs::create_dir_all`, same permissions -- `path` is never treated as
+/// a private raw-mirror directory here, unlike `create_private_dir_all`),
+/// then fsync the PARENT of every ancestor this call actually created, so
+/// each newly-created directory's own entry survives a crash.
+///
+/// This is the fix for the R4-B1 class of bug: four rounds in a row
+/// (`v1` -> `raw-mirror/` -> `data_dir` -> `data_dir`'s own ancestors) each
+/// guessed a fixed upper bound for how far up the fsync chain needed to
+/// reach, and each guess was wrong because SOMETHING ELSE in this codebase
+/// could -- and does -- create the directory one level above the previous
+/// guess's stopping point. This function has no guessed stopping point: it
+/// walks `path`'s ancestors, checking actual filesystem state to find which
+/// ones do NOT yet exist, creates exactly those, and fsyncs exactly their
+/// parents -- "新建到哪就同步到哪" (sync as far up as this call actually
+/// built, nothing more, nothing less, no assumption about what's above).
+///
+/// Existing ancestors are left untouched and unsynced by this function --
+/// this call's contract only covers what IT builds. A directory that
+/// already existed before this call is either a) durable because whoever
+/// created it already made it durable, or b) a residual crash-durability
+/// gap that predates this call entirely and is out of scope for it to fix.
+pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    for ancestor in path.ancestors() {
+        if fs::symlink_metadata(ancestor).is_ok() {
+            break;
+        }
+        missing.push(ancestor.to_path_buf());
+    }
+    // `missing` was collected leaf-first (`path` itself, then its parent,
+    // ...); reverse it so `create_dir_all` below builds shallow-to-deep --
+    // matches `std::fs::create_dir_all`'s own order and doesn't matter for
+    // correctness (it creates the whole chain in one call regardless), but
+    // keeps the syncing loop below in the same intuitive order.
+    missing.reverse();
+
+    fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))?;
+
+    let mut synced_parents: HashSet<PathBuf> = HashSet::new();
+    for created in &missing {
+        if let Some(parent) = created.parent()
+            && synced_parents.insert(parent.to_path_buf())
+        {
+            force_sync_dir(parent)?;
+        }
+    }
     Ok(())
 }
 
@@ -2782,6 +2846,183 @@ mod tests {
              equality judge must still pass exactly as it would with no concurrent interference \
              (variant without the filter: this assertion fails because `filtered` would still \
              contain `foreign_pollution`, one extra element `expected_dirs` doesn't have)"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 正例①：`data_dir` 本身连同其祖先都是新建的（`temp`
+    /// 下嵌套两层，`nested/` 与 `nested/cass-data` 都不存在）-- 断言
+    /// `create_dir_all_durable` 对每个新建层各自的父目录都做了 fsync：既包括
+    /// `data_dir` 自己的父目录（`nested/`），也包括 `nested/` 自己的父目录
+    /// （`temp.path()`，本就存在，充当自然边界）。这正是"新建到哪就同步到
+    /// 哪"要证明的：边界不是硬编码的一跳，而是由实际文件系统状态动态决定的。
+    #[test]
+    fn create_dir_all_durable_syncs_parent_of_every_newly_created_level_positive() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let nested = temp.path().join("nested");
+        let data_dir = nested.join("cass-data");
+        assert!(!nested.exists(), "test setup sanity: nested/ must not pre-exist");
+        assert!(!data_dir.exists(), "test setup sanity: data_dir must not pre-exist");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = create_dir_all_durable(&data_dir);
+        set_dir_sync_probe(None);
+        result.expect("create_dir_all_durable must succeed creating a multi-level path");
+
+        assert!(data_dir.is_dir(), "data_dir must actually be created");
+        assert!(nested.is_dir(), "nested/ must actually be created");
+
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&nested),
+            "create_dir_all_durable must fsync data_dir's own parent (nested/), which it newly \
+             created; synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&temp.path().to_path_buf()),
+            "create_dir_all_durable must ALSO fsync nested/'s own parent (temp.path()), because \
+             nested/ itself was newly created too -- this is the 'no hardcoded upper bound' part: \
+             it must keep climbing past data_dir's immediate parent for as long as each level up \
+             was also newly built, not stop after exactly one hop; synced dirs: {synced:?}"
+        );
+        assert_eq!(
+            synced.len(),
+            2,
+            "must sync exactly the two newly-created levels' parents, no more (temp.path() itself, \
+             which pre-existed, must not have its own parent synced -- that's outside this call's \
+             contract); synced dirs: {synced:?}"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 正例②：`data_dir` 已经预先存在（调用方已经
+    /// `fs::create_dir_all` 过）-- 断言 `create_dir_all_durable` 不 fsync
+    /// 任何目录，证明它不是无脑往上刷，只对"这次调用真正新建的"负责。
+    #[test]
+    fn create_dir_all_durable_does_not_sync_when_data_dir_already_exists_positive() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        fs::create_dir_all(&data_dir).expect("pre-create data_dir");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = create_dir_all_durable(&data_dir);
+        set_dir_sync_probe(None);
+        result.expect("create_dir_all_durable must succeed as a no-op when data_dir pre-exists");
+
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.is_empty(),
+            "create_dir_all_durable must not fsync anything when data_dir already existed before \
+             the call; synced dirs: {synced:?}"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 正例③（R4 点名的组合场景的 raw_mirror.rs 侧一半）：
+    /// `create_dir_all_durable` 与 `sync_capture_durable` 各自的职责边界在
+    /// 衔接点上不留缝隙 -- `data_dir` 连同其祖先都是新建的，走完
+    /// `create_dir_all_durable` → `capture_source_file` →
+    /// `sync_capture_durable` 这条真实调用链后，从镜像叶子（blob/manifest）
+    /// 一路到"第一个本来就存在的祖先"（`temp.path()`）之间的每一层都被同步
+    /// 过，恰好衔接、不重不漏。这条判例不依赖谁创建了 `data_dir` 之上还是
+    /// 之下这类实现细节，只断言"整条链没有洞"。
+    #[test]
+    fn create_dir_all_durable_and_sync_capture_durable_seam_has_no_gap_positive() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let nested = temp.path().join("nested");
+        let data_dir = nested.join("cass-data");
+        let source_path = temp.path().join("rollout-r4b1-seam.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello r4b1\"}\n").expect("write source");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+
+        // Same order as production: `acquire_index_run_lock` creates
+        // `data_dir` (here simulated directly, since it's `indexer::mod.rs`
+        // machinery this module doesn't otherwise need) BEFORE any capture
+        // ever runs.
+        create_dir_all_durable(&data_dir).expect("create_dir_all_durable");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+        sync_capture_durable(&data_dir, &record).expect("sync_capture_durable");
+
+        set_dir_sync_probe(None);
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        fn walk_up_inclusive(mut dir: PathBuf, stop_at: &Path, into: &mut HashSet<PathBuf>) {
+            loop {
+                into.insert(dir.clone());
+                if dir == stop_at {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+        // Every level from `temp.path()` (the first pre-existing ancestor)
+        // down to `data_dir` -- this is `create_dir_all_durable`'s half.
+        let mut expected: HashSet<PathBuf> = HashSet::new();
+        expected.insert(nested.clone());
+        expected.insert(temp.path().to_path_buf());
+        // `sync_capture_durable`'s half: data_dir itself and everything
+        // below (unchanged mechanism from R1-B3/R2-B5/R3-B1).
+        expected.insert(data_dir.clone());
+        expected.insert(raw_mirror_dir.clone());
+        let blob_leaf_dir = v1_dir.join(&record.blob_relative_path).parent().expect("blob path has a parent").to_path_buf();
+        let manifest_leaf_dir = v1_dir.join(&record.manifest_relative_path).parent().expect("manifest path has a parent").to_path_buf();
+        walk_up_inclusive(blob_leaf_dir, &v1_dir, &mut expected);
+        walk_up_inclusive(manifest_leaf_dir, &v1_dir, &mut expected);
+
+        let synced = synced.lock().unwrap();
+        let observed: HashSet<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(temp.path()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "seam judge: the union of what create_dir_all_durable synced (data_dir and its newly \
+             built ancestors' parents) and what sync_capture_durable synced (data_dir down to the \
+             mirror leaves) must exactly equal every directory level from the mirror leaves up to \
+             the first pre-existing ancestor -- no gap at the data_dir boundary, no double-sync \
+             beyond it; synced dirs: {synced:?}"
         );
     }
 

@@ -4203,7 +4203,12 @@ pub(crate) fn acquire_index_run_lock(
     db_path: &Path,
     mode: SearchMaintenanceMode,
 ) -> Result<IndexRunLockGuard> {
-    fs::create_dir_all(data_dir)
+    // R4-B1 (任务书 #120a): this can be `data_dir`'s very first creation for
+    // this run -- `crate::raw_mirror::create_dir_all_durable` fsyncs the
+    // parent of every ancestor it actually creates, so `data_dir`'s own
+    // directory entry is durable before anything else in this run (capture,
+    // sync_capture_durable, DB commit) can happen.
+    crate::raw_mirror::create_dir_all_durable(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
     let lock_path = data_dir.join("index-run.lock");
     let file = OpenOptions::new()
