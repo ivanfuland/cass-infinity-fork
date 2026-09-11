@@ -616,10 +616,25 @@ def run_compare(jsonl_path: str, db_path: str, buckets_path: Optional[str]) -> i
             bucket_doc = json.load(f)
         buckets = bucket_doc["buckets"] if "buckets" in bucket_doc else bucket_doc
         diff_id_set = set(diff_ids)
+        all_ids = {str(rec["message_id"]) for rec in records}
+        # "unclassified" is recomputed here rather than trusted from the
+        # buckets file: the file's own "unclassified" entry is a stale,
+        # separately-authored list (may be empty even when ids outside the
+        # named buckets exist), so trusting it breaks the invariant
+        # `total diffs == sum(named buckets) + unclassified`. Recomputing
+        # as "ids in this jsonl not covered by any named bucket" keeps that
+        # invariant true regardless of what the buckets file says.
+        covered_ids: set[str] = set()
         for name, ids in buckets.items():
+            if name == "unclassified":
+                continue
             id_set = {str(i) for i in ids}
+            covered_ids |= id_set
             n_diff = len(id_set & diff_id_set)
             print(f"bucket={name} diffs={n_diff}/{len(id_set)}")
+        unclassified_ids = all_ids - covered_ids
+        n_diff = len(unclassified_ids & diff_id_set)
+        print(f"bucket=unclassified diffs={n_diff}/{len(unclassified_ids)}")
 
     if precondition_error or sha_mismatch > 0:
         return 2
