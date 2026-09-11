@@ -150,22 +150,43 @@ _LINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\n]*)\)")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 
+def _strip_bold_markers(line: str) -> str:
+    # R4 step 1 (v3): literal removal of every "**" and "__" run
+    # (bold/strong markers), unconditionally, anywhere in the line --
+    # before the neighbor rule below runs on whatever single `*`/`_`
+    # characters remain. Mirrors Rust's `result.replace("**", "");
+    # result.replace("__", "");` in fs_strip_markdown_line, which runs
+    # before fs_strip_italic_underscores. Pre-v3 the judge had no such
+    # step; it relied on the old (backwards) neighbor rule below to
+    # incidentally strip "**" too -- see _strip_emphasis_chars.
+    return line.replace("**", "").replace("__", "")
+
+
 def _strip_emphasis_chars(line: str) -> str:
-    # `*` / `_` are stripped per-character (NOT as paired `**text**` /
-    # `_text_` spans) UNLESS both immediate neighbors are alphanumeric, in
-    # which case the character is kept literally (protects identifier-style
-    # tokens like `snake_case` or `a*b` from being mangled). Decided on
-    # both neighbors of the *original* line so a run like `**` strips fully
-    # regardless of the two chars' mutual (non-alnum) adjacency.
+    # R4 step 2 (v3): a single remaining `*`/`_` character is an
+    # opening/closing emphasis marker -- and deleted -- only when *exactly
+    # one* immediate neighbor (a missing neighbor at line start/end counts
+    # as "not alphanumeric") is alphanumeric; when both neighbors are
+    # alphanumeric, or neither is, the marker is kept (protects
+    # identifier-style tokens like `snake_case` or `a*b`, and also leaves
+    # e.g. a bare `*` bullet marker flanked by punctuation/whitespace on
+    # both sides untouched).
+    #
+    # Pre-v3 this was backwards: "keep only if BOTH neighbors alphanumeric,
+    # drop otherwise" -- which wrongly dropped the character in the
+    # "neither neighbor alphanumeric" case too (e.g. a lone `*` between two
+    # spaces). Flipped here: delete iff left_alnum != right_alnum.
     n = len(line)
     out = []
     for i, ch in enumerate(line):
         if ch in ("*", "_"):
             left = line[i - 1] if i > 0 else ""
             right = line[i + 1] if i + 1 < n else ""
-            if left.isalnum() and right.isalnum():
-                out.append(ch)
-            # else: dropped
+            left_alnum = left.isalnum()
+            right_alnum = right.isalnum()
+            if left_alnum != right_alnum:
+                continue  # exactly one side alphanumeric: delete
+            out.append(ch)  # both or neither alphanumeric: keep
         else:
             out.append(ch)
     return "".join(out)
@@ -221,9 +242,13 @@ def _strip_paired_backticks(line: str) -> str:
 
 
 def _strip_inline_markdown(line: str) -> str:
-    # Order: links first (so bracket/paren text isn't mistaken for emphasis
-    # markers), then emphasis chars, then paired backticks.
+    # Order (unchanged this commit -- R5's full reorder is a later, separate
+    # commit): links first (so bracket/paren text isn't mistaken for
+    # emphasis markers), then bold-marker literal removal + single */_
+    # neighbor rule (R4's two sub-steps, always adjacent to each other),
+    # then paired backticks.
     line = _LINK_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}", line)
+    line = _strip_bold_markers(line)
     line = _strip_emphasis_chars(line)
     line = _strip_paired_backticks(line)
     return line
@@ -534,6 +559,33 @@ def _selftest_normalize_examples() -> None:
     _assert(
         normalize("``a`b``") == "a`b",
         "R3: two length-2 runs pair with each other, middle length-1 run kept literal",
+    )
+    # R4 (v3): flipped neighbor rule for single `*`/`_` (both engines agree
+    # on the word-boundary case; the fix is the "both non-alnum" case).
+    _assert(normalize("*bold*") == "bold", "R4: word-boundary case (regression pin)")
+    _assert(
+        normalize("a*b") == "a*b",
+        "R4: both neighbors alphanumeric -- preserved (was wrongly stripped)",
+    )
+    _assert(
+        normalize("5*3") == "5*3",
+        "R4: shell-arithmetic-shaped, both neighbors digits -- preserved",
+    )
+    # R4 step 1: a lone `*` flanked by non-alnum on both sides (line
+    # start/end, or punctuation/whitespace) is now correctly kept, not
+    # dropped -- the mutation-sensitive case that the old backwards rule
+    # got wrong ("neither alnum" fell into its "else: dropped" branch).
+    _assert(
+        normalize("  * bullet") == "* bullet",
+        "R4: bare `*` bullet marker (neither neighbor alnum) preserved",
+    )
+    # R4 step 1 necessity: without literal "**"/"__" removal running FIRST,
+    # the flipped neighbor rule alone would keep "**x**"'s outer `*`s
+    # (each one's only neighbor is the other `*`, non-alnum on both sides
+    # -> "neither alnum" -> kept), producing the wrong "*x*" instead of "x".
+    _assert(
+        normalize("**x**") == "x",
+        "R4 step1: bold-literal removal must run before the neighbor rule",
     )
 
 
