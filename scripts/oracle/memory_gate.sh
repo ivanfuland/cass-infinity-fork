@@ -395,27 +395,20 @@ PYEOF
 
 assert_sources_toml_only_lists_fixture_root() {
   # $1=XDG_CONFIG_HOME $2=fixture_dir
+  # T4-F7 (#122b-3): normal mode both exports HOME=$fixture_dir (Claude
+  # Code connector auto-discovery) AND used to require an explicit
+  # [[sources]] entry here -- both discovery paths scanned the same tree,
+  # double-ingesting the fixture (#122b-2 exec112: conversations=2,
+  # messages=20,000 against a 10,000-message manifest). This now asserts
+  # the opposite: sources.toml must declare ZERO [[sources]] tables, so
+  # normal mode relies solely on HOME=$fixture_dir auto-discovery.
   local xdg="$1" fixture_dir="$2"
   local toml="$xdg/cass/sources.toml"
   [ -f "$toml" ] || { echo "memory_gate: $toml not found before running the gate" >&2; return 2; }
-  python3 - "$toml" "$fixture_dir" <<'PYEOF'
-import re
-import sys
-
-toml_path, fixture_dir = sys.argv[1:3]
-text = open(toml_path).read()
-paths = re.findall(r'^\s*paths\s*=\s*\[(.*?)\]', text, re.MULTILINE | re.DOTALL)
-entries = []
-for block in paths:
-    entries.extend(re.findall(r'"([^"]*)"', block))
-bad = [p for p in entries if not p.startswith(fixture_dir)]
-if bad:
-    print(f"memory_gate: sources.toml lists paths outside the fixture root {fixture_dir}: {bad}", file=sys.stderr)
-    sys.exit(2)
-if not entries:
-    print(f"memory_gate: sources.toml declares no paths under {fixture_dir}", file=sys.stderr)
-    sys.exit(2)
-PYEOF
+  if grep -qE '^[[:space:]]*\[\[sources\]\]' "$toml"; then
+    echo "memory_gate: $toml declares [[sources]] entries -- normal mode relies solely on HOME=$fixture_dir auto-discovery (T4-F7), remove them" >&2
+    return 2
+  fi
 }
 
 ingested_sessions_of() {
@@ -530,6 +523,16 @@ with open(path, "w") as f:
     f.write("\n")
 print(json.dumps(obj))
 PYEOF
+
+# T4-F7 (#122b-3): the fixture generator (examples/w4_memory_fixture.rs R2)
+# writes exactly one session file per shape -- HOME-based auto-discovery
+# must therefore see exactly one session regardless of shape. This is a
+# structural fact of the fixture layout, not a manifest/config value.
+expected_sessions=1
+if [ "$ingested" != "$expected_sessions" ]; then
+  echo "memory_gate: stage 1 ingested_sessions=$ingested, expected=$expected_sessions (T4-F7)" >&2
+  overall_rc=1
+fi
 
 budget2=$(budget_for index_force_rebuild) || exit 2
 run_stage "$shape" "index_force_rebuild" "$budget2" "" "$binary_sha256" "$fixture_sha256" \
