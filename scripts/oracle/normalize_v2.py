@@ -208,8 +208,11 @@ def _strip_paired_backticks(line: str) -> str:
     # R3 (v3): a run of N consecutive backticks pairs with the *next* run of
     # exactly N consecutive backticks encountered scanning forward (any
     # non-backtick content, and any differently-sized run, may sit between
-    # them); both runs are deleted, content between kept verbatim. A run
-    # with no same-length partner later in the line is left untouched.
+    # them); both runs are deleted. Pairing is global over the line, not
+    # nested: scanning continues with the next unclaimed run, which may lie
+    # *between* the pair just claimed, so inner same-length runs pair among
+    # themselves too (``a`b`c`` -> abc). A run with no same-length partner
+    # later in the line is left untouched.
     # Mirrors Rust's `fs_strip_paired_backticks`: collect runs first, then
     # walk with `idx += 1` only (never `idx = j + 1`), relying on
     # `delete[idx]` to short-circuit runs already claimed as a partner.
@@ -1011,7 +1014,12 @@ def run_compare(
         # named buckets exist), so trusting it breaks the invariant
         # `total diffs == sum(named buckets) + unclassified`. Recomputing
         # as "ids in this jsonl not covered by any named bucket" keeps that
-        # invariant true regardless of what the buckets file says.
+        # invariant true regardless of what the buckets file says -- but
+        # only when the named buckets are pairwise disjoint (R5-N9): an id
+        # in two buckets is counted once in `total` and once per bucket
+        # below. The T3 gate's 216-example classification file is disjoint
+        # (six buckets, 100 ids, union 100). For any other buckets file the
+        # per-bucket lines are a breakdown, not a checksum.
         covered_ids: set[str] = set()
         for name, ids in buckets.items():
             if name == "unclassified":

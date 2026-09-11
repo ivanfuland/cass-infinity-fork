@@ -1549,9 +1549,12 @@ See [docs](http://docs.rs) for more.
         // 4 spaces exceeds R1's <=3 tolerance -- this codebase does not
         // implement CommonMark indented-code-block recognition, so a >3
         // space line still falls through to ordinary per-line stripping
-        // (same as v2's column-0 rule did for any indent at all). Not a
-        // v2/v3 diff -- a boundary check that R1's tolerance is exactly
-        // <=3, not unlimited.
+        // (same as v2's column-0 rule did for any indent at all). The
+        // *recognition* is therefore not a v2/v3 diff -- this is a
+        // boundary check that R1's tolerance is exactly <=3, not
+        // unlimited. The final output does still differ from v2, via R3
+        // rather than R1: v2 deleted the lone backtick runs
+        // unconditionally, v3 keeps them (asserted below).
         let text = "    ```\nbody\n    ```\nafter";
         let canonical = canonicalize_for_embedding(text);
         assert!(canonical.contains("body"));

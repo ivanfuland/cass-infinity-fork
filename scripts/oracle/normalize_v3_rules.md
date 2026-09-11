@@ -25,9 +25,14 @@ Every example below marked "verified" was produced by actually running
 `canonicalize_for_embedding` against the stated input -- the "v2 output"
 lines against the pre-D commit of this same task (still v2), the "v3
 output" lines against the post-D commit (v3), neither hand-computed. A
-handful of R2/R4 examples say "v3 target: unchanged" instead of "v3
-output": those inputs' v2 and v3 output are identical, so the v2 line
-above them already is the verified v3 value too.
+handful of examples say "v3 target: unchanged" instead of "v3 output".
+The word is overloaded (R5-N14): in the R2 over-strip examples
+(`#!/usr/bin/env bash`, `#76`, seven `#`s) it means v3 leaves the *input*
+unchanged -- the v3 output equals the input and therefore *differs* from
+the v2 output shown above it; in the R3 `` `code` `` example it means the
+v3 output is unchanged *from v2*. In every case the value written after
+"unchanged," is the v3 output, judge-verified post-#121b (the judge is
+aligned to Rust at 216/216 and 5,000/5,000 diffs=0).
 
 ## ① NFC Unicode normalization
 
@@ -71,8 +76,14 @@ followed immediately by `` ``` `` -- CommonMark's own fence-indentation
 tolerance. v2 required the fence marker at column 0 exactly
 (`line.starts_with("```")`), so an indented fence line fell through to
 ordinary per-line stripping instead of toggling the code-block state. The
-fence line itself is dropped either way; code-block content is kept
-verbatim, line by line, once the state is on.
+fence line itself is dropped either way; while the state is on, stage ②
+passes code-block lines through without any markdown stripping. That is a
+stage-② statement only (R5-N14): stage ③ still collapses intra-line
+whitespace and trims those lines (judge-verified: `"```\n  a    b\n```"` →
+`"a b"`), and a fence line indented by 4 or more spaces is not a fence at
+all -- it falls through to ordinary per-line stripping, where R3 leaves
+its lone backtick run in place (see the R1 boundary test in
+`canonicalize.rs`).
 
 - Input: `" \`\`\`\nindented fence body\n \`\`\`\nafter"` (fence markers
   indented by 1 space)
@@ -150,9 +161,16 @@ wrong in two independent directions:
 Within a line, a run of N consecutive backticks pairs with the *next* run
 of exactly N consecutive backticks encountered scanning forward (any
 non-backtick content, and any differently-sized backtick run, may sit
-between them); both runs are deleted and the content between them is kept
-verbatim. A run with no same-length partner later in the line is left
-untouched, backticks included. **This is only equal-length run pairing** --
+between them); both runs are deleted. Pairing is global over the line, not
+nested: after a pair is claimed, scanning continues with the next
+still-unclaimed run -- including runs that sit *between* the pair just
+claimed -- so those inner runs may pair among themselves and be deleted
+too. Non-backtick content between paired runs is kept as-is, but the
+region is not protected from further pairing: `` ``a`b`c`` `` → `abc`
+(the two length-2 runs pair, then the two inner length-1 runs pair with
+each other; judge-verified, Rust uses the same walk). A run with no
+same-length partner later in the line is left untouched, backticks
+included. **This is only equal-length run pairing** --
 it is deliberately not full CommonMark inline-code-span semantics (no
 leading/trailing single-space stripping inside the span, no backslash
 escaping rules); if a future need turns up requiring that fuller semantics,
@@ -261,8 +279,11 @@ among others.
     regular space like any other whitespace.
 
 任务书 #121b switched the judge from an ASCII-only whitespace class to a
-per-character `ch.isspace()` test, matching Rust's scope. Judge-verified
-(post-#121b): `normalize("a\u{00A0}b")` → `"a b"`, matching Rust.
+per-character `ch.isspace()` test, which approximates Rust's
+`char::is_whitespace()` scope but is not identical to it (see the known
+edge case below: U+001C–U+001F are whitespace to Python and not to Rust).
+Judge-verified (post-#121b): `normalize("a\u{00A0}b")` → `"a b"`, matching
+Rust on this input.
 
 Known edge case (still open, not designed around): Python's
 `str.isspace()` returns `True` for U+001C–U+001F (the four "information
@@ -323,8 +344,11 @@ a message reaches `canonicalize()` at all).
 ## ⑤ No truncation, no code-block collapsing, no base64/binary stripping
 
 Unchanged from v2: the ingest pipeline has no length cap, and fenced code
-block content is kept verbatim, line by line (only the fence marker lines
-themselves are dropped, per R1's recognition rule above). Nothing that
+block lines pass through stage ② without markdown stripping (only the
+fence marker lines themselves are dropped, per R1's recognition rule
+above) -- stage ③'s whitespace collapse and trim still apply to them, so
+"verbatim" here means "no markdown stripping", not "byte-identical"
+(R5-N14). Nothing that
 looks like base64 or binary data is stripped or altered by any stage.
 
 - Input: a fenced block of 35 lines, `L1`..`L35`
