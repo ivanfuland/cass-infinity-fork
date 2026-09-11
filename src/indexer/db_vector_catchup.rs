@@ -93,6 +93,20 @@ pub struct DbVectorCatchupReport {
     /// non-zero value means this run itself did reconciliation work, not
     /// that anything is wrong.
     pub chunks_pruned: u64,
+    /// T4 mission #122a-R1 (R1-2): [`reconcile_touched_messages`]'s own
+    /// `expected_recomputed` counter -- a scanned zero-chunk message whose
+    /// content changed (canonicalize-empty -> real content, or vice versa)
+    /// since this run's up-front scan. Previously discarded entirely
+    /// (`_expected_recomputed` at the call site) with only a `tracing`
+    /// line as evidence; `0` on the common case.
+    pub expected_recomputed: u64,
+    /// T4 mission #122a-R1 (R1-2): [`reconcile_touched_messages`]'s own
+    /// `set_mismatch` counter -- a touched message whose up-front snapshot
+    /// had a non-empty chunk-block set that no longer matches a fresh
+    /// recompute (spec §四.4's cheap cross-check, "a defense line, not a
+    /// proof of mutual exclusion"). Previously discarded entirely; `0` on
+    /// the common case.
+    pub set_mismatch: u64,
     /// T8: `chunk_holes` rows written off with disposition
     /// `WriteOffIndexBeyondExpected` (the hole's `chunk_idx` is no longer
     /// covered by the message's current expected-chunk count).
@@ -436,6 +450,22 @@ fn assert_drain_completed_or_bail(storage: &FrankenStorage, generation_id: i64) 
 /// be missing under normal operation -- an error here is a genuine
 /// invariant violation, not a race to paper over.
 fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, String, String)> {
+    // T4 mission #122a-R1 (R1-1): counts *every* call to this function made
+    // while `DRAIN_PHASE` is set, regardless of call site -- unlike the
+    // pre-R1 form (a manual `fetch_add` at the drain loop's one intended
+    // call site), this can't be fooled by a reintroduced *second* call
+    // from inside the drain loop's `Embed` branch (control plane's own
+    // adversarial probe: a bare extra `load_message_once(...)?;` that
+    // doesn't touch any counter itself). `DRAIN_PHASE` is toggled true for
+    // exactly the drain loop's duration in `run_db_vector_catchup_
+    // backfill` below, false again before reverse-reconciliation runs, so
+    // reconciliation's own `load_message_once` calls (via `recompute_
+    // expected_for_touched_message`) -- and the ownership audit's, and
+    // generation lookup's -- are correctly excluded.
+    #[cfg(test)]
+    if DRAIN_PHASE.load(std::sync::atomic::Ordering::Relaxed) {
+        LOAD_MESSAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     storage
         .raw()
         .query_row_map(
@@ -1494,6 +1524,58 @@ fn reconcile_touched_messages(
     Ok((chunks_pruned, expected_recomputed, set_mismatch))
 }
 
+/// T4 mission #122a-R1 (R1-2): the one up-front, whole-corpus scan
+/// `run_db_vector_catchup_backfill` needs before it can seed holes for a
+/// brand-new generation or reverse-reconcile touched messages against
+/// current reality -- extracted to its own function so the "every scanned
+/// message gets a key in `expected_by_message`, zero-chunk ones included"
+/// invariant (§〇.2) is directly unit-testable against a real scan,
+/// instead of only through a hand-built `HashMap` that a caller could get
+/// away with never actually producing this way in production.
+///
+/// Returns `(all_expected, expected_by_message)`: `all_expected` is every
+/// `ExpectedChunk` the scan produced, in scan order (consumed by `find_
+/// reusable_or_create_generation` and staging reuse/purge); `expected_by_
+/// message` is the same chunks grouped by `message_id`, with a key for
+/// **every** message the scan visited -- including a zero-chunk one
+/// (canonicalize-empty content, or a role outside the embedding
+/// whitelist), whose value is an empty `Vec` rather than a missing key.
+/// [`reconcile_touched_messages`] depends on that distinction: a missing
+/// key means "never in this scan" (R1-B1, a message touched only after
+/// the scan already ran), not "scanned and found to have zero chunks".
+fn scan_expected_snapshot(storage: &FrankenStorage) -> Result<(Vec<ExpectedChunk>, HashMap<i64, Vec<ExpectedChunk>>)> {
+    let mut all_expected: Vec<ExpectedChunk> = Vec::new();
+    let mut expected_by_message: HashMap<i64, Vec<ExpectedChunk>> = HashMap::new();
+    crate::search::eligibility::for_each_expected_chunk_with_messages(
+        storage,
+        200,
+        |c| {
+            all_expected.push(c);
+            Ok(())
+        },
+        |message_id| {
+            expected_by_message.entry(message_id).or_default();
+            Ok(())
+        },
+    )?;
+    // Task book #98 Step 2: index `all_expected` by `message_id` exactly
+    // once here, up front, so the reverse-reconciliation pass below (which
+    // used to do a full `all_expected.iter().filter(...)` linear scan per
+    // touched message -- O(touched_message_ids.len() * all_expected.len()),
+    // multiple minutes/hours at T12's real scale of ~1.35M touched
+    // messages against ~2M expected chunks) is O(touched) instead: one
+    // O(1)-amortized `HashMap` lookup per touched message. Behavior is
+    // unchanged -- same expected set per message_id, same prune/keep
+    // decisions -- only the algorithmic cost of assembling it moves from
+    // per-lookup-linear-scan to a single up-front `O(all_expected.len())`
+    // index build (also reused by nothing else; `find_reusable_or_create_
+    // generation`'s own use of `all_expected` stays a plain slice).
+    for c in &all_expected {
+        expected_by_message.entry(c.message_id).or_default().push(c.clone());
+    }
+    Ok((all_expected, expected_by_message))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_db_vector_catchup_backfill(
     storage: &FrankenStorage,
@@ -1520,46 +1602,7 @@ pub fn run_db_vector_catchup_backfill(
     // documented gaps this reordering carries). Still computed exactly
     // once and reused for both purposes (staging reuse/purge below, and
     // the reverse-reconciliation pass at the end of this function).
-    let mut all_expected: Vec<ExpectedChunk> = Vec::new();
-    let mut expected_by_message: HashMap<i64, Vec<ExpectedChunk>> = HashMap::new();
-    // T4 mission #122a (§〇.2): `expected_by_message` must carry a key for
-    // every message this scan visits, not just the ones that produced at
-    // least one chunk -- a zero-chunk message (canonicalize-empty content,
-    // or a role outside the embedding whitelist) needs `Some(&[])` from
-    // `reconcile_touched_messages`' snapshot lookup below, distinct from
-    // `None` ("this message was never in the scan at all", R1-B1's
-    // concurrent-touch case). `for_each_expected_chunk_with_messages`'
-    // `on_message` callback fires once per scanned message *before* that
-    // message's zero-or-more chunk callbacks (see its own definition in
-    // `eligibility.rs`), so seeding the key here always lands before any
-    // of that message's chunks would need it.
-    crate::search::eligibility::for_each_expected_chunk_with_messages(
-        storage,
-        200,
-        |c| {
-            all_expected.push(c);
-            Ok(())
-        },
-        |message_id| {
-            expected_by_message.entry(message_id).or_default();
-            Ok(())
-        },
-    )?;
-    // Task book #98 Step 2: index `all_expected` by `message_id` exactly
-    // once here, up front, so the reverse-reconciliation pass below (which
-    // used to do a full `all_expected.iter().filter(...)` linear scan per
-    // touched message -- O(touched_message_ids.len() * all_expected.len()),
-    // multiple minutes/hours at T12's real scale of ~1.35M touched
-    // messages against ~2M expected chunks) is O(touched) instead: one
-    // O(1)-amortized `HashMap` lookup per touched message. Behavior is
-    // unchanged -- same expected set per message_id, same prune/keep
-    // decisions -- only the algorithmic cost of assembling it moves from
-    // per-lookup-linear-scan to a single up-front `O(all_expected.len())`
-    // index build (also reused by nothing else; `find_reusable_or_create_
-    // generation`'s own use of `all_expected` below stays a plain slice).
-    for c in &all_expected {
-        expected_by_message.entry(c.message_id).or_default().push(c.clone());
-    }
+    let (all_expected, expected_by_message) = scan_expected_snapshot(storage)?;
 
     let (generation_id, reused_existing_generation, holes_seeded) = find_reusable_or_create_generation(
         storage.raw(),
@@ -1615,6 +1658,12 @@ pub fn run_db_vector_catchup_backfill(
     // is now structurally impossible, not just less likely.
     let mut current: Option<(i64, String, Vec<ExpectedChunk>)> = None; // (message_id, normalized_text, expected)
     let mut page_number: u64 = 0;
+    // T4 mission #122a-R1 (R1-1): brackets exactly the drain loop's own
+    // `load_message_once` calls (from wherever inside it they're made) for
+    // `LOAD_MESSAGE_CALLS`; cleared below before reverse-reconciliation
+    // (and everything after it) runs.
+    #[cfg(test)]
+    DRAIN_PHASE.store(true, std::sync::atomic::Ordering::Relaxed);
     loop {
         let page_started = std::time::Instant::now();
         let keys = fetch_hole_keys(storage, generation_id, after, batch_size)?;
@@ -1642,8 +1691,6 @@ pub fn run_db_vector_catchup_backfill(
             touched_message_ids.insert(key.message_id);
             if current.as_ref().map(|(mid, _, _)| *mid) != Some(key.message_id) {
                 let (conversation_id, role, content) = load_message_once(storage, key.message_id)?;
-                #[cfg(test)]
-                LOAD_MESSAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 messages_loaded += 1;
                 let normalized = crate::search::eligibility::normalized_for_chunks(&content);
                 let expected = if canonical_role(&role).is_none() {
@@ -1791,6 +1838,8 @@ pub fn run_db_vector_catchup_backfill(
         }
     }
 
+    #[cfg(test)]
+    DRAIN_PHASE.store(false, std::sync::atomic::Ordering::Relaxed);
     let holes_remaining_after_drain = assert_drain_completed_or_bail(storage, generation_id)?;
     emit_drain_event(&serde_json::json!({"event": "drain_done", "holes": holes_remaining_after_drain}));
 
@@ -1801,7 +1850,7 @@ pub fn run_db_vector_catchup_backfill(
     // "index beyond expected" for a hole that never existed for them).
     #[cfg(test)]
     let __reconciliation_started = std::time::Instant::now();
-    let (chunks_pruned, _expected_recomputed, _set_mismatch) =
+    let (chunks_pruned, expected_recomputed, set_mismatch) =
         reconcile_touched_messages(storage, generation_id, &touched_message_ids, &expected_by_message)?;
     #[cfg(test)]
     RECONCILIATION_LAST_DURATION_NANOS.store(u64::try_from(__reconciliation_started.elapsed().as_nanos()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
@@ -1888,6 +1937,8 @@ pub fn run_db_vector_catchup_backfill(
         cleanup_failures,
         chunks_embedded,
         chunks_pruned,
+        expected_recomputed,
+        set_mismatch,
         holes_written_off_beyond_expected,
         staging_reused,
         staging_purged,
@@ -1959,15 +2010,28 @@ fn slice_chunk_span<'a>(normalized: &'a str, span: &ChunkSpanRef, message_id: i6
     })
 }
 
-/// Test-only direct evidence of how many times the drain loop's `Embed`
-/// branch (and the per-message cache refresh feeding it) called
-/// [`load_message_once`] -- T4 mission #122a (T14-1). Deliberately
-/// **not** incremented by `load_message_once` calls outside the drain
-/// loop (reverse-reconciliation, the ownership audit, generation lookup,
-/// ...): the mission's own assertion is "drain-phase reads == distinct
-/// message count", not "every `load_message_once` call anywhere".
+/// Test-only direct evidence of how many times [`load_message_once`] was
+/// called while [`DRAIN_PHASE`] was set -- T4 mission #122a (T14-1),
+/// tightened by #122a-R1 (R1-1) after control plane's adversarial probe
+/// showed the original form (a manual `fetch_add` at the drain loop's one
+/// *intended* call site, not inside `load_message_once` itself) couldn't
+/// detect a reintroduced second call from the `Embed` branch as long as
+/// that new call didn't also touch the counter -- i.e. it verified "the
+/// cache refresh point runs once per message" but not "the `Embed` branch
+/// never reads again". Counting inside `load_message_once` itself closes
+/// that gap: it counts every call made during the drain phase, from
+/// wherever it's made.
 #[cfg(test)]
 static LOAD_MESSAGE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// T4 mission #122a-R1 (R1-1): true for exactly the drain loop's own
+/// duration in [`run_db_vector_catchup_backfill`] (set before the loop,
+/// cleared before reverse-reconciliation runs) -- gates [`LOAD_MESSAGE_
+/// CALLS`] so reconciliation's, the ownership audit's, and generation
+/// lookup's own `load_message_once` calls are correctly excluded from a
+/// counter whose whole point is "reads during the drain phase specifically".
+#[cfg(test)]
+static DRAIN_PHASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 fn load_message_calls_for_test() -> usize {
@@ -1977,6 +2041,11 @@ fn load_message_calls_for_test() -> usize {
 #[cfg(test)]
 fn reset_load_message_calls_for_test() {
     LOAD_MESSAGE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Defensive: a prior test whose drain panicked mid-loop would have
+    // left `DRAIN_PHASE` stuck `true` (its own `false` store, right after
+    // the loop, never reached) -- reset it here too so that leftover
+    // state can't silently make *this* test over-count.
+    DRAIN_PHASE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 
@@ -3262,6 +3331,31 @@ mod chunk_catchup_v5_tests {
         assert_eq!(recomputed, 1, "a keyed zero-chunk snapshot whose fresh recompute is non-empty must count as recomputed");
         assert_eq!(set_mismatch, 0, "an empty snapshot entry takes the zero-chunk branch, not the set-comparison branch");
         assert_eq!(pruned, 0, "nothing was ever stored for this message (genesis, no backfill run), so nothing to prune");
+    }
+
+    /// T4 mission #122a-R1 (R1-2): `run_db_vector_catchup_backfill`'s own
+    /// production scan (`scan_expected_snapshot`) -- not a hand-built map
+    /// like the B②/B③ tests above use -- must actually seed `expected_by_
+    /// message` with a key for a zero-chunk message. Control plane's own
+    /// probe (deleting the `on_message` seeding line at the scan's call
+    /// site) left `indexer::db_vector_catchup::` fully green because
+    /// nothing exercised the real scan's message-to-map wiring end to end;
+    /// this closes that gap.
+    #[test]
+    fn scan_expected_snapshot_keys_zero_chunk_messages() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let zero_ids = insert_conversation_with_role(&storage, "t4-122a-r1-2-zero", "reasoning", "a reasoning trace that would chunk if the role were eligible");
+        let normal_ids = insert_conversation(&storage, "t4-122a-r1-2-normal", &["a normal message with plenty of real content to embed and chunk cleanly"]);
+        let zero_id = zero_ids[0];
+        let normal_id = normal_ids[0];
+
+        let (all_expected, expected_by_message) = scan_expected_snapshot(&storage).unwrap();
+
+        assert_eq!(expected_by_message.len(), 2, "both messages must have a key, zero-chunk included: {expected_by_message:?}");
+        assert_eq!(expected_by_message.get(&zero_id), Some(&Vec::new()), "the zero-chunk message's key must map to an empty Vec, not be absent from the map entirely");
+        assert!(expected_by_message.get(&normal_id).is_some_and(|v| !v.is_empty()), "the normal message must have its real chunks");
+        assert!(all_expected.iter().all(|c| c.message_id == normal_id), "all_expected must only contain the normal (non-zero-chunk) message's chunks: {all_expected:?}");
     }
 
     /// T4 mission #122a (D): `OWNERSHIP_COSINE_MIN` must actually gate the
