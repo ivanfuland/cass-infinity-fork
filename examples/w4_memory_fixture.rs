@@ -24,13 +24,30 @@
 //! qr,encryption,infinity --example w4_memory_fixture -- --shape a --out
 //! <dir>`. Exit codes: 0 always on a completed generation (this is a data-
 //! generation tool, not a pass/fail gate); 2 precondition error (bad
-//! `--shape`, or `--out`'s parent directory does not exist).
+//! `--shape`, `--out`'s parent directory does not exist, or `--out` already
+//! holds a frozen `manifest.json` -- the fixture-freeze contract from
+//! #122b-1: a fixture that already has a manifest is never silently
+//! overwritten with a different byte layout while `memory_gate.sh`'s P0
+//! baseline still references its old `fixture_sha256`).
+//!
+//! #122b-1 (spec v4.5 §四.3 / plan "内存门" row): also writes
+//! `<out>/manifest.json`, the frozen record `memory_gate.sh` reads instead
+//! of querying a live db for `max_message_bytes` -- `{shape, messages,
+//! total_bytes, max_message_bytes, fixture_sha256, stage_merge,
+//! min_stage_ms}`. `fixture_sha256` is the sha256 of every `.jsonl` file
+//! under `<out>` concatenated in path-sorted order (this generator emits a
+//! single file per shape today; the sort-then-concatenate contract is
+//! written for whenever that changes, not as speculative multi-file
+//! support -- no other multi-file plumbing exists here). `stage_merge`
+//! defaults to `[]` and `min_stage_ms` to 200; both are P0-collection-time
+//! decisions (#122b-2/3), not decided by this generator.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, ValueEnum};
 use coding_agent_search::sources::config::SourceDefinition;
+use sha2::{Digest, Sha256};
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -50,6 +67,65 @@ enum Shape {
     A,
     B,
     C,
+}
+
+/// #122b-1: the frozen fixture record `memory_gate.sh` reads instead of
+/// querying a live db for `max_message_bytes`. `stage_merge`/`min_stage_ms`
+/// are P0-collection-time decisions (#122b-2/3); this generator only writes
+/// the defaults (`[]` / 200) it is authoritative for.
+#[derive(serde::Serialize)]
+struct FixtureManifest {
+    shape: String,
+    messages: usize,
+    total_bytes: usize,
+    max_message_bytes: usize,
+    fixture_sha256: String,
+    stage_merge: Vec<serde_json::Value>,
+    min_stage_ms: u64,
+}
+
+/// All `.jsonl` files under `root`, sorted by path. This generator writes
+/// one file per shape today; the sort is here so `fixture_sha256`'s
+/// "concatenate in path-sorted order" contract holds if that ever changes,
+/// not as speculative multi-file support.
+fn collect_jsonl_files_sorted(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn fixture_sha256(root: &Path) -> anyhow::Result<String> {
+    let mut hasher = Sha256::new();
+    for path in collect_jsonl_files_sorted(root) {
+        hasher.update(std::fs::read(&path)?);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_manifest(out: &Path, shape: Shape, messages: usize, total_bytes: usize, max_message_bytes: usize) -> anyhow::Result<()> {
+    let manifest = FixtureManifest {
+        shape: format!("{shape:?}").to_lowercase(),
+        messages,
+        total_bytes,
+        max_message_bytes,
+        fixture_sha256: fixture_sha256(out)?,
+        stage_merge: Vec::new(),
+        min_stage_ms: 200,
+    };
+    std::fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
+    Ok(())
 }
 
 /// One message's target byte length, for a batch to be written together.
@@ -126,11 +202,12 @@ fn make_content(byte_len: usize, seed: usize) -> String {
 /// the cap (confirmed via the real `original_bytes=<full size>` value in
 /// that WARN log line), which is the actual memory-pressure scenario this
 /// shape exists to reproduce.
-fn write_shape(out: &Path, shape: Shape) -> anyhow::Result<(usize, usize)> {
+fn write_shape(out: &Path, shape: Shape) -> anyhow::Result<(usize, usize, usize)> {
     let proj_dir = out.join(".claude").join("projects").join(format!("mem-fixture-{shape:?}").to_lowercase());
     std::fs::create_dir_all(&proj_dir)?;
 
     let plans = plan_for_shape(shape);
+    let max_message_bytes = plans.iter().map(|p| p.byte_len).max().unwrap_or(0);
     let path = proj_dir.join("session-000000.jsonl");
     let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
     let mut global_idx = 0usize;
@@ -157,7 +234,7 @@ fn write_shape(out: &Path, shape: Shape) -> anyhow::Result<(usize, usize)> {
     }
     f.flush()?;
 
-    Ok((total_messages, total_bytes))
+    Ok((total_messages, total_bytes, max_message_bytes))
 }
 
 fn write_sources_toml(out: &Path) -> anyhow::Result<()> {
@@ -170,6 +247,12 @@ fn write_sources_toml(out: &Path) -> anyhow::Result<()> {
 }
 
 fn run(shape: Shape, out: &Path) -> (i32, String) {
+    if out.join("manifest.json").is_file() {
+        return (
+            2,
+            format!("precondition error: fixture already frozen (manifest.json exists) at {}: refusing to overwrite", out.display()),
+        );
+    }
     let parent_missing = match out.parent() {
         Some(p) if !p.as_os_str().is_empty() => !p.exists(),
         _ => false,
@@ -182,16 +265,19 @@ fn run(shape: Shape, out: &Path) -> (i32, String) {
     }
     match write_shape(out, shape) {
         Err(e) => (2, format!("precondition error: {e:#}")),
-        Ok((total_messages, total_bytes)) => match write_sources_toml(out) {
+        Ok((total_messages, total_bytes, max_message_bytes)) => match write_sources_toml(out) {
             Err(e) => (2, format!("precondition error writing sources.toml: {e:#}")),
-            Ok(()) => (
-                0,
-                format!(
-                    "memory_fixture: shape={shape:?} out={} messages={total_messages} total_bytes={total_bytes} ({:.2} MiB)",
-                    out.display(),
-                    total_bytes as f64 / MIB as f64
+            Ok(()) => match write_manifest(out, shape, total_messages, total_bytes, max_message_bytes) {
+                Err(e) => (2, format!("precondition error writing manifest.json: {e:#}")),
+                Ok(()) => (
+                    0,
+                    format!(
+                        "memory_fixture: shape={shape:?} out={} messages={total_messages} total_bytes={total_bytes} ({:.2} MiB) max_message_bytes={max_message_bytes}",
+                        out.display(),
+                        total_bytes as f64 / MIB as f64
+                    ),
                 ),
-            ),
+            },
         },
     }
 }
@@ -230,6 +316,14 @@ mod tests {
         let small = sizes.iter().filter(|&&s| s == KIB).count();
         assert_eq!(small, 9_999, "9,999 exactly-1KiB messages");
         assert!(out.join("sources.toml").is_file());
+
+        let manifest = read_manifest(&out);
+        assert_eq!(manifest["shape"], "a");
+        assert_eq!(manifest["max_message_bytes"], 512 * MIB);
+        assert_eq!(manifest["messages"], 10_000);
+        assert!(manifest["fixture_sha256"].as_str().unwrap().len() == 64, "fixture_sha256 must be a hex sha256");
+        assert_eq!(manifest["stage_merge"], serde_json::json!([]));
+        assert_eq!(manifest["min_stage_ms"], 200);
     }
 
     #[test]
@@ -250,6 +344,10 @@ mod tests {
             }
         }
         assert_eq!(count, 10_000);
+
+        let manifest = read_manifest(&out);
+        assert_eq!(manifest["shape"], "b");
+        assert_eq!(manifest["max_message_bytes"], 200 * KIB);
     }
 
     #[test]
@@ -277,6 +375,10 @@ mod tests {
             total.abs_diff(target) <= tolerance,
             "shape c total {total} must be within 5% of the 2GiB target {target}"
         );
+
+        let manifest = read_manifest(&out);
+        assert_eq!(manifest["shape"], "c");
+        assert_eq!(manifest["max_message_bytes"], 64 * MIB);
     }
 
     #[test]
@@ -288,19 +390,48 @@ mod tests {
     }
 
     fn walkdir_jsonl(root: &Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "jsonl") {
-                    out.push(path);
-                }
-            }
+        super::collect_jsonl_files_sorted(root)
+    }
+
+    fn read_manifest(out: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json must exist after a successful run()");
+        serde_json::from_str(&text).expect("manifest.json must be valid JSON")
+    }
+
+    /// #122b-1 block C: the frozen `max_message_bytes` value must match the
+    /// parameter-freeze table's per-shape figure -- checked via the pure
+    /// `plan_for_shape` computation (no fixture I/O), per the mission's
+    /// "只测 max_message_bytes 计算函数" option, so this doesn't add a new
+    /// 512MiB/2GiB generation on top of the shape_a/b/c tests below (which
+    /// already pay that cost and separately assert the manifest field).
+    /// Mutation: swap `.max()` for `.min()` (or hardcode a wrong constant)
+    /// in `write_shape` -- this test and the shape_a/b/c manifest
+    /// assertions below both go red.
+    #[test]
+    fn shape_max_message_bytes_matches_plan_for_all_shapes() {
+        for (shape, expected) in [(Shape::A, 512 * MIB), (Shape::B, 200 * KIB), (Shape::C, 64 * MIB)] {
+            let got = plan_for_shape(shape).iter().map(|p| p.byte_len).max().unwrap();
+            assert_eq!(got, expected, "{shape:?} max_message_bytes must match the frozen parameter-freeze value");
         }
-        out
+    }
+
+    /// #122b-1 block C: `--out` already holding a `manifest.json` must
+    /// freeze the fixture -- exit 2, no overwrite. Uses a hand-written stub
+    /// manifest (not a real run()) so this test doesn't pay a second full
+    /// generation just to set up the precondition.
+    #[test]
+    fn existing_manifest_freezes_the_fixture_and_refuses_to_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let out = dir.path().join("frozen-fixture");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("manifest.json"), "{}").unwrap();
+
+        let (code, message) = run(Shape::A, &out);
+        assert_eq!(code, 2, "an existing manifest.json must freeze the fixture: {message}");
+        assert_eq!(
+            std::fs::read_dir(&out).unwrap().count(),
+            1,
+            "refusing the overwrite must not have written anything else into the frozen fixture dir"
+        );
     }
 }
