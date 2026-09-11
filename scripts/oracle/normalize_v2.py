@@ -143,7 +143,7 @@ def is_hard_noise(role: Optional[str], text: str) -> bool:
 # spaces, mirroring Rust's `fs_is_fence_marker` (CommonMark's own
 # fence-indentation tolerance). Pre-v3 this required column 0 exactly.
 _FENCE_RE = re.compile(r"^ {0,3}```")  # <=3 leading spaces, mirrors `fs_is_fence_marker`
-_HEADER_RE = re.compile(r"^(\s*)(#{1,6})(\s+)(.*)$")
+_HEADER_RE = re.compile(r"^( {0,3})(#{1,6})( |$)(.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^(\s*)>+\s?(.*)$")
 _LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
 _LINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\n]*)\)")
@@ -439,6 +439,38 @@ def _selftest_normalize_examples() -> None:
     # R7 (v3): Unicode White_Space (e.g. NBSP U+00A0) is collapsible
     # intra-line whitespace, not just the ASCII set.
     _assert(normalize("a b") == "a b", "R7: NBSP folds to a regular space")
+    # R2 (v3): ATX header = <=3 leading spaces, 1-6 `#`, then space-or-EOL.
+    _assert(
+        normalize(" ## docs/m7-arch") == "docs/m7-arch",
+        "R2: under-strip fixed -- indented header now recognized and stripped",
+    )
+    _assert(
+        normalize("#!/usr/bin/env bash") == "#!/usr/bin/env bash",
+        "R2: over-strip fixed -- shebang '#' has no following space, left alone",
+    )
+    _assert(
+        normalize("#76") == "#76",
+        "R2: over-strip fixed -- issue reference has no following space, left alone",
+    )
+    _assert(
+        normalize("####### not a heading") == "####### not a heading",
+        "R2: over-strip fixed -- 7 consecutive #s exceed the 1-6 window, left alone",
+    )
+    _assert(
+        normalize("## Real Heading") == "Real Heading",
+        "R2: already-correct column-0 header regression check",
+    )
+    # R2 known deviation from CommonMark (which allows tab as leading
+    # whitespace): a tab before the `#` run does NOT count as leading
+    # whitespace, matching Rust's `fs_strip_atx_header` (which only trims
+    # literal ' ' bytes) -- so this line is left untouched, not recognized
+    # as a header. This is the one example that actually discriminates the
+    # old `\s*`/`\s+` regex (which treated tab as whitespace and WOULD have
+    # stripped the header here) from the new ' {0,3}'/'( |$)' regex.
+    _assert(
+        normalize("\t## tab-indented") == "## tab-indented",
+        "R2: leading tab does not count as header indentation (known deviation)",
+    )
 
 
 def _selftest_is_hard_noise_empty_and_normal() -> None:
