@@ -18041,36 +18041,42 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_flag_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             assert!(begin_concurrent_writes_enabled());
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_chunk_size_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "7");
             assert_eq!(begin_concurrent_chunk_size(), 7);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_retry_limit_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES", "9");
             assert_eq!(begin_concurrent_retry_limit(), 9);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_writer_cache_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "2048");
             assert_eq!(begin_concurrent_writer_cache_kib(), 2048);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_writer_cache_invalid_defaults() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "0");
             assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_knobs_are_clamped_to_safe_caps() {
             // Pathological values (typos, overflow-adjacent integers) must be
             // clamped, not honored verbatim. Each knob here is exercised at the
@@ -18398,6 +18404,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_persist_writes_all_conversations() {
             use crate::connectors::NormalizedConversation;
 
@@ -18521,6 +18528,7 @@ pub mod persist {
         /// `par_chunks().map()`, so a chunk size smaller than the corpus
         /// drives the peak above 1.
         #[test]
+        #[serial]
         fn begin_concurrent_persist_never_exceeds_one_live_writer_connection() {
             use crate::connectors::NormalizedConversation;
             use crate::storage::api::{reset_writer_connection_peak, writer_connection_peak};
@@ -19143,6 +19151,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn default_serial_batched_hot_path_syncs_fts_lex_domain() {
             // w2 F1 regression: `insert_conversations_batched` is the
             // crate's highest-traffic write path, reached by default (no
@@ -20902,6 +20911,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_disabled_falls_through_to_default() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             assert!(!begin_concurrent_writes_enabled());
@@ -20924,6 +20934,19 @@ mod tests {
     use crate::storage::api::Value as SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    // T4-F1 / #122b-1 invariant: any test in this module (or in
+    // `persist_internal_tests` above, or in `exclusion::tests`) that reads
+    // OR writes process env must carry `#[serial]`. `#[serial]`'s
+    // unnamed/default lock is the one real cross-file lock here -- it is
+    // shared crate-wide by every unnamed `#[serial]` in this binary
+    // regardless of which module or file the test lives in.
+    // `persist_internal_tests`'s own `ENV_LOCK`/`acquire_env_lock` Mutex is
+    // NOT that lock: it only serializes calls within that one nested
+    // module and does nothing to protect against a non-serial test
+    // anywhere else touching the same env key concurrently. The parallel
+    // door is `cargo test --lib -- indexer::` (default threads) 10x all
+    // green; a missing `#[serial]` here is a flake, not a fluke.
 
     fn scratch_db_with_one_message(content_text: &str) -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
@@ -23201,6 +23224,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_orphan_fk_rows_preflight_is_opt_in() {
         {
             let _guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
@@ -23228,6 +23252,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_orphan_fk_rows_skip_does_not_imply_opt_in() {
         let _cleanup_guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
         let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", "1");
@@ -26678,6 +26703,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn streaming_consumer_always_dual_writes_lex_docs_regardless_of_strategy() {
         // W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准):
         // sibling of `batch_index_always_dual_writes_lex_docs_regardless_of_

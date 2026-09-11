@@ -1394,6 +1394,13 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    // T4-F1 / #122b-1 invariant: any test here that reads OR writes
+    // process env (directly, or via a function that does, e.g.
+    // `apply`'s `redaction_enabled()` read of `CASS_REDACT_SECRETS`) must
+    // carry `#[serial]` -- the crate-wide default `#[serial]` lock is
+    // shared with `src/indexer/mod.rs`'s test modules. Full rationale at
+    // that file's `mod tests` opening.
+
     fn paths_cfg() -> ExcludedContextPaths {
         ExcludedContextPaths::default()
     }
@@ -2420,6 +2427,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn apply_clears_content_and_hashes_the_redacted_string() {
         let mut m = msg("tool_result", "here is my AKIAABCDEFGHIJKLMNOP secret and the rest of the hit");
         let decision = decision_cass_recall(vec![]);
