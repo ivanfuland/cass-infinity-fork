@@ -146,7 +146,6 @@ _FENCE_RE = re.compile(r"^ {0,3}```")  # <=3 leading spaces, mirrors `fs_is_fenc
 _HEADER_RE = re.compile(r"^( {0,3})(#{1,6})( |$)(.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^(\s*)>+\s?(.*)$")
 _LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
-_LINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\n]*)\)")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 
@@ -241,13 +240,87 @@ def _strip_paired_backticks(line: str) -> str:
     return "".join(out)
 
 
+def _strip_markdown_links(line: str) -> str:
+    # R6 (v3): character-level state machine (not a regex) -- mirrors
+    # Rust's `fs_strip_markdown_links`. After an opening '[', tracks a
+    # bracket-depth counter that increments on every inner '[' and
+    # decrements on every ']', treating only the ']' that brings the
+    # counter back to zero as the link text's real closing bracket --
+    # everything up to and including any earlier, still-nested '['/']'
+    # pair is kept as literal link-text content. Only then does it check
+    # for an immediately-following '(...)' (itself paren-depth-aware) to
+    # complete the link; if no such URL is found, the entire construct --
+    # brackets included -- is restored verbatim.
+    chars = line
+    n = len(chars)
+    result = []
+    i = 0
+    while i < n:
+        c = chars[i]
+        i += 1
+        if c == "[":
+            link_text_chars = []
+            found_close = False
+            bracket_depth = 1
+            while i < n:
+                inner = chars[i]
+                i += 1
+                if inner == "[":
+                    bracket_depth += 1
+                elif inner == "]":
+                    bracket_depth -= 1
+                    if bracket_depth == 0:
+                        found_close = True
+                        break
+                link_text_chars.append(inner)
+            link_text = "".join(link_text_chars)
+
+            if found_close and i < n and chars[i] == "(":
+                i += 1  # consume '('
+                url_part_chars = ["("]
+                depth = 1
+                valid_link = False
+                while i < n:
+                    inner = chars[i]
+                    i += 1
+                    url_part_chars.append(inner)
+                    if inner == "(":
+                        depth += 1
+                    elif inner == ")":
+                        depth -= 1
+                        if depth == 0:
+                            valid_link = True
+                            break
+                url_part = "".join(url_part_chars)
+                if valid_link:
+                    # keep both link text and URL: "[text](url)" -> "text url"
+                    result.append(link_text)
+                    result.append(" ")
+                    result.append(url_part[1:-1])  # strip outer parens
+                else:
+                    # unbalanced parens or EOF: restore everything
+                    result.append("[")
+                    result.append(link_text)
+                    result.append("]")
+                    result.append(url_part)
+            else:
+                # not a proper link (no '(' after ']'), keep original
+                result.append("[")
+                result.append(link_text)
+                if found_close:
+                    result.append("]")
+        else:
+            result.append(c)
+    return "".join(result)
+
+
 def _strip_inline_markdown(line: str) -> str:
     # Order (unchanged this commit -- R5's full reorder is a later, separate
     # commit): links first (so bracket/paren text isn't mistaken for
     # emphasis markers), then bold-marker literal removal + single */_
     # neighbor rule (R4's two sub-steps, always adjacent to each other),
     # then paired backticks.
-    line = _LINK_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}", line)
+    line = _strip_markdown_links(line)
     line = _strip_bold_markers(line)
     line = _strip_emphasis_chars(line)
     line = _strip_paired_backticks(line)
@@ -586,6 +659,19 @@ def _selftest_normalize_examples() -> None:
     _assert(
         normalize("**x**") == "x",
         "R4 step1: bold-literal removal must run before the neighbor rule",
+    )
+    # R6 (v3): nested-bracket link parsing (depth-aware state machine).
+    _assert(
+        normalize("[[inner]text](http://x.com)") == "[inner]text http://x.com",
+        "R6: inner [/] pair absorbed into link text rather than closing early",
+    )
+    _assert(
+        normalize("[text](http://x.com)") == "text http://x.com",
+        "R6: simple link (regression pin)",
+    )
+    _assert(
+        normalize("[no closing paren") == "[no closing paren",
+        "R6: unclosed bracket restored verbatim, no synthetic ']' added",
     )
 
 
