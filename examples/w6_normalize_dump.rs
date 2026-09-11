@@ -27,7 +27,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use coding_agent_search::raw_mirror;
@@ -39,6 +39,70 @@ fn open_readonly_immutable(path: &std::path::Path) -> anyhow::Result<Connection>
     let uri = format!("file:{}?immutable=1", path.display());
     let conn = Connection::open_with_flags(uri, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)?;
     Ok(conn)
+}
+
+/// R5-B1 (control-plane adversarial review of #121a, blocker class: data
+/// corruption). `--out` / `--identity` are written with plain `fs::write`,
+/// which truncates whatever file is at that path. `SQLITE_OPEN_READ_ONLY`
+/// only protects the *connection*; it does nothing about a later write to
+/// the same file through a different path. Before opening anything, refuse
+/// any output path that resolves to the database file (or its `-wal` /
+/// `-shm` / `-journal` siblings), that lies anywhere under `--mirror` (the
+/// data directory holding the raw-mirror blobs), that is a directory, or that
+/// coincides with the other output. Paths are resolved through
+/// `fs::canonicalize` of the nearest existing ancestor so a symlink or a
+/// `..` segment cannot dodge the comparison.
+fn resolve_for_collision_check(p: &Path) -> PathBuf {
+    if let Ok(c) = fs::canonicalize(p) {
+        return c;
+    }
+    let Some(file_name) = p.file_name() else {
+        return p.to_path_buf();
+    };
+    let parent = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    match fs::canonicalize(parent) {
+        Ok(c) => c.join(file_name),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+fn refuse_output_collisions(db: &Path, mirror: &Path, out: &Path, identity: &Path) -> anyhow::Result<()> {
+    let db_r = resolve_for_collision_check(db);
+    let mirror_r = resolve_for_collision_check(mirror);
+    let out_r = resolve_for_collision_check(out);
+    let id_r = resolve_for_collision_check(identity);
+
+    let mut protected: Vec<PathBuf> = vec![db_r.clone()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut s = db_r.as_os_str().to_owned();
+        s.push(suffix);
+        protected.push(PathBuf::from(s));
+    }
+    for (label, p) in [("--out", &out_r), ("--identity", &id_r)] {
+        if protected.iter().any(|q| q == p) {
+            anyhow::bail!(
+                "{label} {} resolves to the --db file or one of its sqlite siblings; refusing to overwrite the input database",
+                p.display()
+            );
+        }
+        if p.starts_with(&mirror_r) {
+            anyhow::bail!(
+                "{label} {} lies under --mirror {}; refusing to write into the data directory",
+                p.display(),
+                mirror_r.display()
+            );
+        }
+        if p.is_dir() {
+            anyhow::bail!("{label} {} is a directory", p.display());
+        }
+    }
+    if out_r == id_r {
+        anyhow::bail!("--out and --identity resolve to the same file {}", out_r.display());
+    }
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -157,6 +221,8 @@ fn main() -> anyhow::Result<()> {
     if cli.ids.is_none() && (cli.sample.is_none() || cli.seed.is_none()) {
         anyhow::bail!("must give either --ids, or --sample together with --seed");
     }
+
+    refuse_output_collisions(&cli.db, &cli.mirror, &cli.out, &cli.identity)?;
 
     let conn = open_readonly_immutable(&cli.db)?;
 
@@ -296,4 +362,67 @@ fn main() -> anyhow::Result<()> {
         cli.identity.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!("w6nd-r5b1-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(d.join("mirror")).unwrap();
+        fs::write(d.join("x.db"), b"").unwrap();
+        d
+    }
+
+    #[test]
+    fn refuses_identity_equal_to_db() {
+        let d = scratch();
+        let err = refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("o.jsonl"), &d.join("x.db"))
+            .unwrap_err();
+        assert!(err.to_string().contains("--identity"), "{err}");
+    }
+
+    #[test]
+    fn refuses_out_equal_to_db_wal_sibling() {
+        let d = scratch();
+        let err = refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("x.db-wal"), &d.join("i.json"))
+            .unwrap_err();
+        assert!(err.to_string().contains("sqlite siblings"), "{err}");
+    }
+
+    #[test]
+    fn refuses_output_under_mirror() {
+        let d = scratch();
+        let err = refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("mirror").join("o.jsonl"), &d.join("i.json"))
+            .unwrap_err();
+        assert!(err.to_string().contains("under --mirror"), "{err}");
+    }
+
+    #[test]
+    fn refuses_out_equal_identity() {
+        let d = scratch();
+        let err = refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("same.json"), &d.join("same.json"))
+            .unwrap_err();
+        assert!(err.to_string().contains("same file"), "{err}");
+    }
+
+    #[test]
+    fn refuses_db_reached_via_symlink_and_dotdot() {
+        let d = scratch();
+        std::os::unix::fs::symlink(d.join("x.db"), d.join("link.db")).unwrap();
+        assert!(refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("o.jsonl"), &d.join("link.db")).is_err());
+        fs::create_dir_all(d.join("sub")).unwrap();
+        assert!(refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("sub").join("..").join("x.db"), &d.join("i.json")).is_err());
+    }
+
+    #[test]
+    fn accepts_distinct_paths() {
+        let d = scratch();
+        refuse_output_collisions(&d.join("x.db"), &d.join("mirror"), &d.join("o.jsonl"), &d.join("i.json")).unwrap();
+    }
 }
