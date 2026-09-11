@@ -314,16 +314,29 @@ def _strip_markdown_links(line: str) -> str:
     return "".join(result)
 
 
-def _strip_inline_markdown(line: str) -> str:
-    # Order (unchanged this commit -- R5's full reorder is a later, separate
-    # commit): links first (so bracket/paren text isn't mistaken for
-    # emphasis markers), then bold-marker literal removal + single */_
-    # neighbor rule (R4's two sub-steps, always adjacent to each other),
-    # then paired backticks.
-    line = _strip_markdown_links(line)
+def _strip_markdown_line(line: str) -> str:
+    # R5 (v3): unified per-line processing order -- Rust already
+    # implemented this order; pre-v3 the judge did the opposite (header/
+    # blockquote/list-marker prefix checks BEFORE inline-marker stripping),
+    # which masks a list marker wrapped in bold: on "**1. Heading**" the
+    # old order sees "**1." at line start (doesn't match the ordered-list
+    # pattern) and never recognizes a list item, so "1. " survives
+    # alongside the now-stripped "**"; the new order strips "**" first
+    # (step 1), exposing "1. Heading" for the list-marker step (step 7) to
+    # correctly recognize and strip, producing "Heading".
     line = _strip_bold_markers(line)
     line = _strip_emphasis_chars(line)
     line = _strip_paired_backticks(line)
+    line = _strip_markdown_links(line)
+    m = _HEADER_RE.match(line)
+    if m:
+        line = m.group(1) + m.group(4)
+    m = _BLOCKQUOTE_RE.match(line)
+    if m:
+        line = m.group(1) + m.group(2)
+    m = _LIST_RE.match(line)
+    if m:
+        line = m.group(1) + m.group(2)
     return line
 
 
@@ -337,16 +350,7 @@ def _strip_markdown_and_code(text: str) -> str:
         if in_fence:
             out_lines.append(line)  # verbatim, no stripping
             continue
-        m = _HEADER_RE.match(line)
-        if m:
-            line = m.group(1) + m.group(4)
-        m = _BLOCKQUOTE_RE.match(line)
-        if m:
-            line = m.group(1) + m.group(2)
-        m = _LIST_RE.match(line)
-        if m:
-            line = m.group(1) + m.group(2)
-        line = _strip_inline_markdown(line)
+        line = _strip_markdown_line(line)
         out_lines.append(line)
     return "\n".join(out_lines)
 
@@ -672,6 +676,13 @@ def _selftest_normalize_examples() -> None:
     _assert(
         normalize("[no closing paren") == "[no closing paren",
         "R6: unclosed bracket restored verbatim, no synthetic ']' added",
+    )
+    # R5 (v3): stage-order -- inline markers (bold/emphasis/backtick/link)
+    # strip before line-prefix markers (header/blockquote/list), so a list
+    # marker wrapped in bold gets unmasked before the list step runs.
+    _assert(
+        normalize("**1. Heading**") == "Heading",
+        "R5: bold-wrapped list marker unmasked by inline-before-prefix order",
     )
 
 
