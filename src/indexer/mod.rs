@@ -1666,11 +1666,16 @@ fn robot_trace_ingest_finish(
 /// dependent on whatever other test in this file's ~740-test binary happens
 /// to touch an instrumented stage first and lock the cache to "disabled".
 /// `std::env::var_os` is a process-table lookup, not a syscall; this fires
-/// at most 6 times per real index run (three stages x start/end -- ingest
-/// has two call sites, `run_streaming_index` and `run_batch_index`, but only
-/// one executes per run depending on `CASS_STREAMING_INDEX`), so the cost
-/// against a cached atomic read is immaterial next to the I/O each call
-/// brackets.
+/// at most 6 times per real index run (three stages x start/end). Two of
+/// the three stages have more than one call site because their real
+/// dispatch is command/flag-dependent, but only one call site per stage
+/// executes on any given run: ingest is `run_streaming_index` (default) or
+/// `run_batch_index` (`CASS_STREAMING_INDEX=0` fallback); lexical is
+/// `rebuild_lex_domain_from_db_full` (`--full`) or the readonly-preflight
+/// fast path in `try_readonly_canonical_force_rebuild` (plain
+/// `--force-rebuild` on a populated db -- the common real dispatch, and the
+/// one `memory_gate.sh`'s stage 2 actually exercises). The cost against a
+/// cached atomic read is immaterial next to the I/O each call brackets.
 fn memprobe_point(stage: &str, point: &str) {
     let Some(path) = std::env::var_os("CASS_MEMPROBE_LOG") else {
         return;
@@ -2317,6 +2322,7 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
     // whole force-rebuild call (via `?`), not just a logged warning --
     // otherwise "tantivy rebuilt fine" would silently mask "the lexical
     // domain didn't."
+    memprobe_point("lexical", "start");
     let lex_storage = FrankenStorage::open(&opts.db_path).with_context(|| {
         format!(
             "opening canonical database writable for lex domain rebuild: {}",
@@ -2352,6 +2358,7 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
         )
     })?;
 
+    memprobe_point("lexical", "end");
     Ok(true)
 }
 
