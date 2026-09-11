@@ -1657,6 +1657,116 @@ fn robot_trace_ingest_finish(
     }
 }
 
+/// #122b-2 (T14-2, spec §四.2 / plan Task 4 Step 5): `CASS_MEMPROBE_LOG=<path>`
+/// gated `/proc/self/status` VmRSS/VmHWM snapshot, appended as one JSONL
+/// line per call -- same env-switch + zero-cost-when-unset + JSONL shape as
+/// `robot_trace_ingest_start`/`finish` above. Deliberately reads the env var
+/// directly on each call instead of caching it in a `OnceLock` (as the task
+/// book suggested): caching would make the two unit tests below order-
+/// dependent on whatever other test in this file's ~740-test binary happens
+/// to touch an instrumented stage first and lock the cache to "disabled".
+/// `std::env::var_os` is a process-table lookup, not a syscall; this fires
+/// at most 6 times per real index run, so the cost against a cached atomic
+/// read is immaterial next to the I/O each call brackets.
+fn memprobe_point(stage: &str, point: &str) {
+    let Some(path) = std::env::var_os("CASS_MEMPROBE_LOG") else {
+        return;
+    };
+    let mut vm_rss_kb: Option<u64> = None;
+    let mut vm_hwm_kb: Option<u64> = None;
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                vm_rss_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                vm_hwm_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "ts_ms": chrono::Utc::now().timestamp_millis(),
+        "stage": stage,
+        "point": point,
+        "vm_rss_kb": vm_rss_kb,
+        "vm_hwm_kb": vm_hwm_kb,
+        "pid": std::process::id(),
+    });
+    let Ok(mut line) = serde_json::to_string(&payload) else {
+        return;
+    };
+    line.push('\n');
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!(error = %e, path = ?path, "CASS_MEMPROBE_LOG: failed to write line");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = ?path, "CASS_MEMPROBE_LOG: failed to open log file");
+        }
+    }
+}
+
+#[cfg(test)]
+mod memprobe {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn disabled_by_default_creates_no_file() {
+        let dir = std::env::temp_dir().join(format!("cass-memprobe-disabled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("memprobe.jsonl");
+        // SAFETY: #[serial] keeps this the only test touching this env key
+        // at a time; it is unset both before and after.
+        unsafe {
+            std::env::remove_var("CASS_MEMPROBE_LOG");
+        }
+        memprobe_point("ingest", "start");
+        assert!(
+            !log_path.exists(),
+            "memprobe_point must not create a file when CASS_MEMPROBE_LOG is unset"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn enabled_writes_two_well_formed_lines() {
+        let dir = std::env::temp_dir().join(format!("cass-memprobe-enabled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("memprobe.jsonl");
+        // SAFETY: #[serial] keeps this the only test touching this env key
+        // at a time; it is restored (removed) before returning.
+        unsafe {
+            std::env::set_var("CASS_MEMPROBE_LOG", &log_path);
+        }
+        memprobe_point("ingest", "start");
+        memprobe_point("ingest", "end");
+        unsafe {
+            std::env::remove_var("CASS_MEMPROBE_LOG");
+        }
+
+        let text = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "expected exactly two JSONL lines, got: {text:?}");
+        for (line, expected_point) in lines.iter().zip(["start", "end"]) {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["stage"], "ingest");
+            assert_eq!(value["point"], expected_point);
+            assert!(value["ts_ms"].is_i64());
+            assert!(value["pid"].is_u64());
+            let vm_rss = value["vm_rss_kb"].as_u64().expect("vm_rss_kb must be present");
+            let vm_hwm = value["vm_hwm_kb"].as_u64().expect("vm_hwm_kb must be present");
+            assert!(vm_hwm >= vm_rss, "vm_hwm_kb ({vm_hwm}) must be >= vm_rss_kb ({vm_rss})");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 /// W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准): before
 /// Tantivy retirement, this value picked which branch wrote to a live
 /// Tantivy writer (`IncrementalInline`/`InlineRebuildFromScan`) versus
@@ -8008,7 +8118,8 @@ fn run_batch_index(
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
-    run_batch_index_with_connector_factories(
+    memprobe_point("ingest", "start");
+    let result = run_batch_index_with_connector_factories(
         storage,
         opts,
         since_ts,
@@ -8018,7 +8129,9 @@ fn run_batch_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
-    )
+    );
+    memprobe_point("ingest", "end");
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8582,6 +8695,7 @@ fn run_semantic_db_vector_catchup(
     opts: &IndexOptions,
     caller: &str,
 ) -> Result<SemanticDbVectorCatchupOutcome> {
+    memprobe_point("holes", "start");
     if opts.embedder != "infinity" {
         anyhow::bail!(
             "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
@@ -8648,6 +8762,7 @@ fn run_semantic_db_vector_catchup(
              same command to continue draining chunk_holes"
         );
     }
+    memprobe_point("holes", "end");
     Ok(SemanticDbVectorCatchupOutcome {
         activated: report.activated,
         cleanup_failures: report.cleanup_failures,
@@ -11558,6 +11673,7 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     db_path: &Path,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<usize> {
+    memprobe_point("lexical", "start");
     // R1-B4: unconditional drop+recreate before resync, matching
     // `repair_lexical_index_from_canonical_db_for_search`'s pattern below --
     // `rebuild_lex_domain_from_db` only resyncs conversations that still
@@ -11592,6 +11708,7 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     storage
         .close()
         .with_context(|| format!("closing database after full lex domain rebuild: {}", db_path.display()))?;
+    memprobe_point("lexical", "end");
     Ok(stats.lex_docs_count)
 }
 
