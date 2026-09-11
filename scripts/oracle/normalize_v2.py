@@ -471,6 +471,13 @@ def _selftest_normalize_examples() -> None:
         normalize("\t## tab-indented") == "## tab-indented",
         "R2: leading tab does not count as header indentation (known deviation)",
     )
+    # R2: 4 leading spaces exceed the <=3 cap -- another genuine
+    # discriminator between old `\s*` (unbounded, would strip) and new
+    # ` {0,3}` (capped, must not recognize).
+    _assert(
+        normalize("    ## four-space") == "## four-space",
+        "R2: 4 leading spaces exceed the <=3 indentation cap, header not recognized",
+    )
 
 
 def _selftest_is_hard_noise_empty_and_normal() -> None:
