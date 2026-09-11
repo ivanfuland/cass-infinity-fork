@@ -15781,24 +15781,40 @@ pub enum PrepareStage {
 /// point (`run_index_with_options`) in-process. `#[doc(hidden)] pub` (not
 /// `#[cfg(test)]`) so it always compiles into the library -- unset, it costs
 /// one `OnceLock` read + an `Option::is_none` check per prepare call.
+///
+/// #122b-1 D-R1-1: the hook is process-global (one `RwLock`, not
+/// thread-local), and every thread's `prepare_conversation_for_ingest` call
+/// invokes it -- under `cargo test`'s default parallelism, a `#[serial]`
+/// test that sets this hook is NOT protected from a concurrently running
+/// NON-serial test's own ingest also triggering it. The closure itself was
+/// the missing guard: a stage-only match (no session identity) fires for
+/// *any* thread's conversation reaching that stage, not just the session
+/// the test that installed the hook actually cares about (confirmed: a
+/// concurrently running non-serial test's ingest would silently delete a
+/// `#[serial]` test's fixture file out from under it, turning an expected
+/// `Err` into a false `Ok` with `row_count==0` -- the file was just gone
+/// before the `#[serial]` test's own scan ever ran into it). The `&Path`
+/// parameter lets every caller's closure scope itself to the one session it
+/// actually means to fault, closing that hole without needing a lock this
+/// hook doesn't otherwise require.
 static PREPARE_FAULT_HOOK: std::sync::OnceLock<
-    std::sync::RwLock<Option<Box<dyn Fn(PrepareStage) + Send + Sync>>>,
+    std::sync::RwLock<Option<Box<dyn Fn(PrepareStage, &Path) + Send + Sync>>>,
 > = std::sync::OnceLock::new();
 
 #[doc(hidden)]
-pub fn set_prepare_fault_hook(hook: Option<Box<dyn Fn(PrepareStage) + Send + Sync>>) {
+pub fn set_prepare_fault_hook(hook: Option<Box<dyn Fn(PrepareStage, &Path) + Send + Sync>>) {
     let lock = PREPARE_FAULT_HOOK.get_or_init(|| std::sync::RwLock::new(None));
     if let Ok(mut guard) = lock.write() {
         *guard = hook;
     }
 }
 
-fn invoke_prepare_fault_hook(stage: PrepareStage) {
+fn invoke_prepare_fault_hook(stage: PrepareStage, source_path: &Path) {
     let Some(lock) = PREPARE_FAULT_HOOK.get() else { return };
     if let Ok(guard) = lock.read()
         && let Some(hook) = guard.as_ref()
     {
-        hook(stage);
+        hook(stage, source_path);
     }
 }
 
@@ -15859,7 +15875,7 @@ fn prepare_conversation_for_ingest(
             None
         }
         CaptureSourceKind::File(_) => {
-            invoke_prepare_fault_hook(PrepareStage::BeforeCapture);
+            invoke_prepare_fault_hook(PrepareStage::BeforeCapture, &original_source_path);
             Some(attach_raw_mirror_capture(data_dir, &mut conv).map_err(|err| {
                 PrepareError(format!("raw-mirror capture failed for {}: {err:#}", original_source_path.display()))
             })?)
@@ -15990,7 +16006,7 @@ fn prepare_conversation_for_ingest(
         attach_raw_mirror_metadata(&mut conv, record);
 
         if excluded.iter().any(Option::is_some) {
-            invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync);
+            invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync, &original_source_path);
             crate::raw_mirror::sync_capture_durable(data_dir, record)
                 .map_err(|e| PrepareError(format!("排除行提交前镜像持久化失败: {e}")))?;
         }
@@ -27070,8 +27086,8 @@ mod tests {
         let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
 
         let to_delete = session;
-        set_prepare_fault_hook(Some(Box::new(move |stage| {
-            if stage == PrepareStage::BeforeCapture {
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
                 std::fs::remove_file(&to_delete).ok();
             }
         })));
@@ -27123,8 +27139,8 @@ mod tests {
         let _streaming_guard = set_env("CASS_STREAMING_INDEX", "0");
 
         let to_delete = session;
-        set_prepare_fault_hook(Some(Box::new(move |stage| {
-            if stage == PrepareStage::BeforeCapture {
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
                 std::fs::remove_file(&to_delete).ok();
             }
         })));
@@ -27188,8 +27204,8 @@ mod tests {
         let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
 
         let to_delete = session;
-        set_prepare_fault_hook(Some(Box::new(move |stage| {
-            if stage == PrepareStage::BeforeCapture {
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
                 std::fs::remove_file(&to_delete).ok();
             }
         })));
@@ -27260,8 +27276,8 @@ mod tests {
         let _write_window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
 
         let to_delete = session;
-        set_prepare_fault_hook(Some(Box::new(move |stage| {
-            if stage == PrepareStage::BeforeCapture {
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
                 std::fs::remove_file(&to_delete).ok();
             }
         })));
@@ -32287,8 +32303,8 @@ mod tests {
         let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
 
         let file_a_for_hook = file_a.clone();
-        set_prepare_fault_hook(Some(Box::new(move |stage| {
-            if stage == PrepareStage::BeforeCapture {
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == file_a_for_hook.as_path() {
                 let _ = std::fs::remove_file(&file_a_for_hook);
             }
         })));
@@ -32418,8 +32434,8 @@ mod tests {
         ];
 
         let file_a_for_hook = file_a.clone();
-        set_prepare_fault_hook(Some(Box::new(move |stage| {
-            if stage == PrepareStage::BeforeCapture {
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == file_a_for_hook.as_path() {
                 let _ = std::fs::remove_file(&file_a_for_hook);
             }
         })));

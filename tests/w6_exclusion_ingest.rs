@@ -707,7 +707,7 @@ fn capture_failed_before_capture_hook_making_source_unreadable_skips_session() {
     let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
 
     let to_lock_down = session_path.clone();
-    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage, _path| {
         if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
             std::fs::set_permissions(&to_lock_down, std::fs::Permissions::from_mode(0o000)).ok();
         }
@@ -744,7 +744,7 @@ fn capture_failed_before_capture_hook_deleting_source_file_skips_session() {
     let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
 
     let to_delete = session_path.clone();
-    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage, _path| {
         if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
             std::fs::remove_file(&to_delete).ok();
         }
@@ -786,7 +786,7 @@ fn capture_failed_before_durable_sync_hook_readonly_blob_dir_skips_session() {
     let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
 
     let blobs_dir = data_dir.join("raw-mirror").join("v1").join("blobs");
-    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage, _path| {
         if stage == coding_agent_search::indexer::PrepareStage::BeforeDurableSync {
             std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o000)).ok();
         }
@@ -823,7 +823,7 @@ fn before_capture_hook_appending_a_complete_event_lands_n_plus_one_rows() {
     let (session_path, _raw) = write_codex_host_shell_session(session_dir.path());
 
     let to_append = session_path.clone();
-    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage, _path| {
         if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
             use std::io::Write;
             let appended = serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_appended","role":"user","content":[{"type":"input_text","text":"appended after first parse"}]}});
@@ -896,7 +896,7 @@ fn status_json_last_index_counters_survive_a_failed_run() {
     let second_session_dir = tempfile::TempDir::new().expect("second session dir");
     let (second_session_path, _raw2) = write_codex_host_shell_session(second_session_dir.path());
     let to_lock_down = second_session_path.clone();
-    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage| {
+    coding_agent_search::indexer::set_prepare_fault_hook(Some(Box::new(move |stage, _path| {
         if stage == coding_agent_search::indexer::PrepareStage::BeforeCapture {
             std::fs::set_permissions(&to_lock_down, std::fs::Permissions::from_mode(0o000)).ok();
         }

@@ -463,8 +463,8 @@ fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, 
     // expected_for_touched_message`) -- and the ownership audit's, and
     // generation lookup's -- are correctly excluded.
     #[cfg(test)]
-    if DRAIN_PHASE.load(std::sync::atomic::Ordering::Relaxed) {
-        LOAD_MESSAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if DRAIN_PHASE.with(std::cell::Cell::get) {
+        LOAD_MESSAGE_CALLS.with(|c| c.set(c.get() + 1));
     }
     storage
         .raw()
@@ -1663,7 +1663,7 @@ pub fn run_db_vector_catchup_backfill(
     // `LOAD_MESSAGE_CALLS`; cleared below before reverse-reconciliation
     // (and everything after it) runs.
     #[cfg(test)]
-    DRAIN_PHASE.store(true, std::sync::atomic::Ordering::Relaxed);
+    DRAIN_PHASE.with(|c| c.set(true));
     loop {
         let page_started = std::time::Instant::now();
         let keys = fetch_hole_keys(storage, generation_id, after, batch_size)?;
@@ -1839,7 +1839,7 @@ pub fn run_db_vector_catchup_backfill(
     }
 
     #[cfg(test)]
-    DRAIN_PHASE.store(false, std::sync::atomic::Ordering::Relaxed);
+    DRAIN_PHASE.with(|c| c.set(false));
     let holes_remaining_after_drain = assert_drain_completed_or_bail(storage, generation_id)?;
     emit_drain_event(&serde_json::json!({"event": "drain_done", "holes": holes_remaining_after_drain}));
 
@@ -2010,42 +2010,49 @@ fn slice_chunk_span<'a>(normalized: &'a str, span: &ChunkSpanRef, message_id: i6
     })
 }
 
-/// Test-only direct evidence of how many times [`load_message_once`] was
-/// called while [`DRAIN_PHASE`] was set -- T4 mission #122a (T14-1),
-/// tightened by #122a-R1 (R1-1) after control plane's adversarial probe
-/// showed the original form (a manual `fetch_add` at the drain loop's one
-/// *intended* call site, not inside `load_message_once` itself) couldn't
-/// detect a reintroduced second call from the `Embed` branch as long as
-/// that new call didn't also touch the counter -- i.e. it verified "the
-/// cache refresh point runs once per message" but not "the `Embed` branch
-/// never reads again". Counting inside `load_message_once` itself closes
-/// that gap: it counts every call made during the drain phase, from
-/// wherever it's made.
+// Test-only direct evidence of how many times `load_message_once` was
+// called while `DRAIN_PHASE` was set -- T4 mission #122a (T14-1),
+// tightened by #122a-R1 (R1-1) after control plane's adversarial probe
+// showed the original form (a manual `fetch_add` at the drain loop's one
+// *intended* call site, not inside `load_message_once` itself) couldn't
+// detect a reintroduced second call from the `Embed` branch as long as
+// that new call didn't also touch the counter -- i.e. it verified "the
+// cache refresh point runs once per message" but not "the `Embed` branch
+// never reads again". Counting inside `load_message_once` itself closes
+// that gap: it counts every call made during the drain phase, from
+// wherever it's made.
+//
+// #122b-1 D-R1-2: `thread_local!`, not a process-global `static`. The
+// drain loop and every `load_message_once` call it makes (this file has
+// no `thread::spawn`/rayon/etc -- confirmed empirically, nothing in this
+// module ever leaves the calling thread) run synchronously on whichever
+// thread called `run_db_vector_catchup_backfill`, which under `cargo
+// test`'s default parallelism is one dedicated thread per test. A
+// process-global counter was visible to -- and incremented by -- every
+// OTHER concurrently running test's own backfill, so a test asserting
+// `LOAD_MESSAGE_CALLS == this test's own message count` could see a
+// larger number contributed by an unrelated sibling test's drain running
+// at the same time. `thread_local!` scopes both the counter and the
+// phase flag to the one thread that actually owns them.
 #[cfg(test)]
-static LOAD_MESSAGE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// T4 mission #122a-R1 (R1-1): true for exactly the drain loop's own
-/// duration in [`run_db_vector_catchup_backfill`] (set before the loop,
-/// cleared before reverse-reconciliation runs) -- gates [`LOAD_MESSAGE_
-/// CALLS`] so reconciliation's, the ownership audit's, and generation
-/// lookup's own `load_message_once` calls are correctly excluded from a
-/// counter whose whole point is "reads during the drain phase specifically".
-#[cfg(test)]
-static DRAIN_PHASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static LOAD_MESSAGE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DRAIN_PHASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[cfg(test)]
 fn load_message_calls_for_test() -> usize {
-    LOAD_MESSAGE_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+    LOAD_MESSAGE_CALLS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 fn reset_load_message_calls_for_test() {
-    LOAD_MESSAGE_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    LOAD_MESSAGE_CALLS.with(|c| c.set(0));
     // Defensive: a prior test whose drain panicked mid-loop would have
     // left `DRAIN_PHASE` stuck `true` (its own `false` store, right after
     // the loop, never reached) -- reset it here too so that leftover
     // state can't silently make *this* test over-count.
-    DRAIN_PHASE.store(false, std::sync::atomic::Ordering::Relaxed);
+    DRAIN_PHASE.with(|c| c.set(false));
 }
 
 
