@@ -226,21 +226,6 @@ fn main() -> anyhow::Result<()> {
 
     let conn = open_readonly_immutable(&cli.db)?;
 
-    let mirror_conversation_ids: Option<HashSet<i64>> = if cli.require_mirror {
-        let views = raw_mirror::manifest_views(&cli.mirror)?;
-        let mut ids = HashSet::new();
-        for view in &views {
-            for link in &view.db_links {
-                if let Some(cid) = link.conversation_id {
-                    ids.insert(cid);
-                }
-            }
-        }
-        Some(ids)
-    } else {
-        None
-    };
-
     // Decide *which* message_ids are wanted first, using only the light
     // `(id, conversation_id)` projection -- `content` for a 1.4M-row/37GB
     // corpus is by far the expensive column, and both `--ids` (a handful of
@@ -254,6 +239,23 @@ fn main() -> anyhow::Result<()> {
             let pop = wanted_set.len();
             (wanted_set.into_iter().collect(), None, pop)
         } else {
+            // R5-N11: `--require-mirror` is documented as ignored in `--ids`
+            // mode, so the manifest read (which fails loudly on a corrupt
+            // manifest) must live inside the `--sample` branch only.
+            let mirror_conversation_ids: Option<HashSet<i64>> = if cli.require_mirror {
+                let views = raw_mirror::manifest_views(&cli.mirror)?;
+                let mut ids = HashSet::new();
+                for view in &views {
+                    for link in &view.db_links {
+                        if let Some(cid) = link.conversation_id {
+                            ids.insert(cid);
+                        }
+                    }
+                }
+                Some(ids)
+            } else {
+                None
+            };
             let metas: Vec<(i64, i64)> = {
                 let mut stmt = conn.prepare("SELECT id, conversation_id FROM messages ORDER BY id ASC")?;
                 stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?

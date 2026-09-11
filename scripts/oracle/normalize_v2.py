@@ -155,7 +155,10 @@ _HEADER_RE = re.compile(r"^( {0,3})(#{1,6})( |$)(.*)$")
 # `(\s*)` prefix here that tolerated indentation before '>', which no rule
 # in the shared spec calls for -- cass-sql-advisor 2026-09-10 ruling.
 _BLOCKQUOTE_RE = re.compile(r"^>+\s?(.*)$")
-_LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
+# R5-N5: exactly Rust `fs_strip_list_marker`'s shape -- `- ` / `+ ` / ASCII
+# digits + `. `, followed by one literal space. The previous `\d+` accepted
+# non-ASCII digits and `\s+` accepted a tab after the marker; Rust does not.
+_LIST_RE = re.compile(r"^(\s*)(?:[-+]|[0-9]+\.) (.*)$")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 
@@ -350,10 +353,26 @@ def _strip_markdown_line(line: str) -> str:
     return line
 
 
+def _split_lines_like_rust(text: str) -> list[str]:
+    # R5-N4 (control-plane adversarial review of #121b): mirror Rust
+    # `str::lines()`, which `canonicalize_for_embedding` uses for stage ②.
+    # A line ending is "\n" or "\r\n", so the "\r" of a CRLF ending is not
+    # part of the line (a bare trailing "\r" with no "\n" after it stays);
+    # the empty tail after a final "\n" is dropped, as Rust does. Plain
+    # `split("\n")` left the "\r" on the line, so R2's `( |$)` never saw
+    # end-of-line and a CRLF-terminated header was not recognized.
+    parts = text.split("\n")
+    terminated = len(parts) - 1  # parts[i] for i < terminated ended with "\n"
+    lines = [p[:-1] if i < terminated and p.endswith("\r") else p for i, p in enumerate(parts)]
+    if text.endswith("\n"):
+        lines.pop()
+    return lines
+
+
 def _strip_markdown_and_code(text: str) -> str:
     out_lines = []
     in_fence = False
-    for line in text.split("\n"):
+    for line in _split_lines_like_rust(text):
         if _FENCE_RE.match(line):
             in_fence = not in_fence
             continue  # fence marker line itself is dropped entirely (no blank-line residue)
@@ -755,6 +774,22 @@ def _selftest_compare_guards() -> None:
     _assert(run([good]) == 0, "one genuine record without --expect-identity must exit 0")
 
 
+def _selftest_r5_crlf_and_list_marker() -> None:
+    # R5-N4: line splitting mirrors Rust `str::lines()` -- the "\r" of a
+    # CRLF line ending is not part of the line, so an ATX header terminated
+    # by CRLF is still recognized (R2's `( |$)` must see end-of-line there,
+    # not a literal "\r").
+    _assert(normalize("##\r\nbody") == "body", "R5-N4: CRLF-terminated header line is recognized")
+    # R5-N5: list markers are exactly Rust `fs_strip_list_marker`'s shape:
+    # `- ` / `+ ` / ASCII digits + `. `, with one literal space. A tab after
+    # the marker, or a non-ASCII digit, is not a list marker.
+    _assert(normalize("-\titem") == "- item", "R5-N5: tab after '-' is not a list marker")
+    _assert(normalize("**1.\titem**") == "1. item", "R5-N5: tab after 'N.' is not a list marker (after bold strip)")
+    _assert(normalize("\u0661. item") == "\u0661. item", "R5-N5: non-ASCII digit is not an ordered-list marker")
+    _assert(normalize("- item") == "item", "R5-N5 control: '- ' still strips")
+    _assert(normalize("12. item") == "item", "R5-N5 control: 'N. ' still strips")
+
+
 def run_selftest() -> int:
     checks = [
         ("properties_cover_and_overlap", _selftest_properties),
@@ -764,6 +799,7 @@ def run_selftest() -> int:
         ("normalize_v2_rule_examples", _selftest_normalize_examples),
         ("is_hard_noise_empty_and_normal", _selftest_is_hard_noise_empty_and_normal),
         ("compare_guards_reject_empty_dup_and_identity_mismatch", _selftest_compare_guards),
+        ("r5_crlf_and_list_marker", _selftest_r5_crlf_and_list_marker),
     ]
     failed = False
     for name, fn in checks:
