@@ -21,6 +21,7 @@ spec, not silently patched to match Rust.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
@@ -549,12 +550,90 @@ def run_check_fixtures(path: str) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# --compare: T3 (任务书 #121a) A2 -- compare a `w6_normalize_dump` jsonl
+# (message_id, content_sha256, rust_normalized) against this oracle's
+# `normalize()` on the same rows re-read from `--db`. `normalize()` and its
+# helpers are not touched by this addition -- this only wires an existing,
+# unmodified function into a new read-only comparison entry point.
+# ---------------------------------------------------------------------------
+
+def run_compare(jsonl_path: str, db_path: str, buckets_path: Optional[str]) -> int:
+    with open(jsonl_path) as f:
+        records = [json.loads(line) for line in f if line.strip()]
+
+    uri = f"file:{db_path}?immutable=1"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as e:
+        print(f"precondition error: cannot open --db {db_path}: {e}", file=sys.stderr)
+        return 2
+
+    diffs = 0
+    sha_mismatch = 0
+    total = 0
+    precondition_error = False
+    diff_ids: list[str] = []
+
+    try:
+        cur = conn.cursor()
+        for rec in records:
+            message_id = rec["message_id"]
+            expected_sha = rec["content_sha256"]
+            rust_normalized = rec["rust_normalized"]
+            total += 1
+            try:
+                row = cur.execute(
+                    "SELECT content FROM messages WHERE id = ?", (message_id,)
+                ).fetchone()
+            except sqlite3.Error as e:
+                print(f"precondition error: query failed for message_id {message_id}: {e}", file=sys.stderr)
+                precondition_error = True
+                continue
+            if row is None:
+                print(f"precondition error: message_id {message_id} not found in --db", file=sys.stderr)
+                precondition_error = True
+                continue
+            content = row[0] if row[0] is not None else ""
+            actual_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if actual_sha != expected_sha:
+                sha_mismatch += 1
+                continue
+            got_normalized = normalize(content)
+            if got_normalized != rust_normalized:
+                diffs += 1
+                diff_ids.append(str(message_id))
+    finally:
+        conn.close()
+
+    print(f"diffs={diffs} sha_mismatch={sha_mismatch} total={total}")
+
+    if buckets_path:
+        with open(buckets_path) as f:
+            bucket_doc = json.load(f)
+        buckets = bucket_doc["buckets"] if "buckets" in bucket_doc else bucket_doc
+        diff_id_set = set(diff_ids)
+        for name, ids in buckets.items():
+            id_set = {str(i) for i in ids}
+            n_diff = len(id_set & diff_id_set)
+            print(f"bucket={name} diffs={n_diff}/{len(id_set)}")
+
+    if precondition_error or sha_mismatch > 0:
+        return 2
+    if diffs > 0:
+        return 1
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--selftest", action="store_true")
     p.add_argument("--check-fixtures", metavar="PATH")
     p.add_argument("--count-db", metavar="DB")
     p.add_argument("--json", metavar="OUT")
+    p.add_argument("--compare", metavar="JSONL")
+    p.add_argument("--db", metavar="DB")
+    p.add_argument("--buckets", metavar="JSON")
     args = p.parse_args()
 
     if args.selftest:
@@ -566,6 +645,11 @@ def main() -> int:
             print("--count-db requires --json <out>", file=sys.stderr)
             return 2
         return run_count_db(args.count_db, args.json)
+    if args.compare:
+        if not args.db:
+            print("--compare requires --db <db>", file=sys.stderr)
+            return 2
+        return run_compare(args.compare, args.db, args.buckets)
 
     p.print_help()
     return 2
