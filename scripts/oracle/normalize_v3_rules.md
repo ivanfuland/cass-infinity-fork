@@ -4,16 +4,15 @@ Authoritative rule text for the ingest-side canonicalization pipeline
 (`src/search/canonicalize.rs`, `DefaultCanonicalizer::canonicalize`).
 Supersedes `normalize_v2_rules.md` (v2). This document is the shared
 specification for **both** engines -- Rust and the python oracle
-(`scripts/oracle/normalize_v2.py`) -- but as of this pass only Rust has been
-brought in line with it (任务书 #121a). The judge currently mirrors *v2's
-old* fence/backtick behavior (column-0-only fence, unconditional backtick
-deletion) -- a prior Plan-B pass deliberately aligned it to that v2
-behavior, which is exactly the side R1/R3 replace in this document. The
-judge's alignment to R1–R7 here, R1/R3 included, is entirely 任务书 #121b's
-job; none of it is done yet. Until #121b lands, the two engines disagree on
-stage ②; that divergence is exactly what
-`scripts/oracle/normalize_v2.py --compare` and
-`examples/w6_normalize_dump.rs` measure.
+(`scripts/oracle/normalize_v2.py`). Rust was brought in line with it in
+任务书 #121a; the judge's alignment to R1–R7 (R1/R3 included) landed in
+任务书 #121b, which also fixed one pre-existing, unchanged-from-v2 judge
+deviation outside the R1–R7 list (§②'s blockquote-prefix step tolerated
+leading whitespace before `>`; neither this spec nor Rust does). Both
+engines now agree on stage ②, confirmed by `scripts/oracle/normalize_v2.py
+--compare` against the 216-example corpus (`diffs=0`) and a 5,000-message
+random sample (`diffs=0`, seed 6) -- see `examples/w6_normalize_dump.rs`
+for the measurement tool.
 
 The **query** path (`canonicalize_query`) is not changed by v2 or v3 -- it
 stays: NFC → trim → truncate to `QUERY_MAX_CHARS`. Note that as of this
@@ -42,10 +41,10 @@ Unchanged from v2.
 
 ## ② Strip markdown syntax, keep link text **and** URL
 
-Per-line processing order (unified across Rust and the judge as of this
-document -- Rust already implements this order; the judge currently does
-the header/blockquote/list-marker checks *before* inline-marker stripping,
-the opposite order -- see R5):
+Per-line processing order (unified across Rust and the judge as of 任务书
+#121b -- Rust already implemented this order; the judge previously did the
+header/blockquote/list-marker checks *before* inline-marker stripping, the
+opposite order -- see R5):
 
 1. Literal removal of every `**` and `__` run (bold/strong markers),
    unconditionally, anywhere in the line.
@@ -94,6 +93,14 @@ characters, then either a space or end-of-line. On a match, the `#` run and
 one following space (if present) are removed; everything else on the line,
 including the ≤3 leading spaces, is kept. A line that does **not** match
 this shape is left completely untouched, `#` characters included.
+
+**Known deviation from CommonMark**: a tab does not count as leading
+whitespace here (CommonMark itself would allow a tab). Both engines agree
+on this -- Rust's `fs_strip_atx_header` only trims literal `' '` bytes, and
+the judge's `_HEADER_RE` (任务书 #121b) only matches the ASCII space
+character, not `\s`. Judge-verified: `normalize("\t## tab-indented")` →
+`"## tab-indented"` (tab-indented `#` run left untouched, not recognized as
+a header).
 
 v2's rule (`result.trim_start_matches('#').trim_start()`) requires the `#`
 to be the line's very first byte, strips *every* leading `#` with no 1–6
@@ -206,18 +213,18 @@ instead of its previous unconditional `result.replace('*', "")`.
 
 The order listed at the top of §② (`**`/`__` → single `*`/`_` → paired
 backticks → links → headers → blockquote → list markers) is Rust's
-*existing* order and is not changed by v3 -- it is written down here
-because the judge currently does the opposite (header/blockquote/
-list-marker prefix checks *before* inline-marker stripping), which masks a
-list marker wrapped in bold. On input like `"**1. Heading**"`: Rust
-unmasks `"1. "` by stripping the `**` first (step 1), then recognizes the
-now-exposed list marker (step 7) and strips it, producing `"Heading"`; the
-judge's line-start regex instead sees `"**1."` at the start of the raw
-line -- which doesn't match its ordered-list pattern -- so it never
-recognizes a list item, and `"1. "` survives in the output alongside the
-now-stripped `**`. Reordering the judge to match this order is 任务书
-#121b's job; this entry exists purely so both engines implement one
-written specification rather than each engine's incidental order.
+*existing* order and is not changed by v3. Pre-#121b the judge did the
+opposite (header/blockquote/list-marker prefix checks *before*
+inline-marker stripping), which masked a list marker wrapped in bold. On
+input like `"**1. Heading**"`: Rust unmasks `"1. "` by stripping the `**`
+first (step 1), then recognizes the now-exposed list marker (step 7) and
+strips it, producing `"Heading"`; the judge's old line-start regex instead
+saw `"**1."` at the start of the raw line -- which doesn't match its
+ordered-list pattern -- so it never recognized a list item, and `"1. "`
+survived in the output alongside the now-stripped `**`. 任务书 #121b
+reordered the judge to match this order (merging the prefix checks and
+inline stripping into one per-line function). Judge-verified (post-#121b):
+`normalize("**1. Heading**")` → `"Heading"`, matching Rust.
 
 ### R6 — Nested-bracket link parsing (documentation only; no Rust change this pass)
 
@@ -236,9 +243,11 @@ the entire construct -- brackets included -- is restored verbatim.
     inner `[`/`]` pair is absorbed into the link text rather than
     terminating the link early.
 
-Recorded here so the judge's future alignment (#121b) implements the same
-depth-aware algorithm, rather than a single-pass, non-recursive regex that
-cannot see through a nested bracket pair the way this state machine does.
+任务书 #121b ported this same depth-aware algorithm into the judge
+(`_strip_markdown_links`), replacing the single-pass, non-recursive regex
+that couldn't see through a nested bracket pair. Judge-verified
+(post-#121b): `normalize("[[inner]text](http://x.com)")` →
+`"[inner]text http://x.com"`, matching Rust.
 
 ### R7 — Intra-line whitespace collapse scope (documentation only; no Rust change this pass)
 
@@ -251,16 +260,17 @@ among others.
   - Output (verified, unchanged by v3): `"a b"` -- the NBSP is folded to a
     regular space like any other whitespace.
 
-Known edge case for the judge's future alignment (#121b): Python's
+任务书 #121b switched the judge from an ASCII-only whitespace class to a
+per-character `ch.isspace()` test, matching Rust's scope. Judge-verified
+(post-#121b): `normalize("a\u{00A0}b")` → `"a b"`, matching Rust.
+
+Known edge case (still open, not designed around): Python's
 `str.isspace()` returns `True` for U+001C–U+001F (the four "information
 separator" control characters), which are **not** in Unicode's
 `White_Space` property and therefore are **not** whitespace under Rust's
-rule. If the judge is switched to `str.isspace()` to chase Unicode-
-whitespace parity, these four codepoints would diverge in the *opposite*
-direction from today's ASCII-only gap. Not designed around pre-emptively --
-no codepoints in this range have been observed in the 216-example or
-5,000-sample corpora as of this writing; flag it if a later sampling run
-surfaces one, rather than guessing at a fix now.
+rule. No codepoints in this range have been observed in the 216-example or
+the 5,000-message random sample (both `diffs=0` as of 任务书 #121b); flag
+it if a later sampling run surfaces one, rather than guessing at a fix now.
 
 ### R8 — Pipeline version
 
@@ -325,8 +335,8 @@ looks like base64 or binary data is stripped or altered by any stage.
 
 Only entries where Rust's *output* actually changes belong here. R5/R6/R7
 above are documentation-only clarifications of existing, unchanged Rust
-behavior (written down so the judge's future alignment in #121b implements
-the same specification) and are deliberately not listed as diffs.
+behavior (the judge's alignment to that same specification landed in
+任务书 #121b) and are deliberately not listed as diffs.
 
 | 类别 | v2 行为 | v3 行为 | 例子 |
 |---|---|---|---|
