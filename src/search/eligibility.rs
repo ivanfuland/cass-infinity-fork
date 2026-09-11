@@ -95,10 +95,48 @@ static TEST_PAGE_FETCH_COUNT: std::sync::atomic::AtomicUsize =
 pub fn for_each_expected_chunk<F>(
     storage: &crate::storage::sqlite::FrankenStorage,
     page_size: usize,
-    mut f: F,
+    f: F,
 ) -> anyhow::Result<u64>
 where
     F: FnMut(ExpectedChunk) -> anyhow::Result<()>,
+{
+    for_each_expected_chunk_inner(storage, page_size, f, |_message_id| Ok(()))
+}
+
+/// T4 mission #122a (§〇.2): sibling of [`for_each_expected_chunk`] for the
+/// one caller (`db_vector_catchup`'s up-front `all_expected` scan) that
+/// needs the scanned **message id set**, not just the chunks -- a message
+/// whose content canonicalizes to zero chunks (or whose role is excluded)
+/// never invokes the chunk callback at all, so a caller that only sees `f`
+/// can't tell "this message is in the scan, it just has no chunks" apart
+/// from "this message was never scanned". `on_message` is called exactly
+/// once per message this call's underlying scan visits (before that
+/// message's zero-or-more chunk callbacks), regardless of its chunk
+/// count. `pub(crate)`, not `pub`: this is an internal wiring detail for
+/// one call site, not part of this module's public contract the way
+/// `for_each_expected_chunk` is (see its own five external call sites).
+pub(crate) fn for_each_expected_chunk_with_messages<F, M>(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    page_size: usize,
+    f: F,
+    on_message: M,
+) -> anyhow::Result<u64>
+where
+    F: FnMut(ExpectedChunk) -> anyhow::Result<()>,
+    M: FnMut(i64) -> anyhow::Result<()>,
+{
+    for_each_expected_chunk_inner(storage, page_size, f, on_message)
+}
+
+fn for_each_expected_chunk_inner<F, M>(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    page_size: usize,
+    mut f: F,
+    mut on_message: M,
+) -> anyhow::Result<u64>
+where
+    F: FnMut(ExpectedChunk) -> anyhow::Result<()>,
+    M: FnMut(i64) -> anyhow::Result<()>,
 {
     let conn = storage.raw();
     let mut cursor_id: i64 = 0;
@@ -128,6 +166,7 @@ where
         let page_len = rows.len();
         for (message_id, conversation_id, role, content) in rows {
             cursor_id = message_id;
+            on_message(message_id)?;
             for chunk in expected_chunks(message_id, conversation_id, &role, &content) {
                 f(chunk)?;
                 total_chunks += 1;
@@ -408,6 +447,102 @@ mod tests {
         assert!(
             callback_calls <= 100 * pages_fetched as u64,
             "callback invocation count must not exceed page_size * pages_fetched"
+        );
+    }
+
+    /// T4 mission #122a (§〇.2): `for_each_expected_chunk_with_messages`
+    /// must call `on_message` exactly once per scanned message regardless
+    /// of chunk count -- including a message whose role is out of the
+    /// embedding whitelist and so produces zero chunks -- while `f` (the
+    /// chunk callback) still only sees the real chunks.
+    #[test]
+    fn for_each_expected_chunk_with_messages_calls_on_message_for_zero_chunk_messages() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("with-messages-fixture.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "codex".into(),
+            name: "Codex".into(),
+            version: Some("0.2.3".into()),
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: Some(std::path::PathBuf::from("/tmp/workspace")),
+            external_id: Some("with-messages-fixture".into()),
+            title: Some("with_messages fixture".into()),
+            source_path: std::path::PathBuf::from("/tmp/with-messages-fixture.jsonl"),
+            started_at: Some(1_700_000_000_000_i64),
+            ended_at: Some(1_700_000_000_100_i64),
+            approx_tokens: Some(64),
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                // Zero chunks: role out of the embedding whitelist
+                // (same raw role `expected_chunks_reasoning_is_empty`
+                // exercises directly).
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::Other("reasoning".into()),
+                    author: Some("assistant".into()),
+                    created_at: Some(1_700_000_000_000_i64),
+                    content: "a reasoning trace that would chunk if the role were eligible"
+                        .into(),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                },
+                // Two chunks: no separator characters in the window, so
+                // `chunk_normalized` hard-cuts once at char 1000, then the
+                // 600-char remainder (1500 - 900 overlap-adjusted start)
+                // fits as the final chunk -- exactly two, not one, not
+                // three.
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: Some(1_700_000_000_001_i64),
+                    content: "a".repeat(1500),
+                    extra_json: serde_json::json!({}),
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &conversation)])
+            .unwrap();
+
+        let mut messages_seen: Vec<i64> = Vec::new();
+        let mut chunks_seen = 0u64;
+        let total = for_each_expected_chunk_with_messages(
+            &storage,
+            200,
+            |_chunk| {
+                chunks_seen += 1;
+                Ok(())
+            },
+            |message_id| {
+                messages_seen.push(message_id);
+                Ok(())
+            },
+        )
+        .expect("scan must not error");
+
+        assert_eq!(total, 2, "the two-chunk message's chunks, zero from the reasoning message");
+        assert_eq!(chunks_seen, 2, "chunk callback must fire exactly for the real chunks");
+        assert_eq!(
+            messages_seen.len(),
+            2,
+            "on_message must fire once per scanned message, including the zero-chunk one"
         );
     }
 }
