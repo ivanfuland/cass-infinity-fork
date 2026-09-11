@@ -171,14 +171,61 @@ def _strip_emphasis_chars(line: str) -> str:
     return "".join(out)
 
 
+def _strip_paired_backticks(line: str) -> str:
+    # R3 (v3): a run of N consecutive backticks pairs with the *next* run of
+    # exactly N consecutive backticks encountered scanning forward (any
+    # non-backtick content, and any differently-sized run, may sit between
+    # them); both runs are deleted, content between kept verbatim. A run
+    # with no same-length partner later in the line is left untouched.
+    # Mirrors Rust's `fs_strip_paired_backticks`: collect runs first, then
+    # walk with `idx += 1` only (never `idx = j + 1`), relying on
+    # `delete[idx]` to short-circuit runs already claimed as a partner.
+    n = len(line)
+    runs: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if line[i] == "`":
+            start = i
+            length = 0
+            while i < n and line[i] == "`":
+                i += 1
+                length += 1
+            runs.append((start, length))
+        else:
+            i += 1
+
+    delete = [False] * len(runs)
+    idx = 0
+    while idx < len(runs):
+        if delete[idx]:
+            idx += 1
+            continue
+        len_a = runs[idx][1]
+        partner = next(
+            (j for j in range(idx + 1, len(runs)) if not delete[j] and runs[j][1] == len_a),
+            None,
+        )
+        if partner is not None:
+            delete[idx] = True
+            delete[partner] = True
+        idx += 1
+
+    out = []
+    pos = 0
+    for k, (start, length) in enumerate(runs):
+        if delete[k]:
+            out.append(line[pos:start])
+            pos = start + length
+    out.append(line[pos:])
+    return "".join(out)
+
+
 def _strip_inline_markdown(line: str) -> str:
     # Order: links first (so bracket/paren text isn't mistaken for emphasis
-    # markers), then emphasis chars, then inline code.
+    # markers), then emphasis chars, then paired backticks.
     line = _LINK_RE.sub(lambda m: f"{m.group(1)} {m.group(2)}", line)
     line = _strip_emphasis_chars(line)
-    # B案: unconditional backtick removal (not paired inline-code extraction)
-    # -- mirrors `result.replace('`', "")` (canonicalize.rs fs_strip_markdown_line).
-    line = line.replace("`", "")
+    line = _strip_paired_backticks(line)
     return line
 
 
@@ -477,6 +524,16 @@ def _selftest_normalize_examples() -> None:
     _assert(
         normalize("    ## four-space") == "## four-space",
         "R2: 4 leading spaces exceed the <=3 indentation cap, header not recognized",
+    )
+    # R3 (v3): paired backtick runs -- only equal-length runs pair.
+    _assert(normalize("`code`") == "code", "R3: simple paired backticks (regression pin)")
+    _assert(
+        normalize("text with `one backtick") == "text with `one backtick",
+        "R3: unpaired backtick has no partner, left untouched",
+    )
+    _assert(
+        normalize("``a`b``") == "a`b",
+        "R3: two length-2 runs pair with each other, middle length-1 run kept literal",
     )
 
 
