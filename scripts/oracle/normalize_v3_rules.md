@@ -5,10 +5,14 @@ Authoritative rule text for the ingest-side canonicalization pipeline
 Supersedes `normalize_v2_rules.md` (v2). This document is the shared
 specification for **both** engines -- Rust and the python oracle
 (`scripts/oracle/normalize_v2.py`) -- but as of this pass only Rust has been
-brought in line with it (任务书 #121a); the judge's alignment for R2/R3
-(fence/backtick, already done in a prior Plan-B pass) plus R5/R6/R7 is
-任务书 #121b. Until #121b lands, the two engines disagree on stage ②; that
-divergence is exactly what `scripts/oracle/normalize_v2.py --compare` and
+brought in line with it (任务书 #121a). The judge currently mirrors *v2's
+old* fence/backtick behavior (column-0-only fence, unconditional backtick
+deletion) -- a prior Plan-B pass deliberately aligned it to that v2
+behavior, which is exactly the side R1/R3 replace in this document. The
+judge's alignment to R1–R7 here, R1/R3 included, is entirely 任务书 #121b's
+job; none of it is done yet. Until #121b lands, the two engines disagree on
+stage ②; that divergence is exactly what
+`scripts/oracle/normalize_v2.py --compare` and
 `examples/w6_normalize_dump.rs` measure.
 
 The **query** path (`canonicalize_query`) is not changed by v2 or v3 -- it
@@ -19,12 +23,12 @@ non-truncating function documented below) -- see `canonicalize.rs`'s own
 header comment for the exact call-site references.
 
 Every example below marked "verified" was produced by actually running
-`canonicalize_for_embedding` against the stated input on the commit this
-file was written against (still v2 at the time of writing -- Rust changes
-land in a later commit of this same task). Examples marked "v3 target (D
-落地后回填)" are the rule's intended output and are **not yet verified**;
-they get filled in with real `canonicalize_for_embedding` output once the
-Rust changes (this task's D block) land, not hand-computed.
+`canonicalize_for_embedding` against the stated input -- the "v2 output"
+lines against the pre-D commit of this same task (still v2), the "v3
+output" lines against the post-D commit (v3), neither hand-computed. A
+handful of R2/R4 examples say "v3 target: unchanged" instead of "v3
+output": those inputs' v2 and v3 output are identical, so the v2 line
+above them already is the verified v3 value too.
 
 ## ① NFC Unicode normalization
 
@@ -73,10 +77,10 @@ verbatim, line by line, once the state is on.
     (unconditionally-removed) backticks down to an empty line instead of
     toggling code-block state; the body line happens to be unaffected
     either way since it contains no markdown markers.
-  - v3 target (D 落地后回填): the fence lines are recognized and dropped,
-    expected `"indented fence body\nafter"` -- the same shape as the
-    already-correct column-0 case (verified:
-    `"\`\`\`\nverbatim body\n\`\`\`\nafter"` → `"verbatim body\nafter"`).
+  - v3 output (verified): `"indented fence body\nafter"` -- the fence lines
+    are recognized and dropped, matching the already-correct column-0 case
+    (verified: `"\`\`\`\nverbatim body\n\`\`\`\nafter"` →
+    `"verbatim body\nafter"`).
 
 ### R2 — ATX header recognition (v3 change, two independent directions)
 
@@ -101,8 +105,11 @@ wrong in two independent directions:
   - v2 output (verified): `"## docs/m7-arch"` (leading space silently
     dropped, `##` left untouched -- neither "recognized as a header" nor
     "left completely alone")
-  - v3 target (D 落地后回填): recognized and stripped, expected
-    `"docs/m7-arch"`.
+  - v3 output (verified): `"docs/m7-arch"` -- recognized and stripped.
+    (Stage ② itself keeps the leading space as "everything else"; it is
+    stage ③'s per-line leading-whitespace trim, unrelated to this rule,
+    that removes it from the final `canonicalize_for_embedding` output
+    either way.)
 - **Over-strips** (no count cap, no space requirement): any leading run of
   `#` characters is removed even when it isn't followed by whitespace (so
   it isn't really a heading marker) or when it exceeds 6 `#`s (CommonMark
@@ -149,13 +156,13 @@ v2 removes every backtick character unconditionally, paired or not.
   the same length anywhere later in the line)
   - v2 output (verified): `"text with one backtick"` (backtick removed even
     though it has no partner)
-  - v3 target (D 落地后回填): `` "text with `one backtick" `` -- the
-    backtick is preserved, since it has no matching same-length partner.
+  - v3 output (verified): `` "text with `one backtick" `` -- the backtick
+    is preserved, since it has no matching same-length partner.
 - Input: `` "``a`b``" `` (a length-2 run, then a length-1 run, then a
   length-2 run)
   - v2 output (verified): `"ab"` (all four backtick characters removed
     unconditionally)
-  - v3 target (D 落地后回填): `` "a`b" `` -- the two length-2 runs pair with
+  - v3 output (verified): `` "a`b" `` -- the two length-2 runs pair with
     *each other* (the length-1 run in between doesn't match N=2, so it is
     skipped when looking for a partner), deleting the two length-2 runs and
     keeping `` a`b `` -- including the middle single backtick -- as literal
@@ -180,13 +187,13 @@ instead of its previous unconditional `result.replace('*', "")`.
 - Input: `"a*b"` (both neighbors of `*` are alphanumeric)
   - v2 output (verified): `"ab"` (wrong -- v2 deletes every `*` regardless
     of neighbors)
-  - v3 target (D 落地后回填): `"a*b"` (preserved -- matches `_`'s existing,
+  - v3 output (verified): `"a*b"` (preserved -- matches `_`'s existing,
     already-correct behavior on the analogous case, verified unchanged:
     `"snake_case"` → `"snake_case"`).
 - Input: `"5*3"` (shell-arithmetic-shaped: both neighbors of `*` are
   digits)
   - v2 output (verified): `"53"`
-  - v3 target (D 落地后回填): `"5*3"` (preserved; the same shape as
+  - v3 output (verified): `"5*3"` (preserved; the same shape as
     real-world cases like shell arithmetic, regex quantifiers, or
     CJK-flanked emphasis, where both neighbors of `*` are alphanumeric).
 

@@ -1229,6 +1229,24 @@ See [docs](http://docs.rs) for more.
                 "OK",
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
+            // v3 resample (T3, 任务书 #121a): none of the 4 samples above
+            // change hash under v3's R1-R4 (fence/header/backtick/asterisk)
+            // fixes -- each happens to only exercise shapes where v2 and v3
+            // already agreed (verified: full `canonicalize::` test suite
+            // passes unchanged with the old hashes still pinned above). Per
+            // the task book, that means these 4 pins don't actually nail
+            // anything about v3's behavior, so two new samples are added
+            // that DO change: an indented header (R2) and an
+            // alphanumeric-flanked asterisk (R4). v2 hashes recorded for
+            // contrast, not asserted.
+            (
+                " ## indented heading",
+                "611766c43731c66fcdc6b18540c51cfb953fac323dfa6c4030bdf5545d2c3a73",
+            ),
+            (
+                "a*b",
+                "15eb0a792505b1914ccd7f8d39a6b0f1985d86b37566faf73a589ea9e8454d8b",
+            ),
         ];
         for (input, expected_hex) in cases {
             let canonical = canonicalize_for_embedding(input);
