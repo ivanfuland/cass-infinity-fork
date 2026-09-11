@@ -97644,8 +97644,48 @@ fn run_models_backfill(
     }
 
     let tier = parse_models_backfill_tier(tier_raw)?;
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(default_db_path);
+    // T4 mission #122a (C, R2-01/R3-F3/R1-N12): canonicalize `data_dir` up
+    // front so both the mismatch check below and the lock file path
+    // (`acquire_index_run_lock` keys its lock file off `data_dir`) see the
+    // same normalized path a concurrent `cass index`/`watch` on the same
+    // directory would. `data_dir` may not exist yet -- this function has
+    // no directory-creation duty (unlike `acquire_index_run_lock` itself,
+    // which does create it once actually called below); canonicalize only
+    // resolves existing paths, so a nonexistent one falls back to its own
+    // (uncanonicalized) form here, letting the `db_path.is_file()` check
+    // below still correctly report `IndexMissing` instead of a raw "no
+    // such file or directory" from canonicalize itself.
+    let data_dir_raw = data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = std::fs::canonicalize(&data_dir_raw).unwrap_or(data_dir_raw);
+    let expected_db_path = data_dir.join("agent_search.db");
+    // Before this task book, `db_path` resolved independently of
+    // `data_dir` (`db_override.unwrap_or_else(default_db_path)`): a bare
+    // `--data-dir X` with no `--db` silently fell through to the *global*
+    // default database, not `X`'s (R1-N6). Now an explicit `--db` is only
+    // accepted when it names this same `data_dir`'s own database; the
+    // default (no `--db`) is always `data_dir`-derived, matching `cass
+    // index`'s own `db_override.unwrap_or_else(|| data_dir.join(...))`.
+    let db_path = match db_override {
+        Some(raw) => std::fs::canonicalize(&raw).unwrap_or(raw),
+        None => expected_db_path.clone(),
+    };
+    if db_path != expected_db_path {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "--db {} is not the database under --data-dir {} (expected {}); models backfill only operates on data_dir-scoped databases",
+                db_path.display(),
+                data_dir.display(),
+                expected_db_path.display()
+            ),
+            hint: Some(format!(
+                "Drop --db to use {} directly, or point --data-dir at the directory containing the intended database.",
+                expected_db_path.display()
+            )),
+            retryable: false,
+        });
+    }
     if !db_path.is_file() {
         return Err(CliError {
             code: 3,
@@ -97655,6 +97695,44 @@ fn run_models_backfill(
             retryable: true,
         });
     }
+
+    // T4 mission #122a (C, spec §四.4): take the same `index-run.lock`
+    // `cass index`/`watch` take, keyed off this same canonicalized
+    // `data_dir` -- held for the rest of this function (dropped on every
+    // return path, including the scheduler-skip early return below) so a
+    // concurrent `cass index --semantic` (or another `models backfill`)
+    // can't drain the same chunk_holes generation at the same time.
+    // Lock-busy uses the exact same code/message `run_index` itself
+    // produces on contention (`ActiveIndexRunDetails::to_cli_error()`,
+    // code 7, `IndexBusy`) -- control-plane ruling 2026-09-11: spec's
+    // originally-drafted "exit 2" for this case was a drafting error (it
+    // never checked what `run_index` actually does), not an intentional
+    // divergence; "exit 2" is correct only for the `--db`/`data_dir`
+    // mismatch case just above, which is a genuinely different failure.
+    let _index_run_lock_guard = crate::indexer::acquire_index_run_lock(
+        &data_dir,
+        &db_path,
+        crate::search::asset_state::SearchMaintenanceMode::Index,
+    )
+    .map_err(|err| {
+        let chain = err
+            .chain()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if error_chain_indicates_active_cass_index(&chain) {
+            let details = active_index_run_details(&data_dir, &db_path)
+                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path));
+            return details.to_cli_error();
+        }
+        CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("failed to acquire index-run lock for {}: {chain}", data_dir.display()),
+            hint: None,
+            retryable: true,
+        }
+    })?;
 
     let embedder_type = embedder_override
         .map(str::trim)
@@ -98015,6 +98093,126 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             embedded_count, 2,
             "both seeded messages must be embedded via the CLI path"
         );
+    }
+
+    /// T4 mission #122a (C, Step 3 case ①): `models backfill` must refuse
+    /// to run while another process already holds `index-run.lock` for
+    /// the same `data_dir` -- same lock, same contention outcome `cass
+    /// index` gets. Control-plane ruling 2026-09-11: the exit code is 7
+    /// (`IndexBusy`, `ActiveIndexRunDetails::to_cli_error()`), matching
+    /// `run_index`'s real behavior -- the mission's originally-drafted
+    /// "exit 2" was a spec-drafting error (spec's own text never actually
+    /// checked what `run_index` does on lock contention), not a real
+    /// requirement to diverge from it.
+    #[test]
+    fn models_backfill_returns_index_busy_when_lock_is_held() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        {
+            let _ = FrankenStorage::open(&db_path).unwrap();
+        }
+
+        let _held_by_someone_else = crate::indexer::acquire_index_run_lock(
+            &data_dir,
+            &db_path,
+            crate::search::asset_state::SearchMaintenanceMode::Index,
+        )
+        .expect("test setup: acquiring the lock first must succeed");
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let err = result.expect_err("models backfill must refuse to run while another index run holds the lock");
+        assert_eq!(err.code, 7, "lock-busy must use the same exit code run_index uses (IndexBusy), not a bespoke one: {err:?}");
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
+        assert!(
+            err.message.contains("already active for data dir"),
+            "must reuse run_index's own ActiveIndexRunDetails wording verbatim, not a bespoke message: {}",
+            err.message
+        );
+    }
+
+    /// T4 mission #122a (C, Step 3 case ②): a `--db` outside `--data-dir`
+    /// must be rejected as a usage error, not silently accepted and
+    /// operated on.
+    #[test]
+    fn models_backfill_rejects_db_outside_data_dir() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let outside_dir = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_db = outside_dir.join("agent_search.db");
+        {
+            let _ = FrankenStorage::open(&outside_db).unwrap();
+        }
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(outside_db.clone()), None);
+        let err = result.expect_err("a --db outside --data-dir must be rejected");
+        assert_eq!(err.code, 2, "data_dir/db_path mismatch must be a usage error: {err:?}");
+        assert_eq!(err.kind, CliErrorKind::Usage.kind_str());
+    }
+
+    /// T4 mission #122a (C, Step 3 case ③): `--data-dir` with no `--db`
+    /// must operate on *that* data_dir's own database, not the process-
+    /// global default (`default_db_path()`) -- R1-N6. `--tier fast`
+    /// (hash embedder) is used deliberately, not as a stand-in embedder:
+    /// W3-5 retired the hash/fastembed fsvi path entirely (see the
+    /// unconditional "embedder '{embedder_type}' is retired" `Err` this
+    /// function falls through to below its `embedder_type == "infinity"`
+    /// branch), so this call is expected to fail there -- but only
+    /// *after* resolving data_dir/db_path, opening the side database via
+    /// `FrankenStorage::open_writer`, and acquiring the lock, all of
+    /// which happen earlier in the function. Reaching that specific
+    /// "retired" error (code 20), not `IndexMissing` (3) or the mismatch
+    /// `Usage` error (2) case ② covers, is itself the proof this call
+    /// really operated on the side database rather than the default.
+    #[test]
+    fn models_backfill_default_db_path_is_derived_from_data_dir_not_global_default() {
+        let dir = TempDir::new().unwrap();
+        let side_dir = dir.path().join("side");
+        std::fs::create_dir_all(&side_dir).unwrap();
+        let side_db_path = side_dir.join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&side_db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+                .unwrap();
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some("t4-122a-c3-sentinel".into()),
+                title: Some("t4 122a C3 sentinel".into()),
+                source_path: std::path::PathBuf::from("/fixtures/t4-122a-c3-sentinel.jsonl"),
+                started_at: Some(1_000),
+                ended_at: Some(1_000),
+                approx_tokens: None,
+                metadata_json: serde_json::json!(null),
+                messages: vec![],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conv).expect("seed sentinel conversation into the side db");
+        }
+
+        let result = run_models_backfill("fast", None, 100, false, Some(side_dir.clone()), None, None);
+        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence of which db got opened");
+        assert_eq!(err.code, 20, "must reach the retired-embedder error, proving data_dir/db_path resolution and lock acquisition both succeeded against the side db first: {err:?}");
+
+        let lock_path = side_dir.join("index-run.lock");
+        assert!(lock_path.is_file(), "index-run.lock must have been created under --data-dir, not wherever the global default would be: {}", lock_path.display());
+
+        let storage = FrankenStorage::open_readonly(&side_db_path).unwrap();
+        let sentinel_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE external_id = ?1",
+                &crate::storage::api::params!["t4-122a-c3-sentinel"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel_count, 1, "the side db's own sentinel session must still be there and readable -- confirms this call opened *this* file, not some other data_dir's database");
     }
 }
 
