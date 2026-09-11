@@ -147,7 +147,6 @@ _HEADER_RE = re.compile(r"^(\s*)(#{1,6})(\s+)(.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^(\s*)>+\s?(.*)$")
 _LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
 _LINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\n]*)\)")
-_INTRALINE_WS_RE = re.compile(r"[ \t\r\f\v]+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
 
@@ -207,12 +206,34 @@ def _strip_markdown_and_code(text: str) -> str:
     return "\n".join(out_lines)
 
 
+def _collapse_intraline_whitespace(line: str) -> str:
+    # R7 (v3): a character is collapsible intra-line whitespace when
+    # ch.isspace() is true (Python's Unicode White_Space test, e.g. NBSP
+    # U+00A0) -- mirrors Rust's char::is_whitespace() scope. Pre-v3 this was
+    # an ASCII-only class ([ \t\r\f\v]). Leading whitespace is dropped
+    # entirely (never emitted as a space); trailing whitespace is trimmed
+    # by the final .rstrip() -- both use the same Unicode-aware test as the
+    # collapse itself, per Ivan's ruling that trim shares R7's scope rather
+    # than being a separate rule.
+    out = []
+    prev_space = True
+    for ch in line:
+        if ch.isspace():
+            if not prev_space:
+                out.append(" ")
+                prev_space = True
+        else:
+            out.append(ch)
+            prev_space = False
+    return "".join(out).rstrip()
+
+
 def _normalize_whitespace(text: str) -> str:
     lines = text.split("\n")
-    lines = [_INTRALINE_WS_RE.sub(" ", ln).strip(" \t\r\f\v") for ln in lines]
+    lines = [_collapse_intraline_whitespace(ln) for ln in lines]
     joined = "\n".join(lines)
     joined = _MULTI_NEWLINE_RE.sub("\n\n", joined)
-    return joined.strip("\n \t\r\f\v")
+    return joined.strip()
 
 
 def _filter_low_signal(text: str) -> str:
@@ -415,6 +436,9 @@ def _selftest_normalize_examples() -> None:
         normalize(" ```\nindented fence body\n ```\nafter") == "indented fence body\nafter",
         "R1: indented fence (<=3 spaces) recognized as fence marker",
     )
+    # R7 (v3): Unicode White_Space (e.g. NBSP U+00A0) is collapsible
+    # intra-line whitespace, not just the ASCII set.
+    _assert(normalize("a b") == "a b", "R7: NBSP folds to a regular space")
 
 
 def _selftest_is_hard_noise_empty_and_normal() -> None:
