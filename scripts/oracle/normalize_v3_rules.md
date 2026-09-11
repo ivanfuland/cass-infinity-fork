@@ -54,7 +54,12 @@ the opposite order -- see R5):
 4. Markdown links `[text](url)` → `text url` (R6; unchanged from v2).
 5. ATX headers (R2).
 6. Blockquote prefix `>` (unchanged from v2: strip leading `>` characters,
-   then leading whitespace).
+   then leading whitespace). **Known**: `>` recognition does not tolerate
+   leading whitespace (unlike R1/R2's ≤3-space tolerance) -- both engines
+   agree on this (Rust's `trim_start_matches('>')` only fires when `>` is
+   the line's literal first character). **v4 candidate**: whether to align
+   this to R1/R2's ≤3-space tolerance is left to the R1 review; this pass
+   does not touch Rust.
 7. List markers `- `, `+ `, `N. ` (unchanged from v2).
 
 A markdown link `[text](url)` becomes `"text url"` (v2 change, carried

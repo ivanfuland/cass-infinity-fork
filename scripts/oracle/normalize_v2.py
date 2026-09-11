@@ -144,7 +144,16 @@ def is_hard_noise(role: Optional[str], text: str) -> bool:
 # fence-indentation tolerance). Pre-v3 this required column 0 exactly.
 _FENCE_RE = re.compile(r"^ {0,3}```")  # <=3 leading spaces, mirrors `fs_is_fence_marker`
 _HEADER_RE = re.compile(r"^( {0,3})(#{1,6})( |$)(.*)$")
-_BLOCKQUOTE_RE = re.compile(r"^(\s*)>+\s?(.*)$")
+# 任务书 #121b (§2.6, unchanged-from-v2 pre-existing judge deviation, not
+# one of R1-R7): blockquote `>` is only recognized at column 0, mirroring
+# Rust's `result.trim_start_matches('>').trim_start()` -- trim_start_matches
+# only fires when '>' is the string's literal first character, so a line
+# with leading whitespace before '>' is never recognized as a blockquote
+# (the whitespace still gets dropped later by stage 3's per-line trim, but
+# the '>' itself survives as literal text). The judge previously had a
+# `(\s*)` prefix here that tolerated indentation before '>', which no rule
+# in the shared spec calls for -- cass-sql-advisor 2026-09-10 ruling.
+_BLOCKQUOTE_RE = re.compile(r"^>+\s?(.*)$")
 _LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
 
@@ -333,7 +342,7 @@ def _strip_markdown_line(line: str) -> str:
         line = m.group(1) + m.group(4)
     m = _BLOCKQUOTE_RE.match(line)
     if m:
-        line = m.group(1) + m.group(2)
+        line = m.group(1)
     m = _LIST_RE.match(line)
     if m:
         line = m.group(1) + m.group(2)
@@ -684,6 +693,15 @@ def _selftest_normalize_examples() -> None:
         normalize("**1. Heading**") == "Heading",
         "R5: bold-wrapped list marker unmasked by inline-before-prefix order",
     )
+    # §2.6 (pre-existing judge deviation fix, cass-sql-advisor 2026-09-10
+    # ruling): blockquote `>` only recognized at column 0, no leading-
+    # whitespace tolerance -- matches Rust's trim_start_matches('>')
+    # requiring '>' as the literal first character.
+    _assert(
+        normalize("   > quoted") == "> quoted",
+        "blockquote: indented '>' is NOT recognized, kept as literal text",
+    )
+    _assert(normalize("> quoted") == "quoted", "blockquote: column-0 '>' (regression pin)")
 
 
 def _selftest_is_hard_noise_empty_and_normal() -> None:
