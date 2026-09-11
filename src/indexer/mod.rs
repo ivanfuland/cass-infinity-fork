@@ -1666,8 +1666,11 @@ fn robot_trace_ingest_finish(
 /// dependent on whatever other test in this file's ~740-test binary happens
 /// to touch an instrumented stage first and lock the cache to "disabled".
 /// `std::env::var_os` is a process-table lookup, not a syscall; this fires
-/// at most 6 times per real index run, so the cost against a cached atomic
-/// read is immaterial next to the I/O each call brackets.
+/// at most 6 times per real index run (three stages x start/end -- ingest
+/// has two call sites, `run_streaming_index` and `run_batch_index`, but only
+/// one executes per run depending on `CASS_STREAMING_INDEX`), so the cost
+/// against a cached atomic read is immaterial next to the I/O each call
+/// brackets.
 fn memprobe_point(stage: &str, point: &str) {
     let Some(path) = std::env::var_os("CASS_MEMPROBE_LOG") else {
         return;
@@ -7895,7 +7898,8 @@ fn run_streaming_index(
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
-    run_streaming_index_with_connector_factories(
+    memprobe_point("ingest", "start");
+    let result = run_streaming_index_with_connector_factories(
         storage,
         opts,
         since_ts,
@@ -7905,7 +7909,9 @@ fn run_streaming_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
-    )
+    );
+    memprobe_point("ingest", "end");
+    result
 }
 
 type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
