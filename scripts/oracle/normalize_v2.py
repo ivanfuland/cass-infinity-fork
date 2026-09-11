@@ -139,13 +139,10 @@ def is_hard_noise(role: Optional[str], text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 #
-# T11.7 v5.1 B案 (2026-09-05, pending Ivan's A/B ruling via cass-sql-advisor):
-# `_FENCE_RE` and the inline-code step below are re-aligned to MIRROR Rust's
-# *current* canonicalize.rs behavior (not CommonMark), so this oracle stops
-# flagging that behavior as a "diff" while the ruling is pending. If Ivan
-# picks plan A (fix Rust instead), these two edits get reverted and the
-# corresponding Rust fix lands instead -- see t11.7-diag/ for the analysis.
-_FENCE_RE = re.compile(r"^```")  # column-0 only: mirrors `line.starts_with("```")`
+# 任务书 #121b (R1, v3): fence-marker recognition tolerates up to 3 leading
+# spaces, mirroring Rust's `fs_is_fence_marker` (CommonMark's own
+# fence-indentation tolerance). Pre-v3 this required column 0 exactly.
+_FENCE_RE = re.compile(r"^ {0,3}```")  # <=3 leading spaces, mirrors `fs_is_fence_marker`
 _HEADER_RE = re.compile(r"^(\s*)(#{1,6})(\s+)(.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^(\s*)>+\s?(.*)$")
 _LIST_RE = re.compile(r"^(\s*)(?:[-+]|\d+\.)\s+(.*)$")
@@ -412,6 +409,12 @@ def _selftest_normalize_examples() -> None:
     lines = [f"L{i}" for i in range(1, 36)]
     fenced = "```\n" + "\n".join(lines) + "\n```"
     _assert(normalize(fenced) == "\n".join(lines), "fenced code verbatim, no collapse")
+    # R1 (v3): fence marker tolerates up to 3 leading spaces (indented fence
+    # lines toggle code-block state and are dropped, same as column 0).
+    _assert(
+        normalize(" ```\nindented fence body\n ```\nafter") == "indented fence body\nafter",
+        "R1: indented fence (<=3 spaces) recognized as fence marker",
+    )
 
 
 def _selftest_is_hard_noise_empty_and_normal() -> None:
