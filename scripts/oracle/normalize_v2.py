@@ -21,6 +21,7 @@ spec, not silently patched to match Rust.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import re
@@ -721,6 +722,39 @@ def _selftest_is_hard_noise_empty_and_normal() -> None:
     )
 
 
+def _selftest_compare_guards() -> None:
+    # R5-B2: --compare must refuse an empty input, duplicated message_ids,
+    # and an id set that disagrees with --expect-identity (all exit 2), and
+    # still accept one genuine record (exit 0). Hermetic: builds its own
+    # one-row sqlite file; stdout from run_compare is swallowed.
+    import io, os, tempfile, contextlib
+    d = tempfile.mkdtemp(prefix="nv2-r5b2-")
+    db = os.path.join(d, "t.db")
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)")
+    content = "**hello** `w`"
+    conn.execute("INSERT INTO messages VALUES(1, ?)", (content,))
+    conn.commit(); conn.close()
+    good = json.dumps({"message_id": 1, "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                       "rust_normalized": normalize(content)})
+    def run(lines, identity=None):
+        jl = os.path.join(d, "in.jsonl")
+        with open(jl, "w") as f:
+            f.write("".join(l + "\n" for l in lines))
+        ident = None
+        if identity is not None:
+            ident = os.path.join(d, "id.json")
+            with open(ident, "w") as f:
+                json.dump({"message_ids": identity}, f)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return run_compare(jl, db, None, ident)
+    _assert(run([]) == 2, "empty --compare input must be a precondition error (exit 2), not diffs=0")
+    _assert(run([good, good, good]) == 2, "duplicated message_ids must be a precondition error (exit 2)")
+    _assert(run([good], identity=[1, 2]) == 2, "id set disagreeing with --expect-identity must exit 2")
+    _assert(run([good], identity=[1]) == 0, "one genuine record matching --expect-identity must exit 0")
+    _assert(run([good]) == 0, "one genuine record without --expect-identity must exit 0")
+
+
 def run_selftest() -> int:
     checks = [
         ("properties_cover_and_overlap", _selftest_properties),
@@ -729,6 +763,7 @@ def run_selftest() -> int:
         ("role_alias_table", _selftest_role_alias_table),
         ("normalize_v2_rule_examples", _selftest_normalize_examples),
         ("is_hard_noise_empty_and_normal", _selftest_is_hard_noise_empty_and_normal),
+        ("compare_guards_reject_empty_dup_and_identity_mismatch", _selftest_compare_guards),
     ]
     failed = False
     for name, fn in checks:
@@ -848,9 +883,39 @@ def run_check_fixtures(path: str) -> int:
 # unmodified function into a new read-only comparison entry point.
 # ---------------------------------------------------------------------------
 
-def run_compare(jsonl_path: str, db_path: str, buckets_path: Optional[str]) -> int:
+def run_compare(
+    jsonl_path: str, db_path: str, buckets_path: Optional[str], expect_identity_path: Optional[str] = None
+) -> int:
     with open(jsonl_path) as f:
         records = [json.loads(line) for line in f if line.strip()]
+
+    # R5-B2 guards (control-plane adversarial review of #121a, blocker
+    # class: false green). `total` is meant to count *independent* messages
+    # actually checked against --db, so an empty input, an input padded
+    # with duplicate message_ids, or an input whose id set is not the one
+    # the sample identity manifest says was drawn, must all be rejected as
+    # precondition errors (exit 2) rather than reported as diffs=0.
+    if not records:
+        print("precondition error: --compare input has no records", file=sys.stderr)
+        return 2
+    ids = [rec["message_id"] for rec in records]
+    dupes = sorted(i for i, n in Counter(ids).items() if n > 1)
+    if dupes:
+        print(
+            f"precondition error: --compare input repeats {len(dupes)} message_id(s), e.g. {dupes[:5]}",
+            file=sys.stderr,
+        )
+        return 2
+    if expect_identity_path:
+        with open(expect_identity_path) as f:
+            expected = json.load(f)["message_ids"]
+        if sorted(expected) != sorted(ids):
+            print(
+                f"precondition error: --compare input ids ({len(ids)}) do not match "
+                f"--expect-identity message_ids ({len(expected)})",
+                file=sys.stderr,
+            )
+            return 2
 
     uri = f"file:{db_path}?immutable=1"
     try:
@@ -939,6 +1004,7 @@ def main() -> int:
     p.add_argument("--compare", metavar="JSONL")
     p.add_argument("--db", metavar="DB")
     p.add_argument("--buckets", metavar="JSON")
+    p.add_argument("--expect-identity", metavar="JSON")
     args = p.parse_args()
 
     if args.selftest:
@@ -954,7 +1020,7 @@ def main() -> int:
         if not args.db:
             print("--compare requires --db <db>", file=sys.stderr)
             return 2
-        return run_compare(args.compare, args.db, args.buckets)
+        return run_compare(args.compare, args.db, args.buckets, args.expect_identity)
 
     p.print_help()
     return 2
