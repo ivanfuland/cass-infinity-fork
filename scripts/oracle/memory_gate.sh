@@ -26,7 +26,7 @@
 #
 # Normal mode: memory_gate.sh [--collect-baseline] [--stage4-db <path>]
 #   <shape:a|b|c> <cass_wrapper>
-#   Requires env RUN_ROOT, GATES, EXAMPLES, W6 (W6 holds
+#   Requires env RUN_ROOT, EXAMPLES, XDG_CONFIG_HOME, W6 (W6 holds
 #   memgate-baseline.json, read for the budget unless --collect-baseline).
 #   Builds the shape's fixture once (via $EXAMPLES/w4_memory_fixture, which
 #   also freezes <fixture_dir>/manifest.json) into
@@ -481,7 +481,11 @@ manifest="$fixture_dir/manifest.json"
 [ -f "$manifest" ] || { echo "memory_gate: $manifest missing (fixture must be frozen by w4_memory_fixture)" >&2; exit 2; }
 fixture_sha256=$(manifest_field "$manifest" fixture_sha256) || exit 2
 
-binary_sha256=$(binary_sha256_of "$cass_wrapper")
+# #122b-3c: hash the binary the wrapper execs into, not the wrapper shim
+# (a per-run-root constant, so baseline and candidate rounds shared it).
+binary_path="${CASS_CAND_BIN:-$RUN_ROOT/cass-candidate}"
+binary_sha256=$(binary_sha256_of "$binary_path")
+[ -n "$binary_sha256" ] || { echo "memory_gate: cannot hash the binary under test: $binary_path" >&2; exit 2; }
 
 baseline_json="${W6:-}/memgate-baseline.json"
 
