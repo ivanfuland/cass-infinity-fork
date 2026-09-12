@@ -1693,7 +1693,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           wrong_marker_sha=False, project_read_anchor=False,
                           legit_sibling_redaction=False, compact_extra_no_body=False,
                           candidate_only_row=False, array_tool_use_result=None,
-                          excludable_sibling_leak=False):
+                          excludable_sibling_leak=False,
+                          beyond_manifest_excluded=None):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1817,6 +1818,41 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                     msgpack.packb({"message": {"content": [{"type": "text", "text": "sibling turn"}]}}, use_bin_type=True),
                 ],
             )
+        if beyond_manifest_excluded is not None:
+            # N-fam5 (任务书 #131 T6-c): a row the CANDIDATE excluded that the
+            # frozen manifest cannot know about (it was added to the corpus
+            # after the manifest's snapshot). `ok` carries the shape a correct
+            # exclusion has -- empty content, a marker, and extra differences
+            # that are all redacted placeholders; `bad` carries a stray change
+            # the marker does not account for.
+            beyond_extra = _verify_extra(redacted if with_excluded else body_text)
+            beyond_content = "" if with_excluded else body_text
+            if with_excluded and beyond_manifest_excluded == "bad":
+                beyond_extra["stray"] = "a change no redacted placeholder explains"
+            marker_json = json.dumps({
+                "reason": "context_file_read",
+                "rule_version": 1,
+                "bytes": len(body_text.encode("utf-8")),
+                "sha256": body_sha,
+                "fingerprint_blake3": "0" * 64,
+                "parse_error": None,
+                "anchor": {"tool_call_id": "t9", "tool_name": "Read", "paths": None, "shell": None},
+                "src": None,
+                "raw": {"blob": blob_rel, "idx": 1, "event_key": "u2", "blocks": [0]},
+            })
+            if with_excluded:
+                # Only the candidate schema (v6) has the `excluded` column.
+                conn.execute(
+                    "INSERT INTO messages(conversation_id, idx, role, content, extra_bin, excluded) "
+                    "VALUES (1, 5, 'tool_result', ?, ?, jsonb(?))",
+                    [beyond_content, msgpack.packb(beyond_extra, use_bin_type=True), marker_json],
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                    "VALUES (1, 5, 'tool_result', ?, ?)",
+                    [beyond_content, msgpack.packb(beyond_extra, use_bin_type=True)],
+                )
         if excludable_sibling_leak:
             conn.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
@@ -1974,6 +2010,13 @@ def verify_selftest_cases():
         # excluded is still a real leak. (Case order and the `flags` mapping in
         # `_run_verify_selftest` are index-coupled -- append, do not insert.)
         ("V16 a retained body in an excludable row is a failure", False, "retained_excludable"),
+        # N-fam5 (任务书 #131 T6-c): an exclusion the candidate made beyond the
+        # frozen manifest is recorded, not failed -- and only when its marker
+        # and its extra differences hold up.
+        ("V17 an exclusion beyond the manifest is informational", True, "",
+         {"candidate_excluded_beyond_manifest": 1}),
+        ("V18 an exclusion beyond the manifest with a bad marker is a failure", False,
+         "beyond_manifest_bad_marker"),
     ]
 
 
@@ -2008,6 +2051,8 @@ def _run_verify_selftest(paths_cfg):
             13: {"array_tool_use_result": "owned"},
             14: {"array_tool_use_result": "foreign"},
             15: {"excludable_sibling_leak": True},
+            16: {"beyond_manifest_excluded": "ok"},
+            17: {"beyond_manifest_excluded": "bad"},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -3538,6 +3583,36 @@ def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
     return bodies
 
 
+def _beyond_manifest_marker_problem(marker, row, ref_row):
+    """`None` when an exclusion made beyond the manifest is well-formed; else a
+    one-line reason.
+
+    N-fam5 (任务书 #131 T6-c): such a row is informational, so the marker must
+    still be checked -- "the candidate excluded something the frozen manifest
+    cannot list" is only benign while the marker is a real exclusion marker and
+    the extra differences it explains are all redacted placeholders. Anything
+    else is a candidate-side over-clear wearing an exclusion as a disguise.
+    """
+    reason = marker.get("reason")
+    if reason not in ("cass_recall", "context_file_read", "codex_host_shell"):
+        return f"marker reason {reason!r} is not a known exclusion reason"
+    sha = marker.get("sha256")
+    if not isinstance(sha, str) or len(sha) != 64:
+        return f"marker sha256 {sha!r} is not a 64-character digest"
+    if not isinstance(marker.get("bytes"), int):
+        return f"marker bytes {marker.get('bytes')!r} is not an integer"
+    if not isinstance(marker.get("raw"), dict):
+        return "marker carries no raw record"
+    stray = [
+        path
+        for path, value, _reference in _diff_paths(_decode_extra(row["extra_bin"]), _decode_extra(ref_row["extra_bin"]))
+        if not _is_redacted_placeholder(value, sha)
+    ]
+    if stray:
+        return f"extra_bin changed outside a redacted placeholder: {stray[:5]}"
+    return None
+
+
 def _verify_rebuild_blob(entry, marker, mirror_root):
     """Reparse the recorded blob, re-project the recorded blocks and re-apply
     the ingest-side redactor; returns the rebuilt body's sha256 or an error
@@ -3600,6 +3675,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     failures = []
     sha_binding_mismatch = 0
     body_retained_unexcludable = 0
+    candidate_excluded_beyond_manifest = 0
+    candidate_excluded_beyond_manifest_samples = []
     body_retained_unexcludable_samples = []
     excludable_cache = {}
     extra_unchanged_no_body = 0
@@ -3776,6 +3853,22 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         if row is None:
             failures.append((label, "non-manifest row is missing from the candidate"))
             continue
+        marker = json.loads(row["excluded_json"]) if _field(row, "excluded_json") else None
+        if marker is not None and row["content"] == "":
+            # N-fam5 (任务书 #131 T6-c): a row the candidate excluded that the
+            # manifest CANNOT know about -- the manifest comes from the `copy`
+            # snapshot, and this row was added to the corpus afterwards (the
+            # control plane regenerated it against `copy`: 6,882 entries, zero
+            # added or removed). The reference library is a later snapshot, so
+            # it still holds the original text and the two sides differ by
+            # construction. Recorded, not failed -- after a shape check.
+            candidate_excluded_beyond_manifest += 1
+            if len(candidate_excluded_beyond_manifest_samples) < 20:
+                candidate_excluded_beyond_manifest_samples.append([label, key[2]])
+            problem = _beyond_manifest_marker_problem(marker, row, ref_row)
+            if problem is not None:
+                failures.append((label, f"beyond_manifest_bad_marker: {problem}"))
+            continue
         if row["content"] != ref_row["content"]:
             failures.append((label, "non-manifest body differs from reference"))
         if row["extra_bin"] != ref_row["extra_bin"] and not _sibling_extra_diff_is_target_only(
@@ -3830,6 +3923,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "extra_unchanged_no_body": extra_unchanged_no_body,
         "body_retained_unexcludable": body_retained_unexcludable,
         "body_retained_unexcludable_samples": body_retained_unexcludable_samples,
+        "candidate_excluded_beyond_manifest": candidate_excluded_beyond_manifest,
+        "candidate_excluded_beyond_manifest_samples": candidate_excluded_beyond_manifest_samples,
         "candidate_only_rows": candidate_only_rows,
         "failure_families": dict(sorted(Counter(failure_family(detail) for _label, detail in failures).items())),
         # N-fam3 (任务书 #131 追加): the families give the shape of a failure
@@ -3960,7 +4055,8 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
         print("verify: failure families: " + ", ".join(f"{name}={count}" for name, count in families.most_common()))
     informational = {
         key: report[key]
-        for key in ("extra_unchanged_no_body", "candidate_only_rows", "body_retained_unexcludable")
+        for key in ("extra_unchanged_no_body", "candidate_only_rows",
+                    "body_retained_unexcludable", "candidate_excluded_beyond_manifest")
         if key in report
     }
     if any(informational.values()):
