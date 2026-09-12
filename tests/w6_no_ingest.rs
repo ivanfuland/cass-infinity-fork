@@ -202,6 +202,113 @@ fn no_ingest_skips_the_scan_and_leaves_the_corpus_unchanged() {
     );
 }
 
+/// B05 (任务书 #131): `--no-ingest` guards only the connector scan. The
+/// historical-salvage preflight runs BEFORE that guard, so a populated
+/// corpus with a discoverable, not-yet-imported backup had that backup's
+/// sessions written into `messages` -- while `scan_invocations` stayed 0 and
+/// `--json` reported `no_ingest: true`, i.e. the "this run did not touch the
+/// corpus" reading was false.
+///
+/// Both arms run on a fresh fixture: the control arm (no_ingest = false)
+/// proves the fixture really does trigger salvage, so the `--no-ingest`
+/// arm's invariance is evidence and not an untriggered fixture.
+#[test]
+#[serial]
+fn no_ingest_does_not_salvage_historical_bundles() {
+    for no_ingest in [false, true] {
+        let fixture = Fixture::new();
+        let _env = fixture.isolate();
+        fixture.seed_session("rollout-live.jsonl", "noingestsalvagelive");
+
+        // The fixture's own corpus, ingested once so later runs have a
+        // populated canonical DB (which is what lets discovery run at all,
+        // and keeps the live root empty of anything new).
+        let baseline = Arc::new(IndexingProgress::default());
+        indexer::run_index(index_opts(&fixture, Arc::clone(&baseline), false), None).expect("baseline index run");
+        let (conversations_before, messages_before) = corpus_counts(&fixture.db_path());
+        assert!(conversations_before >= 1, "the baseline run must ingest the live fixture session");
+
+        // A second, self-contained corpus holding a session this one has
+        // never seen; its database is dropped into `backups/` as a
+        // discoverable historical bundle.
+        let other = TempDir::new().expect("tempdir");
+        let backup_db = build_backup_corpus(&other);
+        let backups_dir = fixture.data_dir().join("backups");
+        std::fs::create_dir_all(&backups_dir).expect("create backups dir");
+        for (suffix, target_suffix) in [("", ""), ("-wal", "-wal"), ("-shm", "-shm")] {
+            let source = PathBuf::from(format!("{}{suffix}", backup_db.display()));
+            if source.exists() {
+                std::fs::copy(&source, backups_dir.join(format!("agent_search.db.example.bak{target_suffix}")))
+                    .expect("copy the backup bundle");
+            }
+        }
+        let _discovery = EnvGuard::set("CASS_PREFLIGHT_HISTORICAL_SALVAGE_DISCOVERY", "1");
+
+        let progress = Arc::new(IndexingProgress::default());
+        let guarded = Arc::clone(&progress);
+        indexer::run_index(index_opts(&fixture, guarded, no_ingest), None).expect("guarded index run");
+
+        let (conversations_after, messages_after) = corpus_counts(&fixture.db_path());
+        let salvaged = sessions_matching(&fixture.db_path(), "rollout-backup");
+        if no_ingest {
+            let stats = progress.stats.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                stats.salvage_skipped_by_no_ingest,
+                "--json must disclose that --no-ingest suppressed the historical salvage preflight"
+            );
+            assert!(
+                stats.no_ingest,
+                "the run must still report itself as --no-ingest"
+            );
+            drop(stats);
+            assert_eq!(
+                (conversations_after, messages_after),
+                (conversations_before, messages_before),
+                "--no-ingest must not import a discoverable historical backup"
+            );
+            assert_eq!(
+                salvaged, 0,
+                "the backup's session must not appear in a --no-ingest run's corpus"
+            );
+        } else {
+            assert_eq!(
+                salvaged, 1,
+                "the control run must actually salvage the backup, else the --no-ingest arm proves nothing \
+                 (conversations {} -> {})",
+                conversations_before, conversations_after
+            );
+        }
+    }
+}
+
+/// Build a self-contained corpus in its own tempdir and return its
+/// `agent_search.db`, so the caller can drop it into another corpus'
+/// `backups/` as a historical bundle holding a session that corpus has never
+/// seen. `CODEX_HOME` is redirected only for the index run itself.
+fn build_backup_corpus(other: &TempDir) -> PathBuf {
+    let codex_home = other.path().join("codex-home");
+    let data_dir = other.path().join("backup-data");
+    std::fs::create_dir_all(&data_dir).expect("create backup data dir");
+    seed_codex_session(&codex_home, "rollout-backup.jsonl", "noingestsalvagebackup", true);
+
+    let options = IndexOptions {
+        full: false,
+        force_rebuild: false,
+        watch: false,
+        watch_once_paths: None,
+        db_path: data_dir.join("agent_search.db"),
+        data_dir: data_dir.clone(),
+        semantic: false,
+        no_ingest: false,
+        embedder: "infinity".to_string(),
+        progress: Some(Arc::new(IndexingProgress::default())),
+        watch_interval_secs: 30,
+    };
+    let _codex = EnvGuard::set("CODEX_HOME", codex_home.to_str().unwrap());
+    indexer::run_index(options, None).expect("backup corpus index run");
+    data_dir.join("agent_search.db")
+}
+
 /// The CLI contract: a compliant invocation reaches the hole-draining phase
 /// (proved by which failure it reports) without scanning.
 #[test]

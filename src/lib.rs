@@ -86567,6 +86567,14 @@ fn run_index_with_data(
                 serde_json::json!(stats.scan_invocations),
             );
             map.insert("no_ingest".to_string(), serde_json::json!(stats.no_ingest));
+            // B05 (任务书 #131): `scan_invocations: 0` + `no_ingest: true` do
+            // not by themselves mean "nothing entered the corpus" -- the
+            // historical salvage preflight also imports, and this says
+            // whether `--no-ingest` suppressed it for this run.
+            map.insert(
+                "salvage_skipped_by_no_ingest".to_string(),
+                serde_json::json!(stats.salvage_skipped_by_no_ingest),
+            );
             map.insert(
                 "indexing_stats".to_string(),
                 serde_json::to_value(&*stats).unwrap_or_default(),
