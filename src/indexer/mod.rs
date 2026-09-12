@@ -26215,6 +26215,22 @@ mod tests {
         Box::new(DisconnectAwareConnector)
     }
 
+    /// R2-N8/R2-N7 (任务书 #129): the run-level counters (`CAPTURE_NA`,
+    /// `CAPTURE_FAILED`, `EVENT_ALIGN_FAILED`) and the alignment-failure
+    /// list are PROCESS-GLOBAL statics, so a test that reads their absolute
+    /// values is only correct while nothing else can increment or reset them
+    /// -- under `cargo test`'s default parallelism that was luck, not a
+    /// property. Control plane reproduced the failure on the un-fixed tree:
+    /// this module's own prepare-failure fixture bumped `capture_failed` from
+    /// 1 to 2 inside the reader's window.
+    ///
+    /// Rule: every test that can WRITE these globals (anything driving
+    /// `prepare_conversation_for_ingest`, or `judge_reparsed_conversation`
+    /// with a misaligned session) and every test that READS them takes this
+    /// lock; readers additionally assert DELTAS, so a writer that has not
+    /// been converted yet makes the assertion stale rather than wrong.
+    static GLOBAL_COUNTER_TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// R1-N26 (任务书 #129): producer-side twin of `DISCONNECT_TEST_COUNTER`
     /// for the *prepare-failure* path specifically. `spawn_connector_producer`
     /// has two arms that used to discard their `ScanError` send result with
@@ -30048,6 +30064,11 @@ mod tests {
     /// configured additional root after the failed send.
     #[test]
     fn producer_stops_after_prepare_failure_when_scan_error_send_fails() {
+        // This fixture drives a real prepare failure, which increments the
+        // global `capture_failed` counter -- see GLOBAL_COUNTER_TEST_SERIALIZE.
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -35154,6 +35175,10 @@ mod tests {
 
     #[test]
     fn prepare_conversation_for_ingest_logical_source_skips_capture_and_judgment() {
+        // Records one `capture_na` -- see GLOBAL_COUNTER_TEST_SERIALIZE.
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // 任务书 #117④: `CaptureSourceKind::Logical` is pub(crate), so a
         // black-box `tests/w6_exclusion_ingest.rs` case can't construct it --
         // this is the "对照" the mission asks for, driven inline instead.
@@ -35660,6 +35685,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment() {
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_last_index_run_counters();
         let dir = TempDir::new().unwrap();
         let blob = dir.path().join("session.jsonl");
@@ -35690,16 +35718,27 @@ mod tests {
 
         let (_hits, _total, event_align_failed) = last_index_run_counters_snapshot();
         assert_eq!(event_align_failed, 1);
+        // Containment rather than "the list has exactly one entry": the list
+        // is process-global, so another test's misaligned session must not be
+        // able to break this assertion (see GLOBAL_COUNTER_TEST_SERIALIZE).
         let failures = last_index_event_align_failures_snapshot();
-        assert_eq!(failures.len(), 1, "the skipped session must be listed by identity, not just counted");
-        assert_eq!(failures[0].agent_slug, "claude_code");
-        assert_eq!(failures[0].external_id.as_deref(), Some("r2-n7-corrupt-session"));
-        assert_eq!(failures[0].source_path, "/logs/r2-n7-corrupt-session.jsonl");
-        assert_eq!(failures[0].event_count, 2, "the real (truncated) event count");
-        assert_eq!(failures[0].message_count, 3, "the real message count -- the delta IS the lead");
+        let mine: Vec<&EventAlignFailure> = failures
+            .iter()
+            .filter(|failure| failure.external_id.as_deref() == Some("r2-n7-corrupt-session"))
+            .collect();
+        assert_eq!(mine.len(), 1, "the skipped session must be listed by identity, not just counted: {failures:?}");
+        assert_eq!(mine[0].agent_slug, "claude_code");
+        assert_eq!(mine[0].source_path, "/logs/r2-n7-corrupt-session.jsonl");
+        assert_eq!(mine[0].event_count, 2, "the real (truncated) event count");
+        assert_eq!(mine[0].message_count, 3, "the real message count -- the delta IS the lead");
 
         reset_last_index_run_counters();
-        assert!(last_index_event_align_failures_snapshot().is_empty(), "reset must clear the detail list too");
+        assert!(
+            last_index_event_align_failures_snapshot()
+                .iter()
+                .all(|failure| failure.external_id.as_deref() != Some("r2-n7-corrupt-session")),
+            "reset must clear the detail list"
+        );
     }
 
     /// R2-N8 (任务书 #129): the report must distinguish "this session's
@@ -35711,7 +35750,13 @@ mod tests {
     #[test]
     #[serial]
     fn prepare_records_capture_na_and_capture_failed_separately() {
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         reset_last_index_run_counters();
+        // Delta, not absolute: the counters are process-global, so only what
+        // THIS test added is its business (see GLOBAL_COUNTER_TEST_SERIALIZE).
+        let (capture_na_before, capture_failed_before) = last_index_capture_counters_snapshot();
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -35748,10 +35793,17 @@ mod tests {
         )
         .expect_err("a missing source file must fail capture");
 
-        let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
-        assert_eq!(capture_na, 1, "the logical-source session must count as capture_na");
-        assert_eq!(capture_failed, 1, "the missing-file session must count as capture_failed");
-        reset_last_index_run_counters();
+        let (capture_na_after, capture_failed_after) = last_index_capture_counters_snapshot();
+        assert_eq!(
+            capture_na_after.saturating_sub(capture_na_before),
+            1,
+            "the logical-source session must count as capture_na (a delta, so a concurrent reset shows up here as 0 rather than as a false pass)"
+        );
+        assert_eq!(
+            capture_failed_after.saturating_sub(capture_failed_before),
+            1,
+            "the missing-file session must count as capture_failed"
+        );
     }
 
     /// R1-N16 (任务书 #118b) mutation/negative: a connector with no
