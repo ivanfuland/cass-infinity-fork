@@ -1780,9 +1780,27 @@ mod memprobe {
         }
 
         let text = fs::read_to_string(&log_path).unwrap();
-        let mine: Vec<serde_json::Value> = text
+        // R7-7 (#124): every line of this file is this probe's own output, so
+        // parse all of them and require the `pid` field *before* filtering by
+        // it. The previous form (`.filter_map(.. .ok())` straight into the
+        // pid filter) silently dropped a corrupt line and a line without a
+        // pid, so "two well-formed lines" held for a file that also contained
+        // garbage -- the assertion below is about the whole file.
+        let values: Vec<serde_json::Value> = text
             .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|err| panic!("memprobe line is not valid JSON ({err}): {line:?}"))
+            })
+            .collect();
+        for value in &values {
+            assert!(
+                value["pid"].is_u64(),
+                "every memprobe line must carry an integer `pid` field, got {value:?}"
+            );
+        }
+        let mine: Vec<serde_json::Value> = values
+            .into_iter()
             .filter(|value| value["pid"].as_u64() == Some(u64::from(std::process::id())))
             .collect();
         assert_eq!(
