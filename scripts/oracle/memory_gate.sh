@@ -71,9 +71,14 @@
 #   T6-a2) -- this gate reports the peak; it does not judge the mechanism.
 #   Prints one JSON object per stage to stdout (one line each) and to
 #   $RUN_ROOT/mem-<shape>-stage<N>.json:
-#   {shape, stage, pid, peak_tree, peak_proc, samples, stage_ms, measured,
-#   merged_from, budget, exit_code, binary_sha256, fixture_sha256} (bytes
-#   throughout, budget/merged_from may be null/[]). Stage 1's JSON also
+#   {shape, stage, pid, peak_tree, peak_proc, last_tree, peak_sample_idx,
+#   samples, stage_ms, measured, merged_from, budget, exit_code,
+#   binary_sha256, fixture_sha256} (bytes throughout, budget/merged_from may
+#   be null/[]). `last_tree` is the tree RSS of the final sample pass and
+#   `peak_sample_idx` the 1-based ordinal of the sample that produced the
+#   peak (0 when nothing was sampled) -- N-回落 (#128 T6-a2 追加), recorded
+#   so a later "judge the fall" rule has the series' endpoints per cell; a
+#   peak alone cannot show a fall. Stage 1's JSON also
 #   carries `ingested_sessions` (session count read from the stage db's
 #   `conversations` table -- the other option the mission text allows,
 #   `cass index --json`'s own field, isn't used because this script never
@@ -312,6 +317,29 @@ if measured and not (is_int(obj.get("samples")) and obj["samples"] >= 2
     )
     sys.exit(2)
 
+# N-回落 (#128 T6-a2 追加): the two keys the "record only, judge the fall" cut
+# needs. Optional in the same way `samples`/`stage_ms` are -- a cell that
+# predates them is not reported -- but one that carries them must be
+# internally consistent: an ordinal cannot exceed the sample count it indexes.
+for name in ("last_tree", "peak_sample_idx"):
+    value = obj.get(name)
+    if value is not None and (not is_int(value) or value < 0):
+        print(f"judge: field {name} must be a non-negative integer, got {value!r}", file=sys.stderr)
+        sys.exit(2)
+if (is_int(obj.get("peak_sample_idx")) and is_int(obj.get("samples"))):
+    picked = obj["peak_sample_idx"]
+    count = obj["samples"]
+    # NOTE: this source is passed to `python3 -c '...'`, so it must contain no
+    # single quote anywhere, and `python3` here is 3.10 -- where an f-string
+    # cannot reuse its own quote character for a nested subscript (PEP 701 is
+    # 3.12+). Hence the two locals rather than `{obj["samples"]}`.
+    if picked > count:
+        print(
+            f"judge: peak_sample_idx ({picked}) must not exceed samples ({count})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
 # R7-4 (#124): a budget is required unless the *caller* said this mode has
 # none. The old rule read the `shape` field of the judged object, so any
 # hand-written result could declare itself `selfcheck` and drop the budget
@@ -344,15 +372,16 @@ sys.exit(0 if ok else 1)
 
 emit_stage_json() {
   # $1=shape $2=stage $3=pid $4=peak_tree_bytes $5=peak_proc_bytes
-  # $6=samples $7=stage_ms $8=measured(true/false) $9=merged_from_csv
-  # $10=budget_bytes("" -> null) $11=exit_code $12=binary_sha256("" -> null)
-  # $13=fixture_sha256("" -> null)
+  # $6=last_tree_bytes $7=peak_sample_idx $8=samples $9=stage_ms
+  # $10=measured(true/false) $11=merged_from_csv $12=budget_bytes("" -> null)
+  # $13=exit_code $14=binary_sha256("" -> null) $15=fixture_sha256("" -> null)
   python3 - "$@" <<'PYEOF'
 import json
 import sys
 
-(shape, stage, pid, peak_tree, peak_proc, samples, stage_ms, measured,
- merged_from_csv, budget, exit_code, binary_sha256, fixture_sha256) = sys.argv[1:14]
+(shape, stage, pid, peak_tree, peak_proc, last_tree, peak_sample_idx, samples,
+ stage_ms, measured, merged_from_csv, budget, exit_code, binary_sha256,
+ fixture_sha256) = sys.argv[1:16]
 
 obj = {
     "shape": shape,
@@ -360,6 +389,10 @@ obj = {
     "pid": int(pid),
     "peak_tree": int(peak_tree),
     "peak_proc": int(peak_proc),
+    # N-回落 (#128 T6-a2 追加): the last sample pass's tree RSS, and the
+    # 1-based ordinal of the sample that produced the peak (0 = no samples).
+    "last_tree": int(last_tree),
+    "peak_sample_idx": int(peak_sample_idx),
     "samples": int(samples),
     "stage_ms": int(stage_ms),
     "measured": measured == "true",
@@ -391,6 +424,7 @@ run_stage() {
 
   PEAK_PROC_KB=()
   local peak_tree_kb=0 samples=0
+  local last_tree_kb=0 peak_sample_idx=0
   local start_ns end_ns
   start_ns=$(date +%s%N)
 
@@ -425,10 +459,15 @@ run_stage() {
       break
     fi
     sample_tree "$root_pid"
+    # N-回落 (#128 T6-a2 追加): the RSS of this final-so-far sample pass.
+    # A peak alone cannot show a fall; this is what a "judge the fall" rule
+    # will need, so it is recorded rather than recomputed later.
+    last_tree_kb="${SAMPLE_TREE_RSS_KB:-0}"
     if [ "${SAMPLE_PID_COUNT:-0}" -gt 0 ]; then
       samples=$((samples + 1))
       if [ "$SAMPLE_TREE_RSS_KB" -gt "$peak_tree_kb" ]; then
         peak_tree_kb="$SAMPLE_TREE_RSS_KB"
+        peak_sample_idx="$samples"
       fi
     fi
     sleep "$POLL_INTERVAL_S"
@@ -452,11 +491,12 @@ run_stage() {
 
   local peak_tree_bytes=$((peak_tree_kb * 1024))
   local peak_proc_bytes=$((peak_proc_kb * 1024))
+  local last_tree_bytes=$((last_tree_kb * 1024))
 
   local json
   json=$(emit_stage_json "$shape" "$stage" "$root_pid" "$peak_tree_bytes" "$peak_proc_bytes" \
-    "$samples" "$stage_ms" "$measured" "$merged_from_csv" "$budget" "$rc" \
-    "$binary_sha256" "$fixture_sha256")
+    "$last_tree_bytes" "$peak_sample_idx" "$samples" "$stage_ms" "$measured" "$merged_from_csv" \
+    "$budget" "$rc" "$binary_sha256" "$fixture_sha256")
   echo "$json" | tee "$out_json"
 
   echo "$json" | judge_from_stdin "$ALLOW_NULL_BUDGET"
