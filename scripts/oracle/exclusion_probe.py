@@ -1862,30 +1862,66 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
             # the marker does not account for.
             beyond_extra = _verify_extra(redacted if with_excluded else body_text)
             beyond_content = "" if with_excluded else body_text
+            if beyond_manifest_excluded == "body_retained":
+                # R9-B04 (任务书 #132), the leak shape: an ordinary field holds a
+                # verbatim copy of the body on BOTH sides. The candidate cleared
+                # the row's content and appended a well-shaped marker but never
+                # touched that copy, so no `extra_bin` DIFF can see it -- the body
+                # is still reconstructible out of the candidate's own extra.
+                beyond_extra["ordinary"] = body_text
             if with_excluded and beyond_manifest_excluded == "bad":
                 beyond_extra["stray"] = "a change no redacted placeholder explains"
+            if with_excluded and beyond_manifest_excluded == "overclear":
+                # R9-B04, the over-clear shape: the same ordinary field replaced
+                # with the marker's OWN placeholder -- an over-clear wearing the
+                # exclusion's sha, at a path this exclusion does not own.
+                beyond_extra["ordinary"] = redacted
+            beyond_marker_sha = body_sha
+            if beyond_manifest_excluded == "wrong_sha":
+                # R9-B04's "does the sha correspond to the reference body at
+                # all" half: a marker (and the placeholder it explains) whose
+                # sha belongs to some OTHER text.
+                beyond_marker_sha = hashlib.sha256(b"a body this exclusion never saw").hexdigest()
+                if with_excluded:
+                    beyond_extra = _verify_extra(
+                        {"redacted": True, "sha256": beyond_marker_sha,
+                         "bytes": len(body_text.encode("utf-8"))}
+                    )
             marker_json = json.dumps({
-                "reason": "context_file_read",
+                # R9-B04's "is the message really excludable for this reason"
+                # half: `cass_recall` on a message the rules read as a
+                # `context_file_read` must not be taken at face value.
+                "reason": "cass_recall" if beyond_manifest_excluded == "reason_mismatch" else "context_file_read",
                 "rule_version": 1,
                 "bytes": len(body_text.encode("utf-8")),
-                "sha256": body_sha,
+                "sha256": beyond_marker_sha,
                 "fingerprint_blake3": "0" * 64,
                 "parse_error": None,
                 "anchor": {"tool_call_id": "t9", "tool_name": "Read", "paths": None, "shell": None},
                 "src": None,
                 "raw": {"blob": blob_rel, "idx": 1, "event_key": "u2", "blocks": [0]},
             })
+            # R9-B04 (任务书 #132): the beyond-manifest row lives in its OWN
+            # session, so the branch under test is the only judge that can
+            # reach it -- left inside the manifest entry's session, the
+            # session-wide "still carries the body in extra_bin" scan (a
+            # different limb) would catch some of these shapes for reasons that
+            # say nothing about whether this branch validates anything at all.
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+                "VALUES (2, 1, 'local', 'verify-ext-2', 'verify fixture session 2', '/src/verify-ext-2.jsonl')"
+            )
             if with_excluded:
                 # Only the candidate schema (v6) has the `excluded` column.
                 conn.execute(
                     "INSERT INTO messages(conversation_id, idx, role, content, extra_bin, excluded) "
-                    "VALUES (1, 5, 'tool_result', ?, ?, jsonb(?))",
+                    "VALUES (2, 5, 'tool_result', ?, ?, jsonb(?))",
                     [beyond_content, msgpack.packb(beyond_extra, use_bin_type=True), marker_json],
                 )
             else:
                 conn.execute(
                     "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
-                    "VALUES (1, 5, 'tool_result', ?, ?)",
+                    "VALUES (2, 5, 'tool_result', ?, ?)",
                     [beyond_content, msgpack.packb(beyond_extra, use_bin_type=True)],
                 )
         if excludable_sibling_leak:
@@ -2051,7 +2087,7 @@ def verify_selftest_cases():
         ("V17 an exclusion beyond the manifest is informational", True, "",
          {"candidate_excluded_beyond_manifest": 1}),
         ("V18 an exclusion beyond the manifest with a bad marker is a failure", False,
-         "beyond_manifest_bad_marker"),
+         "beyond_manifest_invalid"),
         # R9-B03 (任务书 #132): `toolUseResult`'s array form is ONE projected
         # value. When its elements are FRAGMENTS of the excluded body the join
         # is that body's copy, so every element is a legitimate target -- the
@@ -2062,6 +2098,22 @@ def verify_selftest_cases():
         # this exclusion's copy, so clearing them stays an over-clear.
         ("V20 a foreign fragmented array toolUseResult is a failure", False,
          "redacted a field this exclusion does not own"),
+        # R9-B04 (任务书 #132): going beyond the manifest is a CLAIM, not an
+        # exemption. A candidate that cleared an ordinary message and appended a
+        # well-shaped marker passed with `failures=0` whether it left the body
+        # verbatim in an untouched extra field...
+        ("V21 a beyond-manifest exclusion that leaves the body in its extra is a failure", False,
+         "still reconstructible from extra_bin"),
+        # ...or over-cleared an ordinary field into the marker's own placeholder.
+        ("V22 a beyond-manifest exclusion that over-clears an ordinary field is a failure", False,
+         "does not own"),
+        # ...and the two identity halves the branch previously never checked:
+        # a reason the probe's own decide() does not return for that block,
+        ("V23 a beyond-manifest marker whose reason disagrees with decide is a failure", False,
+         "reason_disagrees_with_decide"),
+        # ...and a sha that is not the reference body's at all.
+        ("V24 a beyond-manifest marker whose sha is not the reference body is a failure", False,
+         "sha_is_not_the_reference_body"),
     ]
 
 
@@ -2100,6 +2152,10 @@ def _run_verify_selftest(paths_cfg):
             17: {"beyond_manifest_excluded": "bad"},
             18: {"fragmented_array_tool_use_result": True},
             19: {"foreign_array_tool_use_result_cleared": True},
+            20: {"beyond_manifest_excluded": "body_retained"},
+            21: {"beyond_manifest_excluded": "overclear"},
+            22: {"beyond_manifest_excluded": "reason_mismatch"},
+            23: {"beyond_manifest_excluded": "wrong_sha"},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -3641,6 +3697,7 @@ _FAILURE_FAMILIES = (
     ("still carries a body", "content_retained"),
     ("has no `excluded` marker", "marker_missing"),
     ("marker reason", "marker_reason"),
+    ("beyond_manifest_invalid", "beyond_manifest_invalid"),
     ("non-manifest row is missing", "non_manifest_row_missing"),
     ("non-manifest row is not in the reference", "non_manifest_row_extra"),
     ("non-manifest body differs", "non_manifest_body_changed"),
@@ -3721,33 +3778,165 @@ def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
     return bodies
 
 
-def _beyond_manifest_marker_problem(marker, row, ref_row):
-    """`None` when an exclusion made beyond the manifest is well-formed; else a
-    one-line reason.
+EXCLUSION_REASONS = ("cass_recall", "context_file_read", "codex_host_shell")
 
-    N-fam5 (任务书 #131 T6-c): such a row is informational, so the marker must
-    still be checked -- "the candidate excluded something the frozen manifest
-    cannot list" is only benign while the marker is a real exclusion marker and
-    the extra differences it explains are all redacted placeholders. Anything
-    else is a candidate-side over-clear wearing an exclusion as a disguise.
+
+def _raw_reference_problem(raw):
+    """The required fields and types of a marker's `raw` record, before
+    anything is looked up with it. A record that cannot name an event must not
+    be able to switch the identity check off by carrying `null`."""
+    if not isinstance(raw, dict):
+        return "marker carries no raw record"
+    blob = raw.get("blob")
+    if not isinstance(blob, str) or not blob:
+        return f"raw.blob {blob!r} is not a non-empty path"
+    idx = raw.get("idx")
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        return f"raw.idx {idx!r} is not an integer"
+    event_key = raw.get("event_key")
+    if not isinstance(event_key, str) or not event_key:
+        return f"raw.event_key {event_key!r} is not a non-empty string"
+    blocks = raw.get("blocks")
+    if not isinstance(blocks, list) or not all(
+        isinstance(block, int) and not isinstance(block, bool) for block in blocks
+    ):
+        return f"raw.blocks {blocks!r} is not a list of integers"
+    return None
+
+
+def _residue_problems(conn, message_id):
+    """The rows an excluded message must not leave behind, as detail strings."""
+    problems = []
+    for snippet in conn.execute(
+        "SELECT snippet_text FROM snippets WHERE message_id = ?", [message_id]
+    ):
+        if (snippet["snippet_text"] or "") != "":
+            problems.append("a snippet_text survived the exclusion")
+            break
+    lex_hits = conn.execute("SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?", [message_id]).fetchone()[0]
+    if lex_hits:
+        problems.append(f"{lex_hits} lex_docs row(s) for an excluded message")
+    chunk_hits = conn.execute(
+        "SELECT COUNT(*) FROM message_chunks WHERE message_id = ?", [message_id]
+    ).fetchone()[0]
+    if chunk_hits:
+        problems.append(f"{chunk_hits} message_chunks row(s) for an excluded message")
+    return problems
+
+
+def _reparse_recorded_candidate(agent_slug, raw, mirror_root):
+    """The candidate `raw` names, rebuilt from the raw-mirror blob. Returns
+    `(candidates, index, problem)`; `problem` is `None` on success, the string
+    `"unverifiable"` when the blob is simply not on disk (the caller records
+    that rather than guessing), else a one-line reason."""
+    blob_path = os.path.join(mirror_root, raw["blob"])
+    if not os.path.exists(blob_path):
+        return None, None, "unverifiable"
+    builder = {
+        "claude_code": build_candidates_claude_code,
+        "codex": build_candidates_codex,
+    }.get(agent_slug)
+    if builder is None:
+        return None, None, f"no reparse builder for agent_slug {agent_slug!r}"
+    candidates = builder(load_blob_events(blob_path))
+    idx = raw["idx"]
+    if idx < 0 or idx >= len(candidates):
+        return candidates, None, (
+            f"marker raw.idx={idx!r} is not a position in the reparsed candidate list "
+            f"({len(candidates)} candidates) for {agent_slug}"
+        )
+    picked = candidates[idx]
+    if picked.event_key != raw["event_key"]:
+        return candidates, idx, (
+            f"candidate at raw.idx={idx} carries event_key={picked.event_key!r}, "
+            f"marker records {raw['event_key']!r}"
+        )
+    if picked.block_index not in raw["blocks"]:
+        return candidates, idx, (
+            f"candidate at raw.idx={idx} is block {picked.block_index}, marker records {raw['blocks']!r}"
+        )
+    return candidates, idx, None
+
+
+def _beyond_manifest_exclusion_problem(entry, marker, row, ref_row, conn_cand, mirror_root, paths_cfg):
+    """`None` when an exclusion made beyond the manifest really IS one; else
+    `(subreason, detail)`.
+
+    N-fam5 (任务书 #131 T6-c) made such a row informational -- the manifest
+    comes from an older snapshot, so it cannot list an exclusion the candidate
+    made afterwards. R9-B04 (任务书 #132) measured what "informational" had
+    become: the branch checked the marker's SHAPE only, so a candidate that
+    cleared an ordinary message's body and appended a well-shaped marker passed
+    with `failures=0` whether it left the body in `extra` or over-cleared an
+    ordinary field into a placeholder.
+
+    Going beyond the manifest is therefore a claim, not an exemption: the row
+    has to satisfy the same invariants a manifest row does -- the marker names
+    a reason this tool knows, its sha IS the reference body's, its `raw` record
+    is complete and really points at this message's block, every `extra`
+    difference is a placeholder at a path this exclusion owns, the body is not
+    reconstructible from the extra, and no snippet/lex/chunks row survived.
     """
     reason = marker.get("reason")
-    if reason not in ("cass_recall", "context_file_read", "codex_host_shell"):
-        return f"marker reason {reason!r} is not a known exclusion reason"
+    if reason not in EXCLUSION_REASONS:
+        return "exclusion_reason", f"marker reason {reason!r} is not a known exclusion reason"
     sha = marker.get("sha256")
     if not isinstance(sha, str) or len(sha) != 64:
-        return f"marker sha256 {sha!r} is not a 64-character digest"
-    if not isinstance(marker.get("bytes"), int):
-        return f"marker bytes {marker.get('bytes')!r} is not an integer"
-    if not isinstance(marker.get("raw"), dict):
-        return "marker carries no raw record"
-    stray = [
-        path
-        for path, value, _reference in _diff_paths(_decode_extra(row["extra_bin"]), _decode_extra(ref_row["extra_bin"]))
-        if not _is_redacted_placeholder(value, sha)
-    ]
-    if stray:
-        return f"extra_bin changed outside a redacted placeholder: {stray[:5]}"
+        return "marker_shape", f"marker sha256 {sha!r} is not a 64-character digest"
+    if not isinstance(marker.get("bytes"), int) or isinstance(marker.get("bytes"), bool):
+        return "marker_shape", f"marker bytes {marker.get('bytes')!r} is not an integer"
+    raw_problem = _raw_reference_problem(marker.get("raw"))
+    if raw_problem is not None:
+        return "marker_shape", raw_problem
+
+    body = ref_row["content"] or ""
+    expected_sha = hashlib.sha256(redact_text(body).encode("utf-8")).hexdigest()
+    if sha != expected_sha:
+        return "sha_is_not_the_reference_body", (
+            f"marker sha256 {sha} is not sha256(redact(reference body)) {expected_sha}"
+        )
+
+    cand_extra = _decode_extra(row["extra_bin"])
+    ref_extra = _decode_extra(ref_row["extra_bin"])
+    allowed = _allowed_extra_paths(entry, ref_row, ref_extra)
+    for path, value, _reference in _diff_paths(cand_extra, ref_extra):
+        if not _is_redacted_placeholder(value, sha):
+            return "extra_changed_outside_a_placeholder", (
+                f"extra_bin changed outside a redacted placeholder: {path}"
+            )
+        if _normalized_diff_path(path) not in allowed:
+            return "extra_redacted_a_path_this_exclusion_does_not_own", (
+                f"extra_bin redacted a field this exclusion does not own: {path} "
+                f"(allowed: {sorted(allowed)[:5]})"
+            )
+    if body and _extra_carries_body(cand_extra, body):
+        return "body_still_in_extra", "the excluded body is still reconstructible from extra_bin"
+
+    residue = _residue_problems(conn_cand, row["id"])
+    if residue:
+        return "residue", residue[0]
+
+    candidates, index, problem = _reparse_recorded_candidate(entry["agent_slug"], marker["raw"], mirror_root)
+    if problem == "unverifiable":
+        return "unverifiable", f"the raw-mirror blob {marker['raw']['blob']!r} is not on disk"
+    if problem is not None:
+        return "raw_does_not_name_this_row", problem
+    pairing = PairingContext(candidates)
+    decision = decide(candidates, index, row["idx"], entry["agent_slug"], paths_cfg, pairing)
+    if decision is None:
+        return "not_excludable", (
+            f"the probe's own decide() does not exclude the candidate at raw.idx={index} "
+            f"({entry['agent_slug']})"
+        )
+    if decision["reason"] != reason:
+        return "reason_disagrees_with_decide", (
+            f"marker reason {reason!r} != decide() {decision['reason']!r} for the candidate at raw.idx={index}"
+        )
+    rebuilt = hashlib.sha256(redact_text(candidates[index].text).encode("utf-8")).hexdigest()
+    if rebuilt != sha:
+        return "sha_is_not_the_rebuilt_body", (
+            f"marker sha256 {sha} != the rebuilt candidate's {rebuilt}"
+        )
     return None
 
 
@@ -3815,6 +4004,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     body_retained_unexcludable = 0
     candidate_excluded_beyond_manifest = 0
     candidate_excluded_beyond_manifest_samples = []
+    beyond_manifest_unverifiable = 0
+    beyond_manifest_unverifiable_samples = []
     body_retained_unexcludable_samples = []
     excludable_cache = {}
     extra_unchanged_no_body = 0
@@ -3929,22 +4120,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         if body and body in (row["title"] or ""):
             failures.append((label, "the session title still contains the body"))
 
-        for snippet in conn_cand.execute(
-            "SELECT snippet_text FROM snippets WHERE message_id = ?", [row["id"]]
-        ):
-            if (snippet["snippet_text"] or "") != "":
-                failures.append((label, "a snippet_text survived the exclusion"))
-                break
-        lex_hits = conn_cand.execute(
-            "SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?", [row["id"]]
-        ).fetchone()[0]
-        if lex_hits:
-            failures.append((label, f"{lex_hits} lex_docs row(s) for an excluded message"))
-        chunk_hits = conn_cand.execute(
-            "SELECT COUNT(*) FROM message_chunks WHERE message_id = ?", [row["id"]]
-        ).fetchone()[0]
-        if chunk_hits:
-            failures.append((label, f"{chunk_hits} message_chunks row(s) for an excluded message"))
+        for detail in _residue_problems(conn_cand, row["id"]):
+            failures.append((label, detail))
 
         # The predicate-P misfire check (spec §七 风险行): a context_file_read
         # hit whose recorded paths are not all inside the configured predicate
@@ -4003,9 +4180,32 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             candidate_excluded_beyond_manifest += 1
             if len(candidate_excluded_beyond_manifest_samples) < 20:
                 candidate_excluded_beyond_manifest_samples.append([label, key[2]])
-            problem = _beyond_manifest_marker_problem(marker, row, ref_row)
+            # R9-B04 (任务书 #132): going beyond the manifest is a CLAIM, not
+            # an exemption -- the row is held to the same invariants a manifest
+            # row is. The entry is synthesized from the row itself, because no
+            # manifest entry describes it.
+            entry = {
+                "reason": marker.get("reason"),
+                "source_id": _field(row, "source_id"),
+                "agent_slug": key[0],
+                "external_id": _field(row, "external_id"),
+                "source_path": _field(row, "source_path"),
+                "idx": key[2],
+                "blocks": (marker.get("raw") or {}).get("blocks") or [],
+            }
+            problem = _beyond_manifest_exclusion_problem(
+                entry, marker, row, ref_row, conn_cand, mirror_root, paths_cfg
+            )
             if problem is not None:
-                failures.append((label, f"beyond_manifest_bad_marker: {problem}"))
+                subreason, detail = problem
+                if subreason == "unverifiable":
+                    # The raw-mirror blob is not on disk, so the decide/raw
+                    # half cannot run. Recorded, never silently passed.
+                    beyond_manifest_unverifiable += 1
+                    if len(beyond_manifest_unverifiable_samples) < 20:
+                        beyond_manifest_unverifiable_samples.append([label, detail])
+                else:
+                    failures.append((label, f"beyond_manifest_invalid: {subreason}: {detail}"))
             continue
         if row["content"] != ref_row["content"]:
             failures.append((label, "non-manifest body differs from reference"))
@@ -4063,6 +4263,11 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "body_retained_unexcludable_samples": body_retained_unexcludable_samples,
         "candidate_excluded_beyond_manifest": candidate_excluded_beyond_manifest,
         "candidate_excluded_beyond_manifest_samples": candidate_excluded_beyond_manifest_samples,
+        # R9-B04: an exclusion beyond the manifest whose raw-mirror blob is not
+        # on disk cannot have its decide/raw half run. Recorded separately so a
+        # non-zero count is visible instead of looking like a clean pass.
+        "beyond_manifest_unverifiable": beyond_manifest_unverifiable,
+        "beyond_manifest_unverifiable_samples": beyond_manifest_unverifiable_samples,
         "candidate_only_rows": candidate_only_rows,
         "failure_families": dict(sorted(Counter(failure_family(detail) for _label, detail in failures).items())),
         # N-fam3 (任务书 #131 追加): the families give the shape of a failure
@@ -4194,7 +4399,8 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
     informational = {
         key: report[key]
         for key in ("extra_unchanged_no_body", "candidate_only_rows",
-                    "body_retained_unexcludable", "candidate_excluded_beyond_manifest")
+                    "body_retained_unexcludable", "candidate_excluded_beyond_manifest",
+                    "beyond_manifest_unverifiable")
         if key in report
     }
     if any(informational.values()):
