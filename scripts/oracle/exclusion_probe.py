@@ -3116,6 +3116,45 @@ def _run_verify_selftest(paths_cfg):
                 f"{report['rebuild_sample']!r} details={details!r}"
             )
 
+    # R9-N07 (任务书 #132): manifest generation paired the DB sequence and the
+    # mirror independently. When the two disagree about the ORDER, the mirror's
+    # `calls_by_id` still supplied a unique call and the entry was emitted --
+    # even though the mirror's own `PairingContext` refuses that result.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        body = "n07 ordinary result body"
+        result_event = {
+            "type": "user", "uuid": "n07-earlier",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "x", "content": body}]},
+        }
+        later_call_event = {
+            "type": "assistant", "uuid": "n07-later",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read", "id": "x",
+                 "input": {"file_path": "/srv/cc-workspace/USER.md"}}]},
+        }
+        conv = {
+            "id": 1, "source_id": "local", "agent_slug": "claude_code",
+            "external_id": "n07-ext", "source_path": "/src/n07.jsonl",
+        }
+        db_rows_full = [
+            (0, "tool_call", hashlib.sha256(b"old call").hexdigest(), "old call row", "x"),
+            (1, "tool_result", hashlib.sha256(body.encode()).hexdigest(), body, "x"),
+        ]
+        raw_candidates = build_candidates_claude_code([result_event, later_call_event])
+        stats = _new_stats()
+        entries = process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats)
+        if not entries and stats["pairing_fail"]["mirror_order_disagrees"] == 1:
+            passed += 1
+            print("ok   N07 a mirror whose order disagrees with the DB yields no manifest entry")
+        else:
+            print(
+                "FAIL N07 a mirror whose order disagrees with the DB yields no manifest entry: "
+                f"entries={entries!r} mirror_order_disagrees="
+                f"{stats['pairing_fail']['mirror_order_disagrees']!r}"
+            )
+
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
 
@@ -3609,6 +3648,21 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
                 stats["pairing_fail"]["result_not_uniquely_in_mirror"] += 1
                 continue
             evidence = result_matches[0]
+            # R9-N07 (任务书 #132): the DB sequence and the mirror are paired
+            # independently -- this row's call comes from `calls_by_id`, its
+            # result from `results_by_id` -- so a DB whose order disagrees with
+            # the mirror's (a concatenated or re-ordered log) still produced a
+            # manifest entry out of the mirror's LATER call. `PairingContext`
+            # already refuses a mirror result that precedes its call; the
+            # mirror's own pairing gets the final say here too: the result must
+            # pair with this very call in mirror order.
+            evidence_pos = next(
+                (pos for pos, candidate in enumerate(raw_candidates) if candidate is evidence), None
+            )
+            mirrored_call = None if evidence_pos is None else blob_pairing.paired_call_for(evidence_pos)
+            if mirrored_call is not call:
+                stats["pairing_fail"]["mirror_order_disagrees"] += 1
+                continue
             if not content_body_ok(content, evidence.text):
                 stats["content_mismatch_messages"] += 1
                 continue
