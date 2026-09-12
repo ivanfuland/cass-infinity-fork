@@ -406,25 +406,46 @@ manifest_field() {
   python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"
 }
 
+# R6-B4 (#123, control-plane adversarial review of T4): the fixture's own
+# identity, recomputed from the bytes on disk -- every `*.jsonl` under the
+# fixture root, path-sorted, concatenated in that order, one sha256 over
+# the concatenation. This is the *same algorithm* `examples/
+# w4_memory_fixture.rs`'s `fixture_sha256` freezes into manifest.json
+# (`collect_jsonl_files_sorted` + `hasher.update(read(path))` per file);
+# the manifest's recorded value is therefore verified against reality
+# here, never copied on trust. `sort` under `LC_ALL=C` is byte-ordered,
+# matching Rust's `Vec<PathBuf>::sort` for the shared absolute prefix these
+# paths all have.
+fixture_sha256_of() {
+  local dir="$1"
+  find "$dir" -type f -name '*.jsonl' -print0 2>/dev/null \
+    | LC_ALL=C sort -z \
+    | xargs -0 -r cat \
+    | sha256sum | awk '{print $1}'
+}
+
 # Fail-loud (exit 2, never a silent 0) lookup of budget bytes for
 # [shape,stage] from $W6/memgate-baseline.json. Schema assumed (this file
 # does not exist yet -- it's #122b-3's Step 6 deliverable):
 #   {"<shape>": {"<stage>": {"binary_sha": "...", "peak_tree": <bytes>,
 #     "peak_proc": <bytes>, "exit_code": 0, "measured": true,
-#     "max_over_min": <float>}}}
+#     "max_over_min": <float>, "fixture_sha256": "..."}}}
+# `fixture_sha256` (R6-B4) is the fourth argument's counterpart: the
+# entry's recorded value must equal the fixture actually measured, or the
+# budget belongs to a different workload.
 # If #122b-3 lands a different shape, this function is the one place to
 # update.
 budget_bytes_for_stage() {
-  local shape="$1" stage="$2" baseline_json="$3"
+  local shape="$1" stage="$2" baseline_json="$3" fixture_sha256="${4:-}"
   if [ ! -f "$baseline_json" ]; then
     echo "memory_gate: P0 baseline file not found: $baseline_json (fail-loud, not defaulting to 0 budget)" >&2
     return 2
   fi
-  python3 - "$baseline_json" "$shape" "$stage" <<'PYEOF'
+  python3 - "$baseline_json" "$shape" "$stage" "$fixture_sha256" <<'PYEOF'
 import json
 import sys
 
-path, shape, stage = sys.argv[1:4]
+path, shape, stage, fixture_sha256 = sys.argv[1:5]
 try:
     with open(path) as f:
         data = json.load(f)
@@ -454,6 +475,17 @@ peak_tree = entry.get("peak_tree")
 peak_proc = entry.get("peak_proc")
 if not is_int(peak_tree) or peak_tree < 0 or not is_int(peak_proc) or peak_proc < 0:
     print(f"memory_gate: P0 baseline entry for {shape}/{stage} has a non-integer or negative peak (peak_tree={peak_tree!r}, peak_proc={peak_proc!r})", file=sys.stderr)
+    sys.exit(2)
+# R6-B4: the P0 cells are only meaningful for the workload they were
+# collected on. Without this, shrinking the fixture (fewer/shorter
+# messages) keeps the same shape/stage key and inherits the old budget.
+entry_fixture_sha256 = entry.get("fixture_sha256")
+if not isinstance(entry_fixture_sha256, str) or entry_fixture_sha256 != fixture_sha256:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} is not bound to the fixture under test "
+        f"(entry fixture_sha256={entry_fixture_sha256!r}, measured fixture={fixture_sha256!r})",
+        file=sys.stderr,
+    )
     sys.exit(2)
 p0 = max(peak_tree, peak_proc)
 budget = int(1.25 * p0 + 256 * 1024 * 1024)
@@ -549,6 +581,17 @@ manifest="$fixture_dir/manifest.json"
 [ -f "$manifest" ] || { echo "memory_gate: $manifest missing (fixture must be frozen by w4_memory_fixture)" >&2; exit 2; }
 fixture_sha256=$(manifest_field "$manifest" fixture_sha256) || exit 2
 
+# R6-B4: the frozen manifest is a *claim* about the fixture; verify it
+# against the bytes actually on disk before any stage runs. Without this,
+# trimming the fixture's messages keeps the same shape/stage keys -- one
+# conversation, still over 200ms -- and inherits the larger fixture's P0
+# budget, so "same fixture" had no machine-checkable meaning.
+fixture_sha256_measured=$(fixture_sha256_of "$fixture_dir")
+if [ "$fixture_sha256_measured" != "$fixture_sha256" ]; then
+  echo "memory_gate: fixture under $fixture_dir does not match the hash frozen in $manifest (recomputed $fixture_sha256_measured, manifest $fixture_sha256) -- refusing to measure a workload the P0 baseline was not collected on" >&2
+  exit 2
+fi
+
 # #122b-3c: hash the binary the wrapper execs into, not the wrapper shim
 # (a per-run-root constant, so baseline and candidate rounds shared it).
 binary_path="${CASS_CAND_BIN:-$RUN_ROOT/cass-candidate}"
@@ -563,7 +606,7 @@ budget_for() {
     echo ""
     return 0
   fi
-  budget_bytes_for_stage "$shape" "$stage" "$baseline_json"
+  budget_bytes_for_stage "$shape" "$stage" "$baseline_json" "$fixture_sha256_measured"
 }
 
 overall_rc=0
