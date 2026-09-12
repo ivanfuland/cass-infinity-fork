@@ -281,6 +281,7 @@ fn test_corrupted_index_triggers_rebuild() {
     // Phase 2: Create initial index
     let start = tracker.start("create_index", Some("Build initial tantivy index"));
     let opts = IndexOptions {
+        no_ingest: false,
         full: true,
         force_rebuild: false,
         watch: false,
@@ -310,6 +311,7 @@ fn test_corrupted_index_triggers_rebuild() {
         // Phase 4: Force rebuild should succeed
         let start = tracker.start("rebuild_index", Some("Rebuild index with force flag"));
         let rebuild_opts = IndexOptions {
+            no_ingest: false,
             full: true,
             force_rebuild: true,
             watch: false,

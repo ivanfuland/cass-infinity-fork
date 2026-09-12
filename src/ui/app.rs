@@ -19425,6 +19425,7 @@ impl super::ftui_adapter::Model for CassApp {
                 {
                     ftui::Cmd::task(move || {
                         let opts = crate::indexer::IndexOptions {
+                            no_ingest: false,
                             full: false,
                             force_rebuild: false,
                             watch: false,

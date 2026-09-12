@@ -101,6 +101,7 @@ fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_siz
     // `force_rebuild=true` + `full=true` to exercise the full ingest +
     // Tantivy commit + FTS repair path end to end.
     let opts = IndexOptions {
+        no_ingest: false,
         full: true,
         force_rebuild: true,
         watch: false,

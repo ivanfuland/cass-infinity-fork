@@ -1565,6 +1565,12 @@ pub struct IndexOptions {
     pub data_dir: PathBuf,
     /// Build semantic vector index after text indexing.
     pub semantic: bool,
+    /// PR6 T5 (`cass index --semantic --no-ingest`): skip the entire source
+    /// scan/ingest phase and run only hole-draining/reconciliation/audit.
+    /// The scan counters in `scan_invocations` must stay 0 and the scan
+    /// watermark must not advance (this is T12 v2's exam-hall mode: the
+    /// corpus must be byte-identical before and after).
+    pub no_ingest: bool,
     /// Embedder ID to use for semantic indexing (hash, fastembed).
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
@@ -19480,6 +19486,7 @@ pub mod persist {
             db_path: std::path::PathBuf,
         ) -> crate::indexer::IndexOptions {
             crate::indexer::IndexOptions {
+                no_ingest: false,
                 full: false,
                 force_rebuild: false,
                 watch: false,
@@ -21333,6 +21340,7 @@ mod tests {
         }
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -22314,6 +22322,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("storage");
         ensure_fts_schema(&storage);
         let opts = IndexOptions {
+            no_ingest: false,
             full: true,
             force_rebuild: false,
             watch: false,
@@ -27187,6 +27196,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -27274,6 +27284,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -27327,6 +27338,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -27392,6 +27404,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -27463,6 +27476,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let db_path = data_dir.join("db.sqlite");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -27542,6 +27556,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -27619,6 +27634,7 @@ mod tests {
 
         run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -29143,6 +29159,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -29225,6 +29242,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -29268,6 +29286,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -29329,6 +29348,7 @@ mod tests {
         ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -29412,6 +29432,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -29463,6 +29484,7 @@ mod tests {
             ensure_fts_schema(&storage);
             let progress = Arc::new(IndexingProgress::default());
             let opts = IndexOptions {
+                no_ingest: false,
                 full: false,
                 force_rebuild: false,
                 watch: false,
@@ -29543,6 +29565,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: true,
             force_rebuild: false,
             watch: false,
@@ -30690,6 +30713,7 @@ mod tests {
         watch_once_paths: Option<Vec<std::path::PathBuf>>,
     ) -> IndexOptions {
         IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -31274,6 +31298,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31342,6 +31367,7 @@ mod tests {
         .unwrap();
 
         let opts = |watch_once_path: PathBuf| super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31397,6 +31423,7 @@ mod tests {
         std::fs::write(&session, initial).unwrap();
 
         let opts = |data_dir: &Path, session: &Path| super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31455,6 +31482,7 @@ mod tests {
         progress: Arc<IndexingProgress>,
     ) -> super::IndexOptions {
         super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31521,6 +31549,7 @@ mod tests {
         // populated (F1's fix covers this path) -- exactly why the next
         // step reverts it, rather than trusting that as the test's proof.
         let seed_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31581,6 +31610,7 @@ mod tests {
         // The real dispatch this bug lived in:
         // `should_try_readonly_canonical_force_rebuild`'s exact condition.
         let force_rebuild_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: true,
@@ -31686,6 +31716,7 @@ mod tests {
         // normal watch-once entry point (not a direct storage call) so the
         // `--full` run below starts from a real populated-DB state.
         let seed_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31718,6 +31749,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let full_opts = super::IndexOptions {
+            no_ingest: false,
             full: true,
             watch: false,
             force_rebuild: false,
@@ -31794,6 +31826,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let seed_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31829,6 +31862,7 @@ mod tests {
         }
 
         let full_opts = super::IndexOptions {
+            no_ingest: false,
             full: true,
             watch: false,
             force_rebuild: false,
@@ -32216,6 +32250,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -32302,6 +32337,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32385,6 +32421,7 @@ mod tests {
         let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32451,6 +32488,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32574,6 +32612,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32684,6 +32723,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32760,6 +32800,7 @@ mod tests {
         let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32840,6 +32881,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -32926,6 +32968,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -33014,6 +33057,7 @@ mod tests {
 
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "600");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -33160,6 +33204,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -33231,6 +33276,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -33322,6 +33368,7 @@ mod tests {
         let _active_guard = set_env("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS", &active_paths);
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -33404,6 +33451,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -33528,6 +33576,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -33640,6 +33689,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -33692,6 +33742,7 @@ mod tests {
         std::fs::write(&amp_file, "not valid json").unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -33775,6 +33826,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -33842,6 +33894,7 @@ mod tests {
 
         let progress = Arc::new(IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -33912,6 +33965,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -34031,6 +34085,7 @@ mod tests {
         save_watch_state(&data_dir, &persisted_state).unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,

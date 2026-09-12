@@ -643,6 +643,7 @@ fn run_index_in_process(
     watch_once_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     let opts = coding_agent_search::indexer::IndexOptions {
+        no_ingest: false,
         full: false,
         force_rebuild: false,
         watch: false,

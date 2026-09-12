@@ -75937,6 +75937,7 @@ pub(crate) fn run_doctor_impl(
                 needs_rebuild = true;
             } else {
                 let index_opts = indexer::IndexOptions {
+                    no_ingest: false,
                     // When the database is missing or corrupted, doctor must
                     // rebuild from source sessions using the full path rather
                     // than the incremental UPSERT-based path.
@@ -85714,6 +85715,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let progress = Arc::new(indexer::IndexingProgress::default());
     let opts = indexer::IndexOptions {
+        no_ingest: false,
         full: false,
         force_rebuild: false,
         watch: false,
@@ -86034,6 +86036,7 @@ fn run_index_with_data(
     let index_progress = std::sync::Arc::new(indexer::IndexingProgress::default());
 
     let opts = IndexOptions {
+        no_ingest: false,
         full,
         force_rebuild,
         watch,
