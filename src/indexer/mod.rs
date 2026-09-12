@@ -34858,70 +34858,104 @@ mod tests {
         assert_eq!(large_claude.messages[0].extra, raw_extra);
     }
 
+    /// R2-N16⑤ (任务书 #129): the `#[ignore]`d test this replaces sized a
+    /// sparse ZERO-BYTE file to `CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES`
+    /// and asserted compaction ran. The reparse step added later cannot parse
+    /// a sparse file, so it had been asserting nothing since -- it was kept
+    /// as a repro fixture, not as acceptance. This is the regression it stood
+    /// in for, with real parseable codex JSONL: the SAME session, once above
+    /// the threshold and once below it, through the real
+    /// `prepare_conversation_for_ingest`. Comparing the two extra key SETS is
+    /// what pins the size threshold -- asserting only "compaction happened"
+    /// would also pass for a build that compacts unconditionally.
     #[test]
-    #[ignore = "T2b (任务书 #114) disclosed gap: prepare_conversation_for_ingest now \
-        reparses the captured raw-mirror blob with the real codex connector \
-        before compacting extras (Global Constraints §2.2 处理顺序); this \
-        fixture's `source_path` is a sparse zero-byte file sized only to hit \
-        the compact threshold by fs::metadata().len(), not parseable codex \
-        JSONL, so reparse now fails the session (CaptureFailed) before \
-        compaction ever runs. Needs a real (large) codex JSONL fixture whose \
-        ancestor path shape the codex connector derives `external_id: \
-        codex-large-batch` from -- flagged for control plane, not fixed in \
-        this round."]
-    fn prepare_conversation_for_ingest_compacts_large_codex_batch_extras() {
+    fn prepare_conversation_for_ingest_compacts_a_real_large_codex_session_but_not_a_small_one() {
+        fn write_codex_rollout(dir: &Path, name: &str, filler_bytes: usize) -> PathBuf {
+            let sessions = dir.join(".codex").join("sessions").join("2026").join("09");
+            std::fs::create_dir_all(&sessions).expect("mkdir .codex/sessions/2026/09");
+            let path = sessions.join(name);
+            let events = [
+                serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_0","role":"user","content":[{"type":"input_text","text":"hello from a real codex session"}]}}).to_string(),
+                serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"x".repeat(filler_bytes)}]}}).to_string(),
+            ];
+            std::fs::write(&path, events.join("\n") + "\n").expect("write codex fixture");
+            path
+        }
+
+        /// The id the connector itself derives for this file -- the reparse
+        /// inside `prepare_conversation_for_ingest` reconstructs the same
+        /// path shape, so this is the id that must match (R1-N5's identity
+        /// check), and deriving it here keeps the fixture honest rather than
+        /// hardcoding a shape that could drift.
+        fn derived_external_id(source_path: &Path) -> String {
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let ctx = crate::connectors::ScanContext::with_roots(
+                source_path.parent().expect("fixture has a parent").to_path_buf(),
+                vec![ScanRoot::local(source_path.to_path_buf())],
+                None,
+            );
+            let mut conversations = connector.scan(&ctx).expect("scan the real fixture");
+            assert_eq!(conversations.len(), 1, "the fixture must parse into exactly one session");
+            conversations
+                .remove(0)
+                .external_id
+                .expect("the codex connector derives an external_id from this path shape")
+        }
+
+        fn prepare_fixture(source_path: &Path, data_dir: &Path) -> NormalizedConversation {
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let external_id = derived_external_id(source_path);
+            let mut conv = norm_conv(Some(&external_id), vec![norm_msg(0, 100)]);
+            conv.agent_slug = "codex".to_string();
+            conv.source_path = source_path.to_path_buf();
+            prepare_conversation_for_ingest(
+                data_dir,
+                "codex",
+                &connector,
+                &Origin::local(),
+                None,
+                CaptureSourceKind::File(source_path.to_path_buf()),
+                conv,
+            )
+            .expect("a real, parseable codex session must prepare -- capture AND reparse both succeed")
+            .conv
+        }
+
+        fn extra_keys(conv: &NormalizedConversation) -> std::collections::BTreeSet<String> {
+            conv.messages
+                .iter()
+                .filter_map(|message| message.extra.as_object())
+                .flat_map(|object| object.keys().cloned().collect::<Vec<_>>())
+                .collect()
+        }
+
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let source_path = temp.path().join("rollout-large.jsonl");
-        std::fs::File::create(&source_path)
-            .expect("create sparse source")
-            .set_len(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES)
-            .expect("size sparse source");
 
-        let mut conv = norm_conv(Some("codex-large-batch"), vec![norm_msg(0, 100)]);
-        conv.agent_slug = "codex".to_string();
-        conv.source_path = source_path;
-        conv.messages[0].extra = serde_json::json!({
-            "payload": {
-                "delta": "duplicated raw codex event payload"
-            },
-            "response": {
-                "model": "gpt-5.4"
-            },
-            "cass": {
-                "event_line": 42
-            }
-        });
+        let large = write_codex_rollout(temp.path(), "rollout-pr6-large-extras.jsonl", 17 * 1024 * 1024);
+        let large_size = std::fs::metadata(&large).expect("stat the large fixture").len();
+        assert!(
+            large_size >= CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES,
+            "sanity: the large fixture must clear the threshold; it is {large_size} bytes"
+        );
+        let small = write_codex_rollout(temp.path(), "rollout-pr6-small-extras.jsonl", 64);
 
-        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
-        let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let conv = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
-            .expect("prepare should succeed")
-            .conv;
+        let large_keys = extra_keys(&prepare_fixture(&large, &data_dir));
+        let small_keys = extra_keys(&prepare_fixture(&small, &data_dir));
 
-        let extra = &conv.messages[0].extra;
-        assert_eq!(
-            extra
-                .pointer("/cass/model")
-                .and_then(serde_json::Value::as_str),
-            Some("gpt-5.4")
+        assert!(
+            !large_keys.is_empty() && !small_keys.is_empty(),
+            "both sessions must yield at least one message extra; large={large_keys:?} small={small_keys:?}"
         );
-        assert_eq!(
-            extra.pointer("/cass/event_line"),
-            Some(&serde_json::json!(42))
+        assert!(
+            large_keys.is_subset(&small_keys),
+            "indexer-side compaction may only REMOVE keys, never add one; large={large_keys:?} small={small_keys:?}"
         );
-        assert!(extra.get("payload").is_none());
-        assert!(extra.get("response").is_none());
-        assert_eq!(
-            conv.metadata.pointer("/cass/origin/source_id"),
-            Some(&serde_json::json!("local"))
-        );
-        assert_eq!(
-            conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes"),
-            Some(&serde_json::json!(
-                CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
-            ))
+        assert!(
+            large_keys.len() < small_keys.len(),
+            "a session above the compact threshold must drop the raw envelope keys a below-threshold one keeps; \
+             large={large_keys:?} small={small_keys:?}"
         );
     }
 

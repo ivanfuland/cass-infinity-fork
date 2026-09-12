@@ -80,22 +80,25 @@ fn mirror_prune_apply_subprocess_refuses_while_lock_held_by_another_process() {
     );
 }
 
-/// Mutex judgment ② (in-process, positive half): `raw_mirror::prune` is
-/// called while this test already holds `index-run.lock` (matching what
-/// `run_mirror_prune`, lib.rs, does for real before calling `prune`).
-/// Mid-prune (fault hook, after the R9 protection check, before deletion),
-/// a simulated concurrent writer tries to claim the SAME lock file and must
-/// see it busy; once prune returns and this test releases the lock, that
-/// same "writer" attempt now succeeds -- proving the lock genuinely
-/// serializes the two, not just "happens to look fine" in this run.
+/// Mutex judgment ② (real CLI lock lifecycle): the production lock must be
+/// taken by the CLI itself. R2-N16② (任务书 #129) found this test's previous
+/// form -- this process grabbing `index-run.lock` and then watching a second
+/// in-process attempt fail -- proved only that the TEST knows how to take a
+/// lock: deleting `run_mirror_prune`'s own acquisition left it green, so the
+/// production lifecycle had no test at all.
+///
+/// This one drives the real `cass mirror prune --apply` twice over the same
+/// mirror, with a genuinely deletable (unreferenced) blob in it:
+///   (a) while this test holds the lock, the CLI must refuse -- exit 2,
+///       `lock-busy`, nothing deleted;
+///   (b) once the lock is free, the same command must succeed and delete it.
+/// If the CLI's lock acquisition disappears, (a) becomes a successful prune
+/// and this test goes red; if the CLI stops pruning at all, (b) does.
 #[test]
-fn prune_holds_lock_across_hook_window_blocking_a_concurrent_writer() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
-    let _serialize = HOOK_TEST_SERIALIZE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+fn mirror_prune_cli_refuses_while_the_lock_is_held_and_completes_without_it() {
     let temp = tempfile::TempDir::new().expect("tempdir");
     let data_dir = temp.path().join("cass-data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data_dir");
 
     let source_path = temp.path().join("expired.jsonl");
     std::fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"about to be pruned\"}\n").expect("write source");
@@ -109,55 +112,57 @@ fn prune_holds_lock_across_hook_window_blocking_a_concurrent_writer() {
         db_links: &[],
     })
     .expect("capture source");
-    let root = data_dir.join("raw-mirror").join("v1");
-    let blob_path = root.join(&captured.blob_relative_path);
-    assert!(blob_path.exists(), "blob B must exist before pruning");
+    let blob_path = data_dir.join("raw-mirror").join("v1").join(&captured.blob_relative_path);
+    assert!(blob_path.exists(), "the unreferenced blob must exist before pruning");
 
-    // Simulate `run_mirror_prune` (lib.rs) having already acquired
-    // `index-run.lock` before calling `raw_mirror::prune`.
+    let prune_args = ["mirror", "prune", "--older-than", "0s", "--apply", "--safety-hold-down", "0s"];
+
+    // (a) Hold `index-run.lock` the way a live `cass index` run does, then ask
+    // the REAL CLI to prune. The refusal is what proves the CLI takes it.
     let lock_path = data_dir.join("index-run.lock");
-    let outer_lock = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path).expect("open lock file");
-    outer_lock.lock_exclusive().expect("acquire outer index-run.lock");
+    let held = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    held.lock_exclusive().expect("acquire index-run.lock");
 
-    let writer_saw_busy = Arc::new(AtomicBool::new(false));
-    let writer_saw_busy_in_hook = Arc::clone(&writer_saw_busy);
-    let lock_path_in_hook = lock_path.clone();
-    coding_agent_search::raw_mirror::set_prune_fault_hook(Some(Box::new(move || {
-        // The "writer" attempt: a fresh handle to the SAME lock file, from
-        // the same process -- `flock` semantics are per-open-file-
-        // description, so this genuinely contends with `outer_lock` above.
-        let writer_attempt = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path_in_hook).expect("open lock file from writer");
-        let busy = writer_attempt.try_lock_exclusive().is_err();
-        writer_saw_busy_in_hook.store(busy, Ordering::SeqCst);
-    })));
+    let refused = cass_cmd(&data_dir, temp.path())
+        .args(prune_args)
+        .output()
+        .expect("spawn cass mirror prune with the lock held");
 
-    let report = coding_agent_search::raw_mirror::prune(
-        &data_dir,
-        coding_agent_search::raw_mirror::RawMirrorPruneOptions {
-            referenced_blobs: std::collections::HashSet::new(),
-            older_than_ms: Some(0),
-            max_size_bytes: None,
-            keep_tags: Vec::new(),
-            safety_hold_down_ms: 0,
-            apply: true,
-        },
-    )
-    .expect("prune must succeed");
+    FileExt::unlock(&held).ok();
+    drop(held);
 
-    coding_agent_search::raw_mirror::set_prune_fault_hook(None);
-    FileExt::unlock(&outer_lock).ok();
-    drop(outer_lock);
+    assert_eq!(
+        refused.status.code(),
+        Some(2),
+        "a real CLI prune must refuse while another process holds index-run.lock; got {:?}, stderr={}",
+        refused.status.code(),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(refused_stderr.contains("index run is active"), "stderr should name the lock conflict: {refused_stderr}");
+    assert!(
+        blob_path.exists(),
+        "the refused run must not have deleted the unreferenced blob -- the lock has to be taken BEFORE any pruning work"
+    );
 
-    assert!(writer_saw_busy.load(Ordering::SeqCst), "a concurrent writer attempting the lock mid-prune must see it busy");
-    assert_eq!(report.applied_blob_count, 1, "the unreferenced expired blob (B) must have been deleted");
-    assert!(!blob_path.exists(), "B must be gone after prune");
-
-    // Retry after prune (and this test's own outer lock) have released:
-    // a legitimate next writer can now proceed -- it would reference a
-    // NEW blob, never B (B no longer exists to reference).
-    let retry = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&lock_path).expect("open lock file for retry");
-    assert!(retry.try_lock_exclusive().is_ok(), "the lock must be free again once prune and the outer holder have both released it");
-    FileExt::unlock(&retry).ok();
+    // (b) Lock free now: the same command must complete the deletion.
+    let completed = cass_cmd(&data_dir, temp.path())
+        .args(prune_args)
+        .output()
+        .expect("spawn cass mirror prune without the lock");
+    assert!(
+        completed.status.success(),
+        "with the lock free the CLI must prune successfully; exit={:?}, stderr={}",
+        completed.status.code(),
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    assert!(!blob_path.exists(), "the unreferenced expired blob must be gone after a successful CLI prune");
 }
 
 /// Mutex judgment ② (mutation half): the SAME fixture and hook, but this
@@ -166,9 +171,14 @@ fn prune_holds_lock_across_hook_window_blocking_a_concurrent_writer() {
 /// `raw_mirror::prune(..., apply: true)` directly, bypassing
 /// `run_mirror_prune`'s lock acquisition). The "concurrent writer" in the
 /// hook now finds the lock free and would race straight past a delete that
-/// is happening in the very same window -- proving the outer lock in the
-/// positive test above is what actually closes this window, not something
-/// incidental to `prune`'s own internals.
+/// is happening in the very same window.
+///
+/// Together with the CLI-lifecycle test above this pins both halves of the
+/// contract: the raw `prune` API does NOT take the lock itself (this test),
+/// and the production CLI that calls it does (that one). R2-N16② (任务书
+/// #129): the previous "positive half" took the lock *in the test process*
+/// and proved nothing about production -- removing `run_mirror_prune`'s
+/// acquisition left it green.
 #[test]
 fn prune_without_an_outer_lock_leaves_the_window_open_for_a_racing_writer() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -354,6 +364,17 @@ struct ExclusionRow {
     raw_idx: Option<i64>,
     raw_event_key: Option<String>,
     raw_blocks_json: Option<String>,
+    /// R2-N16③ (任务书 #129): the row's own body. For an excluded row this
+    /// must be empty -- `exclusion::apply` takes the text (hashing it into
+    /// the marker) and never puts it back, which is the whole point of the
+    /// row being excluded. Comparing this across the four transport modes
+    /// and asserting emptiness per mode is what makes a bug that redacts the
+    /// wrong body -- or forgets to redact -- visible: `excluded_count >= 2`
+    /// plus cross-mode equality alone passes for all four modes sharing the
+    /// same defect.
+    /// NULL reads as "no body" (the column is nullable for rows whose body
+    /// lives elsewhere), which is the same thing this assertion means.
+    content: Option<String>,
 }
 
 /// R1-N24 (任务书 #118b): reads via `coding_agent_search::storage::api::Conn`
@@ -368,7 +389,8 @@ fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
                 m.extra_json, m.extra_bin, c.title, \
                 (SELECT json_group_array(snippet_text ORDER BY id) FROM snippets WHERE message_id = m.id), \
                 json_extract(m.excluded, '$.raw.blob'), json_extract(m.excluded, '$.raw.idx'), \
-                json_extract(m.excluded, '$.raw.event_key'), json_extract(m.excluded, '$.raw.blocks') \
+                json_extract(m.excluded, '$.raw.event_key'), json_extract(m.excluded, '$.raw.blocks'), \
+                m.content \
          FROM messages m JOIN conversations c ON c.id = m.conversation_id \
          ORDER BY c.external_id, c.source_path, m.idx",
         &[],
@@ -387,10 +409,45 @@ fn read_exclusion_rows(db_path: &std::path::Path) -> Vec<ExclusionRow> {
                 raw_idx: row.get_typed(10)?,
                 raw_event_key: row.get_typed(11)?,
                 raw_blocks_json: row.get_typed(12)?,
+                content: row.get_typed::<Option<String>>(13)?,
             })
         },
     )
     .expect("query exclusion rows")
+}
+
+/// R2-N16③ (任务书 #129): the per-mode judge the four-mode test calls once
+/// per transport chain. For every excluded row: the body must be EMPTY
+/// (`exclusion::apply` takes the text, hashes it into the marker, and never
+/// puts it back) and the marker must carry the pre-redaction `sha256` plus
+/// the `raw.*` locator fields. The `content` assertion is the one that
+/// catches "the row is marked excluded but the body is still sitting in the
+/// column", which nothing else here can see.
+fn assert_excluded_rows_are_body_level_redacted(label: &str, rows: &[ExclusionRow]) {
+    let excluded: Vec<&ExclusionRow> = rows.iter().filter(|r| r.excluded_is_some).collect();
+    assert!(
+        excluded.len() >= 2,
+        "{label}: fixture must trigger both anchors (recall + context-file-read); got {} excluded rows in {rows:?}",
+        excluded.len()
+    );
+    for row in excluded {
+        assert_eq!(
+            row.content.as_deref().unwrap_or(""),
+            "",
+            "{label}: an excluded row's body must be redacted to empty -- the marker's sha256 is the only copy that may survive: {row:?}"
+        );
+        assert!(
+            row.excluded_sha256.as_deref().is_some_and(|s| !s.is_empty()),
+            "{label}: excluded row must carry a non-empty excluded.sha256: {row:?}"
+        );
+        // R1-N22 (任务书 #118a, partial): these fields must actually be
+        // populated in this fixture, not just equal-because-empty across
+        // all four modes.
+        assert!(row.raw_blob.as_deref().is_some_and(|b| !b.is_empty()), "{label}: raw.blob must be non-empty: {row:?}");
+        assert!(row.raw_idx.is_some(), "{label}: raw.idx must be present: {row:?}");
+        assert!(row.raw_event_key.as_deref().is_some_and(|e| !e.is_empty()), "{label}: raw.event_key must be non-empty: {row:?}");
+        assert_ne!(row.raw_blocks_json.as_deref(), Some("[]"), "{label}: raw.blocks must be non-empty: {row:?}");
+    }
 }
 
 /// A.4: the same fixture ingested via streaming (default), batch
@@ -441,24 +498,15 @@ fn transport_chain_equivalence_across_ingestion_modes() {
     let force_rebuild_rows = read_exclusion_rows(&force_rebuild_db);
     let watch_once_rows = read_exclusion_rows(&watch_once_db);
 
-    let excluded_count = streaming_default_rows.iter().filter(|r| r.excluded_is_some).count();
-    assert!(
-        excluded_count >= 2,
-        "fixture must trigger both anchors (recall + context-file-read); got {excluded_count} excluded rows in {streaming_default_rows:?}"
-    );
-    for row in streaming_default_rows.iter().filter(|r| r.excluded_is_some) {
-        assert!(
-            row.excluded_sha256.as_deref().is_some_and(|s| !s.is_empty()),
-            "excluded row must carry a non-empty excluded.sha256: {row:?}"
-        );
-        // R1-N22 (任务书 #118a, partial): these fields must actually be
-        // populated in this fixture, not just equal-because-empty across
-        // all four modes.
-        assert!(row.raw_blob.as_deref().is_some_and(|b| !b.is_empty()), "raw.blob must be non-empty: {row:?}");
-        assert!(row.raw_idx.is_some(), "raw.idx must be present: {row:?}");
-        assert!(row.raw_event_key.as_deref().is_some_and(|e| !e.is_empty()), "raw.event_key must be non-empty: {row:?}");
-        assert_ne!(row.raw_blocks_json.as_deref(), Some("[]"), "raw.blocks must be non-empty: {row:?}");
-    }
+    // R2-N16③ (任务书 #129): each mode is judged on its own body-level
+    // correctness, not just "streaming produced at least two excluded rows"
+    // plus cross-mode equality -- all four modes share the same underlying
+    // defect, so equality alone passes for a bug that redacts the wrong body
+    // (or forgets to redact at all) in every one of them.
+    assert_excluded_rows_are_body_level_redacted("streaming (default)", &streaming_default_rows);
+    assert_excluded_rows_are_body_level_redacted("batch (CASS_STREAMING_INDEX=0)", &batch_rows);
+    assert_excluded_rows_are_body_level_redacted("--force-rebuild", &force_rebuild_rows);
+    assert_excluded_rows_are_body_level_redacted("--watch-once", &watch_once_rows);
 
     assert_eq!(
         streaming_default_rows, batch_rows,
@@ -666,7 +714,12 @@ fn message_row_count(db_path: &std::path::Path) -> i64 {
         return 0;
     }
     let conn = coding_agent_search::storage::api::Conn::open_read(db_path).expect("open db for row count");
-    conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0)).unwrap_or(0)
+    // R2-N16① (任务书 #129): `unwrap_or(0)` turned a database error into
+    // "zero rows", so a broken query would read as "nothing was persisted"
+    // and any assertion built on this helper would be judging the wrong
+    // fact -- the exact shape #118a's report claimed was already N/A.
+    conn.query_row_map("SELECT COUNT(*) FROM messages", &[], |r| r.get_typed(0))
+        .expect("counting messages must fail loudly if the query fails, not read as zero rows")
 }
 
 /// Judge case B.10 #4, capture-failure ①: `PrepareStage::BeforeCapture`
@@ -1088,6 +1141,176 @@ fn mirror_restore_apply_carries_excluded_marker_through_to_candidate_db() {
     assert_eq!(
         a_rows, b_rows,
         "restored candidate DB rows must equal the source mirror's rows byte-for-byte, including excluded.{{reason,sha256,raw.blob,raw.event_key,raw.blocks}}"
+    );
+}
+
+/// R2-N16④ (任务书 #129): the three restore cases the ledger found
+/// uncovered, judged at the CLI level against a session whose EXCLUDED body
+/// carries a synthetic secret:
+///   (a) restore equivalence -- the candidate DB matches the source mirror
+///       row-for-row (`excluded.sha256` included) and the raw secret never
+///       lands in the candidate database;
+///   (b) a candidate that already holds the same session plans as `Skip`;
+///   (c) a change confined to the EXCLUDED body must NOT plan as `Skip` --
+///       the marker is part of the version identity, so an excluded-body
+///       edit cannot be silently read as "unchanged".
+/// (b) and (c) are the two directions of the same trap: a planner that
+/// ignores the marker says Skip when it must not, and one that always says
+/// Skip regardless is caught by (c) on its own.
+#[test]
+fn mirror_restore_handles_secret_bearing_excluded_bodies_without_skipping_excluded_only_changes() {
+    const SECRET: &str = "sk-ant-ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+
+    let root = tempfile::TempDir::new().expect("root tempdir");
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    let session_dir = tempfile::TempDir::new().expect("session dir");
+    let (session_path, raw_recall_output) = write_codex_host_shell_session(session_dir.path());
+    assert!(
+        raw_recall_output.contains(SECRET),
+        "sanity: the fixture must really carry the secret in its excluded body: {raw_recall_output}"
+    );
+
+    // A: normal ingest, producing both the DB and the raw mirror to restore from.
+    let data_dir_a = root.path().join("data-a");
+    std::fs::create_dir_all(&data_dir_a).expect("mkdir data_dir_a");
+    let ingest = cass_cmd(&data_dir_a, &home)
+        .args(["index", "--watch-once", session_path.to_str().expect("utf8 session path"), "--json"])
+        .output()
+        .expect("spawn cass index --watch-once (A)");
+    assert!(ingest.status.success(), "seed ingest into A must succeed; stderr={}", String::from_utf8_lossy(&ingest.stderr));
+
+    let a_db = data_dir_a.join("agent_search.db");
+    let a_rows = read_message_rows_single_conversation(&a_db);
+    assert_eq!(
+        a_rows.iter().filter(|r| r.3).count(),
+        2,
+        "sanity: the host-shell and the secret-bearing recall hits must both be excluded in A: {a_rows:?}"
+    );
+
+    let candidate_db = root.path().join("candidate.db");
+    coding_agent_search::storage::sqlite::FrankenStorage::open(&candidate_db).expect("initialize empty candidate db B");
+    let scratch_dir = root.path().join("scratch");
+    let journal_path = root.path().join("journal.json");
+    let generation_label = "t2d-mirror-restore-n16";
+
+    fn run_plan(
+        data_dir: &std::path::Path,
+        home: &std::path::Path,
+        candidate_db: &std::path::Path,
+        scratch_dir: &std::path::Path,
+        generation_label: &str,
+    ) -> serde_json::Value {
+        let output = cass_cmd(data_dir, home)
+            .args([
+                "mirror-restore",
+                "--data-dir", data_dir.to_str().expect("utf8 data_dir"),
+                "--candidate-db", candidate_db.to_str().expect("utf8 candidate_db"),
+                "--scratch", scratch_dir.to_str().expect("utf8 scratch_dir"),
+                "--snapshot-root", generation_label,
+                "--json",
+            ])
+            .output()
+            .expect("spawn cass mirror-restore dry-run");
+        assert!(
+            output.status.success(),
+            "dry-run plan must succeed; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("parse dry-run json")
+    }
+
+    // Fresh candidate: the session is brand new there.
+    let first_plan = run_plan(&data_dir_a, &home, &candidate_db, &scratch_dir, generation_label);
+    assert_eq!(
+        first_plan.get("restore").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "a brand-new session against an empty candidate db must plan RestoreNew: {first_plan}"
+    );
+
+    let apply = cass_cmd(&data_dir_a, &home)
+        .args([
+            "mirror-restore",
+            "--data-dir", data_dir_a.to_str().expect("utf8 data_dir_a"),
+            "--candidate-db", candidate_db.to_str().expect("utf8 candidate_db"),
+            "--scratch", scratch_dir.to_str().expect("utf8 scratch_dir"),
+            "--snapshot-root", generation_label,
+            "--apply",
+            "--generation", generation_label,
+            "--journal", journal_path.to_str().expect("utf8 journal_path"),
+            "--json",
+        ])
+        .output()
+        .expect("spawn cass mirror-restore --apply");
+    assert!(apply.status.success(), "apply must succeed; stderr={}", String::from_utf8_lossy(&apply.stderr));
+
+    // (a) equivalence, markers included, and no plaintext secret in the candidate.
+    let b_rows = read_message_rows_single_conversation(&candidate_db);
+    assert_eq!(
+        a_rows, b_rows,
+        "restored candidate rows must equal the source mirror's rows byte-for-byte, including excluded.{{reason,sha256,raw.blob,raw.event_key,raw.blocks}}"
+    );
+    let candidate_bytes = std::fs::read(&candidate_db).expect("read candidate db bytes");
+    assert!(
+        !candidate_bytes
+            .windows(SECRET.len())
+            .any(|window| window == SECRET.as_bytes()),
+        "the raw secret must not appear anywhere in the restored candidate database"
+    );
+
+    // (b) the same candidate, planned again: equal version -> Skip.
+    let second_plan = run_plan(&data_dir_a, &home, &candidate_db, &scratch_dir, generation_label);
+    assert_eq!(
+        second_plan.get("skip").and_then(serde_json::Value::as_u64),
+        Some(1),
+        "a candidate that already holds this exact version must plan as Skip: {second_plan}"
+    );
+    assert_eq!(
+        second_plan.get("restore").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "nothing is brand-new on the second plan: {second_plan}"
+    );
+
+    // (c) change ONLY the excluded body, re-ingest, re-plan: the version is
+    // no longer equal, so this must not be a Skip.
+    let original = std::fs::read_to_string(&session_path).expect("read fixture");
+    let edited = original.replace(SECRET, &format!("{SECRET}-rotated"));
+    assert_ne!(original, edited, "sanity: the fixture edit must actually change the excluded body");
+    std::fs::write(&session_path, edited).expect("rewrite fixture with a new excluded body");
+    let reingest = cass_cmd(&data_dir_a, &home)
+        .args(["index", "--watch-once", session_path.to_str().expect("utf8 session path"), "--json"])
+        .output()
+        .expect("spawn cass index --watch-once (A, edited)");
+    assert!(
+        reingest.status.success(),
+        "re-ingest after the excluded-body edit must succeed; stderr={}",
+        String::from_utf8_lossy(&reingest.stderr)
+    );
+
+    let third_plan = run_plan(&data_dir_a, &home, &candidate_db, &scratch_dir, generation_label);
+    assert_eq!(
+        third_plan.get("skip").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "an edit confined to the EXCLUDED body changes the version: the planner must not Skip it: {third_plan}"
+    );
+    let judged = [
+        "restore",
+        "replace",
+        "hold_superset",
+        "hold_diverged",
+        "hold_multiple_candidates",
+        // A body-only change makes the two versions diverge, which the
+        // planner reports through its `holds` total (reason
+        // `version-diverged`) rather than through one of the relation
+        // buckets -- still a judgment, still not a Skip.
+        "holds",
+    ]
+    .iter()
+    .filter_map(|key| third_plan.get(*key).and_then(serde_json::Value::as_u64))
+    .sum::<u64>();
+    assert!(
+        judged >= 1,
+        "the changed session must be judged into a non-Skip bucket (a relation bucket or a HOLD), not dropped: {third_plan}"
     );
 }
 

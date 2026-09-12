@@ -22540,6 +22540,93 @@ mod tests {
         assert_eq!(blob, "blobs/blake3/ab/abcd.raw", "json_extract must work directly against the stored JSONB column");
     }
 
+    /// R2-N16⑥ (任务书 #129): two EXCLUDED rows agreeing on `created_at`,
+    /// `role` and `author`, differing only in body, must BOTH persist -- and
+    /// must both still be there after an incremental re-insert of the same
+    /// conversation. Their dedup identity is the marker's pre-redaction
+    /// `fingerprint_blake3`: `content` is empty for both, so a merge keyed on
+    /// `content` (or on the other three fields alone) silently collapses two
+    /// real messages into one. Plan T2 called this shape out and the ledger's
+    /// ⑥ found it had no test.
+    #[test]
+    fn two_excluded_rows_same_time_role_author_different_body_persist_through_merge() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        fn excluded_marker(fingerprint: &str, idx: u32) -> ExcludedMarker {
+            ExcludedMarker {
+                reason: ExclusionReason::ContextFileRead,
+                rule_version: 1,
+                bytes: 42,
+                sha256: "a".repeat(64),
+                fingerprint_blake3: fingerprint.repeat(64),
+                anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: Some(vec!["/x".into()]), shell: None },
+                src: None,
+                parse_error: None,
+                raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx, event_key: format!("ek-{idx}"), blocks: vec![0] },
+            }
+        }
+        fn row(idx: i64, marker: ExcludedMarker) -> Message {
+            Message {
+                excluded: Some(marker),
+                id: None,
+                idx,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                // Identical instant, role and author for both rows: the
+                // marker fingerprint is the only thing telling them apart.
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("two-excluded-rows.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("two-excluded-rows".into()),
+            title: Some("two excluded rows".into()),
+            source_path: PathBuf::from("/tmp/two-excluded-rows.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![row(0, excluded_marker("b", 0)), row(1, excluded_marker("c", 1))],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        fn fingerprints(rows: &[Message]) -> std::collections::BTreeSet<String> {
+            rows.iter()
+                .filter_map(|m| m.excluded.as_ref().map(|e| e.fingerprint_blake3.clone()))
+                .collect()
+        }
+
+        let inserted = storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let conversation_id = inserted.conversation_id;
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), 2, "two excluded rows differing only in body must both persist: {stored:?}");
+        assert_eq!(fingerprints(&stored).len(), 2, "both distinct marker fingerprints must survive: {stored:?}");
+
+        // The incremental path: re-insert the same conversation (this is the
+        // lookup/merge route the ledger asks to cover for excluded rows).
+        storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let after_merge = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(
+            after_merge.len(),
+            2,
+            "an incremental re-insert must merge against BOTH excluded rows, not collapse them into one: {after_merge:?}"
+        );
+        assert_eq!(fingerprints(&after_merge), fingerprints(&stored), "both markers must survive the merge unchanged");
+    }
+
     /// R2-B7 (任务书 #119a): `ExcludedMarker` has two construction paths that
     /// bypass `from_json_str`'s hex-format validation -- public fields
     /// (direct struct construction, this test) and `derive(Deserialize)`
