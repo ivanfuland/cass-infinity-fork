@@ -546,7 +546,7 @@ def build_candidates_claude_code(events):
         role = message.get("role")
         if role not in ("user", "assistant"):
             continue
-        event_key = ev.get("uuid")
+        event_key = ev.get("uuid") or line_identity(ev)
         content = message.get("content")
 
         if isinstance(content, str):
@@ -640,7 +640,7 @@ def build_candidates_codex(events):
             continue
         payload = ev.get("payload", {})
         ptype = payload.get("type")
-        event_key = payload.get("id")
+        event_key = payload.get("id") or line_identity(ev)
 
         if ptype == "message":
             role = payload.get("role")
@@ -1813,6 +1813,44 @@ def _run_verify_selftest(paths_cfg):
                 f"got {report['non_manifest_rows_checked']!r}, want 1"
             )
 
+    # N03 (任务书 #131): `events_from_blob` falls back to the event's PHYSICAL
+    # 1-based line number (`line:N`) when the event carries no id of its own.
+    # The probe's builders recorded `None`, so a marker written against such an
+    # event could never be found on a rebuild (`reparse found 0 block(s)`).
+    # Blank lines count: the identity is the physical line, not an index into
+    # the events that survived parsing.
+    for name, events, want_key, builder in (
+        (
+            "N03 codex event without payload.id falls back to line:N",
+            [
+                {"type": "response_item", "payload": {"type": "function_call_output", "call_id": "x", "output": "the full result"}},
+            ],
+            "line:2",
+            build_candidates_codex,
+        ),
+        (
+            "N03b claude event without uuid falls back to line:N",
+            [
+                {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]}},
+            ],
+            "line:2",
+            build_candidates_claude_code,
+        ),
+    ):
+        total += 1
+        with tempfile.TemporaryDirectory() as root:
+            blob = os.path.join(root, "line_fallback.jsonl")
+            with open(blob, "w", encoding="utf-8") as handle:
+                handle.write("\n")  # physical line 1 is blank
+                for event in events:
+                    handle.write(json.dumps(event) + "\n")
+            keys = [cand.event_key for cand in builder(load_blob_events(blob))]
+        if keys == [want_key]:
+            passed += 1
+            print(f"ok   {name}")
+        else:
+            print(f"FAIL {name}: got {keys!r}, want {[want_key]!r}")
+
     # B01 (任务书 #131): an output that names an input must be refused BEFORE
     # anything is written. Pre-fix, `run_verify` verified the candidate and
     # then unconditionally `open(report_path, "w")` -- with `--report` naming
@@ -1930,15 +1968,30 @@ PROVIDER_TO_CONNECTOR = {
 }
 
 
+# N03 (任务书 #131): the 1-based PHYSICAL line number each parsed event came
+# from, stashed on the parsed dict so the builders can mint the same
+# `line:<n>` identity `events_from_blob` mints when an event carries no id.
+_PROBE_LINE_KEY = "__cass_probe_line__"
+
+
 def load_blob_events(blob_path: str):
     events = []
     with open(blob_path, "rb") as f:
-        for line in f:
+        for line_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            events.append(json.loads(line.decode("utf-8")))
+            event = json.loads(line.decode("utf-8"))
+            if isinstance(event, dict):
+                event[_PROBE_LINE_KEY] = line_no
+            events.append(event)
     return events
+
+
+def line_identity(event):
+    """`line:<physical line>` for an event with no id of its own, else `None`."""
+    line_no = event.get(_PROBE_LINE_KEY) if isinstance(event, dict) else None
+    return f"line:{line_no}" if isinstance(line_no, int) else None
 
 
 def blob_has_compacted_event(events) -> bool:
