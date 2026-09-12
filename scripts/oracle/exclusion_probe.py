@@ -2166,6 +2166,134 @@ def _write_codex_verify_fixture(root):
     return candidate, reference, manifest_path, mirror
 
 
+def _write_b07_fixture(root):
+    """R9-B07 (任务书 #132): an informational hit must not end the session scan.
+
+    Four rows, in insertion (and therefore idx) order:
+
+    | idx | row                                                   |
+    |-----|-------------------------------------------------------|
+    | 0   | an ordinary row that QUOTES the excluded body          |
+    | 1   | the Read call                                          |
+    | 2   | the ordinary row of the SAME mixed event as the result |
+    | 3   | the excluded `tool_result` itself                      |
+
+    Row 0's copy is one the rules do not cover, so it is informational. Row 2
+    still carries the excluded body inside its `extra_bin` -- a real leak. The
+    pre-fix scan matched row 0 first, counted it, and `break`ed, so row 2 was
+    never examined and the run reported `failures=0`.
+    """
+    candidate = os.path.join(root, "b07-candidate.db")
+    reference = os.path.join(root, "b07-reference.db")
+    manifest_path = os.path.join(root, "b07-manifest.json")
+    mirror = os.path.join(root, "b07-mirror")
+    blob_rel = "blobs/blake3/bb/b07-fixture.raw"
+    blob_path = os.path.join(mirror, blob_rel)
+    os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+
+    body = _VERIFY_BODY
+    body_sha = hashlib.sha256(redact_text(body).encode("utf-8")).hexdigest()
+    redacted = {"redacted": True, "sha256": body_sha, "bytes": len(body.encode("utf-8"))}
+    call_uuid, mixed_uuid = "b07-call", "b07-mixed"
+    call_event = {
+        "type": "assistant", "uuid": call_uuid,
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Read", "id": "a",
+             "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}}]},
+    }
+    mixed_dirty = {
+        "type": "user", "uuid": mixed_uuid,
+        "message": {"role": "user", "content": [
+            {"type": "text", "text": "ordinary prose of the mixed event"},
+            {"type": "tool_result", "tool_use_id": "a", "content": body}]},
+    }
+    mixed_clean = {
+        "type": "user", "uuid": mixed_uuid,
+        "message": {"role": "user", "content": [
+            {"type": "text", "text": "ordinary prose of the mixed event"},
+            {"type": "tool_result", "tool_use_id": "a", "content": redacted}]},
+    }
+    with open(blob_path, "w", encoding="utf-8") as handle:
+        for event in (call_event, mixed_dirty):
+            handle.write(json.dumps(event) + "\n")
+
+    marker = {
+        "reason": "context_file_read",
+        "rule_version": 1,
+        "bytes": len(body.encode("utf-8")),
+        "sha256": body_sha,
+        "fingerprint_blake3": "0" * 64,
+        "parse_error": None,
+        "anchor": {"tool_call_id": "a", "tool_name": "Read", "paths": None, "shell": None},
+        "src": None,
+        # `raw.idx` indexes the BUILDER's candidate list, which is not the DB
+        # row order: the blob holds two events, and the mixed event's
+        # `tool_result` is its second block -- candidate 2, block 1.
+        "raw": {"blob": blob_rel, "idx": 2, "event_key": mixed_uuid, "blocks": [1]},
+    }
+    rows = [
+        (0, "user", f"ordinary row quoting {body}",
+         {"message": {"content": [{"type": "text", "text": "plain"}]}}),
+        (1, "tool_call", 'Read({"file_path":"/srv/cc-workspace/MEMORY.md"})', {}),
+        (2, "user", "ordinary prose of the mixed event", mixed_dirty),
+        # A SECOND leak, further down the same session: it is what separates
+        # "the informational branch no longer ends the scan" from "the scan
+        # really runs to the end" -- the extra branch's own `break` stopped at
+        # the first leak and would still hide this one.
+        (4, "user", "a later ordinary turn", mixed_dirty),
+    ]
+    for path, with_excluded in ((reference, False), (candidate, True)):
+        conn = sqlite3.connect(path)
+        conn.executescript(_verify_schema(with_excluded))
+        if with_excluded:
+            conn.executescript(
+                "CREATE TABLE snippets(id INTEGER PRIMARY KEY, message_id INTEGER, snippet_text TEXT);"
+                "CREATE TABLE lex_docs(doc_id INTEGER PRIMARY KEY, content TEXT);"
+                "CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY, message_id INTEGER);"
+            )
+        conn.execute("INSERT INTO agents(id, slug, name, kind) VALUES (1, 'claude_code', 'Claude', 'cli')")
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+            "VALUES (1, 1, 'local', 'b07-ext-1', 'b07 fixture session', '/src/b07-ext-1.jsonl')"
+        )
+        for idx, role, content, extra in rows:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                [idx + 1, idx, role, content, msgpack.packb(extra, use_bin_type=True)],
+            )
+        if with_excluded:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin, excluded) "
+                "VALUES (4, 1, 3, 'tool_result', '', ?, jsonb(?))",
+                [msgpack.packb(mixed_clean, use_bin_type=True), json.dumps(marker)],
+            )
+        else:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (4, 1, 3, 'tool_result', ?, ?)",
+                [body, msgpack.packb(mixed_dirty, use_bin_type=True)],
+            )
+        conn.commit()
+        conn.close()
+
+    manifest = [{
+        "reason": "context_file_read",
+        "source_id": "local",
+        "agent_slug": "claude_code",
+        "external_id": "b07-ext-1",
+        "source_path": "/src/b07-ext-1.jsonl",
+        "idx": 3,
+        "sha256": body_sha,
+        "evidence": "mirror",
+        "event_key": mixed_uuid,
+        "blocks": [1],
+    }]
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    return candidate, reference, manifest_path, mirror
+
+
 def _verify_case(root, paths_cfg, expect_ok, want_substring, want_report=None, **flags):
     candidate, reference, manifest_path, mirror = _write_verify_fixture(root, **flags)
     report_path = os.path.join(root, "report.json")
@@ -2613,6 +2741,30 @@ def _run_verify_selftest(paths_cfg):
                 "FAIL B06 a body fragmented across several extra blocks is a failure: "
                 f"failures={report.get('failures')!r} extra_unchanged_no_body="
                 f"{report.get('extra_unchanged_no_body')!r} details={details!r}"
+            )
+
+    # R9-B07 (任务书 #132): the session scan must run to the END of the
+    # session. A row whose copy the rules do not cover is informational, and
+    # stopping there hid the leak sitting in a later row's extra.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_b07_fixture(root)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        details = " | ".join(detail for _label, detail in failures)
+        leaked = sorted(
+            sib
+            for label, detail in failures
+            for sib in [detail.split("idx=")[1].split(" ")[0]] if "still carries the body in extra_bin" in detail
+        )
+        if leaked == ["2", "4"]:
+            passed += 1
+            print("ok   B07 the session scan runs to the end past an informational hit and past a leak")
+        else:
+            print(
+                "FAIL B07 the session scan runs to the end past an informational hit and past a leak: "
+                f"leaked rows={leaked!r}, want ['2', '4']; failures={report.get('failures')!r} "
+                f"body_retained_unexcludable={report.get('body_retained_unexcludable')!r} "
+                f"details={details!r}"
             )
 
     print(f"selftest/verify: {passed}/{total}")
@@ -4377,6 +4529,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                     )
 
 
+        # R9-B07 (任务书 #132): the scan used to `break` on the FIRST row that
+        # matched -- including the informational branch -- so a session whose
+        # row 0 legitimately quoted the body ended the scan there and a real
+        # leak in a LATER row's `extra_bin` was never looked at. Every row of
+        # the session gets both checks now; a match on one row is not evidence
+        # about the next.
         body = ref_row["content"]
         if body:
             excludable = _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, excludable_cache)
@@ -4395,13 +4553,11 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                         body_retained_unexcludable += 1
                         if len(body_retained_unexcludable_samples) < 20:
                             body_retained_unexcludable_samples.append([label, sib["idx"]])
-                    break
                 sib_extra = _decode_extra(sib["extra_bin"])
                 if sib_extra is not None and _extra_carries_body(sib_extra, body, entry["agent_slug"]):
                     failures.append(
                         (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
                     )
-                    break
         if body and body in (row["title"] or ""):
             failures.append((label, "the session title still contains the body"))
 
