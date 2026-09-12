@@ -1692,6 +1692,63 @@ def _run_verify_selftest(paths_cfg):
         except _NotV6:
             passed += 1
             print("ok   V5 a non-v6 candidate is refused")
+
+    # B01 (任务书 #131): an output that names an input must be refused BEFORE
+    # anything is written. Pre-fix, `run_verify` verified the candidate and
+    # then unconditionally `open(report_path, "w")` -- with `--report` naming
+    # the candidate library itself, the verified database was truncated into
+    # JSON and the exit code still said "verified".
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root)
+        before = open(candidate, "rb").read()
+        rc = run_verify(candidate, manifest_path, reference, mirror, 50, 6, candidate, paths_cfg)
+        after = open(candidate, "rb").read()
+        if rc == 0:
+            print("FAIL V6 an output that names an input is refused: run_verify exited 0")
+        elif after != before:
+            print("FAIL V6 an output that names an input is refused: the candidate library was modified")
+        else:
+            passed += 1
+            print("ok   V6 an output that names an input is refused (and nothing was written)")
+
+    # B01, the probe's own entry point: `--out` naming the database the probe
+    # is reading is the same collision on the other command (there the
+    # manifest write, not a report, does the truncating).
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, _reference, _manifest_path, mirror = _write_verify_fixture(root)
+        before = open(candidate, "rb").read()
+        rc = run_probe(candidate, mirror, paths_cfg, candidate, os.path.join(root, "report.md"))
+        after = open(candidate, "rb").read()
+        if rc != 2:
+            print(f"FAIL V6b probe refuses an --out that names its --db: run_probe returned {rc!r}")
+        elif after != before:
+            print("FAIL V6b probe refuses an --out that names its --db: the database was rewritten")
+        else:
+            passed += 1
+            print("ok   V6b probe refuses an --out that names its --db (and nothing was written)")
+
+    # B01 regression guard: the refused path returns an int, but the NORMAL
+    # path returns `(manifest, stats)` -- a caller that fed that tuple to
+    # `sys.exit` would print it and exit 1, turning every healthy probe run
+    # into a failure.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, _reference, _manifest_path, mirror = _write_verify_fixture(root)
+        manifest_out = os.path.join(root, "manifest.json")
+        try:
+            main(["--db", candidate, "--mirror", mirror, "--out", manifest_out,
+                  "--report", os.path.join(root, "report.md")])
+            code = 0
+        except SystemExit as exit_:
+            code = exit_.code
+        if code == 0 and os.path.exists(manifest_out):
+            passed += 1
+            print("ok   V6c a normal probe run still exits 0 and writes its manifest")
+        else:
+            print(f"FAIL V6c a normal probe run still exits 0 and writes its manifest (code={code!r})")
+
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
 
@@ -2165,6 +2222,22 @@ def _new_stats():
 
 
 def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None):
+    # B01 (任务书 #131): `--out`/`--report` naming the database being read (or
+    # each other) used to be caught only by the opening read -- the manifest
+    # and report writes come last and truncate whatever they name. Refuse
+    # before opening anything.
+    collision = report_output_collisions(
+        "probe",
+        [
+            ("--db", db_path),
+            ("--mirror", mirror_root),
+            *[("--db sidecar", path) for path in sqlite_sidecar_paths(db_path)],
+        ],
+        [("--out", out_path), ("--report", report_path)],
+    )
+    if collision is not None:
+        print(collision, file=sys.stderr)
+        return 2
     conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
     conn.row_factory = sqlite3.Row
 
@@ -2827,6 +2900,57 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     return failures, report
 
 
+def _file_identity(path):
+    """`(realpath, (st_dev, st_ino) or None)` -- what a same-file check can
+    compare before anything is written. The inode is what catches an alias or
+    symlink of the same file; the realpath alone already covers a path that
+    does not exist yet."""
+    try:
+        st = os.stat(path)
+        inode = (st.st_dev, st.st_ino)
+    except OSError:
+        inode = None
+    return (os.path.realpath(path), inode)
+
+
+def find_output_collisions(inputs, outputs):
+    """`[(out_label, other_label, path)]` for every output that names one of
+    the inputs, or that names another output. Pure -- nothing is opened,
+    created or written."""
+    problems = []
+    identity_by_input = [(label, _file_identity(path)) for label, path in inputs]
+    seen_outputs = []
+    for out_label, out_path in outputs:
+        out_real, out_inode = _file_identity(out_path)
+        for in_label, (in_real, in_inode) in identity_by_input:
+            if out_real == in_real or (out_inode is not None and out_inode == in_inode):
+                problems.append((out_label, in_label, out_path))
+        for other_label, (other_real, other_inode) in seen_outputs:
+            if out_real == other_real or (out_inode is not None and out_inode == other_inode):
+                problems.append((out_label, other_label, out_path))
+        seen_outputs.append((out_label, (out_real, out_inode)))
+    return problems
+
+
+def sqlite_sidecar_paths(path):
+    """The two files SQLite may hold committed data in besides the database
+    itself; naming either as an output would destroy the input too."""
+    return [f"{path}{suffix}" for suffix in ("-wal", "-shm")]
+
+
+def report_output_collisions(what, inputs, outputs):
+    """B01 (任务书 #131): fail-loud message when an output names an input, or
+    `None` when the write is safe. Callers must check this BEFORE any
+    computation or write."""
+    problems = find_output_collisions(inputs, outputs)
+    if not problems:
+        return None
+    detail = "; ".join(
+        f"{out} ({out_label}) is the same file as {other_label}" for out_label, other_label, out in problems
+    )
+    return f"{what}: refusing to write an output over an input (nothing was written): {detail}"
+
+
 class _NotV6(Exception):
     """The candidate library predates schema v6, i.e. it has no `excluded`
     column at all -- a precondition failure, never a silent pass."""
@@ -2849,6 +2973,27 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
         if not os.path.exists(path):
             print(f"--verify: {label} {path} does not exist", file=sys.stderr)
             return 2
+
+    # B01 (任务书 #131): the report write used to be unconditional and last --
+    # `--report` naming the candidate (or the reference, the manifest, or a
+    # raw-mirror blob) truncated a verified input into JSON. Check before the
+    # read-only verification even runs, so a rejected invocation writes
+    # nothing at all.
+    collision = report_output_collisions(
+        "--verify",
+        [
+            ("--candidate", candidate),
+            ("--manifest", manifest_path),
+            ("--reference", reference),
+            ("--mirror", mirror_root),
+            *[("--candidate sidecar", path) for path in sqlite_sidecar_paths(candidate)],
+            *[("--reference sidecar", path) for path in sqlite_sidecar_paths(reference)],
+        ],
+        [("--report", report_path)],
+    )
+    if collision is not None:
+        print(collision, file=sys.stderr)
+        return 2
 
     try:
         failures, report = _verify_once(
@@ -2933,7 +3078,12 @@ def main(argv=None):
     if not args.db or not args.mirror:
         parser.error("--db and --mirror are required unless --selftest")
 
-    run_probe(args.db, args.mirror, paths_cfg, args.out, args.report, limit=args.limit)
+    # B01 (任务书 #131): `run_probe` returns the integer 2 when it refused an
+    # output/input collision, and its usual `(manifest, stats)` tuple
+    # otherwise -- the tuple must never reach `sys.exit` (which would print it
+    # and exit 1).
+    probe_outcome = run_probe(args.db, args.mirror, paths_cfg, args.out, args.report, limit=args.limit)
+    sys.exit(probe_outcome if isinstance(probe_outcome, int) else 0)
 
 
 if __name__ == "__main__":
