@@ -14769,6 +14769,9 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            // N09 (#131): an empty cycle can be an empty cycle BECAUSE every
+            // capture failed; report the counters before leaving.
+            refresh_run_counters_in_stats(opts);
             publish_watch_watermark_if_kind_complete(
                 &opts.data_dir,
                 state,
@@ -14883,28 +14886,9 @@ fn reindex_paths_with_semantic_delta(
                         },
                     )?;
                 }
-                // mission #116⑥: `--json` scan report disclosure. `run_index`'s
-                // own copy of this same three-line block (right before its
-                // `targeted_watch_once_only_run`/meta-persist branch) only
-                // covers the broad-scan path -- watch/watch-once ingestion
-                // happens later, in this function, called from inside
-                // `watch_sources`'s callback, so it needs its own copy or
-                // `cass index --watch-once --json`'s `indexing_stats` never
-                // picks up a non-zero count (confirmed empirically: the `meta`
-                // table write above landed real counts while `indexing_stats`
-                // still showed zeros before this fix).
-                if let Some(p) = &opts.progress
-                    && let Ok(mut stats) = p.stats.lock()
-                {
-                    let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
-                        last_index_run_counters_snapshot();
-                    stats.codex_host_shell_hits = codex_host_shell_hits;
-                    stats.codex_idx0_user_total = codex_idx0_user_total;
-                    stats.event_align_failed = event_align_failed;
-                    let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
-                    stats.capture_na = capture_na;
-                    stats.capture_failed = capture_failed;
-                }
+                // mission #116⑥ / N09 (#131): see
+                // `refresh_run_counters_in_stats`.
+                refresh_run_counters_in_stats(opts);
 
                 // Deferred check is CUMULATIVE, not per-chunk: once any earlier
                 // chunk deferred a conversation, a later successful chunk must
@@ -16000,6 +15984,28 @@ fn record_capture_na() {
     CAPTURE_NA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// mission #116⑥ / N09 (#131): copy this run's process-wide counters into the
+/// caller-visible `IndexingStats`. Two call sites need it now: the chunk loop
+/// below (where a successful chunk can report) and the `conv_count == 0`
+/// early `continue` above it -- a cycle whose EVERY source failed in the
+/// capture stage has no chunk to report from, and pre-fix it left
+/// `capture_failed` at whatever it was before (0), i.e. the machine-readable
+/// "how many captures failed" was blanked on exactly the cycle where every
+/// capture failed.
+fn refresh_run_counters_in_stats(opts: &IndexOptions) {
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
+        stats.codex_host_shell_hits = codex_host_shell_hits;
+        stats.codex_idx0_user_total = codex_idx0_user_total;
+        stats.event_align_failed = event_align_failed;
+        let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+        stats.capture_na = capture_na;
+        stats.capture_failed = capture_failed;
+    }
+}
+
 fn record_capture_failed() {
     CAPTURE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -16565,8 +16571,15 @@ fn prepare_conversation_for_ingest(
 
         if excluded.iter().any(Option::is_some) {
             invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync, &original_source_path);
-            crate::raw_mirror::sync_capture_durable(data_dir, record)
-                .map_err(|e| PrepareError(format!("排除行提交前镜像持久化失败: {e}")))?;
+            crate::raw_mirror::sync_capture_durable(data_dir, record).map_err(|e| {
+                // N09 (#131): the capture-failure exit on either side of this
+                // one reports through `record_capture_failed`; a failure to
+                // make the capture durable is the same class of "the capture
+                // did not land" and was the one error exit that left the
+                // counter at 0.
+                record_capture_failed();
+                PrepareError(format!("排除行提交前镜像持久化失败: {e}"))
+            })?;
         }
     }
 
@@ -27810,6 +27823,70 @@ mod tests {
 
         assert!(result.is_err(), "a streaming run with a capture-failed session must return Err, not Ok: {result:?}");
         assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
+    }
+
+    /// N09 (任务书 #131): a watch-once cycle whose ONLY source fails in the
+    /// capture stage ends with `prepared_convs` empty, so the cycle hits the
+    /// `conv_count == 0` early `continue` -- which sat BEFORE the block that
+    /// copies the run counters into the public stats. The run itself reports
+    /// the failure (Err), but `IndexingStats::capture_failed` kept whatever it
+    /// had before (0), i.e. the machine-readable "how many captures failed"
+    /// was blanked on exactly the cycle where every capture failed.
+    #[test]
+    #[serial]
+    fn watch_once_all_capture_failures_are_counted_in_stats_negative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("08")
+            .join("rollout-n09-all-capture-fail.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"n09 fixture\"}]}}\n",
+        )
+        .unwrap();
+
+        let to_delete = session.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let progress = std::sync::Arc::new(super::IndexingProgress::default());
+        let result = run_index(
+            super::IndexOptions {
+                no_ingest: false,
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                watch_once_paths: Some(vec![session.clone()]),
+                db_path: data_dir.join("agent_search.db"),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "fastembed".to_string(),
+                progress: Some(std::sync::Arc::clone(&progress)),
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        let capture_failed = progress
+            .stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capture_failed;
+        assert!(
+            capture_failed >= 1,
+            "a cycle whose every capture failed must disclose capture_failed >= 1 in the public stats (run result: {result:?})"
+        );
     }
 
     /// R2-B1 member "batch" (`CASS_STREAMING_INDEX=0`): the SAME
