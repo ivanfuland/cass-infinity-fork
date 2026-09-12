@@ -1700,7 +1700,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           excludable_sibling_leak=False,
                           beyond_manifest_excluded=None,
                           fragmented_array_tool_use_result=False,
-                          foreign_array_tool_use_result_cleared=False):
+                          foreign_array_tool_use_result_cleared=False,
+                          candidate_only_excluded_row=None):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1930,6 +1931,45 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "VALUES (1, 2, 'user', ?, ?)",
                 [f"sibling turn {body_text}", msgpack.packb(sibling_extra, use_bin_type=True)],
             )
+        if candidate_only_excluded_row is not None and with_excluded:
+            # R9-B05 (任务书 #132): a session the CANDIDATE alone has (the
+            # reference snapshot predates it), whose single row carries an
+            # `excluded` marker. Its own invariants are all the judge has --
+            # and a marker next to a surviving body is a contradiction the
+            # reference's absence cannot excuse.
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+                "VALUES (3, 1, 'local', 'verify-ext-3', 'verify fixture session 3', '/src/verify-ext-3.jsonl')"
+            )
+            co_marker = json.dumps({
+                "reason": "context_file_read",
+                "rule_version": 1,
+                "bytes": len(body_text.encode("utf-8")),
+                "sha256": body_sha,
+                "fingerprint_blake3": "0" * 64,
+                "parse_error": None,
+                "anchor": {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None},
+                "src": None,
+                "raw": {
+                    "blob": (
+                        "blobs/blake3/zz/not-in-the-mirror.raw"
+                        if candidate_only_excluded_row == "unverifiable"
+                        else blob_rel
+                    ),
+                    "idx": 1,
+                    "event_key": "u2",
+                    "blocks": [0],
+                },
+            })
+            co_content = body_text if candidate_only_excluded_row == "body_retained" else ""
+            co_extra = _verify_extra(redacted)
+            if candidate_only_excluded_row == "extra_leak":
+                co_extra["leak"] = body_text
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin, excluded) "
+                "VALUES (3, 0, 'tool_result', ?, ?, jsonb(?))",
+                [co_content, msgpack.packb(co_extra, use_bin_type=True), co_marker],
+            )
         if candidate_only_row and with_excluded:
             # N-fam2: a row only the CANDIDATE has (a newer library).
             conn.execute(
@@ -2114,6 +2154,20 @@ def verify_selftest_cases():
         # ...and a sha that is not the reference body's at all.
         ("V24 a beyond-manifest marker whose sha is not the reference body is a failure", False,
          "sha_is_not_the_reference_body"),
+        # R9-B05 (任务书 #132): a candidate-only row carrying an exclusion
+        # marker is held to the exclusion's own invariants -- `excluded` next
+        # to a surviving body is a contradiction the reference's absence
+        # cannot excuse.
+        ("V25 a well-formed candidate-only exclusion passes", True, "",
+         {"candidate_only_excluded": 1, "candidate_only_unjudgeable": 0}),
+        ("V26 a candidate-only excluded row that still carries its body is a failure", False,
+         "candidate_only_bad_marker"),
+        ("V27 a candidate-only excluded row that leaves the body in its extra is a failure", False,
+         "body_still_in_extra"),
+        # ...and when the raw-mirror blob is not on disk the half that needs it
+        # is RECORDED, never silently passed.
+        ("V28 a candidate-only exclusion with no mirror blob is recorded as unjudgeable", True, "",
+         {"candidate_only_unjudgeable": 1}),
     ]
 
 
@@ -2156,6 +2210,10 @@ def _run_verify_selftest(paths_cfg):
             21: {"beyond_manifest_excluded": "overclear"},
             22: {"beyond_manifest_excluded": "reason_mismatch"},
             23: {"beyond_manifest_excluded": "wrong_sha"},
+            24: {"candidate_only_excluded_row": "ok"},
+            25: {"candidate_only_excluded_row": "body_retained"},
+            26: {"candidate_only_excluded_row": "extra_leak"},
+            27: {"candidate_only_excluded_row": "unverifiable"},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -3698,6 +3756,7 @@ _FAILURE_FAMILIES = (
     ("has no `excluded` marker", "marker_missing"),
     ("marker reason", "marker_reason"),
     ("beyond_manifest_invalid", "beyond_manifest_invalid"),
+    ("candidate_only_bad_marker", "candidate_only_bad_marker"),
     ("non-manifest row is missing", "non_manifest_row_missing"),
     ("non-manifest row is not in the reference", "non_manifest_row_extra"),
     ("non-manifest body differs", "non_manifest_body_changed"),
@@ -3940,6 +3999,61 @@ def _beyond_manifest_exclusion_problem(entry, marker, row, ref_row, conn_cand, m
     return None
 
 
+def _candidate_only_excluded_problem(row, marker, conn_cand, mirror_root):
+    """`None` when a CANDIDATE-ONLY row's own exclusion holds up; else
+    `(subreason, detail)`; `("unverifiable", ...)` when the raw-mirror blob is
+    not on disk.
+
+    N-fam2 (任务书 #131 追加) made candidate-only rows informational -- the
+    candidate is a newer library, so rows the reference snapshot does not have
+    yet are expected. R9-B05 (任务书 #132) measured what that left: the loop
+    only incremented a counter, so a row carrying an `excluded` marker AND a
+    non-empty `content` -- a self-contradiction, and exactly what a body left
+    behind by a broken exclusion looks like -- passed with `failures=0`.
+
+    Whether the reference has the row is beside the point: `excluded != NULL`
+    plus a surviving body is a contradiction on its own. There is no reference
+    row to compare against, so the invariants here are the ones the row can be
+    held to by itself: content cleared, marker complete, no snippet/lex/chunks
+    residue, and -- when the raw-mirror blob is available -- the marker really
+    naming this row's block and its sha really being that block's body, with no
+    copy of that body left in the extra.
+    """
+    content = row["content"] or ""
+    if content != "":
+        return "body_not_cleared", (
+            f"an excluded row still carries a {len(content)}-character body"
+        )
+    reason = marker.get("reason")
+    if reason not in EXCLUSION_REASONS:
+        return "exclusion_reason", f"marker reason {reason!r} is not a known exclusion reason"
+    sha = marker.get("sha256")
+    if not isinstance(sha, str) or len(sha) != 64:
+        return "marker_shape", f"marker sha256 {sha!r} is not a 64-character digest"
+    if not isinstance(marker.get("bytes"), int) or isinstance(marker.get("bytes"), bool):
+        return "marker_shape", f"marker bytes {marker.get('bytes')!r} is not an integer"
+    raw_problem = _raw_reference_problem(marker.get("raw"))
+    if raw_problem is not None:
+        return "marker_shape", raw_problem
+    residue = _residue_problems(conn_cand, row["id"])
+    if residue:
+        return "residue", residue[0]
+    candidates, index, problem = _reparse_recorded_candidate(row["agent_slug"], marker["raw"], mirror_root)
+    if problem == "unverifiable":
+        return "unverifiable", f"the raw-mirror blob {marker['raw']['blob']!r} is not on disk"
+    if problem is not None:
+        return "raw_does_not_name_this_row", problem
+    rebuilt = hashlib.sha256(redact_text(candidates[index].text).encode("utf-8")).hexdigest()
+    if rebuilt != sha:
+        return "sha_is_not_the_rebuilt_body", (
+            f"marker sha256 {sha} != the rebuilt candidate's {rebuilt}"
+        )
+    body = candidates[index].text
+    if body and _extra_carries_body(_decode_extra(row["extra_bin"]), body):
+        return "body_still_in_extra", "the excluded body is still reconstructible from extra_bin"
+    return None
+
+
 def _verify_rebuild_blob(entry, marker, mirror_root):
     """Reparse the recorded blob, re-project the recorded blocks and re-apply
     the ingest-side redactor; returns the rebuilt body's sha256 or an error
@@ -4006,6 +4120,9 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     candidate_excluded_beyond_manifest_samples = []
     beyond_manifest_unverifiable = 0
     beyond_manifest_unverifiable_samples = []
+    candidate_only_excluded = 0
+    candidate_only_unjudgeable = 0
+    candidate_only_unjudgeable_samples = []
     body_retained_unexcludable_samples = []
     excludable_cache = {}
     extra_unchanged_no_body = 0
@@ -4226,6 +4343,23 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             # jump is worth seeing; only "the candidate lost something the
             # reference has" is a failure.
             candidate_only_rows += 1
+            # R9-B05 (任务书 #132): "the reference does not have this row" is
+            # not a licence for the row to contradict itself. A marker plus a
+            # surviving body is a contradiction whatever the reference holds.
+            row = cand_rows[key]
+            marker = json.loads(row["excluded_json"]) if _field(row, "excluded_json") else None
+            if marker is not None:
+                candidate_only_excluded += 1
+                problem = _candidate_only_excluded_problem(row, marker, conn_cand, mirror_root)
+                if problem is not None:
+                    subreason, detail = problem
+                    label = f"{key[0]}/idx={key[2]}"
+                    if subreason == "unverifiable":
+                        candidate_only_unjudgeable += 1
+                        if len(candidate_only_unjudgeable_samples) < 20:
+                            candidate_only_unjudgeable_samples.append([label, detail])
+                    else:
+                        failures.append((label, f"candidate_only_bad_marker: {subreason}: {detail}"))
 
     # Sampled rebuilds.
     rng = random.Random(seed)
@@ -4269,6 +4403,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "beyond_manifest_unverifiable": beyond_manifest_unverifiable,
         "beyond_manifest_unverifiable_samples": beyond_manifest_unverifiable_samples,
         "candidate_only_rows": candidate_only_rows,
+        # R9-B05: of the candidate-only rows, the ones that carry an exclusion
+        # marker (held to the exclusion invariants) and the ones whose
+        # raw-mirror blob is not on disk (recorded, never silently passed).
+        "candidate_only_excluded": candidate_only_excluded,
+        "candidate_only_unjudgeable": candidate_only_unjudgeable,
+        "candidate_only_unjudgeable_samples": candidate_only_unjudgeable_samples,
         "failure_families": dict(sorted(Counter(failure_family(detail) for _label, detail in failures).items())),
         # N-fam3 (任务书 #131 追加): the families give the shape of a failure
         # set, this gives every one of them -- `[family, label, message]` per
@@ -4400,7 +4540,8 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
         key: report[key]
         for key in ("extra_unchanged_no_body", "candidate_only_rows",
                     "body_retained_unexcludable", "candidate_excluded_beyond_manifest",
-                    "beyond_manifest_unverifiable")
+                    "beyond_manifest_unverifiable", "candidate_only_excluded",
+                    "candidate_only_unjudgeable")
         if key in report
     }
     if any(informational.values()):
