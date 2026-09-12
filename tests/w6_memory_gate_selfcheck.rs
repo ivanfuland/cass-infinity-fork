@@ -717,3 +717,248 @@ fn p0_lookup_holds_a_cell_carrying_samples_to_the_judges_measured_rule() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// B12 (任务书 #131): the stage measurement record is this door's product, so
+/// a `tee` that fails (here: the output path is a directory) must fail the
+/// run. Pre-fix the pipeline's exit status was never checked and the
+/// in-memory JSON went straight to the judge, which -- with a budget the
+/// stage easily clears -- returned success: the run reported a good stage
+/// while the measurement it exists to produce was never written.
+///
+/// Driven by sourcing the script (the same convention
+/// `run_check_ingest_totals` uses) and calling `run_stage` directly, because
+/// the failure has to be provoked at a path the caller names: `--selfcheck`
+/// picks its own (pid-stamped) path, and normal mode would need the whole
+/// fixture pipeline to get as far as a stage write.
+#[test]
+fn a_stage_record_that_cannot_be_written_fails_the_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let unwritable = tmp.path().join("stage.json");
+    std::fs::create_dir(&unwritable).expect("pre-create the output path as a directory");
+
+    let output = Command::new("bash")
+        .arg("-c")
+        // A budget the `sleep 1` stage cannot exceed, so the ONLY thing that
+        // can fail this run is the write itself.
+        .arg(". \"$1\"; run_stage selfcheck selfcheck 1073741824 \"\" \"\" \"\" \"$2\" sleep 1")
+        .arg("--")
+        .arg(gate_script())
+        .arg(&unwritable)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn bash -c 'source memory_gate.sh; run_stage ...'");
+
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "a stage whose measurement could not be written must not report success: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        unwritable.is_dir(),
+        "the guard must not have replaced the unwritable path -- nothing was written"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T6-c N07 (任务书 #131 / T7 勘误): normal mode RECORDS, it does not judge a
+// budget. These three tests drive the real four-stage driver against a frozen
+// fixture, a stub wrapper that materializes a stage db, and a stub
+// completeness gate -- so the driver's own flow (fixture identity check,
+// ingest-totals check, four stages, twelve cells) runs for real, with no P0
+// baseline anywhere.
+// ---------------------------------------------------------------------------
+
+const STUB_BODY: &str = "stage one body\n";
+
+struct NormalRun {
+    tmp: tempfile::TempDir,
+}
+
+impl NormalRun {
+    fn new() -> Self {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        for dir in ["run", "examples", "w6", "xdg/cass"] {
+            std::fs::create_dir_all(tmp.path().join(dir)).expect("create dir");
+        }
+        let body_bytes = STUB_BODY.len();
+        // The frozen fixture: one *.jsonl whose bytes ARE the manifest's
+        // `fixture_sha256` (path-sorted concatenation of every *.jsonl).
+        let session = tmp.path().join("fixture-session.jsonl");
+        std::fs::write(&session, STUB_BODY).expect("write fixture session");
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(STUB_BODY.as_bytes());
+            h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        std::fs::write(
+            tmp.path().join("fixture-manifest.json"),
+            format!(
+                "{{\"fixture_sha256\": \"{digest}\", \"messages\": 1, \"total_bytes\": {body_bytes}, \"max_message_bytes\": {body_bytes}}}\n"
+            ),
+        )
+        .expect("write manifest");
+        std::fs::write(
+            tmp.path().join("examples/w4_completeness_gate"),
+            "#!/bin/bash\nset -eu\n# The one thing stage 4 must do is leave the --json report behind.\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in\n    --json) out=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n[ -n \"$out\" ] && printf '{\"stub\": true}\\n' > \"$out\"\nexit 0\n",
+        )
+        .expect("write stub gate");
+        std::fs::write(
+            tmp.path().join("runner.sh"),
+            format!(
+                "#!/bin/bash\nset -eu\nmkdir -p \"$CASS_DATA_DIR\"\npython3 - \"$CASS_DATA_DIR/agent_search.db\" <<'PY'\nimport sqlite3, sys\nconn = sqlite3.connect(sys.argv[1])\nconn.executescript(\n    \"CREATE TABLE IF NOT EXISTS conversations(id INTEGER PRIMARY KEY);\"\n    \"CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, content TEXT NOT NULL);\"\n)\nconn.execute(\"DELETE FROM conversations\")\nconn.execute(\"DELETE FROM messages\")\nconn.execute(\"INSERT INTO conversations(id) VALUES (1)\")\nconn.execute(\"INSERT INTO messages(id, content) VALUES (1, ?)\", ({:?},))\nconn.commit()\nconn.close()\nPY\nsleep 0.35\n",
+                STUB_BODY
+            ),
+        )
+        .expect("write stub wrapper");
+        std::fs::write(tmp.path().join("cass-candidate"), b"not a real binary, only hashed\n").expect("write candidate");
+        std::fs::write(tmp.path().join("xdg/cass/sources.toml"), "").expect("write sources.toml");
+        Self { tmp }
+    }
+
+    fn prepare_shape(&self, shape: &str) {
+        let fixture = self.tmp.path().join(format!("run/mem-{shape}-fixture"));
+        std::fs::create_dir_all(&fixture).expect("create fixture dir");
+        std::fs::copy(self.tmp.path().join("fixture-session.jsonl"), fixture.join("session.jsonl"))
+            .expect("copy session");
+        std::fs::copy(self.tmp.path().join("fixture-manifest.json"), fixture.join("manifest.json"))
+            .expect("copy manifest");
+    }
+
+    fn run(&self, shape: &str) -> std::process::Output {
+        Command::new("bash")
+            .arg(gate_script())
+            .arg(shape)
+            .arg(self.tmp.path().join("runner.sh"))
+            .env("RUN_ROOT", self.tmp.path().join("run"))
+            .env("EXAMPLES", self.tmp.path().join("examples"))
+            .env("W6", self.tmp.path().join("w6"))
+            .env("XDG_CONFIG_HOME", self.tmp.path().join("xdg"))
+            .env("CASS_CAND_BIN", self.tmp.path().join("cass-candidate"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn memory_gate.sh")
+    }
+
+    fn cells(&self) -> Value {
+        let path = self.tmp.path().join("run/memgate-cells.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read the cells matrix {path:?}: {e}"));
+        serde_json::from_str(&text).expect("cells matrix must be JSON")
+    }
+}
+
+/// A stage result read back from disk, so the assertions are about what the
+/// door actually wrote.
+fn stage_json(run: &NormalRun, shape: &str, stage: &str) -> Value {
+    let path = run.tmp.path().join(format!("run/mem-{shape}-stage{stage}.json"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+    serde_json::from_str(&text).expect("stage record must be JSON")
+}
+
+const STAGE_FILES: [(&str, &str); 4] = [
+    ("index", "1"),
+    ("index_force_rebuild", "2"),
+    ("index_semantic", "3"),
+    ("completeness_gate", "4"),
+];
+
+/// N07: with no `memgate-baseline.json` at all, normal mode must still collect
+/// all four stages and record them -- pre-fix it exited 2 at
+/// `budget_for index` ("P0 baseline file not found") before running anything.
+#[test]
+fn normal_mode_records_all_four_cells_without_a_p0_baseline() {
+    let run = NormalRun::new();
+    run.prepare_shape("a");
+    let output = run.run("a");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a missing P0 baseline must not fail the record-only door: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for (stage, file) in STAGE_FILES {
+        let cell = stage_json(&run, "a", file);
+        assert_eq!(cell["stage"], stage, "stage {file} record must name its stage");
+        assert!(
+            cell["p0_ratio"].is_null(),
+            "with no P0 cell the ratio is recorded as null, not fabricated: {cell:?}"
+        );
+        // The two fall keys the twelve cells are judged by must survive.
+        assert!(cell["last_tree"].is_u64() && cell["peak_tree"].is_u64(), "fall keys: {cell:?}");
+        assert!(cell["peak_sample_idx"].is_u64() && cell["samples"].is_u64(), "fall keys: {cell:?}");
+    }
+
+    let cells = run.cells();
+    assert_eq!(
+        cells.as_object().map(|m| m.len()),
+        Some(4),
+        "one shape's run must record its four cells: {cells:?}"
+    );
+    for (stage, _) in STAGE_FILES {
+        assert!(cells.get(format!("a/{stage}")).is_some(), "cell a/{stage} missing: {cells:?}");
+    }
+}
+
+/// N07: three shapes x four stages = the door's twelve cells, merged across
+/// invocations into one matrix (`$RUN_ROOT/memgate-cells.json`), written by
+/// rename so an interrupted run cannot leave a half-written file behind.
+#[test]
+fn normal_mode_merges_cells_across_shapes() {
+    let run = NormalRun::new();
+    for shape in ["a", "b"] {
+        run.prepare_shape(shape);
+        let output = run.run(shape);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "shape {shape} must record cleanly: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let cells = run.cells();
+    assert_eq!(
+        cells.as_object().map(|m| m.len()),
+        Some(8),
+        "two shapes must leave eight cells in the matrix: {cells:?}"
+    );
+    for shape in ["a", "b"] {
+        for (stage, _) in STAGE_FILES {
+            assert!(cells.get(format!("{shape}/{stage}")).is_some(), "cell {shape}/{stage} missing: {cells:?}");
+        }
+    }
+}
+
+/// N07: the door used to `rm -rf` whatever sat at its own output path -- an
+/// earlier run's result tree included. It now refuses and writes nothing.
+#[test]
+fn normal_mode_refuses_to_delete_an_existing_result_tree() {
+    let run = NormalRun::new();
+    run.prepare_shape("a");
+    let stale = run.tmp.path().join("run/mem-a");
+    std::fs::create_dir_all(&stale).expect("pre-create the result tree");
+    let marker = stale.join("keep-me.txt");
+    std::fs::write(&marker, b"an earlier run's result\n").expect("write marker");
+
+    let output = run.run("a");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an existing result tree must be a fail-loud precondition, not something to delete: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.is_file(), "the pre-existing result tree must be left exactly as it was");
+    assert_eq!(
+        std::fs::read(&marker).expect("read marker"),
+        b"an earlier run's result\n",
+        "the marker's bytes must be untouched"
+    );
+    assert!(
+        !run.tmp.path().join("run/mem-a-stage1.json").exists(),
+        "nothing may be written once the door refused"
+    );
+}
