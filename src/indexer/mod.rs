@@ -1710,7 +1710,17 @@ fn robot_trace_ingest_finish(
 /// `--force-rebuild` on a populated db -- the common real dispatch, and the
 /// one `memory_gate.sh`'s stage 2 actually exercises). The cost against a
 /// cached atomic read is immaterial next to the I/O each call brackets.
-fn memprobe_point(stage: &str, point: &str) {
+///
+/// N05 (任务书 #131 T6-c): `site` is the CALLER's identity, written into every
+/// line. Before it, the only thing separating two writers of the same file
+/// was the `pid`, which is a property of the process, not of the call: a
+/// non-`#[serial]` test reaching one of these production call sites while
+/// another test holds `CASS_MEMPROBE_LOG` writes into that test's file, in
+/// that test's process, with that test's pid -- indistinguishable from its
+/// own lines. Production sites pass their enclosing function's name (fixed
+/// strings, so the JSONL stays greppable); a test passes its own name and
+/// reads back only the lines carrying it.
+fn memprobe_point(site: &str, stage: &str, point: &str) {
     let Some(path) = std::env::var_os("CASS_MEMPROBE_LOG") else {
         return;
     };
@@ -1727,6 +1737,7 @@ fn memprobe_point(stage: &str, point: &str) {
     }
     let payload = serde_json::json!({
         "ts_ms": chrono::Utc::now().timestamp_millis(),
+        "site": site,
         "stage": stage,
         "point": point,
         "vm_rss_kb": vm_rss_kb,
@@ -1786,7 +1797,7 @@ mod memprobe {
         unsafe {
             std::env::remove_var("CASS_MEMPROBE_LOG");
         }
-        memprobe_point("ingest", "start");
+        memprobe_point("test_disabled_by_default_creates_no_file", "ingest", "start");
         assert!(
             !log_path.exists(),
             "memprobe_point must not create a file when CASS_MEMPROBE_LOG is unset"
@@ -1825,20 +1836,21 @@ mod memprobe {
     #[test]
     #[serial]
     fn enabled_writes_two_well_formed_lines() {
+        // N05 (任务书 #131 T6-c): this test's own caller identity, passed to
+        // the two `memprobe_point` calls it counts and used as the filter.
+        const TEST_SITE: &str = "test_enabled_writes_two_well_formed_lines";
         // R6-N7 (#123): the log path is unique per run (pid *and* a
-        // nanosecond stamp), the assertion below counts only the lines
-        // carrying *this* process's pid, and the env var is restored to
-        // whatever it held before rather than merely removed.
+        // nanosecond stamp), and the env var is restored to whatever it held
+        // before rather than merely removed.
         //
-        // Residual limit, stated rather than papered over: `#[serial]` only
-        // orders tests that take the same lock, so a non-`#[serial]` test
-        // that reaches an instrumented production path while this env var
-        // is set still appends to this file -- and since such a test runs
-        // in *this* process, its lines carry the same pid and the pid
-        // filter cannot exclude them. The unique path is what keeps two
-        // concurrent *processes* (other test binaries) apart; the
-        // same-process overlap is bounded by this test holding the
-        // env var for only the two calls between set and restore.
+        // N05 (任务书 #131 T6-c): the residual limit R6-N7 stated here -- a
+        // non-`#[serial]` test reaching an instrumented production path
+        // while this env var is set appends to this file, in this process,
+        // with this pid, so a pid filter cannot exclude it -- is what the
+        // `site` field closes. The neighbour call further down makes that
+        // executable instead of hypothetical; the count below filters by
+        // site. The unique path still keeps two concurrent *processes*
+        // (other test binaries) apart.
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -1885,8 +1897,15 @@ mod memprobe {
         unsafe {
             std::env::set_var("CASS_MEMPROBE_LOG", &log_path);
         }
-        memprobe_point("ingest", "start");
-        memprobe_point("ingest", "end");
+        memprobe_point(TEST_SITE, "ingest", "start");
+        memprobe_point(TEST_SITE, "ingest", "end");
+        // N05 (任务书 #131 T6-c): the same-process neighbour the doc comment
+        // above concedes to, made executable. A non-`#[serial]` test reaching
+        // an instrumented production path while this env var is set appends
+        // to this very file, in THIS process -- same pid. Calling a production
+        // site's own `memprobe_point` here is that neighbour, with no
+        // scheduling luck involved.
+        memprobe_point("run_streaming_index", "ingest", "start");
         unsafe {
             match &prior {
                 Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
@@ -1922,19 +1941,39 @@ mod memprobe {
                 value["pid"].is_u64(),
                 "every memprobe line must carry an integer `pid` field, got {value:?}"
             );
+            assert!(
+                value["site"].is_string(),
+                "every memprobe line must carry a string `site` field, got {value:?}"
+            );
         }
+        // N05 (任务书 #131 T6-c): the identity that separates two writers of
+        // this file is the CALLER, not the process. The neighbour call above
+        // runs in *this* process, so its line carries this process's pid and
+        // a pid filter counts three lines here.
         let mine: Vec<serde_json::Value> = values
-            .into_iter()
-            .filter(|value| value["pid"].as_u64() == Some(u64::from(std::process::id())))
+            .iter()
+            .filter(|value| value["site"].as_str() == Some(TEST_SITE))
+            .cloned()
             .collect();
         assert_eq!(
             mine.len(),
             2,
-            "expected exactly two JSONL lines carrying this process's pid, got {} of {} lines: {text:?}",
+            "expected exactly two JSONL lines carrying this test's own site, got {} of {} lines: {text:?}",
             mine.len(),
             text.lines().count()
         );
+        // Asserted as "at least one foreign line", not "exactly three lines":
+        // an ADDITIONAL neighbour (any other test reaching an instrumented
+        // path inside this window) is exactly the interference this test is
+        // about, and a third-party line count would make the test fail for
+        // the very reason it exists.
+        assert!(
+            values.iter().any(|value| value["site"].as_str() != Some(TEST_SITE)),
+            "the file must also hold the neighbour production-site line -- with the neighbour \
+             missing, the site filter above is never exercised: {text:?}"
+        );
         for (value, expected_point) in mine.iter().zip(["start", "end"]) {
+            assert_eq!(value["site"], TEST_SITE);
             assert_eq!(value["stage"], "ingest");
             assert_eq!(value["point"], expected_point);
             assert!(value["ts_ms"].is_i64());
@@ -2494,7 +2533,7 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
     // whole force-rebuild call (via `?`), not just a logged warning --
     // otherwise "tantivy rebuilt fine" would silently mask "the lexical
     // domain didn't."
-    memprobe_point("lexical", "start");
+    memprobe_point("try_readonly_canonical_force_rebuild", "lexical", "start");
     let lex_storage = FrankenStorage::open(&opts.db_path).with_context(|| {
         format!(
             "opening canonical database writable for lex domain rebuild: {}",
@@ -2530,7 +2569,7 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
         )
     })?;
 
-    memprobe_point("lexical", "end");
+    memprobe_point("try_readonly_canonical_force_rebuild", "lexical", "end");
     Ok(true)
 }
 
@@ -8153,7 +8192,7 @@ fn run_streaming_index(
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
-    memprobe_point("ingest", "start");
+    memprobe_point("run_streaming_index", "ingest", "start");
     let result = run_streaming_index_with_connector_factories(
         storage,
         opts,
@@ -8165,7 +8204,7 @@ fn run_streaming_index(
         progress_bump,
         active_session_source_skips,
     );
-    memprobe_point("ingest", "end");
+    memprobe_point("run_streaming_index", "ingest", "end");
     result
 }
 
@@ -8379,7 +8418,7 @@ fn run_batch_index(
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
-    memprobe_point("ingest", "start");
+    memprobe_point("run_batch_index", "ingest", "start");
     let result = run_batch_index_with_connector_factories(
         storage,
         opts,
@@ -8391,7 +8430,7 @@ fn run_batch_index(
         progress_bump,
         active_session_source_skips,
     );
-    memprobe_point("ingest", "end");
+    memprobe_point("run_batch_index", "ingest", "end");
     result
 }
 
@@ -8958,7 +8997,7 @@ fn run_semantic_db_vector_catchup(
     opts: &IndexOptions,
     caller: &str,
 ) -> Result<SemanticDbVectorCatchupOutcome> {
-    memprobe_point("holes", "start");
+    memprobe_point("run_semantic_db_vector_catchup", "holes", "start");
     if opts.embedder != "infinity" {
         anyhow::bail!(
             "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
@@ -9025,7 +9064,7 @@ fn run_semantic_db_vector_catchup(
              same command to continue draining chunk_holes"
         );
     }
-    memprobe_point("holes", "end");
+    memprobe_point("run_semantic_db_vector_catchup", "holes", "end");
     Ok(SemanticDbVectorCatchupOutcome {
         activated: report.activated,
         cleanup_failures: report.cleanup_failures,
@@ -11978,7 +12017,7 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     db_path: &Path,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<usize> {
-    memprobe_point("lexical", "start");
+    memprobe_point("rebuild_lex_domain_from_db_full", "lexical", "start");
     // R1-B4: unconditional drop+recreate before resync, matching
     // `repair_lexical_index_from_canonical_db_for_search`'s pattern below --
     // `rebuild_lex_domain_from_db` only resyncs conversations that still
@@ -12013,7 +12052,7 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     storage
         .close()
         .with_context(|| format!("closing database after full lex domain rebuild: {}", db_path.display()))?;
-    memprobe_point("lexical", "end");
+    memprobe_point("rebuild_lex_domain_from_db_full", "lexical", "end");
     Ok(stats.lex_docs_count)
 }
 
