@@ -1628,6 +1628,10 @@ _VERIFY_MULTILINE_BODY = "PR6 T5 verify fixture multiline body\nline two with a 
 # B08: shorter than the old `len(body) >= 32` gate, which skipped the whole
 # carried-body check for it.
 _VERIFY_SHORT_BODY = "short leaked body"
+# R9-B03 (任务书 #132): a body the connector carries as an ARRAY of fragments
+# -- `flatten_content` joins them with `\n`, so the projected body is this
+# whole string while no single element is it.
+_VERIFY_FRAGMENT_BODY = "secret A\nsecret B"
 
 
 def _verify_extra(block_value):
@@ -1694,7 +1698,9 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           legit_sibling_redaction=False, compact_extra_no_body=False,
                           candidate_only_row=False, array_tool_use_result=None,
                           excludable_sibling_leak=False,
-                          beyond_manifest_excluded=None):
+                          beyond_manifest_excluded=None,
+                          fragmented_array_tool_use_result=False,
+                          foreign_array_tool_use_result_cleared=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1703,7 +1709,13 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     blob_path = os.path.join(mirror, blob_rel)
     os.makedirs(os.path.dirname(blob_path), exist_ok=True)
 
-    body_text = _VERIFY_SHORT_BODY if short_body else (_VERIFY_MULTILINE_BODY if leak_multiline_body else _VERIFY_BODY)
+    fragmented = fragmented_array_tool_use_result or foreign_array_tool_use_result_cleared
+    body_text = (
+        _VERIFY_FRAGMENT_BODY if fragmented
+        else _VERIFY_SHORT_BODY if short_body
+        else _VERIFY_MULTILINE_BODY if leak_multiline_body
+        else _VERIFY_BODY
+    )
     # B10 (任务书 #131): a marker whose recorded identity was tampered with.
     # `wrong_marker_sha` moves the marker's sha AND its placeholder together,
     # so only the manifest binding (not the placeholder-shape check) can
@@ -1722,11 +1734,16 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
              "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}},
         ]},
     }
+    # R9-B03 (任务书 #132): the connector's ARRAY form of a `tool_result`
+    # body. `_flatten_content` joins these fragments with `\n`, so the
+    # projected body is exactly `body_text` -- but no single element is it.
+    fragment_blocks = [{"type": "text", "text": part} for part in body_text.split("\n")]
+    result_block_value = fragment_blocks if fragmented else body_text
     result_event = {
         "type": "user",
         "uuid": "u2",
         "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1", "content": body_text},
+            {"type": "tool_result", "tool_use_id": "t1", "content": result_block_value},
         ]},
     }
     second_pair = []
@@ -1775,7 +1792,25 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "VALUES (1, 1, 0, 'user', ?, ?)",
                 [boundary_content, msgpack.packb(boundary, use_bin_type=True)],
             )
-        candidate_extra = _verify_extra(redacted if with_excluded else body_text)
+        candidate_extra = _verify_extra(redacted if with_excluded else result_block_value)
+        # R9-B03 (任务书 #132): the array-form top-level `toolUseResult`.
+        # `fragmented_array_tool_use_result` is the POSITIVE shape -- its join
+        # IS the excluded body, so every element is a fragment of that body's
+        # copy and the candidate replaced them all. The foreign one is the
+        # boundary: its join is a different body, so clearing the elements is
+        # an over-clear the judge must keep failing.
+        if fragmented_array_tool_use_result:
+            candidate_extra["toolUseResult"] = (
+                [{"type": "text", "text": redacted}, {"type": "text", "text": redacted}]
+                if with_excluded
+                else [{"type": "text", "text": part} for part in body_text.split("\n")]
+            )
+        if foreign_array_tool_use_result_cleared:
+            candidate_extra["toolUseResult"] = (
+                [{"type": "text", "text": redacted}, {"type": "text", "text": redacted}]
+                if with_excluded
+                else [{"type": "text", "text": "some other"}, {"type": "text", "text": "tool's body"}]
+            )
         if compact_extra_no_body:
             # N-fam2: the "compact" shape the frozen corpus has for ~31% of
             # rows -- prior compression left only these keys, so NO field ever
@@ -2017,6 +2052,16 @@ def verify_selftest_cases():
          {"candidate_excluded_beyond_manifest": 1}),
         ("V18 an exclusion beyond the manifest with a bad marker is a failure", False,
          "beyond_manifest_bad_marker"),
+        # R9-B03 (任务书 #132): `toolUseResult`'s array form is ONE projected
+        # value. When its elements are FRAGMENTS of the excluded body the join
+        # is that body's copy, so every element is a legitimate target -- the
+        # per-element proof alone saw neither fragment as the body and called
+        # the exclusion an over-clear.
+        ("V19 a fragmented array toolUseResult is one owned body's copy", True, ""),
+        # ...and the boundary: fragments joining to a DIFFERENT body are not
+        # this exclusion's copy, so clearing them stays an over-clear.
+        ("V20 a foreign fragmented array toolUseResult is a failure", False,
+         "redacted a field this exclusion does not own"),
     ]
 
 
@@ -2053,6 +2098,8 @@ def _run_verify_selftest(paths_cfg):
             15: {"excludable_sibling_leak": True},
             16: {"beyond_manifest_excluded": "ok"},
             17: {"beyond_manifest_excluded": "bad"},
+            18: {"fragmented_array_tool_use_result": True},
+            19: {"foreign_array_tool_use_result_cleared": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -2279,6 +2326,37 @@ def _run_verify_selftest(paths_cfg):
             print("ok   V6c a normal probe run still exits 0 and writes its manifest")
         else:
             print(f"FAIL V6c a normal probe run still exits 0 and writes its manifest (code={code!r})")
+
+    # R9-B03 (任务书 #132): the ownership bodies are read off the reference
+    # EVENT, projected exactly as the connector projects it. The string-only
+    # reading dropped an array-form body entirely, which is what left the
+    # sibling path (no `ref_row` of its own to offer) with nothing to prove
+    # ownership against.
+    total += 1
+    array_event = {
+        "uuid": "u2",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": [{"type": "text", "text": "secret A"}]},
+        ]},
+    }
+    got = _owned_bodies(array_event, [0], None)
+    if got == ["secret A"]:
+        passed += 1
+        print("ok   B03 an array-form content block projects to its own body")
+    else:
+        print(f"FAIL B03 an array-form content block projects to its own body: got {got!r}, want ['secret A']")
+
+    total += 1
+    got = _owned_bodies(array_event, [0], "the row's own body")
+    if got == ["the row's own body", "secret A"]:
+        passed += 1
+        print("ok   B03 the row's own body and the event's array body are both owned")
+    else:
+        print(
+            "FAIL B03 the row's own body and the event's array body are both owned: "
+            f"got {got!r}"
+        )
 
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
@@ -3379,14 +3457,63 @@ def _expand_field_paths(agent_slug, blocks):
     return allowed
 
 
+def _owned_bodies(extra, blocks, own_body):
+    """Mirrors `exclusion.rs::owned_bodies`: the bodies an exclusion may treat
+    as its own -- the row's own pre-clear content (absent on the sibling path,
+    whose content is never cleared) plus, for every targeted block, that
+    block's body as the CONNECTOR projects it.
+
+    R9-B03 (任务书 #132): the string-only reading dropped an array-form body
+    (`tool_result.content = [{"type":"text","text":...}]`) entirely, so both
+    top-level `toolUseResult` shapes that exist to be cleared against it kept
+    the excluded body verbatim in `extra_bin`.
+    """
+    bodies = []
+    if own_body:
+        bodies.append(own_body)
+    if not isinstance(extra, dict):
+        return bodies
+    message = extra.get("message")
+    blocks_value = message.get("content") if isinstance(message, dict) else None
+    if blocks_value is None:
+        blocks_value = extra.get("content")
+    if not isinstance(blocks_value, list):
+        return bodies
+    for index in blocks:
+        if not isinstance(index, int) or not 0 <= index < len(blocks_value):
+            continue
+        block = blocks_value[index]
+        if isinstance(block, str):
+            bodies.append(block)
+            continue
+        if not isinstance(block, dict):
+            continue
+        for key in ("content", "text"):
+            if key not in block:
+                continue
+            value = block[key]
+            if isinstance(value, str):
+                bodies.append(value)
+                continue
+            projected = _flatten_content(value)
+            if projected:
+                bodies.append(projected)
+    return bodies
+
+
 def _allowed_extra_paths(entry, ref_row, ref_extra):
     """Concrete dot-paths (no leading dot) this exclusion may rewrite."""
     allowed = _expand_field_paths(entry.get("agent_slug"), entry.get("blocks") or [])
     if entry.get("agent_slug") == "claude_code" and isinstance(ref_extra, dict):
-        body = ref_row["content"] if ref_row is not None else None
+        own_body = ref_row["content"] if ref_row is not None else None
+        # B04's ownership proof, but read off the reference EVENT rather than
+        # the row's content alone: that covers the sibling path (N02, no row
+        # of its own) and the array-form body R9-B03 measured the string-only
+        # reading dropping.
+        bodies = _owned_bodies(ref_extra, entry.get("blocks") or [], own_body)
         # The string-form top-level `toolUseResult` is a legitimate target
-        # only when it IS the excluded body's copy (B04's ownership proof).
-        if _owned_body_copy(ref_extra.get("toolUseResult"), body):
+        # only when it IS one of those bodies' copy.
+        if any(_owned_body_copy(ref_extra.get("toolUseResult"), body) for body in bodies):
             allowed.add("toolUseResult")
         # N-R7arr (任务书 #131 T6-c): the ARRAY form
         # (`[{"type":"text","text":...}]`, what the MCP tool results such as
@@ -3398,7 +3525,18 @@ def _allowed_extra_paths(entry, ref_row, ref_extra):
         items = ref_extra.get("toolUseResult")
         if isinstance(items, list):
             for index, item in enumerate(items):
-                if isinstance(item, dict) and _owned_body_copy(item.get("text"), body):
+                if isinstance(item, dict) and any(
+                    _owned_body_copy(item.get("text"), body) for body in bodies
+                ):
+                    allowed.add(f"toolUseResult[{index}].text")
+            # R9-B03: the array is ONE projected value for the whole result.
+            # When its elements are FRAGMENTS (`[text A, text B]` for a body
+            # `"secret A\nsecret B"`) no single element is that body, yet the
+            # connector's own join reconstructs it exactly -- so the whole
+            # array is the body's copy and every element is a target.
+            joined = _flatten_content(items)
+            if joined and any(joined == body for body in bodies):
+                for index in range(len(items)):
                     allowed.add(f"toolUseResult[{index}].text")
     return allowed
 

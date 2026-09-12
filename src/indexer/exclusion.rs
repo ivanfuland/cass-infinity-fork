@@ -1296,6 +1296,24 @@ fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, owned_bodi
 /// positions, so the proof (not the position) is what entitles a clear.
 fn strip_claude_array_tool_use_result(value: &mut serde_json::Value, owned_bodies: &[String], placeholder: &serde_json::Value) {
     let Some(items) = value.get_mut("toolUseResult").and_then(serde_json::Value::as_array_mut) else { return };
+    // R9-B03 (任务书 #132): the array is ONE projected value for the whole
+    // result. When its elements are FRAGMENTS of a body (`[{text:"secret A"},
+    // {text:"secret B"}]` for a body `"secret A\nsecret B"`) no single element
+    // is that body, so the per-element proof below cannot fire and every
+    // fragment survived -- the excluded body went back into `extra_bin` one
+    // part at a time. The connector's own join (`extract_content_part` +
+    // `flatten_content`, `\n` between the parts it renders) reconstructs the
+    // body exactly, so the whole array IS that body's copy and every element's
+    // `text` is replaced.
+    let joined = project_parts(items);
+    if !joined.is_empty() && owned_bodies.iter().any(|body| joined == *body) {
+        for item in items.iter_mut() {
+            if let Some(slot) = item.get_mut("text") {
+                *slot = placeholder.clone();
+            }
+        }
+        return;
+    }
     for item in items.iter_mut() {
         let owned = item
             .get("text")
@@ -1322,6 +1340,55 @@ fn is_owned_body_copy(recorded: &str, body: &str) -> bool {
     !body.is_empty()
         && recorded.len() <= body.len() + TOOL_USE_RESULT_WRAPPER_SLACK
         && recorded.contains(body)
+}
+
+/// One element of a content array, rendered exactly as the connector renders
+/// it (pin `bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8`,
+/// `connectors/utils.rs::extract_content_part`): a bare string is itself, a
+/// `text`/`input_text`/`output_text` block (or one with no `type` at all) is
+/// its `text`, a `tool_use` block is its `[Tool: name - desc]` display form,
+/// and anything else is not rendered and therefore contributes nothing.
+fn content_part_text(item: &serde_json::Value) -> Option<String> {
+    if let Some(text) = item.as_str() {
+        return Some(text.to_string());
+    }
+    let item_type = item.get("type").and_then(|v| v.as_str());
+    if let Some(text) = item.get("text").and_then(|v| v.as_str())
+        && (item_type.is_none() || matches!(item_type, Some("text" | "input_text" | "output_text")))
+    {
+        return Some(text.to_string());
+    }
+    if item_type == Some("tool_use") {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let desc = item
+            .pointer("/input/description")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.pointer("/input/file_path").and_then(|v| v.as_str()))
+            .unwrap_or("");
+        return Some(if desc.is_empty() { format!("[Tool: {name}]") } else { format!("[Tool: {name} - {desc}]") });
+    }
+    None
+}
+
+/// `connectors/utils.rs::flatten_content`'s array arm: the rendered parts,
+/// empty ones dropped, joined with a single `\n`.
+fn project_parts(items: &[serde_json::Value]) -> String {
+    items
+        .iter()
+        .filter_map(content_part_text)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `connectors/utils.rs::flatten_content`: a bare string passes through, an
+/// array is [`project_parts`], anything else renders as nothing.
+fn project_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => project_parts(items),
+        _ => String::new(),
+    }
 }
 
 /// The bodies this call may treat as its own: the caller row's own pre-clear
@@ -1352,8 +1419,23 @@ fn owned_bodies(value: &serde_json::Value, target_blocks: &[u32], own_body: Opti
                 serde_json::Value::String(text) => bodies.push(text.clone()),
                 serde_json::Value::Object(_) => {
                     for key in ["content", "text"] {
-                        if let Some(text) = block.get(key).and_then(serde_json::Value::as_str) {
-                            bodies.push(text.to_string());
+                        match block.get(key) {
+                            Some(serde_json::Value::String(text)) => bodies.push(text.clone()),
+                            // R9-B03 (任务书 #132): a target block whose body
+                            // is carried as an ARRAY (`tool_result.content` =
+                            // `[{"type":"text","text":...}]`) contributed no
+                            // ownership evidence at all -- `as_str()` returned
+                            // `None` and the body was silently dropped. The
+                            // connector projects that array with the same
+                            // `flatten_content` it applies to any content
+                            // array, so the projection IS this block's body.
+                            Some(value) => {
+                                let projected = project_content(value);
+                                if !projected.is_empty() {
+                                    bodies.push(projected);
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -2894,6 +2976,125 @@ mod tests {
             m.extra["toolUseResult"][0]["text"],
             serde_json::json!("some other tool's body"),
             "an array element belonging to an un-targeted body must survive, got {:?}",
+            m.extra["toolUseResult"]
+        );
+    }
+
+    /// R9-B03 (任务书 #132), scenario one. `owned_bodies` read a target
+    /// block's `content`/`text` with `as_str()` only, so a `tool_result` whose
+    /// `content` is the connector's ARRAY form contributed no ownership
+    /// evidence whatsoever. On the `apply_sibling` path -- which by design
+    /// passes `own_body = None`, because a sibling's content is never cleared
+    /// -- that left the ownership proof with nothing at all to work from, so
+    /// the top-level string copy of the excluded body survived while the row
+    /// reported a successful exclusion.
+    #[test]
+    fn apply_sibling_clears_string_tool_use_result_owned_by_an_array_content_block_positive() {
+        let mut m = msg("user", "ordinary sibling prose");
+        m.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "text", "text": "ordinary sibling"},
+                {"type": "tool_result", "tool_use_id": "a",
+                 "content": [{"type": "text", "text": "secret A"}]}
+            ]},
+            "toolUseResult": "secret A"
+        });
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CassRecall,
+            rule_version: 1,
+            bytes: 8,
+            sha256: sha256_hex("secret A"),
+            fingerprint_blake3: blake3_hex("secret A"),
+            anchor: ExclusionAnchor { tool_call_id: Some("a".into()), tool_name: Some("Read".into()), paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 1, event_key: "ek1".into(), blocks: vec![1] },
+        };
+        apply_sibling(&mut m, &marker, field_map_for("claude_code"));
+
+        assert_eq!(
+            m.extra["toolUseResult"]["redacted"],
+            serde_json::json!(true),
+            "the sibling's copy of the excluded body's top-level string must be cleared once the target block's own array body proves ownership, got {:?}",
+            m.extra["toolUseResult"]
+        );
+        assert!(
+            !m.extra.to_string().contains("secret A"),
+            "no raw copy of the excluded body may remain anywhere in the sibling's extra: {:?}",
+            m.extra
+        );
+    }
+
+    /// R9-B03 (任务书 #132), scenario two: the body is fragmented across the
+    /// array elements and only the JOIN reconstructs it. Both the direct and
+    /// the sibling path were affected -- one element is never the whole body,
+    /// and the pre-fix `owned_bodies` could not even see the array carrying
+    /// it.
+    #[test]
+    fn apply_clears_array_tool_use_result_whose_join_is_the_owned_body_positive() {
+        let mut m = msg("tool_result", "secret A\nsecret B");
+        m.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": [
+                    {"type": "text", "text": "secret A"},
+                    {"type": "text", "text": "secret B"}
+                ]}
+            ]},
+            "toolUseResult": [
+                {"type": "text", "text": "secret A"},
+                {"type": "text", "text": "secret B"}
+            ]
+        });
+        apply(&mut m, &decision_cass_recall(vec![0]), &mut MemoizingRedactor::new(), "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+
+        for index in 0..2 {
+            assert_eq!(
+                m.extra["toolUseResult"][index]["text"]["redacted"],
+                serde_json::json!(true),
+                "element {index}'s fragment is part of the owned body's copy and must be cleared, got {:?}",
+                m.extra["toolUseResult"]
+            );
+        }
+        assert!(
+            !m.extra.to_string().contains("secret A") && !m.extra.to_string().contains("secret B"),
+            "no fragment of the excluded body may remain anywhere in extra: {:?}",
+            m.extra
+        );
+    }
+
+    /// R9-B03's boundary: the join rule must not become "clear any array the
+    /// body happens to be a substring of". The joined fragments of a DIFFERENT
+    /// body are not this call's copy and survive untouched.
+    #[test]
+    fn apply_keeps_an_array_tool_use_result_whose_join_is_a_foreign_body_negative() {
+        let mut m = msg("tool_result", "secret A\nsecret B");
+        m.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": [
+                    {"type": "text", "text": "secret A"},
+                    {"type": "text", "text": "secret B"}
+                ]}
+            ]},
+            "toolUseResult": [
+                {"type": "text", "text": "some other"},
+                {"type": "text", "text": "tool's body"}
+            ]
+        });
+        apply(&mut m, &decision_cass_recall(vec![0]), &mut MemoizingRedactor::new(), "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+
+        assert_eq!(
+            m.extra["toolUseResult"][0]["text"],
+            serde_json::json!("some other"),
+            "fragments of a DIFFERENT body must survive, got {:?}",
+            m.extra["toolUseResult"]
+        );
+        assert_eq!(
+            m.extra["toolUseResult"][1]["text"],
+            serde_json::json!("tool's body"),
+            "fragments of a DIFFERENT body must survive, got {:?}",
             m.extra["toolUseResult"]
         );
     }
