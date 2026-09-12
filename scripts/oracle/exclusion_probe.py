@@ -1538,7 +1538,8 @@ def _verify_schema(with_excluded):
 
 def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           non_manifest_altered=False, overclear_ordinary=False,
-                          leak_multiline_body=False, short_body=False):
+                          leak_multiline_body=False, short_body=False,
+                          missing_nonmanifest_row=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1587,11 +1588,15 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
             "VALUES (1, 1, 'local', 'verify-ext-1', 'verify fixture session', '/src/verify-ext-1.jsonl')"
         )
         boundary_content = "altered boundary" if (non_manifest_altered and with_excluded) else "turn boundary"
-        conn.execute(
-            "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
-            "VALUES (1, 1, 0, 'user', ?, ?)",
-            [boundary_content, msgpack.packb(boundary, use_bin_type=True)],
-        )
+        if not (missing_nonmanifest_row and with_excluded):
+            # B09: the candidate simply does not have this ordinary row, while
+            # the reference library does. Only a two-way comparison of the
+            # stable keys can see it.
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 1, 0, 'user', ?, ?)",
+                [boundary_content, msgpack.packb(boundary, use_bin_type=True)],
+            )
         candidate_extra = _verify_extra(redacted if with_excluded else body_text)
         if with_excluded and non_target_cleared:
             # A change that is NOT a redacted placeholder (an extra block the
@@ -1697,6 +1702,9 @@ def verify_selftest_cases():
         # could not see it.
         ("V8 a multi-line body leaking in an extra is a failure", False, "still carries the body"),
         ("V8b a SHORT body leaking in an extra is a failure", False, "still carries the body"),
+        # B09 (任务书 #131): a non-manifest row the candidate lost entirely --
+        # the pre-fix loop only ever looked at rows the candidate still has.
+        ("V9 a missing non-manifest row is a failure", False, "non-manifest row is missing"),
     ]
 
 
@@ -1720,6 +1728,7 @@ def _run_verify_selftest(paths_cfg):
             4: {"overclear_ordinary": True},
             5: {"leak_multiline_body": True},
             6: {"short_body": True},
+            7: {"missing_nonmanifest_row": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -1740,6 +1749,22 @@ def _run_verify_selftest(paths_cfg):
         except _NotV6:
             passed += 1
             print("ok   V5 a non-v6 candidate is refused")
+
+    # B09 (任务书 #131): the report's own count must come from the REFERENCE
+    # side's rows -- walking the candidate alone reported
+    # `non_manifest_rows_checked=0` for a candidate that had dropped one.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root, missing_nonmanifest_row=True)
+        _failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        if report["non_manifest_rows_checked"] == 1:
+            passed += 1
+            print("ok   V9b non_manifest_rows_checked counts the reference side")
+        else:
+            print(
+                "FAIL V9b non_manifest_rows_checked counts the reference side: "
+                f"got {report['non_manifest_rows_checked']!r}, want 1"
+            )
 
     # B01 (任务书 #131): an output that names an input must be refused BEFORE
     # anything is written. Pre-fix, `run_verify` verified the candidate and
@@ -2716,6 +2741,19 @@ def _session_key(entry):
     )
 
 
+def _stable_row_key(row):
+    """B09 (任务书 #131): the key the candidate and the reference library must
+    agree on for an ordinary row -- agent, session identity, position.
+    `source_id` is deliberately NOT part of it: it is derived from
+    provenance/origin host, which may legitimately differ between the two
+    libraries without anything being wrong."""
+    return (
+        _field(row, "agent_slug"),
+        _field(row, "external_id") or _field(row, "source_path"),
+        _field(row, "idx"),
+    )
+
+
 def _decode_extra(blob):
     if blob is None:
         return None
@@ -2995,26 +3033,38 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                     (label, f"context_file_read hit outside predicate P: {outside[:5]}")
                 )
 
-    # Non-manifest rows must be untouched, byte for byte.
+    # Non-manifest rows must be untouched, byte for byte -- on BOTH sides.
+    # B09 (任务书 #131): walking only the candidate's rows (as this did) cannot
+    # see a row the candidate no longer has at all: the reference library still
+    # holds it, the candidate dropped it, and "非清单零误清" passed with
+    # `non_manifest_rows_checked=0`. The comparison is now two-way over the
+    # stable key both libraries must agree on.
     manifest_keys = {_session_key(entry) for entry in manifest}
-    checked = 0
-    for row in conn_cand.execute(sql_cand):
-        if _session_key(row) in manifest_keys:
-            continue
-        checked += 1
-        ref_row = _fetch_row(conn_ref, sql_ref, row, row["idx"])
-        if ref_row is None:
-            failures.append(
-                (f"{row['agent_slug']}/idx={row['idx']}", "row is absent from the reference library")
-            )
+    cand_rows = {
+        _stable_row_key(row): row
+        for row in conn_cand.execute(sql_cand)
+        if _session_key(row) not in manifest_keys
+    }
+    ref_rows = {
+        _stable_row_key(row): row
+        for row in conn_ref.execute(sql_ref)
+        if _session_key(row) not in manifest_keys
+    }
+    checked = len(ref_rows)
+    for key, ref_row in ref_rows.items():
+        label = f"{key[0]}/idx={key[2]}"
+        row = cand_rows.get(key)
+        if row is None:
+            failures.append((label, "non-manifest row is missing from the candidate"))
             continue
         if row["content"] != ref_row["content"]:
-            failures.append(
-                (f"{row['agent_slug']}/idx={row['idx']}", "non-manifest body differs from reference")
-            )
+            failures.append((label, "non-manifest body differs from reference"))
         if row["extra_bin"] != ref_row["extra_bin"]:
+            failures.append((label, "non-manifest extra_bin differs from reference"))
+    for key, _row in cand_rows.items():
+        if key not in ref_rows:
             failures.append(
-                (f"{row['agent_slug']}/idx={row['idx']}", "non-manifest extra_bin differs from reference")
+                (f"{key[0]}/idx={key[2]}", "non-manifest row is not in the reference library")
             )
 
     # Sampled rebuilds.
