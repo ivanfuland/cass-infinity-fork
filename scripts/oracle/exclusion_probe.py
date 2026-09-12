@@ -52,8 +52,21 @@ import argparse
 import glob
 import hashlib
 import json
-import msgpack
+try:
+    import msgpack
+except ImportError as _msgpack_error:  # pragma: no cover - interpreter setup
+    # `extra_bin` is msgpack on every path of this script, and `--verify` also
+    # needs SQLite >= 3.45 for JSONB. On the deployment host no single
+    # interpreter has both (python3.10 has msgpack, SQLite 3.37; python3.12 has
+    # SQLite 3.50, no msgpack), so spell out the combination that works
+    # instead of dying on a bare ImportError.
+    raise SystemExit(
+        "exclusion_probe.py needs the `msgpack` module: "
+        "PYTHONPATH=/usr/lib/python3/dist-packages python3.12 "
+        "scripts/oracle/exclusion_probe.py ..."
+    ) from _msgpack_error
 import os
+import random
 import re
 import shlex
 import sqlite3
@@ -1407,11 +1420,222 @@ def _run_report_selftest(paths_cfg):
     return passed, len(cases)
 
 
+# ---------------------------------------------------------------------------
+# verify family (PR6 T5): drives the PRODUCTION `_verify_once` against a
+# synthetic v6/reference pair so the assertions are exercised without the
+# 30 GB frozen library. Bodies are invented strings -- no real content, no
+# real host paths.
+# ---------------------------------------------------------------------------
+_VERIFY_BODY = "PR6 T5 verify fixture body " + "abcdefghij" * 8
+_VERIFY_SIBLING = "PR6 T5 verify fixture sibling block " + "klmnopqrst" * 8
+
+
+def _verify_extra(block_value):
+    return {
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _VERIFY_SIBLING},
+                {"type": "tool_result", "tool_use_id": "t1", "content": block_value},
+            ],
+        }
+    }
+
+
+def _verify_schema(with_excluded):
+    excluded = ", excluded BLOB" if with_excluded else ""
+    return (
+        "CREATE TABLE agents(id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE, "
+        "name TEXT, version TEXT, kind TEXT);"
+        "CREATE TABLE conversations(id INTEGER PRIMARY KEY, agent_id INTEGER, "
+        "source_id TEXT, external_id TEXT, title TEXT, source_path TEXT);"
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER, "
+        f"idx INTEGER, role TEXT, content TEXT NOT NULL, extra_bin BLOB{excluded});"
+    )
+
+
+def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
+                          non_manifest_altered=False):
+    candidate = os.path.join(root, "candidate.db")
+    reference = os.path.join(root, "reference.db")
+    manifest_path = os.path.join(root, "manifest.json")
+    mirror = os.path.join(root, "mirror")
+    blob_rel = "blobs/blake3/aa/verify-fixture.raw"
+    blob_path = os.path.join(mirror, blob_rel)
+    os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+
+    body_sha = hashlib.sha256(redact_text(_VERIFY_BODY).encode("utf-8")).hexdigest()
+    redacted = {"redacted": True, "sha256": body_sha, "bytes": len(_VERIFY_BODY.encode("utf-8"))}
+
+    call_event = {
+        "type": "assistant",
+        "uuid": "u1",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Read", "id": "t1",
+             "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}},
+        ]},
+    }
+    result_event = {
+        "type": "user",
+        "uuid": "u2",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": _VERIFY_BODY},
+        ]},
+    }
+    with open(blob_path, "w", encoding="utf-8") as handle:
+        for event in (call_event, result_event):
+            handle.write(json.dumps(event) + "\n")
+
+    boundary = {"message": {"role": "user", "content": [{"type": "text", "text": "turn boundary"}]}}
+    sibling_extra = {"message": {"content": [{"type": "text", "text": _VERIFY_BODY}]}}
+    for path, with_excluded in ((reference, False), (candidate, True)):
+        conn = sqlite3.connect(path)
+        conn.executescript(_verify_schema(with_excluded))
+        if with_excluded:
+            conn.executescript(
+                "CREATE TABLE snippets(id INTEGER PRIMARY KEY, message_id INTEGER, snippet_text TEXT);"
+                "CREATE TABLE lex_docs(doc_id INTEGER PRIMARY KEY, content TEXT);"
+                "CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY, message_id INTEGER);"
+            )
+        conn.execute("INSERT INTO agents(id, slug, name, kind) VALUES (1, 'claude_code', 'Claude', 'cli')")
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+            "VALUES (1, 1, 'local', 'verify-ext-1', 'verify fixture session', '/src/verify-ext-1.jsonl')"
+        )
+        boundary_content = "altered boundary" if (non_manifest_altered and with_excluded) else "turn boundary"
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+            "VALUES (1, 1, 0, 'user', ?, ?)",
+            [boundary_content, msgpack.packb(boundary, use_bin_type=True)],
+        )
+        candidate_extra = _verify_extra(redacted if with_excluded else _VERIFY_BODY)
+        if with_excluded and non_target_cleared:
+            candidate_extra["message"]["content"][0]["text"] = ""
+        conn.execute(
+            "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+            "VALUES (1, 1, 'tool_result', ?, ?)",
+            ["" if with_excluded else _VERIFY_BODY, msgpack.packb(candidate_extra, use_bin_type=True)],
+        )
+        if sibling_leak:
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 2, 'user', ?, ?)",
+                ["sibling turn", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if with_excluded:
+            marker = {
+                "reason": "cass_recall",
+                "rule_version": 1,
+                "bytes": len(_VERIFY_BODY.encode("utf-8")),
+                "sha256": body_sha,
+                "fingerprint_blake3": "0" * 64,
+                "parse_error": None,
+                "anchor": {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None},
+                "src": None,
+                "raw": {"blob": blob_rel, "idx": 1, "event_key": "u2", "blocks": [0]},
+            }
+            conn.execute(
+                "UPDATE messages SET excluded = jsonb(?) WHERE conversation_id = 1 AND idx = 1",
+                [json.dumps(marker)],
+            )
+        conn.commit()
+        conn.close()
+
+    manifest = [{
+        "reason": "cass_recall",
+        "source_id": "local",
+        "agent_slug": "claude_code",
+        "external_id": "verify-ext-1",
+        "source_path": "/src/verify-ext-1.jsonl",
+        "idx": 1,
+        "sha256": body_sha,
+        "evidence": "mirror",
+        "event_key": "u2",
+        "blocks": [0],
+    }]
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    return candidate, reference, manifest_path, mirror
+
+
+def _verify_case(root, paths_cfg, expect_ok, want_substring, **flags):
+    candidate, reference, manifest_path, mirror = _write_verify_fixture(root, **flags)
+    report_path = os.path.join(root, "report.json")
+    try:
+        failures, report = _verify_once(
+            candidate, manifest_path, reference, mirror, 50, 6, paths_cfg
+        )
+    except _NotV6 as not_v6:
+        return False, f"unexpected _NotV6 for {not_v6}"
+    details = "; ".join(f"{label}: {detail}" for label, detail in failures)
+    if expect_ok:
+        if failures:
+            return False, f"expected a clean pass, got {details}"
+        if report["rebuild_ok"] != report["rebuild_sample"] or report["rebuild_sample"] != 1:
+            return False, f"rebuild proof did not run: {report}"
+        return True, ""
+    if not failures:
+        return False, "expected a FAIL, got none"
+    if want_substring not in details:
+        return False, f"expected {want_substring!r} in {details!r}"
+    return True, ""
+
+
+def verify_selftest_cases():
+    return [
+        ("V1 clean candidate verifies", True, ""),
+        ("V2 sibling row still carries the body", False, "still carries the body"),
+        ("V3 a non-target block was cleared", False, "changed somewhere other than a redacted block"),
+        ("V4 a non-manifest row was altered", False, "non-manifest body differs from reference"),
+    ]
+
+
+def _run_verify_selftest(paths_cfg):
+    passed = 0
+    total = 0
+    if not _verify_jsonb_available():
+        print(
+            f"FAIL verify family needs SQLite >= "
+            f"{'.'.join(map(str, VERIFY_JSONB_MIN))} (JSONB); this interpreter has "
+            f"{sqlite3.sqlite_version}. Run `python3.12 scripts/oracle/exclusion_probe.py "
+            f"--selftest`."
+        )
+        return 0, len(verify_selftest_cases()) + 1
+    for index, (name, expect_ok, want_substring) in enumerate(verify_selftest_cases()):
+        total += 1
+        flags = {
+            1: {"sibling_leak": True},
+            2: {"non_target_cleared": True},
+            3: {"non_manifest_altered": True},
+        }.get(index, {})
+        with tempfile.TemporaryDirectory() as root:
+            ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
+        if ok:
+            passed += 1
+            print(f"ok   {name}")
+        else:
+            print(f"FAIL {name}: {why}")
+
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root)
+        # A pre-v6 candidate (no `excluded` column) must be a loud precondition
+        # error, never a pass with nothing to check.
+        try:
+            _verify_once(reference, manifest_path, reference, mirror, 50, 6, paths_cfg)
+            print("FAIL verify rejects a non-v6 candidate: no error raised")
+        except _NotV6:
+            passed += 1
+            print("ok   V5 a non-v6 candidate is refused")
+    print(f"selftest/verify: {passed}/{total}")
+    return passed, total
+
+
 def run_selftest(paths_cfg) -> bool:
     passed = total = 0
     for runner in (_run_decide_selftest, _run_content_selftest,
                    _run_pairing_selftest, _run_perf_selftest,
-                   _run_report_selftest):
+                   _run_report_selftest, _run_verify_selftest):
         p, t = runner(paths_cfg)
         passed += p
         total += t
@@ -2204,6 +2428,383 @@ def write_report(report_path, stats, manifest, session_count):
         f.writelines(lines)
 
 
+# ---------------------------------------------------------------------------
+# PR6 T5 (任务书 #126): `--verify` -- the T6 Step 3b consumer.
+#
+# Checks a reingest candidate against the frozen exclusion manifest and the
+# PR4 reference library. Four shapes of assertion:
+#   1. every manifest row: `content` cleared, `excluded` present with the
+#      manifest's reason, its `extra_bin` differing from the reference's ONLY
+#      by `{"redacted": true, "sha256": <marker sha>, "bytes": n}` at the
+#      cleared positions, no row of its session still carrying the original
+#      body, `snippets` empty, the session title free of the body, and no
+#      `lex_docs`/`message_chunks` row for it;
+#   2. every non-manifest row: same `(session key, idx)` sha and the same
+#      `extra_bin` bytes as the reference library;
+#   3. sampled manifest rows: the marker's sha reproduces by reparsing the
+#      recorded raw-mirror blob, re-projecting the recorded blocks and
+#      applying the ingest-side redactor;
+#   4. the manifest itself contains no `context_file_read` hit outside the
+#      path predicate (`predicate_p`) -- i.e. zero deep same-name misfires.
+#
+# `messages.excluded` is SQLite JSONB (schema v6 writes `jsonb(?)`), which
+# needs SQLite >= 3.45 to read. This repo's `python3` is 3.10 with SQLite
+# 3.37 on the deployment host, where `json(blob)` cannot decode JSONB at all,
+# so `--verify` refuses to run rather than reading a blob as text: run it with
+# an interpreter built against a newer SQLite (`python3.12` on that host).
+# ---------------------------------------------------------------------------
+VERIFY_JSONB_MIN = (3, 45, 0)
+VERIFY_MAX_LISTED_FAILURES = 20
+
+
+def _verify_jsonb_available() -> bool:
+    return sqlite3.sqlite_version_info >= VERIFY_JSONB_MIN
+
+
+def _open_verify_db(path, label):
+    """Read-only handle plus whether `messages` carries the v6 `excluded`
+    column. The reference library is the PR4 reingest product and predates
+    schema v6, so the column has to be probed, not assumed."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if not columns:
+        raise RuntimeError(f"{label} {path} has no `messages` table")
+    return conn, "excluded" in columns
+
+
+def _row_columns(has_excluded):
+    excluded = "json(m.excluded) AS excluded_json" if has_excluded else "NULL AS excluded_json"
+    return (
+        "SELECT m.id AS id, m.idx AS idx, m.content AS content, "
+        f"{excluded}, m.extra_bin AS extra_bin, "
+        "c.id AS conversation_id, c.title AS title, c.source_path AS source_path, "
+        "c.source_id AS source_id, a.slug AS agent_slug, c.external_id AS external_id "
+        "FROM messages m JOIN conversations c ON c.id = m.conversation_id "
+        "JOIN agents a ON a.id = c.agent_id"
+    )
+
+
+def _field(entry, name):
+    """`entry[name]` for both a manifest dict and a `sqlite3.Row`, returning
+    `None` when the key is not there."""
+    try:
+        return entry[name]
+    except (KeyError, IndexError):
+        return None
+
+
+def _session_predicate(entry):
+    """The manifest's stable session key: `external_id` when it has one, else
+    `source_path` -- the same rule `w4_corpus_diff` uses."""
+    if _field(entry, "external_id"):
+        return (
+            "c.source_id = ? AND a.slug = ? AND c.external_id = ?",
+            [_field(entry, "source_id"), _field(entry, "agent_slug"), _field(entry, "external_id")],
+        )
+    return (
+        "c.source_id = ? AND a.slug = ? AND c.source_path = ?",
+        [_field(entry, "source_id"), _field(entry, "agent_slug"), _field(entry, "source_path")],
+    )
+
+
+def _fetch_row(conn, sql, entry, idx):
+    predicate, params = _session_predicate(entry)
+    return conn.execute(f"{sql} WHERE {predicate} AND m.idx = ?", params + [idx]).fetchone()
+
+
+def _session_key(entry):
+    return (
+        _field(entry, "source_id"),
+        _field(entry, "agent_slug"),
+        _field(entry, "external_id") or _field(entry, "source_path"),
+        _field(entry, "idx"),
+    )
+
+
+def _decode_extra(blob):
+    if blob is None:
+        return None
+    return msgpack.unpackb(blob, raw=False)
+
+
+def _diff_paths(candidate, reference, path=""):
+    """Positions where `candidate` differs from `reference`, as
+    `(path, candidate_value, reference_value)` triples."""
+    if isinstance(reference, dict) and isinstance(candidate, dict):
+        out = []
+        for key in sorted(set(reference) | set(candidate)):
+            here = f"{path}.{key}"
+            if key not in candidate or key not in reference:
+                out.append((here, candidate.get(key), reference.get(key)))
+            else:
+                out.extend(_diff_paths(candidate[key], reference[key], here))
+        return out
+    if isinstance(reference, list) and isinstance(candidate, list):
+        out = []
+        for i in range(max(len(reference), len(candidate))):
+            here = f"{path}[{i}]"
+            if i >= len(candidate) or i >= len(reference):
+                out.append((here, None, None))
+            else:
+                out.extend(_diff_paths(candidate[i], reference[i], here))
+        return out
+    if candidate != reference:
+        return [(path, candidate, reference)]
+    return []
+
+
+def _is_redacted_placeholder(value, sha):
+    return (
+        isinstance(value, dict)
+        and value.get("redacted") is True
+        and value.get("sha256") == sha
+        and isinstance(value.get("bytes"), int)
+    )
+
+
+def _session_rows(conn, sql, entry):
+    predicate, params = _session_predicate(entry)
+    return conn.execute(f"{sql} WHERE {predicate}", params).fetchall()
+
+
+def _verify_rebuild_blob(entry, marker, mirror_root):
+    """Reparse the recorded blob, re-project the recorded blocks and re-apply
+    the ingest-side redactor; returns the rebuilt body's sha256 or an error
+    string."""
+    raw = marker.get("raw") or {}
+    blob_rel = raw.get("blob")
+    blocks = raw.get("blocks") or []
+    event_key = raw.get("event_key")
+    if not blob_rel:
+        return None, "marker has no raw.blob"
+    blob_path = os.path.join(mirror_root, blob_rel)
+    if not os.path.exists(blob_path):
+        return None, f"raw-mirror blob is gone: {blob_path}"
+    events = load_blob_events(blob_path)
+    builders = {
+        "claude_code": build_candidates_claude_code,
+        "codex": build_candidates_codex,
+    }
+    builder = builders.get(entry["agent_slug"])
+    if builder is None:
+        return None, f"no reparse builder for agent_slug {entry['agent_slug']!r}"
+    picked = [
+        cand
+        for cand in builder(events)
+        if (event_key is None or cand.event_key == event_key) and cand.block_index in blocks
+    ]
+    if len(picked) != 1:
+        return None, (
+            f"reparse found {len(picked)} block(s) for event_key={event_key!r} "
+            f"blocks={blocks!r}, want exactly 1"
+        )
+    return hashlib.sha256(redact_text(picked[0].text).encode("utf-8")).hexdigest(), None
+
+
+def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuild,
+                 seed, paths_cfg):
+    """The whole check, returning `(failures, report)`. Split out of
+    `run_verify` so `--selftest` drives the same code and asserts on the
+    failures themselves, not on an exit code."""
+    conn_cand, cand_has_excluded = _open_verify_db(candidate, "--candidate")
+    if not cand_has_excluded:
+        raise _NotV6(candidate)
+    conn_ref, ref_has_excluded = _open_verify_db(reference, "--reference")
+    sql_cand = _row_columns(cand_has_excluded)
+    sql_ref = _row_columns(ref_has_excluded)
+
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
+    failures = []
+    for entry in manifest:
+        label = f"{entry['agent_slug']}/{entry['reason']}/idx={entry['idx']}"
+        row = _fetch_row(conn_cand, sql_cand, entry, entry["idx"])
+        if row is None:
+            failures.append((label, "manifest row is absent from the candidate"))
+            continue
+        if row["content"] != "":
+            failures.append((label, "excluded row still carries a body"))
+            continue
+        marker = json.loads(row["excluded_json"]) if row["excluded_json"] else None
+        if marker is None:
+            failures.append((label, "manifest row has no `excluded` marker"))
+            continue
+        if marker.get("reason") != entry["reason"]:
+            failures.append(
+                (label, f"marker reason {marker.get('reason')!r} != manifest {entry['reason']!r}")
+            )
+        sha = marker.get("sha256")
+        ref_row = _fetch_row(conn_ref, sql_ref, entry, entry["idx"])
+        if ref_row is None:
+            failures.append((label, "manifest row is absent from the reference library"))
+            continue
+
+        cand_extra = _decode_extra(row["extra_bin"])
+        ref_extra = _decode_extra(ref_row["extra_bin"])
+        if (cand_extra is None) != (ref_extra is None):
+            failures.append((label, "extra_bin presence differs from the reference"))
+        elif cand_extra is not None:
+            diffs = _diff_paths(cand_extra, ref_extra)
+            cleared = [d for d in diffs if _is_redacted_placeholder(d[1], sha)]
+            if not diffs:
+                failures.append((label, "the excluded block is still present in extra_bin"))
+            elif len(cleared) != len(diffs):
+                stray = [d[0] for d in diffs if d not in cleared]
+                failures.append(
+                    (label, f"extra_bin changed somewhere other than a redacted block: {stray[:5]}")
+                )
+
+        body = ref_row["content"]
+        if body and len(body) >= 32:
+            for sib in _session_rows(conn_cand, sql_cand, entry):
+                if body in (sib["content"] or ""):
+                    failures.append((label, f"session row idx={sib['idx']} still carries the body"))
+                    break
+                sib_extra = _decode_extra(sib["extra_bin"])
+                if sib_extra is not None and body in json.dumps(sib_extra, ensure_ascii=False):
+                    failures.append(
+                        (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
+                    )
+                    break
+        if body and body in (row["title"] or ""):
+            failures.append((label, "the session title still contains the body"))
+
+        for snippet in conn_cand.execute(
+            "SELECT snippet_text FROM snippets WHERE message_id = ?", [row["id"]]
+        ):
+            if (snippet["snippet_text"] or "") != "":
+                failures.append((label, "a snippet_text survived the exclusion"))
+                break
+        lex_hits = conn_cand.execute(
+            "SELECT COUNT(*) FROM lex_docs WHERE doc_id = ?", [row["id"]]
+        ).fetchone()[0]
+        if lex_hits:
+            failures.append((label, f"{lex_hits} lex_docs row(s) for an excluded message"))
+        chunk_hits = conn_cand.execute(
+            "SELECT COUNT(*) FROM message_chunks WHERE message_id = ?", [row["id"]]
+        ).fetchone()[0]
+        if chunk_hits:
+            failures.append((label, f"{chunk_hits} message_chunks row(s) for an excluded message"))
+
+        # The predicate-P misfire check (spec §七 风险行): a context_file_read
+        # hit whose recorded paths are not all inside the configured predicate
+        # is a false positive by construction.
+        if entry["reason"] == "context_file_read":
+            paths = (marker.get("anchor") or {}).get("paths") or []
+            outside = [p for p in paths if not predicate_p(p, paths_cfg)]
+            if outside:
+                failures.append(
+                    (label, f"context_file_read hit outside predicate P: {outside[:5]}")
+                )
+
+    # Non-manifest rows must be untouched, byte for byte.
+    manifest_keys = {_session_key(entry) for entry in manifest}
+    checked = 0
+    for row in conn_cand.execute(sql_cand):
+        if _session_key(row) in manifest_keys:
+            continue
+        checked += 1
+        ref_row = _fetch_row(conn_ref, sql_ref, row, row["idx"])
+        if ref_row is None:
+            failures.append(
+                (f"{row['agent_slug']}/idx={row['idx']}", "row is absent from the reference library")
+            )
+            continue
+        if row["content"] != ref_row["content"]:
+            failures.append(
+                (f"{row['agent_slug']}/idx={row['idx']}", "non-manifest body differs from reference")
+            )
+        if row["extra_bin"] != ref_row["extra_bin"]:
+            failures.append(
+                (f"{row['agent_slug']}/idx={row['idx']}", "non-manifest extra_bin differs from reference")
+            )
+
+    # Sampled rebuilds.
+    rng = random.Random(seed)
+    sample = rng.sample(manifest, min(sample_rebuild, len(manifest)))
+    rebuilt = 0
+    for entry in sample:
+        row = _fetch_row(conn_cand, sql_cand, entry, entry["idx"])
+        if row is None or not row["excluded_json"]:
+            continue
+        marker = json.loads(row["excluded_json"])
+        sha, error = _verify_rebuild_blob(entry, marker, mirror_root)
+        if error is not None:
+            failures.append((f"rebuild/{entry['agent_slug']}/idx={entry['idx']}", error))
+        elif sha != marker.get("sha256"):
+            failures.append(
+                (
+                    f"rebuild/{entry['agent_slug']}/idx={entry['idx']}",
+                    f"rebuilt sha256 {sha} != marker {marker.get('sha256')}",
+                )
+            )
+        else:
+            rebuilt += 1
+
+    report = {
+        "candidate": candidate,
+        "reference": reference,
+        "manifest": manifest_path,
+        "manifest_entries": len(manifest),
+        "non_manifest_rows_checked": checked,
+        "rebuild_sample": len(sample),
+        "rebuild_ok": rebuilt,
+        "failures": len(failures),
+    }
+    return failures, report
+
+
+class _NotV6(Exception):
+    """The candidate library predates schema v6, i.e. it has no `excluded`
+    column at all -- a precondition failure, never a silent pass."""
+
+
+def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
+               seed, report_path, paths_cfg):
+    if not _verify_jsonb_available():
+        print(
+            "--verify reads `messages.excluded`, which schema v6 stores as SQLite "
+            f"JSONB (needs SQLite >= {'.'.join(map(str, VERIFY_JSONB_MIN))}); this "
+            f"interpreter has SQLite {sqlite3.sqlite_version} "
+            f"(python {sys.version.split()[0]}). Run this script with an interpreter "
+            "built against a newer SQLite (python3.12 on this host).",
+            file=sys.stderr,
+        )
+        return 2
+    for label, path in (("--candidate", candidate), ("--manifest", manifest_path),
+                        ("--reference", reference)):
+        if not os.path.exists(path):
+            print(f"--verify: {label} {path} does not exist", file=sys.stderr)
+            return 2
+
+    try:
+        failures, report = _verify_once(
+            candidate, manifest_path, reference, mirror_root, sample_rebuild, seed, paths_cfg
+        )
+    except _NotV6 as not_v6:
+        print(
+            f"--verify: candidate {not_v6} is not a v6 library "
+            "(`messages` has no `excluded` column)",
+            file=sys.stderr,
+        )
+        return 2
+
+    with open(report_path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    for label, detail in failures[:VERIFY_MAX_LISTED_FAILURES]:
+        print(f"FAIL {label}: {detail}")
+    if len(failures) > VERIFY_MAX_LISTED_FAILURES:
+        print(f"... and {len(failures) - VERIFY_MAX_LISTED_FAILURES} more")
+    print(
+        f"verify: manifest={report['manifest_entries']} "
+        f"non_manifest_rows={report['non_manifest_rows_checked']} "
+        f"rebuild_ok={report['rebuild_ok']}/{report['rebuild_sample']} "
+        f"failures={report['failures']}"
+    )
+    return 0 if not failures else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db")
@@ -2214,6 +2815,14 @@ def main(argv=None):
     parser.add_argument("--report", default="t1b-probe-report.md")
     parser.add_argument("--selftest", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    # PR6 T5: `--verify` (T6 Step 3b). In this mode `--report` names a JSON
+    # report instead of the markdown one the probe writes.
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--candidate")
+    parser.add_argument("--manifest")
+    parser.add_argument("--reference")
+    parser.add_argument("--sample-rebuild", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=6)
     args = parser.parse_args(argv)
 
     paths_cfg = load_paths_config(args.paths)
@@ -2221,6 +2830,32 @@ def main(argv=None):
     if args.selftest:
         ok = run_selftest(paths_cfg)
         sys.exit(0 if ok else 1)
+
+    if args.verify:
+        missing = [
+            name
+            for name, value in (
+                ("--candidate", args.candidate),
+                ("--manifest", args.manifest),
+                ("--reference", args.reference),
+                ("--mirror", args.mirror),
+            )
+            if not value
+        ]
+        if missing:
+            parser.error("--verify requires " + ", ".join(missing))
+        sys.exit(
+            run_verify(
+                candidate=args.candidate,
+                manifest_path=args.manifest,
+                reference=args.reference,
+                mirror_root=args.mirror,
+                sample_rebuild=args.sample_rebuild,
+                seed=args.seed,
+                report_path=args.report,
+                paths_cfg=paths_cfg,
+            )
+        )
 
     if not args.db or not args.mirror:
         parser.error("--db and --mirror are required unless --selftest")
