@@ -40,15 +40,20 @@ pub enum ExclusionReason {
 /// `anchor` sub-object (R6): which structural fact triggered the decision.
 /// Exactly one of `tool_call_id`/`tool_name` (R1/R2) or `shell` (R3) is
 /// populated per reason; `paths` is R2-only.
+///
+/// R2-N6 (任务书 #129): the frozen interface is "字段齐全、空值为 null" -- all
+/// four keys are written on every marker, empty ones as `null`. `default`
+/// stays (old rows written before this fix, with keys omitted, still
+/// deserialize), `skip_serializing_if` does not.
 #[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ExclusionAnchor {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub paths: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub shell: Option<ShellAnchor>,
 }
 
@@ -73,7 +78,7 @@ pub struct ShellAnchor {
 pub struct RecallHit {
     pub source_id: String,
     pub source_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub line_number: Option<u64>,
 }
 
@@ -109,6 +114,12 @@ pub struct RawRef {
 /// every marker (schema v6 DDL has no partial-marker concept); `parse_error`
 /// is non-null only for R1-c (cass-mcp hits JSON parse failure), and then
 /// `src` is `None`.
+///
+/// R2-N6 (任务书 #129): this sentence was aspirational until then --
+/// `skip_serializing_if` on `src`/`parse_error` (and on the `anchor`/
+/// `RecallHit` optionals) omitted those keys whenever they were empty, so a
+/// context-file marker carried neither. Now it holds literally: every key
+/// above is present on every marker, empty ones as `null`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExcludedMarker {
     pub reason: ExclusionReason,
@@ -117,9 +128,9 @@ pub struct ExcludedMarker {
     pub sha256: String,
     pub fingerprint_blake3: String,
     pub anchor: ExclusionAnchor,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub src: Option<RecallSrc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub parse_error: Option<String>,
     pub raw: RawRef,
 }
@@ -2779,6 +2790,135 @@ mod tests {
         assert!(json.contains("\"reason\":\"context_file_read\""));
         let round_tripped = ExcludedMarker::from_json_str(&json).unwrap();
         assert_eq!(round_tripped, marker);
+    }
+
+    /// R2-N6 (任务书 #129): the frozen interface (spec v4.5 §2.3 / R6 section
+    /// of `docs/excluded-rules.md`) is "字段齐全、空值为 null" -- every key is
+    /// written on EVERY marker, with `null` where the value is absent.
+    /// `skip_serializing_if = "Option::is_none"` broke that for the
+    /// usually-empty fields: a context-file marker lost `src`/
+    /// `parse_error`/`tool_call_id`/`tool_name`/`shell` outright. The
+    /// round-trip test above cannot see that -- it compares Rust objects,
+    /// which are equal whether or not the key was written. This one compares
+    /// JSON key SETS, i.e. what a reader of the JSONB column actually sees.
+    /// The key-set assertion is the load-bearing one: `value["x"].is_null()`
+    /// alone would also hold for an omitted key (serde_json's `Index` yields
+    /// `Null` for a missing key), so the `is_null` checks below only pin
+    /// "present and empty", never "present".
+    #[test]
+    fn excluded_marker_json_always_carries_every_frozen_key() {
+        fn key_set(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+            value
+                .as_object()
+                .expect("marker JSON must be an object")
+                .keys()
+                .cloned()
+                .collect()
+        }
+        fn frozen(names: &[&str]) -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| (*n).to_string()).collect()
+        }
+
+        let context_file = ExcludedMarker {
+            reason: ExclusionReason::ContextFileRead,
+            rule_version: 1,
+            bytes: 4380,
+            sha256: "a".repeat(64),
+            fingerprint_blake3: "b".repeat(64),
+            // Every anchor field except `paths` empty: the shape a real
+            // context-file-read marker has.
+            anchor: ExclusionAnchor {
+                tool_call_id: None,
+                tool_name: None,
+                paths: Some(vec!["/x".into()]),
+                shell: None,
+            },
+            src: None,
+            parse_error: None,
+            raw: RawRef {
+                blob: "blobs/blake3/ab/abcd.raw".into(),
+                idx: 17,
+                event_key: "ek".into(),
+                blocks: vec![1],
+            },
+        };
+        // R1-c's id-less pairing shape: empty `tool_call_id`, present `src`,
+        // and its only optional per-hit field (`line_number`) empty too.
+        let pairing = ExcludedMarker {
+            reason: ExclusionReason::CassRecall,
+            rule_version: 1,
+            bytes: 12,
+            sha256: "c".repeat(64),
+            fingerprint_blake3: "d".repeat(64),
+            anchor: ExclusionAnchor::default(),
+            src: Some(RecallSrc {
+                sessions: vec!["/s.jsonl".into()],
+                hits: vec![RecallHit {
+                    source_id: "local".into(),
+                    source_path: "/s.jsonl".into(),
+                    line_number: None,
+                }],
+            }),
+            parse_error: None,
+            raw: RawRef {
+                blob: "blobs/blake3/ab/abcd.raw".into(),
+                idx: 0,
+                event_key: "line:1".into(),
+                blocks: vec![],
+            },
+        };
+
+        let top_level = frozen(&[
+            "reason",
+            "rule_version",
+            "bytes",
+            "sha256",
+            "fingerprint_blake3",
+            "anchor",
+            "src",
+            "parse_error",
+            "raw",
+        ]);
+        for (label, marker) in [("context_file_read", &context_file), ("cass_recall", &pairing)] {
+            let value: serde_json::Value =
+                serde_json::from_str(&marker.to_json_string()).expect("marker JSON parses");
+            assert_eq!(key_set(&value), top_level, "{label}: every frozen top-level key must be written");
+            assert_eq!(
+                key_set(&value["anchor"]),
+                frozen(&["tool_call_id", "tool_name", "paths", "shell"]),
+                "{label}: anchor must carry all four keys"
+            );
+            assert_eq!(
+                key_set(&value["raw"]),
+                frozen(&["blob", "idx", "event_key", "blocks"]),
+                "{label}: raw must carry all four keys"
+            );
+            assert!(value["parse_error"].is_null(), "{label}: absent parse_error must be null");
+            assert!(value["anchor"]["tool_call_id"].is_null(), "{label}: absent tool_call_id must be null");
+            assert!(value["anchor"]["tool_name"].is_null(), "{label}: absent tool_name must be null");
+            assert!(value["anchor"]["shell"].is_null(), "{label}: absent shell must be null");
+        }
+
+        let context_file_value: serde_json::Value =
+            serde_json::from_str(&context_file.to_json_string()).unwrap();
+        assert!(
+            context_file_value["src"].is_null(),
+            "an absent src must be written as null (key present, per the set assertion above)"
+        );
+
+        let pairing_value: serde_json::Value = serde_json::from_str(&pairing.to_json_string()).unwrap();
+        assert_eq!(
+            key_set(&pairing_value["src"]),
+            frozen(&["sessions", "hits"]),
+            "a present src must carry both keys"
+        );
+        let hit = &pairing_value["src"]["hits"][0];
+        assert_eq!(
+            key_set(hit),
+            frozen(&["source_id", "source_path", "line_number"]),
+            "a recall hit must carry all three keys"
+        );
+        assert!(hit["line_number"].is_null(), "an absent hit line_number must be null");
     }
 
     /// R1-B4 (任务书 #118a): a malformed `fingerprint_blake3` (structurally

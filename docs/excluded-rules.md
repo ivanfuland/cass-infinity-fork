@@ -106,7 +106,7 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
  "bytes": 4380, "sha256": "…64 hex…", "fingerprint_blake3": "…64 hex…",
  "parse_error": null,
  "anchor": {"tool_call_id": "toolu_01…", "tool_name": "mcp__cass-mcp__cass_search", "paths": null, "shell": null},
- "src": {"sessions": ["…"], "message_ids": [1189316]},
+ "src": {"sessions": ["…"], "hits": [{"source_id": "local", "source_path": "…", "line_number": 1189316}]},
  "raw": {"blob": "blobs/blake3/ab/ab12…cd.raw", "idx": 17, "event_key": "3f9c…-uuid", "blocks": [1]}}
 ```
 
