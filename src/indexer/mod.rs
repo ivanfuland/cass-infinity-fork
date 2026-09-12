@@ -15152,7 +15152,15 @@ fn unique_failed_seed_backup_root(backups_dir: &Path, db_name: &str) -> PathBuf 
 fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
     let path = state_path(data_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        // T2T-2 (任务书 #129): `state_path` puts the file directly under
+        // `data_dir`, so `parent` IS the data directory -- this call can be
+        // the one that creates it, and R4-B1's rule is that every place that
+        // creates `data_dir` does so durably. The literal source-level guard
+        // cannot see this one: its argument is spelled `parent`, which is
+        // exactly the "parameter not named data_dir but the argument is
+        // data_dir" shape the gate's death criterion names (and it did
+        // trigger here -- see the mission report).
+        crate::raw_mirror::create_dir_all_durable(parent)?;
     }
     let watch_state = WatchState {
         version: 1,
@@ -32484,6 +32492,29 @@ mod tests {
         let loaded = load_watch_state(&data_dir);
         assert_eq!(loaded.get(&ConnectorKind::Codex), Some(&123));
         assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
+    }
+
+    /// T2T-2 (任务书 #129): `save_watch_state` writes `data_dir/watch_state.json`,
+    /// so its `create_dir_all(parent)` can be the call that creates
+    /// `data_dir` itself. It now goes through `create_dir_all_durable`;
+    /// this test only pins the functional half (a missing data dir is
+    /// created and the state round-trips) -- durability itself is not
+    /// observable from here and is not claimed as tested.
+    #[test]
+    #[serial]
+    fn save_watch_state_creates_a_missing_data_dir_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("nested").join("cass-data");
+        assert!(!data_dir.exists(), "sanity: the data dir must not exist yet");
+
+        let mut state = HashMap::new();
+        state.insert(ConnectorKind::Codex, 123);
+
+        save_watch_state(&data_dir, &state).unwrap();
+
+        assert!(data_dir.is_dir(), "the data dir must have been created by the save");
+        assert!(data_dir.join("watch_state.json").is_file(), "the state file must be written under it");
+        assert_eq!(load_watch_state(&data_dir).get(&ConnectorKind::Codex), Some(&123));
     }
 
     #[test]
