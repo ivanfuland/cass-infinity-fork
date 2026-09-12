@@ -365,6 +365,13 @@ pub enum Commands {
         #[arg(long)]
         semantic: bool,
 
+        /// PR6 T5: skip the entire source scan/ingest phase and only run the
+        /// semantic hole-draining/reconciliation. Requires `--semantic`; refuses
+        /// `--watch`, `--watch-once`, `--full` and `--force-rebuild` (exit 2).
+        /// Used by the T12 protocol v2 exam hall so the corpus stays identical.
+        #[arg(long, default_value_t = false)]
+        no_ingest: bool,
+
         /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
         /// requires the `semantic` build feature, retired in this build --
         /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
@@ -6825,6 +6832,7 @@ async fn execute_cli(
                     watch_interval,
                     data_dir,
                     semantic,
+                    no_ingest,
                     embedder,
                     idempotency_key,
                     json,
@@ -6842,6 +6850,7 @@ async fn execute_cli(
                         watch_interval,
                         data_dir,
                         semantic,
+                        no_ingest,
                         embedder,
                         progress,
                         structured_format,
@@ -85841,6 +85850,7 @@ fn run_index_with_data(
     watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
+    no_ingest: bool,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -85873,6 +85883,7 @@ fn run_index_with_data(
         force_rebuild.hash(&mut hasher);
         watch.hash(&mut hasher);
         semantic.hash(&mut hasher);
+        no_ingest.hash(&mut hasher);
         embedder.hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
@@ -85951,6 +85962,45 @@ fn run_index_with_data(
     }
 
     let watch_once_paths = resolve_watch_once_paths(watch, watch_once);
+
+    // PR6 T5 (任务书 #126, spec §五 考场不拉源): `--no-ingest` means "do not
+    // touch the corpus" -- it is only meaningful next to `--semantic` (which
+    // is the phase that still runs: hole-draining/reconciliation), and it is
+    // incompatible with every mode that exists to scan sources. All five
+    // rejections are exit 2 per the plan's parameter freeze table.
+    if no_ingest {
+        let conflict = if watch {
+            Some("--watch")
+        } else if watch_once_paths.as_ref().is_some_and(|p| !p.is_empty()) {
+            Some("--watch-once")
+        } else if full {
+            Some("--full")
+        } else if force_rebuild {
+            Some("--force-rebuild")
+        } else {
+            None
+        };
+        if let Some(flag) = conflict {
+            return Err(CliError::usage(
+                format!("--no-ingest cannot be combined with {flag}"),
+                Some(
+                    "--no-ingest skips the source scan/ingest phase entirely; a mode that \
+                     scans sources has nothing to do without it"
+                        .to_string(),
+                ),
+            ));
+        }
+        if !semantic {
+            return Err(CliError::usage(
+                "--no-ingest requires --semantic",
+                Some(
+                    "--no-ingest only skips scanning: without --semantic there is nothing left \
+                     to run (hole-draining/reconciliation)"
+                        .to_string(),
+                ),
+            ));
+        }
+    }
     let entrypoint = index_entrypoint_diagnostics(
         full,
         force_rebuild,
@@ -86036,7 +86086,6 @@ fn run_index_with_data(
     let index_progress = std::sync::Arc::new(indexer::IndexingProgress::default());
 
     let opts = IndexOptions {
-        no_ingest: false,
         full,
         force_rebuild,
         watch,
@@ -86044,6 +86093,7 @@ fn run_index_with_data(
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
         semantic,
+        no_ingest,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
@@ -86481,10 +86531,18 @@ fn run_index_with_data(
             payload["activated"] = serde_json::json!(activated);
         }
 
-        // Add structured indexing stats if available (T7.4)
+        // Add structured indexing stats if available (T7.4). PR6 T5 also
+        // lifts the two `--no-ingest` fields to the payload's top level:
+        // `indexing_stats` keeps them too (single source), but the plan's
+        // interface and the T6 exam step read them as top-level keys.
         if let Ok(stats) = index_progress.stats.lock()
             && let serde_json::Value::Object(ref mut map) = payload
         {
+            map.insert(
+                "scan_invocations".to_string(),
+                serde_json::json!(stats.scan_invocations),
+            );
+            map.insert("no_ingest".to_string(), serde_json::json!(stats.no_ingest));
             map.insert(
                 "indexing_stats".to_string(),
                 serde_json::to_value(&*stats).unwrap_or_default(),
@@ -95777,6 +95835,7 @@ fn run_sources_sync(
             30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
+            false,          // no_ingest
             "fastembed".to_string(),
             progress,
             output_format,
@@ -95929,6 +95988,7 @@ fn run_sources_reingest(
         30,                     // watch_interval (default)
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
+        false,                  // no_ingest
         "fastembed".to_string(),
         progress,
         output_format,

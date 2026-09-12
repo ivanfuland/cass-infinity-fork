@@ -970,6 +970,11 @@ pub struct IndexingStats {
     /// the reparsed message count, so judgment was skipped entirely for
     /// that session (宁漏勿误, not an error).
     pub event_align_failed: u64,
+    /// PR6 T5: connector scan invocations started by this run (see
+    /// `SCAN_INVOCATIONS`). Must be 0 for `--no-ingest`.
+    pub scan_invocations: u64,
+    /// PR6 T5: whether this run was `cass index --semantic --no-ingest`.
+    pub no_ingest: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -7290,6 +7295,7 @@ fn spawn_connector_producer(
                 local_since_ts,
                 config.active_source_filter.as_ref(),
             );
+            record_scan_invocation();
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
@@ -7399,6 +7405,7 @@ fn spawn_connector_producer(
                 root_since_ts,
                 config.active_source_filter.as_ref(),
             );
+            record_scan_invocation();
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
@@ -8300,6 +8307,7 @@ fn run_batch_index_with_connector_factories(
                         local_since_ts,
                         active_source_filter.as_ref(),
                     );
+                    record_scan_invocation();
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
@@ -8363,6 +8371,7 @@ fn run_batch_index_with_connector_factories(
                             root_since_ts,
                             active_source_filter.as_ref(),
                         );
+                        record_scan_invocation();
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
                                 remote_convs.retain(|conv| {
@@ -8893,6 +8902,7 @@ pub fn run_index(
     // 视为一次 run" 的归零边界见 watch 循环内 `ingest_watch_batch_with_oom_split`
     // 前的同名调用。
     reset_last_index_run_counters();
+    reset_scan_invocations();
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -9870,7 +9880,21 @@ pub fn run_index(
                 needs_rebuild = false;
             }
 
-            if targeted_watch_once_only {
+            if opts.no_ingest {
+                // PR6 T5 (任务书 #126): `cass index --semantic --no-ingest`
+                // skips the entire scan/ingest phase -- no connector
+                // discovery, no `capture_connector_sources_before_parse`
+                // source-row writes, and no watermark movement (the branch
+                // that sets `performed_scan = true` is never entered, so
+                // `persist_final_index_run_metadata` keeps `last_scan_ts`).
+                // Only hole-draining/reconciliation/audit run. The
+                // `scan_invocations` counter is the machine check for this.
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    scan_invocations = scan_invocations_snapshot(),
+                    "--no-ingest: skipping the source scan and ingest phase entirely"
+                );
+            } else if targeted_watch_once_only {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     "skipping broad incremental scan because targeted watch-once paths were supplied"
@@ -10281,6 +10305,18 @@ pub fn run_index(
     // the DB vector domain catch-up (ingest-time hole registration + genesis
     // rescan safety net) replaces the old bulk-build/watermark-gated design;
     // see run_semantic_db_vector_catchup's doc comment.
+    // PR6 T5: publish this run's scan-invocation count here, BEFORE the
+    // semantic phase -- a `--no-ingest` run that then fails in hole-draining
+    // (e.g. no reachable Infinity) must still report `scan_invocations` and
+    // `no_ingest`, because that assertion is exactly what proves the scan
+    // phase was skipped.
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        stats.scan_invocations = scan_invocations_snapshot();
+        stats.no_ingest = opts.no_ingest;
+    }
+
     if opts.semantic && targeted_semantic_watch_once {
         tracing::info!(
             embedder = %opts.embedder,
@@ -10429,7 +10465,11 @@ pub fn run_index(
 
     reset_progress_to_idle(opts.progress.as_ref());
 
-    if opts.watch || opts.watch_once_paths.is_some() {
+    // PR6 T5: a `no_ingest` run must never enter the watch accept-loop (it
+    // would block forever scanning sources). The CLI rejects
+    // `--no-ingest --watch/--watch-once` outright; this guard also covers a
+    // direct library caller that sets both.
+    if (opts.watch || opts.watch_once_paths.is_some()) && !opts.no_ingest {
         // R2-B1 (任务书 #119a): the startup scan just above (shared with the
         // non-watch streaming/batch path, and run for plain `--watch` too --
         // `targeted_watch_once_only_run` is the only case that skips it, and
@@ -14429,6 +14469,7 @@ fn reindex_paths_with_semantic_delta(
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
         let mut scan_failed = false;
+        record_scan_invocation();
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -15684,6 +15725,28 @@ pub(crate) fn reset_last_index_run_counters() {
     CODEX_HOST_SHELL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     CODEX_IDX0_USER_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
     EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PR6 T5 (任务书 #126): how many connector scan invocations this run has
+/// started. Incremented immediately before every `conn.scan*` call site in
+/// `run_index`'s reachable graph -- local-default scan (streaming and batch),
+/// `additional_scan_roots` (configured sources / `list_sources()` fallback),
+/// and the watch-path reindex scan. `--no-ingest` must leave this at 0: that
+/// is the machine check for "the whole scan/ingest phase was skipped"
+/// (spec §五 考场不拉源), not a code-reading assertion.
+static SCAN_INVOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_scan_invocation() {
+    SCAN_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Zeroed at `run_index` entry (the run boundary this counter reports on).
+fn reset_scan_invocations() {
+    SCAN_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn scan_invocations_snapshot() -> u64 {
+    SCAN_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Snapshot the three run-level counters (for `--json` scan report fields
