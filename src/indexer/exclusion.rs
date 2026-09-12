@@ -1241,7 +1241,40 @@ fn apply_path(value: &mut serde_json::Value, segments: &[&str], target_blocks: &
 /// `toolUseResult` wholesale only when it is currently a JSON string,
 /// leaving the object shape untouched here (the existing sub-path handles
 /// it).
-fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, placeholder: &serde_json::Value) {
+fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, target_blocks: &[u32], placeholder: &serde_json::Value) {
+    // R3-N2 (任务书 #129): the top-level string is ONE value for the whole
+    // event, while `target_blocks` names the block indices this call is
+    // redacting. Clearing it whenever it is a string over-clears: an event
+    // with two `tool_result` blocks, only one of them targeted, would lose
+    // the other one's copy too. Clear it only when it can ONLY belong to a
+    // targeted block -- i.e. every `tool_result` block in this event is in
+    // `target_blocks` (and there is at least one).
+    // A shape with no inspectable `content[]` array (e.g. the minimal
+    // `{"toolUseResult": "..."}` extras the unit tests build) proves nothing
+    // either way, so it keeps the pre-fix behavior -- only a *proven*
+    // ambiguity (an event that does expose its blocks, with a `tool_result`
+    // this call is not targeting) holds the strip back. Leaning that way
+    // keeps the leak direction safe: the string is byte-identical to the
+    // `content` this same call is clearing, so leaving it behind would keep
+    // the excluded body in `extra`.
+    let tool_result_indices: Option<Vec<u32>> = value
+        .pointer("/message/content")
+        .or_else(|| value.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
+                .map(|(index, _)| index as u32)
+                .collect()
+        });
+    if let Some(indices) = &tool_result_indices
+        && !indices.is_empty()
+        && !indices.iter().all(|index| target_blocks.contains(index))
+    {
+        return;
+    }
     if let Some(v) = value.get_mut("toolUseResult") {
         if v.is_string() {
             *v = placeholder.clone();
@@ -1263,7 +1296,7 @@ fn apply_extra(extra: &mut serde_json::Value, field_map: ExtraFieldMap, target_b
                 let segments: Vec<&str> = path.split('.').collect();
                 apply_path(&mut inner, &segments, target_blocks, placeholder);
             }
-            strip_claude_string_tool_use_result(&mut inner, placeholder);
+            strip_claude_string_tool_use_result(&mut inner, target_blocks, placeholder);
             let rewritten = serde_json::to_string(&inner).unwrap_or(raw);
             extra[HISTORICAL_RAW_JSON_SENTINEL_KEY] = serde_json::Value::String(rewritten);
         }
@@ -1273,7 +1306,7 @@ fn apply_extra(extra: &mut serde_json::Value, field_map: ExtraFieldMap, target_b
         let segments: Vec<&str> = path.split('.').collect();
         apply_path(extra, &segments, target_blocks, placeholder);
     }
-    strip_claude_string_tool_use_result(extra, placeholder);
+    strip_claude_string_tool_use_result(extra, target_blocks, placeholder);
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -2554,6 +2587,62 @@ mod tests {
         assert_eq!(m.extra["toolUseResult"]["file"]["content"]["redacted"], serde_json::json!(true), "the sub-path entry must still redact the nested content");
         assert_eq!(m.extra["toolUseResult"]["filePath"], serde_json::json!("/tmp/x"), "non-body metadata sibling to .file must survive");
         assert_eq!(m.extra["toolUseResult"]["type"], serde_json::json!("text"), "non-body metadata sibling to .file must survive");
+    }
+
+    /// R3-N2 (任务书 #129): `strip_claude_string_tool_use_result` used to
+    /// check only the type, so an event carrying TWO `tool_result` blocks
+    /// where only one is being excluded had its top-level string copy cleared
+    /// as well -- over-clearing whichever body the string actually held. The
+    /// strip is now conditional on block ownership: cleared when every
+    /// `tool_result` block in the event is targeted, left alone when the
+    /// event proves one of them is not.
+    #[test]
+    fn apply_clears_string_tool_use_result_only_when_every_result_block_is_targeted() {
+        let placeholder = serde_json::json!({"redacted": true});
+
+        // (a) Two result blocks, only block 0 targeted: the string may belong
+        // to block 1, so it must survive.
+        let mut ambiguous = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "secret B"}
+            ]},
+            "toolUseResult": "secret A"
+        });
+        apply_extra(&mut ambiguous, &[], &[0], &placeholder);
+        assert!(
+            ambiguous["toolUseResult"].is_string(),
+            "one un-targeted tool_result block makes the string's owner ambiguous: it must be left alone, got {:?}",
+            ambiguous["toolUseResult"]
+        );
+
+        // (b) Both result blocks targeted: nothing ambiguous left, clear it.
+        let mut both_targeted = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "secret B"}
+            ]},
+            "toolUseResult": "secret A"
+        });
+        apply_extra(&mut both_targeted, &[], &[0, 1], &placeholder);
+        assert_eq!(
+            both_targeted["toolUseResult"], placeholder,
+            "when every tool_result block is targeted the string copy belongs to one of them and must be cleared"
+        );
+
+        // (c) The single-result shape the frozen corpus actually has: still
+        // cleared (this is the case the R2-B2 fix was written for).
+        let mut single = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"}
+            ]},
+            "toolUseResult": "secret A"
+        });
+        apply_extra(&mut single, &[], &[0], &placeholder);
+        assert_eq!(single["toolUseResult"], placeholder, "the corpus' single-result shape must keep being cleared");
     }
 
     #[test]
