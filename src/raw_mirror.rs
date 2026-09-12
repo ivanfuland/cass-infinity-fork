@@ -242,6 +242,14 @@ pub struct RawMirrorPruneReport {
     pub manifest_count: u64,
     pub unique_blob_count: u64,
     pub current_blob_bytes: u64,
+    /// R2-N9 (任务书 #125): distinct blobs a manifest names whose file could
+    /// not be stat'ed as a regular non-symlink file. They contribute zero
+    /// bytes to `current_blob_bytes` rather than their declared size.
+    pub unreadable_blob_count: u64,
+    /// R2-N9 (任务书 #125): referenced blobs (`messages.excluded.raw.blob`)
+    /// whose file is missing or not a regular file. Non-empty means the DB
+    /// points at mirror evidence that is not on disk; `apply` refuses.
+    pub missing_referenced_blobs: Vec<String>,
     pub safety_hold_down_ms: i64,
     pub keep_tags: Vec<String>,
     pub pinned_manifest_count: u64,
@@ -293,6 +301,8 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         manifest_count: 0,
         unique_blob_count: 0,
         current_blob_bytes: 0,
+        unreadable_blob_count: 0,
+        missing_referenced_blobs: Vec::new(),
         safety_hold_down_ms: options.safety_hold_down_ms,
         keep_tags: options.keep_tags.clone(),
         pinned_manifest_count: 0,
@@ -309,7 +319,24 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
 
     let metadata = match fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // R2-N9 (任务书 #125): no raw mirror on disk is a fresh install
+            // when nothing references one (the #253 contract: `cass mirror
+            // prune --apply` on an empty data dir still prints its summary).
+            // With live `messages.excluded.raw.blob` references in hand it
+            // means the mirror was removed while the DB still points into
+            // it -- the caller asked for the mirror, and reporting an
+            // ordinary "nothing to prune" success would hide that.
+            if options.referenced_blobs.is_empty() {
+                return Ok(report);
+            }
+            anyhow::bail!(
+                "raw mirror root {} does not exist, but {} blob(s) are still referenced by \
+                 messages.excluded.raw.blob -- the mirror is missing, not empty",
+                root.display(),
+                options.referenced_blobs.len()
+            );
+        }
         Err(err) => {
             return Err(err).with_context(|| format!("stat raw mirror root {}", root.display()));
         }
@@ -328,19 +355,32 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     let mut blob_to_manifests: HashMap<String, Vec<String>> = HashMap::new();
     let mut manifest_by_id: HashMap<String, &RawMirrorPruneManifest> = HashMap::new();
     let mut blob_size_by_relative: HashMap<String, u64> = HashMap::new();
+    let mut unreadable_blobs: HashSet<String> = HashSet::new();
     for manifest in &manifests {
         manifest_by_id.insert(manifest.manifest_id.clone(), manifest);
         blob_to_manifests
             .entry(manifest.blob_relative_path.clone())
             .or_default()
             .push(manifest.manifest_id.clone());
-        blob_size_by_relative
-            .entry(manifest.blob_relative_path.clone())
-            .or_insert_with(|| {
-                blob_file_size(&root.join(&manifest.blob_relative_path))
-                    .unwrap_or(manifest.blob_size_bytes)
-            });
+        if blob_size_by_relative.contains_key(&manifest.blob_relative_path) {
+            continue;
+        }
+        // R2-N9 (任务书 #125): a blob that cannot be stat'ed as a regular
+        // file counts as ZERO bytes and is tallied. Falling back to
+        // `manifest.blob_size_bytes` let a missing blob contribute the size
+        // the manifest merely DECLARES to the accounting the size-based
+        // prune plans against.
+        match blob_file_size(&root.join(&manifest.blob_relative_path)) {
+            Some(size) => {
+                blob_size_by_relative.insert(manifest.blob_relative_path.clone(), size);
+            }
+            None => {
+                blob_size_by_relative.insert(manifest.blob_relative_path.clone(), 0);
+                unreadable_blobs.insert(manifest.blob_relative_path.clone());
+            }
+        }
     }
+    report.unreadable_blob_count = unreadable_blobs.len() as u64;
     report.unique_blob_count = blob_size_by_relative.len() as u64;
     report.current_blob_bytes = blob_size_by_relative
         .values()
@@ -387,6 +427,30 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
             "raw mirror prune refused: {} referenced blob(s) have no protected manifest backing them \
              (R9 invariant violated): {missing:?}",
             missing.len()
+        );
+    }
+
+    // R2-N9 (任务书 #125): the check above proves every referenced blob has a
+    // manifest NAMING it -- it proves nothing about the blob's file. A blob
+    // deleted out from under the mirror still passed as protected, and the
+    // prune reported success. Every referenced blob must be stat-able as a
+    // regular file; `apply` refuses while any is not, and the paths are
+    // reported either way so a dry run surfaces it too.
+    let mut missing_referenced_blobs: Vec<String> = options
+        .referenced_blobs
+        .iter()
+        .filter(|relative| blob_file_size(&root.join(relative.as_str())).is_none())
+        .cloned()
+        .collect();
+    missing_referenced_blobs.sort();
+    if !missing_referenced_blobs.is_empty() {
+        report.missing_referenced_blobs = missing_referenced_blobs.clone();
+    }
+    if options.apply && !missing_referenced_blobs.is_empty() {
+        anyhow::bail!(
+            "raw mirror prune refused: {} referenced blob(s) are named by a manifest but their \
+             files are missing or are not regular files: {missing_referenced_blobs:?}",
+            missing_referenced_blobs.len()
         );
     }
 
@@ -3734,6 +3798,166 @@ mod tests {
         assert!(!unreferenced_manifest_path.exists(), "unreferenced expired manifest must be pruned");
         assert!(!unreferenced_blob_path.exists(), "unreferenced expired blob must be pruned");
         assert_eq!(report.applied_blob_count, 1, "exactly the unreferenced blob should be deleted");
+    }
+
+    /// R2-N9 (任务书 #125) half ①: a manifest that protects a referenced blob
+    /// is not enough -- the blob's FILE has to be there. The reference check
+    /// used to prove only "some manifest names this path", so a blob that had
+    /// been deleted out from under the mirror still passed as protected and
+    /// the prune reported success. It must refuse and name the path.
+    #[test]
+    fn prune_refuses_when_a_referenced_blob_file_is_gone_r2_n9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("referenced.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"referenced\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+        assert!(manifest_path.exists() && blob_path.exists());
+        fs::remove_file(&blob_path).expect("delete the referenced blob");
+
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert(captured.blob_relative_path.clone());
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect_err("a referenced blob whose file is gone must refuse the prune");
+
+        assert!(
+            err.to_string().contains(&captured.blob_relative_path),
+            "refusal must name the missing blob path: {err}"
+        );
+    }
+
+    /// R2-N9 (任务书 #125) half ②: with `messages.excluded.raw.blob`
+    /// references in hand but no raw mirror on disk at all, the DB is telling
+    /// us it has rows pointing at mirror evidence that is not there. That
+    /// used to return the ordinary "nothing to prune" success report, which
+    /// reads as "fine".
+    #[test]
+    fn prune_refuses_when_the_mirror_root_is_absent_but_blobs_are_referenced_r2_n9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert("blobs/blake3/aa/aaaa.raw".to_string());
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: false,
+            },
+        )
+        .expect_err("a missing mirror root with live blob references must not report success");
+
+        assert!(
+            err.to_string().contains("raw mirror root"),
+            "refusal must name the missing root: {err}"
+        );
+    }
+
+    /// R2-N9 (任务书 #125) guard for the #253 contract the change above must
+    /// not break: a data dir with no raw mirror and NO references is a fresh
+    /// install, not a broken mirror, and stays a success report.
+    #[test]
+    fn prune_still_reports_success_when_the_mirror_root_is_absent_and_nothing_is_referenced() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect("a fresh install with no references must still report success");
+
+        assert!(!report.initialized);
+        assert_eq!(report.manifest_count, 0);
+    }
+
+    /// R2-N9 (任务书 #125) half ③: `blob_file_size` failing used to fall back
+    /// to `manifest.blob_size_bytes`, so an unreadable blob still contributed
+    /// its DECLARED size to the accounting the size-based prune plans against.
+    /// A blob path that is not a regular file (here: a directory) must count
+    /// as zero bytes and as an unreadable blob, never as its declared size.
+    #[test]
+    fn prune_does_not_count_an_unreadable_blob_at_its_declared_size_r2_n9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("unreadable.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"unreadable\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let declared = fs::metadata(&blob_path).expect("blob metadata").len();
+        assert!(declared > 0, "the capture must have written a non-empty blob");
+        fs::remove_file(&blob_path).expect("remove blob file");
+        fs::create_dir(&blob_path).expect("replace the blob with a directory");
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: false,
+            },
+        )
+        .expect("dry-run with an unreadable blob still produces a report");
+
+        assert_eq!(
+            report.current_blob_bytes, 0,
+            "an unreadable blob must not contribute its declared {declared} bytes"
+        );
+        assert_eq!(report.unreadable_blob_count, 1);
     }
 
     /// R9 mutation half of the pair above: the SAME two captures, but
