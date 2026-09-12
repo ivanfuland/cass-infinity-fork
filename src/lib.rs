@@ -97776,15 +97776,21 @@ fn run_models_backfill(
     // path ending in `agent_search.db`), so handing it the resolved target
     // of a symlinked `agent_search.db` silently drops that protection --
     // same directory, so the cross-directory exemption does not apply.
-    // What is opened (and what the lock is derived from) stays the path the
-    // caller actually named, or `data_dir`'s own join.
-    let (db_path, db_path_for_open) = match db_override {
-        Some(raw) => {
-            let resolved = std::fs::canonicalize(&raw).unwrap_or_else(|_| raw.clone());
-            (resolved, raw)
-        }
-        None => (expected_db_path.clone(), data_dir.join("agent_search.db")),
+    //
+    // N08 (任务书 #131 T6-c, from R8): R7-5 pinned that for the path the
+    // caller *named*. The caller's other legitimate form names the symlink's
+    // TARGET (`--db D/real.db`): it passes the identity check just above
+    // (`canonicalize` on both sides resolves to the same file) and then
+    // handed the storage layer `real.db` -- a name that derives no lock at
+    // all, so that form skipped the protection the symlinked-name form keeps.
+    // Whichever alias was named, what is opened (and what the lock is derived
+    // from) is now the `data_dir`-derived name; it resolves to the same file
+    // the identity check just approved.
+    let db_path = match db_override {
+        Some(raw) => std::fs::canonicalize(&raw).unwrap_or(raw),
+        None => expected_db_path.clone(),
     };
+    let db_path_for_open = data_dir.join("agent_search.db");
     if db_path != expected_db_path {
         return Err(CliError {
             code: 2,
@@ -98362,6 +98368,67 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             "a held doctor mutation lock must stop the open; a canonicalized path must not be what the storage layer is given",
         );
         assert_eq!(err.code, 5, "the doctor lock must fail the storage open, not be skipped past it: {err:?}");
+        assert!(
+            err.message.contains("doctor mutation lock"),
+            "expected the doctor-lock wording, got: {}",
+            err.message
+        );
+    }
+
+    /// N08 (任务书 #131 T6-c, from R8). R7-5's test above names the
+    /// *symlinked* path (`data_dir/agent_search.db`), so it got the doctor
+    /// lock by accident of that name. The user's other legitimate form names
+    /// the symlink's TARGET (`--db D/real.db`): the identity comparison
+    /// passes -- `canonicalize` on both sides resolves to the same file --
+    /// but the storage layer was handed `real.db`, whose file name derives NO
+    /// doctor mutation lock at all (`doctor_mutation_lock_path_for_db_open`
+    /// returns a lock path only for a name ending in `agent_search.db`). Same
+    /// directory, so the cross-directory exemption does not apply: the
+    /// protection was simply gone. The open path is now always the
+    /// `data_dir`-derived name, whichever alias the caller named.
+    ///
+    /// Runtime note: same ~30 s wait as the R7-5 test above
+    /// (`DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT`, a const with no env
+    /// override), so this is one of the suite's slow tests.
+    #[test]
+    fn models_backfill_keeps_the_doctor_lock_on_an_explicitly_named_symlink_target() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real_db = data_dir.join("real.db");
+        {
+            let _ = FrankenStorage::open(&real_db).unwrap();
+        }
+        let linked_db = data_dir.join("agent_search.db");
+        std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
+
+        let lock_path = data_dir.join("doctor").join("locks").join("doctor-repair.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the doctor mutation lock file");
+        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold the doctor mutation lock");
+        writeln!(
+            lock_file,
+            "schema_version=1\npid={}\nmode=safe_auto_run",
+            std::process::id().saturating_add(1)
+        )
+        .unwrap();
+        lock_file.flush().unwrap();
+
+        let explicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(real_db), None);
+        let err = explicit.expect_err(
+            "a held doctor mutation lock must stop the open even when --db names the symlink's target; deriving the lock from the caller's alias is what lets this form skip it",
+        );
+        assert_eq!(
+            err.code, 5,
+            "the doctor lock must fail the storage open for the explicit target-name form too, not be skipped past it: {err:?}"
+        );
         assert!(
             err.message.contains("doctor mutation lock"),
             "expected the doctor-lock wording, got: {}",
