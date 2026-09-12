@@ -15726,6 +15726,63 @@ fn record_event_align_failed() {
     EVENT_ALIGN_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// R2-N7 (任务书 #129): WHICH session an `EVENT_ALIGN_FAILED` increment was
+/// about. The counter alone says "some session somewhere was skipped without
+/// judgment" (宁漏勿误); whoever has to act on it needs the identity and the
+/// size of the mismatch. Bounded by a literal cap: past it the counter stays
+/// exact and only the detail stops accumulating, so a pathological corpus
+/// can't grow this list without limit (no config knob -- one literal).
+const EVENT_ALIGN_FAILED_DETAIL_CAP: usize = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventAlignFailure {
+    pub agent_slug: String,
+    pub external_id: Option<String>,
+    pub source_path: String,
+    /// How many events `events_from_blob` produced. A blob READ failure
+    /// surfaces here as 0 -- that function returns an empty `Vec` for an
+    /// unreadable blob -- so "0 events against N messages" is what a
+    /// corrupt/unreadable blob looks like in this list, as opposed to a
+    /// parseable blob whose events simply don't line up.
+    pub event_count: usize,
+    pub message_count: usize,
+}
+
+static EVENT_ALIGN_FAILURES: std::sync::Mutex<Vec<EventAlignFailure>> = std::sync::Mutex::new(Vec::new());
+
+fn record_event_align_failure(conv: &NormalizedConversation, event_count: usize) {
+    let failure = EventAlignFailure {
+        agent_slug: conv.agent_slug.clone(),
+        external_id: conv.external_id.clone(),
+        source_path: conv.source_path.display().to_string(),
+        event_count,
+        message_count: conv.messages.len(),
+    };
+    tracing::warn!(
+        agent = %failure.agent_slug,
+        external_id = ?failure.external_id,
+        source_path = %failure.source_path,
+        event_count = failure.event_count,
+        message_count = failure.message_count,
+        "event/message alignment failed for this session; exclusion judgment skipped entirely (宁漏勿误)"
+    );
+    let mut failures = EVENT_ALIGN_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failures.len() < EVENT_ALIGN_FAILED_DETAIL_CAP {
+        failures.push(failure);
+    }
+}
+
+/// Per-session detail recorded since the last [`reset_last_index_run_counters`]
+/// (same run boundary the `EVENT_ALIGN_FAILED` counter itself uses).
+pub(crate) fn last_index_event_align_failures_snapshot() -> Vec<EventAlignFailure> {
+    EVENT_ALIGN_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 /// T2b.3 (B段, mission #116 授权项⑥): run-level counters for the `meta`
 /// keys `last_index.codex_host_shell_hits` / `last_index.codex_idx0_user_total`
 /// / `last_index.event_align_failed` (`EVENT_ALIGN_FAILED` above is the third).
@@ -15755,6 +15812,12 @@ pub(crate) fn reset_last_index_run_counters() {
     CODEX_HOST_SHELL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     CODEX_IDX0_USER_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
     EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // R2-N7 (任务书 #129): the per-session detail list is the counter's
+    // detail side, so it shares the counter's run boundary.
+    EVENT_ALIGN_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 /// PR6 T5 (任务书 #126): how many connector scan invocations this run has
@@ -16015,6 +16078,8 @@ pub(crate) fn judge_reparsed_conversation(
         judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg)
     } else {
         record_event_align_failed();
+        // R2-N7 (任务书 #129): name the session, not just count it.
+        record_event_align_failure(conv, events.len());
         vec![None; conv.messages.len()]
     }
 }
@@ -35266,6 +35331,58 @@ mod tests {
         let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
         assert_eq!(codex_idx0_user_total, 1, "denominator must count this session's idx0 user message even though alignment failed");
         assert_eq!(event_align_failed, 1, "a real claude_code/codex misalignment must still be counted as one");
+    }
+
+    /// R2-N7 (任务书 #129): an alignment failure must name the session it
+    /// skipped, not just bump a global counter. The blob here is a REAL
+    /// truncated JSONL file parsed by the real `events_from_blob` (not a
+    /// hand-built `Vec<RawEvent>`): its unparseable trailing line is dropped
+    /// by the per-line parse, so the event count it yields cannot match the
+    /// session's own message count and the session lands in the failure list
+    /// with its identity and both real numbers.
+    #[test]
+    #[serial]
+    fn judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment() {
+        reset_last_index_run_counters();
+        let dir = TempDir::new().unwrap();
+        let blob = dir.path().join("session.jsonl");
+        // Two well-formed events plus a truncated third line.
+        std::fs::write(
+            &blob,
+            concat!(
+                r#"{"uuid":"e1","type":"user","message":{"role":"user","content":[{"type":"text","text":"a"}]}}"#,
+                "\n",
+                r#"{"uuid":"e2","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}"#,
+                "\n",
+                r#"{"uuid":"e3","type":"user","message":{"role":"user","cont"#
+            ),
+        )
+        .unwrap();
+        let events = crate::indexer::exclusion::events_from_blob("claude_code", &blob);
+        assert_eq!(events.len(), 2, "sanity: the truncated line must not parse into an event");
+
+        let mut conv = norm_conv(
+            Some("r2-n7-corrupt-session"),
+            vec![norm_msg(0, 10), norm_msg(1, 20), norm_msg(2, 30)],
+        );
+        conv.agent_slug = "claude_code".to_string();
+        conv.source_path = PathBuf::from("/logs/r2-n7-corrupt-session.jsonl");
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/r2n7.raw", &paths_cfg);
+        assert!(markers.iter().all(Option::is_none), "misaligned session must judge nothing (宁漏勿误)");
+
+        let (_hits, _total, event_align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(event_align_failed, 1);
+        let failures = last_index_event_align_failures_snapshot();
+        assert_eq!(failures.len(), 1, "the skipped session must be listed by identity, not just counted");
+        assert_eq!(failures[0].agent_slug, "claude_code");
+        assert_eq!(failures[0].external_id.as_deref(), Some("r2-n7-corrupt-session"));
+        assert_eq!(failures[0].source_path, "/logs/r2-n7-corrupt-session.jsonl");
+        assert_eq!(failures[0].event_count, 2, "the real (truncated) event count");
+        assert_eq!(failures[0].message_count, 3, "the real message count -- the delta IS the lead");
+
+        reset_last_index_run_counters();
+        assert!(last_index_event_align_failures_snapshot().is_empty(), "reset must clear the detail list too");
     }
 
     /// R1-N16 (任务书 #118b) mutation/negative: a connector with no
