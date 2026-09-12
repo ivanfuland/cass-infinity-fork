@@ -7674,10 +7674,26 @@ impl FrankenStorage {
             })
             .context("querying historical conversations")?;
 
-        let msg_sql = "SELECT idx, role, author, created_at, content, extra_json
+        // B02 (任务书 #131): a v6 source library carries an `excluded` marker
+        // on its excluded messages. This SELECT never projected that column,
+        // so `Message.excluded` was built as a hard `None` and every marker a
+        // recovered session carried was silently dropped -- the identity/audit
+        // anchor (and the prune reference protection that reads it) went with
+        // it, while the import still reported success. The column is PROBED,
+        // not assumed: v4/v5 bundles predate it and keep the `None` they
+        // always had.
+        let source_has_excluded = franken_table_column_names(source_conn, "messages")?.contains("excluded");
+        let msg_sql = if source_has_excluded {
+            "SELECT idx, role, author, created_at, content, extra_json, json(excluded)
              FROM messages
              WHERE conversation_id = ?1
-             ORDER BY idx";
+             ORDER BY idx"
+        } else {
+            "SELECT idx, role, author, created_at, content, extra_json
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY idx"
+        };
 
         let mut imported_conversations = resume_progress
             .as_ref()
@@ -7822,8 +7838,10 @@ impl FrankenStorage {
             let messages: Vec<Message> = source_conn
                 .query_all_map(msg_sql, fparams![conversation_row_id], |msg_row| {
                     let role: String = msg_row.get_typed(1)?;
+                    let excluded_json: Option<String> =
+                        if source_has_excluded { msg_row.get_typed(6)? } else { None };
                     Ok(Message {
-                        excluded: None,
+                        excluded: franken_decode_excluded_column(excluded_json)?,
                         id: None,
                         idx: msg_row.get_typed(0)?,
                         role: role_from_str(&role),
@@ -21048,6 +21066,109 @@ mod tests {
         let second = storage.salvage_historical_databases(&canonical_db).unwrap();
         assert_eq!(second.bundles_imported, 0);
         assert_eq!(second.messages_imported, 0);
+    }
+
+    /// B02 (任务书 #131): a v6 source library carries `excluded` markers on its
+    /// messages, and the historical-salvage SELECT did not project that
+    /// column -- every imported marker came back as `excluded: None`, so the
+    /// recovered row lost its identity/audit anchor (and the prune reference
+    /// protection that reads it) while the import still reported success.
+    /// v4/v5 bundles have no such column and keep the `None` they always had.
+    #[test]
+    fn salvage_historical_databases_preserves_v6_excluded_markers() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CodexHostShell,
+            rule_version: 1,
+            bytes: 11,
+            sha256: "a".repeat(64),
+            fingerprint_blake3: "b".repeat(64),
+            anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 1, event_key: "ek-excluded".into(), blocks: vec![0] },
+        };
+
+        let backup_conv = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: None,
+            title: Some("v6 backup with a marker".into()),
+            source_path: PathBuf::from("/tmp/v6-backup.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: "ordinary recovered row".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_050),
+                    content: String::new(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let bundle_path = dir.path().join("backups/agent_search.db.20260912T000000.bak");
+        seed_historical_db_direct(&bundle_path, std::slice::from_ref(&backup_conv));
+        // The seeder writes the legacy core schema, which predates v6. Add the
+        // column exactly as a real v6 backup carries it, and write the marker
+        // through the same `jsonb(?)` the v6 writer uses.
+        {
+            let conn = FrankenConnection::open_writable(&bundle_path, crate::storage::api::Profile::Production).unwrap();
+            conn.execute("ALTER TABLE messages ADD COLUMN excluded BLOB", fparams![]).unwrap();
+            conn.execute("UPDATE messages SET excluded = jsonb(?1) WHERE idx = 1", fparams![marker.to_json_string().as_str()])
+                .unwrap();
+        }
+
+        let outcome = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(outcome.bundles_imported, 1);
+        assert_eq!(outcome.messages_imported, 2);
+
+        let conversation_id = storage
+            .list_conversations(10, 0)
+            .unwrap()
+            .into_iter()
+            .find(|conv| conv.source_path == std::path::Path::new("/tmp/v6-backup.jsonl"))
+            .and_then(|conv| conv.id)
+            .expect("the bundle's conversation must have been imported");
+        let messages = storage.fetch_messages(conversation_id).unwrap();
+        let excluded_row = messages.iter().find(|msg| msg.idx == 1).expect("the idx=1 row must have been imported");
+        assert_eq!(
+            excluded_row.excluded,
+            Some(marker),
+            "a v6 backup's excluded marker must survive the import, not degrade to None"
+        );
+        assert!(
+            messages.iter().find(|msg| msg.idx == 0).unwrap().excluded.is_none(),
+            "an unmarked row must stay unmarked"
+        );
     }
 
     #[test]
