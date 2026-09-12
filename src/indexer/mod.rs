@@ -1743,26 +1743,56 @@ mod memprobe {
     #[test]
     #[serial]
     fn enabled_writes_two_well_formed_lines() {
-        let dir = std::env::temp_dir().join(format!("cass-memprobe-enabled-{}", std::process::id()));
+        // R6-N7 (#123): the log path is unique per run (pid *and* a
+        // nanosecond stamp), the assertion below counts only the lines
+        // carrying *this* process's pid, and the env var is restored to
+        // whatever it held before rather than merely removed.
+        //
+        // Residual limit, stated rather than papered over: `#[serial]` only
+        // orders tests that take the same lock, so a non-`#[serial]` test
+        // that reaches an instrumented production path while this env var
+        // is set still appends to this file -- and since such a test runs
+        // in *this* process, its lines carry the same pid and the pid
+        // filter cannot exclude them. The unique path is what keeps two
+        // concurrent *processes* (other test binaries) apart; the
+        // same-process overlap is bounded by this test holding the
+        // env var for only the two calls between set and restore.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("cass-memprobe-enabled-{}-{unique}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log_path = dir.join("memprobe.jsonl");
+        let prior = std::env::var_os("CASS_MEMPROBE_LOG");
         // SAFETY: #[serial] keeps this the only test touching this env key
-        // at a time; it is restored (removed) before returning.
+        // at a time; the prior value is restored before returning.
         unsafe {
             std::env::set_var("CASS_MEMPROBE_LOG", &log_path);
         }
         memprobe_point("ingest", "start");
         memprobe_point("ingest", "end");
         unsafe {
-            std::env::remove_var("CASS_MEMPROBE_LOG");
+            match prior {
+                Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
+                None => std::env::remove_var("CASS_MEMPROBE_LOG"),
+            }
         }
 
         let text = fs::read_to_string(&log_path).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "expected exactly two JSONL lines, got: {text:?}");
-        for (line, expected_point) in lines.iter().zip(["start", "end"]) {
-            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let mine: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["pid"].as_u64() == Some(u64::from(std::process::id())))
+            .collect();
+        assert_eq!(
+            mine.len(),
+            2,
+            "expected exactly two JSONL lines carrying this process's pid, got {} of {} lines: {text:?}",
+            mine.len(),
+            text.lines().count()
+        );
+        for (value, expected_point) in mine.iter().zip(["start", "end"]) {
             assert_eq!(value["stage"], "ingest");
             assert_eq!(value["point"], expected_point);
             assert!(value["ts_ms"].is_i64());
