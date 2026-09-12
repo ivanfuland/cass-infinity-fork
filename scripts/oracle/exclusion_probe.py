@@ -1494,6 +1494,12 @@ def _run_report_selftest(paths_cfg):
 _VERIFY_BODY = "PR6 T5 verify fixture body " + "abcdefghij" * 8
 _VERIFY_SIBLING = "PR6 T5 verify fixture sibling block " + "klmnopqrst" * 8
 _VERIFY_ORDINARY = "PR6 T5 verify fixture ordinary field " + "uvwxyzabcd" * 8
+# B08 (任务书 #131): a body that JSON has to escape, so "the body is still
+# in the extra" cannot be decided by looking at a serialized dump of it.
+_VERIFY_MULTILINE_BODY = "PR6 T5 verify fixture multiline body\nline two with a \"quote\"\n" + "abcdefghij" * 8
+# B08: shorter than the old `len(body) >= 32` gate, which skipped the whole
+# carried-body check for it.
+_VERIFY_SHORT_BODY = "short leaked body"
 
 
 def _verify_extra(block_value):
@@ -1531,7 +1537,8 @@ def _verify_schema(with_excluded):
 
 
 def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
-                          non_manifest_altered=False, overclear_ordinary=False):
+                          non_manifest_altered=False, overclear_ordinary=False,
+                          leak_multiline_body=False, short_body=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1540,8 +1547,9 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     blob_path = os.path.join(mirror, blob_rel)
     os.makedirs(os.path.dirname(blob_path), exist_ok=True)
 
-    body_sha = hashlib.sha256(redact_text(_VERIFY_BODY).encode("utf-8")).hexdigest()
-    redacted = {"redacted": True, "sha256": body_sha, "bytes": len(_VERIFY_BODY.encode("utf-8"))}
+    body_text = _VERIFY_SHORT_BODY if short_body else (_VERIFY_MULTILINE_BODY if leak_multiline_body else _VERIFY_BODY)
+    body_sha = hashlib.sha256(redact_text(body_text).encode("utf-8")).hexdigest()
+    redacted = {"redacted": True, "sha256": body_sha, "bytes": len(body_text.encode("utf-8"))}
 
     call_event = {
         "type": "assistant",
@@ -1555,7 +1563,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         "type": "user",
         "uuid": "u2",
         "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "t1", "content": _VERIFY_BODY},
+            {"type": "tool_result", "tool_use_id": "t1", "content": body_text},
         ]},
     }
     with open(blob_path, "w", encoding="utf-8") as handle:
@@ -1563,7 +1571,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
             handle.write(json.dumps(event) + "\n")
 
     boundary = {"message": {"role": "user", "content": [{"type": "text", "text": "turn boundary"}]}}
-    sibling_extra = {"message": {"content": [{"type": "text", "text": _VERIFY_BODY}]}}
+    sibling_extra = {"message": {"content": [{"type": "text", "text": body_text}]}}
     for path, with_excluded in ((reference, False), (candidate, True)):
         conn = sqlite3.connect(path)
         conn.executescript(_verify_schema(with_excluded))
@@ -1584,7 +1592,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
             "VALUES (1, 1, 0, 'user', ?, ?)",
             [boundary_content, msgpack.packb(boundary, use_bin_type=True)],
         )
-        candidate_extra = _verify_extra(redacted if with_excluded else _VERIFY_BODY)
+        candidate_extra = _verify_extra(redacted if with_excluded else body_text)
         if with_excluded and non_target_cleared:
             # A change that is NOT a redacted placeholder (an extra block the
             # reference library does not have).
@@ -1596,13 +1604,25 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         conn.execute(
             "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
             "VALUES (1, 1, 'tool_result', ?, ?)",
-            ["" if with_excluded else _VERIFY_BODY, msgpack.packb(candidate_extra, use_bin_type=True)],
+            ["" if with_excluded else body_text, msgpack.packb(candidate_extra, use_bin_type=True)],
         )
         if sibling_leak:
             conn.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
                 ["sibling turn", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if leak_multiline_body or short_body:
+            # B08: the body survives verbatim in a later row's extra,
+            # IDENTICAL on both sides -- so no `extra_bin` diff can expose it
+            # and only a scan of the decoded string leaves can.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 3, 'user', ?, ?)",
+                [
+                    "a later turn",
+                    msgpack.packb({"message": {"content": [{"type": "text", "text": body_text}]}}, use_bin_type=True),
+                ],
             )
         if with_excluded:
             marker = {
@@ -1672,6 +1692,11 @@ def verify_selftest_cases():
         # B07 (任务书 #131): the same placeholder at a path the exclusion does
         # not own is an over-clear, not a clean exclusion.
         ("V7 an over-cleared ordinary field is a failure", False, "redacted a field this exclusion does not own"),
+        # B08 (任务书 #131): a multi-line body that is still verbatim in a
+        # later row's extra -- escaped by `json.dumps`, so the old comparison
+        # could not see it.
+        ("V8 a multi-line body leaking in an extra is a failure", False, "still carries the body"),
+        ("V8b a SHORT body leaking in an extra is a failure", False, "still carries the body"),
     ]
 
 
@@ -1693,6 +1718,8 @@ def _run_verify_selftest(paths_cfg):
             2: {"non_target_cleared": True},
             3: {"non_manifest_altered": True},
             4: {"overclear_ordinary": True},
+            5: {"leak_multiline_body": True},
+            6: {"short_body": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -2774,6 +2801,35 @@ def _allowed_extra_paths(entry, ref_row, ref_extra):
     return allowed
 
 
+def _string_leaves(value, depth=0):
+    """Every string leaf of a decoded extra, unwrapping one level of
+    JSON-in-a-string (the `__cass_historical_raw_json__` envelope) so a body
+    stored inside it counts too."""
+    if isinstance(value, str):
+        yield value
+        if depth == 0 and value.lstrip()[:1] in ("{", "["):
+            try:
+                yield from _string_leaves(json.loads(value), depth + 1)
+            except ValueError:
+                pass
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_leaves(item, depth)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_leaves(item, depth)
+
+
+def _extra_carries_body(extra, body):
+    """B08 (任务书 #131): compare against the DECODED string leaves, never
+    against `json.dumps(extra)` -- serialization escapes newlines, quotes and
+    backslashes, so a multi-line body still sitting verbatim in the extra was
+    invisible to the old comparison and the run reported failures=0. Length is
+    not a gate either: a short body is a body (the old `len(body) >= 32` guard
+    skipped the whole check for anything shorter)."""
+    return any(body in leaf for leaf in _string_leaves(extra))
+
+
 def _normalized_diff_path(path):
     return path[1:] if path.startswith(".") else path
 
@@ -2897,13 +2953,13 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
 
 
         body = ref_row["content"]
-        if body and len(body) >= 32:
+        if body:
             for sib in _session_rows(conn_cand, sql_cand, entry):
                 if body in (sib["content"] or ""):
                     failures.append((label, f"session row idx={sib['idx']} still carries the body"))
                     break
                 sib_extra = _decode_extra(sib["extra_bin"])
-                if sib_extra is not None and body in json.dumps(sib_extra, ensure_ascii=False):
+                if sib_extra is not None and _extra_carries_body(sib_extra, body):
                     failures.append(
                         (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
                     )
