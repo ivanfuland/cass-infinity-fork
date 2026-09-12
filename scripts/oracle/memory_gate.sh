@@ -500,15 +500,61 @@ assert_sources_toml_only_lists_fixture_root() {
   # [[sources]] entry here -- both discovery paths scanned the same tree,
   # double-ingesting the fixture (#122b-2 exec112: conversations=2,
   # messages=20,000 against a 10,000-message manifest). This now asserts
-  # the opposite: sources.toml must declare ZERO [[sources]] tables, so
-  # normal mode relies solely on HOME=$fixture_dir auto-discovery.
+  # the opposite: sources.toml must declare ZERO sources, so normal mode
+  # relies solely on HOME=$fixture_dir auto-discovery.
+  #
+  # R6-N2 (#123, control-plane adversarial review of T4): the check used
+  # to grep for the literal `[[sources]]` header, which is only one of the
+  # legal spellings -- `sources = [{name="extra", ...}]` (the reviewer's
+  # bypass), `["sources"]`, `[ [ sources ] ]` and outright malformed TOML
+  # all passed it. The file is now parsed as TOML (src/sources/config.rs
+  # reads a `sources: Vec<SourceDefinition>`, so the parsed value -- not
+  # the text -- is what the binary actually sees). `tomllib` is stdlib
+  # only from Python 3.11 and this host's `python3` is 3.10, so the first
+  # interpreter that can import it is used; having none is a fail-loud
+  # exit 2, never a silently skipped isolation check.
   local xdg="$1" fixture_dir="$2"
   local toml="$xdg/cass/sources.toml"
   [ -f "$toml" ] || { echo "memory_gate: $toml not found before running the gate" >&2; return 2; }
-  if grep -qE '^[[:space:]]*\[\[sources\]\]' "$toml"; then
-    echo "memory_gate: $toml declares [[sources]] entries -- normal mode relies solely on HOME=$fixture_dir auto-discovery (T4-F7), remove them" >&2
+  local toml_py="" candidate
+  for candidate in python3 python3.12 python3.11; do
+    if "$candidate" -c 'import tomllib' 2>/dev/null; then
+      toml_py="$candidate"
+      break
+    fi
+  done
+  if [ -z "$toml_py" ]; then
+    echo "memory_gate: no python3 with tomllib (>=3.11) is on PATH, so $toml cannot be parsed; refusing to run the gate with the sources isolation check skipped" >&2
     return 2
   fi
+  "$toml_py" - "$toml" "$fixture_dir" <<'PYEOF'
+import sys
+import tomllib
+
+path, fixture_dir = sys.argv[1:3]
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception as e:
+    print(f"memory_gate: cannot parse {path} as TOML: {e}", file=sys.stderr)
+    sys.exit(2)
+sources = data.get("sources")
+if isinstance(sources, list) and sources:
+    names = [s.get("name") if isinstance(s, dict) else s for s in sources]
+    print(
+        f"memory_gate: {path} declares {len(sources)} source(s) {names} -- normal mode relies solely on "
+        f"HOME={fixture_dir} auto-discovery (T4-F7), remove them",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if sources is not None and not isinstance(sources, list):
+    print(
+        f"memory_gate: {path} declares `sources` as a {type(sources).__name__} (e.g. the [sources] table header), "
+        f"not the list of source tables the real config reads (sources: Vec<SourceDefinition>); remove it",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+PYEOF
 }
 
 ingested_sessions_of() {
