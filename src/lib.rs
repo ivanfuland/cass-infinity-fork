@@ -97665,6 +97665,15 @@ fn run_models_backfill(
     // accepted when it names this same `data_dir`'s own database; the
     // default (no `--db`) is always `data_dir`-derived, matching `cass
     // index`'s own `db_override.unwrap_or_else(|| data_dir.join(...))`.
+    // R6-N11 (#123): both sides of the comparison below must be resolved
+    // the same way. Only the `--db` side used to be canonicalized, so a
+    // `data_dir/agent_search.db` that is itself a symlink compared as its
+    // *target* against the unresolved data_dir join -- the same request
+    // rejected as a mismatch (code 2) when `--db` named that path
+    // explicitly, while the implicit form passed. (`.unwrap_or` keeps the
+    // "no such file" case falling through to the `IndexMissing` check
+    // below, exactly as `data_dir`'s own canonicalize above does.)
+    let expected_db_path = std::fs::canonicalize(&expected_db_path).unwrap_or(expected_db_path);
     let db_path = match db_override {
         Some(raw) => std::fs::canonicalize(&raw).unwrap_or(raw),
         None => expected_db_path.clone(),
@@ -98151,6 +98160,45 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         let err = result.expect_err("a --db outside --data-dir must be rejected");
         assert_eq!(err.code, 2, "data_dir/db_path mismatch must be a usage error: {err:?}");
         assert_eq!(err.kind, CliErrorKind::Usage.kind_str());
+    }
+
+    /// R6-N11 (#123): when `data_dir/agent_search.db` is itself a symlink,
+    /// an *explicit* `--db` naming that same path must behave like the
+    /// implicit (no `--db`) form. Before this fix only the `--db` side was
+    /// canonicalized, so the link's target was compared against the
+    /// unresolved `data_dir` join and the same request was rejected as a
+    /// `--db`/`data_dir` mismatch (code 2) purely for having said it out
+    /// loud. `--tier fast` is the `hash` embedder, retired by W3-5, so
+    /// reaching that error (code 20) -- which happens after the path check,
+    /// the lock, and opening the database -- is the evidence the path check
+    /// accepted the symlinked db.
+    #[test]
+    fn models_backfill_accepts_explicit_db_that_is_a_symlink_to_the_data_dir_db() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real_db = data_dir.join("real.db");
+        {
+            let _ = FrankenStorage::open(&real_db).unwrap();
+        }
+        let linked_db = data_dir.join("agent_search.db");
+        std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(linked_db.clone()), None);
+        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence that the explicit --db was accepted");
+        assert_eq!(
+            err.code, 20,
+            "an explicit --db naming the data_dir's own (symlinked) database must not be rejected as a --db/--data-dir mismatch: {err:?}"
+        );
+
+        // The implicit form (no --db) is the behaviour the explicit form has
+        // to match -- it resolves the same symlink through
+        // `expected_db_path`. Asserted here too so a future reordering that
+        // canonicalizes only after the `db_path` match cannot pass this
+        // test: it would break this direction instead.
+        let implicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let implicit_err = implicit.expect_err("same retired embedder, reached via the default db path");
+        assert_eq!(implicit_err.code, 20, "the implicit (no --db) form must keep working against a symlinked agent_search.db: {implicit_err:?}");
     }
 
     /// T4 mission #122a (C, Step 3 case ③): `--data-dir` with no `--db`
