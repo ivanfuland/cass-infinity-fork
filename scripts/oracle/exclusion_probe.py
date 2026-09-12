@@ -10,8 +10,13 @@ the identity source (session key, idx, role, content sha).
 
 Judgment follows `docs/excluded-rules.md` R1-R4 verbatim; sub-numbers (R1-a,
 R2-e, ...) are cited in comments next to the code that implements them, and
-`--selftest` exercises them directly (14 synthetic cases, see
-`SELFTEST_CASES`). "宁漏勿误" (safe-to-miss) is the standing default: any
+`--selftest` exercises them directly -- in families, each with its own runner
+and its own printed tally: `decide` (`selftest_cases`, the R1-R4 judgment
+cases driven through `decide`) and `content` (`selftest_content_cases`, the
+projection+redaction+empty-body gate driven through the PRODUCTION entry
+`process_session_v2`); further families are added next to the fix that needs
+them. The last line is the grand total across families. "宁漏勿误"
+(safe-to-miss) is the standing default: any
 ambiguity around identity, pairing, syntax, or connector coverage falls
 through to "not excluded" (real run) or "not verifiable" (session-level).
 
@@ -402,6 +407,77 @@ class Candidate:
         self.text = text
 
 
+# ---------------------------------------------------------------------------
+# Connector projection port (任务书 #125, R1-N19 + R2-N14).
+#
+# Mirrors the PINNED `franken_agent_detection` rev `bc0f4d3c...`:
+# `claude_code.rs::render_tool_result_content`, `utils.rs::flatten_content`,
+# `utils.rs::extract_content_part`. This is not decoration: `messages.content`
+# was written from EXACTLY this projection, so the mirror side of a content
+# comparison is only meaningful if it goes through the same transform. The
+# previous `json.dumps(content)` shape disagreed with the connector on array
+# tool_results and was the R2-N14 defect.
+# ---------------------------------------------------------------------------
+_MISSING = object()
+
+
+def _extract_content_part(item):
+    """`utils.rs::extract_content_part` -- returns None when the connector
+    would drop the part (`flatten_content` skips both None and "")."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    text = item.get("text")
+    if isinstance(text, str) and (
+        item_type is None or item_type in ("text", "input_text", "output_text")
+    ):
+        return text
+    if item_type == "tool_use":
+        name = item.get("name")
+        if not isinstance(name, str):
+            name = "unknown"
+        desc = ""
+        inp = item.get("input")
+        if isinstance(inp, dict):
+            if isinstance(inp.get("description"), str):
+                desc = inp["description"]
+            elif isinstance(inp.get("file_path"), str):
+                desc = inp["file_path"]
+        return f"[Tool: {name} - {desc}]" if desc else f"[Tool: {name}]"
+    return None
+
+
+def _flatten_content(val):
+    """`utils.rs::flatten_content` -- string passthrough, array joined with a
+    single `\\n` dropping empty parts, anything else empty."""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        parts = []
+        for item in val:
+            text = _extract_content_part(item)
+            if text is None or text == "":
+                continue
+            parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _render_tool_result_content(content):
+    """`claude_code.rs::render_tool_result_content`. Takes `_MISSING` for an
+    absent `content` key so an EXPLICIT JSON `null` keeps serde_json's
+    `null` rendering instead of collapsing into the absent branch."""
+    if content is _MISSING:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return _flatten_content(content)
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+
+
 # claude_code: connector-internal event types that never become a DB row.
 CLAUDE_CODE_DROPPED_TYPES = {"attachment", "session", "summary"}
 
@@ -459,8 +535,10 @@ def build_candidates_claude_code(events):
                 )
                 emitted = True
             elif btype == "tool_result":
-                result_content = block.get("content")
-                text = result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False)
+                # R2-N14: the connector renders this block's `content` with
+                # `render_tool_result_content` (string passthrough / array
+                # flatten / serde_json display), never with `json.dumps`.
+                text = _render_tool_result_content(block.get("content", _MISSING))
                 candidates.append(
                     Candidate("tool_result", event_key, i, tool_call_id=block.get("tool_use_id"), text=text)
                 )
@@ -878,7 +956,130 @@ def selftest_cases(paths_cfg):
     return cases
 
 
-def run_selftest(paths_cfg) -> bool:
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _v2_stats():
+    """Minimal `stats` mapping for driving `process_session_v2` outside
+    `run_probe`. Only the counters that function actually touches are
+    present; a missing key here is a KeyError in the selftest, not a
+    silently-skipped assertion."""
+    return {
+        "hits_by_reason": Counter(),
+        "anchor3_opener": Counter(),
+        "content_mismatch_messages": 0,
+        "pairing_fail": Counter(),
+    }
+
+
+def _tool_result_fixture(result_block, db_content, agent_slug="claude_code",
+                         tool_name="Read", args=None):
+    """Build the minimal (conv, db_rows_full, raw_candidates) triple that
+    drives ONE claude_code tool_result DB row through the PRODUCTION entry
+    `process_session_v2` -- not through `decide` directly (任务书 #125
+    R2-N13: the production entry and the selftest must share one judgment
+    path). DB rows: a user turn boundary, the `tool_call` row carrying
+    `tool_call_id=t1`, and the `tool_result` row under test."""
+    if args is None:
+        args = {"file_path": "/home/ivan/projects/cc-workspace/MEMORY.md"}
+    call_event = {
+        "type": "assistant",
+        "uuid": "u1",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": tool_name, "input": args}],
+        },
+    }
+    result_event = {
+        "type": "user",
+        "uuid": "u2",
+        "message": {"role": "user", "content": [result_block]},
+    }
+    raw_candidates = build_candidates_claude_code([call_event, result_event])
+    conv = {
+        "id": 1,
+        "source_id": "local",
+        "agent_slug": agent_slug,
+        "external_id": "ext-1",
+        "source_path": "/src/ext-1.jsonl",
+    }
+    db_rows_full = [
+        (0, "user", _sha("turn boundary"), "turn boundary", None),
+        (1, "tool_call", _sha("call row"), "Read(...)", "t1"),
+        (2, "tool_result", _sha(db_content), db_content, "t1"),
+    ]
+    return conv, db_rows_full, raw_candidates
+
+
+def selftest_content_cases():
+    """Family B (任务书 #125, R1-N19 + R2-N14 + §〇 空正文): content
+    verification must go through the SAME connector projection and the SAME
+    ingest-side redactor that produced `messages.content`, and must compare
+    the whole body -- not a substring.
+
+    Each case is `(name, result_block, db_content, expect_entries,
+    expect_content_mismatch)` and is driven through `process_session_v2`."""
+    cases = []
+
+    # C1 (R1-N19): the mirror still holds the RAW secret; the DB holds the
+    # redacted form written by `redact_secrets::redact_text`. A substring
+    # gate can never accept this pair -- `token: [REDACTED]` does not occur
+    # anywhere in the raw mirror text.
+    cases.append((
+        "C1 redacted DB body vs raw mirror",
+        {"type": "tool_result", "tool_use_id": "t1",
+         "content": "token: AKIAIOSFODNN7EXAMPLE\ntail of the tool output"},
+        "token: [REDACTED]\ntail of the tool output",
+        1, 0,
+    ))
+
+    # C2 (R2-N14): a claude ARRAY-typed tool_result projects through the
+    # connector's `render_tool_result_content -> flatten_content` (single
+    # `\n` join, empty parts dropped) -- NOT `json.dumps`.
+    cases.append((
+        "C2 array tool_result projection",
+        {"type": "tool_result", "tool_use_id": "t1",
+         "content": [{"type": "text", "text": "L1"}, {"type": "text", "text": "L2"}]},
+        "L1\nL2",
+        1, 0,
+    ))
+
+    # C3 (§〇): an empty DB body whose mirror projection is ALSO empty stays
+    # a legitimate hit. The projection is empty when the block carries no
+    # `content` key at all (`render_tool_result_content(None) -> ""`).
+    cases.append((
+        "C3 empty DB body with empty mirror projection",
+        {"type": "tool_result", "tool_use_id": "t1"},
+        "",
+        1, 0,
+    ))
+
+    # C3b (R2-N14 appendix): an EXPLICIT JSON `null` `content` is NOT the same
+    # as an absent one -- Rust's `Some(value) => value.to_string()` renders it
+    # as the literal `null`, and the production DB body proves it. Pinned so
+    # the port cannot quietly collapse the two.
+    cases.append((
+        "C3b explicit null content renders as null",
+        {"type": "tool_result", "tool_use_id": "t1", "content": None},
+        "null",
+        1, 0,
+    ))
+
+    # C4 (§〇): an empty DB body whose mirror projection is NON-empty must no
+    # longer pass unconditionally -- that is a `content_mismatch`, and the
+    # message is dropped rather than frozen into the manifest.
+    cases.append((
+        "C4 empty DB body with non-empty mirror projection",
+        {"type": "tool_result", "tool_use_id": "t1", "content": "a real tool body"},
+        "",
+        0, 1,
+    ))
+
+    return cases
+
+
+def _run_decide_selftest(paths_cfg):
     cases = selftest_cases(paths_cfg)
     assert len(cases) == 22, f"selftest must have exactly 22 cases, got {len(cases)}"
     passed = 0
@@ -890,8 +1091,36 @@ def run_selftest(paths_cfg) -> bool:
         print(f"{'ok  ' if ok else 'FAIL'} {name} (expect={expect!r} got={got!r})")
         if ok:
             passed += 1
-    print(f"selftest: {passed}/{len(cases)}")
-    return passed == len(cases)
+    print(f"selftest/decide: {passed}/{len(cases)}")
+    return passed, len(cases)
+
+
+def _run_content_selftest(paths_cfg):
+    """Family B runner: every case goes through the PRODUCTION entry."""
+    cases = selftest_content_cases()
+    passed = 0
+    for name, result_block, db_content, expect_entries, expect_mismatch in cases:
+        conv, db_rows_full, raw_candidates = _tool_result_fixture(result_block, db_content)
+        stats = _v2_stats()
+        entries = process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats)
+        got = (len(entries), stats["content_mismatch_messages"])
+        want = (expect_entries, expect_mismatch)
+        ok = got == want
+        print(f"{'ok  ' if ok else 'FAIL'} {name} (expect={want} got={got})")
+        if ok:
+            passed += 1
+    print(f"selftest/content: {passed}/{len(cases)}")
+    return passed, len(cases)
+
+
+def run_selftest(paths_cfg) -> bool:
+    passed = total = 0
+    for runner in (_run_decide_selftest, _run_content_selftest):
+        p, t = runner(paths_cfg)
+        passed += p
+        total += t
+    print(f"selftest: {passed}/{total}")
+    return passed == total
 
 
 # ---------------------------------------------------------------------------
@@ -957,11 +1186,71 @@ def blob_has_compacted_event(events) -> bool:
 # ---------------------------------------------------------------------------
 # Per-session processing.
 # ---------------------------------------------------------------------------
-def content_substring_ok(db_content: str, candidate_text: str) -> bool:
-    core = db_content.strip()
-    if not core:
-        return True
-    return core in candidate_text
+# ---------------------------------------------------------------------------
+# Ingest-side redactor port (任务书 #125 §〇, R1-N19 + R2-N14).
+#
+# Mirrors `src/indexer/redact_secrets.rs`: `SECRET_PATTERNS` (:95) applied by
+# `apply_replacements` (:194) -- ASCENDING pattern-index order, one sequential
+# `replace_all` per pattern, replacement constant `[REDACTED]`. That ordering
+# is a frozen behaviour contract in Rust and is reproduced here verbatim.
+# `messages.content` is written as `redact_text(<connector projection>)`
+# (`indexer/mod.rs::map_to_internal_with_redactor`), so the mirror side of a
+# content comparison must go through this function to be comparable at all.
+#
+# ASSUMED INGEST CONFIGURATION: the frozen DB was ingested with the default
+# `CASS_REDACT_SECRETS` (redaction ON). Rust's `redaction_enabled()` gate is
+# deliberately NOT mirrored from the environment here -- doing so would make
+# this probe's output depend on the caller's shell, and the manifest has to
+# be reproducible: same DB + same mirror must yield the same manifest for
+# anyone. A DB ingested with redaction OFF simply fails the byte-equality
+# gate loudly, which is the intended, visible failure.
+# ---------------------------------------------------------------------------
+REDACTED = "[REDACTED]"
+
+_SECRET_PATTERNS = (
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"(?i)aws(.{0,20})?(secret|access)?[_-]?key\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{40}['\"]?",
+    r"\bgh[pousr]_[A-Za-z0-9]{36}\b",
+    r"\bsk-[A-Za-z0-9]{20,}\b",
+    r"\bsk-ant-[A-Za-z0-9]{20,}\b",
+    r"(?i)Bearer\s+[A-Za-z0-9_\-.]{20,}",
+    r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b",
+    r"-----BEGIN (?:RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----",
+    r"(?i)\b(postgres|postgresql|mysql|mongodb|redis)://[^\s]{8,}",
+    r"(?i)(api[_-]?key|api[_-]?secret|auth[_-]?token|access[_-]?token|secret[_-]?key|password|passwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{8,}['\"]?",
+    r"\bxox[bpsar]-[A-Za-z0-9\-]{10,}",
+    r"\b[spr]k_live_[A-Za-z0-9]{20,}",
+)
+
+_SECRET_REGEXES = tuple(re.compile(pattern) for pattern in _SECRET_PATTERNS)
+
+
+def redact_text(text: str) -> str:
+    """Rust `redact_secrets::redact_text`, including its RegexSet prefilter
+    (clean inputs take no replacement pass) and its ordered `replace_all`
+    semantics. `[REDACTED]` cannot itself re-trigger any pattern, so running
+    every pattern over the evolving string is equivalent to running only the
+    ones that matched the original input."""
+    if not any(regex.search(text) for regex in _SECRET_REGEXES):
+        return text
+    out = text
+    for regex in _SECRET_REGEXES:
+        out = regex.sub(REDACTED, out)
+    return out
+
+
+def content_body_ok(db_content: str, candidate_text: str) -> bool:
+    """R1-N19 + R2-N14 + §〇 (任务书 #125): the mirror side must be projected
+    by the connector and redacted by the ingest-side redactor, then compared
+    as a WHOLE against `messages.content` -- no substring test.
+
+    An empty DB body is no longer an unconditional pass: it is only a hit
+    when the mirror side is empty too. A body that production emptied for a
+    reason other than an empty source is a `content_mismatch` and stays out
+    of the manifest."""
+    if candidate_text is None:
+        return False
+    return redact_text(candidate_text) == db_content
 
 
 def compute_session_alignment(conv, db_rows, raw_candidates, events, stats):
@@ -1095,7 +1384,7 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
                 stats["pairing_fail"]["result_not_uniquely_in_mirror"] += 1
                 continue
             evidence = result_matches[0]
-            if not content_substring_ok(content, evidence.text):
+            if not content_body_ok(content, evidence.text):
                 stats["content_mismatch_messages"] += 1
                 continue
 
@@ -1120,7 +1409,7 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
             if first_user_cand is None:
                 stats["pairing_fail"]["anchor3_no_first_user_in_mirror"] += 1
                 continue
-            if not content_substring_ok(content, first_user_cand.text):
+            if not content_body_ok(content, first_user_cand.text):
                 stats["content_mismatch_messages"] += 1
                 continue
             opener = anchor3_shell_opener(content)
