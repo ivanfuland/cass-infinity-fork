@@ -557,17 +557,23 @@ def build_candidates_claude_code(events):
         if not isinstance(content, list):
             continue
 
-        # One event's content[] can carry several role-changing blocks (spec
-        # §一: 12 events project to user+tool_result two rows in the frozen
-        # corpus) -- emit one candidate per tool_use/tool_result block, and
-        # a single fallback candidate for a block-less (pure text) event.
-        emitted = False
+        # R9-N04 (任务书 #132, 控制面 2026-09-12 裁「完整对齐」): the authority
+        # is `claude_code_events_from_blob`, which emits an event's Text blocks
+        # as ONE `\n`-joined prose row FIRST, and then one row per non-Text
+        # block in array order. The pre-fix builder walked the array in order
+        # and gave every `text` block a row of its own, so `[tool_result, text]`
+        # came out `result, prose` (reversed) and a two-text event came out one
+        # row too long -- either way every later `raw.idx` in the session named
+        # the wrong event and correct candidates failed to rebuild.
+        prose_parts = []
+        first_text_index = None
+        per_block = []
         for i, block in enumerate(content):
             if not isinstance(block, dict):
                 continue
             btype = block.get("type")
             if btype == "tool_use":
-                candidates.append(
+                per_block.append(
                     Candidate(
                         "tool_call", event_key, i,
                         tool_call_id=block.get("id"),
@@ -576,27 +582,36 @@ def build_candidates_claude_code(events):
                         text=_tool_call_display_text(block.get("name"), block.get("input")),
                     )
                 )
-                emitted = True
             elif btype == "tool_result":
                 # R2-N14: the connector renders this block's `content` with
                 # `render_tool_result_content` (string passthrough / array
                 # flatten / serde_json display), never with `json.dumps`.
                 text = _render_tool_result_content(block.get("content", _MISSING))
-                candidates.append(
+                per_block.append(
                     Candidate("tool_result", event_key, i, tool_call_id=block.get("tool_use_id"), text=text)
                 )
-                emitted = True
             elif btype == "thinking":
                 # A thinking block gets its own DB row with role='reasoning',
                 # distinct from any sibling 'text' block's role='assistant'
                 # row in the same event (verified against real DB: `copy/`
                 # conversation_id=54, event idx 11/12).
-                candidates.append(Candidate("reasoning", event_key, i, text=block.get("thinking", "")))
-                emitted = True
+                per_block.append(Candidate("reasoning", event_key, i, text=block.get("thinking", "")))
             elif btype == "text":
-                candidates.append(Candidate(role, event_key, i, text=block.get("text", "")))
-                emitted = True
-        if not emitted:
+                if first_text_index is None:
+                    first_text_index = i
+                prose_parts.append(block.get("text", ""))
+        prose = "\n".join(prose_parts)
+        has_prose = bool(prose.strip())
+        if has_prose:
+            # The prose row's own block index is the first Text block's: the
+            # authority's `RawEvent` carries the event's whole block list, and
+            # the row is not a tool_result, so nothing downstream indexes it as
+            # a specific block.
+            candidates.append(
+                Candidate(role, event_key, 0 if first_text_index is None else first_text_index, text=prose)
+            )
+        candidates.extend(per_block)
+        if not has_prose and not per_block:
             # No recognized block type at all (image, redacted_thinking,
             # etc.) -- one candidate, role from the event, empty text; R1-R3
             # never match an empty/unrecognized candidate so this is a safe
@@ -627,10 +642,15 @@ def _codex_content_nonempty(payload):
     STRING `payload.content`/`payload.output` counts (the connector's
     `flatten_content` accepts it), and an array form counts when any element
     carries non-empty text -- an array of only empty-text blocks is zero real
-    messages, not one."""
-    value = payload.get("content")
-    if value is None:
-        value = payload.get("output")
+    messages, not one.
+
+    R9-N04 (任务书 #132): the fallback to `output` is `Option::or_else`, so it
+    fires only when the KEY IS ABSENT. An explicit JSON `null` `content` is
+    `Some(Null)` -- the connector's `payload.get("content").map(flatten_content)`
+    renders "" and the message is dropped. Reading a null as "missing" let
+    `content: null, output: "visible"` produce an empty-text candidate the
+    authority never emits, shifting every later `raw.idx` in the session."""
+    value = payload["content"] if "content" in payload else payload.get("output")
     if isinstance(value, str):
         return bool(value.strip())
     if isinstance(value, list):
@@ -744,7 +764,10 @@ def build_candidates_codex(events):
         if not isinstance(payload, dict):
             continue
         payload_id = payload.get("id") if isinstance(payload.get("id"), str) else None
-        event_key = payload_id or line_identity(ev)
+        # R9-N04: Rust's `.map(str::to_string).unwrap_or_else(...)` falls back
+        # only on a MISSING/non-string id -- `id: ""` is a (degenerate but
+        # real) identity and must not be replaced by `line:N`.
+        event_key = payload_id if payload_id is not None else line_identity(ev)
         call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else None
         name = payload.get("name") if isinstance(payload.get("name"), str) else None
 
@@ -769,7 +792,11 @@ def build_candidates_codex(events):
                 # Emptiness is judged on the EXTRACTED text, with
                 # `encrypted_content` as the other way to survive.
                 text = _codex_reasoning_text(payload)
-                if text.strip() or payload.get("encrypted_content") is not None:
+                # R9-N04: Rust's `.get("encrypted_content").is_some()` keeps the
+                # event when the key is PRESENT -- an explicit JSON `null` is
+                # `Some(Null)`, so `is not None` dropped an event the authority
+                # keeps.
+                if text.strip() or "encrypted_content" in payload:
                     candidates.append(Candidate("reasoning", event_key, 0, text=text))
             elif ptype in CODEX_TOOL_CALL_TYPES:
                 arguments = _codex_tool_call_arguments(payload, decode_json_string=True)
@@ -2358,6 +2385,117 @@ def _write_b07_fixture(root):
     return candidate, reference, manifest_path, mirror
 
 
+def _write_n04_claude_fixture(root):
+    """R9-N04's `valid_claude_raw_idx_mixed_event`, end to end.
+
+    A `[tool_result, text]` event. The AUTHORITY orders its rows prose-first, so
+    a correct candidate's marker records the result at `raw.idx=2` (call 0,
+    prose 1, result 2). The pre-fix builder ordered the same event the other way
+    (result 1, prose 2), so the marker named the prose row and the rebuild
+    failed with `candidate at raw.idx=2 is block 1, marker records blocks=[0]`
+    for a candidate that was right.
+    """
+    candidate = os.path.join(root, "n04-candidate.db")
+    reference = os.path.join(root, "n04-reference.db")
+    manifest_path = os.path.join(root, "n04-manifest.json")
+    mirror = os.path.join(root, "n04-mirror")
+    blob_rel = "blobs/blake3/n4/n4-mixed.raw"
+    blob_path = os.path.join(mirror, blob_rel)
+    os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+
+    body = _VERIFY_BODY
+    body_sha = hashlib.sha256(redact_text(body).encode("utf-8")).hexdigest()
+    redacted = {"redacted": True, "sha256": body_sha, "bytes": len(body.encode("utf-8"))}
+    call_event = {
+        "type": "assistant", "uuid": "n4-call",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Read", "id": "t1",
+             "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}}]},
+    }
+    mixed_dirty = {
+        "type": "user", "uuid": "n4-mixed",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": body},
+            {"type": "text", "text": "ordinary prose of the mixed event"}]},
+    }
+    mixed_clean = {
+        "type": "user", "uuid": "n4-mixed",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": redacted},
+            {"type": "text", "text": "ordinary prose of the mixed event"}]},
+    }
+    with open(blob_path, "w", encoding="utf-8") as handle:
+        for event in (call_event, mixed_dirty):
+            handle.write(json.dumps(event) + "\n")
+
+    marker = {
+        "reason": "context_file_read",
+        "rule_version": 1,
+        "bytes": len(body.encode("utf-8")),
+        "sha256": body_sha,
+        "fingerprint_blake3": "0" * 64,
+        "parse_error": None,
+        "anchor": {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None},
+        "src": None,
+        "raw": {"blob": blob_rel, "idx": 2, "event_key": "n4-mixed", "blocks": [0]},
+    }
+    rows = [
+        (0, "tool_call", 'Read({"file_path":"/srv/cc-workspace/MEMORY.md"})', {}),
+        (1, "user", "ordinary prose of the mixed event",
+         {"message": {"content": [{"type": "text", "text": "ordinary prose of the mixed event"}]}}),
+    ]
+    for path, with_excluded in ((reference, False), (candidate, True)):
+        conn = sqlite3.connect(path)
+        conn.executescript(_verify_schema(with_excluded))
+        if with_excluded:
+            conn.executescript(
+                "CREATE TABLE snippets(id INTEGER PRIMARY KEY, message_id INTEGER, snippet_text TEXT);"
+                "CREATE TABLE lex_docs(doc_id INTEGER PRIMARY KEY, content TEXT);"
+                "CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY, message_id INTEGER);"
+            )
+        conn.execute("INSERT INTO agents(id, slug, name, kind) VALUES (1, 'claude_code', 'Claude', 'cli')")
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+            "VALUES (1, 1, 'local', 'n04-ext-1', 'n04 mixed-event session', '/src/n04-ext-1.jsonl')"
+        )
+        for idx, role, content, extra in rows:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                [idx + 1, idx, role, content, msgpack.packb(extra, use_bin_type=True)],
+            )
+        if with_excluded:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin, excluded) "
+                "VALUES (3, 1, 2, 'tool_result', '', ?, jsonb(?))",
+                [msgpack.packb(mixed_clean, use_bin_type=True), json.dumps(marker)],
+            )
+        else:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (3, 1, 2, 'tool_result', ?, ?)",
+                [body, msgpack.packb(mixed_dirty, use_bin_type=True)],
+            )
+        conn.commit()
+        conn.close()
+
+    manifest = [{
+        "reason": "context_file_read",
+        "source_id": "local",
+        "agent_slug": "claude_code",
+        "external_id": "n04-ext-1",
+        "source_path": "/src/n04-ext-1.jsonl",
+        "idx": 2,
+        "sha256": body_sha,
+        "evidence": "mirror",
+        "event_key": "n4-mixed",
+        "blocks": [0],
+    }]
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    return candidate, reference, manifest_path, mirror
+
+
 def _verify_case(root, paths_cfg, expect_ok, want_substring, want_report=None, **flags):
     candidate, reference, manifest_path, mirror = _write_verify_fixture(root, **flags)
     report_path = os.path.join(root, "report.json")
@@ -2959,6 +3097,25 @@ def _run_verify_selftest(paths_cfg):
                 f"first={first!r} second={second!r} fresh={fresh!r}"
             )
 
+    # R9-N04 (任务书 #132): the mixed-event rebuild, end to end. The correct
+    # candidate's marker names the result's position in the AUTHORITY's row
+    # order (prose first); a builder that orders the same event the other way
+    # points that marker at the prose row and fails a candidate that is right.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_n04_claude_fixture(root)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        details = " | ".join(f"{label}: {detail}" for label, detail in failures)
+        if not failures and report["rebuild_ok"] == 1 and report["rebuild_sample"] == 1:
+            passed += 1
+            print("ok   N04 F a correct mixed-event marker rebuilds at its recorded raw.idx")
+        else:
+            print(
+                "FAIL N04 F a correct mixed-event marker rebuilds at its recorded raw.idx: "
+                f"failures={report['failures']!r} rebuild_ok={report['rebuild_ok']!r}/"
+                f"{report['rebuild_sample']!r} details={details!r}"
+            )
+
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
 
@@ -3013,7 +3170,64 @@ def codex_projection_selftest_cases():
         ("C response_item arms the old role filter rejected",
          c, [("user", "am_1"), ("user", "m_bare"), ("reasoning", "rs_enc"),
              ("assistant", "line:5")]),
+        # R9-N04 (任务书 #132): three arms the Python projection read with
+        # Python truthiness instead of the authority's Rust semantics.
+        ("N04 A an explicit `encrypted_content: null` still keeps the reasoning event",
+         ['{"type":"response_item","payload":{"type":"reasoning","id":"rs_null","summary":[],"encrypted_content":null}}'],
+         [("reasoning", "rs_null")]),
+        ("N04 B `id: \"\"` is an identity, not a missing id",
+         ['{"type":"response_item","payload":{"type":"message","id":"","role":"user","content":[{"type":"input_text","text":"hello"}]}}'],
+         [("user", "")]),
+        ("N04 C a null `content` does not fall back to `output`",
+         ['{"type":"response_item","payload":{"type":"message","id":"m_null","role":"user","content":null,"output":"visible"}}'],
+         []),
     ]
+
+
+def claude_projection_selftest_cases():
+    """R9-N04 (任务书 #132, 控制面 2026-09-12 裁「完整对齐」): the claude
+    candidate projection must be `claude_code_events_from_blob`'s row for row --
+    the event's Text blocks as ONE `\n`-joined prose row FIRST, then one row per
+    non-Text block in array order.
+
+    Each expected entry is `(role, block_index, text)`.
+    """
+    mixed = {"type": "user", "uuid": "u2", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "secret A"},
+        {"type": "text", "text": "ordinary prose"},
+    ]}}
+    two_text = {"type": "assistant", "uuid": "u3", "message": {"role": "assistant", "content": [
+        {"type": "text", "text": "first"},
+        {"type": "text", "text": "second"},
+    ]}}
+    return [
+        # The pre-fix builder walked the array in order, so this came out
+        # `result, prose` -- reversed against the authority, which emits the
+        # prose row first. Every later `raw.idx` in the session then named the
+        # wrong event and a CORRECT candidate failed to rebuild.
+        ("N04 D a [tool_result, text] event projects prose FIRST",
+         [mixed],
+         [("user", 1, "ordinary prose"), ("tool_result", 0, "secret A")]),
+        # ...and the Text blocks are ONE row, not one row each.
+        ("N04 E several text blocks collapse into one prose row",
+         [two_text],
+         [("assistant", 0, "first\nsecond")]),
+    ]
+
+
+def _run_claude_projection_selftest(paths_cfg):
+    passed = 0
+    total = 0
+    for name, events, want in claude_projection_selftest_cases():
+        total += 1
+        got = [(c.role, c.block_index, c.text) for c in build_candidates_claude_code(events)]
+        if got == want:
+            passed += 1
+            print(f"ok   {name}")
+        else:
+            print(f"FAIL {name}: want={want!r} got={got!r}")
+    print(f"selftest/claude_projection: {passed}/{total}")
+    return passed, total
 
 
 def _run_codex_projection_selftest(paths_cfg):
@@ -3039,6 +3253,7 @@ def run_selftest(paths_cfg) -> bool:
     for runner in (_run_decide_selftest, _run_content_selftest,
                    _run_pairing_selftest, _run_perf_selftest,
                    _run_report_selftest, _run_verify_selftest,
+                   _run_claude_projection_selftest,
                    _run_codex_projection_selftest):
         p, t = runner(paths_cfg)
         passed += p
