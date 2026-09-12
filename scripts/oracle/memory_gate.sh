@@ -561,9 +561,54 @@ ingested_sessions_of() {
   sqlite3 "$1" "SELECT COUNT(*) FROM conversations;" 2>/dev/null || echo 0
 }
 
+# R7-2 (#124, control-plane adversarial review of #123, blocker class: false
+# green): the frozen manifest's identity has to cover how much of the fixture
+# actually reached the database, not just the bytes on disk. `fixture_sha256`
+# is the sorted concatenation of every `*.jsonl` with no path or length
+# framing, so splitting one session file into a scanned half plus an
+# unscanned `z-unscanned/rest.jsonl` leaves the hash identical while the
+# connector ingests only the scanned half -- a smaller workload would then
+# inherit the bigger fixture's P0 budget. `messages` and `total_bytes` are
+# already frozen in the manifest, and both are read back from the stage db
+# with the same accounting `examples/w4_memory_fixture.rs` used to freeze
+# them (one row per message, `byte_len` content bytes each); measured equal
+# for shapes a/b/c on 2026-09-11. Fail-loud exit 2, the same class as a
+# fixture-hash mismatch: a stage db that does not hold the fixture under test
+# is a precondition failure, not a stage failure.
+check_ingest_totals() {
+  # $1=stage db path $2=manifest.json path
+  local db="$1" manifest="$2"
+  local manifest_messages manifest_total_bytes totals db_messages db_total_bytes
+  manifest_messages=$(manifest_field "$manifest" messages) || return 2
+  manifest_total_bytes=$(manifest_field "$manifest" total_bytes) || return 2
+  if ! totals=$(sqlite3 "$db" "SELECT COUNT(*), COALESCE(SUM(length(CAST(content AS BLOB))), 0) FROM messages;"); then
+    echo "memory_gate: cannot read message totals from $db" >&2
+    return 2
+  fi
+  db_messages="${totals%%|*}"
+  db_total_bytes="${totals##*|}"
+  if [ "$db_messages" = "$totals" ] || [ -z "$db_messages" ] || [ -z "$db_total_bytes" ]; then
+    echo "memory_gate: cannot parse message totals from $db (sqlite3 printed '$totals')" >&2
+    return 2
+  fi
+  if [ "$db_messages" != "$manifest_messages" ] || [ "$db_total_bytes" != "$manifest_total_bytes" ]; then
+    echo "memory_gate: the stage db holds $db_messages message(s) / $db_total_bytes content byte(s), which is not the ingested workload the fixture manifest describes ($manifest_messages message(s) / $manifest_total_bytes content byte(s)) -- refusing to measure a workload the P0 baseline was not collected on" >&2
+    return 2
+  fi
+}
+
 binary_sha256_of() {
   sha256sum "$1" 2>/dev/null | awk '{print $1}'
 }
+
+# R7-2 (#124): tests/w6_memory_gate_selfcheck.rs exercises
+# `check_ingest_totals` directly, which means sourcing this file for its
+# functions. Sourcing must not fall through into the dispatch below: its
+# `usage` calls `exit 2`, which would kill the caller's shell instead of
+# handing it the function.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 # ---------------------------------------------------------------------
 # CLI dispatch.
@@ -694,6 +739,12 @@ if [ "$ingested" != "$expected_sessions" ]; then
   echo "memory_gate: stage 1 ingested_sessions=$ingested, expected=$expected_sessions (T4-F7)" >&2
   overall_rc=1
 fi
+
+# R7-2 (#124): `ingested_sessions` counts conversations; the fixture's own
+# message count and content-byte total are the two numbers that actually
+# bound the workload the P0 budget was collected on. Stages 2-4 measure the
+# same data dir, so this runs before any of them.
+check_ingest_totals "$data_dir/agent_search.db" "$manifest" || exit 2
 
 budget2=$(budget_for index_force_rebuild) || exit 2
 run_stage "$shape" "index_force_rebuild" "$budget2" "" "$binary_sha256" "$fixture_sha256" \

@@ -165,3 +165,90 @@ fn judge_mode_rejects_empty_input_with_exit_2() {
     assert_eq!(output.status.code(), Some(2), "stderr={stderr}");
     assert!(stderr.contains("empty input"), "expected the dedicated empty-input message, got: {stderr}");
 }
+
+/// Source the gate for one function call and run
+/// `check_ingest_totals <db> <manifest>`. Sourcing is what the guard added
+/// at the top of the CLI dispatch makes safe: without it the sourced file
+/// would fall through into `usage; exit 2` and kill this shell.
+fn run_check_ingest_totals(db: &std::path::Path, manifest: &std::path::Path) -> std::process::Output {
+    Command::new("bash")
+        .arg("-c")
+        .arg(". \"$1\"; check_ingest_totals \"$2\" \"$3\"")
+        .arg("--")
+        .arg(gate_script())
+        .arg(db)
+        .arg(manifest)
+        .output()
+        .expect("spawn bash -c 'source memory_gate.sh; check_ingest_totals ...'")
+}
+
+/// R7-2 (#124, control-plane adversarial review of #123, blocker class:
+/// false green). The fixture hash is a sorted concatenation of every
+/// `*.jsonl` with no path or length framing, so splitting one session file
+/// into a scanned half plus an unscanned `z-unscanned/rest.jsonl` keeps the
+/// hash identical while the connector ingests only the scanned half -- a
+/// smaller workload inheriting a bigger fixture's P0 budget. The two totals
+/// the manifest already freezes (message count, content bytes; verified
+/// equal to `COUNT(*)` and `SUM(length(CAST(content AS BLOB)))` of a real
+/// stage db for all three shapes) are now compared after stage 1.
+#[test]
+fn ingest_totals_must_match_the_manifest_before_stages_run() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = tmp.path().join("agent_search.db");
+    let manifest = tmp.path().join("manifest.json");
+    // 2 messages, 3 + 5 = 8 content bytes.
+    let sqlite = Command::new("sqlite3")
+        .arg(&db)
+        .arg("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT); INSERT INTO messages(id, content) VALUES (1, 'abc'), (2, 'defgh');")
+        .output()
+        .expect("run sqlite3 to build the mini stage db");
+    assert!(
+        sqlite.status.success(),
+        "sqlite3 could not build the mini db: {}",
+        String::from_utf8_lossy(&sqlite.stderr)
+    );
+
+    // ① control first: an honest manifest passes. Asserted before the two
+    // mismatch cases so that the check being *absent* (or unreachable the
+    // way the gate's own dispatch makes it) fails here, on the semantic
+    // claim, rather than on a message string.
+    std::fs::write(&manifest, r#"{"messages": 2, "total_bytes": 8}"#).unwrap();
+    let out = run_check_ingest_totals(&db, &manifest);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a db holding exactly what the manifest describes must pass: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ② the reviewer's shape: a manifest claiming more messages than the db
+    // actually holds (the unscanned-half rewrite, reduced to its numbers).
+    std::fs::write(&manifest, r#"{"messages": 10, "total_bytes": 8}"#).unwrap();
+    let out = run_check_ingest_totals(&db, &manifest);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a db holding 2 of the manifest's 10 messages must fail loud, not run the stages: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("not the ingested workload the fixture manifest describes"),
+        "expected the ingest-totals mismatch message, got: {stderr}"
+    );
+
+    // ③ the byte total is a separate claim: same message count, different
+    // bytes must fail too (a trimmed message body is the same attack with a
+    // smaller delta).
+    std::fs::write(&manifest, r#"{"messages": 2, "total_bytes": 9}"#).unwrap();
+    let out = run_check_ingest_totals(&db, &manifest);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a db holding 8 of the manifest's 9 content bytes must fail loud: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("8 content byte(s)"),
+        "expected the byte total to be named in the mismatch, got: {stderr}"
+    );
+}
