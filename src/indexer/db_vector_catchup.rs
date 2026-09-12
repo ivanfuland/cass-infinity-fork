@@ -1672,11 +1672,17 @@ pub fn run_db_vector_catchup_backfill(
     // R6-N10 (#123): the `?` operators inside the loop (a batched embed
     // failure, span slicing, any transaction error) return from this
     // function without reaching that explicit `set(false)`, leaving this
-    // thread-local flag set for the rest of the thread's life -- and the
-    // next drain on the same thread would then count its
-    // reverse-reconciliation reads as drain-phase reads. The guard clears
-    // it on every exit; the explicit `set(false)` below still ends the
-    // *phase* at the same point it always did, which is a different job.
+    // thread-local flag set after the drain has already returned.
+    // R7-9 (#124): what that leaks into is bounded -- the flag stays set
+    // until this thread next runs a drain *to completion*, which clears it
+    // unconditionally at the `set(false)` below, *before* that drain's own
+    // reverse reconciliation, so a later drain's reconciliation is not
+    // counted as drain-phase (the earlier wording here overclaimed that).
+    // What the leak does do is count every `load_message_once` on this
+    // thread in the meantime as a drain-phase read, including reads that
+    // have nothing to do with a drain. The guard clears the flag on every
+    // exit; the explicit `set(false)` below still ends the *phase* at the
+    // same point it always did, which is a different job.
     #[cfg(test)]
     let _drain_phase_reset_guard = {
         DRAIN_PHASE.with(|c| c.set(true));
@@ -2313,10 +2319,11 @@ mod chunk_catchup_v5_tests {
     /// return out of this function. An injected embedder failure is one
     /// such exit (the same shape a real one takes: the batched embed call
     /// propagates with `?`), so the flag must be back to `false` by the
-    /// time the failure reaches the caller -- otherwise the next drain on
-    /// this thread counts its own reverse-reconciliation reads as
-    /// drain-phase reads (the thread-local cousin of the process-global
-    /// counter `reset_load_message_calls_for_test` already guards against).
+    /// time the failure reaches the caller -- otherwise, until this thread
+    /// next runs a drain to completion, every `load_message_once` on it is
+    /// counted as a drain-phase read, including reads made outside any drain
+    /// (the thread-local cousin of the process-global counter
+    /// `reset_load_message_calls_for_test` already guards against).
     #[test]
     fn drain_phase_is_cleared_when_the_drain_returns_early() {
         let dir = tempfile::TempDir::new().unwrap();
