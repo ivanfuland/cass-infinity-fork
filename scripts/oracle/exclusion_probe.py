@@ -1565,7 +1565,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           leak_multiline_body=False, short_body=False,
                           missing_nonmanifest_row=False, wrong_raw_idx=False,
                           wrong_marker_sha=False, project_read_anchor=False,
-                          legit_sibling_redaction=False):
+                          legit_sibling_redaction=False, compact_extra_no_body=False,
+                          candidate_only_row=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1631,6 +1632,11 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 [boundary_content, msgpack.packb(boundary, use_bin_type=True)],
             )
         candidate_extra = _verify_extra(redacted if with_excluded else body_text)
+        if compact_extra_no_body:
+            # N-fam2: the "compact" shape the frozen corpus has for ~31% of
+            # rows -- prior compression left only these keys, so NO field ever
+            # carried the body and the two sides' extras are byte-identical.
+            candidate_extra = {"raw_role": "tool_result", "tool_call_id": "t1"}
         if with_excluded and non_target_cleared:
             # A change that is NOT a redacted placeholder (an extra block the
             # reference library does not have).
@@ -1649,6 +1655,13 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
                 ["sibling turn", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if candidate_only_row and with_excluded:
+            # N-fam2: a row only the CANDIDATE has (a newer library).
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 4, 'user', ?, ?)",
+                ["a newer session row", msgpack.packb({"message": {"content": [{"type": "text", "text": "newer"}]}}, use_bin_type=True)],
             )
         if legit_sibling_redaction:
             # N02 (任务书 #131): a SECOND row carrying the same event, with the
@@ -1771,6 +1784,9 @@ def verify_selftest_cases():
         # N02 (任务书 #131): an ordinary row sharing the excluded row's event
         # legitimately carries the same redacted target block.
         ("V12 a legit sibling redaction passes", True, ""),
+        # N-fam2 (任务书 #131 追加): zero diff is not a failure when no copy of
+        # the body was ever in the extra (the corpus' compact shape).
+        ("V13 an unchanged extra with no body anywhere passes", True, ""),
     ]
 
 
@@ -1799,6 +1815,7 @@ def _run_verify_selftest(paths_cfg):
             9: {"wrong_marker_sha": True},
             10: {"project_read_anchor": True},
             11: {"legit_sibling_redaction": True},
+            12: {"compact_extra_no_body": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -1854,6 +1871,37 @@ def _run_verify_selftest(paths_cfg):
             print("ok   N10 logical_source counts an opencode session")
         else:
             print(f"FAIL N10 logical_source counts an opencode session: got {got!r}, want 1")
+
+    # N-fam2 (任务书 #131 追加): a row only the candidate has is recorded, not
+    # failed -- the candidate is a newer library.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root, candidate_only_row=True)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        details = " | ".join(detail for _label, detail in failures)
+        if report.get("candidate_only_rows") == 1 and not failures:
+            passed += 1
+            print("ok   N-fam2 a candidate-only row is recorded, not failed")
+        else:
+            print(
+                f"FAIL N-fam2 a candidate-only row is recorded, not failed: "
+                f"candidate_only_rows={report.get('candidate_only_rows')!r} failures={details!r}"
+            )
+
+    # N-fam2, the other half: the zero-diff compact row must also be counted.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root, compact_extra_no_body=True)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        details = " | ".join(detail for _label, detail in failures)
+        if report.get("extra_unchanged_no_body") == 1 and not failures:
+            passed += 1
+            print("ok   N-fam2 an unchanged extra with no body is counted, not failed")
+        else:
+            print(
+                f"FAIL N-fam2 an unchanged extra with no body is counted, not failed: "
+                f"extra_unchanged_no_body={report.get('extra_unchanged_no_body')!r} failures={details!r}"
+            )
 
     # N-fam (任务书 #131, 控制面追加): a run that reports tens of thousands of
     # failures must be reducible to families, not just to a total.
@@ -3209,6 +3257,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     manifest = json.load(open(manifest_path, encoding="utf-8"))
     failures = []
     sha_binding_mismatch = 0
+    extra_unchanged_no_body = 0
+    candidate_only_rows = 0
     for entry in manifest:
         label = f"{entry['agent_slug']}/{entry['reason']}/idx={entry['idx']}"
         row = _fetch_row(conn_cand, sql_cand, entry, entry["idx"])
@@ -3254,7 +3304,19 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             diffs = _diff_paths(cand_extra, ref_extra)
             cleared = [d for d in diffs if _is_redacted_placeholder(d[1], sha)]
             if not diffs:
-                failures.append((label, "the excluded block is still present in extra_bin"))
+                # N-fam2 (任务书 #131 追加, 控制面 on T6-b new6): zero diff is
+                # NOT a failure by itself. An exclusion whose event never
+                # carried the body in `extra` (the ~31% "compact" shape: the
+                # reference and candidate extras are byte-identical, 59 bytes,
+                # no body anywhere) has nothing to redact, yet the pre-fix
+                # judge called every such row "the excluded block is still
+                # present in extra_bin". The failure condition is that the
+                # body is STILL THERE -- which is exactly what the recursive
+                # leaf check above decides.
+                if _extra_carries_body(cand_extra, ref_row["content"]):
+                    failures.append((label, "the excluded block is still present in extra_bin"))
+                else:
+                    extra_unchanged_no_body += 1
             elif len(cleared) != len(diffs):
                 stray = [d[0] for d in diffs if d not in cleared]
                 failures.append(
@@ -3365,11 +3427,16 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             manifest_by_event,
         ):
             failures.append((label, "non-manifest extra_bin differs from reference"))
-    for key, _row in cand_rows.items():
+    for key in cand_rows:
         if key not in ref_rows:
-            failures.append(
-                (f"{key[0]}/idx={key[2]}", "non-manifest row is not in the reference library")
-            )
+            # N-fam2 (任务书 #131 追加): the candidate is a NEWER library than
+            # the reference snapshot (T6-b: 5,439 sessions today against
+            # 5,112 on 2026-09-05), so rows the reference simply does not have
+            # yet are expected -- counting them as failures produced ~82k of
+            # them in one real run. They are still RECORDED, because a large
+            # jump is worth seeing; only "the candidate lost something the
+            # reference has" is a failure.
+            candidate_only_rows += 1
 
     # Sampled rebuilds.
     rng = random.Random(seed)
@@ -3402,6 +3469,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "rebuild_sample": len(sample),
         "rebuild_ok": rebuilt,
         "sha_binding_mismatch": sha_binding_mismatch,
+        "extra_unchanged_no_body": extra_unchanged_no_body,
+        "candidate_only_rows": candidate_only_rows,
         "failure_families": dict(sorted(Counter(failure_family(detail) for _label, detail in failures).items())),
         "failures": len(failures),
     }
@@ -3525,6 +3594,13 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
     if failures:
         families = Counter(failure_family(detail) for _label, detail in failures)
         print("verify: failure families: " + ", ".join(f"{name}={count}" for name, count in families.most_common()))
+    informational = {
+        key: report[key]
+        for key in ("extra_unchanged_no_body", "candidate_only_rows")
+        if key in report
+    }
+    if any(informational.values()):
+        print("verify: informational (not failures): " + ", ".join(f"{k}={v}" for k, v in informational.items()))
     print(
         f"verify: manifest={report['manifest_entries']} "
         f"non_manifest_rows={report['non_manifest_rows_checked']} "
