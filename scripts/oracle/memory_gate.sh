@@ -707,7 +707,14 @@ run_stage "$shape" "index_semantic" "$budget3" "" "$binary_sha256" "$fixture_sha
 
 stage4_db="${STAGE4_DB:-$data_dir-stage4/agent_search.db}"
 budget4=$(budget_for completeness_gate) || exit 2
-run_stage "$shape" "completeness_gate" "$budget4" "" "$binary_sha256" "$fixture_sha256" \
+# R6-N3 (#123): stage 4 executes $EXAMPLES/w4_completeness_gate, not the
+# candidate -- recording $binary_sha256 here misidentified the measured
+# program (#122b-3c fixed exactly this wrapper-vs-binary confusion for the
+# stages that *do* run the candidate; stage 4 was left behind). Hash the
+# binary this stage actually runs.
+gate_sha256=$(binary_sha256_of "$EXAMPLES/w4_completeness_gate")
+[ -n "$gate_sha256" ] || { echo "memory_gate: cannot hash the stage 4 binary under test: $EXAMPLES/w4_completeness_gate" >&2; exit 2; }
+run_stage "$shape" "completeness_gate" "$budget4" "" "$gate_sha256" "$fixture_sha256" \
   "$RUN_ROOT/mem-${shape}-stage4.json" \
   "$EXAMPLES/w4_completeness_gate" --db "$stage4_db" --json "$RUN_ROOT/mem-${shape}-completeness.json" || overall_rc=1
 
