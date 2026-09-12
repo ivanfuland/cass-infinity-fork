@@ -1019,6 +1019,10 @@ struct NonWatchIngestOutcome {
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
+    /// R3-N5 (任务书 #129): conversations this batch refused to insert (an
+    /// unusable excluded fingerprint). Carried up so the consumer reports
+    /// them as scan errors for their connector.
+    skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
 }
 
 impl NonWatchIngestOutcome {
@@ -1038,6 +1042,11 @@ impl NonWatchIngestOutcome {
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
+            skipped_conversations: {
+                let mut skipped = self.skipped_conversations;
+                skipped.extend(other.skipped_conversations);
+                skipped
+            },
         }
     }
 }
@@ -7814,7 +7823,7 @@ fn run_streaming_consumer(
 
                 // Ingest the combined batch (== original single batch when
                 // combine_enabled = false or no extras were drained).
-                let batch_outcome = ingest_non_watch_batch_with_oom_split(
+                let batch_result = ingest_non_watch_batch_with_oom_split(
                     storage,
                     data_dir,
                     &combined_conversations,
@@ -7824,7 +7833,33 @@ fn run_streaming_consumer(
                     progress_bump,
                 );
                 flow_limiter.release(combined_byte_reservation);
-                ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
+                // R3-N5 (任务书 #129): conversations this batch skipped (an
+                // unusable excluded fingerprint) are a scan error for the
+                // connector -- the same accounting the ScanError arm below
+                // does, since the pass did not fully succeed for it. The rest
+                // of the batch landed normally, so this does NOT return Err.
+                let skipped_in_batch = batch_result
+                    .as_ref()
+                    .map_or(0, |outcome| outcome.skipped_conversations.len());
+                ingest_outcome = ingest_outcome.accumulate(batch_result?);
+                if skipped_in_batch > 0 {
+                    ingest_outcome.scan_had_errors = true;
+                    failed_scan_connectors.insert(connector_name.to_string());
+                    let stats = connector_stats
+                        .entry(connector_name.to_string())
+                        .or_insert_with(|| ConnectorStats {
+                            name: connector_name.to_string(),
+                            ..Default::default()
+                        });
+                    stats.error = Some(format!(
+                        "{skipped_in_batch} conversation(s) skipped: an excluded fingerprint is unusable"
+                    ));
+                    tracing::warn!(
+                        connector = connector_name,
+                        skipped = skipped_in_batch,
+                        "streaming batch skipped conversations whose excluded fingerprint is unusable"
+                    );
+                }
 
                 // For tracing parity with the per-message path, use the
                 // first batch's connector_name + the combined totals.
@@ -12167,6 +12202,7 @@ fn ingest_batch_detailed(
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
+        skipped_conversations: batch_outcome.skipped_conversations,
     })
 }
 
@@ -12339,8 +12375,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             quarantined_conversations: 0,
             deferred_conversations: 1,
             lexical_update_deferred: true,
-            scanned_connectors: BTreeSet::new(),
-            scan_had_errors: false,
+            ..NonWatchIngestOutcome::default()
         });
     }
 
@@ -12363,8 +12398,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         quarantined_conversations: 1,
         deferred_conversations: 0,
         lexical_update_deferred: true,
-        scanned_connectors: BTreeSet::new(),
-        scan_had_errors: false,
+        ..NonWatchIngestOutcome::default()
     })
 }
 
@@ -17086,6 +17120,12 @@ pub mod persist {
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
         pub lexical_update_deferred: bool,
         pub lexical_update_error: Option<String>,
+        /// R3-N5 (任务书 #129): conversations this batch refused to insert
+        /// because an excluded marker's `fingerprint_blake3` is unusable.
+        /// They are not an error for the batch (the rest commits), but the
+        /// connector's scan must report a skipped session, so callers turn
+        /// each of these into a `ScanError`.
+        pub skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
     }
 
     impl PersistBatchOutcome {
@@ -17129,6 +17169,7 @@ pub mod persist {
                     self.lexical_update_error = other.lexical_update_error;
                 }
             }
+            self.skipped_conversations.extend(other.skipped_conversations);
         }
     }
 
@@ -18276,7 +18317,7 @@ pub mod persist {
             )
             .collect();
 
-        let outcomes = with_ephemeral_writer(
+        let (outcomes, skipped_conversations) = with_ephemeral_writer(
             storage,
             defer_checkpoints,
             "serial batched indexing",
@@ -18333,20 +18374,46 @@ pub mod persist {
                     prepared.iter().map(|(a, w, c)| (*a, *w, c)).collect();
                 let chunk_size = serial_batch_chunk_size().min(refs.len().max(1));
                 let mut outcomes = Vec::with_capacity(refs.len());
+                // R3-N5 (任务书 #129): a conversation the batch refuses
+                // (unusable excluded fingerprint) is skipped and reported
+                // instead of failing the whole chunk.
+                let mut skipped: Vec<crate::storage::sqlite::BatchSkippedConversation> = Vec::new();
 
                 for start in (0..refs.len()).step_by(chunk_size) {
                     let end = (start + chunk_size).min(refs.len());
                     let chunk_refs = &refs[start..end];
-                    outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    let mut chunk_skipped = Vec::new();
+                    outcomes.extend(
+                        writer.insert_conversations_batched_reporting(chunk_refs, &mut chunk_skipped)?,
+                    );
+                    for mut skip in chunk_skipped {
+                        // The reporting call reports positions within ITS
+                        // slice; lift them back to `refs`/`convs` positions.
+                        skip.index += start;
+                        skipped.push(skip);
+                    }
                 }
 
-                Ok(outcomes)
+                Ok((outcomes, skipped))
             },
         )?;
         let mut batch_outcome = PersistBatchOutcome::default();
+        // R3-N5 (任务书 #129): `record_persisted_raw_mirror_db_links` pairs
+        // conversations with outcomes POSITIONALLY, so a skipped conversation
+        // left in the list would shift every later conversation's db_link
+        // onto its neighbour. Drop the skipped ones from the conversation
+        // side instead -- they were never inserted, so they have no link to
+        // record.
+        let skipped_positions: std::collections::HashSet<usize> =
+            skipped_conversations.iter().map(|skip| skip.index).collect();
+        batch_outcome.skipped_conversations = skipped_conversations;
         record_persisted_raw_mirror_db_links(
             raw_mirror_data_dir,
-            convs.iter().map(|p| &p.conv),
+            convs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !skipped_positions.contains(index))
+                .map(|(_, prepared)| &prepared.conv),
             &outcomes,
         );
         for outcome in &outcomes {
@@ -34956,6 +35023,132 @@ mod tests {
             large_keys.len() < small_keys.len(),
             "a session above the compact threshold must drop the raw envelope keys a below-threshold one keeps; \
              large={large_keys:?} small={small_keys:?}"
+        );
+    }
+
+    /// R3-N5 (任务书 #129): the A/B/C batch judge, through the production
+    /// persist entry point. Three conversations go into ONE batch; B's
+    /// excluded marker has an illegal `fingerprint_blake3`.
+    ///   - A and C must land, B must not;
+    ///   - the batch must report exactly one skip, naming B's position and
+    ///     its source path;
+    ///   - the raw-mirror db link recorded for A and for C must carry THAT
+    ///     conversation's own id. This is the trap the ledger called out:
+    ///     `record_persisted_raw_mirror_db_links` pairs conversations with
+    ///     outcomes POSITIONALLY, so skipping B without also dropping it from
+    ///     the conversation side silently attributes C's outcome to B (and
+    ///     shifts everything after it) -- a silent data-attribution bug, not
+    ///     a failure.
+    #[test]
+    fn batched_insert_skips_only_the_conversation_with_an_unusable_fingerprint() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef, PreparedConversation};
+
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
+            .expect("open storage");
+
+        let mut convs: Vec<PreparedConversation> = Vec::new();
+        for (label, illegal) in [("a", false), ("b", true), ("c", false)] {
+            let source_path = temp.path().join(format!("rollout-r3n5-{label}.jsonl"));
+            std::fs::write(&source_path, format!("{{\"type\":\"message\",\"text\":\"{label}\"}}\n"))
+                .expect("write source");
+            let mut conv = norm_conv(Some(&format!("r3-n5-{label}")), vec![norm_msg(0, 1_000)]);
+            conv.agent_slug = "codex".to_string();
+            conv.source_path = source_path;
+            inject_provenance(&mut conv, &Origin::local());
+            attach_raw_mirror_capture(&data_dir, &mut conv).expect("raw-mirror capture");
+            let marker = illegal.then(|| ExcludedMarker {
+                reason: ExclusionReason::CassRecall,
+                rule_version: 1,
+                bytes: 4,
+                sha256: "a".repeat(64),
+                // Illegal: not hex, not 32 bytes -- the shape R2-B7 turned
+                // from a process abort into an `Err`.
+                fingerprint_blake3: "zz".to_string(),
+                anchor: ExclusionAnchor::default(),
+                src: None,
+                parse_error: None,
+                raw: RawRef {
+                    blob: "blobs/blake3/ab/abcd.raw".into(),
+                    idx: 0,
+                    event_key: "ek-0".into(),
+                    blocks: vec![0],
+                },
+            });
+            convs.push(PreparedConversation { conv, excluded: vec![marker] });
+        }
+
+        let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+            &storage,
+            &data_dir,
+            &convs,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+        )
+        .expect("a batch is not failed by one unusable excluded fingerprint");
+
+        assert_eq!(
+            outcome.skipped_conversations.len(),
+            1,
+            "exactly the illegal conversation must be reported as skipped: {:?}",
+            outcome.skipped_conversations
+        );
+        let skipped = &outcome.skipped_conversations[0];
+        assert_eq!(skipped.index, 1, "the skip must carry its own position in the input slice");
+        assert_eq!(skipped.external_id.as_deref(), Some("r3-n5-b"));
+        assert!(
+            skipped.source_path.contains("rollout-r3n5-b.jsonl"),
+            "the skip must name the session it dropped: {skipped:?}"
+        );
+        assert_eq!(outcome.inserted_conversations, 2, "A and C must both land");
+
+        let conversation_id_for = |external_id: &str| -> Option<i64> {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT id FROM conversations WHERE external_id = ?1",
+                    &[ParamValue::from(external_id)],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .ok()
+        };
+        let a_id = conversation_id_for("r3-n5-a").expect("A must be in the database");
+        let c_id = conversation_id_for("r3-n5-c").expect("C must be in the database");
+        assert!(
+            conversation_id_for("r3-n5-b").is_none(),
+            "B's rows must not be in the database at all"
+        );
+
+        // The capture itself leaves a placeholder link with a null
+        // conversation id, so the assertion looks at every NON-NULL id the
+        // manifest ended up carrying.
+        let db_link_conversation_ids = |conv: &crate::indexer::exclusion::PreparedConversation| -> Vec<i64> {
+            let relative = conv.conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
+                .as_str()
+                .expect("manifest relative path")
+                .to_string();
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(data_dir.join("raw-mirror/v1").join(relative)).expect("read manifest"),
+            )
+            .expect("manifest json");
+            manifest["db_links"]
+                .as_array()
+                .expect("db_links array")
+                .iter()
+                .filter_map(|link| link["conversation_id"].as_i64())
+                .collect()
+        };
+        assert_eq!(
+            db_link_conversation_ids(&convs[0]),
+            vec![a_id],
+            "A's manifest must record A's conversation id, and only that"
+        );
+        assert_eq!(
+            db_link_conversation_ids(&convs[2]),
+            vec![c_id],
+            "C's manifest must record C's OWN conversation id -- a positional shift caused by B's skipped outcome would put B's or A's id here instead"
         );
     }
 

@@ -4125,6 +4125,18 @@ pub struct InsertOutcome {
     pub inserted_indices: Vec<i64>,
 }
 
+/// R3-N5 (任务书 #129): one conversation a batch refused to insert, with the
+/// position it held in the caller's slice -- callers pair outcomes with their
+/// own conversation lists positionally (raw-mirror db links do exactly that),
+/// so a skip has to be reported with its index rather than just omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchSkippedConversation {
+    pub index: usize,
+    pub source_path: String,
+    pub external_id: Option<String>,
+    pub error: String,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct MessageInsertSubstageProfile {
@@ -4372,6 +4384,22 @@ fn fingerprint_hash_for(content: &str, excluded: Option<&crate::indexer::exclusi
 /// in-memory (already-a-`Message`) call sites.
 fn fingerprint_hash(msg: &Message) -> anyhow::Result<[u8; 32]> {
     fingerprint_hash_for(&msg.content, msg.excluded.as_ref())
+}
+
+/// R3-N5 (任务书 #129): the reason this conversation cannot be inserted at
+/// all, if any -- one of its messages carries an `excluded` marker whose
+/// `fingerprint_blake3` is not 32-byte hex. Exactly the check
+/// [`fingerprint_hash_for`] performs, run before the transaction so one bad
+/// conversation costs only itself (R2-B7 turned this from a `panic` into an
+/// `Err`; this keeps that `Err` from taking every sibling conversation's
+/// insert down with it).
+fn uninsertable_excluded_fingerprint_error(conv: &Conversation) -> Option<String> {
+    conv.messages.iter().find_map(|msg| {
+        msg.excluded
+            .as_ref()
+            .and_then(|_| fingerprint_hash_for(&msg.content, msg.excluded.as_ref()).err())
+            .map(|error| format!("message idx {}: {error:#}", msg.idx))
+    })
 }
 
 /// R2-B7 (任务书 #119a): a `fingerprint_hash` failure means either `apply()`
@@ -9163,9 +9191,59 @@ impl FrankenStorage {
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
     ) -> Result<Vec<InsertOutcome>> {
+        let mut skipped = Vec::new();
+        let outcomes = self.insert_conversations_batched_reporting(conversations, &mut skipped)?;
+        for skip in &skipped {
+            tracing::warn!(
+                source_path = %skip.source_path,
+                external_id = ?skip.external_id,
+                error = %skip.error,
+                "skipping one conversation: its excluded fingerprint is unusable"
+            );
+        }
+        Ok(outcomes)
+    }
+
+    /// R3-N5 (任务书 #129): the batch entry point that also reports the
+    /// conversations it refused. `insert_conversations_batched` is a thin
+    /// delegate over this (log-and-drop), so the ~40 existing call sites keep
+    /// their signature while the ingest path gets the per-session report it
+    /// needs to raise a `ScanError` for each skipped session.
+    ///
+    /// Pre-flight check rather than an in-loop catch: `fingerprint_hash_for`
+    /// can only fail on a conversation's OWN messages (a malformed
+    /// `fingerprint_blake3`), so deciding up front which conversations are
+    /// acceptable costs no correctness and leaves the insert loop (300+ lines
+    /// of shared accumulator state) untouched. The rest of the batch then
+    /// commits normally in one transaction.
+    pub(crate) fn insert_conversations_batched_reporting(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        skipped: &mut Vec<BatchSkippedConversation>,
+    ) -> Result<Vec<InsertOutcome>> {
         if conversations.is_empty() {
             return Ok(Vec::new());
         }
+
+        let mut acceptable: Vec<(i64, Option<i64>, &Conversation)> =
+            Vec::with_capacity(conversations.len());
+        for (index, &(agent_id, workspace_id, conv)) in conversations.iter().enumerate() {
+            match uninsertable_excluded_fingerprint_error(conv) {
+                Some(error) => skipped.push(BatchSkippedConversation {
+                    index,
+                    source_path: conv.source_path.display().to_string(),
+                    external_id: conv.external_id.clone(),
+                    error,
+                }),
+                None => acceptable.push((agent_id, workspace_id, conv)),
+            }
+        }
+        if acceptable.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Shadow the parameter: everything below operates on the acceptable
+        // subset, and `skipped` already carries the caller's positions.
+        let conversations: &[(i64, Option<i64>, &Conversation)] = &acceptable;
 
         self.ensure_sources_for_batch(conversations)?;
 
