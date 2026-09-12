@@ -611,84 +611,210 @@ CODEX_TOOL_CALL_TYPES = {"function_call", "custom_tool_call"}
 CODEX_TOOL_RESULT_TYPES = {"function_call_output", "custom_tool_call_output"}
 
 
-def _codex_block_text(payload):
-    out = payload.get("output")
-    if isinstance(out, list):
-        return "\n".join(b.get("text", "") for b in out if isinstance(b, dict))
-    if isinstance(out, str):
-        return out
-    content = payload.get("content")
-    if isinstance(content, list):
-        return "\n".join(b.get("text", "") for b in content if isinstance(b, dict))
-    return ""
+def _codex_block_text_nonempty(block):
+    """`utils.rs::extract_content_part`'s first branch: a bare non-empty
+    string element counts as visible text."""
+    if isinstance(block, str):
+        return bool(block.strip())
+    if isinstance(block, dict):
+        text = block.get("text")
+        return isinstance(text, str) and bool(text.strip())
+    return False
+
+
+def _codex_content_nonempty(payload):
+    """Rust `codex_events_from_blob`'s `content_nonempty`: a bare non-empty
+    STRING `payload.content`/`payload.output` counts (the connector's
+    `flatten_content` accepts it), and an array form counts when any element
+    carries non-empty text -- an array of only empty-text blocks is zero real
+    messages, not one."""
+    value = payload.get("content")
+    if value is None:
+        value = payload.get("output")
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, list):
+        return any(_codex_block_text_nonempty(block) for block in value)
+    return False
+
+
+def _codex_reasoning_text(payload):
+    """`codex.rs::reasoning_summary_text`: each non-empty `summary[].text`
+    (type `summary_text`), newline-joined."""
+    summary = payload.get("summary")
+    if not isinstance(summary, list):
+        return ""
+    parts = []
+    for item in summary:
+        if not isinstance(item, dict) or item.get("type") != "summary_text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _codex_agent_message_text(payload):
+    """`codex.rs::parse_agent_message_content`'s visible half: the
+    text/input_text/output_text blocks' `text`, newline-joined."""
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return ""
+    parts = [
+        block["text"]
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("type") in ("text", "input_text", "output_text")
+        and isinstance(block.get("text"), str)
+    ]
+    return "\n".join(parts)
+
+
+def _codex_tool_output_text(payload):
+    """`codex.rs::tool_output_text`: a bare string `output`; else its `content`
+    flattened when that is non-blank; else the whole `output` flattened."""
+    output = payload.get("output")
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict) and "content" in output:
+        flattened = _flatten_content(output["content"])
+        if flattened.strip():
+            return flattened
+    return _flatten_content(output)
+
+
+def _codex_tool_call_arguments(payload, decode_json_string):
+    """`codex.rs::parse_tool_call_arguments` for `response_item` (key order
+    `arguments` then `input`, a non-empty JSON string decoded) versus the
+    `event_msg` arm's raw pick (key order `input` then `arguments`, never
+    decoded)."""
+    if decode_json_string:
+        raw = payload.get("arguments")
+        if raw is None:
+            raw = payload.get("input")
+    else:
+        raw = payload.get("input")
+        if raw is None:
+            raw = payload.get("arguments")
+    if raw is None:
+        return None
+    if decode_json_string and isinstance(raw, str) and raw != "":
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return raw
+    return raw
+
+
+def _codex_render_tool_call(name, arguments):
+    """`codex.rs::render_tool_call_content`: `<name>(<args>)`, or the bare name
+    when there is no input (absent or JSON null)."""
+    if arguments is None:
+        return name
+    return f"{name}({json.dumps(arguments, ensure_ascii=False, separators=(',', ':'))})"
 
 
 def build_candidates_codex(events):
+    """Port of `src/indexer/exclusion.rs::codex_events_from_blob` (N-codexkey,
+    任务书 #131 T6-c).
+
+    That function is the authority for a codex event's identity (`payload.id`,
+    else `line:<physical line>`), for which lines produce a message at all, and
+    for their order; the roles and texts below mirror the connector's own
+    projection (`connectors/codex.rs`), because those are what the DB rows hold
+    -- `_session_alignment` compares roles row by row.
+
+    The pre-fix builder walked only `type == "response_item"`, so the whole
+    `event_msg` layer (user_message / agent_reasoning / tool_call) was missing:
+    its candidate list came out SHORTER than the recorded `raw.idx` positions
+    of the same session, every later candidate shifted up, and the rebuild
+    checks then compared the wrong event against the marker (`rs_…`/`fco_…` vs
+    `line:23`, 4,449 candidates against a marker `raw.idx` of 5,384). Its
+    `message` arm also had no non-emptiness test (an empty user message was
+    emitted as a row) and no `agent_message` / missing-`payload.type` arms.
+    """
     candidates = []
     for ev in events:
-        # NOTE (investigated, not fixed): `event_msg/user_message` echoes a
-        # real user turn's text a second time, and in SOME sessions (e.g.
-        # `copy/` conversation_id=39) that echo gets its own DB row -- but
-        # in others (e.g. conversation_id=32) it does not (the DB idx
-        # sequence has a gap instead, i.e. the echo is assigned an idx and
-        # then dropped, not simply absent). Unconditionally emitting a
-        # candidate for it regressed more sessions than it fixed on a
-        # 300-session sample, so it is deliberately NOT handled here;
-        # sessions hitting this shape correctly fall through to
-        # `misaligned` (宁漏勿误) rather than risk a wrong guess. T2 (which
-        # reads the actual connector source, not black-box blob inspection)
-        # should resolve the real rule.
-        if ev.get("type") != "response_item":
+        if not isinstance(ev, dict):
             continue
-        payload = ev.get("payload", {})
-        ptype = payload.get("type")
-        event_key = payload.get("id") or line_identity(ev)
+        entry_type = ev.get("type") if isinstance(ev.get("type"), str) else ""
+        payload = ev.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        payload_id = payload.get("id") if isinstance(payload.get("id"), str) else None
+        event_key = payload_id or line_identity(ev)
+        call_id = payload.get("call_id") if isinstance(payload.get("call_id"), str) else None
+        name = payload.get("name") if isinstance(payload.get("name"), str) else None
 
-        if ptype == "message":
-            role = payload.get("role")
-            if role in CODEX_DROPPED_ROLES:
-                continue
-            if role not in ("user", "assistant", "reasoning"):
-                continue
-            content = payload.get("content")
-            texts = []
-            if isinstance(content, list):
-                texts = [b.get("text", "") for b in content if isinstance(b, dict)]
-            elif isinstance(content, str):
-                texts = [content]
-            candidates.append(Candidate(role, event_key, 0, text="\n".join(texts)))
-        elif ptype == "reasoning":
-            summary = payload.get("summary")
-            texts = [b.get("text", "") for b in summary if isinstance(b, dict)] if isinstance(summary, list) else []
-            candidates.append(Candidate("reasoning", event_key, 0, text="\n".join(texts)))
-        elif ptype in CODEX_TOOL_CALL_TYPES:
-            args = payload.get("arguments") if payload.get("arguments") is not None else payload.get("input")
-            # `function_call.arguments` is a JSON-encoded string (a real
-            # object); `custom_tool_call.input` is a plain string (JS code,
-            # not JSON) meant to display as a quoted string, not parsed --
-            # only unwrap the JSON-string case so the display text matches
-            # what the connector actually wrote into `messages.content`.
-            display_args = args
-            if isinstance(args, str):
-                try:
-                    display_args = json.loads(args)
-                except (ValueError, TypeError):
-                    display_args = args
-            candidates.append(
-                Candidate(
-                    "tool_call", event_key, 0,
-                    tool_call_id=payload.get("call_id"),
-                    tool_name=payload.get("name"),
-                    args=args,
-                    text=_tool_call_display_text(payload.get("name"), display_args),
+        if entry_type == "response_item":
+            ptype = payload.get("type") if isinstance(payload.get("type"), str) else None
+            if ptype is None or ptype == "message":
+                # `Some("message") | None`: a missing payload.type takes this
+                # arm, and only a user/assistant role with non-empty content
+                # produces a row -- the developer/system prompt line is dropped
+                # by that test, not by a role blacklist.
+                role = payload.get("role")
+                if role in ("user", "assistant") and _codex_content_nonempty(payload):
+                    candidates.append(
+                        Candidate(role, event_key, 0, text=_flatten_content(payload.get("content")))
+                    )
+            elif ptype == "agent_message":
+                if _codex_content_nonempty(payload):
+                    candidates.append(
+                        Candidate("user", event_key, 0, text=_codex_agent_message_text(payload))
+                    )
+            elif ptype == "reasoning":
+                # Emptiness is judged on the EXTRACTED text, with
+                # `encrypted_content` as the other way to survive.
+                text = _codex_reasoning_text(payload)
+                if text.strip() or payload.get("encrypted_content") is not None:
+                    candidates.append(Candidate("reasoning", event_key, 0, text=text))
+            elif ptype in CODEX_TOOL_CALL_TYPES:
+                arguments = _codex_tool_call_arguments(payload, decode_json_string=True)
+                candidates.append(
+                    Candidate(
+                        "tool_call", event_key, 0,
+                        tool_call_id=call_id or payload_id,
+                        tool_name=name or "unknown",
+                        args=arguments,
+                        text=_codex_render_tool_call(name or "unknown", arguments),
+                    )
                 )
-            )
-        elif ptype in CODEX_TOOL_RESULT_TYPES:
-            candidates.append(
-                Candidate("tool_result", event_key, 0, tool_call_id=payload.get("call_id"), text=_codex_block_text(payload))
-            )
-        # everything else (session_meta / event_msg / world_state /
-        # turn_context / compacted) is connector plumbing, never a row.
+            elif ptype in CODEX_TOOL_RESULT_TYPES:
+                candidates.append(
+                    Candidate(
+                        "tool_result", event_key, 0,
+                        tool_call_id=call_id,
+                        text=_codex_tool_output_text(payload),
+                    )
+                )
+        elif entry_type == "event_msg":
+            etype = payload.get("type") if isinstance(payload.get("type"), str) else None
+            if etype == "user_message":
+                text = payload.get("message")
+                if isinstance(text, str) and text.strip():
+                    candidates.append(Candidate("user", event_key, 0, text=text))
+            elif etype == "agent_reasoning":
+                text = payload.get("text")
+                if isinstance(text, str) and text.strip():
+                    candidates.append(Candidate("reasoning", event_key, 0, text=text))
+            elif etype == "tool_call":
+                arguments = _codex_tool_call_arguments(payload, decode_json_string=False)
+                candidates.append(
+                    Candidate(
+                        "tool_call", event_key, 0,
+                        tool_call_id=call_id or payload_id,
+                        tool_name=name or "unknown",
+                        args=arguments,
+                        text=_codex_render_tool_call(name or "unknown", arguments),
+                    )
+                )
+            # `event_msg/agent_message` duplicates the response_item version and
+            # is dropped; `token_count` attaches to an existing message and
+            # emits none of its own; anything else here is connector plumbing.
+        # any other outer `type` is dropped entirely.
     return candidates
 
 
@@ -2069,11 +2195,83 @@ def _run_verify_selftest(paths_cfg):
     return passed, total
 
 
+def codex_projection_selftest_cases():
+    """N-codexkey (任务书 #131 T6-c): the codex candidate projection must be
+    `codex_events_from_blob`'s, event for event.
+
+    The fixtures are the Rust side's own: case A is
+    `events_from_blob_codex_developer_dropped_and_reasoning_sequence_matches_real_reparse_positive`'s
+    six lines verbatim (its `real_count == 5` is asserted against the REAL
+    connector), so the expected sequence below is that test's count and keys in
+    order. B and C pin the two layers the pre-fix builder dropped whole: the
+    `event_msg` outer type (Rust emits user_message/agent_reasoning/tool_call,
+    drops agent_message, emits nothing for token_count) and the
+    `response_item` arms the old role filter rejected (a missing payload.type
+    taking the `message` arm, `agent_message`, and a `reasoning` kept alive by
+    `encrypted_content` alone). A blank line is present in B to pin the
+    PHYSICAL line numbering the `line:<n>` fallback uses.
+    """
+    a = [
+        '{"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex, a coding agent."}]}}',
+        '{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list files"}]}}',
+        '{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"I should run ls."}]}}',
+        '{"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"function_call","id":"fc_1","name":"exec_command","arguments":"{\\"cmd\\":\\"ls\\"}","call_id":"call_1"}}',
+        '{"type":"response_item","timestamp":"2026-01-01T00:00:04Z","payload":{"type":"function_call_output","call_id":"call_1","output":"README.md\\n"}}',
+        '{"type":"response_item","timestamp":"2026-01-01T00:00:05Z","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Found README.md."}]}}',
+    ]
+    b = [
+        '{"type":"event_msg","payload":{"type":"token_count","info":{}}}',
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hello there"}}',
+        '{"type":"event_msg","payload":{"type":"agent_message","message":"duplicate of the response_item version"}}',
+        '',
+        '{"type":"event_msg","payload":{"type":"agent_reasoning","text":"weighing options"}}',
+        '{"type":"event_msg","payload":{"type":"tool_call","id":"tc_9","name":"exec_command","input":{"cmd":"ls"}}}',
+        '{"type":"event_msg","payload":{"type":"user_message","message":"   "}}',
+    ]
+    c = [
+        '{"type":"response_item","payload":{"type":"agent_message","id":"am_1","content":[{"type":"output_text","text":"hi"}]}}',
+        '{"type":"response_item","payload":{"type":"message","id":"m_bare","role":"user","content":["a bare string content block"]}}',
+        '{"type":"response_item","payload":{"type":"message","id":"m_empty","role":"user","content":[{"type":"input_text","text":""}]}}',
+        '{"type":"response_item","payload":{"type":"reasoning","id":"rs_enc","summary":[{"type":"summary_text","text":""}],"encrypted_content":"opaque"}}',
+        '{"type":"response_item","payload":{"role":"assistant","content":"a message with no payload.type"}}',
+        '{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"system prompt"}]}}',
+    ]
+    return [
+        ("A developer dropped, reasoning/function_call/function_call_output kept",
+         a, [("user", "line:2"), ("reasoning", "rs_1"), ("tool_call", "fc_1"),
+             ("tool_result", "line:5"), ("assistant", "msg_1")]),
+        ("B the event_msg layer projects per Rust, blank line counted physically",
+         b, [("user", "line:2"), ("reasoning", "line:5"), ("tool_call", "tc_9")]),
+        ("C response_item arms the old role filter rejected",
+         c, [("user", "am_1"), ("user", "m_bare"), ("reasoning", "rs_enc"),
+             ("assistant", "line:5")]),
+    ]
+
+
+def _run_codex_projection_selftest(paths_cfg):
+    passed = 0
+    cases = codex_projection_selftest_cases()
+    for name, lines, want in cases:
+        with tempfile.TemporaryDirectory() as root:
+            blob = os.path.join(root, "rollout-projection.jsonl")
+            with io.open(blob, "w", encoding="utf-8") as handle:
+                for line in lines:
+                    handle.write(line + "\n")
+            got = [(c.role, c.event_key) for c in build_candidates_codex(load_blob_events(blob))]
+        ok = got == want
+        print(f"{'ok  ' if ok else 'FAIL'} N-codexkey {name} (want={want} got={got})")
+        if ok:
+            passed += 1
+    print(f"selftest/codex_projection: {passed}/{len(cases)}")
+    return passed, len(cases)
+
+
 def run_selftest(paths_cfg) -> bool:
     passed = total = 0
     for runner in (_run_decide_selftest, _run_content_selftest,
                    _run_pairing_selftest, _run_perf_selftest,
-                   _run_report_selftest, _run_verify_selftest):
+                   _run_report_selftest, _run_verify_selftest,
+                   _run_codex_projection_selftest):
         p, t = runner(paths_cfg)
         passed += p
         total += t
