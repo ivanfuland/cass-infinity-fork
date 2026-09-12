@@ -32,18 +32,28 @@ use crate::storage::vector_domain;
 
 /// T4 mission #122a (D), spec §五 "ownership oracle cosine 阈值": the
 /// activation audit's fresh-vs-stored ownership check (`run_activation_
-/// audit`, `cos < OWNERSHIP_COSINE_MIN` below) and (T5, not this task) the
-/// standalone ownership oracle (`examples/w4_ownership_oracle.rs`) must
-/// gate on the exact same number -- two independent re-embeddings of
-/// identical content can differ by floating-point/batch noise alone, and
-/// letting the two call sites drift to different thresholds would mean
-/// "passes the audit" and "passes the oracle" stop meaning the same
-/// thing. **Placeholder value**: `1.0 - 1e-3`, picked as a plausible
-/// starting point, not measured. T5 calibrates the real value from actual
-/// cross-batch re-embedding noise (spec §五's `e_max` derivation) and
-/// changes only the number here -- both call sites keep reading this one
-/// constant.
-pub const OWNERSHIP_COSINE_MIN: f32 = 1.0 - 1e-3;
+/// audit`, `cos < OWNERSHIP_COSINE_MIN` below) and the standalone
+/// ownership oracle (`examples/w4_ownership_oracle.rs`, `c <
+/// OWNERSHIP_COSINE_MIN` there) must gate on the exact same number -- two
+/// independent re-embeddings of identical content can differ by
+/// floating-point/batch noise alone, and letting the two call sites drift
+/// to different thresholds would mean "passes the audit" and "passes the
+/// oracle" stop meaning the same thing. Both call sites read this one
+/// constant; neither carries its own copy.
+///
+/// **Measured value (T5, #127)**: `1 - e_max`, where
+/// `e_max = max(2 * max_e, 1e-3)` and `max_e = 6.631367e-4` is the largest
+/// `e = 1 - cos` observed when the same text was freshly re-embedded under
+/// two batch compositions (one request per text, vs `EMBED_BATCH`-sized
+/// batches) over 200 chunks -- the derivation, the 200-pair distinct-message
+/// negative control (200/200 rejected, max cosine 0.628) and the embedder
+/// identity are frozen in `W6_ARTIFACTS/cosine-calibration.json`
+/// (sha256 `b191f230e56b0f80981ead908d4579990b85855beec8beaca7c5756e633a31a4`).
+/// The T4 placeholder this replaces was `1.0 - 1e-3` (= 0.9990000129f32),
+/// which real re-embedding noise did cross: a `models backfill` activation
+/// audit over this same corpus failed one sampled chunk at cosine
+/// 0.99896365 before the value was measured.
+pub const OWNERSHIP_COSINE_MIN: f32 = 1.0 - 1.3262734e-3;
 
 /// Summary of one `run_db_vector_catchup_backfill` call, for attestation
 /// reporting (Step2).

@@ -23,7 +23,9 @@
 //!   - cosine: re-embed (via Infinity, using the *stored* span's text,
 //!     sliced from `eligibility::normalized_for_chunks`) and compare
 //!     against the stored `message_chunks.embedding` via cosine similarity
-//!     -- must be `>= 0.999`.
+//!     -- must be `>= OWNERSHIP_COSINE_MIN`, the same constant the
+//!     activation audit gates on (T5 measured it; the number is not
+//!     restated here on purpose).
 //!   - vec0: `message_chunks.embedding` vs the `vec0` mirror's raw BLOB for
 //!     the same `chunk_id` (`rowid`) -- must be byte-identical.
 //!
@@ -107,6 +109,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
+use coding_agent_search::indexer::db_vector_catchup::OWNERSHIP_COSINE_MIN;
 use coding_agent_search::search::eligibility::normalized_for_chunks;
 use coding_agent_search::storage::api::Value;
 use coding_agent_search::storage::schema::le_blob_to_f32_vector;
@@ -512,7 +515,10 @@ fn flush_embed_pending(
         let item_failed = match cos {
             Some(c) => {
                 *min_cosine = Some(min_cosine.map_or(c, |m: f32| m.min(c)));
-                c < 0.999
+                // T5 (#127): this threshold is the audit's own constant, not a
+                // second copy of its value -- see `OWNERSHIP_COSINE_MIN`'s doc
+                // comment for how the number was measured.
+                c < OWNERSHIP_COSINE_MIN
             }
             None => true,
         };
@@ -1080,19 +1086,25 @@ fn load_chunk_texts(storage: &FrankenStorage, generation_id: i64, needed: &HashS
     Ok(out)
 }
 
-/// Build [`CALIBRATION_NEGATIVE_PAIRS`] distinct-message pairs from `pool`
-/// (already in `chunk_id` order), taking consecutive entries in order and
-/// skipping any that share a `message_id`. Deterministic, and returns fewer
-/// than requested rather than reusing a message.
+/// Build up to [`CALIBRATION_NEGATIVE_PAIRS`] distinct-message pairs from
+/// `pool` (already in `chunk_id` order), pairing the first half against the
+/// second. The halves matter: chunks of one multi-chunk message are adjacent
+/// in `chunk_id` order, so pairing neighbours would keep hitting same-message
+/// pairs (the real 400-chunk pool yielded only 195 that way) -- a chunk drawn
+/// from the far half is ~`pool.len() / 2` chunk ids away from its partner.
+/// A lone collision walks forward deterministically rather than reusing a
+/// message. Returns fewer than requested rather than guessing.
 fn negative_pairs(pool: &[(i64, i64, String)]) -> Vec<((i64, i64, String), (i64, i64, String))> {
+    let half = pool.len() / 2;
     let mut pairs = Vec::new();
-    let mut i = 0usize;
-    while i + 1 < pool.len() && pairs.len() < CALIBRATION_NEGATIVE_PAIRS {
-        if pool[i].1 != pool[i + 1].1 {
-            pairs.push((pool[i].clone(), pool[i + 1].clone()));
-            i += 2;
-        } else {
-            i += 1;
+    for i in 0..half {
+        if pairs.len() == CALIBRATION_NEGATIVE_PAIRS {
+            break;
+        }
+        let left = &pool[i];
+        let right = (0..half).map(|k| &pool[half + ((i + k) % half)]).find(|c| c.1 != left.1);
+        if let Some(right) = right {
+            pairs.push((left.clone(), right.clone()));
         }
     }
     pairs
@@ -1930,11 +1942,135 @@ mod tests {
                 // own `index`, never by response-array position.
                 items.reverse();
                 let payload = serde_json::json!({ "data": items }).to_string();
-                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload);
+                // `Connection: close`: this handler serves exactly one request per
+                // accepted connection, and without the header reqwest's pool would
+                // keep the connection and race the close on the next request.
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload);
                 let _ = stream.write_all(response.as_bytes());
             }
         });
         (addr, stop)
+    }
+
+    /// One conversation, one message, one chunk, whose stored embedding is
+    /// `[1,0,0,0]` -- so a mock that answers with `[c, sqrt(1-c^2), 0, 0]`
+    /// pins this oracle's measured cosine at exactly `c`, and the threshold it
+    /// gates on becomes observable from the outside.
+    fn seed_single_chunk_with_unit_embedding(path: &std::path::Path, content: &str) {
+        let storage = FrankenStorage::open(path).unwrap();
+        insert_message_parent_chain(&storage, 1, 1, 1, "user", content);
+        let generation_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", 4, 1, 1, b"fp", 1_700_000_000_000))
+            .unwrap();
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &[Value::from(generation_id)])
+            .unwrap();
+        let chunks = coding_agent_search::search::eligibility::expected_chunks(1, 1, "user", content);
+        assert_eq!(chunks.len(), 1, "the fixture message must produce exactly one chunk");
+        let chunk = &chunks[0];
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                tx.execute(
+                    "INSERT INTO message_chunks(chunk_id, generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+                     VALUES (1, ?1, 1, 1, ?2, ?3, ?4, ?5, ?6, 1.0, 1700000000000)",
+                    &[
+                        Value::from(generation_id),
+                        Value::from(chunk.chunk_idx as i64),
+                        Value::from(chunk.byte_start as i64),
+                        Value::from(chunk.byte_end as i64),
+                        Value::from(chunk.content_hash.clone()),
+                        Value::from(schema::f32_vector_to_le_blob(&[1.0f32, 0.0, 0.0, 0.0])),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, 4).unwrap();
+    }
+
+    /// A mock Infinity that answers every request with one fixed vector --
+    /// `seed_single_chunk_with_unit_embedding`'s counterpart.
+    fn start_mock_fixed_infinity(vector: Vec<f32>) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let body_end = loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) else { continue };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + len {
+                        break header_end + len;
+                    }
+                };
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let request: serde_json::Value = serde_json::from_slice(&buf[header_end..body_end.min(buf.len())]).unwrap_or(serde_json::Value::Null);
+                let n = request["input"].as_array().map(Vec::len).unwrap_or(0);
+                let items: Vec<serde_json::Value> = (0..n).map(|i| serde_json::json!({"index": i, "embedding": vector.clone()})).collect();
+                let payload = serde_json::json!({ "data": items }).to_string();
+                // `Connection: close`: this handler serves exactly one request per
+                // accepted connection, and without the header reqwest's pool would
+                // keep the connection and race the close on the next request.
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (addr, stop)
+    }
+
+    /// T5 (#127): the oracle's cosine gate must be the audit's constant, not a
+    /// second copy of its value. A fixture measured at a cosine strictly
+    /// between `OWNERSHIP_COSINE_MIN` and the old hardcoded `0.999` passes
+    /// only if the oracle reads the constant: reverting line ~485's
+    /// `c < OWNERSHIP_COSINE_MIN` to `c < 0.999` makes this fail exactly as
+    /// the placeholder constant did against real re-embedding noise.
+    #[test]
+    fn the_oracle_gates_on_the_shared_ownership_constant() {
+        assert!(
+            OWNERSHIP_COSINE_MIN < 0.999,
+            "OWNERSHIP_COSINE_MIN is {OWNERSHIP_COSINE_MIN}, i.e. the 1e-3 floor took over and equals the value this \
+             test discriminates against; the constant is still read from one place, but no behavioural test can tell \
+             a reference from a copy at that value"
+        );
+        let target = (f64::from(OWNERSHIP_COSINE_MIN) + 0.999) / 2.0;
+        let companion = (1.0 - target * target).sqrt();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent_search.db");
+        seed_single_chunk_with_unit_embedding(&path, "A probe message whose re-embedding is a controlled cosine away from its stored vector.");
+        let (addr, stop) = start_mock_fixed_infinity(vec![target as f32, companion as f32, 0.0, 0.0]);
+        let (code, report, message) = run(&path, true, None, None, &format!("http://{addr}"), None, None);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let report = report.unwrap_or_else(|| panic!("the fixture must produce a report: {message}"));
+        assert_eq!(
+            report.cosine_failed, 0,
+            "a cosine of {target} is at or above OWNERSHIP_COSINE_MIN ({OWNERSHIP_COSINE_MIN}) and must pass; failing it \
+             means this gate is not reading that constant (min_cosine seen: {:?})",
+            report.min_cosine
+        );
+        assert_eq!(code, 0, "{message}");
     }
 
     #[test]
