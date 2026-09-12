@@ -366,7 +366,36 @@ run_stage() {
   local start_ns end_ns
   start_ns=$(date +%s%N)
 
+  # R6-B2 (#128 T6-a2): the liveness check runs BEFORE the sample pass, and
+  # `end_ns` is taken at the moment it first reports the root gone. The old
+  # order (sample -> check -> sleep) paid a full /proc sweep for a tree that
+  # had already died, and then took `end_ns` after `wait`. Five runs against
+  # the pre-fix script measured a `sleep 0.12` command as stage_ms = 235 /
+  # 243 / 244 on an idle host and 263 / 287 while a parallel cargo build held
+  # the machine, all with samples=1 -- above this door's own 200ms `measured`
+  # threshold, from a stage that had really finished in 120ms.
+  #
+  # Timed breakdown of one pre-fix run of that command (instrumented copy of
+  # this script; the script itself was not modified):
+  #   sample pass 1   0.6ms ->  69ms   root alive, samples=1
+  #   sleep           100ms
+  #   sample pass 2   170ms -> 241ms   root already dead, samples stays 1
+  #   kill -0 fails   242ms
+  #   wait            1.5ms
+  # `wait` was 1.5ms of those 243ms; the trailing sweep of the dead tree was
+  # the rest, which is why moving `end_ns` alone is not enough and the check
+  # has to come first.
+  #
+  # Residual overshoot bound: <= one poll period, i.e. one sample pass plus
+  # `POLL_INTERVAL_S` (measured 169-176ms per cycle on an unloaded host;
+  # higher while the machine is loaded, since the sweep cost is the dominant
+  # term). The loop can only learn the root is gone at a check, and death is
+  # detected at the first check after it happens.
   while :; do
+    if ! kill -0 "$root_pid" 2>/dev/null; then
+      end_ns=$(date +%s%N)
+      break
+    fi
     sample_tree "$root_pid"
     if [ "${SAMPLE_PID_COUNT:-0}" -gt 0 ]; then
       samples=$((samples + 1))
@@ -374,13 +403,11 @@ run_stage() {
         peak_tree_kb="$SAMPLE_TREE_RSS_KB"
       fi
     fi
-    kill -0 "$root_pid" 2>/dev/null || break
     sleep "$POLL_INTERVAL_S"
   done
 
   wait "$root_pid"
   local rc=$?
-  end_ns=$(date +%s%N)
   local stage_ms=$(( (end_ns - start_ns) / 1000000 ))
 
   local peak_proc_kb=0 pid
