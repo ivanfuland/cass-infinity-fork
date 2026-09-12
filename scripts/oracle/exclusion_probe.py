@@ -1690,6 +1690,16 @@ def _verify_schema(with_excluded):
     )
 
 
+def _cleared_tool_use_result(redacted, shape):
+    """What the R7 DSL leaves behind for each top-level `toolUseResult` shape:
+    the STRING form is replaced wholesale (B04), the ARRAY form per element's
+    `text` (N-R7arr) -- the shapes are mutually exclusive, so the fixture has to
+    clear the one it built."""
+    if shape == "string":
+        return redacted
+    return [{"type": "text", "text": redacted}]
+
+
 def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           non_manifest_altered=False, overclear_ordinary=False,
                           leak_multiline_body=False, short_body=False,
@@ -1703,7 +1713,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           foreign_array_tool_use_result_cleared=False,
                           candidate_only_excluded_row=None,
                           fragmented_extra_text_blocks=False,
-                          duplicate_source_row=False, null_raw_event_key=False):
+                          duplicate_source_row=False, null_raw_event_key=False,
+                          sibling_tool_use_result=None, tool_use_result_shape=None):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -2021,17 +2032,39 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "VALUES (1, 4, 'user', ?, ?)",
                 ["a newer session row", msgpack.packb({"message": {"content": [{"type": "text", "text": "newer"}]}}, use_bin_type=True)],
             )
+        if tool_use_result_shape is not None:
+            # R9-N02 (任务书 #132): the two dynamic top-level `toolUseResult`
+            # shapes, cleared on BOTH the excluded row and the ordinary sibling
+            # that shares its event. `string` is B04's form (the whole field is
+            # the body); `array` is N-R7arr's (`[{type:text,text:...}]`).
+            candidate_extra["toolUseResult"] = (
+                _cleared_tool_use_result(redacted, tool_use_result_shape)
+                if with_excluded
+                else (
+                    body_text
+                    if tool_use_result_shape == "string"
+                    else [{"type": "text", "text": body_text}]
+                )
+            )
         if legit_sibling_redaction:
             # N02 (任务书 #131): a SECOND row carrying the same event, with the
             # same target block replaced -- what `apply_sibling` produces. The
             # reference library has the same row un-redacted.
+            sibling_extra = _verify_extra(redacted if with_excluded else body_text)
+            if tool_use_result_shape is not None:
+                sibling_extra["toolUseResult"] = (
+                    _cleared_tool_use_result(redacted, tool_use_result_shape)
+                    if with_excluded
+                    else (
+                        body_text
+                        if tool_use_result_shape == "string"
+                        else [{"type": "text", "text": body_text}]
+                    )
+                )
             conn.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
-                [
-                    "assistant commentary, must stay",
-                    msgpack.packb(_verify_extra(redacted if with_excluded else body_text), use_bin_type=True),
-                ],
+                ["assistant commentary, must stay", msgpack.packb(sibling_extra, use_bin_type=True)],
             )
         if leak_multiline_body or short_body:
             # B08: the body survives verbatim in a later row's extra,
@@ -2460,6 +2493,12 @@ def verify_selftest_cases():
         # identity check off, so a marker naming no event rebuilt "successfully".
         ("V31 a raw marker whose event_key is null is a failure", False,
          "rebuild_raw_invalid"),
+        # R9-N02 (任务书 #132): a sibling row whose event is the excluded one
+        # legitimately carries the same cleared target -- including the two
+        # dynamic top-level `toolUseResult` shapes, which the sibling exemption
+        # did not know about.
+        ("V32 a legit string toolUseResult sibling redaction passes", True, ""),
+        ("V33 a legit array toolUseResult sibling redaction passes", True, ""),
     ]
 
 
@@ -2509,6 +2548,8 @@ def _run_verify_selftest(paths_cfg):
             28: {"fragmented_extra_text_blocks": True},
             29: {"duplicate_source_row": True},
             30: {"null_raw_event_key": True},
+            31: {"legit_sibling_redaction": True, "tool_use_result_shape": "string"},
+            32: {"legit_sibling_redaction": True, "tool_use_result_shape": "array"},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -4093,7 +4134,14 @@ def _sibling_extra_diff_is_target_only(cand_extra, ref_extra, agent_slug, manife
     entry = manifest_by_event.get((agent_slug, _extra_event_key(cand_extra)))
     if entry is None:
         return False
-    allowed = _expand_field_paths(agent_slug, entry.get("blocks") or [])
+    # R9-N02 (任务书 #132): the manifest row's own checks use
+    # `_allowed_extra_paths`, which admits the two dynamic `toolUseResult`
+    # shapes once ownership is proven -- the sibling path used the static
+    # `_expand_field_paths` alone, so a legitimately cleaned sibling was
+    # reported as `non-manifest extra_bin differs from reference`. There is no
+    # reference ROW for a sibling, so the ownership bodies come from the
+    # reference EVENT itself (`ref_row=None`).
+    allowed = _allowed_extra_paths(entry, None, ref_extra)
     sha = entry.get("sha256")
     diffs = _diff_paths(cand_extra, ref_extra)
     if not diffs:
