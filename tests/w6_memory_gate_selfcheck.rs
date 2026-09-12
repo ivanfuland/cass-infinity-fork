@@ -740,7 +740,9 @@ fn a_stage_record_that_cannot_be_written_fails_the_run() {
         .arg("-c")
         // A budget the `sleep 1` stage cannot exceed, so the ONLY thing that
         // can fail this run is the write itself.
-        .arg(". \"$1\"; run_stage selfcheck selfcheck 1073741824 \"\" \"\" \"\" \"$2\" sleep 1")
+        // T6-c N07 inserted `p0_bytes` as run_stage's $7, so the output path
+        // is $8 and the command follows it.
+        .arg(". \"$1\"; run_stage selfcheck selfcheck 1073741824 \"\" \"\" \"\" \"\" \"$2\" sleep 1")
         .arg("--")
         .arg(gate_script())
         .arg(&unwritable)
@@ -814,6 +816,16 @@ impl NormalRun {
         )
         .expect("write stub wrapper");
         std::fs::write(tmp.path().join("cass-candidate"), b"not a real binary, only hashed\n").expect("write candidate");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for script in ["examples/w4_completeness_gate", "runner.sh"] {
+                let path = tmp.path().join(script);
+                let mut perms = std::fs::metadata(&path).expect("stat stub").permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&path, perms).expect("chmod stub");
+            }
+        }
         std::fs::write(tmp.path().join("xdg/cass/sources.toml"), "").expect("write sources.toml");
         Self { tmp }
     }
