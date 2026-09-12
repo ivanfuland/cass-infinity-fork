@@ -127,6 +127,44 @@ fn selfcheck_judges_nonzero_exit_code_as_failed() {
     assert_ne!(outcome.exit_code, 0, "a failed test process must judge failed: json={:?}", outcome.stage_json);
 }
 
+/// R6-N6-① (#128 T6-a2): the claim "a stage that fails must judge failed
+/// regardless of what the memory samples say" was carried by the `/bin/false`
+/// variant alone, and `/bin/false` exits before the poller ever samples it
+/// (`measured=false`, `samples=0`, `stage_ms=187` on bbf8c299) -- so that
+/// variant only ever exercised "unmeasured => failed". This is the missing
+/// combination: a stage that *is* measured (a real ~500ms hold: samples=3,
+/// stage_ms=639 on bbf8c299) and *then* fails. Only its exit code can decide
+/// the verdict, and the verdict must be a real judgment (1) -- not malformed
+/// input (2) and not a pass (0).
+///
+/// This finding has no product defect behind it (verified: the judgment is
+/// already correct on bbf8c299), so its redness is a *mutation* red, per the
+/// #128 任务书 ruling: deleting the `exit_code` term from `judge_from_stdin`
+/// leaves the `/bin/false` variant green (it is already failed for being
+/// unmeasured) and turns only this variant red.
+#[test]
+fn selfcheck_judges_a_measured_stage_failed_by_its_nonzero_exit_code() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let outcome = run_selfcheck(tmp.path(), &["bash", "-c", "sleep 0.5; exit 3"]);
+
+    assert_eq!(outcome.stage_json["exit_code"], 3, "json={:?}", outcome.stage_json);
+    assert_eq!(
+        outcome.stage_json["measured"], true,
+        "a ~500ms stage must be measured: json={:?}",
+        outcome.stage_json
+    );
+    assert!(
+        outcome.stage_json["samples"].as_i64().expect("samples present") >= 2,
+        "json={:?}",
+        outcome.stage_json
+    );
+    assert_eq!(
+        outcome.exit_code, 1,
+        "measured=true with exit_code!=0 must judge failed (1) -- neither 2 (malformed input) nor 0 (a pass): json={:?}",
+        outcome.stage_json
+    );
+}
+
 /// Variant ③: a stage shorter than the `stage_ms>=200` measured threshold
 /// must report `measured=false` and judge failed, even though the process
 /// itself exits cleanly (`exit_code=0`) -- an unmeasured stage is not a
@@ -139,6 +177,96 @@ fn selfcheck_a_too_short_stage_is_unmeasured_and_judged_failed() {
 
     assert_eq!(outcome.stage_json["measured"], false, "a 50ms stage must be unmeasured: json={:?}", outcome.stage_json);
     assert_ne!(outcome.exit_code, 0, "an unmeasured stage must judge failed even with exit_code=0: json={:?}", outcome.stage_json);
+}
+
+/// R6-B2 / R6-N6-② (#128 T6-a2): a stage's `stage_ms` ends the moment
+/// `kill -0` first reports the root gone, and the liveness check runs before
+/// the sample pass, so a deadline that has already passed is never paid for
+/// by another full `/proc` sweep.
+///
+/// Adversarial input: a ~120ms command. On bbf8c299 the old loop order
+/// (sample -> check -> sleep) swept the already-dead tree once more and took
+/// `end_ns` after `wait`: measured `stage_ms` = 235 / 243 / 244 on an idle
+/// host and 263 / 287 while a parallel cargo build was running, all from a
+/// stage that had really finished in 120ms.
+///
+/// Timed breakdown of one pre-fix run (a timestamp-instrumented *copy* of the
+/// script; the script under test was not modified):
+///   sample pass 1   0.6ms -> 69ms   root alive, samples=1
+///   sleep           100ms
+///   sample pass 2   170ms -> 241ms  root already dead, samples stays 1
+///   kill -0 fails   242ms
+///   wait            1.5ms
+/// `wait` was 1.5ms of those 243ms; the trailing sweep of the dead tree was
+/// the rest, which is why moving `end_ns` alone is not enough and the check
+/// has to come first.
+///
+/// Why this is asserted against a measured period and not against a fixed
+/// number: the fix leaves a sub-period stage costing exactly one poll period
+/// -- one `/proc` sweep plus one 100ms sleep. The pre-fix loop paid one
+/// period plus a second sweep of the tree that had already died (measured
+/// 55-73ms extra: that sweep still walks every `/proc/<pid>/stat` in the
+/// system, it merely finds no tree members to read `status` from). So a
+/// literal `stage_ms < 200` line would in fact be asserting "one /proc sweep
+/// takes under 100ms *on this host*", which is a property of the machine and
+/// its load, not of this change: the sweep measured ~70ms idle and ~106ms
+/// with a cargo build running, and the 200ms assertion flapped exactly on
+/// that difference. The loop's own period is calibrated from a long stage in
+/// the same test run instead, which cancels the host term. The remaining
+/// allowance is a fixed eighth of that period -- above the post-fix residual
+/// over a period (≤2ms measured across runs, since the break lands
+/// immediately after a cheap `kill -0`) and well below the pre-fix excess
+/// (55ms+), with roughly 2x headroom on both sides. The door's own 200ms
+/// `measured` line is what makes this worth pinning at all: it is the
+/// threshold the reported duration must not cross for a stage that finished
+/// long before it.
+///
+/// The `samples>=2 AND stage_ms<200` corner (two samples, a duration below
+/// the threshold) is *not* reachable from a real child on this host -- two
+/// samples require the root to outlive a full poll period, after which the
+/// break check lands ~239ms in -- so that limb is pinned on the `--judge`
+/// surface by `judge_rejects_measured_true_whose_samples_disagree_with_its_stage_ms`
+/// below instead (R6-N6-②).
+#[test]
+fn selfcheck_a_short_stage_stays_under_the_measured_stage_ms_threshold() {
+    let tmp = tempfile::TempDir::new().unwrap();
+
+    // Calibration: a stage that outlives several poll periods reports its own
+    // per-period cost as `stage_ms / samples`. Each sample is one full
+    // `/proc` sweep, each sweep is followed by exactly one `POLL_INTERVAL_S`
+    // sleep, and the loop breaks at the first check after the root dies -- so
+    // the quotient is this run's period, with no assumption about how fast a
+    // sweep is.
+    let calibration = run_selfcheck(tmp.path(), &["sleep", "1.2"]);
+    let cal_ms = calibration.stage_json["stage_ms"].as_i64().expect("stage_ms present");
+    let cal_samples = calibration.stage_json["samples"].as_i64().expect("samples present");
+    assert!(
+        cal_samples >= 3,
+        "the calibration stage must outlive several poll periods to price one: {:?}",
+        calibration.stage_json
+    );
+    let period_est = cal_ms / cal_samples;
+
+    let outcome = run_selfcheck(tmp.path(), &["sleep", "0.12"]);
+    let stage_ms = outcome.stage_json["stage_ms"].as_i64().expect("stage_ms present");
+    assert!(
+        stage_ms <= period_est + period_est / 8,
+        "a ~120ms stage must cost at most one poll period (measured period {period_est}ms on this \
+         host in this run): before the fix the loop paid a second, already-dead /proc sweep on top \
+         of that period. got stage_ms={stage_ms}ms, json={:?}",
+        outcome.stage_json
+    );
+    assert!(
+        outcome.stage_json["samples"].as_i64().expect("samples present") < 2,
+        "a ~120ms stage cannot be sampled twice at this cadence: json={:?}",
+        outcome.stage_json
+    );
+    assert_eq!(outcome.stage_json["measured"], false, "json={:?}", outcome.stage_json);
+    assert_ne!(
+        outcome.exit_code, 0,
+        "an unmeasured stage must judge failed: json={:?}",
+        outcome.stage_json
+    );
 }
 
 /// Variant ④: `--judge` with empty stdin must fail loud (exit 2), never
@@ -279,6 +407,62 @@ fn judge_requires_a_budget_unless_the_caller_allows_none() {
         outcome.exit_code, 0,
         "run_stage must pass --allow-null-budget for --selfcheck: {:?}",
         outcome.stage_json
+    );
+}
+
+/// R6-N6-② (#128 T6-a2): the `stage_ms>=200` limb of `measured`. A real
+/// child cannot produce `samples>=2` with `stage_ms<200` on this host -- two
+/// samples require the root to outlive a full poll period (~170ms: a ~70ms
+/// `/proc` sweep plus the 100ms sleep), so the earliest a two-sample stage
+/// can end is ~239ms -- which is why the corner is pinned here, on the one
+/// surface that takes `samples`/`stage_ms` as input (R6-N6-②: 与 B2 样本合并
+/// 的是真子进程那一半，这一半只能合成).
+///
+/// Mutation-covered: deleting the `stage_ms` half of the consistency rule in
+/// `judge_from_stdin` (keeping only the sample count) turns case ① below
+/// green; deleting the sample-count half turns case ② green.
+#[test]
+fn judge_rejects_measured_true_whose_samples_disagree_with_its_stage_ms() {
+    // ① two samples, a duration below the threshold: both limbs must hold,
+    // not just the sample count.
+    let out = run_judge(
+        r#"{"shape":"a","measured":true,"exit_code":0,"peak_tree":1000,"peak_proc":1000,"samples":2,"stage_ms":170,"budget":1000000}"#,
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "measured=true with samples=2 but stage_ms=170 must be malformed input: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("stage_ms>=200"),
+        "expected the measured-consistency message, got: {stderr}"
+    );
+    // ② the mirror: a duration over the threshold with a single sample. This
+    // keeps ① from being satisfiable by checking only the duration.
+    let out = run_judge(
+        r#"{"shape":"a","measured":true,"exit_code":0,"peak_tree":1000,"peak_proc":1000,"samples":1,"stage_ms":200,"budget":1000000}"#,
+        &[],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "measured=true with stage_ms=200 but samples=1 must be malformed input: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // ③ control: both limbs satisfied, so the object is judged on its budget
+    // term alone and passes -- proving ①② are not satisfied by rejecting
+    // every measured object.
+    let out = run_judge(
+        r#"{"shape":"a","measured":true,"exit_code":0,"peak_tree":1000,"peak_proc":1000,"samples":2,"stage_ms":200,"budget":1000000}"#,
+        &[],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "samples=2 / stage_ms=200 within budget must pass: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
