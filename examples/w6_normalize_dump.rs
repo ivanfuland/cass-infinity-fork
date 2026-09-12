@@ -29,6 +29,7 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use clap::Parser;
 use coding_agent_search::raw_mirror;
 use coding_agent_search::search::canonicalize::{canonicalize_for_embedding, content_hash_hex};
@@ -93,20 +94,35 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// R6-B6: any file under `root` carrying this `(dev, ino)`? Used to catch
 /// an output path that is a hard link *to a mirror blob* from outside
 /// `--mirror`, which the `starts_with` containment check cannot see.
-fn contains_inode(root: &Path, dev: u64, ino: u64) -> bool {
+///
+/// R7-1 (#124): a walk that cannot see part of the mirror is not evidence
+/// that the inode is absent. The first version swallowed every
+/// `read_dir`/entry error and returned `false`, so a blob inside a directory
+/// the running user cannot enumerate -- reachable through an alias that does
+/// not need to read that directory at all -- passed the check and was
+/// truncated by the `fs::write` below. "Unknown" is now an error the caller
+/// refuses on, never a silent "no alias".
+fn contains_inode(root: &Path, dev: u64, ino: u64) -> anyhow::Result<bool> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let Ok(md) = entry.metadata() else { continue };
+        let entries = fs::read_dir(&dir).with_context(|| {
+            format!("cannot enumerate {} while checking it for hard-link aliases", dir.display())
+        })?;
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("cannot read an entry of {} while checking it for hard-link aliases", dir.display())
+            })?;
+            let md = entry.metadata().with_context(|| {
+                format!("cannot stat {} while checking it for hard-link aliases", entry.path().display())
+            })?;
             if md.is_dir() {
                 stack.push(entry.path());
             } else if md.dev() == dev && md.ino() == ino {
-                return true;
+                return Ok(true);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 fn refuse_output_collisions(db: &Path, mirror: &Path, out: &Path, identity: &Path) -> anyhow::Result<()> {
@@ -141,9 +157,10 @@ fn refuse_output_collisions(db: &Path, mirror: &Path, out: &Path, identity: &Pat
         // R6-B6: the containment check above misses a hard link to a blob
         // placed outside --mirror. Only an existing path with more than one
         // link can be such an alias, so the walk (the mirror holds
-        // thousands of files) runs for those alone.
+        // thousands of files) runs for those alone. R7-1 (#124): a walk that
+        // could not complete is an error (`?`), not an `Ok(false)`.
         if let Ok(md) = fs::metadata(p) {
-            if md.nlink() > 1 && contains_inode(&mirror_r, md.dev(), md.ino()) {
+            if md.nlink() > 1 && contains_inode(&mirror_r, md.dev(), md.ino())? {
                 anyhow::bail!(
                     "{label} {} is a hard link to a file under --mirror {}; refusing to write into the data directory",
                     p.display(),
