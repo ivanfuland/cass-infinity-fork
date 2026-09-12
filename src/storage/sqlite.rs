@@ -9224,12 +9224,29 @@ impl FrankenStorage {
     ) -> Result<Vec<InsertOutcome>> {
         let mut skipped = Vec::new();
         let outcomes = self.insert_conversations_batched_reporting(conversations, &mut skipped)?;
-        for skip in &skipped {
-            tracing::warn!(
-                source_path = %skip.source_path,
-                external_id = ?skip.external_id,
-                error = %skip.error,
-                "skipping one conversation: its excluded fingerprint is unusable"
+        if !skipped.is_empty() {
+            // B06 (任务书 #131): this wrapper's callers have no other way to
+            // learn that a conversation was refused -- `skipped` is not part
+            // of the public signature, so pre-fix the only trace was a
+            // `tracing::warn!` and a caller's `?` carried on as if every
+            // conversation had been written (`Ok([])` for a batch whose only
+            // conversation was refused, `Ok([A])` for an A/B batch). The
+            // internal ingest path calls `_reporting` directly and turns each
+            // entry into a per-session `ScanError`, so nothing there depends
+            // on this wrapper.
+            let detail = skipped
+                .iter()
+                .map(|skip| {
+                    format!(
+                        "{} (external_id={:?}): {}",
+                        skip.source_path, skip.external_id, skip.error
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "{} conversation(s) were refused for an unusable excluded fingerprint: {detail}",
+                skipped.len()
             );
         }
         Ok(outcomes)
@@ -21074,6 +21091,113 @@ mod tests {
     /// recovered row lost its identity/audit anchor (and the prune reference
     /// protection that reads it) while the import still reported success.
     /// v4/v5 bundles have no such column and keep the `None` they always had.
+    /// B06 (任务书 #131): the public `insert_conversations_batched` returned
+    /// `Ok` even when its pre-flight refused a conversation for an unusable
+    /// `excluded` fingerprint. `skipped` is not part of the public signature
+    /// (the wrapper only logged it), so a caller's `?` carried on as if every
+    /// conversation had been written -- and `Ok([A])` for an A/B batch hid B
+    /// entirely.
+    #[test]
+    fn insert_conversations_batched_reports_skipped_conversations_as_err() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("batched-skipped.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = |name: &str, fingerprint: Option<&str>| Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(name.to_string()),
+            title: None,
+            source_path: PathBuf::from(format!("/tmp/{name}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: fingerprint.map(|fp| ExcludedMarker {
+                    reason: ExclusionReason::CassRecall,
+                    rule_version: 1,
+                    bytes: 2,
+                    sha256: "a".repeat(64),
+                    fingerprint_blake3: fp.to_string(),
+                    anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: None },
+                    src: None,
+                    parse_error: None,
+                    raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 0, event_key: "ek-1".into(), blocks: vec![] },
+                }),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        // (a) A healthy batch still returns Ok.
+        let healthy = conversation("healthy", None);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &healthy)])
+            .expect("a batch with no refused conversation keeps returning Ok");
+
+        // (b) A batch whose only conversation is refused is an Err that names it.
+        let refused = conversation("refused", Some("zz"));
+        let err = storage
+            .insert_conversations_batched(&[(agent_id, None, &refused)])
+            .map(|_| ())
+            .expect_err("a refused conversation must not be reported as an Ok batch");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("/tmp/refused.jsonl") && message.contains("refused"),
+            "the error must name the conversation it refused: {message}"
+        );
+
+        // (c) A healthy-and-refused pair must not come back as Ok([A]).
+        let healthy_second = conversation("healthy-second", None);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &healthy_second), (agent_id, None, &refused)])
+            .map(|_| ())
+            .expect_err("one refused conversation must fail the whole public call");
+        let persisted: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE external_id = 'healthy-second'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1, "the acceptable conversation is still written; the Err is about the refused one");
+
+        // (d) The per-session entry point still skips ONLY the bad one -- the
+        // ingest path turns each entry into a per-session ScanError.
+        let mut skipped = Vec::new();
+        let a = conversation("reporting-a", None);
+        let b = conversation("reporting-b", Some("zz"));
+        let c = conversation("reporting-c", None);
+        let outcomes = storage
+            .insert_conversations_batched_reporting(
+                &[(agent_id, None, &a), (agent_id, None, &b), (agent_id, None, &c)],
+                &mut skipped,
+            )
+            .expect("the reporting entry point never fails the batch for one bad conversation");
+        assert_eq!(outcomes.len(), 2, "A and C must be inserted");
+        assert_eq!(skipped.len(), 1, "only B is skipped");
+        assert_eq!(skipped[0].external_id.as_deref(), Some("reporting-b"));
+        assert_eq!(skipped[0].source_path, "/tmp/reporting-b.jsonl");
+        assert!(skipped[0].error.contains("fingerprint"), "the skip must say why: {}", skipped[0].error);
+    }
+
     #[test]
     fn salvage_historical_databases_preserves_v6_excluded_markers() {
         use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
