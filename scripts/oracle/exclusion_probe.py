@@ -1525,6 +1525,27 @@ def _verify_extra(block_value):
     }
 
 
+def _write_opencode_probe_db(root):
+    """A minimal corpus holding ONE `opencode` session (the connector whose
+    sessions the plan models as `SourceKind::Logical`), and no mirror at all --
+    so `run_probe` reaches its `no_manifest` branch for it."""
+    path = os.path.join(root, "opencode-probe.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(_verify_schema(False))
+    conn.execute("INSERT INTO agents(id, slug, name, kind) VALUES (1, 'opencode', 'OpenCode', 'cli')")
+    conn.execute(
+        "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+        "VALUES (1, 1, 'local', 'opencode-ext-1', 'probe fixture session', '/src/opencode-1.jsonl')"
+    )
+    conn.execute(
+        "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+        "VALUES (1, 1, 0, 'user', 'hello', NULL)"
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
 def _verify_schema(with_excluded):
     excluded = ", excluded BLOB" if with_excluded else ""
     return (
@@ -1812,6 +1833,25 @@ def _run_verify_selftest(paths_cfg):
                 "FAIL V9b non_manifest_rows_checked counts the reference side: "
                 f"got {report['non_manifest_rows_checked']!r}, want 1"
             )
+
+    # N10 (任务书 #131): `logical_source` counts sessions of a connector the
+    # plan models as `SourceKind::Logical` (opencode). That counting sat AFTER
+    # the `no_manifest`/`connector is None` branches, both of which `continue`
+    # -- so the one connector the column exists for could never be counted.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        db = _write_opencode_probe_db(root)
+        mirror = os.path.join(root, "empty-mirror")
+        os.makedirs(mirror)
+        _manifest, probe_stats = run_probe(
+            db, mirror, paths_cfg, os.path.join(root, "out.json"), os.path.join(root, "report.md")
+        )
+        got = probe_stats["coverage"]["opencode"]["logical_source"]
+        if got == 1:
+            passed += 1
+            print("ok   N10 logical_source counts an opencode session")
+        else:
+            print(f"FAIL N10 logical_source counts an opencode session: got {got!r}, want 1")
 
     # N03 (任务书 #131): `events_from_blob` falls back to the event's PHYSICAL
     # 1-based line number (`line:N`) when the event carries no id of its own.
@@ -2434,6 +2474,14 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
         agent_slug = conv_d["agent_slug"]
         cov = stats["coverage"][agent_slug]
         cov["sessions"] += 1
+        # N10 (任务书 #131): `logical_source` is a property of the SESSION's
+        # connector, so it must be counted here -- before the `no_manifest` /
+        # `no_blob` / `parse_error` / `connector is None` branches `continue`,
+        # which is exactly the state an opencode session is in (it has no
+        # manifest and no candidate builder). Counting it at the end left the
+        # one connector the column exists for permanently at 0.
+        if agent_slug.split("/")[0] in LOGICAL_SOURCE_CONNECTORS:
+            cov["logical_source"] += 1
 
         db_msg_rows = conn.execute(
             "SELECT idx, role, content, extra_bin FROM messages WHERE conversation_id = ? ORDER BY idx",
@@ -2499,13 +2547,6 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
 
         entries = process_session_v2(conv_d, db_rows_full, raw_candidates, paths_cfg, stats)
         manifest.extend(entries)
-
-        # R1-N20/R2-N15: `logical_source` is the `SourceKind::Logical`
-        # connector column the plan asks for; mirrors the production table
-        # (`indexer/mod.rs:15708 LOGICAL_SOURCE_CONNECTORS`) rather than
-        # guessing from whether `source_path` exists.
-        if agent_slug.split("/")[0] in LOGICAL_SOURCE_CONNECTORS:
-            cov["logical_source"] += 1
 
         # R1-N20/R2-N15: codex `user` rows at `idx != 0` whose body carries a
         # memory feature string are the known out-of-anchor class (spec §60:
