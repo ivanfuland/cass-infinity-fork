@@ -1702,7 +1702,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           fragmented_array_tool_use_result=False,
                           foreign_array_tool_use_result_cleared=False,
                           candidate_only_excluded_row=None,
-                          fragmented_extra_text_blocks=False):
+                          fragmented_extra_text_blocks=False,
+                          duplicate_source_row=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1784,10 +1785,39 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY, message_id INTEGER);"
             )
         conn.execute("INSERT INTO agents(id, slug, name, kind) VALUES (1, 'claude_code', 'Claude', 'cli')")
+        if duplicate_source_row and not with_excluded:
+            # R9-B08 (任务书 #132): the OTHER source's row, inserted FIRST (rowid
+            # 0) so it is scanned before the candidate's survivor -- the fold R9
+            # measured, where the later row overwrote it in the pre-fix dict and
+            # the dropped row became invisible. The reference keeps it; the
+            # candidate never has it.
+            conn.execute(
+                "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+                "VALUES (4, 1, 'other', 'verify-ext-1', 'same session key, other source', '/src/other/verify-ext-1.jsonl')"
+            )
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (0, 4, 7, 'user', 'host A unique data', ?)",
+                [msgpack.packb(
+                    {"message": {"content": [{"type": "text", "text": "host A unique data"}]}},
+                    use_bin_type=True,
+                )],
+            )
         conn.execute(
             "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
             "VALUES (1, 1, 'local', 'verify-ext-1', 'verify fixture session', '/src/verify-ext-1.jsonl')"
         )
+        if duplicate_source_row:
+            # The same (agent, external_id, idx) from the OTHER source -- the
+            # key both rows would fold to if `source_id` were not part of it.
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (800, 1, 7, 'user', 'host B data', ?)",
+                [msgpack.packb(
+                    {"message": {"content": [{"type": "text", "text": "host B data"}]}},
+                    use_bin_type=True,
+                )],
+            )
         boundary_content = "altered boundary" if (non_manifest_altered and with_excluded) else "turn boundary"
         if not (missing_nonmanifest_row and with_excluded):
             # B09: the candidate simply does not have this ordinary row, while
@@ -2420,6 +2450,11 @@ def verify_selftest_cases():
         # only projecting the extra reconstructs the body.
         ("V29 a claude body fragmented across extra text blocks is a failure", False,
          "still present in extra_bin"),
+        # R9-B08 (任务书 #132): two rows differing only in `source_id` used to
+        # fold to one dict key, so the row the candidate dropped was invisible
+        # -- each side showed one row, and they matched.
+        ("V30 a row dropped from one source is a missing non-manifest row", False,
+         "non-manifest row is missing"),
     ]
 
 
@@ -2467,6 +2502,7 @@ def _run_verify_selftest(paths_cfg):
             26: {"candidate_only_excluded_row": "extra_leak"},
             27: {"candidate_only_excluded_row": "unverifiable"},
             28: {"fragmented_extra_text_blocks": True},
+            29: {"duplicate_source_row": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -3775,12 +3811,23 @@ def _session_key(entry):
 
 
 def _stable_row_key(row):
-    """B09 (任务书 #131): the key the candidate and the reference library must
-    agree on for an ordinary row -- agent, session identity, position.
-    `source_id` is deliberately NOT part of it: it is derived from
-    provenance/origin host, which may legitimately differ between the two
-    libraries without anything being wrong."""
+    """B09 (任务书 #131) / R9-B08 (任务书 #132): the key the candidate and the
+    reference library must agree on for an ordinary row -- SOURCE, agent,
+    session identity, position.
+
+    The key used to drop `source_id`, on the theory that it is derived from
+    provenance and may legitimately differ between the two libraries. That
+    theory does not survive contact with the data: two rows differing ONLY in
+    `source_id` then collapse to one dict key, the later one silently
+    overwrites the earlier, and "non-manifest row is missing" cannot fire for a
+    row that was dropped -- each side shows one row and they match. Whether a
+    source change is legitimate is a question for an explicit mapping to
+    answer, not for a key that discards the field.
+
+    `external_id` is still the session identity (falling back to
+    `source_path`, the same rule the manifest uses)."""
     return (
+        _field(row, "source_id"),
         _field(row, "agent_slug"),
         _field(row, "external_id") or _field(row, "source_path"),
         _field(row, "idx"),
@@ -4604,7 +4651,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     }
     checked = len(ref_rows)
     for key, ref_row in ref_rows.items():
-        label = f"{key[0]}/idx={key[2]}"
+        label = f"{key[1]}/{key[0]}/idx={key[3]}"
         row = cand_rows.get(key)
         if row is None:
             failures.append((label, "non-manifest row is missing from the candidate"))
@@ -4620,7 +4667,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             # construction. Recorded, not failed -- after a shape check.
             candidate_excluded_beyond_manifest += 1
             if len(candidate_excluded_beyond_manifest_samples) < 20:
-                candidate_excluded_beyond_manifest_samples.append([label, key[2]])
+                candidate_excluded_beyond_manifest_samples.append([label, key[3]])
             # R9-B04 (任务书 #132): going beyond the manifest is a CLAIM, not
             # an exemption -- the row is held to the same invariants a manifest
             # row is. The entry is synthesized from the row itself, because no
@@ -4628,10 +4675,10 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             entry = {
                 "reason": marker.get("reason"),
                 "source_id": _field(row, "source_id"),
-                "agent_slug": key[0],
+                "agent_slug": key[1],
                 "external_id": _field(row, "external_id"),
                 "source_path": _field(row, "source_path"),
-                "idx": key[2],
+                "idx": key[3],
                 "blocks": (marker.get("raw") or {}).get("blocks") or [],
             }
             problem = _beyond_manifest_exclusion_problem(
@@ -4653,7 +4700,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         if row["extra_bin"] != ref_row["extra_bin"] and not _sibling_extra_diff_is_target_only(
             _decode_extra(row["extra_bin"]),
             _decode_extra(ref_row["extra_bin"]),
-            key[0],
+            key[1],
             manifest_by_event,
         ):
             failures.append((label, "non-manifest extra_bin differs from reference"))
@@ -4677,7 +4724,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                 problem = _candidate_only_excluded_problem(row, marker, conn_cand, mirror_root)
                 if problem is not None:
                     subreason, detail = problem
-                    label = f"{key[0]}/idx={key[2]}"
+                    label = f"{key[1]}/{key[0]}/idx={key[3]}"
                     if subreason == "unverifiable":
                         candidate_only_unjudgeable += 1
                         if len(candidate_only_unjudgeable_samples) < 20:
