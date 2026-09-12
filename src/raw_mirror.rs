@@ -1711,6 +1711,16 @@ pub(crate) fn force_sync_dir(_dir: &Path) -> Result<()> {
 pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
     let mut missing: Vec<PathBuf> = Vec::new();
     for ancestor in path.ancestors() {
+        // N06 (任务书 #131): a bare relative path's ancestors are `fresh-data`
+        // and then the EMPTY path -- the current directory, which this call
+        // neither creates nor may fsync. Walking into it pushed `""` into
+        // `missing`, and the sync loop below then opened `""` (ENOENT), so the
+        // first `create_dir_all_durable(Path::new("fresh-data"))` in a fresh
+        // cwd failed. `run_index` / `QuarantineState::save` hit this whenever
+        // `data_dir` is a bare relative name.
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
         if fs::symlink_metadata(ancestor).is_ok() {
             break;
         }
@@ -1727,7 +1737,13 @@ pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
 
     let mut synced_parents: HashSet<PathBuf> = HashSet::new();
     for created in &missing {
-        if let Some(parent) = created.parent()
+        // The same empty-parent shape, one level down: for a single-component
+        // relative path the directory to sync IS `.`.
+        let parent = match created.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+            other => other,
+        };
+        if let Some(parent) = parent
             && synced_parents.insert(parent.to_path_buf())
         {
             force_sync_dir(parent)?;
@@ -2980,6 +2996,32 @@ mod tests {
     /// R4-B1 (任务书 #120a) 正例②：`data_dir` 已经预先存在（调用方已经
     /// `fs::create_dir_all` 过）-- 断言 `create_dir_all_durable` 不 fsync
     /// 任何目录，证明它不是无脑往上刷，只对"这次调用真正新建的"负责。
+    /// N06 (任务书 #131): a bare relative path's direct ancestor is the EMPTY
+    /// path -- the current directory, not a directory this call creates. The
+    /// ancestor walk pushed `""` into the created-set and the sync loop then
+    /// tried to fsync it (`File::open("")` -> ENOENT), so the first
+    /// `create_dir_all_durable(Path::new("fresh-data"))` in a fresh cwd failed.
+    /// `run_index`/`QuarantineState::save` reach this whenever `data_dir` is a
+    /// bare relative name.
+    ///
+    /// The test chdirs (process-global) under the crate's serial lock and
+    /// restores the previous directory before returning; every other test in
+    /// this binary works from absolute temp paths, so the window only affects
+    /// a `#[serial]` sibling.
+    #[test]
+    #[serial_test::serial]
+    fn create_dir_all_durable_bare_relative_path_creates_and_syncs_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(temp.path()).expect("chdir into the tempdir");
+        let result = create_dir_all_durable(Path::new("fresh-data"));
+        let exists = temp.path().join("fresh-data").is_dir();
+        std::env::set_current_dir(&previous).expect("restore cwd");
+
+        result.expect("a bare relative first-run directory must be created and made durable");
+        assert!(exists, "the directory must exist after the call");
+    }
+
     #[test]
     fn create_dir_all_durable_does_not_sync_when_data_dir_already_exists_positive() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
