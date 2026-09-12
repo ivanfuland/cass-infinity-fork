@@ -126,6 +126,12 @@
         },
         "event_align_failed": {
           "type": "null"
+        },
+        "capture_na": {
+          "type": "null"
+        },
+        "capture_failed": {
+          "type": "null"
         }
       }
     },

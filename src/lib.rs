@@ -18019,6 +18019,10 @@ struct StateDbSnapshot {
     codex_host_shell_hits: Option<u64>,
     codex_idx0_user_total: Option<u64>,
     event_align_failed: Option<u64>,
+    /// R2-N8 (任务书 #129): the two capture-outcome counts, same `last_index.*`
+    /// meta keys and same null-when-never-written semantics as the three above.
+    capture_na: Option<u64>,
+    capture_failed: Option<u64>,
 }
 
 fn probe_state_db(
@@ -18117,6 +18121,22 @@ fn probe_state_db_modes(
     snapshot.event_align_failed = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_index.event_align_failed'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.capture_na = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.capture_na'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.capture_failed = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.capture_failed'",
         &[],
         |r| r.get_typed::<String>(0),
     )
@@ -18825,6 +18845,8 @@ fn state_meta_json_inner(
     let codex_host_shell_hits = db_snapshot.codex_host_shell_hits;
     let codex_idx0_user_total = db_snapshot.codex_idx0_user_total;
     let event_align_failed = db_snapshot.event_align_failed;
+    let capture_na = db_snapshot.capture_na;
+    let capture_failed = db_snapshot.capture_failed;
 
     let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
@@ -19111,6 +19133,8 @@ fn state_meta_json_inner(
             "codex_host_shell_hits": codex_host_shell_hits,
             "codex_idx0_user_total": codex_idx0_user_total,
             "event_align_failed": event_align_failed,
+            "capture_na": capture_na,
+            "capture_failed": capture_failed,
         },
         "index": {
             "exists": lexical.exists,

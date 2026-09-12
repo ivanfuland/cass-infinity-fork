@@ -970,6 +970,14 @@ pub struct IndexingStats {
     /// the reparsed message count, so judgment was skipped entirely for
     /// that session (宁漏勿误, not an error).
     pub event_align_failed: u64,
+    /// R2-N8 (任务书 #129): sessions whose source is connector-internal
+    /// ("logical", no backing file), so raw-mirror capture and exclusion
+    /// judgment are both inapplicable -- a legitimate skip, not a failure.
+    pub capture_na: u64,
+    /// R2-N8 (任务书 #129): sessions whose raw-mirror capture actually
+    /// FAILED (a hard `CaptureFailed`). The pair with `capture_na` is what
+    /// separates "not applicable" from "went wrong".
+    pub capture_failed: u64,
     /// PR6 T5: connector scan invocations started by this run (see
     /// `SCAN_INVOCATIONS`). Must be 0 for `--no-ingest`.
     pub scan_invocations: u64,
@@ -6193,15 +6201,22 @@ fn persist_final_index_run_metadata(
 fn persist_last_index_run_meta_counters(writer: &FrankenStorage) -> Result<()> {
     let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
         last_index_run_counters_snapshot();
+    // R2-N8 (任务书 #129): the two capture-outcome counts land in the same
+    // statement (and therefore the same commit) as the three anchor counts.
+    let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
     writer.raw().execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES \
          ('last_index.codex_host_shell_hits', ?1), \
          ('last_index.codex_idx0_user_total', ?2), \
-         ('last_index.event_align_failed', ?3)",
+         ('last_index.event_align_failed', ?3), \
+         ('last_index.capture_na', ?4), \
+         ('last_index.capture_failed', ?5)",
         &crate::storage::api::params![
             codex_host_shell_hits.to_string(),
             codex_idx0_user_total.to_string(),
-            event_align_failed.to_string()
+            event_align_failed.to_string(),
+            capture_na.to_string(),
+            capture_failed.to_string()
         ],
     )?;
     Ok(())
@@ -10378,6 +10393,9 @@ pub fn run_index(
         stats.codex_host_shell_hits = codex_host_shell_hits;
         stats.codex_idx0_user_total = codex_idx0_user_total;
         stats.event_align_failed = event_align_failed;
+        let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+        stats.capture_na = capture_na;
+        stats.capture_failed = capture_failed;
     }
 
     if targeted_watch_once_only_run {
@@ -14734,6 +14752,9 @@ fn reindex_paths_with_semantic_delta(
                     stats.codex_host_shell_hits = codex_host_shell_hits;
                     stats.codex_idx0_user_total = codex_idx0_user_total;
                     stats.event_align_failed = event_align_failed;
+                    let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+                    stats.capture_na = capture_na;
+                    stats.capture_failed = capture_failed;
                 }
 
                 // Deferred check is CUMULATIVE, not per-chunk: once any earlier
@@ -15806,12 +15827,46 @@ fn record_codex_idx0_user_candidate() {
     CODEX_IDX0_USER_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// R2-N8 (任务书 #129): the two capture-outcome counters the frozen report
+/// interface needs, in the same shape as the three counters above (statics +
+/// `record_*` + snapshot + the same `reset_last_index_run_counters` boundary
+/// + `last_index.*` meta keys + an `IndexStats` field pair). `capture_na` =
+/// the session's source is connector-internal ("logical", no backing file),
+/// so raw-mirror capture and exclusion judgment are both inapplicable -- a
+/// legitimate skip. `capture_failed` = capture was attempted and failed --
+/// a real error. Both were previously indistinguishable: only a
+/// `tracing::debug!` line and a `PrepareError` existed.
+static CAPTURE_NA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CAPTURE_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_capture_na() {
+    CAPTURE_NA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_capture_failed() {
+    CAPTURE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// R2-N8: separate accessor rather than a five-tuple widening of
+/// [`last_index_run_counters_snapshot`] -- the anchor counters and the
+/// capture counters are consumed at the same three places but are two
+/// different facts, and widening the tuple would rewrite five unrelated
+/// destructuring sites (including tests that assert only on the anchors).
+pub(crate) fn last_index_capture_counters_snapshot() -> (u64, u64) {
+    (
+        CAPTURE_NA.load(std::sync::atomic::Ordering::Relaxed),
+        CAPTURE_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Reset all three run-level counters. Call at `run_index` entry and at the
 /// start of each watch cycle -- "each cycle = one run" per mission #116⑥.
 pub(crate) fn reset_last_index_run_counters() {
     CODEX_HOST_SHELL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
     CODEX_IDX0_USER_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
     EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE_NA.store(0, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
     // R2-N7 (任务书 #129): the per-session detail list is the counter's
     // detail side, so it shares the counter's run boundary.
     EVENT_ALIGN_FAILURES
@@ -16214,11 +16269,15 @@ fn prepare_conversation_for_ingest(
     let record = match source_kind {
         CaptureSourceKind::Logical => {
             tracing::debug!(agent = %conv.agent_slug, "prepare: logical source, capture/judgment inapplicable (capture_na)");
+            // R2-N8 (任务书 #129): count it, don't just log it -- the report
+            // must tell this legitimate skip apart from a real failure.
+            record_capture_na();
             None
         }
         CaptureSourceKind::File(_) => {
             invoke_prepare_fault_hook(PrepareStage::BeforeCapture, &original_source_path);
             Some(attach_raw_mirror_capture(data_dir, &mut conv).map_err(|err| {
+                record_capture_failed();
                 PrepareError(format!("raw-mirror capture failed for {}: {err:#}", original_source_path.display()))
             })?)
         }
@@ -35383,6 +35442,58 @@ mod tests {
 
         reset_last_index_run_counters();
         assert!(last_index_event_align_failures_snapshot().is_empty(), "reset must clear the detail list too");
+    }
+
+    /// R2-N8 (任务书 #129): the report must distinguish "this session's
+    /// source has no backing file at all, so raw-mirror capture and exclusion
+    /// judgment are both inapplicable" (`capture_na`, a legitimate skip) from
+    /// "capture was attempted and failed" (`capture_failed`, a real error).
+    /// The plan's gate asserts exactly this pair against a fixture with one
+    /// real failure.
+    #[test]
+    #[serial]
+    fn prepare_records_capture_na_and_capture_failed_separately() {
+        reset_last_index_run_counters();
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+
+        // (a) A connector whose `source_path` is a DB-derived key, never a
+        // real file (R1-N6's `LOGICAL_SOURCE_CONNECTORS`), classified
+        // `Logical` by the scan call site -> capture_na.
+        let logical_conv = norm_conv(Some("r2-n8-logical"), vec![norm_msg(0, 10)]);
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "opencode",
+            &codex_connector,
+            &Origin::local(),
+            None,
+            CaptureSourceKind::Logical,
+            logical_conv,
+        )
+        .expect("a logical source must prepare fine -- capture and judgment are inapplicable");
+
+        // (b) A `File` source that does not exist -> the capture really runs
+        // and really fails -> capture_failed.
+        let missing = temp.path().join("r2-n8-missing.jsonl");
+        let mut failing_conv = norm_conv(Some("r2-n8-failing"), vec![norm_msg(0, 10)]);
+        failing_conv.source_path = missing.clone();
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &codex_connector,
+            &Origin::local(),
+            None,
+            CaptureSourceKind::File(missing),
+            failing_conv,
+        )
+        .expect_err("a missing source file must fail capture");
+
+        let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+        assert_eq!(capture_na, 1, "the logical-source session must count as capture_na");
+        assert_eq!(capture_failed, 1, "the missing-file session must count as capture_failed");
+        reset_last_index_run_counters();
     }
 
     /// R1-N16 (任务书 #118b) mutation/negative: a connector with no

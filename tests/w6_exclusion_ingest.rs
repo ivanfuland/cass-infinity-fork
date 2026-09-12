@@ -890,6 +890,18 @@ fn status_json_last_index_counters_survive_a_failed_run() {
     let event_align_failed_after_success =
         last_index_after_success.get("event_align_failed").and_then(serde_json::Value::as_u64);
     assert_eq!(event_align_failed_after_success, Some(0), "the fixture is a real mixed shape, alignment must not fail: {status_value}");
+    // R2-N8 (任务书 #129): the two capture-outcome counts must be published
+    // through the same `last_index` block as the three above. This fixture
+    // has no logical-source session and no capture failure, so both are 0 --
+    // the assertion that matters here is that the keys EXIST and are
+    // numbers, i.e. `cass status --json` really carries the new read surface
+    // and not just `cass index --json`'s run report.
+    let capture_na_after_success =
+        last_index_after_success.get("capture_na").and_then(serde_json::Value::as_u64);
+    assert_eq!(capture_na_after_success, Some(0), "capture_na must be published by every run (0 here: no logical-source session): {status_value}");
+    let capture_failed_after_success =
+        last_index_after_success.get("capture_failed").and_then(serde_json::Value::as_u64);
+    assert_eq!(capture_failed_after_success, Some(0), "capture_failed must be published by every run (0 here: nothing failed to capture): {status_value}");
 
     // Now run a genuinely capture-failed session (in-process hook) against
     // the SAME data_dir -- a failed run must not clobber the counters the
