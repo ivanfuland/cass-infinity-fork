@@ -49,6 +49,8 @@ disclosure in the report), not to gate the manifest.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import glob
 import hashlib
 import json
@@ -1853,6 +1855,36 @@ def _run_verify_selftest(paths_cfg):
         else:
             print(f"FAIL N10 logical_source counts an opencode session: got {got!r}, want 1")
 
+    # N-fam (任务书 #131, 控制面追加): a run that reports tens of thousands of
+    # failures must be reducible to families, not just to a total.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root, non_target_cleared=True)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        families = report.get("failure_families") or {}
+        details = " | ".join(detail for _label, detail in failures)
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            rc = run_verify(
+                candidate, manifest_path, reference, mirror, 50, 6,
+                os.path.join(root, "report.json"), paths_cfg,
+            )
+        printed = stream.getvalue()
+        if (
+            families.get("extra_unexpected_change") == 1
+            and "changed somewhere other than" in details
+            and rc == 1
+            and "failure families:" in printed
+            and "extra_unexpected_change=1" in printed
+        ):
+            passed += 1
+            print("ok   N-fam failures are counted by family (report + stdout)")
+        else:
+            print(
+                f"FAIL N-fam failures are counted by family (report + stdout): "
+                f"families={families!r} rc={rc!r} printed={printed!r} details={details!r}"
+            )
+
     # N03 (任务书 #131): `events_from_blob` falls back to the event's PHYSICAL
     # 1-based line number (`line:N`) when the event carries no id of its own.
     # The probe's builders recorded `None`, so a marker written against such an
@@ -3054,6 +3086,54 @@ def _normalized_diff_path(path):
     return path[1:] if path.startswith(".") else path
 
 
+# ---------------------------------------------------------------------------
+# N-fam (任务书 #131, 控制面追加): a coarse family per failure detail. A real
+# run can report tens of thousands of failures (`failures=84642` on the T6-b
+# rehearsal); a bare total cannot be reduced to a cause, and listing the first
+# twenty cannot either. The families are matched on the detail text emitted by
+# `_verify_once` below -- ordered, because several details share substrings.
+# ---------------------------------------------------------------------------
+_FAILURE_FAMILIES = (
+    ("sha_binding_mismatch", "sha_binding_mismatch"),
+    # The rebuild family is matched on the DETAIL text: the `rebuild/...` part
+    # is the failure's LABEL, not its detail, so a `"rebuild/"` needle here
+    # would never fire.
+    ("rebuilt sha256", "rebuild_sha"),
+    ("is not a position in the reparsed candidate list", "rebuild_raw_idx"),
+    ("carries event_key=", "rebuild_event_key"),
+    ("is block ", "rebuild_block"),
+    ("raw-mirror blob is gone", "rebuild_blob_missing"),
+    ("marker has no raw.blob", "rebuild_no_blob"),
+    ("no reparse builder", "rebuild_no_builder"),
+    ("context_file_read hit outside predicate P", "outside_predicate_p"),
+    ("the session title still contains the body", "title_retained"),
+    ("still carries the body in extra_bin", "body_retained_in_extra"),
+    ("still carries the body", "body_retained_in_content"),
+    ("redacted a field this exclusion does not own", "extra_over_clear"),
+    ("changed somewhere other than a redacted block", "extra_unexpected_change"),
+    ("is still present in extra_bin", "extra_body_present"),
+    ("extra_bin presence differs", "extra_presence"),
+    ("still carries a body", "content_retained"),
+    ("has no `excluded` marker", "marker_missing"),
+    ("marker reason", "marker_reason"),
+    ("non-manifest row is missing", "non_manifest_row_missing"),
+    ("non-manifest row is not in the reference", "non_manifest_row_extra"),
+    ("non-manifest body differs", "non_manifest_body_changed"),
+    ("non-manifest extra_bin differs", "non_manifest_extra_changed"),
+    ("manifest row is absent", "manifest_row_missing"),
+    ("snippet_text survived", "snippet_retained"),
+    ("lex_docs row(s)", "lex_row_present"),
+    ("message_chunks row(s)", "chunk_row_present"),
+)
+
+
+def failure_family(detail):
+    for needle, family in _FAILURE_FAMILIES:
+        if needle in detail:
+            return family
+    return "other"
+
+
 def _is_redacted_placeholder(value, sha):
     return (
         isinstance(value, dict)
@@ -3322,6 +3402,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "rebuild_sample": len(sample),
         "rebuild_ok": rebuilt,
         "sha_binding_mismatch": sha_binding_mismatch,
+        "failure_families": dict(sorted(Counter(failure_family(detail) for _label, detail in failures).items())),
         "failures": len(failures),
     }
     return failures, report
@@ -3441,6 +3522,9 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
         print(f"FAIL {label}: {detail}")
     if len(failures) > VERIFY_MAX_LISTED_FAILURES:
         print(f"... and {len(failures) - VERIFY_MAX_LISTED_FAILURES} more")
+    if failures:
+        families = Counter(failure_family(detail) for _label, detail in failures)
+        print("verify: failure families: " + ", ".join(f"{name}={count}" for name, count in families.most_common()))
     print(
         f"verify: manifest={report['manifest_entries']} "
         f"non_manifest_rows={report['non_manifest_rows_checked']} "
