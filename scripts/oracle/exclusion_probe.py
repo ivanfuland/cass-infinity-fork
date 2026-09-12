@@ -983,7 +983,7 @@ def _v2_stats():
 
 
 def _tool_result_fixture(result_block, db_content, agent_slug="claude_code",
-                         tool_name="Read", args=None):
+                         tool_name="Read", args=None, call_id="t1"):
     """Build the minimal (conv, db_rows_full, raw_candidates) triple that
     drives ONE claude_code tool_result DB row through the PRODUCTION entry
     `process_session_v2` -- not through `decide` directly (任务书 #125
@@ -992,13 +992,13 @@ def _tool_result_fixture(result_block, db_content, agent_slug="claude_code",
     `tool_call_id=t1`, and the `tool_result` row under test."""
     if args is None:
         args = {"file_path": "/home/ivan/projects/cc-workspace/MEMORY.md"}
+    call_block = {"type": "tool_use", "name": tool_name, "input": args}
+    if call_id is not None:
+        call_block["id"] = call_id
     call_event = {
         "type": "assistant",
         "uuid": "u1",
-        "message": {
-            "role": "assistant",
-            "content": [{"type": "tool_use", "id": "t1", "name": tool_name, "input": args}],
-        },
+        "message": {"role": "assistant", "content": [call_block]},
     }
     result_event = {
         "type": "user",
@@ -1015,8 +1015,8 @@ def _tool_result_fixture(result_block, db_content, agent_slug="claude_code",
     }
     db_rows_full = [
         (0, "user", _sha("turn boundary"), "turn boundary", None),
-        (1, "tool_call", _sha("call row"), "Read(...)", "t1"),
-        (2, "tool_result", _sha(db_content), db_content, "t1"),
+        (1, "tool_call", _sha("call row"), "Read(...)", call_id),
+        (2, "tool_result", _sha(db_content), db_content, call_id),
     ]
     return conv, db_rows_full, raw_candidates
 
@@ -1122,6 +1122,96 @@ def _run_content_selftest(paths_cfg):
         if ok:
             passed += 1
     print(f"selftest/content: {passed}/{len(cases)}")
+    return passed, len(cases)
+
+
+def selftest_pairing_cases():
+    """Family D (任务书 #125, R2-N13): the no-`tool_call_id` shape must be
+    judged through the PRODUCTION entry, not only through `decide`.
+
+    `PairingContext` (used by both `decide` and `process_session_v2`) accepts
+    a turn with exactly one unpaired tool_call and one result even when
+    neither carries an id -- `selftest_cases` case 13 asserts exactly that
+    through `decide`. The production entry then threw the row away at
+    `if not call_id: continue`, so the manifest was not the output of the
+    rule the selftest claimed to cover.
+
+    Each case is `(name, fixture_triple, expect_entries, expect_mismatch)`."""
+    cases = []
+
+    # D1: one unpaired no-id call, one no-id result -- the shape case 13
+    # covers for `decide`, here driven end to end.
+    cases.append((
+        "D1 unique no-id call pairs through the production entry",
+        _tool_result_fixture(
+            {"type": "tool_result", "content": "read body"}, "read body", call_id=None
+        ),
+        1, 0,
+    ))
+
+    # D2: two no-id results carrying the SAME body in the mirror -- the
+    # evidence anchor is not unique, so the row stays out (宁漏勿误).
+    cases.append((
+        "D2 twin no-id results are not verifiable",
+        _twin_no_id_fixture({"type": "tool_result", "content": "read body"},
+                            {"type": "tool_result", "content": "read body"}),
+        0, 0,
+    ))
+
+    # D3: two no-id results with DIFFERENT bodies. This is what makes the
+    # body comparison load-bearing: without it both events would claim the
+    # row and the row would be dropped. With it, exactly the event whose
+    # projected+redacted body IS this row's content anchors the pairing.
+    cases.append((
+        "D3 the no-id anchor is the event whose body matches",
+        _twin_no_id_fixture({"type": "tool_result", "content": "read body"},
+                            {"type": "tool_result", "content": "a different body"}),
+        1, 0,
+    ))
+
+    return cases
+
+
+def _twin_no_id_fixture(first_block, second_block):
+    """One no-id `tool_use`, two no-id `tool_result` blocks in the same turn.
+    `PairingContext` pairs the first result to the call and leaves the second
+    unpaired, so only a body match can pick the right evidence."""
+    conv, db_rows_full, _unused = _tool_result_fixture(
+        {"type": "tool_result", "content": "placeholder"}, "read body", call_id=None
+    )
+    call_event = {
+        "type": "assistant",
+        "uuid": "u1",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"file_path": "/home/ivan/projects/cc-workspace/MEMORY.md"},
+            }],
+        },
+    }
+    result_event = {
+        "type": "user",
+        "uuid": "u2",
+        "message": {"role": "user", "content": [first_block, second_block]},
+    }
+    return conv, db_rows_full, build_candidates_claude_code([call_event, result_event])
+
+
+def _run_pairing_selftest(paths_cfg):
+    cases = selftest_pairing_cases()
+    passed = 0
+    for name, (conv, db_rows_full, raw_candidates), expect_entries, expect_mismatch in cases:
+        stats = _v2_stats()
+        entries = process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats)
+        got = (len(entries), stats["content_mismatch_messages"])
+        want = (expect_entries, expect_mismatch)
+        ok = got == want
+        print(f"{'ok  ' if ok else 'FAIL'} {name} (expect={want} got={got})")
+        if ok:
+            passed += 1
+    print(f"selftest/pairing: {passed}/{len(cases)}")
     return passed, len(cases)
 
 
@@ -1249,7 +1339,8 @@ def _run_report_selftest(paths_cfg):
 
 def run_selftest(paths_cfg) -> bool:
     passed = total = 0
-    for runner in (_run_decide_selftest, _run_content_selftest, _run_report_selftest):
+    for runner in (_run_decide_selftest, _run_content_selftest,
+                   _run_pairing_selftest, _run_report_selftest):
         p, t = runner(paths_cfg)
         passed += p
         total += t
@@ -1459,6 +1550,33 @@ def build_blob_id_indices(raw_candidates):
     return calls_by_id, results_by_id, first_user
 
 
+def _resolve_no_id_evidence(raw_candidates, blob_pairing, content, stats):
+    """R2-N13: locate the mirror evidence for a DB `tool_result` row whose
+    paired call carries no `tool_call_id`.
+
+    The only admissible anchor left is the body itself: the mirror event must
+    also be a no-id `tool_result` whose projected+redacted text IS this row's
+    content (the same gate every other row goes through), and it must be the
+    ONLY such event. Returns `(call, evidence)` or `(None, None);` the caller
+    treats the latter as "not verifiable"."""
+    matches = []
+    for pos, cand in enumerate(raw_candidates):
+        if cand.role != "tool_result" or cand.tool_call_id:
+            continue
+        if not content_body_ok(content, cand.text):
+            continue
+        matches.append((pos, cand))
+    if len(matches) != 1:
+        stats["pairing_fail"]["no_id_evidence_not_unique"] += 1
+        return None, None
+    pos, evidence = matches[0]
+    call = blob_pairing.paired_call_for(pos)
+    if call is None or not call.tool_name or call.args is None:
+        stats["pairing_fail"]["no_id_call_missing_structure"] += 1
+        return None, None
+    return call, evidence
+
+
 def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
     """`db_rows_full` = [(idx, role, content_sha256, content, tool_call_id_or_None), ...]
     ordered by idx, covering EVERY message in the session (not just
@@ -1475,6 +1593,9 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
     # the blob reconstruction that whole-session alignment depended on.
     db_pairing_candidates = [Candidate(role, None, 0, tool_call_id=tid) for (_idx, role, _sha, _content, tid) in db_rows_full]
     pairing = PairingContext(db_pairing_candidates)
+    # The blob's own candidates, paired by the SAME rule, for the no-id path
+    # below.
+    blob_pairing = PairingContext(raw_candidates)
 
     agent_slug = conv["agent_slug"]
     manifest_entries = []
@@ -1487,7 +1608,40 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
                 continue
             call_id = paired.tool_call_id
             if not call_id:
-                stats["pairing_fail"]["no_unpaired_candidate"] += 1
+                # R2-N13: the DB turn's unique-unpaired rule already resolved
+                # this row (that is the `PairingContext` rule `decide` uses
+                # too) -- the call just carries no id, so `calls_by_id` cannot
+                # locate its structural facts. Rather than `continue`, anchor
+                # on the mirror event that has no id either and whose
+                # projected+redacted body IS this row's content; 0 or >=2
+                # candidates is not verifiable and stays out (宁漏勿误). This
+                # deliberately does NOT reintroduce whole-session positional
+                # alignment, which T1b.2 retired.
+                call, evidence = _resolve_no_id_evidence(
+                    raw_candidates, blob_pairing, content, stats
+                )
+                if call is None:
+                    continue
+                decision = decide_r1_r2_for_call(call, agent_slug, paths_cfg)
+                if decision is None:
+                    continue
+                manifest_entries.append(
+                    {
+                        "reason": decision["reason"],
+                        "source_id": conv["source_id"],
+                        "agent_slug": agent_slug,
+                        "external_id": conv["external_id"],
+                        "source_path": conv["source_path"],
+                        "idx": idx,
+                        "sha256": content_sha,
+                        "evidence": "mirror",
+                        "event_key": evidence.event_key,
+                        "blocks": [evidence.block_index],
+                        "anchor": decision["anchor"],
+                    }
+                )
+                stats["hits_by_reason"][decision["reason"]] += 1
+                stats["hits_by_reason_agent"][(decision["reason"], agent_slug)] += 1
                 continue
             call_matches = calls_by_id.get(call_id, [])
             if len(call_matches) == 0:
