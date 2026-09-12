@@ -39,8 +39,11 @@
 #   Stage 4 always measures against its OWN db (--stage4-db, or
 #   <data_dir>-stage4/agent_search.db by default) -- per parameter-freeze,
 #   stage 4's baseline binary (82cd5f0a) differs from stages 1-3's
-#   (4423e48b) and never shares a measurement unit with them; stage_merge
-#   (from the fixture manifest) may only combine stages within 1-3.
+#   (4423e48b) and never shares a measurement unit with them. The
+#   `stage_merge` key that used to be read from the fixture manifest for
+#   combining stages within 1-3 is gone (R6-N4, #128 T6-a2): nothing read it
+#   and the `merged_from` it would have fed is always empty, so there is no
+#   cross-stage merge to describe.
 #   Prints one JSON object per stage to stdout (one line each) and to
 #   $RUN_ROOT/mem-<shape>-stage<N>.json:
 #   {shape, stage, pid, peak_tree, peak_proc, samples, stage_ms, measured,

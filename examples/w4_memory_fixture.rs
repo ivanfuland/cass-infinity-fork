@@ -31,16 +31,19 @@
 //! baseline still references its old `fixture_sha256`).
 //!
 //! #122b-1 (spec v4.5 §四.3 / plan "内存门" row): also writes
-//! `<out>/manifest.json`, the frozen record `memory_gate.sh` reads instead
-//! of querying a live db for `max_message_bytes` -- `{shape, messages,
-//! total_bytes, max_message_bytes, fixture_sha256, stage_merge,
-//! min_stage_ms}`. `fixture_sha256` is the sha256 of every `.jsonl` file
-//! under `<out>` concatenated in path-sorted order (this generator emits a
-//! single file per shape today; the sort-then-concatenate contract is
-//! written for whenever that changes, not as speculative multi-file
-//! support -- no other multi-file plumbing exists here). `stage_merge`
-//! defaults to `[]` and `min_stage_ms` to 200; both are P0-collection-time
-//! decisions (#122b-2/3), not decided by this generator.
+//! `<out>/manifest.json`, the frozen record `memory_gate.sh` reads --
+//! `{shape, messages, total_bytes, fixture_sha256}`. `fixture_sha256` is the
+//! sha256 of every `.jsonl` file under `<out>` concatenated in path-sorted
+//! order (this generator emits a single file per shape today; the
+//! sort-then-concatenate contract is written for whenever that changes, not
+//! as speculative multi-file support -- no other multi-file plumbing exists
+//! here). R6-N4 (#128 T6-a2) removed `max_message_bytes`, `stage_merge` and
+//! `min_stage_ms` from this record: `memory_gate.sh` reads none of them (it
+//! reads exactly `messages`/`total_bytes` through `check_ingest_totals`, plus
+//! `fixture_sha256` for the fixture-identity recheck), and the sentence that
+//! used to stand here -- that the gate read the manifest "instead of querying
+//! a live db for `max_message_bytes`" -- described a reader that never
+//! existed.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -69,19 +72,19 @@ enum Shape {
     C,
 }
 
-/// #122b-1: the frozen fixture record `memory_gate.sh` reads instead of
-/// querying a live db for `max_message_bytes`. `stage_merge`/`min_stage_ms`
-/// are P0-collection-time decisions (#122b-2/3); this generator only writes
-/// the defaults (`[]` / 200) it is authoritative for.
+/// #122b-1: the frozen fixture record `memory_gate.sh` reads -- the
+/// workload's own totals, plus the identity of the bytes they were counted
+/// on. R6-N4 (#128 T6-a2) dropped `max_message_bytes`, `stage_merge` and
+/// `min_stage_ms`: nothing in the gate reads them, and `merged_from` (the
+/// field `stage_merge` would have fed) is always empty. The key-set
+/// assertion in this file's tests is what keeps a field from being added
+/// back without a consumer.
 #[derive(serde::Serialize)]
 struct FixtureManifest {
     shape: String,
     messages: usize,
     total_bytes: usize,
-    max_message_bytes: usize,
     fixture_sha256: String,
-    stage_merge: Vec<serde_json::Value>,
-    min_stage_ms: u64,
 }
 
 /// All `.jsonl` files under `root`, sorted by path. This generator writes
@@ -114,15 +117,12 @@ fn fixture_sha256(root: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn write_manifest(out: &Path, shape: Shape, messages: usize, total_bytes: usize, max_message_bytes: usize) -> anyhow::Result<()> {
+fn write_manifest(out: &Path, shape: Shape, messages: usize, total_bytes: usize) -> anyhow::Result<()> {
     let manifest = FixtureManifest {
         shape: format!("{shape:?}").to_lowercase(),
         messages,
         total_bytes,
-        max_message_bytes,
         fixture_sha256: fixture_sha256(out)?,
-        stage_merge: Vec::new(),
-        min_stage_ms: 200,
     };
     std::fs::write(out.join("manifest.json"), serde_json::to_string_pretty(&manifest)?)?;
     Ok(())
@@ -267,7 +267,7 @@ fn run(shape: Shape, out: &Path) -> (i32, String) {
         Err(e) => (2, format!("precondition error: {e:#}")),
         Ok((total_messages, total_bytes, max_message_bytes)) => match write_sources_toml(out) {
             Err(e) => (2, format!("precondition error writing sources.toml: {e:#}")),
-            Ok(()) => match write_manifest(out, shape, total_messages, total_bytes, max_message_bytes) {
+            Ok(()) => match write_manifest(out, shape, total_messages, total_bytes) {
                 Err(e) => (2, format!("precondition error writing manifest.json: {e:#}")),
                 Ok(()) => (
                     0,
@@ -319,11 +319,29 @@ mod tests {
 
         let manifest = read_manifest(&out);
         assert_eq!(manifest["shape"], "a");
-        assert_eq!(manifest["max_message_bytes"], 512 * MIB);
         assert_eq!(manifest["messages"], 10_000);
         assert!(manifest["fixture_sha256"].as_str().unwrap().len() == 64, "fixture_sha256 must be a hex sha256");
-        assert_eq!(manifest["stage_merge"], serde_json::json!([]));
-        assert_eq!(manifest["min_stage_ms"], 200);
+        // R6-N4 (#128 T6-a2): the key set *is* the contract, so assert it as
+        // one thing rather than field by field. `memory_gate.sh` reads exactly
+        // `messages`, `total_bytes` and `fixture_sha256` from this file
+        // (`check_ingest_totals`, then the fixture-identity recheck); the
+        // `max_message_bytes` / `stage_merge` / `min_stage_ms` that used to
+        // sit here had no consumer in the gate at all -- the two comments
+        // claiming the gate reads `max_message_bytes` "instead of querying a
+        // live db" described a reader that did not exist. Re-adding any field
+        // makes this assertion fail.
+        let mut keys: Vec<&str> = manifest
+            .as_object()
+            .expect("the manifest must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["fixture_sha256", "messages", "shape", "total_bytes"],
+            "the fixture manifest's key set is the contract memory_gate.sh reads"
+        );
     }
 
     #[test]
@@ -347,7 +365,6 @@ mod tests {
 
         let manifest = read_manifest(&out);
         assert_eq!(manifest["shape"], "b");
-        assert_eq!(manifest["max_message_bytes"], 200 * KIB);
     }
 
     #[test]
@@ -378,7 +395,6 @@ mod tests {
 
         let manifest = read_manifest(&out);
         assert_eq!(manifest["shape"], "c");
-        assert_eq!(manifest["max_message_bytes"], 64 * MIB);
     }
 
     #[test]
@@ -403,10 +419,14 @@ mod tests {
     /// `plan_for_shape` computation (no fixture I/O), per the mission's
     /// "只测 max_message_bytes 计算函数" option, so this doesn't add a new
     /// 512MiB/2GiB generation on top of the shape_a/b/c tests below (which
-    /// already pay that cost and separately assert the manifest field).
+    /// already pay that cost and separately assert the manifest's totals).
     /// Mutation: swap `.max()` for `.min()` (or hardcode a wrong constant)
-    /// in `write_shape` -- this test and the shape_a/b/c manifest
-    /// assertions below both go red.
+    /// in `write_shape` -- this test goes red.
+    ///
+    /// (R6-N4, #128 T6-a2: this is now the *only* place the per-shape
+    /// maximum is held to the parameter-freeze table -- the manifest key
+    /// that used to carry it was removed, but the figure is still printed by
+    /// a successful run, so the computation itself is not dead.)
     #[test]
     fn shape_max_message_bytes_matches_plan_for_all_shapes() {
         for (shape, expected) in [(Shape::A, 512 * MIB), (Shape::B, 200 * KIB), (Shape::C, 64 * MIB)] {
