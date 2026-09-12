@@ -2809,6 +2809,71 @@ def _run_verify_selftest(paths_cfg):
                 f"details={details!r}"
             )
 
+    # R9-B02 (任务书 #132): the mirror is a TREE. Only the directory's own
+    # identity was compared, so an output naming a writable input blob inside
+    # it matched neither path nor inode and the verified run overwrote the blob.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, _reference, _manifest_path, mirror = _write_verify_fixture(root)
+        # A path inside the tree that does NOT exist yet: no inode to compare,
+        # so the realpath containment check is the only thing that can refuse
+        # it -- exactly the shape a fresh `--report` under the mirror has.
+        inside = os.path.join(mirror, "blobs", "blake3", "zz", "report-not-written-yet.json")
+        problems = find_output_collisions([("--mirror", mirror)], [("--report", inside)])
+        if problems:
+            passed += 1
+            print("ok   B02 an output inside the mirror tree is a collision")
+        else:
+            print(f"FAIL B02 an output inside the mirror tree is a collision: got {problems!r}")
+
+    # ...and the same for a HARD LINK placed outside the tree: the path is not
+    # under the mirror, but the file it names is one of the mirror's own.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, _reference, _manifest_path, mirror = _write_verify_fixture(root)
+        inside = os.path.join(mirror, "blobs", "blake3", "aa", "verify-fixture.raw")
+        alias = os.path.join(root, "alias-outside-the-tree.raw")
+        os.link(inside, alias)
+        problems = find_output_collisions([("--mirror", mirror)], [("--report", alias)])
+        if problems:
+            passed += 1
+            print("ok   B02 a hard link to a mirror blob is a collision")
+        else:
+            print(f"FAIL B02 a hard link to a mirror blob is a collision: got {problems!r}")
+
+    # ...and end to end on both entry points: the refusal must come before the
+    # run, so nothing is written and the blob survives byte for byte.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root)
+        inside = os.path.join(mirror, "blobs", "blake3", "aa", "verify-fixture.raw")
+        before = open(inside, "rb").read()
+        rc = run_verify(candidate, manifest_path, reference, mirror, 50, 6, inside, paths_cfg)
+        after = open(inside, "rb").read()
+        if rc == 2 and after == before:
+            passed += 1
+            print("ok   B02 --verify refuses a report inside the mirror (nothing written)")
+        else:
+            print(f"FAIL B02 --verify refuses a report inside the mirror: rc={rc!r} rewritten={after != before}")
+
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, _reference, _manifest_path, mirror = _write_verify_fixture(root)
+        inside = os.path.join(mirror, "blobs", "blake3", "aa", "verify-fixture.raw")
+        before = open(inside, "rb").read()
+        rc = run_probe(candidate, mirror, paths_cfg, os.path.join(root, "out.json"), inside)
+        after = open(inside, "rb").read()
+        if rc == 2 and after == before:
+            passed += 1
+            print("ok   B02 probe refuses a report inside the mirror (nothing written)")
+        elif not isinstance(rc, int):
+            print(
+                "FAIL B02 probe refuses a report inside the mirror: run_probe returned a "
+                f"(manifest, stats) tuple, i.e. it never refused; rewritten={after != before}"
+            )
+        else:
+            print(f"FAIL B02 probe refuses a report inside the mirror: rc={rc!r} rewritten={after != before}")
+
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
 
@@ -4819,18 +4884,56 @@ def _file_identity(path):
     return (os.path.realpath(path), inode)
 
 
+def _tree_identities(root_real):
+    """`(dev, ino)` for every existing file under `root_real` -- what makes a
+    hard-link ALIAS of one of those files detectable from outside the tree."""
+    identities = set()
+    for dirpath, _dirnames, filenames in os.walk(root_real):
+        for name in filenames:
+            try:
+                st = os.stat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            identities.add((st.st_dev, st.st_ino))
+    return identities
+
+
 def find_output_collisions(inputs, outputs):
     """`[(out_label, other_label, path)]` for every output that names one of
-    the inputs, or that names another output. Pure -- nothing is opened,
-    created or written."""
+    the inputs, that names another output, or that would land inside -- or onto
+    a hard-link alias of a file inside -- an input DIRECTORY tree. Pure:
+    nothing is opened, created or written.
+
+    R9-B02 (任务书 #132): `--mirror` was passed as an ordinary file input, so
+    only the directory's OWN identity was compared. A `--report` naming a
+    writable input blob inside that tree matched neither path nor inode, the
+    check passed, and the verified run then overwrote the blob with JSON. A
+    directory input is a tree: an output under its realpath is refused by
+    construction, and an output whose inode is one of the tree's files -- a
+    hard link placed outside it -- is refused too.
+
+    (The tree half needs the directory to exist; a path that does not exist
+    cannot be known to be a tree, and has no blobs to overwrite.)"""
     problems = []
     identity_by_input = [(label, _file_identity(path)) for label, path in inputs]
+    trees = []
+    for label, path in inputs:
+        if os.path.isdir(path):
+            real = os.path.realpath(path)
+            trees.append((label, real, _tree_identities(real)))
     seen_outputs = []
     for out_label, out_path in outputs:
         out_real, out_inode = _file_identity(out_path)
         for in_label, (in_real, in_inode) in identity_by_input:
             if out_real == in_real or (out_inode is not None and out_inode == in_inode):
                 problems.append((out_label, in_label, out_path))
+        for tree_label, tree_real, tree_inodes in trees:
+            if out_real == tree_real or out_real.startswith(tree_real + os.sep):
+                problems.append((out_label, f"{tree_label} (inside its tree)", out_path))
+                break
+            if out_inode is not None and out_inode in tree_inodes:
+                problems.append((out_label, f"{tree_label} (a hard link to a file inside its tree)", out_path))
+                break
         for other_label, (other_real, other_inode) in seen_outputs:
             if out_real == other_real or (out_inode is not None and out_inode == other_inode):
                 problems.append((out_label, other_label, out_path))
