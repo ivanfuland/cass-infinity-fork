@@ -1241,45 +1241,88 @@ fn apply_path(value: &mut serde_json::Value, segments: &[&str], target_blocks: &
 /// `toolUseResult` wholesale only when it is currently a JSON string,
 /// leaving the object shape untouched here (the existing sub-path handles
 /// it).
-fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, target_blocks: &[u32], placeholder: &serde_json::Value) {
-    // R3-N2 (任务书 #129): the top-level string is ONE value for the whole
-    // event, while `target_blocks` names the block indices this call is
-    // redacting. Clearing it whenever it is a string over-clears: an event
-    // with two `tool_result` blocks, only one of them targeted, would lose
-    // the other one's copy too. Clear it only when it can ONLY belong to a
-    // targeted block -- i.e. every `tool_result` block in this event is in
-    // `target_blocks` (and there is at least one).
-    // A shape with no inspectable `content[]` array (e.g. the minimal
-    // `{"toolUseResult": "..."}` extras the unit tests build) proves nothing
-    // either way, so it keeps the pre-fix behavior -- only a *proven*
-    // ambiguity (an event that does expose its blocks, with a `tool_result`
-    // this call is not targeting) holds the strip back. Leaning that way
-    // keeps the leak direction safe: the string is byte-identical to the
-    // `content` this same call is clearing, so leaving it behind would keep
-    // the excluded body in `extra`.
-    let tool_result_indices: Option<Vec<u32>> = value
-        .pointer("/message/content")
-        .or_else(|| value.get("content"))
-        .and_then(serde_json::Value::as_array)
-        .map(|blocks| {
-            blocks
-                .iter()
-                .enumerate()
-                .filter(|(_, block)| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"))
-                .map(|(index, _)| index as u32)
-                .collect()
-        });
-    if let Some(indices) = &tool_result_indices
-        && !indices.is_empty()
-        && !indices.iter().all(|index| target_blocks.contains(index))
-    {
+///
+/// B04 (任务书 #131): the top-level string is ONE value for the whole event,
+/// while the call being applied names only the block indices it is
+/// redacting. R3-N2 (任务书 #129) guarded that with "clear only when EVERY
+/// `tool_result` block in the event is targeted", which over-corrected in
+/// the opposite direction: an event with two result blocks where only block
+/// 0 is excluded left the string behind EVEN WHEN it was byte-identical to
+/// block 0's own body, so the excluded body survived in `extra_bin` while
+/// the row reported a successful exclusion (R2-B2's "原文只在 raw-mirror"
+/// broken). `apply_sibling` was worse off: it always passes exactly ONE
+/// block, so the all-members guard could never be satisfied at all.
+///
+/// The guard is now an ownership proof: clear the string when it IS the
+/// pre-clear body of a block this call is clearing (or a bounded superset of
+/// it -- see [`TOOL_USE_RESULT_WRAPPER_SLACK`]), and keep it otherwise. That
+/// keeps R3-N2's protection (a string holding some OTHER block's body
+/// survives) without re-opening R2-B2's leak.
+fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, owned_bodies: &[String], placeholder: &serde_json::Value) {
+    let Some(recorded) = value.get("toolUseResult").and_then(serde_json::Value::as_str) else { return };
+    if !owned_bodies.iter().any(|body| is_owned_body_copy(recorded, body)) {
         return;
     }
     if let Some(v) = value.get_mut("toolUseResult") {
-        if v.is_string() {
-            *v = placeholder.clone();
+        *v = placeholder.clone();
+    }
+}
+
+/// How much decoration a string-form `toolUseResult` may carry around a body
+/// it copies before that copy stops being attributable to the body. Every
+/// measured shape is byte-identical (R2-B2's 1,558 rows); this absorbs small
+/// wrappers so the rule does not hinge on an exact-equality accident, while
+/// staying far too tight for "anything containing the body" to be treated as
+/// that body's copy.
+const TOOL_USE_RESULT_WRAPPER_SLACK: usize = 1024;
+
+fn is_owned_body_copy(recorded: &str, body: &str) -> bool {
+    if recorded == body {
+        return true;
+    }
+    !body.is_empty()
+        && recorded.len() <= body.len() + TOOL_USE_RESULT_WRAPPER_SLACK
+        && recorded.contains(body)
+}
+
+/// The bodies this call may treat as its own: the caller row's own pre-clear
+/// content (`own_body`, absent for `apply_sibling`, whose content is never
+/// cleared) plus, for each targeted block, that block's body as read from the
+/// still-intact event. Both are captured BEFORE the R7 DSL rewrites anything,
+/// so they really are the pre-clear values (the DSL replaces
+/// `message.content[i].content` itself, which would otherwise destroy the
+/// evidence for exactly the blocks under judgment).
+///
+/// The event may be an `historical_raw_json`-wrapped string (`apply_extra`
+/// unwraps it first) or a compact shape with no `message.content` at all --
+/// in that case only `own_body` remains, which is precisely the attribution
+/// the corpus' string rows offer (`content` is byte-identical to the string).
+fn owned_bodies(value: &serde_json::Value, target_blocks: &[u32], own_body: Option<&str>) -> Vec<String> {
+    let mut bodies: Vec<String> = Vec::new();
+    if let Some(body) = own_body.filter(|body| !body.is_empty()) {
+        bodies.push(body.to_string());
+    }
+    let blocks = value
+        .pointer("/message/content")
+        .or_else(|| value.get("content"))
+        .and_then(serde_json::Value::as_array);
+    if let Some(blocks) = blocks {
+        for index in target_blocks {
+            let Some(block) = blocks.get(*index as usize) else { continue };
+            match block {
+                serde_json::Value::String(text) => bodies.push(text.clone()),
+                serde_json::Value::Object(_) => {
+                    for key in ["content", "text"] {
+                        if let Some(text) = block.get(key).and_then(serde_json::Value::as_str) {
+                            bodies.push(text.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
+    bodies
 }
 
 /// Replace every R7 field map path's leaf value with `placeholder`, only at
@@ -1287,26 +1330,37 @@ fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, target_blo
 /// `historical_raw_json` string envelope first when present (R7 note): the
 /// whole `extra` value being exactly `{"__cass_historical_raw_json__": "..."}`
 /// means the real event JSON lives inside that string.
-fn apply_extra(extra: &mut serde_json::Value, field_map: ExtraFieldMap, target_blocks: &[u32], placeholder: &serde_json::Value) {
+///
+/// `own_body` is the row's pre-clear content (`apply`'s `original`), used for
+/// the ownership proof in [`strip_claude_string_tool_use_result`]; see there.
+fn apply_extra(
+    extra: &mut serde_json::Value,
+    field_map: ExtraFieldMap,
+    target_blocks: &[u32],
+    placeholder: &serde_json::Value,
+    own_body: Option<&str>,
+) {
     let historical = matches!(extra, serde_json::Value::Object(m) if m.len() == 1 && m.contains_key(HISTORICAL_RAW_JSON_SENTINEL_KEY));
     if historical {
         let raw = extra[HISTORICAL_RAW_JSON_SENTINEL_KEY].as_str().unwrap_or_default().to_string();
         if let Ok(mut inner) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let bodies = owned_bodies(&inner, target_blocks, own_body);
             for path in field_map {
                 let segments: Vec<&str> = path.split('.').collect();
                 apply_path(&mut inner, &segments, target_blocks, placeholder);
             }
-            strip_claude_string_tool_use_result(&mut inner, target_blocks, placeholder);
+            strip_claude_string_tool_use_result(&mut inner, &bodies, placeholder);
             let rewritten = serde_json::to_string(&inner).unwrap_or(raw);
             extra[HISTORICAL_RAW_JSON_SENTINEL_KEY] = serde_json::Value::String(rewritten);
         }
         return;
     }
+    let bodies = owned_bodies(extra, target_blocks, own_body);
     for path in field_map {
         let segments: Vec<&str> = path.split('.').collect();
         apply_path(extra, &segments, target_blocks, placeholder);
     }
-    strip_claude_string_tool_use_result(extra, target_blocks, placeholder);
+    strip_claude_string_tool_use_result(extra, &bodies, placeholder);
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -1414,7 +1468,11 @@ pub(crate) fn apply(
     };
 
     let placeholder = serde_json::json!({"redacted": true, "sha256": marker.sha256, "bytes": marker.bytes});
-    apply_extra(&mut msg.extra, field_map, &decision.target_blocks, &placeholder);
+    // B04 (任务书 #131): `original` is this row's pre-clear content -- one of
+    // the ownership proofs the top-level string-form `toolUseResult` is
+    // cleared against (the others come from the event itself, inside
+    // `apply_extra`).
+    apply_extra(&mut msg.extra, field_map, &decision.target_blocks, &placeholder, Some(&original));
 
     for snippet in &mut msg.snippets {
         snippet.snippet_text = Some(String::new());
@@ -1430,7 +1488,13 @@ pub(crate) fn apply(
 /// row is not itself excluded, only its copy of the same event blocks is.
 pub(crate) fn apply_sibling(msg: &mut NormalizedMessage, marker: &ExcludedMarker, field_map: ExtraFieldMap) {
     let placeholder = serde_json::json!({"redacted": true, "sha256": marker.sha256, "bytes": marker.bytes});
-    apply_extra(&mut msg.extra, field_map, &marker.raw.blocks, &placeholder);
+    // B04 (任务书 #131): no `own_body` here -- a sibling's content is never
+    // cleared, so there is nothing of its own to attribute the top-level
+    // string to. Its copy of the SAME event still supplies the targeted
+    // blocks' pre-clear bodies inside `apply_extra`, which is what lets this
+    // path clear an excluded body's string copy at all (pre-fix it passed a
+    // single block, so R3-N2's all-members guard could never be satisfied).
+    apply_extra(&mut msg.extra, field_map, &marker.raw.blocks, &placeholder, None);
 }
 
 #[cfg(test)]
@@ -2589,60 +2653,148 @@ mod tests {
         assert_eq!(m.extra["toolUseResult"]["type"], serde_json::json!("text"), "non-body metadata sibling to .file must survive");
     }
 
-    /// R3-N2 (任务书 #129): `strip_claude_string_tool_use_result` used to
-    /// check only the type, so an event carrying TWO `tool_result` blocks
-    /// where only one is being excluded had its top-level string copy cleared
-    /// as well -- over-clearing whichever body the string actually held. The
-    /// strip is now conditional on block ownership: cleared when every
-    /// `tool_result` block in the event is targeted, left alone when the
-    /// event proves one of them is not.
+    /// B04 (任务书 #131): R3-N2's all-members guard was itself the reverse
+    /// hole. An event carrying two `tool_result` blocks where only block 0 is
+    /// targeted had its top-level string copy left behind EVEN WHEN that
+    /// string was byte-identical to the very block being cleared -- so the
+    /// excluded body stayed in `extra_bin` while the row reported a
+    /// successful exclusion, breaking R2-B2's "原文只在 raw-mirror".
+    /// (`apply_sibling` was worse off still: it always passes ONE block, so
+    /// the all-members guard could never be satisfied.)
+    ///
+    /// The guard is now an *ownership proof*: the string is cleared when it
+    /// equals -- or contains, within the bounded gate -- the pre-clear body
+    /// of a block THIS call is clearing, and left alone otherwise. That keeps
+    /// R3-N2's over-clear protection (a string holding another block's body
+    /// survives) without re-opening R2-B2's leak.
     #[test]
-    fn apply_clears_string_tool_use_result_only_when_every_result_block_is_targeted() {
-        let placeholder = serde_json::json!({"redacted": true});
+    fn apply_clears_string_tool_use_result_only_when_it_proves_ownership() {
+        let two_results = |string: &str| {
+            serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "a", "content": "secret A"},
+                    {"type": "tool_result", "tool_use_id": "b", "content": "secret B"}
+                ]},
+                "toolUseResult": string
+            })
+        };
 
-        // (a) Two result blocks, only block 0 targeted: the string may belong
-        // to block 1, so it must survive.
-        let mut ambiguous = serde_json::json!({
-            "type": "user",
-            "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"},
-                {"type": "tool_result", "tool_use_id": "b", "content": "secret B"}
-            ]},
-            "toolUseResult": "secret A"
-        });
-        apply_extra(&mut ambiguous, &[], &[0], &placeholder);
-        assert!(
-            ambiguous["toolUseResult"].is_string(),
-            "one un-targeted tool_result block makes the string's owner ambiguous: it must be left alone, got {:?}",
-            ambiguous["toolUseResult"]
-        );
-
-        // (b) Both result blocks targeted: nothing ambiguous left, clear it.
-        let mut both_targeted = serde_json::json!({
-            "type": "user",
-            "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"},
-                {"type": "tool_result", "tool_use_id": "b", "content": "secret B"}
-            ]},
-            "toolUseResult": "secret A"
-        });
-        apply_extra(&mut both_targeted, &[], &[0, 1], &placeholder);
+        // (a) Targeting block 0, string == block 0's own body: PROVEN, clear.
+        // Pre-fix the all-members guard returned early here and the excluded
+        // body survived in `extra`.
+        let mut owned = msg("tool_result", "secret A");
+        owned.extra = two_results("secret A");
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut owned, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
         assert_eq!(
-            both_targeted["toolUseResult"], placeholder,
-            "when every tool_result block is targeted the string copy belongs to one of them and must be cleared"
+            owned.extra["toolUseResult"]["redacted"],
+            serde_json::json!(true),
+            "a string byte-equal to the targeted block's own body is that body's copy and must be cleared, got {:?}",
+            owned.extra["toolUseResult"]
+        );
+        assert!(
+            !owned.extra.to_string().contains("secret A"),
+            "no raw copy of the excluded body may remain anywhere in extra: {:?}",
+            owned.extra
         );
 
-        // (c) The single-result shape the frozen corpus actually has: still
-        // cleared (this is the case the R2-B2 fix was written for).
-        let mut single = serde_json::json!({
+        // (b) Targeting block 0, string == block 1's body: not this call's
+        // copy, keep it (the R3-N2 protection, restated on the new rule).
+        let mut unowned = msg("tool_result", "secret A");
+        unowned.extra = two_results("secret B");
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut unowned, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(
+            unowned.extra["toolUseResult"],
+            serde_json::json!("secret B"),
+            "a string belonging to an un-targeted block must survive, got {:?}",
+            unowned.extra["toolUseResult"]
+        );
+
+        // (c) Both blocks targeted: the string belongs to one of them.
+        let mut both_targeted = msg("tool_result", "secret A");
+        both_targeted.extra = two_results("secret A");
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut both_targeted, &decision_cass_recall(vec![0, 1]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(both_targeted.extra["toolUseResult"]["redacted"], serde_json::json!(true), "when every tool_result block is targeted the string belongs to one of them");
+
+        // (d) The single-result shape the frozen corpus actually has.
+        let mut single = msg("tool_result", "secret A");
+        single.extra = serde_json::json!({
             "type": "user",
             "message": {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "a", "content": "secret A"}
             ]},
             "toolUseResult": "secret A"
         });
-        apply_extra(&mut single, &[], &[0], &placeholder);
-        assert_eq!(single["toolUseResult"], placeholder, "the corpus' single-result shape must keep being cleared");
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut single, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(single.extra["toolUseResult"]["redacted"], serde_json::json!(true), "the corpus' single-result shape must keep being cleared");
+
+        // (e) A bounded superset (the copy wrapped in decoration) is the same
+        // copy; the length gate keeps this from becoming "clear anything
+        // containing the body".
+        let mut wrapped = msg("tool_result", "secret A");
+        wrapped.extra = two_results("prefix :: secret A :: suffix");
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut wrapped, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(wrapped.extra["toolUseResult"]["redacted"], serde_json::json!(true), "a bounded superset of the owned body is that same copy");
+
+        // (f) The row's own pre-clear content is an ownership proof too: the
+        // minimal `{"toolUseResult": "..."}` extras have no inspectable block
+        // array at all, so attribution has nothing else to go on.
+        let mut minimal = msg("tool_result", "the recall hit body");
+        minimal.extra = serde_json::json!({"toolUseResult": "the recall hit body"});
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut minimal, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(minimal.extra["toolUseResult"]["redacted"], serde_json::json!(true), "the row's own pre-clear body proves the string is its copy");
+
+        // (g) ...and it proves nothing about a DIFFERENT string.
+        let mut foreign = msg("tool_result", "the recall hit body");
+        foreign.extra = serde_json::json!({"toolUseResult": "some other body"});
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut foreign, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(foreign.extra["toolUseResult"], serde_json::json!("some other body"), "an unrelated string must not be cleared just because this row is excluded");
+    }
+
+    /// B04, `apply_sibling` path: a sibling row (same event, projected into a
+    /// second row) has no `original` of its own to offer -- content is never
+    /// cleared for it -- so attribution has to come from its own copy of the
+    /// event. Before the fix this path could never clear the string at all:
+    /// it always passes exactly ONE block, and the all-members guard demanded
+    /// every block be targeted.
+    #[test]
+    fn apply_sibling_clears_owned_string_tool_use_result() {
+        let mut row = msg("user", "ordinary sibling prose");
+        // The report's shape: a two-result event where only A is targeted.
+        // The sibling row carries the whole event, so its own copy of A's
+        // body must go -- but its copy of the OTHER block's body must not.
+        row.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "secret B"}
+            ]},
+            "toolUseResult": "secret A"
+        });
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CassRecall,
+            rule_version: 1,
+            bytes: 8,
+            sha256: sha256_hex("secret A"),
+            fingerprint_blake3: blake3_hex("secret A"),
+            anchor: ExclusionAnchor { tool_call_id: Some("a".into()), tool_name: Some("Read".into()), paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 1, event_key: "ek1".into(), blocks: vec![0] },
+        };
+        apply_sibling(&mut row, &marker, field_map_for("claude_code"));
+
+        assert_eq!(row.content, "ordinary sibling prose", "apply_sibling must never touch content");
+        assert_eq!(row.extra["message"]["content"][0]["content"]["redacted"], serde_json::json!(true), "the sibling's copy of the targeted block is redacted");
+        assert_eq!(row.extra["message"]["content"][1]["content"], serde_json::json!("secret B"), "the sibling's copy of an un-targeted block survives");
+        assert_eq!(row.extra["toolUseResult"]["redacted"], serde_json::json!(true), "the sibling's copy of the excluded body's top-level string must not survive");
     }
 
     #[test]
