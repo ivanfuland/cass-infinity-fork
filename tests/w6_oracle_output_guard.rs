@@ -162,3 +162,49 @@ fn an_output_naming_a_symlink_to_the_input_db_is_refused() {
     );
     assert_eq!(fs::read(&db).expect("read db after refusal"), before, "the real database must be untouched");
 }
+
+/// R9-B01 (任务书 #132): `--db` and `--out` naming two paths that are HARD
+/// LINKS to one inode. The canonical paths differ, the `(dev, ino)` pair does
+/// not -- and the guard compared the whole identity tuple at once, so it read
+/// them as different files, ran the calibration, and let the final
+/// `fs::write` truncate the database through the other name.
+#[cfg(unix)]
+#[test]
+fn an_output_hardlinked_to_the_input_db_is_refused() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let db = plant_unreadable_db(&dir);
+    let alias = dir.path().join("report.json");
+    fs::hard_link(&db, &alias).expect("hard link");
+    let before = fs::read(&db).expect("read planted db");
+
+    let output = run_oracle(&[
+        std::ffi::OsStr::new("--calibrate"),
+        std::ffi::OsStr::new("--db"),
+        db.as_os_str(),
+        std::ffi::OsStr::new("--sample"),
+        std::ffi::OsStr::new("1"),
+        std::ffi::OsStr::new("--seed"),
+        std::ffi::OsStr::new("1"),
+        std::ffi::OsStr::new("--infinity"),
+        std::ffi::OsStr::new("http://127.0.0.1:1"),
+        std::ffi::OsStr::new("--out"),
+        alias.as_os_str(),
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an --out that is a hard link to --db must be refused; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to run, nothing was written"),
+        "the refusal must come from the guard, before any run: stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&db).expect("read db after refusal"),
+        before,
+        "the database must be untouched after a refused invocation"
+    );
+}
