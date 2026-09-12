@@ -85,16 +85,21 @@
 #   parses the wrapped binary's stdout for anything else today and adding
 #   that parsing path is exactly the kind of scope growth #122b-1's
 #   boundary order forbids for a single-field readout).
-#   Exit code = 1 if any stage fails judgment (measured && exit_code==0 &&
-#   max(peak_tree,peak_proc)<=budget when budget is non-null; budget is
-#   null only in --collect-baseline/--selfcheck, where judgment drops the
-#   budget term), 0 otherwise. --collect-baseline additionally asserts
-#   `pgrep -x cargo`/`pgrep -x cass` are both empty before sampling, and
-#   never reads/judges against $W6/memgate-baseline.json -- P0 itself is
-#   collected in --collect-baseline mode, so it cannot also be an input.
-#   Outside --collect-baseline, a missing/incomplete
-#   $W6/memgate-baseline.json entry for a [shape,stage] is a fail-loud exit
-#   2 (never a silent 0 budget -- #122b-1 boundary order).
+#   T6-c N07 (任务书 #131 / T7 勘误, Ivan 2026-09-12 裁): normal mode only
+#   RECORDS. The `1.25 x P0 + 256 MiB` budget and its exit-2-on-missing-P0
+#   are retired: a stage is never failed for a peak, a missing P0 baseline is
+#   not a precondition failure, and each cell carries `p0_ratio` (peak over
+#   its P0 cell, null when there is no cell) alongside the two fall keys
+#   (`last_tree`/`peak_tree`, `peak_sample_idx`/`samples`) the control plane
+#   judges the twelve cells by. The four stages are merged into
+#   $RUN_ROOT/memgate-cells.json, keyed `<shape>/<stage>`, written by rename.
+#   Exit code = 1 only when a stage's own process failed (or its ingest
+#   totals disagreed with the manifest, an operator-visible `overall_rc=1`),
+#   2 for a precondition failure (no fixture, wrong hash, an output that
+#   cannot be written, or a result tree already sitting at $RUN_ROOT/mem-<shape>).
+#   `--judge` keeps the old verdict as its own subcommand, and `--selfcheck`
+#   keeps judging the one stage it runs. --collect-baseline additionally
+#   asserts `pgrep -x cargo`/`pgrep -x cass` are both empty before sampling.
 #
 # --selfcheck mode (the interface's own self-test surface, T14-3 /
 # tests/w6_memory_gate_selfcheck.rs's entry point):
@@ -377,13 +382,14 @@ emit_stage_json() {
   # $6=last_tree_bytes $7=peak_sample_idx $8=samples $9=stage_ms
   # $10=measured(true/false) $11=merged_from_csv $12=budget_bytes("" -> null)
   # $13=exit_code $14=binary_sha256("" -> null) $15=fixture_sha256("" -> null)
+  # $16=p0_bytes (the P0 cell's max(peak_tree,peak_proc); "" -> a null p0_ratio)
   python3 - "$@" <<'PYEOF'
 import json
 import sys
 
 (shape, stage, pid, peak_tree, peak_proc, last_tree, peak_sample_idx, samples,
  stage_ms, measured, merged_from_csv, budget, exit_code, binary_sha256,
- fixture_sha256) = sys.argv[1:16]
+ fixture_sha256, p0_bytes) = sys.argv[1:17]
 
 obj = {
     "shape": shape,
@@ -403,6 +409,11 @@ obj = {
     "exit_code": int(exit_code),
     "binary_sha256": binary_sha256 or None,
     "fixture_sha256": fixture_sha256 or None,
+    # T6-c N07 (任务书 #131): the door no longer judges the budget -- it
+    # records the peak against the P0 cell it was collected from, and there
+    # is no P0 cell for this (shape, stage) is a fact to record, not a reason
+    # to refuse to run.
+    "p0_ratio": None if p0_bytes == "" else round(max(int(peak_tree), int(peak_proc)) / int(p0_bytes), 3),
 }
 print(json.dumps(obj))
 PYEOF
@@ -415,11 +426,11 @@ PYEOF
 
 run_stage() {
   # $1=shape $2=stage $3=budget_bytes("" -> null) $4=merged_from_csv
-  # $5=binary_sha256 $6=fixture_sha256 $7=out_json -- rest: the command to
-  # run
+  # $5=binary_sha256 $6=fixture_sha256 $7=p0_bytes("" -> null p0_ratio)
+  # $8=out_json -- rest: the command to run
   local shape="$1" stage="$2" budget="$3" merged_from_csv="$4"
-  local binary_sha256="$5" fixture_sha256="$6" out_json="$7"
-  shift 7
+  local binary_sha256="$5" fixture_sha256="$6" p0_bytes="$7" out_json="$8"
+  shift 8
 
   "$@" &
   local root_pid=$!
@@ -498,7 +509,7 @@ run_stage() {
   local json
   json=$(emit_stage_json "$shape" "$stage" "$root_pid" "$peak_tree_bytes" "$peak_proc_bytes" \
     "$last_tree_bytes" "$peak_sample_idx" "$samples" "$stage_ms" "$measured" "$merged_from_csv" \
-    "$budget" "$rc" "$binary_sha256" "$fixture_sha256")
+    "$budget" "$rc" "$binary_sha256" "$fixture_sha256" "$p0_bytes")
   # B12 (任务书 #131): the record IS this door's product. Pre-fix the
   # `tee`'s exit status was never checked (the header only sets `set -u`), so
   # a stage whose measurement never reached disk still got judged from the
@@ -509,7 +520,15 @@ run_stage() {
     exit 2
   fi
 
-  echo "$json" | judge_from_stdin "$ALLOW_NULL_BUDGET"
+  if [ "$JUDGE_STAGES" -eq 1 ]; then
+    echo "$json" | judge_from_stdin "$ALLOW_NULL_BUDGET"
+  else
+    # T6-c N07 (任务书 #131 / T7 勘误): the door RECORDS, it no longer judges
+    # a budget. The only verdict left in normal mode is the measured process'
+    # own exit code -- a stage that ran fine is not made a failure by a peak
+    # the (now retired) formula would have called over-budget.
+    [ "$rc" -eq 0 ]
+  fi
 }
 
 # ---------------------------------------------------------------------
@@ -518,7 +537,7 @@ run_stage() {
 
 run_selfcheck() {
   local out_json="${RUN_ROOT:-/tmp}/memory-selfcheck-$$.json"
-  run_stage "selfcheck" "selfcheck" "" "" "" "" "$out_json" "$@"
+  run_stage "selfcheck" "selfcheck" "" "" "" "" "" "$out_json" "$@"
 }
 
 # ---------------------------------------------------------------------
@@ -808,6 +827,11 @@ if [ "${1:-}" = "--judge" ]; then
   exit $?
 fi
 
+# T6-c N07 (任务书 #131 / T7 勘误): normal mode RECORDS, it does not judge.
+# `--judge` stays as its own subcommand for callers that want the old verdict
+# on one stage result, and `--selfcheck` keeps judging the single stage it
+# runs; this switch only governs the four-stage driver.
+JUDGE_STAGES=0
 COLLECT_BASELINE=0
 STAGE4_DB=""
 while [ $# -gt 0 ]; do
@@ -844,7 +868,14 @@ fi
 
 fixture_dir="$RUN_ROOT/mem-${shape}-fixture"
 data_dir="$RUN_ROOT/mem-${shape}"
-rm -rf "$data_dir"
+# T6-c N07 (任务书 #131): this used to `rm -rf` whatever sat at the door's own
+# output path -- including an earlier run's result tree (the T4 `mem-a`/
+# `mem-b`/`mem-c` trees, their fixtures and stage JSONs). A result tree that
+# is still there is the operator's decision, not the gate's.
+if [ -e "$data_dir" ]; then
+  echo "memory_gate: $data_dir already exists; refusing to delete it (rename it aside first, e.g. mv $data_dir $data_dir.bak-$(date +%Y%m%d%H%M%S))" >&2
+  exit 2
+fi
 mkdir -p "$data_dir"
 
 if [ ! -d "$fixture_dir" ]; then
@@ -873,13 +904,84 @@ binary_sha256=$(binary_sha256_of "$binary_path")
 
 baseline_json="${W6:-}/memgate-baseline.json"
 
-budget_for() {
-  local stage="$1"
-  if [ "$COLLECT_BASELINE" -eq 1 ]; then
-    echo ""
-    return 0
-  fi
-  budget_bytes_for_stage "$shape" "$stage" "$baseline_json" "$fixture_sha256_measured"
+# N07 (任务书 #131): `budget_for` -- the normal-mode wrapper that turned a P0
+# cell into `1.25 x P0 + 256 MiB` and exited 2 when the cell was missing -- was
+# the only caller this change removed. `budget_bytes_for_stage` below is NOT
+# dead: it still validates a hand-filled baseline cell and
+# tests/w6_memory_gate_selfcheck.rs drives it directly.
+
+p0_for() {
+  # $1=shape $2=stage. Prints that cell's max(peak_tree,peak_proc) in bytes,
+  # or nothing when there is no usable cell. NEVER exits: T7's record-only
+  # contract means a run with no P0 baseline (or with a cell missing for this
+  # shape/stage) still collects its twelve cells, with `p0_ratio` null.
+  local shape="$1" stage="$2"
+  local baseline="${W6:-}/memgate-baseline.json"
+  [ -f "$baseline" ] || return 0
+  python3 - "$baseline" "$shape" "$stage" <<'PYEOF'
+import json
+import sys
+
+path, shape, stage = sys.argv[1:4]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+entry = (data.get(shape) or {}).get(stage)
+if not isinstance(entry, dict):
+    sys.exit(0)
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+peak_tree = entry.get("peak_tree")
+peak_proc = entry.get("peak_proc")
+if not is_int(peak_tree) or not is_int(peak_proc):
+    sys.exit(0)
+print(max(peak_tree, peak_proc))
+PYEOF
+}
+
+record_cell() {
+  # $1=shape $2=stage $3=that stage's JSON path. Merges this cell into
+  # $RUN_ROOT/memgate-cells.json -- three shapes x four stages = the door's
+  # twelve cells -- writing a temp file and renaming it into place, so an
+  # interrupted run never leaves a half-written matrix behind.
+  local shape="$1" stage="$2" out_json="$3"
+  local cells="$RUN_ROOT/memgate-cells.json"
+  python3 - "$cells" "$shape" "$stage" "$out_json" <<'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+cells_path, shape, stage, stage_path = sys.argv[1:5]
+data = {}
+if os.path.exists(cells_path):
+    try:
+        with open(cells_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"memory_gate: cannot read {cells_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+try:
+    with open(stage_path) as f:
+        cell = json.load(f)
+except Exception as e:
+    print(f"memory_gate: cannot read the stage record {stage_path}: {e}", file=sys.stderr)
+    sys.exit(2)
+data[f"{shape}/{stage}"] = cell
+directory = os.path.dirname(cells_path) or "."
+fd, tmp = tempfile.mkstemp(dir=directory, prefix=".memgate-cells-")
+with os.fdopen(fd, "w") as f:
+    json.dump(data, f, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, cells_path)
+print(f"memory_gate: cells recorded: {len(data)}")
+PYEOF
 }
 
 overall_rc=0
@@ -889,8 +991,8 @@ export HOME="$fixture_dir"
 
 assert_sources_toml_only_lists_fixture_root "${XDG_CONFIG_HOME:-}" "$fixture_dir" || exit 2
 
-budget1=$(budget_for index) || exit 2
-run_stage "$shape" "index" "$budget1" "" "$binary_sha256" "$fixture_sha256" \
+p0_1=$(p0_for "$shape" index)
+run_stage "$shape" "index" "" "" "$binary_sha256" "$fixture_sha256" "$p0_1" \
   "$RUN_ROOT/mem-${shape}-stage1.json" \
   "$cass_wrapper" index || overall_rc=1
 
@@ -927,19 +1029,22 @@ fi
 # bound the workload the P0 budget was collected on. Stages 2-4 measure the
 # same data dir, so this runs before any of them.
 check_ingest_totals "$data_dir/agent_search.db" "$manifest" || exit 2
+record_cell "$shape" "index" "$RUN_ROOT/mem-${shape}-stage1.json" || exit 2
 
-budget2=$(budget_for index_force_rebuild) || exit 2
-run_stage "$shape" "index_force_rebuild" "$budget2" "" "$binary_sha256" "$fixture_sha256" \
+p0_2=$(p0_for "$shape" index_force_rebuild)
+run_stage "$shape" "index_force_rebuild" "" "" "$binary_sha256" "$fixture_sha256" "$p0_2" \
   "$RUN_ROOT/mem-${shape}-stage2.json" \
   "$cass_wrapper" index --force-rebuild || overall_rc=1
+record_cell "$shape" "index_force_rebuild" "$RUN_ROOT/mem-${shape}-stage2.json" || exit 2
 
-budget3=$(budget_for index_semantic) || exit 2
-run_stage "$shape" "index_semantic" "$budget3" "" "$binary_sha256" "$fixture_sha256" \
+p0_3=$(p0_for "$shape" index_semantic)
+run_stage "$shape" "index_semantic" "" "" "$binary_sha256" "$fixture_sha256" "$p0_3" \
   "$RUN_ROOT/mem-${shape}-stage3.json" \
   "$cass_wrapper" index --semantic || overall_rc=1
+record_cell "$shape" "index_semantic" "$RUN_ROOT/mem-${shape}-stage3.json" || exit 2
 
 stage4_db="${STAGE4_DB:-$data_dir-stage4/agent_search.db}"
-budget4=$(budget_for completeness_gate) || exit 2
+p0_4=$(p0_for "$shape" completeness_gate)
 # R6-N3 (#123): stage 4 executes $EXAMPLES/w4_completeness_gate, not the
 # candidate -- recording $binary_sha256 here misidentified the measured
 # program (#122b-3c fixed exactly this wrapper-vs-binary confusion for the
@@ -947,8 +1052,9 @@ budget4=$(budget_for completeness_gate) || exit 2
 # binary this stage actually runs.
 gate_sha256=$(binary_sha256_of "$EXAMPLES/w4_completeness_gate")
 [ -n "$gate_sha256" ] || { echo "memory_gate: cannot hash the stage 4 binary under test: $EXAMPLES/w4_completeness_gate" >&2; exit 2; }
-run_stage "$shape" "completeness_gate" "$budget4" "" "$gate_sha256" "$fixture_sha256" \
+run_stage "$shape" "completeness_gate" "" "" "$gate_sha256" "$fixture_sha256" "$p0_4" \
   "$RUN_ROOT/mem-${shape}-stage4.json" \
   "$EXAMPLES/w4_completeness_gate" --db "$stage4_db" --json "$RUN_ROOT/mem-${shape}-completeness.json" || overall_rc=1
+record_cell "$shape" "completeness_gate" "$RUN_ROOT/mem-${shape}-stage4.json" || exit 2
 
 exit "$overall_rc"
