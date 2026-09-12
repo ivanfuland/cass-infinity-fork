@@ -76,14 +76,18 @@
 #   $RUN_ROOT/memory-selfcheck-$$.json (or /tmp if RUN_ROOT unset).
 #
 # --judge mode (standalone judgment, for testing "空输入 fail-loud" without
-# a real stage run): memory_gate.sh --judge < stage.json
+# a real stage run): memory_gate.sh --judge [--allow-null-budget] < stage.json
 #   Reads one stage-result JSON object from stdin, applies the same
 #   judgment `judge_from_stdin` uses internally, exits 0 (pass) / 1 (fail)
-#   / 2 (empty input, invalid JSON, a field missing, or a field whose type
-#   or value is not a valid measurement -- #123 R6-B1: these are treated
-#   as an adversary's input, so `"false"` is not a bool, a negative peak is
-#   not a count, and `measured=true` needs the samples/stage_ms the
-#   emitter's own rule requires). Fail-loud, never defaults. This is also
+#   / 2 (empty input, invalid JSON, a field missing, a missing/null budget,
+#   or a field whose type or value is not a valid measurement -- #123 R6-B1:
+#   these are treated as an adversary's input, so `"false"` is not a bool, a
+#   negative peak is not a count, and `measured=true` needs the samples/
+#   stage_ms the emitter's own rule requires). Fail-loud, never defaults.
+#   #124 R7-4: the judged object's own `shape` never decides whether a
+#   budget is required -- `--allow-null-budget` is the caller's statement
+#   that this mode (`--selfcheck`, `--collect-baseline`) has no P0 budget,
+#   and without it a missing or null budget is malformed input. This is also
 #   how run_stage's own judgment
 #   step is implemented (it pipes the JSON it just built through the same
 #   function), so there is exactly one judgment code path.
@@ -92,11 +96,16 @@ set -u
 usage() {
   echo "usage: memory_gate.sh [--collect-baseline] [--stage4-db <path>] <shape:a|b|c> <cass_wrapper>" >&2
   echo "       memory_gate.sh --selfcheck -- <binary> [args...]" >&2
-  echo "       memory_gate.sh --judge   # reads one stage JSON object from stdin" >&2
+  echo "       memory_gate.sh --judge [--allow-null-budget]   # reads one stage JSON object from stdin" >&2
   exit 2
 }
 
 POLL_INTERVAL_S=0.1
+
+# R7-4 (#124): whether a stage result may carry no budget is decided by the
+# mode the caller selected (--selfcheck, --collect-baseline), never by the
+# judged JSON's own fields. Everything else leaves this at 0.
+ALLOW_NULL_BUDGET=0
 
 # ---------------------------------------------------------------------
 # Process-tree sampling (no forked ps/pgrep/awk in the poll loop).
@@ -201,8 +210,12 @@ sample_tree() {
 # ---------------------------------------------------------------------
 
 # Reads one stage-result JSON object from stdin; exits 0 (pass) / 1 (fail)
-# / 2 (empty input, invalid JSON, or missing a required field).
+# / 2 (empty input, invalid JSON, missing a required field, or a missing/null
+# budget in a mode that requires one). $1="1" is the caller's statement that
+# this mode has no P0 budget to compare against (`--selfcheck`,
+# `--collect-baseline`); it is never read from the judged object (#124 R7-4).
 judge_from_stdin() {
+  local allow_null_budget="${1:-0}"
   # NOTE: this must be `python3 -c '<code>'`, NOT `python3 - <<'PYEOF'`.
   # `python3 -` reads its own PROGRAM from stdin, so a heredoc there
   # supplies the code and leaves nothing in stdin for `sys.stdin.read()`
@@ -213,6 +226,8 @@ judge_from_stdin() {
   python3 -c '
 import json
 import sys
+
+allow_null_budget = len(sys.argv) > 1 and sys.argv[1] == "1"
 
 raw = sys.stdin.read()
 if not raw.strip():
@@ -269,16 +284,20 @@ if measured and not (is_int(obj.get("samples")) and obj["samples"] >= 2
     )
     sys.exit(2)
 
-# `budget` is null only in --collect-baseline/--selfcheck, both of which
-# still *emit* the key; a normal stage result whose key is absent is a
-# hand-trimmed object, not a collected one -- fail loud rather than
-# silently dropping the budget term. (An explicit null for a normal shape
-# stays accepted: --collect-baseline also pipes its stages through this
-# same judgment, and that run legitimately carries null.)
-if "budget" not in obj and obj.get("shape") != "selfcheck":
-    print("judge: missing required field budget for a non-selfcheck stage (fail-loud, not a free pass)", file=sys.stderr)
-    sys.exit(2)
+# R7-4 (#124): a budget is required unless the *caller* said this mode has
+# none. The old rule read the `shape` field of the judged object, so any
+# hand-written result could declare itself `selfcheck` and drop the budget
+# term -- and an explicit null for a normal shape was accepted as well
+# (the #122b-1 A-ruling left that door open). A missing or null budget is now
+# malformed input in every mode that did not pass --allow-null-budget.
 budget = obj.get("budget")
+if budget is None and not allow_null_budget:
+    print(
+        "judge: stage result carries no budget, and this invocation does not allow one "
+        "(pass --allow-null-budget for a --selfcheck/--collect-baseline run)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 if budget is not None and (not is_int(budget) or budget < 0):
     print(f"judge: field budget must be null or a non-negative integer, got {budget!r}", file=sys.stderr)
     sys.exit(2)
@@ -287,7 +306,7 @@ ok = measured and exit_code == 0
 if budget is not None:
     ok = ok and max(peak_tree, peak_proc) <= budget
 sys.exit(0 if ok else 1)
-'
+' "$allow_null_budget"
 }
 
 # ---------------------------------------------------------------------
@@ -385,7 +404,7 @@ run_stage() {
     "$binary_sha256" "$fixture_sha256")
   echo "$json" | tee "$out_json"
 
-  echo "$json" | judge_from_stdin
+  echo "$json" | judge_from_stdin "$ALLOW_NULL_BUDGET"
 }
 
 # ---------------------------------------------------------------------
@@ -619,12 +638,25 @@ if [ "${1:-}" = "--selfcheck" ]; then
   [ "${1:-}" = "--" ] || usage
   shift
   [ $# -ge 1 ] || usage
+  # R7-4 (#124): this mode has no P0 and no fixture, so its stage result
+  # legitimately carries a null budget -- said by the caller, not by the
+  # judged JSON.
+  ALLOW_NULL_BUDGET=1
   run_selfcheck "$@"
   exit $?
 fi
 
 if [ "${1:-}" = "--judge" ]; then
-  judge_from_stdin
+  shift
+  # R7-4 (#124): standalone judgment has no stage run to infer the mode
+  # from, so the caller states it. `--allow-null-budget` is the only
+  # argument this surface accepts.
+  if [ "${1:-}" = "--allow-null-budget" ]; then
+    ALLOW_NULL_BUDGET=1
+    shift
+  fi
+  [ $# -eq 0 ] || usage
+  judge_from_stdin "$ALLOW_NULL_BUDGET"
   exit $?
 fi
 
@@ -632,7 +664,9 @@ COLLECT_BASELINE=0
 STAGE4_DB=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --collect-baseline) COLLECT_BASELINE=1; shift ;;
+    # R7-4 (#124): the collection run's own stages have no P0 budget to
+    # compare against; every other mode does.
+    --collect-baseline) COLLECT_BASELINE=1; ALLOW_NULL_BUDGET=1; shift ;;
     --stage4-db) STAGE4_DB="${2:?missing --stage4-db path}"; shift 2 ;;
     --) shift; break ;;
     -*) usage ;;

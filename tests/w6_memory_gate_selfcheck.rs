@@ -166,6 +166,122 @@ fn judge_mode_rejects_empty_input_with_exit_2() {
     assert!(stderr.contains("empty input"), "expected the dedicated empty-input message, got: {stderr}");
 }
 
+/// Feed one stage-result JSON through the real `--judge` surface, with the
+/// given extra flags (`--allow-null-budget`).
+fn run_judge(stdin_json: &str, extra_args: &[&str]) -> std::process::Output {
+    use std::io::Write as _;
+    let mut child = Command::new("bash")
+        .arg(gate_script())
+        .arg("--judge")
+        .args(extra_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn memory_gate.sh --judge");
+    child
+        .stdin
+        .as_mut()
+        .expect("judge stdin is piped")
+        .write_all(stdin_json.as_bytes())
+        .expect("write the stage JSON to judge stdin");
+    child.wait_with_output().expect("wait for memory_gate.sh --judge")
+}
+
+/// R7-4 (#124, control-plane adversarial review of #123, blocker class:
+/// false green). Whether the budget term is *required* used to be decided by
+/// the judged object's own `shape` field: any hand-written stage result
+/// could declare itself `"shape":"selfcheck"` and have the budget check
+/// skipped, and an explicit `"budget":null` was accepted for a normal shape
+/// too. Malformed input must not be able to name the mode it wants to be
+/// judged under; the caller now says so with `--allow-null-budget`, which
+/// `run_stage` passes only for the two modes that have no P0 budget
+/// (`--selfcheck` and `--collect-baseline`). Cases ①② are the reproductions
+/// (both exited 0 before the fix), case ③ the flag, and the end-to-end case
+/// at the bottom is what proves the flag really reaches the judge from
+/// `run_stage` -- without it the selfcheck mode would judge every stage
+/// failed.
+#[test]
+fn judge_requires_a_budget_unless_the_caller_allows_none() {
+    const PEAKS: &str =
+        r#""stage":"index","measured":true,"exit_code":0,"peak_tree":1000000000000,"peak_proc":8192,"samples":3,"stage_ms":300"#;
+    let no_budget_selfcheck = format!(r#"{{"shape":"selfcheck",{PEAKS}}}"#);
+    let no_budget_shape_a = format!(r#"{{"shape":"a",{PEAKS}}}"#);
+    let null_budget = format!(r#"{{"shape":"a",{PEAKS},"budget":null}}"#);
+
+    // ① a missing `budget` key: a self-declared `shape` buys no free pass.
+    let out = run_judge(&no_budget_selfcheck, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a missing budget must be malformed input even when the object calls itself `selfcheck`: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("carries no budget"),
+        "expected the missing-budget message, got: {stderr}"
+    );
+    assert_eq!(
+        run_judge(&no_budget_shape_a, &[]).status.code(),
+        Some(2),
+        "a missing budget must stay malformed input for a normal shape"
+    );
+    // ② an explicit null is the same door, and the same shut door.
+    let out = run_judge(&null_budget, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "a null budget must be malformed input: stderr={stderr}");
+    assert!(
+        stderr.contains("carries no budget"),
+        "expected the missing-budget message for an explicit null too, got: {stderr}"
+    );
+
+    // ③ the caller-supplied flag is what allows a budgetless verdict.
+    for allowed in [&no_budget_selfcheck, &null_budget] {
+        let out = run_judge(allowed, &["--allow-null-budget"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "with --allow-null-budget a measured, zero-exit stage must pass: input={allowed} stderr={stderr}"
+        );
+    }
+
+    // The budget term itself is still enforced when one is present: this is
+    // what keeps ①② from being satisfiable by simply deleting the check.
+    let over = format!(r#"{{"shape":"a",{PEAKS},"budget":1024}}"#);
+    assert_eq!(
+        run_judge(&over, &[]).status.code(),
+        Some(1),
+        "a budget the peaks exceed must still judge failed"
+    );
+
+    // ④ end to end: `--selfcheck` reaches the judge through `run_stage`,
+    // which must therefore be passing the flag. (Before the fix this mode
+    // passed on its own `shape` value, so this case alone is not the
+    // reproduction -- ①② are.)
+    let tmp = tempfile::TempDir::new().unwrap();
+    let outcome = run_selfcheck(
+        tmp.path(),
+        &[hog_binary_path().to_str().unwrap(), "--mib", "8", "--hold-ms", "400"],
+    );
+    assert_eq!(
+        outcome.stage_json["measured"], true,
+        "the selfcheck stage must be measured (>=2 samples, >=200ms): {:?}",
+        outcome.stage_json
+    );
+    assert_eq!(
+        outcome.stage_json["budget"],
+        Value::Null,
+        "selfcheck stages carry no budget: {:?}",
+        outcome.stage_json
+    );
+    assert_eq!(
+        outcome.exit_code, 0,
+        "run_stage must pass --allow-null-budget for --selfcheck: {:?}",
+        outcome.stage_json
+    );
+}
+
 /// Source the gate for one function call and run
 /// `check_ingest_totals <db> <manifest>`. Sourcing is what the guard added
 /// at the top of the CLI dispatch makes safe: without it the sourced file
