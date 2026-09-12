@@ -7,13 +7,16 @@
 # Measurement object = the cass PROCESS TREE, not one pid. The wrapper
 # under test must `exec` itself into the measured binary (cass-cand.sh does
 # this already), so the pid this script backgrounds via `"$@" &` IS the
-# tree's root. Every 100ms (fixed -- this script does not implement the
-# spec's "阶段短于2个周期用50ms" adaptive-interval exception: that requires
-# knowing a stage's duration before it finishes, which a live single-pass
-# poll cannot; whether a stage is `measured` depends only on `samples>=2 ∧
-# stage_ms>=200`, both of which a 100ms-fixed cadence still resolves
+# tree's root. Each poll samples, then sleeps 100ms -- so the cycle is one
+# sample pass plus 100ms, not a fixed 100ms period (R6-N5, #128 T6-a2):
+# measured 169-176ms per cycle on this host, and higher while the machine is
+# loaded, because the /proc sweep is the dominant term. This script does not
+# implement the spec's "阶段短于2个周期用50ms" adaptive-interval exception:
+# that requires knowing a stage's duration before it finishes, which a live
+# single-pass poll cannot; whether a stage is `measured` depends only on
+# `samples>=2 ∧ stage_ms>=200`, both of which this cadence still resolves
 # correctly for any stage lasting >=1 poll period -- 2026-09-11 control-
-# plane approved this reading over the spec's literal adaptive wording),
+# plane approved this reading over the spec's literal adaptive wording.
 # one sample = one pass over /proc/[0-9]*/stat (pure bash builtins, no
 # forked `ps`/`pgrep`/`awk` per sample -- see collect_process_maps below)
 # to rebuild the whole system's pid->ppid map, then a BFS closure from the
@@ -23,6 +26,18 @@
 # pid's running-max, kept in PEAK_PROC_KB even after the pid exits and
 # drops out of /proc, since VmHWM is monotonic and its last reading before
 # exit is real "peak-and-not-yet-reused-since" data).
+#
+# Two limits of what this can see, recorded rather than left implied:
+#   - The tree is the root's descendants *while the root is alive*: once the
+#     root exits, any surviving descendant is neither measured nor waited for
+#     (R6-B3, #128 T6-a2). The object under test here is single-process, so
+#     the root's exit is the end of its work; a wrapper that leaves work
+#     behind would be under-measured from that moment.
+#   - VmHWM is monotonic, which bounds what the CASS_MEMPROBE_LOG
+#     instrumentation can separate: it is only valid for stages that run as
+#     *independent processes*, and on a failed path only the `start` reading
+#     survives -- a per-stage peak inside one process is not available from it
+#     (R6-N8, #128 T6-a2).
 #
 # Normal mode: memory_gate.sh [--collect-baseline] [--stage4-db <path>]
 #   <shape:a|b|c> <cass_wrapper>
@@ -44,6 +59,16 @@
 #   combining stages within 1-3 is gone (R6-N4, #128 T6-a2): nothing read it
 #   and the `merged_from` it would have fed is always empty, so there is no
 #   cross-stage merge to describe.
+#   Stage 4 records only; it carries no budget judgement. `--stage4-db` is
+#   also not bound to the fixture's identity: pointing it at a different
+#   (smaller) complete db under the same shape would still be recorded with
+#   this fixture's sha256 and budget blocks. Binding the two belongs with
+#   whatever restores a judgement here (R7-3, #128 T6-a2).
+#   Ingestion amplification is recorded, not fixed: stage 1 normalizes each
+#   message twice (drain's `normalized` plus the `expected_chunks`
+#   re-normalization of the full text), so a 512MiB message keeps two copies
+#   alive at once. Accepted-not-fixed per the T4-F8 ruling (R6-N9, #128
+#   T6-a2) -- this gate reports the peak; it does not judge the mechanism.
 #   Prints one JSON object per stage to stdout (one line each) and to
 #   $RUN_ROOT/mem-<shape>-stage<N>.json:
 #   {shape, stage, pid, peak_tree, peak_proc, samples, stage_ms, measured,
