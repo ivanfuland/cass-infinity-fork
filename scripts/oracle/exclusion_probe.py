@@ -596,10 +596,15 @@ def build_candidates_claude_code(events):
                 # row in the same event (verified against real DB: `copy/`
                 # conversation_id=54, event idx 11/12).
                 per_block.append(Candidate("reasoning", event_key, i, text=block.get("thinking", "")))
-            elif btype == "text":
+            elif btype in ("text", "input_text", "output_text") and isinstance(block.get("text"), str):
+                # R9-N04b (任务书 #132, 控制面 2026-09-12 追加): the authority's
+                # Text kind is `text | input_text | output_text` WITH a string
+                # `text` (`block.get("text").and_then(as_str).is_some()`); the
+                # probe read only `text`, so an event carrying `input_text`
+                # blocks produced one row fewer than the authority's.
                 if first_text_index is None:
                     first_text_index = i
-                prose_parts.append(block.get("text", ""))
+                prose_parts.append(block["text"])
         prose = "\n".join(prose_parts)
         has_prose = bool(prose.strip())
         if has_prose:
@@ -611,12 +616,14 @@ def build_candidates_claude_code(events):
                 Candidate(role, event_key, 0 if first_text_index is None else first_text_index, text=prose)
             )
         candidates.extend(per_block)
-        if not has_prose and not per_block:
-            # No recognized block type at all (image, redacted_thinking,
-            # etc.) -- one candidate, role from the event, empty text; R1-R3
-            # never match an empty/unrecognized candidate so this is a safe
-            # (宁漏勿误) placeholder that still occupies its idx slot.
-            candidates.append(Candidate(role, event_key, 0, text=""))
+        # R9-N04b (任务书 #132, 控制面 2026-09-12 追加): an event whose blocks
+        # are ALL unrecognized (image, redacted_thinking, ...) produces NO row
+        # in the authority -- `claude_code_events_from_blob` pushes prose only
+        # when it is non-empty and a row only per recognized non-Text block.
+        # The probe used to emit an empty-text placeholder "to occupy its idx
+        # slot", which made every later `raw.idx` in such a session name the
+        # wrong event. The `_ => continue` classification above already drops
+        # those blocks; nothing is emitted for them now either.
     return candidates
 
 
@@ -3251,6 +3258,24 @@ def claude_projection_selftest_cases():
         ("N04 E several text blocks collapse into one prose row",
          [two_text],
          [("assistant", 0, "first\nsecond")]),
+        # R9-N04b (任务书 #132, 控制面追加): the Text kind is
+        # `text | input_text | output_text`, not `text` alone -- an event
+        # carrying `input_text` blocks produced one row fewer than the
+        # authority's, shifting every later `raw.idx`.
+        ("N04b A input_text blocks are Text blocks",
+         [{"type": "user", "uuid": "u4", "message": {"role": "user", "content": [
+             {"type": "input_text", "text": "first"},
+             {"type": "output_text", "text": "second"},
+         ]}}],
+         [("user", 0, "first\nsecond")]),
+        # ...and an event whose blocks are ALL unrecognized produces no row at
+        # all, instead of an empty-text placeholder that shifted the rest.
+        ("N04b B an event with no recognized block produces no row",
+         [{"type": "user", "uuid": "u5", "message": {"role": "user", "content": [
+             {"type": "image", "source": {"type": "base64", "data": "aGk="}},
+             {"type": "redacted_thinking", "data": "opaque"},
+         ]}}],
+         []),
     ]
 
 
