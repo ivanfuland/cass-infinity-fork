@@ -2674,6 +2674,10 @@ mod tests {
     /// leaf-to-`data_dir` layer enumeration, derived from the capture's own
     /// relative paths, must equal exactly what the probe observed.
     #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
     fn sync_capture_durable_fsyncs_mirror_root_parent_directory_entry() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
             .lock()
@@ -2810,6 +2814,10 @@ mod tests {
     /// works" into "verified": without the filter, the injected path is an
     /// extra element the equality assertion cannot tolerate.
     #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
     fn sync_capture_durable_probe_filter_rejects_foreign_test_tree_pollution() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
             .lock()
@@ -2920,6 +2928,10 @@ mod tests {
     /// （`temp.path()`，本就存在，充当自然边界）。这正是"新建到哪就同步到
     /// 哪"要证明的：边界不是硬编码的一跳，而是由实际文件系统状态动态决定的。
     #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
     fn create_dir_all_durable_syncs_parent_of_every_newly_created_level_positive() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
             .lock()
@@ -3004,6 +3016,10 @@ mod tests {
     /// 过，恰好衔接、不重不漏。这条判例不依赖谁创建了 `data_dir` 之上还是
     /// 之下这类实现细节，只断言"整条链没有洞"。
     #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
     fn create_dir_all_durable_and_sync_capture_durable_seam_has_no_gap_positive() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
             .lock()
@@ -3207,6 +3223,10 @@ mod tests {
     /// (`record_persisted_raw_mirror_db_link` in `indexer/mod.rs`) -- not
     /// `replace_manifest_bytes` directly (private).
     #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
     fn merge_manifest_db_links_walks_full_directory_chain_when_fsync_enabled() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
             .lock()
@@ -3354,6 +3374,10 @@ mod tests {
     /// `replace_manifest_bytes` (#119b R2-B5 场景二) already got, not the
     /// single-level `sync_parent` it had before this fix.
     #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
     fn capture_source_file_first_publish_walks_full_directory_chain_when_fsync_enabled() {
         let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
             .lock()

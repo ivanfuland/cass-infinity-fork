@@ -1593,6 +1593,20 @@ fn unique_atomic_sidecar_path(path: &Path, suffix: &str, fallback_name: &str) ->
 
 #[cfg(test)]
 mod tests {
+
+    /// R3-N6 (任务书 #129): `id -u` == 0. Used to skip tests whose premise is
+    /// "a permission bit blocks the caller" -- root bypasses those bits, and
+    /// the crate has no `libc`/`nix` dependency to read euid directly.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|uid| uid.trim() == "0")
+            .unwrap_or(false)
+    }
     use super::*;
 
     #[test]
@@ -1899,6 +1913,15 @@ paths = ["/mnt/histories/laptop"]
     #[test]
     #[cfg(unix)]
     fn excluded_context_paths_unreadable_parent_dir_reports_config_error() {
+        // R3-N6 (任务书 #129): `chmod 000` blocks a non-root user, but root
+        // bypasses directory permissions entirely, so `metadata()` still
+        // succeeds and this test's premise does not hold. Skip there rather
+        // than assert something that cannot be true in that environment.
+        if running_as_root() {
+            eprintln!("skipping: running as root, where directory permissions do not block traversal");
+            return;
+        }
+
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("tempdir");
