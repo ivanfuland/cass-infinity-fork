@@ -773,6 +773,13 @@ def _selftest_compare_guards() -> None:
     _assert(run([]) == 2, "empty --compare input must be a precondition error (exit 2), not diffs=0")
     _assert(run([good, good, good]) == 2, "duplicated message_ids must be a precondition error (exit 2)")
     _assert(run([good], identity=[1, 2]) == 2, "id set disagreeing with --expect-identity must exit 2")
+    # R6-B5: a string id is not merely a different Python key -- SQLite's
+    # INTEGER PRIMARY KEY affinity binds it to row 1, so `1` and `"1"` are
+    # the same message and `total` would count it twice.
+    _assert(
+        run([good, json.dumps({**json.loads(good), "message_id": "1"})]) == 2,
+        "a non-integer message_id must be a precondition error (exit 2), not a second independent record",
+    )
     _assert(run([good], identity=[1]) == 0, "one genuine record matching --expect-identity must exit 0")
     _assert(run([good]) == 0, "one genuine record without --expect-identity must exit 0")
 
@@ -938,6 +945,24 @@ def run_compare(
         print("precondition error: --compare input has no records", file=sys.stderr)
         return 2
     ids = [rec["message_id"] for rec in records]
+    # R6-B5 (control-plane adversarial review, blocker class: false green).
+    # The duplicate guard below compares *Python values*, but the query
+    # this feeds binds each id to `messages.id INTEGER PRIMARY KEY`, whose
+    # affinity makes 2, "2", "02" and "2.0" the same row -- so four
+    # textually different records counted as four independent messages
+    # while actually re-checking one (`diffs=0 sha_mismatch=0 total=4`).
+    # Reject any non-int id first (bools included: `True` would bind as 1),
+    # naming the record, so `total` counts distinct rows or the run fails.
+    for i, message_id in enumerate(ids):
+        if not isinstance(message_id, int) or isinstance(message_id, bool):
+            print(
+                f"precondition error: --compare record {i} (0-based) has a non-integer "
+                f"message_id {message_id!r} ({type(message_id).__name__}); message ids are "
+                f"bound to a SQLite INTEGER PRIMARY KEY, whose affinity makes "
+                f"2, \"2\", \"02\" and \"2.0\" one row",
+                file=sys.stderr,
+            )
+            return 2
     dupes = sorted(i for i, n in Counter(ids).items() if n > 1)
     if dupes:
         print(
