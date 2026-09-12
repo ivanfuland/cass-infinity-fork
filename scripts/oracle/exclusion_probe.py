@@ -1493,17 +1493,28 @@ def _run_report_selftest(paths_cfg):
 # ---------------------------------------------------------------------------
 _VERIFY_BODY = "PR6 T5 verify fixture body " + "abcdefghij" * 8
 _VERIFY_SIBLING = "PR6 T5 verify fixture sibling block " + "klmnopqrst" * 8
+_VERIFY_ORDINARY = "PR6 T5 verify fixture ordinary field " + "uvwxyzabcd" * 8
 
 
 def _verify_extra(block_value):
+    """The EVENT shape `raw.blocks` addresses: `result_event` has exactly one
+    `message.content` entry, so a marker recorded against it carries
+    `blocks=[0]` and index 0 IS the tool_result block. (Before B07 this
+    fixture put a sibling text block at 0 and the tool_result at 1, a pairing
+    no real marker/event can produce -- which is what let an over-clear at a
+    block the exclusion does not own look identical to a legitimate one.)
+
+    `ordinary` is a field of this event that no R7 path may touch; the
+    over-clear case replaces it with the same redacted placeholder and must
+    still be a failure."""
     return {
         "message": {
             "role": "user",
             "content": [
-                {"type": "text", "text": _VERIFY_SIBLING},
                 {"type": "tool_result", "tool_use_id": "t1", "content": block_value},
             ],
-        }
+        },
+        "ordinary": _VERIFY_ORDINARY,
     }
 
 
@@ -1520,7 +1531,7 @@ def _verify_schema(with_excluded):
 
 
 def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
-                          non_manifest_altered=False):
+                          non_manifest_altered=False, overclear_ordinary=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1575,7 +1586,13 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         )
         candidate_extra = _verify_extra(redacted if with_excluded else _VERIFY_BODY)
         if with_excluded and non_target_cleared:
-            candidate_extra["message"]["content"][0]["text"] = ""
+            # A change that is NOT a redacted placeholder (an extra block the
+            # reference library does not have).
+            candidate_extra["message"]["content"].append({"type": "text", "text": ""})
+        if with_excluded and overclear_ordinary:
+            # B07: the SAME redacted placeholder, at a path this exclusion
+            # does not own. Pre-fix this passed as a clean exclusion.
+            candidate_extra["ordinary"] = redacted
         conn.execute(
             "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
             "VALUES (1, 1, 'tool_result', ?, ?)",
@@ -1652,6 +1669,9 @@ def verify_selftest_cases():
         ("V2 sibling row still carries the body", False, "still carries the body"),
         ("V3 a non-target block was cleared", False, "changed somewhere other than a redacted block"),
         ("V4 a non-manifest row was altered", False, "non-manifest body differs from reference"),
+        # B07 (任务书 #131): the same placeholder at a path the exclusion does
+        # not own is an over-clear, not a clean exclusion.
+        ("V7 an over-cleared ordinary field is a failure", False, "redacted a field this exclusion does not own"),
     ]
 
 
@@ -1672,6 +1692,7 @@ def _run_verify_selftest(paths_cfg):
             1: {"sibling_leak": True},
             2: {"non_target_cleared": True},
             3: {"non_manifest_altered": True},
+            4: {"overclear_ordinary": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -2700,6 +2721,63 @@ def _diff_paths(candidate, reference, path=""):
     return []
 
 
+# ---------------------------------------------------------------------------
+# B07 (任务书 #131): the R7 body-field map, mirrored from
+# `src/indexer/exclusion.rs::EXTRA_FIELD_MAP` (claude_code / codex entries --
+# the only two connectors with a candidate builder). The verifier uses it to
+# derive the exact set of `extra_bin` positions an exclusion may rewrite for a
+# given event and block set; a redacted placeholder anywhere else is an
+# over-clear, not an exclusion.
+# `[*]` on a segment means "index into that array with the block index".
+# ---------------------------------------------------------------------------
+EXTRA_FIELD_MAP = {
+    "claude_code": ("message.content[*].content", "message.content[*].text", "toolUseResult.file.content"),
+    "codex": (
+        "payload.output[*].text",
+        "payload.content[*].text",
+        "payload.arguments",
+        "payload.input",
+        "payload.output",
+        "payload.content",
+        "payload.message",
+    ),
+}
+
+# Mirrors `is_owned_body_copy`/`TOOL_USE_RESULT_WRAPPER_SLACK` in that same
+# file (B04).
+TOOL_USE_RESULT_WRAPPER_SLACK = 1024
+
+
+def _owned_body_copy(recorded, body):
+    if not isinstance(recorded, str) or not isinstance(body, str):
+        return False
+    if recorded == body:
+        return True
+    return bool(body) and len(recorded) <= len(body) + TOOL_USE_RESULT_WRAPPER_SLACK and body in recorded
+
+
+def _allowed_extra_paths(entry, ref_row, ref_extra):
+    """Concrete dot-paths (no leading dot) this exclusion may rewrite."""
+    blocks = entry.get("blocks") or []
+    allowed = set()
+    for path in EXTRA_FIELD_MAP.get(entry.get("agent_slug"), ()):
+        if "[*]" in path:
+            for index in blocks:
+                allowed.add(path.replace("[*]", f"[{index}]"))
+        else:
+            allowed.add(path)
+    if entry.get("agent_slug") == "claude_code" and isinstance(ref_extra, dict):
+        # The string-form top-level `toolUseResult` is a legitimate target
+        # only when it IS the excluded body's copy (B04's ownership proof).
+        if _owned_body_copy(ref_extra.get("toolUseResult"), ref_row["content"] if ref_row is not None else None):
+            allowed.add("toolUseResult")
+    return allowed
+
+
+def _normalized_diff_path(path):
+    return path[1:] if path.startswith(".") else path
+
+
 def _is_redacted_placeholder(value, sha):
     return (
         isinstance(value, dict)
@@ -2799,6 +2877,24 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                 failures.append(
                     (label, f"extra_bin changed somewhere other than a redacted block: {stray[:5]}")
                 )
+            else:
+                # B07 (任务书 #131): "the new value looks like a placeholder"
+                # is not enough -- the PATH has to be one this event/block set
+                # may legitimately rewrite. Otherwise an over-clear that
+                # redacts an ordinary field with the same sha (or any other
+                # body-bearing field the exclusion does not own) reads as a
+                # clean exclusion with failures=0.
+                allowed = _allowed_extra_paths(entry, ref_row, ref_extra)
+                off_map = [d[0] for d in cleared if _normalized_diff_path(d[0]) not in allowed]
+                if off_map:
+                    failures.append(
+                        (
+                            label,
+                            f"extra_bin redacted a field this exclusion does not own: {off_map[:5]} "
+                            f"(allowed: {sorted(allowed)[:5]})",
+                        )
+                    )
+
 
         body = ref_row["content"]
         if body and len(body) >= 32:
