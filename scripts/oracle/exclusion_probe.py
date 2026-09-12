@@ -1539,7 +1539,8 @@ def _verify_schema(with_excluded):
 def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           non_manifest_altered=False, overclear_ordinary=False,
                           leak_multiline_body=False, short_body=False,
-                          missing_nonmanifest_row=False):
+                          missing_nonmanifest_row=False, wrong_raw_idx=False,
+                          wrong_marker_sha=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1549,8 +1550,15 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     os.makedirs(os.path.dirname(blob_path), exist_ok=True)
 
     body_text = _VERIFY_SHORT_BODY if short_body else (_VERIFY_MULTILINE_BODY if leak_multiline_body else _VERIFY_BODY)
+    # B10 (任务书 #131): a marker whose recorded identity was tampered with.
+    # `wrong_marker_sha` moves the marker's sha AND its placeholder together,
+    # so only the manifest binding (not the placeholder-shape check) can
+    # expose it.
+    marker_sha = hashlib.sha256(b"not the body this fixture excluded").hexdigest() if wrong_marker_sha else None
     body_sha = hashlib.sha256(redact_text(body_text).encode("utf-8")).hexdigest()
     redacted = {"redacted": True, "sha256": body_sha, "bytes": len(body_text.encode("utf-8"))}
+    if wrong_marker_sha:
+        redacted = dict(redacted, sha256=marker_sha)
 
     call_event = {
         "type": "assistant",
@@ -1633,13 +1641,13 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
             marker = {
                 "reason": "cass_recall",
                 "rule_version": 1,
-                "bytes": len(_VERIFY_BODY.encode("utf-8")),
-                "sha256": body_sha,
+                "bytes": len(body_text.encode("utf-8")),
+                "sha256": marker_sha if wrong_marker_sha else body_sha,
                 "fingerprint_blake3": "0" * 64,
                 "parse_error": None,
                 "anchor": {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None},
                 "src": None,
-                "raw": {"blob": blob_rel, "idx": 1, "event_key": "u2", "blocks": [0]},
+                "raw": {"blob": blob_rel, "idx": 123456 if wrong_raw_idx else 1, "event_key": "u2", "blocks": [0]},
             }
             conn.execute(
                 "UPDATE messages SET excluded = jsonb(?) WHERE conversation_id = 1 AND idx = 1",
@@ -1705,6 +1713,10 @@ def verify_selftest_cases():
         # B09 (任务书 #131): a non-manifest row the candidate lost entirely --
         # the pre-fix loop only ever looked at rows the candidate still has.
         ("V9 a missing non-manifest row is a failure", False, "non-manifest row is missing"),
+        # B10 (任务书 #131): the rebuild never read `raw.idx`, and no
+        # per-entry comparison bound the marker's sha to the manifest's.
+        ("V10 a wrong raw.idx is a failure", False, "raw.idx"),
+        ("V10b a marker sha still bound to no manifest entry is a failure", False, "sha_binding_mismatch"),
     ]
 
 
@@ -1729,6 +1741,8 @@ def _run_verify_selftest(paths_cfg):
             5: {"leak_multiline_body": True},
             6: {"short_body": True},
             7: {"missing_nonmanifest_row": True},
+            8: {"wrong_raw_idx": True},
+            9: {"wrong_marker_sha": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -2907,17 +2921,29 @@ def _verify_rebuild_blob(entry, marker, mirror_root):
     builder = builders.get(entry["agent_slug"])
     if builder is None:
         return None, f"no reparse builder for agent_slug {entry['agent_slug']!r}"
-    picked = [
-        cand
-        for cand in builder(events)
-        if (event_key is None or cand.event_key == event_key) and cand.block_index in blocks
-    ]
-    if len(picked) != 1:
+    # B10 (任务书 #131): the rebuild must take the message the marker's
+    # `raw.idx` points at, then VERIFY that this position really is the
+    # recorded event/block -- the old version searched the reparsed candidates
+    # for a matching event_key/blocks pair and never read `raw.idx` at all, so
+    # a corrupted idx (or one that disagrees with the recorded event) rebuilt
+    # "successfully".
+    candidates = builder(events)
+    idx = raw.get("idx")
+    if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
         return None, (
-            f"reparse found {len(picked)} block(s) for event_key={event_key!r} "
-            f"blocks={blocks!r}, want exactly 1"
+            f"marker raw.idx={idx!r} is not a position in the reparsed candidate list "
+            f"({len(candidates)} candidates) for {entry['agent_slug']}"
         )
-    return hashlib.sha256(redact_text(picked[0].text).encode("utf-8")).hexdigest(), None
+    picked = candidates[idx]
+    if event_key is not None and picked.event_key != event_key:
+        return None, (
+            f"candidate at raw.idx={idx} carries event_key={picked.event_key!r}, marker records {event_key!r}"
+        )
+    if picked.block_index not in blocks:
+        return None, (
+            f"candidate at raw.idx={idx} is block {picked.block_index}, marker records blocks={blocks!r}"
+        )
+    return hashlib.sha256(redact_text(picked.text).encode("utf-8")).hexdigest(), None
 
 
 def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuild,
@@ -2934,6 +2960,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
 
     manifest = json.load(open(manifest_path, encoding="utf-8"))
     failures = []
+    sha_binding_mismatch = 0
     for entry in manifest:
         label = f"{entry['agent_slug']}/{entry['reason']}/idx={entry['idx']}"
         row = _fetch_row(conn_cand, sql_cand, entry, entry["idx"])
@@ -2952,6 +2979,20 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                 (label, f"marker reason {marker.get('reason')!r} != manifest {entry['reason']!r}")
             )
         sha = marker.get("sha256")
+        # B10 (任务书 #131): every manifest entry's own sha must BE the marker's
+        # -- sampled rebuilds only re-derive the ones they happen to pick, so
+        # an unsampled entry whose marker sha (and placeholder) were both
+        # changed together had nothing binding it to the manifest at all. Its
+        # own failure class, so a corpus-wide binding gap is countable apart
+        # from a real rebuild mismatch.
+        if entry.get("sha256") != sha:
+            sha_binding_mismatch += 1
+            failures.append(
+                (
+                    label,
+                    f"sha_binding_mismatch: marker sha256 {sha!r} != manifest sha256 {entry.get('sha256')!r}",
+                )
+            )
         ref_row = _fetch_row(conn_ref, sql_ref, entry, entry["idx"])
         if ref_row is None:
             failures.append((label, "manifest row is absent from the reference library"))
@@ -3097,6 +3138,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "non_manifest_rows_checked": checked,
         "rebuild_sample": len(sample),
         "rebuild_ok": rebuilt,
+        "sha_binding_mismatch": sha_binding_mismatch,
         "failures": len(failures),
     }
     return failures, report
