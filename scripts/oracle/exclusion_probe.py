@@ -1701,7 +1701,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           beyond_manifest_excluded=None,
                           fragmented_array_tool_use_result=False,
                           foreign_array_tool_use_result_cleared=False,
-                          candidate_only_excluded_row=None):
+                          candidate_only_excluded_row=None,
+                          fragmented_extra_text_blocks=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1710,7 +1711,11 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     blob_path = os.path.join(mirror, blob_rel)
     os.makedirs(os.path.dirname(blob_path), exist_ok=True)
 
-    fragmented = fragmented_array_tool_use_result or foreign_array_tool_use_result_cleared
+    fragmented = (
+        fragmented_array_tool_use_result
+        or foreign_array_tool_use_result_cleared
+        or fragmented_extra_text_blocks
+    )
     body_text = (
         _VERIFY_FRAGMENT_BODY if fragmented
         else _VERIFY_SHORT_BODY if short_body
@@ -1812,6 +1817,15 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 if with_excluded
                 else [{"type": "text", "text": "some other"}, {"type": "text", "text": "tool's body"}]
             )
+        if fragmented_extra_text_blocks:
+            # R9-B06's other half: the extra carries the body as SEVERAL
+            # `text` blocks, so the connector's visible text is their `\n`
+            # join and no single leaf holds it. Left identical on both sides
+            # (the candidate never touched the extra), so only a check that
+            # PROJECTS the extra can see the body survive.
+            candidate_extra["message"]["content"] = [
+                {"type": "text", "text": part} for part in body_text.split("\n")
+            ]
         if compact_extra_no_body:
             # N-fam2: the "compact" shape the frozen corpus has for ~31% of
             # rows -- prior compression left only these keys, so NO field ever
@@ -2047,6 +2061,111 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     return candidate, reference, manifest_path, mirror
 
 
+_VERIFY_CODEX_SHELL_BLOCKS = (
+    "<environment_context>\n<cwd>/fixture</cwd>",
+    "private injected context\n</environment_context>",
+)
+
+
+def _write_codex_verify_fixture(root):
+    """R9-B06 (任务书 #132): a `codex_host_shell` whose body the connector
+    carries as TWO `input_text` blocks.
+
+    `flatten_content` joins the visible blocks with `\n`, so the projected body
+    is the whole joined string while each block holds only a fragment. The
+    candidate cleared `messages.content` and wrote its marker but left
+    `extra.payload.content` untouched, so the complete original is still
+    reconstructible from the extra -- yet no single string leaf contains it and
+    the leaf-only scan called this `extra_unchanged_no_body`.
+
+    The first (and only) message of a codex session is the host shell at idx 0,
+    so this is the R3 shape end to end: a real blob, a real marker, a real
+    manifest entry, and a candidate whose only change is the one it claims.
+    """
+    candidate = os.path.join(root, "codex-candidate.db")
+    reference = os.path.join(root, "codex-reference.db")
+    manifest_path = os.path.join(root, "codex-manifest.json")
+    mirror = os.path.join(root, "codex-mirror")
+    blob_rel = "blobs/blake3/cc/codex-host-shell.raw"
+    blob_path = os.path.join(mirror, blob_rel)
+    os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+
+    body_text = "\n".join(_VERIFY_CODEX_SHELL_BLOCKS)
+    body_sha = hashlib.sha256(redact_text(body_text).encode("utf-8")).hexdigest()
+    redacted = {"redacted": True, "sha256": body_sha, "bytes": len(body_text.encode("utf-8"))}
+    event = {
+        "type": "response_item",
+        "payload": {
+            "id": "ev-1",
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": _VERIFY_CODEX_SHELL_BLOCKS[0]},
+                {"type": "input_text", "text": _VERIFY_CODEX_SHELL_BLOCKS[1]},
+            ],
+        },
+    }
+    with open(blob_path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+
+    marker = {
+        "reason": "codex_host_shell",
+        "rule_version": 1,
+        "bytes": len(body_text.encode("utf-8")),
+        "sha256": body_sha,
+        "fingerprint_blake3": "0" * 64,
+        "parse_error": None,
+        "anchor": {"tool_call_id": None, "tool_name": None, "paths": None,
+                   "shell": {"opener": "environment_context"}},
+        "src": None,
+        "raw": {"blob": blob_rel, "idx": 0, "event_key": "ev-1", "blocks": [0]},
+    }
+    for path, with_excluded in ((reference, False), (candidate, True)):
+        conn = sqlite3.connect(path)
+        conn.executescript(_verify_schema(with_excluded))
+        if with_excluded:
+            conn.executescript(
+                "CREATE TABLE snippets(id INTEGER PRIMARY KEY, message_id INTEGER, snippet_text TEXT);"
+                "CREATE TABLE lex_docs(doc_id INTEGER PRIMARY KEY, content TEXT);"
+                "CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY, message_id INTEGER);"
+            )
+        conn.execute("INSERT INTO agents(id, slug, name, kind) VALUES (1, 'codex', 'Codex', 'cli')")
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, source_id, external_id, title, source_path) "
+            "VALUES (1, 1, 'local', 'codex-ext-1', 'codex host shell session', '/src/codex-ext-1.jsonl')"
+        )
+        if with_excluded:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin, excluded) "
+                "VALUES (1, 1, 0, 'user', '', ?, jsonb(?))",
+                [msgpack.packb(event, use_bin_type=True), json.dumps(marker)],
+            )
+        else:
+            conn.execute(
+                "INSERT INTO messages(id, conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 1, 0, 'user', ?, ?)",
+                [body_text, msgpack.packb(event, use_bin_type=True)],
+            )
+        conn.commit()
+        conn.close()
+
+    manifest = [{
+        "reason": "codex_host_shell",
+        "source_id": "local",
+        "agent_slug": "codex",
+        "external_id": "codex-ext-1",
+        "source_path": "/src/codex-ext-1.jsonl",
+        "idx": 0,
+        "sha256": body_sha,
+        "evidence": "mirror",
+        "event_key": "ev-1",
+        "blocks": [0],
+    }]
+    with open(manifest_path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle)
+    return candidate, reference, manifest_path, mirror
+
+
 def _verify_case(root, paths_cfg, expect_ok, want_substring, want_report=None, **flags):
     candidate, reference, manifest_path, mirror = _write_verify_fixture(root, **flags)
     report_path = os.path.join(root, "report.json")
@@ -2168,6 +2287,11 @@ def verify_selftest_cases():
         # is RECORDED, never silently passed.
         ("V28 a candidate-only exclusion with no mirror blob is recorded as unjudgeable", True, "",
          {"candidate_only_unjudgeable": 1}),
+        # R9-B06 (任务书 #132) via the claude side: the extra's visible text is
+        # the `\n` join of several blocks, so leaf-by-leaf search misses it and
+        # only projecting the extra reconstructs the body.
+        ("V29 a claude body fragmented across extra text blocks is a failure", False,
+         "still present in extra_bin"),
     ]
 
 
@@ -2214,6 +2338,7 @@ def _run_verify_selftest(paths_cfg):
             25: {"candidate_only_excluded_row": "body_retained"},
             26: {"candidate_only_excluded_row": "extra_leak"},
             27: {"candidate_only_excluded_row": "unverifiable"},
+            28: {"fragmented_extra_text_blocks": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -2471,6 +2596,24 @@ def _run_verify_selftest(paths_cfg):
             "FAIL B03 the row's own body and the event's array body are both owned: "
             f"got {got!r}"
         )
+
+    # R9-B06 (任务书 #132): a body the connector carries as SEVERAL blocks is
+    # still a body. The leaf scan above sees only fragments; projecting the
+    # extra through the probe's own builder reconstructs the whole thing.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_codex_verify_fixture(root)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        details = " | ".join(detail for _label, detail in failures)
+        if any("still present in extra_bin" in detail for _label, detail in failures):
+            passed += 1
+            print("ok   B06 a body fragmented across several extra blocks is a failure")
+        else:
+            print(
+                "FAIL B06 a body fragmented across several extra blocks is a failure: "
+                f"failures={report.get('failures')!r} extra_unchanged_no_body="
+                f"{report.get('extra_unchanged_no_body')!r} details={details!r}"
+            )
 
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
@@ -3710,14 +3853,39 @@ def _string_leaves(value, depth=0):
             yield from _string_leaves(item, depth)
 
 
-def _extra_carries_body(extra, body):
+def _extra_carries_body(extra, body, agent_slug=None):
     """B08 (任务书 #131): compare against the DECODED string leaves, never
     against `json.dumps(extra)` -- serialization escapes newlines, quotes and
     backslashes, so a multi-line body still sitting verbatim in the extra was
     invisible to the old comparison and the run reported failures=0. Length is
     not a gate either: a short body is a body (the old `len(body) >= 32` guard
-    skipped the whole check for anything shorter)."""
-    return any(body in leaf for leaf in _string_leaves(extra))
+    skipped the whole check for anything shorter).
+
+    R9-B06 (任务书 #132): a leaf scan still cannot see a body the connector
+    carries as SEVERAL blocks -- the visible text is the `\n`-joined
+    projection of them, so each leaf holds a fragment and none holds the whole.
+    The extra IS an event, so it is projected through the probe's own candidate
+    builder (the same code that projects the mirror side for the content
+    comparison) and the result compared as a whole."""
+    if not body:
+        return False
+    if any(body in leaf for leaf in _string_leaves(extra)):
+        return True
+    builder = {
+        "claude_code": build_candidates_claude_code,
+        "codex": build_candidates_codex,
+    }.get(agent_slug)
+    if builder is None or not isinstance(extra, dict):
+        return False
+    try:
+        texts = [candidate.text or "" for candidate in builder([extra])]
+    except Exception:
+        return False
+    # The `\n` join, not a per-candidate equality: a single candidate makes the
+    # two identical, and several candidates are exactly the case a per-candidate
+    # test cannot see (no one of them is the body).
+    joined = "\n".join(texts)
+    return bool(joined) and joined == body
 
 
 def _normalized_diff_path(path):
@@ -3968,7 +4136,7 @@ def _beyond_manifest_exclusion_problem(entry, marker, row, ref_row, conn_cand, m
                 f"extra_bin redacted a field this exclusion does not own: {path} "
                 f"(allowed: {sorted(allowed)[:5]})"
             )
-    if body and _extra_carries_body(cand_extra, body):
+    if body and _extra_carries_body(cand_extra, body, entry.get("agent_slug")):
         return "body_still_in_extra", "the excluded body is still reconstructible from extra_bin"
 
     residue = _residue_problems(conn_cand, row["id"])
@@ -4049,7 +4217,7 @@ def _candidate_only_excluded_problem(row, marker, conn_cand, mirror_root):
             f"marker sha256 {sha} != the rebuilt candidate's {rebuilt}"
         )
     body = candidates[index].text
-    if body and _extra_carries_body(_decode_extra(row["extra_bin"]), body):
+    if body and _extra_carries_body(_decode_extra(row["extra_bin"]), body, row["agent_slug"]):
         return "body_still_in_extra", "the excluded body is still reconstructible from extra_bin"
     return None
 
@@ -4181,7 +4349,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                 # present in extra_bin". The failure condition is that the
                 # body is STILL THERE -- which is exactly what the recursive
                 # leaf check above decides.
-                if _extra_carries_body(cand_extra, ref_row["content"]):
+                if _extra_carries_body(cand_extra, ref_row["content"], entry["agent_slug"]):
                     failures.append((label, "the excluded block is still present in extra_bin"))
                 else:
                     extra_unchanged_no_body += 1
@@ -4229,7 +4397,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                             body_retained_unexcludable_samples.append([label, sib["idx"]])
                     break
                 sib_extra = _decode_extra(sib["extra_bin"])
-                if sib_extra is not None and _extra_carries_body(sib_extra, body):
+                if sib_extra is not None and _extra_carries_body(sib_extra, body, entry["agent_slug"]):
                     failures.append(
                         (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
                     )
