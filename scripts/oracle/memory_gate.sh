@@ -499,7 +499,15 @@ run_stage() {
   json=$(emit_stage_json "$shape" "$stage" "$root_pid" "$peak_tree_bytes" "$peak_proc_bytes" \
     "$last_tree_bytes" "$peak_sample_idx" "$samples" "$stage_ms" "$measured" "$merged_from_csv" \
     "$budget" "$rc" "$binary_sha256" "$fixture_sha256")
-  echo "$json" | tee "$out_json"
+  # B12 (任务书 #131): the record IS this door's product. Pre-fix the
+  # `tee`'s exit status was never checked (the header only sets `set -u`), so
+  # a stage whose measurement never reached disk still got judged from the
+  # in-memory JSON and could hand back success -- with T7's record-only
+  # contract that is a lost run reported as a good one. Fail-loud instead.
+  if ! echo "$json" | tee "$out_json"; then
+    echo "memory_gate: cannot write the stage measurement to $out_json; refusing to continue without the record" >&2
+    exit 2
+  fi
 
   echo "$json" | judge_from_stdin "$ALLOW_NULL_BUDGET"
 }
