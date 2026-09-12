@@ -600,15 +600,24 @@ impl PairingContext {
         // call's result) is data corruption, not a pairing nuance. Once an id
         // is seen twice it's marked ambiguous and permanently excluded from
         // `by_id` (a third+ occurrence must not resurrect it either).
-        let mut by_id: HashMap<&str, &PairedTool> = HashMap::new();
+        // B03 (任务书 #131): R1-B5's ledger says the fix includes "限定配对到
+        // 结果之前的调用"; the tree only had the duplicate-id half. `by_id`
+        // used to index every call in the WHOLE session and the result branch
+        // looked its id up without regard to position, so a concatenated or
+        // compacted log -- one that keeps a result whose own call is gone --
+        // bound that ordinary result to a LATER call reusing the same id, and
+        // `decide` then cleared it as that call's hit. The position is now
+        // part of the entry, and the lookup below requires it to be strictly
+        // earlier than the result being resolved.
+        let mut by_id: HashMap<&str, (usize, &PairedTool)> = HashMap::new();
         let mut ambiguous_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for c in candidates {
+        for (idx, c) in candidates.iter().enumerate() {
             if let PairingCandidate::ToolCall(pt) = c {
                 if let Some(id) = pt.tool_call_id.as_deref() {
                     if ambiguous_ids.contains(id) {
                         continue;
                     }
-                    if by_id.insert(id, pt).is_some() {
+                    if by_id.insert(id, (idx, pt)).is_some() {
                         by_id.remove(id);
                         ambiguous_ids.insert(id);
                     }
@@ -624,7 +633,10 @@ impl PairingContext {
                 PairingCandidate::ToolCall(_) => unpaired.push(idx),
                 PairingCandidate::ToolResult { tool_call_id } => {
                     if let Some(id) = tool_call_id {
-                        if let Some(pt) = by_id.get(id.as_str()) {
+                        // B03: `call_idx < idx` -- see the `by_id` construction
+                        // above. A call at or after this result's own position
+                        // cannot be the call that produced it.
+                        if let Some((_, pt)) = by_id.get(id.as_str()).filter(|(call_idx, _)| *call_idx < idx) {
                             resolved.insert(idx, (*pt).clone());
                             if let Some(pos) = unpaired.iter().position(|&i| {
                                 matches!(&candidates[i], PairingCandidate::ToolCall(p) if p.tool_call_id.as_deref() == Some(id.as_str()))
@@ -632,7 +644,7 @@ impl PairingContext {
                                 unpaired.remove(pos);
                             }
                         }
-                        // id given but not found in `by_id` -> R4: not
+                        // id given but no EARLIER call carries it -> R4: not
                         // excluded (no entry in `resolved`).
                     } else if unpaired.len() == 1 {
                         let call_idx = unpaired.remove(0);
@@ -2506,6 +2518,41 @@ mod tests {
             decide(&result_b, 3, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
             "call B's own result must ALSO stay unpaired once its id is ambiguous (宁漏勿误), not just A's"
         );
+    }
+
+    #[test]
+    fn r4_result_pairing_is_position_constrained_negative() {
+        // B03 (任务书 #131): R1-B5's ledger says the fix includes "限定配对到
+        // 结果之前的调用"; the tree only ever had the visible-duplicate-id
+        // half. `by_id` indexed every call in the SESSION up front, so when a
+        // concatenated/compacted log keeps a result whose own call is gone
+        // and a LATER position reuses that id, the ordinary result bound to
+        // the later call -- and was then judged (and cleared) as that call's
+        // `context_file_read`.
+        let later_project_read = || {
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("x".into()),
+                tool_name: "mcp__ccw-control-plane__project_read".into(),
+                args: Some(serde_json::json!({"document": "exec"})),
+            })
+        };
+        let event = RawEvent { event_key: "later".into(), blocks: vec![tool_result_block(0, Some("x"))] };
+
+        let ctx = ctx_from(&[PairingCandidate::ToolResult { tool_call_id: Some("x".into()) }, later_project_read()]);
+        assert!(ctx.paired_call_for(0).is_none(), "a result that precedes its call must not pair to it");
+        let ordinary = msg("tool_result", "ordinary result before the read ever occurred");
+        assert!(
+            decide(&ordinary, 0, &event, &ctx, "claude_code", &paths_cfg()).is_none(),
+            "the earlier ordinary result must stay unpaired (and so unexcluded), not bind to the later call"
+        );
+
+        // Control: the very same pair, in call-then-result order, still
+        // resolves and is judged exactly as before.
+        let ctx = ctx_from(&[later_project_read(), PairingCandidate::ToolResult { tool_call_id: Some("x".into()) }]);
+        assert!(ctx.paired_call_for(1).is_some(), "call-then-result order must keep pairing");
+        let hit = msg("tool_result", "exec doc contents");
+        let decision = decide(&hit, 1, &event, &ctx, "claude_code", &paths_cfg()).expect("the control pair must still resolve");
+        assert_eq!(decision.reason, ExclusionReason::ContextFileRead);
     }
 
     #[test]

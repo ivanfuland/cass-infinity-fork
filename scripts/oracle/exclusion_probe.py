@@ -697,10 +697,27 @@ class PairingContext:
     """Built once per session, walked in candidate order."""
 
     def __init__(self, candidates):
+        # B03 (任务书 #131): two constraints on id-based pairing, mirroring
+        # `src/indexer/exclusion.rs::PairingContext::build`:
+        #   1. an id reused by two different `tool_call`s resolves to NO entry
+        #      at all (R1-B5's 宁漏 half -- this port was missing it: plain
+        #      assignment let the LAST call win);
+        #   2. the call must sit STRICTLY BEFORE the result. The lookup used
+        #      to be session-wide, so a result whose own call is gone
+        #      (compacted/concatenated log) bound to a LATER call reusing the
+        #      id and was judged -- and cleared -- as that call's hit.
         self.by_id = {}
-        for c in candidates:
-            if c.role == "tool_call" and c.tool_call_id:
-                self.by_id[c.tool_call_id] = c
+        self.ambiguous_ids = set()
+        for index, c in enumerate(candidates):
+            if c.role != "tool_call" or not c.tool_call_id:
+                continue
+            if c.tool_call_id in self.ambiguous_ids:
+                continue
+            if c.tool_call_id in self.by_id:
+                del self.by_id[c.tool_call_id]
+                self.ambiguous_ids.add(c.tool_call_id)
+            else:
+                self.by_id[c.tool_call_id] = (c, index)
         self._unpaired_in_turn = []
         # Precompute, per tool_result candidate index, the pairing decision
         # by replaying candidates in order (turn = span since last 'user').
@@ -713,9 +730,10 @@ class PairingContext:
                 unpaired.append(c)
             elif c.role == "tool_result":
                 if c.tool_call_id:
-                    matched = self.by_id.get(c.tool_call_id)
+                    entry = self.by_id.get(c.tool_call_id)
+                    matched = entry[0] if entry is not None and entry[1] < idx else None
                     self._pair_by_position[idx] = matched
-                    if matched in unpaired:
+                    if matched is not None and matched in unpaired:
                         unpaired.remove(matched)
                 else:
                     if len(unpaired) == 1:
@@ -1256,8 +1274,55 @@ def _run_pairing_selftest(paths_cfg):
         print(f"{'ok  ' if ok else 'FAIL'} {name} (expect={want} got={got})")
         if ok:
             passed += 1
-    print(f"selftest/pairing: {passed}/{len(cases)}")
-    return passed, len(cases)
+
+    # B03 (任务书 #131): pairing is position-constrained, and a session-wide
+    # reused id still resolves to nothing. Pre-fix `PairingContext` indexed
+    # every call in the whole session up front, so a result whose own call is
+    # gone (compacted or concatenated log) bound to a LATER call that merely
+    # reuses the id, and the ordinary result was then judged -- and cleared --
+    # as that call's `context_file_read`. Each case is
+    # `(name, candidates, result_index, want_reason)`; the assertion goes
+    # through the same `decide_r1_r2_for_call` the production entry calls.
+    read_args = {"file_path": "/x/cc-workspace/USER.md"}
+    extra_cases = [
+        (
+            "B03 a result that PRECEDES its call stays unpaired",
+            [
+                Candidate("tool_result", "later", 0, tool_call_id="x", text="ordinary result before the read ever occurred"),
+                Candidate("tool_call", "later", 0, tool_call_id="x", tool_name="Read", args=read_args),
+            ],
+            0, None,
+        ),
+        (
+            "B03 the same pair in call-then-result order still resolves",
+            [
+                Candidate("tool_call", "ek", 0, tool_call_id="x", tool_name="Read", args=read_args),
+                Candidate("tool_result", "ek", 0, tool_call_id="x", text="read body"),
+            ],
+            1, "context_file_read",
+        ),
+        (
+            "B03 a session-wide reused id leaves its results unpaired",
+            [
+                Candidate("tool_call", "ek", 0, tool_call_id="x", tool_name="Read", args=read_args),
+                Candidate("tool_result", "ek", 0, tool_call_id="x", text="read body"),
+                Candidate("tool_call", "ek", 0, tool_call_id="x", tool_name="Read", args=read_args),
+            ],
+            1, None,
+        ),
+    ]
+    for name, candidates, result_index, want_reason in extra_cases:
+        ctx = PairingContext(candidates)
+        paired = ctx.paired_call_for(result_index)
+        decision = decide_r1_r2_for_call(paired, "claude_code", paths_cfg) if paired is not None else None
+        got_reason = decision["reason"] if decision else None
+        ok = got_reason == want_reason
+        print(f"{'ok  ' if ok else 'FAIL'} {name} (expect={want_reason!r} got={got_reason!r})")
+        if ok:
+            passed += 1
+    total = len(cases) + len(extra_cases)
+    print(f"selftest/pairing: {passed}/{total}")
+    return passed, total
 
 
 def selftest_perf_cases():
@@ -1899,7 +1964,15 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
         if role == "tool_result":
             paired = pairing.paired_call_for(i)
             if paired is None:
-                stats["pairing_fail"]["no_unpaired_candidate"] += 1
+                # B03 (任务书 #131): an id carried by two tool_calls now
+                # resolves to no pairing at all, so such a row never reaches
+                # the mirror-side `calls_by_id` ambiguity check below. Count it
+                # here instead of losing the statistic (T1b reported 416 such
+                # rows); everything else keeps meaning "no unpaired candidate".
+                if _tid and _tid in pairing.ambiguous_ids:
+                    stats["pairing_fail"]["ambiguous_call_id"] += 1
+                else:
+                    stats["pairing_fail"]["no_unpaired_candidate"] += 1
                 continue
             call_id = paired.tool_call_id
             if not call_id:
