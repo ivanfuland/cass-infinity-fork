@@ -95,10 +95,16 @@ pub struct DbVectorCatchupReport {
     pub chunks_pruned: u64,
     /// T4 mission #122a-R1 (R1-2): [`reconcile_touched_messages`]'s own
     /// `expected_recomputed` counter -- a scanned zero-chunk message whose
-    /// content changed (canonicalize-empty -> real content, or vice versa)
-    /// since this run's up-front scan. Previously discarded entirely
-    /// (`_expected_recomputed` at the call site) with only a `tracing`
-    /// line as evidence; `0` on the common case.
+    /// *up-front snapshot was empty* and whose content now normalizes to
+    /// real content since this run's up-front scan. Previously discarded
+    /// entirely (`_expected_recomputed` at the call site) with only a
+    /// `tracing` line as evidence; `0` on the common case.
+    ///
+    /// R6-N10 (#123): the direction matters and this comment used to get it
+    /// wrong ("or vice versa"). Only empty -> non-empty moves this counter;
+    /// the reverse (a non-empty snapshot whose fresh set is now empty)
+    /// takes the set-comparison branch in
+    /// [`reconcile_touched_messages`]'s match and moves `set_mismatch`.
     pub expected_recomputed: u64,
     /// T4 mission #122a-R1 (R1-2): [`reconcile_touched_messages`]'s own
     /// `set_mismatch` counter -- a touched message whose up-front snapshot
@@ -1662,8 +1668,26 @@ pub fn run_db_vector_catchup_backfill(
     // `load_message_once` calls (from wherever inside it they're made) for
     // `LOAD_MESSAGE_CALLS`; cleared below before reverse-reconciliation
     // (and everything after it) runs.
+    //
+    // R6-N10 (#123): the `?` operators inside the loop (a batched embed
+    // failure, span slicing, any transaction error) return from this
+    // function without reaching that explicit `set(false)`, leaving this
+    // thread-local flag set for the rest of the thread's life -- and the
+    // next drain on the same thread would then count its
+    // reverse-reconciliation reads as drain-phase reads. The guard clears
+    // it on every exit; the explicit `set(false)` below still ends the
+    // *phase* at the same point it always did, which is a different job.
     #[cfg(test)]
-    DRAIN_PHASE.with(|c| c.set(true));
+    let _drain_phase_reset_guard = {
+        DRAIN_PHASE.with(|c| c.set(true));
+        struct ResetDrainPhaseOnDrop;
+        impl Drop for ResetDrainPhaseOnDrop {
+            fn drop(&mut self) {
+                DRAIN_PHASE.with(|c| c.set(false));
+            }
+        }
+        ResetDrainPhaseOnDrop
+    };
     loop {
         let page_started = std::time::Instant::now();
         let keys = fetch_hole_keys(storage, generation_id, after, batch_size)?;
@@ -2282,6 +2306,45 @@ mod chunk_catchup_v5_tests {
         assert_eq!(chunk_holes_count(&storage, generation_id), 0, "every hole must be resolved");
         assert_eq!(chunk_staging_count(&storage, generation_id), 0, "staging must be empty once moved");
         assert!(report.activated, "zero remaining holes must activate: {report:?}");
+    }
+
+    /// R6-N10 (#123): `DRAIN_PHASE` brackets the drain loop for
+    /// `LOAD_MESSAGE_CALLS`, and every `?` inside that loop is an early
+    /// return out of this function. An injected embedder failure is one
+    /// such exit (the same shape a real one takes: the batched embed call
+    /// propagates with `?`), so the flag must be back to `false` by the
+    /// time the failure reaches the caller -- otherwise the next drain on
+    /// this thread counts its own reverse-reconciliation reads as
+    /// drain-phase reads (the thread-local cousin of the process-global
+    /// counter `reset_load_message_calls_for_test` already guards against).
+    #[test]
+    fn drain_phase_is_cleared_when_the_drain_returns_early() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let generation_id = genesis(&storage);
+        insert_conversation(&storage, "n10-early-return", &[long_unique_filler(2500).as_str()]);
+        assert_eq!(chunk_holes_count(&storage, generation_id), 3, "sanity: the drain needs holes to reach its embed step");
+
+        let failing_embed = |_texts: &[&str]| std::result::Result::<Vec<Vec<f32>>, String>::Err("injected embedder failure".to_string());
+        let err = run_db_vector_catchup_backfill(
+            &storage,
+            100,
+            &mock_identity(),
+            CANONICALIZE_PIPELINE_VERSION,
+            CHUNKING_POLICY_VERSION,
+            &mock_fingerprint(),
+            &failing_embed,
+            42,
+        )
+        .expect_err("the injected embedder failure must propagate out of the drain loop");
+        assert!(
+            format!("{err:#}").contains("injected embedder failure"),
+            "the drain must fail for the injected reason, not something earlier: {err:#}"
+        );
+        assert!(
+            !DRAIN_PHASE.with(std::cell::Cell::get),
+            "an early return out of the drain loop must leave DRAIN_PHASE cleared (R6-N10)"
+        );
     }
 
     #[test]
