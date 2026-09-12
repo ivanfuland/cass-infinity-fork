@@ -142,6 +142,49 @@ fn table_columns(storage: &FrankenStorage, schema: &str, table: &str) -> Result<
     Ok(cols)
 }
 
+/// PR6 T5 (任务书 #126): test-only fault hooks. A single static would let two
+/// tests running in parallel fire each other's hook, so each is armed for one
+/// specific target path and consumed by the first matching call.
+#[cfg(test)]
+static BEFORE_BEGIN_IMMEDIATE_HOOK: std::sync::Mutex<
+    Option<(PathBuf, Box<dyn Fn(&FrankenStorage) + Send>)>,
+> = std::sync::Mutex::new(None);
+#[cfg(test)]
+static AFTER_ROLLBACK_HOOK: std::sync::Mutex<
+    Option<(PathBuf, Box<dyn Fn(&FrankenStorage) + Send>)>,
+> = std::sync::Mutex::new(None);
+
+/// Fires immediately before `BEGIN IMMEDIATE`, i.e. after any check the
+/// production code runs *before* taking the write lock. A test arms this to
+/// commit a racing writer in exactly that window.
+#[cfg(test)]
+fn fire_before_begin_immediate_hook(target: &Path, storage: &FrankenStorage) {
+    let mut guard = BEFORE_BEGIN_IMMEDIATE_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let armed = matches!(guard.as_ref(), Some((path, _)) if path.as_path() == target);
+    if armed && let Some((_, hook)) = guard.take() {
+        hook(storage);
+    }
+}
+#[cfg(not(test))]
+fn fire_before_begin_immediate_hook(_target: &Path, _storage: &FrankenStorage) {}
+
+/// Fires after the copy's ROLLBACK decision, before the `DETACH`. It gets the
+/// copy's own storage handle so a test can break the `src` attachment out
+/// from under the cleanup path and prove the original copy error still
+/// reaches the caller.
+#[cfg(test)]
+fn fire_after_rollback_hook(target: &Path, storage: &FrankenStorage) {
+    let mut guard = AFTER_ROLLBACK_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    let armed = matches!(guard.as_ref(), Some((path, _)) if path.as_path() == target);
+    if armed && let Some((_, hook)) = guard.take() {
+        hook(storage);
+    }
+}
+#[cfg(not(test))]
+fn fire_after_rollback_hook(_target: &Path, _storage: &FrankenStorage) {}
+
 fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
     anyhow::ensure!(from.is_file(), "source db {} does not exist or is not a file", from.display());
     let parent_missing = match to.parent() {
@@ -151,25 +194,6 @@ fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
     anyhow::ensure!(!parent_missing, "target's parent directory does not exist: {}", to.display());
 
     let storage = FrankenStorage::open_writer(to).with_context(|| format!("opening/ensuring fresh v5 target at {}", to.display()))?;
-
-    // R1-B5 (exec92): the whole design ("copy only, never merge content
-    // into an existing db") assumes `to` is a freshly-built, empty v5
-    // target -- `open_writer` above happily opens an *existing* db with
-    // real content too. Without this check, copying into an already-
-    // populated target let every conflicting row through the `OR IGNORE`
-    // below (see next comment) silently keep its stale pre-existing
-    // content while still reporting a matching row count and exit 0.
-    let existing_conversations: i64 =
-        storage.raw().query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0))?;
-    let existing_messages: i64 =
-        storage.raw().query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
-    anyhow::ensure!(
-        existing_conversations == 0 && existing_messages == 0,
-        "target {} is not empty ({existing_conversations} conversation(s), {existing_messages} message(s)) -- \
-         w4_content_copy only supports copying into a freshly-built, empty v5 target, never merging into or \
-         overwriting an existing one",
-        to.display()
-    );
 
     let from_uri = format!("file:{}?mode=ro", from.display());
     storage
@@ -190,8 +214,34 @@ fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
     // used within the transaction fails with "database src is locked"
     // until that transaction has committed or rolled back), so DETACH
     // below always runs after the COMMIT/ROLLBACK decision, not before.
+    fire_before_begin_immediate_hook(to, &storage);
     storage.raw().execute("BEGIN IMMEDIATE;", &[]).context("BEGIN IMMEDIATE for content copy")?;
     let copy_result: Result<ContentCopyReport> = (|| {
+        // R1-B5 (exec92): the whole design ("copy only, never merge content
+        // into an existing db") assumes `to` is a freshly-built, empty v5
+        // target -- `open_writer` above happily opens an *existing* db with
+        // real content too. Without this check, copying into an already-
+        // populated target let every conflicting row through the `OR IGNORE`
+        // below (see next comment) silently keep its stale pre-existing
+        // content while still reporting a matching row count and exit 0.
+        //
+        // PR6 T5 (R3-F8): this check now runs INSIDE the `BEGIN IMMEDIATE`
+        // above rather than before it. Between "saw an empty target" and
+        // "took the write lock" there is a real window, and a writer
+        // committing in it produced exactly the silent merge this check
+        // exists to refuse.
+        let existing_conversations: i64 =
+            storage.raw().query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed(0))?;
+        let existing_messages: i64 =
+            storage.raw().query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+        anyhow::ensure!(
+            existing_conversations == 0 && existing_messages == 0,
+            "target {} is not empty ({existing_conversations} conversation(s), {existing_messages} message(s)) -- \
+             w4_content_copy only supports copying into a freshly-built, empty v5 target, never merging into or \
+             overwriting an existing one",
+            to.display()
+        );
+
         let order = discover_content_tables_topo(&storage, &["conversations", "messages"])?;
 
         let mut tables_report = Vec::with_capacity(order.len());
@@ -232,12 +282,32 @@ fn copy_content_layer(from: &Path, to: &Path) -> Result<ContentCopyReport> {
         storage.raw().execute("COMMIT;", &[]).context("COMMIT content copy")?;
         Ok(ContentCopyReport { tables: tables_report, src_messages, dst_messages })
     })();
-    if copy_result.is_err() {
-        let _ = storage.raw().execute("ROLLBACK;", &[]);
+    if copy_result.is_err()
+        && let Err(rollback_error) = storage.raw().execute("ROLLBACK;", &[])
+    {
+        // Recorded separately from the copy failure, which is the actionable
+        // one -- R3-F8 asked for both to be reported rather than swallowed.
+        eprintln!("w4_content_copy: ROLLBACK failed: {rollback_error}");
     }
-    storage.raw().execute_batch("DETACH DATABASE src").context("DETACH src")?;
+    fire_after_rollback_hook(to, &storage);
+    let detach_result = storage.raw().execute_batch("DETACH DATABASE src");
 
-    copy_result
+    // PR6 T5 (R3-F8): the copy failure is what the caller must see. The old
+    // `?` on DETACH substituted a cleanup error for it, so a failed copy
+    // reported "no such database: src" and the real cause was lost. A DETACH
+    // failure is appended to the original instead of replacing it.
+    match copy_result {
+        Err(copy_error) => match detach_result {
+            Ok(()) => Err(copy_error),
+            Err(detach_error) => {
+                Err(copy_error.context(format!("DETACH src also failed: {detach_error}")))
+            }
+        },
+        Ok(report) => {
+            detach_result.context("DETACH src")?;
+            Ok(report)
+        }
+    }
 }
 
 /// Runs the copy and returns the process exit code (0/1/2) plus the report
@@ -291,6 +361,7 @@ mod tests {
     use super::*;
     use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use coding_agent_search::sources::provenance::LOCAL_SOURCE_ID;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn seed_source_db(dir: &Path, n_conversations: usize, n_messages_each: usize) -> PathBuf {
@@ -312,6 +383,7 @@ mod tests {
                     content: format!("content-copy fixture message {c}-{i} with enough text to be non-trivial."),
                     extra_json: serde_json::json!({}),
                     snippets: Vec::new(),
+                    excluded: None,
                 });
             }
             conversations.push(Conversation {
@@ -449,6 +521,101 @@ mod tests {
     /// silently dropped, so a source mutated between the two copies (same
     /// message ids, edited content) would report success while the
     /// target's stale pre-existing rows never got updated.
+    /// PR6 T5 (R3-F8): the "is the target empty?" check must run INSIDE the
+    /// `BEGIN IMMEDIATE` the copy writes under. Pre-fix it ran *before* the
+    /// lock, so a writer committing in that window made the copy merge into a
+    /// now-non-empty target -- every conflicting row silently kept its stale
+    /// pre-existing content while the tool still reported `match=true`/exit 0.
+    #[test]
+    #[serial]
+    fn a_target_that_fills_after_the_empty_check_is_still_refused() {
+        let dir = TempDir::new().unwrap();
+        let from = seed_source_db(dir.path(), 3, 5);
+        let to = dir.path().join("target").join("fresh.db");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+
+        // Arm the hook for this target only: it commits a racing writer in the
+        // window between "checked the target was empty" and "took the lock".
+        *BEFORE_BEGIN_IMMEDIATE_HOOK.lock().unwrap() = Some((
+            to.clone(),
+            Box::new(move |copy_storage: &FrankenStorage| {
+                // The fresh target has no `agents` row yet (`seed_source_db`
+                // only populates the SOURCE), so the racing write has to bring
+                // its own parent row -- otherwise `INSERT ... SELECT ... FROM
+                // agents` matches nothing and silently inserts zero rows, which
+                // is a fixture that proves nothing.
+                copy_storage
+                    .raw()
+                    .execute(
+                        "INSERT INTO agents(id, slug, name, kind, created_at, updated_at) \
+                         VALUES (999, 'raced', 'Raced', 'cli', 0, 0)",
+                        &[],
+                    )
+                    .unwrap();
+                let inserted = copy_storage
+                    .raw()
+                    .execute(
+                        "INSERT INTO conversations(id, agent_id, source_id, source_path, external_id) \
+                         VALUES (999, 999, 'local', '/raced-in.jsonl', 'raced-in')",
+                        &[],
+                    )
+                    .unwrap();
+                assert_eq!(inserted, 1, "the racing writer must actually land a row");
+            }),
+        ));
+
+        let (code, message) = run(&from, &to);
+        assert_eq!(
+            code, 2,
+            "a target that became non-empty before the copy took its write lock must still be refused: {message}"
+        );
+        assert!(
+            message.contains("not empty"),
+            "the refusal must name the target as non-empty: {message}"
+        );
+    }
+
+    /// PR6 T5 (R3-F8): when the copy fails, the returned error must be the
+    /// ORIGINAL failure, not whatever the cleanup's `DETACH` reported. Pre-fix
+    /// the `?` on `DETACH` replaced the real cause with its own error whenever
+    /// both failed -- the caller then debugs a cleanup step, not the copy.
+    #[test]
+    #[serial]
+    fn detach_failure_does_not_mask_the_original_copy_error() {
+        let dir = TempDir::new().unwrap();
+        let from = seed_source_db(dir.path(), 3, 5);
+
+        // A mid-copy failure (the same shape as
+        // `partial_copy_failure_rolls_back_already_copied_tables`): the source
+        // is missing the `messages` table, so the copy fails on it.
+        let writer = FrankenStorage::open_writer(&from).unwrap();
+        writer.raw().execute_batch("DROP TABLE messages;").unwrap();
+        drop(writer);
+
+        let to = dir.path().join("target").join("fresh.db");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+
+        // Break the attachment out from under the cleanup path, on the copy's
+        // OWN connection, so its `DETACH` must fail.
+        *AFTER_ROLLBACK_HOOK.lock().unwrap() = Some((
+            to.clone(),
+            Box::new(|copy_storage: &FrankenStorage| {
+                copy_storage
+                    .raw()
+                    .execute_batch("DETACH DATABASE src")
+                    .unwrap();
+            }),
+        ));
+
+        let (code, message) = run(&from, &to);
+        assert_eq!(code, 2, "a failed copy is still a precondition error: {message}");
+        assert!(
+            message.contains("messages"),
+            "the original copy failure (the missing `messages` table) must survive the cleanup's \
+             own DETACH failure instead of being replaced by it: {message}"
+        );
+    }
+
     #[test]
     fn copying_into_an_already_populated_target_is_refused_exit_2() {
         let dir = TempDir::new().unwrap();
