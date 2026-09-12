@@ -431,6 +431,11 @@ fn run(cli: &Cli) -> anyhow::Result<i32> {
     let mut failures: Vec<String> = Vec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut excluded: Vec<ExcludedReport> = Vec::new();
+    // B11 (任务书 #131): target path -> the conversation that claimed it. The
+    // pre-flight below runs entirely before the write loop, so two
+    // conversations whose `layout_rel_path` collide both looked "not existing
+    // yet" and the second silently overwrote the first's materialized file.
+    let mut dest_owner: HashMap<PathBuf, (i64, String)> = HashMap::new();
 
     for conv in &identity.conversations {
         let cid = conv.conversation_id;
@@ -534,6 +539,12 @@ fn run(cli: &Cli) -> anyhow::Result<i32> {
         }
 
         let dest = cli.out.join(&rel_path);
+        if let Some((previous_cid, previous_source_path)) = dest_owner.get(&dest) {
+            anyhow::bail!(
+                "conversations {previous_cid} ({previous_source_path}) and {cid} ({db_source_path}) map to the same target file {}; refusing to materialize a source tree where one overwrites the other (rename one corpus or split --out)",
+                dest.display()
+            );
+        }
         if fs::symlink_metadata(&dest).is_ok() {
             anyhow::bail!(
                 "target {} already exists; refusing to overwrite a previously materialized source tree (move {} aside first)",
@@ -542,6 +553,7 @@ fn run(cli: &Cli) -> anyhow::Result<i32> {
             );
         }
 
+        dest_owner.insert(dest.clone(), (cid, db_source_path.clone()));
         candidates.push(Candidate {
             conversation_id: cid,
             source_id: db_source_id,

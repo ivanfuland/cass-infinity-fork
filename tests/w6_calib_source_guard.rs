@@ -123,13 +123,19 @@ fn orphan_spec() -> ConversationSpec {
 
 impl Fixture {
     fn new(include_orphan: bool) -> Self {
-        let root = tempfile::TempDir::new().expect("tempdir");
-        let dir = root.path();
-
         let mut all = specs();
         if include_orphan {
             all.push(orphan_spec());
         }
+        Self::with_specs(all)
+    }
+
+    /// B11 (任务书 #131): the same builder with the conversation list stated
+    /// outright -- what a two-host corpus (two `source_path`s sharing one
+    /// connector-relative layout) needs, and what `new` now delegates to.
+    fn with_specs(all: Vec<ConversationSpec>) -> Self {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let dir = root.path();
 
         let conn = rusqlite::Connection::open(dir.join("db.sqlite")).expect("create fixture db");
         conn.execute_batch(
@@ -394,4 +400,57 @@ fn an_existing_manifest_is_never_silently_overwritten() {
     assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr_of(&out));
     assert!(stderr_of(&out).contains("already exists"), "stderr: {}", stderr_of(&out));
     assert_eq!(fs::read(fixture.dir().join("calib-sample.json")).expect("read"), b"{}");
+}
+
+/// B11 (任务书 #131): `layout_rel_path` starts at the first dot-prefixed
+/// component, so two sessions from different hosts can map to the SAME
+/// connector-relative path (`/host-a/.claude/projects/p/s.jsonl` and
+/// `/host-b/.claude/projects/p/s.jsonl` both become
+/// `.claude/projects/p/s.jsonl`). Pre-fix the pre-flight saw both targets as
+/// "not existing yet" (it runs before any write), the write loop then silently
+/// overwrote the first materialized file with the second, and the report still
+/// listed two selected conversations.
+#[test]
+fn two_hosts_mapping_onto_one_target_path_are_refused() {
+    const OTHER_BYTES: &[u8] = b"a different host's blob for the same relative path\n";
+    let fixture = Fixture::with_specs(vec![
+        ConversationSpec {
+            id: 1,
+            agent_slug: "claude_code",
+            external_id: "-p/s.jsonl",
+            source_path: "/host-a/.claude/projects/p/s.jsonl",
+            rel_path: ".claude/projects/p/s.jsonl",
+            db_messages: 2,
+            manifest_message_count: 2,
+            bytes: CLAUDE_BYTES,
+        },
+        ConversationSpec {
+            id: 2,
+            agent_slug: "claude_code",
+            external_id: "-p/s.jsonl",
+            source_path: "/host-b/.claude/projects/p/s.jsonl",
+            rel_path: ".claude/projects/p/s.jsonl",
+            db_messages: 2,
+            manifest_message_count: 2,
+            bytes: OTHER_BYTES,
+        },
+    ]);
+
+    let out = fixture.run(&["--sample", "2", "--seed", "6"]);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "two conversations onto one target file must be refused: stderr={}",
+        stderr_of(&out)
+    );
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains("/host-a/.claude/projects/p/s.jsonl") && stderr.contains("/host-b/.claude/projects/p/s.jsonl"),
+        "the refusal must name both conversations: {stderr}"
+    );
+    assert!(
+        fixture.written_files().is_empty(),
+        "a refused run writes nothing: {:?}",
+        fixture.written_files()
+    );
 }
