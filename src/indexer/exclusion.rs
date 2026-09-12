@@ -1280,6 +1280,33 @@ fn strip_claude_string_tool_use_result(value: &mut serde_json::Value, owned_bodi
     }
 }
 
+/// N-R7arr (任务书 #131 T6-c, from T6-b new6): `toolUseResult`'s ARRAY form
+/// (`[{"type":"text","text":...}]`), which is what the MCP tool results such
+/// as `mcp__cass-mcp__cass_expand` record -- the T6-b candidate library had a
+/// 595 B recall body sitting verbatim at `/toolUseResult[0]/text` on an
+/// excluded row, because no R7 field path names that element and the string
+/// guard above returns early on a non-string `toolUseResult`.
+///
+/// Same ownership proof, applied per element: an element whose `text` IS the
+/// pre-clear body of a block this call is clearing (or a bounded superset of
+/// it) has that `text` replaced by the placeholder; every other element, and
+/// every sibling field of a cleared element, is left alone. The element index
+/// is deliberately NOT matched against the target block index -- the measured
+/// corpus array holds one element for the whole result, unrelated to block
+/// positions, so the proof (not the position) is what entitles a clear.
+fn strip_claude_array_tool_use_result(value: &mut serde_json::Value, owned_bodies: &[String], placeholder: &serde_json::Value) {
+    let Some(items) = value.get_mut("toolUseResult").and_then(serde_json::Value::as_array_mut) else { return };
+    for item in items.iter_mut() {
+        let owned = item
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| owned_bodies.iter().any(|body| is_owned_body_copy(text, body)));
+        if owned && let Some(slot) = item.get_mut("text") {
+            *slot = placeholder.clone();
+        }
+    }
+}
+
 /// How much decoration a string-form `toolUseResult` may carry around a body
 /// it copies before that copy stops being attributable to the body. Every
 /// measured shape is byte-identical (R2-B2's 1,558 rows); this absorbs small
@@ -1362,6 +1389,7 @@ fn apply_extra(
                 apply_path(&mut inner, &segments, target_blocks, placeholder);
             }
             strip_claude_string_tool_use_result(&mut inner, &bodies, placeholder);
+            strip_claude_array_tool_use_result(&mut inner, &bodies, placeholder);
             let rewritten = serde_json::to_string(&inner).unwrap_or(raw);
             extra[HISTORICAL_RAW_JSON_SENTINEL_KEY] = serde_json::Value::String(rewritten);
         }
@@ -1373,6 +1401,7 @@ fn apply_extra(
         apply_path(extra, &segments, target_blocks, placeholder);
     }
     strip_claude_string_tool_use_result(extra, &bodies, placeholder);
+    strip_claude_array_tool_use_result(extra, &bodies, placeholder);
 }
 
 fn sha256_hex(text: &str) -> String {
@@ -2803,6 +2832,70 @@ mod tests {
         let mut redactor = MemoizingRedactor::new();
         apply(&mut foreign, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
         assert_eq!(foreign.extra["toolUseResult"], serde_json::json!("some other body"), "an unrelated string must not be cleared just because this row is excluded");
+    }
+
+    /// N-R7arr (任务书 #131 T6-c, from T6-b new6). `toolUseResult` has a
+    /// THIRD measured shape beyond B04's top-level string and R2-B2's nested
+    /// object: an ARRAY (`[{"type":"text","text":...}]`), which is what the
+    /// MCP tool results such as `mcp__cass-mcp__cass_expand` record -- the
+    /// T6-b candidate library had a 595 B recall body sitting verbatim at
+    /// `/toolUseResult[0]/text` on an excluded row. The claude field map has
+    /// no path for that shape, so the body survived while the row reported a
+    /// successful exclusion: the same "原文只在 raw-mirror" break B04 closed
+    /// for the string form. Attribution is B04's ownership proof, applied per
+    /// element -- the element index is not the block index, so the proof is
+    /// what selects the element, never the block being cleared.
+    #[test]
+    fn apply_clears_an_owned_array_tool_use_result() {
+        let mut m = msg("tool_result", "secret A");
+        m.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"}
+            ]},
+            "toolUseResult": [{"type": "text", "text": "secret A"}]
+        });
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut m, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(
+            m.extra["toolUseResult"][0]["text"]["redacted"],
+            serde_json::json!(true),
+            "an array element byte-equal to the targeted block's own body is that body's copy and must be cleared, got {:?}",
+            m.extra["toolUseResult"]
+        );
+        assert!(
+            !m.extra.to_string().contains("secret A"),
+            "no raw copy of the excluded body may remain anywhere in extra: {:?}",
+            m.extra
+        );
+        assert_eq!(
+            m.extra["toolUseResult"][0]["type"],
+            serde_json::json!("text"),
+            "the element's own sibling field must stay"
+        );
+    }
+
+    /// The other half of N-R7arr, same rule as B04's string case: an element
+    /// carrying a DIFFERENT body is not this call's copy and must survive, or
+    /// the array form becomes a blanket "clear anything in `toolUseResult`".
+    #[test]
+    fn apply_keeps_a_foreign_array_tool_use_result() {
+        let mut m = msg("tool_result", "secret A");
+        m.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "secret A"}
+            ]},
+            "toolUseResult": [{"type": "text", "text": "some other tool's body"}]
+        });
+        let mut redactor = MemoizingRedactor::new();
+        apply(&mut m, &decision_cass_recall(vec![0]), &mut redactor, "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+        assert_eq!(
+            m.extra["toolUseResult"][0]["text"],
+            serde_json::json!("some other tool's body"),
+            "an array element belonging to an un-targeted body must survive, got {:?}",
+            m.extra["toolUseResult"]
+        );
     }
 
     /// B04, `apply_sibling` path: a sibling row (same event, projected into a
