@@ -145,6 +145,17 @@ POLL_INTERVAL_S=0.1
 # judged JSON's own fields. Everything else leaves this at 0.
 ALLOW_NULL_BUDGET=0
 
+# T6-c N07-reg (任务书 #131): whether `run_stage` judges a stage's budget.
+# Declared HERE, with the other mode defaults, and NOT next to the normal-mode
+# CLI parse where N07 introduced it: the `--selfcheck` and `--judge` dispatch
+# blocks run BEFORE that parse, and `run_stage` reads this under `set -u`. Left
+# undeclared there, every `--selfcheck` run died with
+# `JUDGE_STAGES: unbound variable` and rc=1 -- AFTER `tee` had already emitted
+# the stage JSON, so the failure looked like a judgment (measured=true,
+# budget=null, exit_code=0, gate rc=1) and only the release-档 selfcheck target
+# noticed. `--judge` is its own subcommand and never reaches `run_stage`.
+JUDGE_STAGES=0
+
 # ---------------------------------------------------------------------
 # Process-tree sampling (no forked ps/pgrep/awk in the poll loop).
 # ---------------------------------------------------------------------
@@ -809,6 +820,13 @@ if [ "${1:-}" = "--selfcheck" ]; then
   # legitimately carries a null budget -- said by the caller, not by the
   # judged JSON.
   ALLOW_NULL_BUDGET=1
+  # T6-c N07-reg (任务书 #131): `--selfcheck` KEEPS judging the single stage it
+  # runs (the header says so, and `tests/w6_memory_gate_selfcheck.rs` asserts
+  # both directions: a measured, zero-exit stage passes, an unmeasured one
+  # still judges failed). N07's `JUDGE_STAGES` wrapper around `judge_from_stdin`
+  # governs the four-stage driver only, so the normal-mode default stays 0 --
+  # but the selfcheck dispatch runs BEFORE that parse and must say 1 itself.
+  JUDGE_STAGES=1
   run_selfcheck "$@"
   exit $?
 fi
@@ -830,8 +848,8 @@ fi
 # T6-c N07 (任务书 #131 / T7 勘误): normal mode RECORDS, it does not judge.
 # `--judge` stays as its own subcommand for callers that want the old verdict
 # on one stage result, and `--selfcheck` keeps judging the single stage it
-# runs; this switch only governs the four-stage driver.
-JUDGE_STAGES=0
+# runs; this switch only governs the four-stage driver. (The default lives in
+# the top-of-file defaults with the other mode switches -- see there.)
 COLLECT_BASELINE=0
 STAGE4_DB=""
 while [ $# -gt 0 ]; do
