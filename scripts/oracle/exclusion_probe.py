@@ -2915,6 +2915,50 @@ def _run_verify_selftest(paths_cfg):
         else:
             print(f"FAIL B02 probe refuses a report inside the mirror: rc={rc!r} rewritten={after != before}")
 
+    # R9-N03 (任务书 #132): `_excludable_session_bodies` answers "other than
+    # MY position", so its cache key must carry that position. A blob with two
+    # excludable results is processed entry by entry; the second one must not
+    # inherit the first one's answer.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        mirror = os.path.join(root, "mirror")
+        blob_rel = "blobs/blake3/n3/n3-two-excludable.raw"
+        blob_path = os.path.join(mirror, blob_rel)
+        os.makedirs(os.path.dirname(blob_path), exist_ok=True)
+        body_a, body_b = "body one", "body two"
+        events = [
+            {"type": "assistant", "uuid": "n3-call-a", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read", "id": "t1",
+                 "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}}]}},
+            {"type": "user", "uuid": "n3-result-a", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": body_a}]}},
+            {"type": "assistant", "uuid": "n3-call-b", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "name": "Read", "id": "t2",
+                 "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}}]}},
+            {"type": "user", "uuid": "n3-result-b", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": body_b}]}},
+        ]
+        with open(blob_path, "w", encoding="utf-8") as handle:
+            for event in events:
+                handle.write(json.dumps(event) + "\n")
+        entry = {"agent_slug": "claude_code"}
+
+        def marker_for(idx):
+            return {"raw": {"blob": blob_rel, "idx": idx, "event_key": "x", "blocks": [0]}}
+
+        shared = {}
+        first = _excludable_session_bodies(entry, marker_for(1), mirror, paths_cfg, shared)
+        second = _excludable_session_bodies(entry, marker_for(3), mirror, paths_cfg, shared)
+        fresh = _excludable_session_bodies(entry, marker_for(3), mirror, paths_cfg, {})
+        if first == [body_b] and second == [body_a] and fresh == second:
+            passed += 1
+            print("ok   N03 the excludable set does not depend on manifest processing order")
+        else:
+            print(
+                "FAIL N03 the excludable set does not depend on manifest processing order: "
+                f"first={first!r} second={second!r} fresh={fresh!r}"
+            )
+
     print(f"selftest/verify: {passed}/{total}")
     return passed, total
 
@@ -4299,7 +4343,14 @@ def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
     blob_path = os.path.join(mirror_root, blob_rel)
     if not os.path.exists(blob_path):
         return None
-    key = (blob_path, entry.get("agent_slug"))
+    # R9-N03 (任务书 #132): the cached answer is "this session's excludable
+    # bodies OTHER THAN the entry's own position", so it depends on that
+    # position. Keyed on the blob alone, the second entry of a blob reused the
+    # first entry's list -- which still contained the second entry's own body,
+    # so a legitimate informational copy of it looked like an excludable one
+    # left in place (`retained_excludable`) and the count depended on the
+    # manifest's processing order.
+    key = (blob_path, entry.get("agent_slug"), raw.get("idx"))
     if key in cache:
         return cache[key]
     builder = {
