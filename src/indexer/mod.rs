@@ -18275,7 +18275,20 @@ pub mod persist {
         let duplicate_keys_present = begin_concurrent_enabled
             && duplicate_conversation_keys_present(convs.iter().map(|p| &p.conv));
 
-        if begin_concurrent_enabled && !duplicate_keys_present {
+        // R3-N5 (任务书 #129): control plane's second finding -- the
+        // begin-concurrent path never reaches `insert_conversations_batched_reporting`,
+        // where the serial path's per-conversation skip lives, so a batch
+        // carrying an unusable excluded fingerprint still failed wholesale on
+        // that path. The same pre-check is hoisted to the branch decision:
+        // such a batch routes to the serial path, which skips and reports
+        // that ONE conversation and commits the rest.
+        let uninsertable_fingerprint_present = convs.iter().any(|prepared| {
+            prepared.excluded.iter().flatten().any(|marker| {
+                crate::storage::sqlite::excluded_fingerprint_error(marker).is_some()
+            })
+        });
+
+        if begin_concurrent_enabled && !duplicate_keys_present && !uninsertable_fingerprint_present {
             let db_path = storage
                 .database_path()
                 .with_context(|| "resolving database path for begin-concurrent write mode")?;
@@ -18291,6 +18304,13 @@ pub mod persist {
                 defer_checkpoints,
                 capture_semantic_delta,
                 raw_mirror_data_dir,
+            );
+        }
+
+        if uninsertable_fingerprint_present {
+            tracing::info!(
+                conversations = convs.len(),
+                "batch carries a conversation with an unusable excluded fingerprint; using the serial path, which skips it per conversation"
             );
         }
 
@@ -35061,117 +35081,160 @@ mod tests {
     ///     shifts everything after it) -- a silent data-attribution bug, not
     ///     a failure.
     #[test]
+    #[serial]
     fn batched_insert_skips_only_the_conversation_with_an_unusable_fingerprint() {
         use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef, PreparedConversation};
 
-        let temp = TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let storage = crate::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
-            .expect("open storage");
+        const ENV_KEY: &str = "CASS_INDEXER_BEGIN_CONCURRENT";
+        // R3-N5 (任务书 #129, control plane's second finding): the persist
+        // entry has TWO production paths and the skip must hold on both. The
+        // begin-concurrent one is selected by a PROCESS-GLOBAL env var that
+        // other `#[serial]` tests in this module set (`set_env`, :18538+), so
+        // reading the ambient value made this test exercise whichever path a
+        // neighbour happened to leave behind -- under parallelism that is how
+        // the unfixed concurrent path produced its red. This test now pins
+        // the var itself for each half (`#[serial]` keeps those in-process
+        // setters out of its window) and restores it afterwards.
+        let previous_env = std::env::var(ENV_KEY).ok();
 
-        let mut convs: Vec<PreparedConversation> = Vec::new();
-        for (label, illegal) in [("a", false), ("b", true), ("c", false)] {
-            let source_path = temp.path().join(format!("rollout-r3n5-{label}.jsonl"));
-            std::fs::write(&source_path, format!("{{\"type\":\"message\",\"text\":\"{label}\"}}\n"))
-                .expect("write source");
-            let mut conv = norm_conv(Some(&format!("r3-n5-{label}")), vec![norm_msg(0, 1_000)]);
-            conv.agent_slug = "codex".to_string();
-            conv.source_path = source_path;
-            inject_provenance(&mut conv, &Origin::local());
-            attach_raw_mirror_capture(&data_dir, &mut conv).expect("raw-mirror capture");
-            let marker = illegal.then(|| ExcludedMarker {
-                reason: ExclusionReason::CassRecall,
-                rule_version: 1,
-                bytes: 4,
-                sha256: "a".repeat(64),
-                // Illegal: not hex, not 32 bytes -- the shape R2-B7 turned
-                // from a process abort into an `Err`.
-                fingerprint_blake3: "zz".to_string(),
-                anchor: ExclusionAnchor::default(),
-                src: None,
-                parse_error: None,
-                raw: RawRef {
-                    blob: "blobs/blake3/ab/abcd.raw".into(),
-                    idx: 0,
-                    event_key: "ek-0".into(),
-                    blocks: vec![0],
-                },
+        for (path_label, concurrent) in [("serial", false), ("begin-concurrent", true)] {
+            let temp = TempDir::new().expect("tempdir");
+            let data_dir = temp.path().join("cass-data");
+            std::fs::create_dir_all(&data_dir).expect("create data dir");
+            let storage = crate::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
+                .expect("open storage");
+
+            let mut convs: Vec<PreparedConversation> = Vec::new();
+            for (label, illegal) in [("a", false), ("b", true), ("c", false)] {
+                let source_path = temp.path().join(format!("rollout-r3n5-{label}.jsonl"));
+                std::fs::write(&source_path, format!("{{\"type\":\"message\",\"text\":\"{label}\"}}\n"))
+                    .expect("write source");
+                let mut conv = norm_conv(Some(&format!("r3-n5-{label}")), vec![norm_msg(0, 1_000)]);
+                conv.agent_slug = "codex".to_string();
+                conv.source_path = source_path;
+                inject_provenance(&mut conv, &Origin::local());
+                attach_raw_mirror_capture(&data_dir, &mut conv).expect("raw-mirror capture");
+                let marker = illegal.then(|| ExcludedMarker {
+                    reason: ExclusionReason::CassRecall,
+                    rule_version: 1,
+                    bytes: 4,
+                    sha256: "a".repeat(64),
+                    // Illegal: not hex, not 32 bytes -- the shape R2-B7
+                    // turned from a process abort into an `Err`.
+                    fingerprint_blake3: "zz".to_string(),
+                    anchor: ExclusionAnchor::default(),
+                    src: None,
+                    parse_error: None,
+                    raw: RawRef {
+                        blob: "blobs/blake3/ab/abcd.raw".into(),
+                        idx: 0,
+                        event_key: "ek-0".into(),
+                        blocks: vec![0],
+                    },
+                });
+                convs.push(PreparedConversation { conv, excluded: vec![marker] });
+            }
+
+            // Pin the var for the persist call ONLY, then restore at once:
+            // it is process-global, and tests outside this module's serial
+            // lock can still be persisting while this one runs. A few
+            // hundred milliseconds of leak is exactly how the un-fixed
+            // concurrent path produced its parallel red -- the same window,
+            // in the other direction, must not be opened by this test.
+            match concurrent {
+                true => unsafe { std::env::set_var(ENV_KEY, "1") },
+                false => unsafe { std::env::remove_var(ENV_KEY) },
+            }
+            let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+                &storage,
+                &data_dir,
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            );
+            match &previous_env {
+                Some(value) => unsafe { std::env::set_var(ENV_KEY, value) },
+                None => unsafe { std::env::remove_var(ENV_KEY) },
+            }
+            let outcome = outcome.unwrap_or_else(|error| {
+                panic!("[{path_label}] a batch is not failed by one unusable excluded fingerprint: {error:#}")
             });
-            convs.push(PreparedConversation { conv, excluded: vec![marker] });
+
+            assert_eq!(
+                outcome.skipped_conversations.len(),
+                1,
+                "[{path_label}] exactly the illegal conversation must be reported as skipped: {:?}",
+                outcome.skipped_conversations
+            );
+            let skipped = &outcome.skipped_conversations[0];
+            assert_eq!(
+                skipped.index,
+                1,
+                "[{path_label}] the skip must carry its own position in the input slice"
+            );
+            assert_eq!(
+                skipped.external_id.as_deref(),
+                Some("r3-n5-b"),
+                "[{path_label}] the skip must name its session"
+            );
+            assert!(
+                skipped.source_path.contains("rollout-r3n5-b.jsonl"),
+                "[{path_label}] the skip must name the session it dropped: {skipped:?}"
+            );
+            assert_eq!(outcome.inserted_conversations, 2, "[{path_label}] A and C must both land");
+
+            let conversation_id_for = |external_id: &str| -> Option<i64> {
+                storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT id FROM conversations WHERE external_id = ?1",
+                        &[ParamValue::from(external_id)],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .ok()
+            };
+            let a_id = conversation_id_for("r3-n5-a")
+                .unwrap_or_else(|| panic!("[{path_label}] A must be in the database"));
+            let c_id = conversation_id_for("r3-n5-c")
+                .unwrap_or_else(|| panic!("[{path_label}] C must be in the database"));
+            assert!(
+                conversation_id_for("r3-n5-b").is_none(),
+                "[{path_label}] B's rows must not be in the database at all"
+            );
+
+            // The capture itself leaves a placeholder link with a null
+            // conversation id, so the assertion looks at every NON-NULL id the
+            // manifest ended up carrying.
+            let db_link_conversation_ids = |conv: &PreparedConversation| -> Vec<i64> {
+                let relative = conv.conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
+                    .as_str()
+                    .expect("manifest relative path")
+                    .to_string();
+                let manifest: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(data_dir.join("raw-mirror/v1").join(relative)).expect("read manifest"),
+                )
+                .expect("manifest json");
+                manifest["db_links"]
+                    .as_array()
+                    .expect("db_links array")
+                    .iter()
+                    .filter_map(|link| link["conversation_id"].as_i64())
+                    .collect()
+            };
+            assert_eq!(
+                db_link_conversation_ids(&convs[0]),
+                vec![a_id],
+                "[{path_label}] A's manifest must record A's conversation id, and only that"
+            );
+            assert_eq!(
+                db_link_conversation_ids(&convs[2]),
+                vec![c_id],
+                "[{path_label}] C's manifest must record C's OWN conversation id -- a positional shift from B's skipped outcome would put B's or A's id here"
+            );
         }
 
-        let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
-            &storage,
-            &data_dir,
-            &convs,
-            LexicalPopulationStrategy::IncrementalInline,
-            false,
-        )
-        .expect("a batch is not failed by one unusable excluded fingerprint");
-
-        assert_eq!(
-            outcome.skipped_conversations.len(),
-            1,
-            "exactly the illegal conversation must be reported as skipped: {:?}",
-            outcome.skipped_conversations
-        );
-        let skipped = &outcome.skipped_conversations[0];
-        assert_eq!(skipped.index, 1, "the skip must carry its own position in the input slice");
-        assert_eq!(skipped.external_id.as_deref(), Some("r3-n5-b"));
-        assert!(
-            skipped.source_path.contains("rollout-r3n5-b.jsonl"),
-            "the skip must name the session it dropped: {skipped:?}"
-        );
-        assert_eq!(outcome.inserted_conversations, 2, "A and C must both land");
-
-        let conversation_id_for = |external_id: &str| -> Option<i64> {
-            storage
-                .raw()
-                .query_row_map(
-                    "SELECT id FROM conversations WHERE external_id = ?1",
-                    &[ParamValue::from(external_id)],
-                    |row| row.get_typed::<i64>(0),
-                )
-                .ok()
-        };
-        let a_id = conversation_id_for("r3-n5-a").expect("A must be in the database");
-        let c_id = conversation_id_for("r3-n5-c").expect("C must be in the database");
-        assert!(
-            conversation_id_for("r3-n5-b").is_none(),
-            "B's rows must not be in the database at all"
-        );
-
-        // The capture itself leaves a placeholder link with a null
-        // conversation id, so the assertion looks at every NON-NULL id the
-        // manifest ended up carrying.
-        let db_link_conversation_ids = |conv: &crate::indexer::exclusion::PreparedConversation| -> Vec<i64> {
-            let relative = conv.conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
-                .as_str()
-                .expect("manifest relative path")
-                .to_string();
-            let manifest: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(data_dir.join("raw-mirror/v1").join(relative)).expect("read manifest"),
-            )
-            .expect("manifest json");
-            manifest["db_links"]
-                .as_array()
-                .expect("db_links array")
-                .iter()
-                .filter_map(|link| link["conversation_id"].as_i64())
-                .collect()
-        };
-        assert_eq!(
-            db_link_conversation_ids(&convs[0]),
-            vec![a_id],
-            "A's manifest must record A's conversation id, and only that"
-        );
-        assert_eq!(
-            db_link_conversation_ids(&convs[2]),
-            vec![c_id],
-            "C's manifest must record C's OWN conversation id -- a positional shift caused by B's skipped outcome would put B's or A's id here instead"
-        );
     }
+
 
     #[test]
     fn prepare_conversation_for_ingest_logical_source_skips_capture_and_judgment() {

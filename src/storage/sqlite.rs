@@ -4386,6 +4386,19 @@ fn fingerprint_hash(msg: &Message) -> anyhow::Result<[u8; 32]> {
     fingerprint_hash_for(&msg.content, msg.excluded.as_ref())
 }
 
+/// R3-N5 (任务书 #129, control-plane 亲核抓出（二）): the same check
+/// [`uninsertable_excluded_fingerprint_error`] performs, for the
+/// CONNECTOR-side marker (`PreparedConversation.excluded`) -- the persist
+/// entry needs it BEFORE it builds internal conversations, to decide whether
+/// the begin-concurrent path may take this batch at all.
+pub(crate) fn excluded_fingerprint_error(
+    marker: &crate::indexer::exclusion::ExcludedMarker,
+) -> Option<String> {
+    fingerprint_hash_for("", Some(marker))
+        .err()
+        .map(|error| format!("{error:#}"))
+}
+
 /// R3-N5 (任务书 #129): the reason this conversation cannot be inserted at
 /// all, if any -- one of its messages carries an `excluded` marker whose
 /// `fingerprint_blake3` is not 32-byte hex. Exactly the check
