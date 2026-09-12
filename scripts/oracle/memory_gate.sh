@@ -475,10 +475,15 @@ fixture_sha256_of() {
 # does not exist yet -- it's #122b-3's Step 6 deliverable):
 #   {"<shape>": {"<stage>": {"binary_sha": "...", "peak_tree": <bytes>,
 #     "peak_proc": <bytes>, "exit_code": 0, "measured": true,
-#     "max_over_min": <float>, "fixture_sha256": "..."}}}
+#     "max_over_min": <float>, "fixture_sha256": "...",
+#     "samples": <int>, "stage_ms": <int>}}}
 # `fixture_sha256` (R6-B4) is the fourth argument's counterpart: the
 # entry's recorded value must equal the fixture actually measured, or the
 # budget belongs to a different workload.
+# `samples`/`stage_ms` (R7-8) are optional: a cell that carries them is held
+# to the same consistency rule `--judge` applies to a stage result, and one
+# that predates them is reported rather than retro-invalidated (every cell
+# frozen so far carries neither).
 # If #122b-3 lands a different shape, this function is the one place to
 # update.
 budget_bytes_for_stage() {
@@ -521,6 +526,44 @@ peak_tree = entry.get("peak_tree")
 peak_proc = entry.get("peak_proc")
 if not is_int(peak_tree) or peak_tree < 0 or not is_int(peak_proc) or peak_proc < 0:
     print(f"memory_gate: P0 baseline entry for {shape}/{stage} has a non-integer or negative peak (peak_tree={peak_tree!r}, peak_proc={peak_proc!r})", file=sys.stderr)
+    sys.exit(2)
+# R7-8 (#128 T6-a2): the P0 file is hand-fillable too, so a cell that
+# *carries* `samples`/`stage_ms` is held to the same consistency rule
+# `--judge` applies to a stage result: claiming measured=true with a sample
+# count or duration below what run_stage requires to set measured is
+# malformed, not a valid budget source.
+#
+# Presence is not required, and that asymmetry with `--judge` is deliberate:
+# the nine frozen cells of memgate-baseline.json (each measured once,
+# 2026-09-11) carry neither key, so requiring them here would make every cell
+# unusable and the door unable to read any budget at all -- feeding such a
+# cell to `--judge` exits 2 with "measured=true requires samples>=2 and
+# stage_ms>=200". Absence is therefore reported on stderr and left
+# unverified; half of the pair is malformed.
+samples = entry.get("samples")
+stage_ms = entry.get("stage_ms")
+if (samples is None) != (stage_ms is None):
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} carries only one of samples/stage_ms (samples={samples!r}, stage_ms={stage_ms!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if samples is None:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} carries no samples/stage_ms (pre-#128 format); its measured flag is checked, the sample/duration rule is not",
+        file=sys.stderr,
+    )
+elif not is_int(samples) or not is_int(stage_ms) or samples < 0 or stage_ms < 0:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} has a non-integer or negative samples/stage_ms (samples={samples!r}, stage_ms={stage_ms!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+elif samples < 2 or stage_ms < 200:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} is measured=true but its samples/stage_ms do not satisfy the rule run_stage uses to set measured (samples={samples}, stage_ms={stage_ms}; requires samples>=2 and stage_ms>=200)",
+        file=sys.stderr,
+    )
     sys.exit(2)
 # R6-B4: the P0 cells are only meaningful for the workload they were
 # collected on. Without this, shrinking the fixture (fewer/shorter

@@ -552,3 +552,120 @@ fn ingest_totals_must_match_the_manifest_before_stages_run() {
         "expected the byte total to be named in the mismatch, got: {stderr}"
     );
 }
+
+/// Source the gate and call
+/// `budget_bytes_for_stage <shape> <stage> <p0.json> <fixture_sha256>`.
+fn run_budget_lookup(
+    p0: &std::path::Path,
+    shape: &str,
+    stage: &str,
+    fixture_sha256: &str,
+) -> std::process::Output {
+    Command::new("bash")
+        .arg("-c")
+        .arg(". \"$1\"; budget_bytes_for_stage \"$2\" \"$3\" \"$4\" \"$5\"")
+        .arg("--")
+        .arg(gate_script())
+        .arg(shape)
+        .arg(stage)
+        .arg(p0)
+        .arg(fixture_sha256)
+        .output()
+        .expect("spawn bash -c 'source memory_gate.sh; budget_bytes_for_stage ...'")
+}
+
+/// R7-8 (#128 T6-a2). The P0 lookup did not read `samples`/`stage_ms` at all,
+/// so a hand-filled cell could claim `measured:true` while the two figures
+/// the measured rule is derived from contradicted it -- the asymmetry with
+/// `--judge` the review named (feeding one of today's cells to `--judge`
+/// exits 2 on exactly this rule).
+///
+/// A cell that carries the pair is now held to that rule. A cell that
+/// predates it is not retro-invalidated by its absence: all nine frozen
+/// `memgate-baseline.json` cells carry neither key, so requiring presence
+/// would make every cell unusable and the door unable to read any budget.
+/// That case is reported on stderr instead, so a later re-collection can see
+/// which cells went unverified.
+#[test]
+fn p0_lookup_holds_a_cell_carrying_samples_to_the_judges_measured_rule() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let p0 = tmp.path().join("memgate-baseline.json");
+    let fixture = "f".repeat(64);
+    // One cell, `a`/`index`, with an optional extra key pair appended.
+    let cell = |extra: &str| {
+        format!(
+            r#"{{"a":{{"index":{{"measured":true,"exit_code":0,"peak_tree":1000,"peak_proc":1000,"fixture_sha256":"{fixture}"{extra}}}}}}}"#
+        )
+    };
+
+    // ① the reproduction: `measured:true` with a single sample. Before the fix
+    // the lookup read neither key and handed out a budget from this cell.
+    std::fs::write(&p0, cell(r#","samples":1,"stage_ms":100000"#)).unwrap();
+    let out = run_budget_lookup(&p0, "a", "index", &fixture);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a cell whose samples contradict its own measured flag must fail loud, not supply a budget: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("samples>=2 and stage_ms>=200"),
+        "expected the measured-consistency message, got: {stderr}"
+    );
+
+    // ② the same claim from the duration side, so ① cannot be satisfied by
+    // checking only the sample count.
+    std::fs::write(&p0, cell(r#","samples":2,"stage_ms":170"#)).unwrap();
+    let out = run_budget_lookup(&p0, "a", "index", &fixture);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "measured=true with stage_ms=170 must fail loud: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ③ a consistent cell still supplies its budget -- the rule must not
+    // reject every hand-filled cell.
+    std::fs::write(&p0, cell(r#","samples":2,"stage_ms":200"#)).unwrap();
+    let out = run_budget_lookup(&p0, "a", "index", &fixture);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a consistent cell must still yield its budget: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let budget: i64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("the lookup prints the budget in bytes");
+    assert_eq!(
+        budget,
+        1250 + 256 * 1024 * 1024,
+        "budget = 1.25 * max(peak_tree, peak_proc) + 256MiB"
+    );
+
+    // ④ the frozen format: neither key present. Readable as before, and the
+    // stderr line is what makes that visible to a later re-collection.
+    std::fs::write(&p0, cell("")).unwrap();
+    let out = run_budget_lookup(&p0, "a", "index", &fixture);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a cell predating these keys must still yield its budget: stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("carries no samples/stage_ms"),
+        "the pre-#128 format must be named on stderr, got: {stderr}"
+    );
+
+    // ⑤ half a pair is malformed: the two keys are one claim, not two.
+    std::fs::write(&p0, cell(r#","samples":2"#)).unwrap();
+    let out = run_budget_lookup(&p0, "a", "index", &fixture);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a cell carrying only one of the pair must fail loud: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
