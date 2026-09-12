@@ -3004,22 +3004,64 @@ mod tests {
     /// `run_index`/`QuarantineState::save` reach this whenever `data_dir` is a
     /// bare relative name.
     ///
-    /// The test chdirs (process-global) under the crate's serial lock and
-    /// restores the previous directory before returning; every other test in
-    /// this binary works from absolute temp paths, so the window only affects
-    /// a `#[serial]` sibling.
+    /// R9-N01 (任务书 #132): this test used to `std::env::set_current_dir` --
+    /// PROCESS-GLOBAL -- under the crate's serial lock, on the stated premise
+    /// that "every other test in this binary works from absolute temp paths,
+    /// so the window only affects a `#[serial]` sibling". The premise is
+    /// false: `src/search/canonicalize.rs`'s
+    /// `hard_noise_phrases_json_matches_source` (:1406) and
+    /// `low_signal_phrases_json_matches_source` (:1477) each read the RELATIVE
+    /// path `scripts/oracle/hard_noise_phrases.json` and neither carries
+    /// `#[serial]`, so a read landing inside the chdir window looks for the
+    /// file under an empty temp directory and panics.
+    ///
+    /// The body now runs in a CHILD process -- this same test binary
+    /// re-invoked with `--exact` on this test's name, with its cwd set to the
+    /// tempdir -- so the lib test process' cwd is never touched and the
+    /// `#[serial]` attribute is no longer needed for the same reason.
     #[test]
-    #[serial_test::serial]
     fn create_dir_all_durable_bare_relative_path_creates_and_syncs_positive() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let previous = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(temp.path()).expect("chdir into the tempdir");
-        let result = create_dir_all_durable(Path::new("fresh-data"));
-        let exists = temp.path().join("fresh-data").is_dir();
-        std::env::set_current_dir(&previous).expect("restore cwd");
+        const CHILD_MARKER: &str = "CASS_RAW_MIRROR_BARE_RELATIVE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let exe = std::env::current_exe().expect("current_exe");
+            let output = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "raw_mirror::tests::create_dir_all_durable_bare_relative_path_creates_and_syncs_positive",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .current_dir(temp.path())
+                .output()
+                .expect("spawn the child test process");
 
+            assert!(
+                output.status.success(),
+                "the child process (cwd = a fresh tempdir) must create and sync the bare relative \
+                 directory; status={:?} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // The invariant the sibling tests depend on, asserted where it
+            // matters: the LIB test process' cwd still resolves the relative
+            // fixture path `search::canonicalize` reads.
+            assert!(
+                std::env::current_dir()
+                    .expect("cwd")
+                    .join("scripts/oracle/hard_noise_phrases.json")
+                    .is_file(),
+                "the lib test process' cwd must still resolve scripts/oracle/hard_noise_phrases.json"
+            );
+            return;
+        }
+        let result = create_dir_all_durable(Path::new("fresh-data"));
         result.expect("a bare relative first-run directory must be created and made durable");
-        assert!(exists, "the directory must exist after the call");
+        assert!(
+            Path::new("fresh-data").is_dir(),
+            "the directory must exist after the call (the child's cwd is its tempdir)"
+        );
     }
 
     #[test]
