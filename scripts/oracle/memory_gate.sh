@@ -329,10 +329,12 @@ for name in ("last_tree", "peak_sample_idx"):
 if (is_int(obj.get("peak_sample_idx")) and is_int(obj.get("samples"))):
     picked = obj["peak_sample_idx"]
     count = obj["samples"]
-    # NOTE: this source is passed to `python3 -c '...'`, so it must contain no
-    # single quote anywhere, and `python3` here is 3.10 -- where an f-string
-    # cannot reuse its own quote character for a nested subscript (PEP 701 is
-    # 3.12+). Hence the two locals rather than `{obj["samples"]}`.
+    # NOTE: this source reaches Python through the shell, which strips quotes
+    # out of it before the interpreter ever sees them -- so keep every string
+    # literal double-quoted and write no single quote anywhere in this block.
+    # The interpreter here is also 3.10, where an f-string cannot reuse its own
+    # quote character for a nested subscript (PEP 701 is 3.12+) -- hence the
+    # two locals rather than a subscript written inside the f-string.
     if picked > count:
         print(
             f"judge: peak_sample_idx ({picked}) must not exceed samples ({count})",
