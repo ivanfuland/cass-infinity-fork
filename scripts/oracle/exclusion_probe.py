@@ -1514,6 +1514,7 @@ def _verify_extra(block_value):
     over-clear case replaces it with the same redacted placeholder and must
     still be a failure."""
     return {
+        "uuid": "u2",
         "message": {
             "role": "user",
             "content": [
@@ -1540,7 +1541,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           non_manifest_altered=False, overclear_ordinary=False,
                           leak_multiline_body=False, short_body=False,
                           missing_nonmanifest_row=False, wrong_raw_idx=False,
-                          wrong_marker_sha=False):
+                          wrong_marker_sha=False, project_read_anchor=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1637,15 +1638,25 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                     msgpack.packb({"message": {"content": [{"type": "text", "text": body_text}]}}, use_bin_type=True),
                 ],
             )
+        fixture_reason = "context_file_read" if project_read_anchor else "cass_recall"
         if with_excluded:
             marker = {
-                "reason": "cass_recall",
+                "reason": fixture_reason,
                 "rule_version": 1,
                 "bytes": len(body_text.encode("utf-8")),
                 "sha256": marker_sha if wrong_marker_sha else body_sha,
                 "fingerprint_blake3": "0" * 64,
                 "parse_error": None,
-                "anchor": {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None},
+                "anchor": (
+                    {
+                        "tool_call_id": "t1",
+                        "tool_name": "mcp__ccw-control-plane__project_read",
+                        "paths": ["exec"],
+                        "shell": None,
+                    }
+                    if project_read_anchor
+                    else {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None}
+                ),
                 "src": None,
                 "raw": {"blob": blob_rel, "idx": 123456 if wrong_raw_idx else 1, "event_key": "u2", "blocks": [0]},
             }
@@ -1657,7 +1668,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         conn.close()
 
     manifest = [{
-        "reason": "cass_recall",
+        "reason": fixture_reason,
         "source_id": "local",
         "agent_slug": "claude_code",
         "external_id": "verify-ext-1",
@@ -1717,6 +1728,10 @@ def verify_selftest_cases():
         # per-entry comparison bound the marker's sha to the manifest's.
         ("V10 a wrong raw.idx is a failure", False, "raw.idx"),
         ("V10b a marker sha still bound to no manifest entry is a failure", False, "sha_binding_mismatch"),
+        # N01 (任务书 #131): a project_read hit's `anchor.paths` holds DOCUMENT
+        # names, not file paths -- judging them with the file predicate rejects
+        # a legitimate hit.
+        ("V11 a project_read document anchor passes", True, ""),
     ]
 
 
@@ -1743,6 +1758,7 @@ def _run_verify_selftest(paths_cfg):
             7: {"missing_nonmanifest_row": True},
             8: {"wrong_raw_idx": True},
             9: {"wrong_marker_sha": True},
+            10: {"project_read_anchor": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -3067,8 +3083,17 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         # hit whose recorded paths are not all inside the configured predicate
         # is a false positive by construction.
         if entry["reason"] == "context_file_read":
-            paths = (marker.get("anchor") or {}).get("paths") or []
-            outside = [p for p in paths if not predicate_p(p, paths_cfg)]
+            anchor = (marker.get("anchor") or {})
+            paths = anchor.get("paths") or []
+            # N01 (任务书 #131): `project_read` records the DOCUMENT name in
+            # `anchor.paths` (that is what predicate P's fourth arm judges),
+            # so running the file-path predicate over it rejects every
+            # legitimate project_read hit.
+            identities = READ_TOOL_IDENTITIES.get(entry["agent_slug"]) or {}
+            if anchor.get("tool_name") and anchor.get("tool_name") == identities.get("project_read"):
+                outside = [p for p in paths if not predicate_p_project_read_document(p, paths_cfg)]
+            else:
+                outside = [p for p in paths if not predicate_p(p, paths_cfg)]
             if outside:
                 failures.append(
                     (label, f"context_file_read hit outside predicate P: {outside[:5]}")
