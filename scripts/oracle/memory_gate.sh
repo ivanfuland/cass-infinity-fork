@@ -424,7 +424,13 @@ obj = {
     # records the peak against the P0 cell it was collected from, and there
     # is no P0 cell for this (shape, stage) is a fact to record, not a reason
     # to refuse to run.
-    "p0_ratio": None if p0_bytes == "" else round(max(int(peak_tree), int(peak_proc)) / int(p0_bytes), 3),
+    # R9-N06: a zero (or unparsable) P0 peak must not divide. `p0_for` already
+    # refuses to hand one out, but this is the arithmetic's own guard.
+    "p0_ratio": (
+        None
+        if not p0_bytes or not p0_bytes.lstrip("-").isdigit() or int(p0_bytes) <= 0
+        else round(max(int(peak_tree), int(peak_proc)) / int(p0_bytes), 3)
+    ),
 }
 print(json.dumps(obj))
 PYEOF
@@ -690,6 +696,70 @@ print(budget)
 PYEOF
 }
 
+p0_for() {
+  # $1=shape $2=stage $3=the fixture sha THIS run is measuring. Prints that
+  # cell's max(peak_tree,peak_proc) in bytes, or nothing when there is no
+  # USABLE cell. NEVER exits: T7's record-only contract means a run with no P0
+  # baseline (or with an unusable cell for this shape/stage) still collects its
+  # twelve cells, with `p0_ratio` null.
+  #
+  # R9-N06 (任务书 #132): "the two peak fields are integers" was the whole
+  # test, so a cell collected on a DIFFERENT fixture, or from a run that was
+  # not measured / did not exit 0 / recorded a zero peak, still produced a
+  # `p0_ratio` that read like a valid same-fixture comparison -- and two zero
+  # peaks divided by zero. A cell now has to BE a measurement of this fixture;
+  # when it is not, the reason goes to stderr so a later re-collection can see
+  # which cells went unused.
+  local shape="$1" stage="$2" fixture_sha256="${3:-}"
+  local baseline="${W6:-}/memgate-baseline.json"
+  [ -f "$baseline" ] || return 0
+  python3 - "$baseline" "$shape" "$stage" "$fixture_sha256" <<'PYEOF'
+import json
+import sys
+
+path, shape, stage, fixture_sha256 = sys.argv[1:5]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+entry = (data.get(shape) or {}).get(stage)
+if not isinstance(entry, dict):
+    sys.exit(0)
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def unusable(reason):
+    print(
+        f"memory_gate: P0 cell {shape}/{stage} is not usable ({reason}); "
+        "p0_ratio will be null",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+
+peak_tree = entry.get("peak_tree")
+peak_proc = entry.get("peak_proc")
+if not is_int(peak_tree) or not is_int(peak_proc):
+    unusable("peak_tree/peak_proc are not integers")
+if entry.get("fixture_sha256") != fixture_sha256:
+    unusable(
+        f"fixture_sha256={entry.get('fixture_sha256')!r} != this run's fixture {fixture_sha256!r}"
+    )
+if entry.get("measured") is not True:
+    unusable(f"measured={entry.get('measured')!r}")
+if entry.get("exit_code") != 0:
+    unusable(f"exit_code={entry.get('exit_code')!r}")
+peak = max(peak_tree, peak_proc)
+if peak <= 0:
+    unusable(f"peak={peak} is not positive")
+print(peak)
+PYEOF
+}
+
 assert_sources_toml_only_lists_fixture_root() {
   # $1=XDG_CONFIG_HOME $2=fixture_dir
   # T4-F7 (#122b-3): normal mode both exports HOME=$fixture_dir (Claude
@@ -928,41 +998,6 @@ baseline_json="${W6:-}/memgate-baseline.json"
 # dead: it still validates a hand-filled baseline cell and
 # tests/w6_memory_gate_selfcheck.rs drives it directly.
 
-p0_for() {
-  # $1=shape $2=stage. Prints that cell's max(peak_tree,peak_proc) in bytes,
-  # or nothing when there is no usable cell. NEVER exits: T7's record-only
-  # contract means a run with no P0 baseline (or with a cell missing for this
-  # shape/stage) still collects its twelve cells, with `p0_ratio` null.
-  local shape="$1" stage="$2"
-  local baseline="${W6:-}/memgate-baseline.json"
-  [ -f "$baseline" ] || return 0
-  python3 - "$baseline" "$shape" "$stage" <<'PYEOF'
-import json
-import sys
-
-path, shape, stage = sys.argv[1:4]
-try:
-    with open(path) as f:
-        data = json.load(f)
-except Exception:
-    sys.exit(0)
-entry = (data.get(shape) or {}).get(stage)
-if not isinstance(entry, dict):
-    sys.exit(0)
-
-
-def is_int(v):
-    return isinstance(v, int) and not isinstance(v, bool)
-
-
-peak_tree = entry.get("peak_tree")
-peak_proc = entry.get("peak_proc")
-if not is_int(peak_tree) or not is_int(peak_proc):
-    sys.exit(0)
-print(max(peak_tree, peak_proc))
-PYEOF
-}
-
 record_cell() {
   # $1=shape $2=stage $3=that stage's JSON path. Merges this cell into
   # $RUN_ROOT/memgate-cells.json -- three shapes x four stages = the door's
@@ -1009,7 +1044,7 @@ export HOME="$fixture_dir"
 
 assert_sources_toml_only_lists_fixture_root "${XDG_CONFIG_HOME:-}" "$fixture_dir" || exit 2
 
-p0_1=$(p0_for "$shape" index)
+p0_1=$(p0_for "$shape" index "$fixture_sha256")
 run_stage "$shape" "index" "" "" "$binary_sha256" "$fixture_sha256" "$p0_1" \
   "$RUN_ROOT/mem-${shape}-stage1.json" \
   "$cass_wrapper" index || overall_rc=1
@@ -1049,20 +1084,20 @@ fi
 check_ingest_totals "$data_dir/agent_search.db" "$manifest" || exit 2
 record_cell "$shape" "index" "$RUN_ROOT/mem-${shape}-stage1.json" || exit 2
 
-p0_2=$(p0_for "$shape" index_force_rebuild)
+p0_2=$(p0_for "$shape" index_force_rebuild "$fixture_sha256")
 run_stage "$shape" "index_force_rebuild" "" "" "$binary_sha256" "$fixture_sha256" "$p0_2" \
   "$RUN_ROOT/mem-${shape}-stage2.json" \
   "$cass_wrapper" index --force-rebuild || overall_rc=1
 record_cell "$shape" "index_force_rebuild" "$RUN_ROOT/mem-${shape}-stage2.json" || exit 2
 
-p0_3=$(p0_for "$shape" index_semantic)
+p0_3=$(p0_for "$shape" index_semantic "$fixture_sha256")
 run_stage "$shape" "index_semantic" "" "" "$binary_sha256" "$fixture_sha256" "$p0_3" \
   "$RUN_ROOT/mem-${shape}-stage3.json" \
   "$cass_wrapper" index --semantic || overall_rc=1
 record_cell "$shape" "index_semantic" "$RUN_ROOT/mem-${shape}-stage3.json" || exit 2
 
 stage4_db="${STAGE4_DB:-$data_dir-stage4/agent_search.db}"
-p0_4=$(p0_for "$shape" completeness_gate)
+p0_4=$(p0_for "$shape" completeness_gate "$fixture_sha256")
 # R6-N3 (#123): stage 4 executes $EXAMPLES/w4_completeness_gate, not the
 # candidate -- recording $binary_sha256 here misidentified the measured
 # program (#122b-3c fixed exactly this wrapper-vs-binary confusion for the
