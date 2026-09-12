@@ -1309,6 +1309,16 @@ fn file_identity(path: &Path) -> (PathBuf, Option<(u64, u64)>) {
     (canonical, inode)
 }
 
+/// R9-B01 (任务书 #132): two names are the same file when their canonical
+/// paths agree OR when both resolve to the same `(dev, ino)`. Comparing the
+/// whole identity tuple at once demanded BOTH halves at the same time, so a
+/// hard link -- two distinct canonical paths, one inode -- compared unequal
+/// and slipped through the guard: the calibration ran, and its final
+/// `fs::write` truncated the input database through the other name.
+fn same_file(left: &(PathBuf, Option<(u64, u64)>), right: &(PathBuf, Option<(u64, u64)>)) -> bool {
+    left.0 == right.0 || (left.1.is_some() && left.1 == right.1)
+}
+
 /// B01 (任务书 #131): an output path that names the input database -- or one
 /// of its SQLite sidecars -- is data loss, not a usage slip: the final
 /// `fs::write` truncates the very file the run spent its whole budget
@@ -1330,7 +1340,7 @@ fn refuse_output_over_input(db: &Path, outputs: &[(&str, &Path)]) -> Option<Stri
     for (label, out) in outputs {
         let out_identity = file_identity(out);
         for (input_label, input) in &inputs {
-            if out_identity == file_identity(input) {
+            if same_file(&out_identity, &file_identity(input)) {
                 return Some(format!(
                     "{label} {} names the input database {input_label} (same file); refusing to run, nothing was written",
                     out.display()
