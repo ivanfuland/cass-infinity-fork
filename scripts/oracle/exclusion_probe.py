@@ -1703,7 +1703,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           foreign_array_tool_use_result_cleared=False,
                           candidate_only_excluded_row=None,
                           fragmented_extra_text_blocks=False,
-                          duplicate_source_row=False):
+                          duplicate_source_row=False, null_raw_event_key=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -2065,7 +2065,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                     else {"tool_call_id": "t1", "tool_name": "Read", "paths": None, "shell": None}
                 ),
                 "src": None,
-                "raw": {"blob": blob_rel, "idx": 123456 if wrong_raw_idx else 1, "event_key": "u2", "blocks": [0]},
+                "raw": {"blob": blob_rel, "idx": 123456 if wrong_raw_idx else 1,
+                        "event_key": None if null_raw_event_key else "u2", "blocks": [0]},
             }
             conn.execute(
                 "UPDATE messages SET excluded = jsonb(?) WHERE conversation_id = 1 AND idx = 1",
@@ -2455,6 +2456,10 @@ def verify_selftest_cases():
         # -- each side showed one row, and they matched.
         ("V30 a row dropped from one source is a missing non-manifest row", False,
          "non-manifest row is missing"),
+        # R9-B09 (任务书 #132): `event_key: null` used to switch the rebuild's
+        # identity check off, so a marker naming no event rebuilt "successfully".
+        ("V31 a raw marker whose event_key is null is a failure", False,
+         "rebuild_raw_invalid"),
     ]
 
 
@@ -2503,6 +2508,7 @@ def _run_verify_selftest(paths_cfg):
             27: {"candidate_only_excluded_row": "unverifiable"},
             28: {"fragmented_extra_text_blocks": True},
             29: {"duplicate_source_row": True},
+            30: {"null_raw_event_key": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -4103,6 +4109,7 @@ _FAILURE_FAMILIES = (
     # The rebuild family is matched on the DETAIL text: the `rebuild/...` part
     # is the failure's LABEL, not its detail, so a `"rebuild/"` needle here
     # would never fire.
+    ("rebuild_raw_invalid", "rebuild_raw_invalid"),
     ("rebuilt sha256", "rebuild_sha"),
     ("is not a position in the reparsed candidate list", "rebuild_raw_idx"),
     ("carries event_key=", "rebuild_event_key"),
@@ -4431,6 +4438,15 @@ def _verify_rebuild_blob(entry, marker, mirror_root):
     event_key = raw.get("event_key")
     if not blob_rel:
         return None, "marker has no raw.blob"
+    # R9-B09 (任务书 #132): the identity check below reads
+    # `if event_key is not None and ...`, so a marker whose `raw.event_key` was
+    # set to JSON null switched that check off ENTIRELY: its position and body
+    # sha both still checked out and the rebuild reported success for a record
+    # that names no event at all. A raw record must carry its fields, and carry
+    # them as the right types, BEFORE anything is looked up with it.
+    raw_problem = _raw_reference_problem(raw)
+    if raw_problem is not None:
+        return None, f"rebuild_raw_invalid: {raw_problem}"
     blob_path = os.path.join(mirror_root, blob_rel)
     if not os.path.exists(blob_path):
         return None, f"raw-mirror blob is gone: {blob_path}"
