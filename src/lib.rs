@@ -97652,7 +97652,7 @@ fn run_models_backfill(
     // no directory-creation duty (unlike `acquire_index_run_lock` itself,
     // which does create it once actually called below); canonicalize only
     // resolves existing paths, so a nonexistent one falls back to its own
-    // (uncanonicalized) form here, letting the `db_path.is_file()` check
+    // (uncanonicalized) form here, letting the `db_path_for_open.is_file()` check
     // below still correctly report `IndexMissing` instead of a raw "no
     // such file or directory" from canonicalize itself.
     let data_dir_raw = data_dir_override.unwrap_or_else(default_data_dir);
@@ -97674,9 +97674,21 @@ fn run_models_backfill(
     // "no such file" case falling through to the `IndexMissing` check
     // below, exactly as `data_dir`'s own canonicalize above does.)
     let expected_db_path = std::fs::canonicalize(&expected_db_path).unwrap_or(expected_db_path);
-    let db_path = match db_override {
-        Some(raw) => std::fs::canonicalize(&raw).unwrap_or(raw),
-        None => expected_db_path.clone(),
+    // R7-5 (#124): the resolved path is a *comparison* value only. The
+    // storage layer derives its doctor mutation-open lock from the db
+    // path's file NAME (`src/storage/sqlite.rs::
+    // doctor_mutation_lock_path_for_db_open` returns a lock path only for a
+    // path ending in `agent_search.db`), so handing it the resolved target
+    // of a symlinked `agent_search.db` silently drops that protection --
+    // same directory, so the cross-directory exemption does not apply.
+    // What is opened (and what the lock is derived from) stays the path the
+    // caller actually named, or `data_dir`'s own join.
+    let (db_path, db_path_for_open) = match db_override {
+        Some(raw) => {
+            let resolved = std::fs::canonicalize(&raw).unwrap_or_else(|_| raw.clone());
+            (resolved, raw)
+        }
+        None => (expected_db_path.clone(), data_dir.join("agent_search.db")),
     };
     if db_path != expected_db_path {
         return Err(CliError {
@@ -97695,11 +97707,11 @@ fn run_models_backfill(
             retryable: false,
         });
     }
-    if !db_path.is_file() {
+    if !db_path_for_open.is_file() {
         return Err(CliError {
             code: 3,
             kind: CliErrorKind::IndexMissing.kind_str(),
-            message: format!("cass database not found: {}", db_path.display()),
+            message: format!("cass database not found: {}", db_path_for_open.display()),
             hint: Some("Run 'cass index --full' before semantic backfill".into()),
             retryable: true,
         });
@@ -97720,7 +97732,7 @@ fn run_models_backfill(
     // mismatch case just above, which is a genuinely different failure.
     let _index_run_lock_guard = crate::indexer::acquire_index_run_lock(
         &data_dir,
-        &db_path,
+        &db_path_for_open,
         crate::search::asset_state::SearchMaintenanceMode::Index,
     )
     .map_err(|err| {
@@ -97730,8 +97742,8 @@ fn run_models_backfill(
             .collect::<Vec<_>>()
             .join(" | ");
         if error_chain_indicates_active_cass_index(&chain) {
-            let details = active_index_run_details(&data_dir, &db_path)
-                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path));
+            let details = active_index_run_details(&data_dir, &db_path_for_open)
+                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path_for_open));
             return details.to_cli_error();
         }
         CliError {
@@ -97810,7 +97822,7 @@ fn run_models_backfill(
                     "tier": tier.as_str(),
                     "embedder_id": embedder_type,
                     "data_dir": data_dir.display().to_string(),
-                    "db_path": db_path.display().to_string(),
+                    "db_path": db_path_for_open.display().to_string(),
                     "batch_conversations_limit": batch_conversations,
                     "scheduler": decision,
                 }))
@@ -97833,10 +97845,10 @@ fn run_models_backfill(
         return Ok(());
     }
 
-    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path_for_open).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
-        message: format!("Failed to open cass database {}: {e}", db_path.display()),
+        message: format!("Failed to open cass database {}: {e}", db_path_for_open.display()),
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
@@ -97933,7 +97945,7 @@ fn run_models_backfill(
                         "tier": "quality",
                         "embedder_id": report.embedder_id,
                         "data_dir": data_dir.display().to_string(),
-                        "db_path": db_path.display().to_string(),
+                        "db_path": db_path_for_open.display().to_string(),
                         "generation_id": report.generation_id,
                         "reused_existing_generation": report.reused_existing_generation,
                         "eligible_seeded": report.eligible_seeded,
@@ -98199,6 +98211,67 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         let implicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
         let implicit_err = implicit.expect_err("same retired embedder, reached via the default db path");
         assert_eq!(implicit_err.code, 20, "the implicit (no --db) form must keep working against a symlinked agent_search.db: {implicit_err:?}");
+    }
+
+    /// R7-5 (#124, control-plane adversarial review of #123). The doctor
+    /// mutation lock is derived from the db path's file NAME
+    /// (`src/storage/sqlite.rs::doctor_mutation_lock_path_for_db_open`:
+    /// only a path whose file name is `agent_search.db` gets one), so the
+    /// canonicalized path R6-N11 introduced must stay a *comparison* value:
+    /// with `data_dir/agent_search.db` symlinked to the same file under
+    /// another name, handing the storage layer the resolved path silently
+    /// drops the lock -- same directory, so the cross-directory exemption
+    /// does not apply. What gets opened (and what the lock is derived from)
+    /// is the user's own path.
+    ///
+    /// Runtime note: a contended lock reports itself only after
+    /// `DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT` (`src/storage/sqlite.rs`, a 30s
+    /// const with no env override), so ~30s of this test is that wait, not a
+    /// hang.
+    #[test]
+    fn models_backfill_keeps_the_doctor_lock_on_a_symlinked_data_dir_db() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real_db = data_dir.join("real.db");
+        {
+            let _ = FrankenStorage::open(&real_db).unwrap();
+        }
+        let linked_db = data_dir.join("agent_search.db");
+        std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
+
+        // A doctor repair holds the mutation lock. Its metadata must not
+        // carry this process's pid: `doctor_lock_file_pid_is_current_process`
+        // reads exactly that line and hands back a lock-free guard for it.
+        let lock_path = data_dir.join("doctor").join("locks").join("doctor-repair.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the doctor mutation lock file");
+        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold the doctor mutation lock");
+        writeln!(
+            lock_file,
+            "schema_version=1\npid={}\nmode=safe_auto_run",
+            std::process::id().saturating_add(1)
+        )
+        .unwrap();
+        lock_file.flush().unwrap();
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let err = result.expect_err(
+            "a held doctor mutation lock must stop the open; a canonicalized path must not be what the storage layer is given",
+        );
+        assert_eq!(err.code, 5, "the doctor lock must fail the storage open, not be skipped past it: {err:?}");
+        assert!(
+            err.message.contains("doctor mutation lock"),
+            "expected the doctor-lock wording, got: {}",
+            err.message
+        );
     }
 
     /// T4 mission #122a (C, Step 3 case ③): `--data-dir` with no `--db`
