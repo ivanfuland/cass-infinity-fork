@@ -983,6 +983,12 @@ pub struct IndexingStats {
     pub scan_invocations: u64,
     /// PR6 T5: whether this run was `cass index --semantic --no-ingest`.
     pub no_ingest: bool,
+    /// B05 (任务书 #131): this run was `--no-ingest`, so the historical
+    /// salvage preflight (bundle discovery + import) was suppressed by that
+    /// flag rather than by the corpus' own state. Disclosed because
+    /// `scan_invocations: 0` alone cannot tell "nothing was imported" apart
+    /// from "nothing was scanned, but a backup was imported".
+    pub salvage_skipped_by_no_ingest: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -5476,8 +5482,15 @@ fn should_salvage_historical_databases(
     canonical_sessions_before_salvage: usize,
     has_pending_historical_bundles: bool,
     canonical_only_full_rebuild: bool,
+    no_ingest: bool,
 ) -> bool {
-    if canonical_only_full_rebuild {
+    // B05 (任务书 #131): `--no-ingest` must not import anything. This
+    // preflight runs BEFORE the `no_ingest` branch that guards the connector
+    // scan, so without this the salvage wrote a discoverable backup's
+    // sessions into `messages` while the run still reported
+    // `scan_invocations: 0` and `no_ingest: true` -- i.e. the "this run did
+    // not touch the corpus" reading was false.
+    if no_ingest || canonical_only_full_rebuild {
         return false;
     }
     canonical_storage_rebuilt
@@ -5491,8 +5504,12 @@ fn should_probe_pending_historical_bundles(
     canonical_sessions_before_salvage: usize,
     canonical_only_full_rebuild: bool,
     operator_requested_discovery: bool,
+    no_ingest: bool,
 ) -> bool {
-    if canonical_only_full_rebuild {
+    // B05: same reason as `should_salvage_historical_databases` above --
+    // discovery opens candidate backup/snapshot DBs, and every bundle it
+    // finds is a bundle the salvage step would import.
+    if no_ingest || canonical_only_full_rebuild {
         return false;
     }
     full_rebuild
@@ -9789,6 +9806,7 @@ pub fn run_index(
             canonical_sessions_before_salvage,
             canonical_only_full_rebuild,
             preflight_historical_salvage_discovery_enabled(),
+            opts.no_ingest,
         );
         let mut has_pending_historical_bundles = if probe_pending_historical_bundles {
             storage.has_pending_historical_bundles(&opts.db_path)?
@@ -9817,6 +9835,7 @@ pub fn run_index(
                 canonical_sessions_before_salvage,
                 has_pending_historical_bundles,
                 canonical_only_full_rebuild,
+                opts.no_ingest,
             );
         tracing::warn!(
             db_path = %opts.db_path.display(),
@@ -10485,6 +10504,12 @@ pub fn run_index(
     {
         stats.scan_invocations = scan_invocations_snapshot();
         stats.no_ingest = opts.no_ingest;
+        // B05 (任务书 #131): with `--no-ingest` the historical salvage
+        // preflight is suppressed by that flag (see
+        // `should_probe_pending_historical_bundles` /
+        // `should_salvage_historical_databases`), so this run may not have
+        // imported anything even when discoverable bundles existed.
+        stats.salvage_skipped_by_no_ingest = opts.no_ingest;
     }
 
     if opts.semantic && targeted_semantic_watch_once {
@@ -31173,39 +31198,53 @@ mod tests {
 
     #[test]
     fn historical_salvage_decision_skips_populated_canonical_db() {
-        assert!(!should_salvage_historical_databases(false, 1, false, false));
+        assert!(!should_salvage_historical_databases(false, 1, false, false, false));
         assert!(!should_salvage_historical_databases(
-            false, 43_678, false, false
-        ));
+            false, 43_678, false, false, false));
     }
 
     #[test]
     fn historical_salvage_decision_keeps_empty_or_rebuilt_storage() {
-        assert!(should_salvage_historical_databases(false, 0, false, false));
-        assert!(should_salvage_historical_databases(true, 0, false, false));
+        assert!(should_salvage_historical_databases(false, 0, false, false, false));
+        assert!(should_salvage_historical_databases(true, 0, false, false, false));
         assert!(should_salvage_historical_databases(
-            true, 43_678, false, false
-        ));
+            true, 43_678, false, false, false));
     }
 
     #[test]
     fn historical_salvage_decision_keeps_populated_canonical_when_more_bundles_are_pending() {
         assert!(should_salvage_historical_databases(
-            false, 43_678, true, false
-        ));
+            false, 43_678, true, false, false));
     }
 
     #[test]
     fn historical_salvage_decision_skips_pending_bundles_during_canonical_only_full_rebuild() {
         assert!(!should_salvage_historical_databases(
-            false, 43_678, true, true
-        ));
+            false, 43_678, true, true, false));
+    }
+
+    /// B05 (任务书 #131): `--no-ingest` suppresses both the bundle discovery
+    /// probe and the salvage itself, whatever the canonical corpus' own
+    /// state says -- a `--no-ingest` run must not import anything.
+    #[test]
+    fn historical_salvage_decision_is_suppressed_by_no_ingest() {
+        assert!(
+            !should_salvage_historical_databases(false, 0, true, false, true),
+            "--no-ingest must suppress salvage even for an empty canonical archive"
+        );
+        assert!(
+            !should_salvage_historical_databases(true, 0, true, false, true),
+            "--no-ingest must suppress salvage even for freshly rebuilt storage"
+        );
+        assert!(
+            !should_probe_pending_historical_bundles(true, true, 0, false, true, true),
+            "--no-ingest must suppress the discovery probe even on the explicit recovery paths"
+        );
     }
 
     #[test]
-    fn pending_historical_bundle_probe_skips_populated_incremental_by_default() {
-        assert!(
-            !should_probe_pending_historical_bundles(false, false, 43_678, false, false),
+    fn pending_historical_bundle_probe_skips_populated_incremental_by_default() {        assert!(
+            !should_probe_pending_historical_bundles(false, false, 43_678, false, false, false),
             "routine populated incremental index must not open historical backup bundles before indexing"
         );
     }
@@ -31213,23 +31252,23 @@ mod tests {
     #[test]
     fn pending_historical_bundle_probe_keeps_recovery_paths() {
         assert!(
-            should_probe_pending_historical_bundles(true, false, 43_678, false, false),
+            should_probe_pending_historical_bundles(true, false, 43_678, false, false, false),
             "--full is an explicit heavy recovery/rebuild path and keeps historical discovery"
         );
         assert!(
-            should_probe_pending_historical_bundles(false, true, 43_678, false, false),
+            should_probe_pending_historical_bundles(false, true, 43_678, false, false, false),
             "freshly rebuilt canonical storage keeps historical discovery"
         );
         assert!(
-            should_probe_pending_historical_bundles(false, false, 0, false, false),
+            should_probe_pending_historical_bundles(false, false, 0, false, false, false),
             "empty canonical archives keep historical discovery so seed recovery still works"
         );
         assert!(
-            should_probe_pending_historical_bundles(false, false, 43_678, false, true),
+            should_probe_pending_historical_bundles(false, false, 43_678, false, true, false),
             "operators can explicitly request populated-incremental historical discovery"
         );
         assert!(
-            !should_probe_pending_historical_bundles(true, true, 0, true, true),
+            !should_probe_pending_historical_bundles(true, true, 0, true, true, false),
             "canonical-only full rebuilds must not broaden into historical salvage"
         );
     }
