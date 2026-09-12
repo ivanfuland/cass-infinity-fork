@@ -1541,7 +1541,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           non_manifest_altered=False, overclear_ordinary=False,
                           leak_multiline_body=False, short_body=False,
                           missing_nonmanifest_row=False, wrong_raw_idx=False,
-                          wrong_marker_sha=False, project_read_anchor=False):
+                          wrong_marker_sha=False, project_read_anchor=False,
+                          legit_sibling_redaction=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1625,6 +1626,18 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
                 ["sibling turn", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if legit_sibling_redaction:
+            # N02 (任务书 #131): a SECOND row carrying the same event, with the
+            # same target block replaced -- what `apply_sibling` produces. The
+            # reference library has the same row un-redacted.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 2, 'user', ?, ?)",
+                [
+                    "assistant commentary, must stay",
+                    msgpack.packb(_verify_extra(redacted if with_excluded else body_text), use_bin_type=True),
+                ],
             )
         if leak_multiline_body or short_body:
             # B08: the body survives verbatim in a later row's extra,
@@ -1732,6 +1745,9 @@ def verify_selftest_cases():
         # names, not file paths -- judging them with the file predicate rejects
         # a legitimate hit.
         ("V11 a project_read document anchor passes", True, ""),
+        # N02 (任务书 #131): an ordinary row sharing the excluded row's event
+        # legitimately carries the same redacted target block.
+        ("V12 a legit sibling redaction passes", True, ""),
     ]
 
 
@@ -1759,6 +1775,7 @@ def _run_verify_selftest(paths_cfg):
             8: {"wrong_raw_idx": True},
             9: {"wrong_marker_sha": True},
             10: {"project_read_anchor": True},
+            11: {"legit_sibling_redaction": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -2851,22 +2868,63 @@ def _owned_body_copy(recorded, body):
     return bool(body) and len(recorded) <= len(body) + TOOL_USE_RESULT_WRAPPER_SLACK and body in recorded
 
 
-def _allowed_extra_paths(entry, ref_row, ref_extra):
-    """Concrete dot-paths (no leading dot) this exclusion may rewrite."""
-    blocks = entry.get("blocks") or []
+def _expand_field_paths(agent_slug, blocks):
+    """The R7 field map resolved to concrete dot-paths for `blocks`."""
     allowed = set()
-    for path in EXTRA_FIELD_MAP.get(entry.get("agent_slug"), ()):
+    for path in EXTRA_FIELD_MAP.get(agent_slug, ()):
         if "[*]" in path:
             for index in blocks:
                 allowed.add(path.replace("[*]", f"[{index}]"))
         else:
             allowed.add(path)
+    return allowed
+
+
+def _allowed_extra_paths(entry, ref_row, ref_extra):
+    """Concrete dot-paths (no leading dot) this exclusion may rewrite."""
+    allowed = _expand_field_paths(entry.get("agent_slug"), entry.get("blocks") or [])
     if entry.get("agent_slug") == "claude_code" and isinstance(ref_extra, dict):
         # The string-form top-level `toolUseResult` is a legitimate target
         # only when it IS the excluded body's copy (B04's ownership proof).
         if _owned_body_copy(ref_extra.get("toolUseResult"), ref_row["content"] if ref_row is not None else None):
             allowed.add("toolUseResult")
     return allowed
+
+
+def _extra_event_key(extra):
+    """The event identity a decoded extra carries: claude's top-level `uuid`,
+    codex's `payload.id`."""
+    if not isinstance(extra, dict):
+        return None
+    if isinstance(extra.get("uuid"), str):
+        return extra["uuid"]
+    payload = extra.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("id"), str):
+        return payload["id"]
+    return None
+
+
+def _sibling_extra_diff_is_target_only(cand_extra, ref_extra, agent_slug, manifest_by_event):
+    """N02 (任务书 #131): a row that shares the excluded row's EVENT legitimately
+    carries that same event with the same target blocks replaced -- that is
+    `apply_sibling`'s whole job -- so "a non-manifest extra_bin must be
+    byte-equal to the reference" is too strong for it. The exemption is kept
+    narrow: every difference must be a redacted placeholder at a path this
+    event's blocks may rewrite, and nowhere else. A blanket per-row exemption
+    would hide exactly the over-clears B07 exists to catch.
+    """
+    entry = manifest_by_event.get((agent_slug, _extra_event_key(cand_extra)))
+    if entry is None:
+        return False
+    allowed = _expand_field_paths(agent_slug, entry.get("blocks") or [])
+    sha = entry.get("sha256")
+    diffs = _diff_paths(cand_extra, ref_extra)
+    if not diffs:
+        return False
+    return all(
+        _is_redacted_placeholder(candidate_value, sha) and _normalized_diff_path(path) in allowed
+        for path, candidate_value, _reference_value in diffs
+    )
 
 
 def _string_leaves(value, depth=0):
@@ -3106,6 +3164,7 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     # `non_manifest_rows_checked=0`. The comparison is now two-way over the
     # stable key both libraries must agree on.
     manifest_keys = {_session_key(entry) for entry in manifest}
+    manifest_by_event = {(entry["agent_slug"], entry.get("event_key")): entry for entry in manifest}
     cand_rows = {
         _stable_row_key(row): row
         for row in conn_cand.execute(sql_cand)
@@ -3125,7 +3184,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
             continue
         if row["content"] != ref_row["content"]:
             failures.append((label, "non-manifest body differs from reference"))
-        if row["extra_bin"] != ref_row["extra_bin"]:
+        if row["extra_bin"] != ref_row["extra_bin"] and not _sibling_extra_diff_is_target_only(
+            _decode_extra(row["extra_bin"]),
+            _decode_extra(ref_row["extra_bin"]),
+            key[0],
+            manifest_by_event,
+        ):
             failures.append((label, "non-manifest extra_bin differs from reference"))
     for key, _row in cand_rows.items():
         if key not in ref_rows:
