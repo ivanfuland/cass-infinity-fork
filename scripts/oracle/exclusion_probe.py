@@ -1903,6 +1903,22 @@ def _run_verify_selftest(paths_cfg):
                 f"extra_unchanged_no_body={report.get('extra_unchanged_no_body')!r} failures={details!r}"
             )
 
+    # N-fam3 (任务书 #131 追加): the report must carry EVERY failure, not just
+    # the first twenty and not just the family totals.
+    total += 1
+    with tempfile.TemporaryDirectory() as root:
+        candidate, reference, manifest_path, mirror = _write_verify_fixture(root, non_target_cleared=True)
+        failures, report = _verify_once(candidate, manifest_path, reference, mirror, 50, 6, paths_cfg)
+        listed = report.get("failure_list") or []
+        if len(listed) == report["failures"] and len(listed) == len(failures) and listed and listed[0][0] == "extra_unexpected_change":
+            passed += 1
+            print("ok   N-fam3 the report carries every failure")
+        else:
+            print(
+                f"FAIL N-fam3 the report carries every failure: failures={report['failures']!r} "
+                f"listed={len(listed)} sample={listed[:1]!r}"
+            )
+
     # N-fam (任务书 #131, 控制面追加): a run that reports tens of thousands of
     # failures must be reducible to families, not just to a total.
     total += 1
@@ -3472,6 +3488,10 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "extra_unchanged_no_body": extra_unchanged_no_body,
         "candidate_only_rows": candidate_only_rows,
         "failure_families": dict(sorted(Counter(failure_family(detail) for _label, detail in failures).items())),
+        # N-fam3 (任务书 #131 追加): the families give the shape of a failure
+        # set, this gives every one of them -- `[family, label, message]` per
+        # failure, never truncated (stdout keeps its first-20 listing).
+        "failure_list": [[failure_family(detail), label, detail] for label, detail in failures],
         "failures": len(failures),
     }
     return failures, report
