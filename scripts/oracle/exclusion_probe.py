@@ -58,6 +58,7 @@ import re
 import shlex
 import sqlite3
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 
@@ -162,6 +163,13 @@ def is_cass_recall_tool(tool_name: str, agent_slug: str) -> bool:
 # ---------------------------------------------------------------------------
 # R2 谓词 P.
 # ---------------------------------------------------------------------------
+# Mirrors `src/indexer/mod.rs:15708 LOGICAL_SOURCE_CONNECTORS` -- connector
+# slugs whose `source_path` is not a real filesystem path (a DB-derived key, a
+# synthetic id), so their sessions are `SourceKind::Logical`: capture absence
+# there is expected (`capture_na`), never a `CaptureFailed`.
+LOGICAL_SOURCE_CONNECTORS = ("opencode",)
+
+
 def _normalize_path(p: str) -> str:
     p = p.replace("\\", "/")
     # Collapse "." / ".." segments without requiring the path to exist.
@@ -967,6 +975,7 @@ def _v2_stats():
     silently-skipped assertion."""
     return {
         "hits_by_reason": Counter(),
+        "hits_by_reason_agent": Counter(),
         "anchor3_opener": Counter(),
         "content_mismatch_messages": 0,
         "pairing_fail": Counter(),
@@ -1103,8 +1112,11 @@ def _run_content_selftest(paths_cfg):
         conv, db_rows_full, raw_candidates = _tool_result_fixture(result_block, db_content)
         stats = _v2_stats()
         entries = process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats)
-        got = (len(entries), stats["content_mismatch_messages"])
-        want = (expect_entries, expect_mismatch)
+        # Every emitted entry must also land in the per-connector counter the
+        # report derives its cass_recall split from (R1-N20) -- once each.
+        agent_total = sum(stats["hits_by_reason_agent"].values())
+        got = (len(entries), stats["content_mismatch_messages"], agent_total)
+        want = (expect_entries, expect_mismatch, expect_entries)
         ok = got == want
         print(f"{'ok  ' if ok else 'FAIL'} {name} (expect={want} got={got})")
         if ok:
@@ -1113,9 +1125,131 @@ def _run_content_selftest(paths_cfg):
     return passed, len(cases)
 
 
+def selftest_report_cases():
+    """Family C (任务书 #125, R1-N20 + R2-N15): every number the report prints
+    must be derived from `stats` -- no frozen prose about "this run", no count
+    that is really a list length, no field that was initialised and never
+    filled. `checks` entries are `("in"|"not_in", needle)` against the
+    rendered report text, or `("bucket", (command, expected))` against
+    `bash_bucket_of`."""
+    cases = []
+
+    # B1: the per-connector cass_recall split must come from stats. The old
+    # report asserted, in prose, "命中 25 条，全部来自 claude_code；codex 侧
+    # 0 条" -- three numbers, none of them read from the counters.
+    stats = _new_stats()
+    stats["hits_by_reason"]["cass_recall"] = 37
+    stats["hits_by_reason_agent"] = Counter()
+    stats["hits_by_reason_agent"][("cass_recall", "claude_code")] = 28
+    stats["hits_by_reason_agent"][("cass_recall", "codex")] = 9
+    cases.append((
+        "B1 cass_recall split is counted, not asserted in prose",
+        stats, [],
+        [("not_in", "命中 25 条"),
+         ("not_in", "codex 侧 0 条"),
+         ("in", "`cass_recall`: 合计 37；按 agent_slug：claude_code 28、codex 9")],
+    ))
+
+    # B2: the deep-doc negative-control count must be the real count, not the
+    # length of a list that was capped at 20 during collection.
+    stats = _new_stats()
+    stats["deep_doc_hits_total"] = 37  # test-supplied: pre-fix stats has no such key
+    stats["deep_doc_hits"] = [f"/elsewhere/doc{i}.md" for i in range(20)]
+    cases.append((
+        "B2 deep-doc count is the full count, list is what is capped",
+        stats, [],
+        [("in", "命中数: 37"), ("in", "前 20 条"), ("in", "共 37")],
+    ))
+
+    # B3: the two fields that were initialised and never filled. `idx!=0`
+    # candidates are the known out-of-anchor class the T6 downstream gate
+    # needs a number for; `logical_source` is the `SourceKind::Logical`
+    # connector column (`LOGICAL_SOURCE_CONNECTORS`, indexer/mod.rs:15708).
+    stats = _new_stats()
+    stats["idx_ne_0_memory_candidates_total"] = 41  # test-supplied
+    stats["idx_ne_0_memory_candidates"] = [f"codex idx={i}" for i in range(20)]
+    stats["idx_ne_0_anchor3_also"] = 3
+    stats["coverage"]["opencode"] = {
+        "sessions": 7, "mirror_ok": 0, "has_tool_call_id": 0,
+        "has_tool_name": 0, "has_path_arg": 0, "logical_source": 7,
+    }
+    cases.append((
+        "B3 idx!=0 candidates and logical-source are filled in",
+        stats, [],
+        [("in", "命中数: 41"),
+         ("in", "其中 anchor3_shell_opener 也命中 3"),
+         ("in", "| 有 path 参数 | 逻辑来源 |"),
+         ("in", "| opencode | 7 | 0 | 无（本轮未实现，见 R7/R11「不启用」） | 0 | 0 | 0 | 7 |")],
+    ))
+
+    # B4: a truncated list must say so ("前 N 条 / 共 M"), not masquerade as
+    # the whole population.
+    stats = _new_stats()
+    for i in range(30):
+        stats["tool_name_freq"]["codex"][f"tool_{i:02d}"] = 100 - i
+    cases.append((
+        "B4 truncated tool-name list carries its own total",
+        stats, [],
+        [("in", "共 30")],
+    ))
+
+    # B5: compound Bash forms used to be dropped from BOTH Bash buckets --
+    # neither "in the subset" nor "outside it by head token" -- so the report
+    # could not show how much Bash traffic R2-e was rejecting.
+    stats = _new_stats()
+    stats["bash_subset_out_compound"] = Counter()
+    stats["bash_subset_out_compound"]["cat"] = 5
+    cases.append((
+        "B5 compound Bash forms get their own bucket",
+        stats, [],
+        [("in", "复合形态"), ("in", "`cat`: 5")],
+    ))
+
+    # B6: the classification itself, driven directly.
+    cases.append((
+        "B6 compound command classifies as a compound bucket, not as a subset miss",
+        _new_stats(), [],
+        [("bucket", ("cat /a/MEMORY.md && grep -n x /tmp/y", ("compound", "cat"))),
+         ("bucket", ("grep -rn x /tmp", ("out", "grep"))),
+         ("bucket", ("cat /a/MEMORY.md /a/USER.md", ("in", None)))],
+    ))
+
+    return cases
+
+
+def _run_report_selftest(paths_cfg):
+    cases = selftest_report_cases()
+    passed = 0
+    for name, stats, manifest, checks in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = os.path.join(tmp, "report.md")
+            write_report(report_path, stats, manifest, 1)
+            with open(report_path, encoding="utf-8") as f:
+                text = f.read()
+        failures = []
+        for kind, payload in checks:
+            if kind == "in":
+                if payload not in text:
+                    failures.append(f"missing {payload!r}")
+            elif kind == "not_in":
+                if payload in text:
+                    failures.append(f"still present {payload!r}")
+            elif kind == "bucket":
+                command, expected = payload
+                got = bash_bucket_of(command)
+                if got != expected:
+                    failures.append(f"bucket({command!r}) = {got!r}, want {expected!r}")
+        ok = not failures
+        print(f"{'ok  ' if ok else 'FAIL'} {name}" + ("" if ok else f" ({'; '.join(failures)})"))
+        if ok:
+            passed += 1
+    print(f"selftest/report: {passed}/{len(cases)}")
+    return passed, len(cases)
+
+
 def run_selftest(paths_cfg) -> bool:
     passed = total = 0
-    for runner in (_run_decide_selftest, _run_content_selftest):
+    for runner in (_run_decide_selftest, _run_content_selftest, _run_report_selftest):
         p, t = runner(paths_cfg)
         passed += p
         total += t
@@ -1404,6 +1538,7 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
                 }
             )
             stats["hits_by_reason"][decision["reason"]] += 1
+            stats["hits_by_reason_agent"][(decision["reason"], agent_slug)] += 1
 
         elif role == "user" and idx == 0 and agent_slug == "codex":
             if first_user_cand is None:
@@ -1431,6 +1566,7 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
                 }
             )
             stats["hits_by_reason"]["codex_host_shell"] += 1
+            stats["hits_by_reason_agent"][("codex_host_shell", agent_slug)] += 1
             stats["anchor3_opener"][opener] += 1
 
     return manifest_entries
@@ -1440,6 +1576,70 @@ def process_session_v2(conv, db_rows_full, raw_candidates, paths_cfg, stats):
 # Full-corpus driver.
 # ---------------------------------------------------------------------------
 BASH_HEAD_TOKEN_RE = re.compile(r"^\s*(\S+)")
+
+
+def bash_bucket_of(command):
+    """Classify one Bash `command` for the report's sub-set tallies.
+
+    Returns `("in", None)`, `("out", <head token>)`, `("compound",
+    <head token>)`, or None when the string is not a classified read
+    attempt at all. Extracted verbatim from the `run_probe` loop so the
+    classification can be driven from `--selftest` instead of only being
+    observable through a full corpus run."""
+    if bash_readonly_paths(command) is not None:
+        return ("in", None)
+    head = BASH_HEAD_TOKEN_RE.match(command)
+    if _COMPOUND_SHELL_CHARS_RE.search(command):
+        # R2-e: a compound form is not one of the five literal shapes, so it
+        # is not in the subset -- but it also must not be filed as "a single
+        # command whose head token is outside the subset", because that is a
+        # different reason. Its own bucket (R2-N15).
+        return ("compound", head.group(1)) if head else None
+    return ("out", head.group(1)) if head else None
+
+
+def _memory_basenames(paths_cfg) -> frozenset:
+    """Every basename predicate P can match, i.e. what "记忆特征串" means for
+    the `idx≠0` candidate tally (spec §60)."""
+    return frozenset(
+        paths_cfg["memory_files"]
+        + paths_cfg["injection_only_files"]
+        + paths_cfg["workspace_scoped_files"]
+    )
+
+
+def _new_stats():
+    return {
+        "hits_by_reason": Counter(),
+        # R1-N20/R2-N15: the report used to state the cass_recall split in
+        # prose. Same counter, keyed by connector, so the text can be derived.
+        "hits_by_reason_agent": Counter(),
+        "anchor3_opener": Counter(),
+        "content_mismatch_messages": 0,
+        "unverifiable_sessions_by_reason": Counter(),
+        "unverifiable_messages": 0,
+        "bash_subset_in": 0,
+        "bash_subset_out": Counter(),
+        "bash_subset_out_compound": Counter(),
+        "pairing_fail": Counter(),
+        "deep_doc_hits": [],
+        "deep_doc_hits_total": 0,
+        "idx_ne_0_memory_candidates": [],
+        "idx_ne_0_memory_candidates_total": 0,
+        "idx_ne_0_anchor3_also": 0,
+        "coverage": defaultdict(lambda: {"sessions": 0, "mirror_ok": 0, "has_tool_call_id": 0, "has_tool_name": 0, "has_path_arg": 0, "logical_source": 0}),
+        # T1b.2: manifest inclusion no longer depends on whole-session
+        # alignment; these are reporting-only (old-model disclosure).
+        "alignment_by_agent": defaultdict(lambda: {"total": 0, "aligned": 0, "misaligned": 0, "misaligned_compacted": 0}),
+        "alignment_first_diff_pos": Counter(),
+        "compacted_sessions_by_agent": Counter(),
+        "out_of_scope_connector_sessions": 0,
+        # R7/R11 backfill evidence (item 7 support, not itself one of the 9
+        # numbered stats): tool_name frequency per agent_slug, so step 3 can
+        # pick the actual Read/Bash-equivalent identities instead of
+        # guessing them.
+        "tool_name_freq": defaultdict(Counter),
+    }
 
 
 def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None):
@@ -1459,30 +1659,7 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
     by_conv, by_source_path = build_manifest_index(mirror_root)
 
     manifest = []
-    stats = {
-        "hits_by_reason": Counter(),
-        "anchor3_opener": Counter(),
-        "content_mismatch_messages": 0,
-        "unverifiable_sessions_by_reason": Counter(),
-        "unverifiable_messages": 0,
-        "bash_subset_in": 0,
-        "bash_subset_out": Counter(),
-        "pairing_fail": Counter(),
-        "deep_doc_hits": [],
-        "idx_ne_0_memory_candidates": [],
-        "coverage": defaultdict(lambda: {"sessions": 0, "mirror_ok": 0, "has_tool_call_id": 0, "has_tool_name": 0, "has_path_arg": 0, "logical_source": 0}),
-        # T1b.2: manifest inclusion no longer depends on whole-session
-        # alignment; these are reporting-only (old-model disclosure).
-        "alignment_by_agent": defaultdict(lambda: {"total": 0, "aligned": 0, "misaligned": 0, "misaligned_compacted": 0}),
-        "alignment_first_diff_pos": Counter(),
-        "compacted_sessions_by_agent": Counter(),
-        "out_of_scope_connector_sessions": 0,
-        # R7/R11 backfill evidence (item 7 support, not itself one of the 9
-        # numbered stats): tool_name frequency per agent_slug, so step 3 can
-        # pick the actual Read/Bash-equivalent identities instead of
-        # guessing them.
-        "tool_name_freq": defaultdict(Counter),
-    }
+    stats = _new_stats()
 
     for conv in convs:
         conv_d = dict(conv)
@@ -1555,6 +1732,31 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
         entries = process_session_v2(conv_d, db_rows_full, raw_candidates, paths_cfg, stats)
         manifest.extend(entries)
 
+        # R1-N20/R2-N15: `logical_source` is the `SourceKind::Logical`
+        # connector column the plan asks for; mirrors the production table
+        # (`indexer/mod.rs:15708 LOGICAL_SOURCE_CONNECTORS`) rather than
+        # guessing from whether `source_path` exists.
+        if agent_slug.split("/")[0] in LOGICAL_SOURCE_CONNECTORS:
+            cov["logical_source"] += 1
+
+        # R1-N20/R2-N15: codex `user` rows at `idx != 0` whose body carries a
+        # memory feature string are the known out-of-anchor class (spec §60:
+        # "含记忆特征串但 `idx≠0` 的 40 条 codex user 行"). `anchor3_shell_opener`
+        # is additionally counted for the same rows, because that is exactly
+        # the evidence for "另立锚点 or not" the spec defers.
+        if agent_slug == "codex":
+            memory_basenames = _memory_basenames(paths_cfg)
+            for (row_idx, row_role, _row_sha, row_content, _row_tid) in db_rows_full:
+                if row_role != "user" or row_idx == 0:
+                    continue
+                if not any(name in row_content for name in memory_basenames):
+                    continue
+                stats["idx_ne_0_memory_candidates_total"] += 1
+                if anchor3_shell_opener(row_content) is not None:
+                    stats["idx_ne_0_anchor3_also"] += 1
+                if len(stats["idx_ne_0_memory_candidates"]) < 20:
+                    stats["idx_ne_0_memory_candidates"].append(f"{conv_d['external_id']} idx={row_idx}")
+
         # Coverage stats (item 7) from the raw candidate pool for this session.
         for c in raw_candidates:
             if c.role == "tool_call":
@@ -1595,16 +1797,27 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
             if isinstance(command_val, str):
                 extracted = bash_readonly_paths(command_val) or []
                 candidate_paths.extend(extracted)
-                if extracted:
-                    stats["bash_subset_in"] += 1
-                elif not _COMPOUND_SHELL_CHARS_RE.search(command_val):
-                    head = BASH_HEAD_TOKEN_RE.match(command_val)
-                    if head:
-                        stats["bash_subset_out"][head.group(1)] += 1
+                bucket = bash_bucket_of(command_val)
+                if bucket is not None:
+                    kind, key = bucket
+                    if kind == "in":
+                        stats["bash_subset_in"] += 1
+                    elif kind == "compound":
+                        # R2-N15: compound forms (R2-e) used to fall out of
+                        # BOTH tallies, so the report could not show how much
+                        # Bash traffic the subset was rejecting for being
+                        # compound. Own bucket, kept OUT of `bash_subset_out`
+                        # so the v1 head-token buckets stay comparable.
+                        stats["bash_subset_out_compound"][key] += 1
+                    else:
+                        stats["bash_subset_out"][key] += 1
             for p in candidate_paths:
                 base = _normalize_path(p).rsplit("/", 1)[-1]
                 paths_cfg_memory = set(paths_cfg["memory_files"]) | set(paths_cfg["workspace_scoped_files"])
                 if base in paths_cfg_memory and not predicate_p(p, paths_cfg):
+                    # R1-N20: the COUNT is the whole population; only the
+                    # sample list is capped, and the report says so.
+                    stats["deep_doc_hits_total"] += 1
                     if len(stats["deep_doc_hits"]) < 20:
                         stats["deep_doc_hits"].append(p)
 
@@ -1618,6 +1831,11 @@ def run_probe(db_path, mirror_root, paths_cfg, out_path, report_path, limit=None
     return manifest, stats
 
 
+# spec §2.1's frozen reference counts. Constants on purpose: this is the SPEC
+# BASELINE the report is compared against, NOT a statement about this run.
+# (The old report also hard-coded "命中 25 条，全部来自 claude_code；codex 侧
+# 0 条" as though it were a measurement -- that is gone; every "this run"
+# number below is read from `stats`.)
 REFERENCE_COUNTS = {"cass_recall": 26, "context_file_read": 851, "codex_host_shell": 1665}
 
 
@@ -1627,7 +1845,7 @@ def write_report(report_path, stats, manifest, session_count):
     lines.append(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n")
     lines.append(f"处理会话数: {session_count}\n")
 
-    lines.append("\n## ① 三锚点各命中数（与 spec §2.1 参考值并列）\n")
+    lines.append("\n## ① 三锚点各命中数（「命中」= 本次运行值，来自 stats；「参考值」= spec §2.1 冻结基线，不是本次结论）\n")
     for reason, ref in REFERENCE_COUNTS.items():
         got = stats["hits_by_reason"].get(reason, 0)
         lines.append(f"- `{reason}`: {got}（参考值 {ref}，差异 {got - ref:+d}）\n")
@@ -1638,8 +1856,20 @@ def write_report(report_path, stats, manifest, session_count):
 
     lines.append("\n## ③ Bash 只读子集 内/外计数\n")
     lines.append(f"- 子集内（命中五形态之一）: {stats['bash_subset_in']}\n")
-    lines.append("- 子集外（按首 token 前 10 分桶）:\n")
+    out_total = sum(stats["bash_subset_out"].values())
+    lines.append(
+        f"- 子集外（按首 token 分桶；此处只列前 10 个 token，共 {out_total} 条 / "
+        f"{len(stats['bash_subset_out'])} 个不同首 token）:\n"
+    )
     for tok, n in stats["bash_subset_out"].most_common(10):
+        lines.append(f"  - `{tok}`: {n}\n")
+    compound = stats["bash_subset_out_compound"]
+    compound_total = sum(compound.values())
+    lines.append(
+        f"- 复合形态（R2-e 拒绝：含 `|`/`&`/`;`/`<`/`>`/反引号/`*`/`?`/`[`/`]`/换行/`$` 之一；"
+        f"既不判入子集，也不计入上方「子集外」分桶）: {compound_total} 条 / {len(compound)} 个不同首 token\n"
+    )
+    for tok, n in compound.most_common(10):
         lines.append(f"  - `{tok}`: {n}\n")
 
     lines.append("\n## ④ 配对失败计数（T1b.2：按 DB 消息逐条统计，不再静默）\n")
@@ -1653,29 +1883,49 @@ def write_report(report_path, stats, manifest, session_count):
     lines.append(f"- `anchor3_no_first_user_in_mirror`（DB idx=0 是 user，但 blob 里找不到任何 user 角色事件）: {pf.get('anchor3_no_first_user_in_mirror', 0)}\n")
 
     lines.append("\n## ⑤ 谓词 P 深层同名文档计数（应全部不命中）\n")
-    lines.append(f"命中数: {len(stats['deep_doc_hits'])}（前 20 条路径）\n")
+    deep_total = stats["deep_doc_hits_total"]
+    lines.append(f"命中数: {deep_total}（全量计数）\n")
+    lines.append(f"列表为前 {len(stats['deep_doc_hits'])} 条，共 {deep_total} 条：\n")
     for p in stats["deep_doc_hits"]:
         lines.append(f"- `{p}`\n")
     nl_count = stats["bash_subset_out"].get("nl", 0)
     lines.append(
         f"\n**`nl` 单列披露**（advisor 2026-09-07 指出；v4.4 Ivan 已裁并入 R2 六形态，T2a 落地，任务书 #113）："
-        f"Bash 子集外前 10 分桶里 `nl` 有 {nl_count} 条（本次 `--selftest` 后的常量表已识别 `nl [-ba] <paths>`；"
-        "本报告若来自尚未按 v4.4 重跑的 `run_full`，这里的计数仍是六形态生效**前**的旧口径，子集内/外分布"
-        "以下一次控制面重跑探针出的 manifest v2 为准，见 docs/excluded-rules.md R2-i）。\n"
+        f"`nl` 已在只读子集内（见 docs/excluded-rules.md R2-i），本次运行落在「子集外」分桶里的 `nl` 还有 {nl_count} 条 —— "
+        "读 `nl` 的完整体量要把上方「子集内」计数一起看。\n"
     )
 
     lines.append("\n## ⑥ codex 全部 tool_name 频次（advisor 2026-09-07：核对有无可疑的 cass-mcp 调用名）\n")
+    recall_by_agent = "、".join(
+        f"{slug} {n}"
+        for (reason, slug), n in sorted(
+            (item for item in stats["hits_by_reason_agent"].items() if item[0][0] == "cass_recall"),
+            key=lambda item: item[0][1],
+        )
+    )
+    lines.append(
+        f"- `cass_recall`: 合计 {stats['hits_by_reason'].get('cass_recall', 0)}；"
+        f"按 agent_slug：{recall_by_agent or '（无）'}\n"
+    )
     codex_freq = stats["tool_name_freq"].get("codex", Counter())
-    lines.append(f"`cass_recall` 本轮命中 25 条，全部来自 claude_code；codex 侧 0 条。以下是 codex 全部 tool_call 候选（不限于配对成功的）按 `tool_name` 的前 20 频次，供核对 codex 是否真的从不调用 cass-mcp（或以另一个名字调用）：\n")
+    lines.append(
+        f"以下是 codex 全部 tool_call 候选（不限于配对成功的）按 `tool_name` 的前 20 频次"
+        f"（共 {len(codex_freq)} 个不同 `tool_name`），供核对 codex 是否真的从不调用 cass-mcp"
+        "（或以另一个名字调用）：\n"
+    )
     for name, n in codex_freq.most_common(20):
         lines.append(f"- `{name}`: {n}\n")
 
     lines.append("\n## ⑦ 连接器结构字段覆盖率\n")
-    lines.append("| agent_slug | 会话数 | 镜像可得 | 候选构造器 | 有 tool_call_id | 有 tool_name | 有 path 参数 |\n")
-    lines.append("|---|---|---|---|---|---|---|\n")
+    lines.append("| agent_slug | 会话数 | 镜像可得 | 候选构造器 | 有 tool_call_id | 有 tool_name | 有 path 参数 | 逻辑来源 |\n")
+    lines.append("|---|---|---|---|---|---|---|---|\n")
     for slug, cov in sorted(stats["coverage"].items()):
         builder = "有（claude_code/codex）" if slug in ("claude_code", "codex") else "无（本轮未实现，见 R7/R11「不启用」）"
-        lines.append(f"| {slug} | {cov['sessions']} | {cov['mirror_ok']} | {builder} | {cov['has_tool_call_id']} | {cov['has_tool_name']} | {cov['has_path_arg']} |\n")
+        lines.append(f"| {slug} | {cov['sessions']} | {cov['mirror_ok']} | {builder} | {cov['has_tool_call_id']} | {cov['has_tool_name']} | {cov['has_path_arg']} | {cov['logical_source']} |\n")
+    lines.append(
+        "「逻辑来源」= 该 agent_slug 属于 `SourceKind::Logical` 连接器（`LOGICAL_SOURCE_CONNECTORS`，"
+        "镜像 `src/indexer/mod.rs:15708`）的会话数；这类连接器没有真实文件源，捕获缺席记 `capture_na` 而非失败。\n"
+    )
 
     lines.append("\n## ⑧ unverifiable 计数（T1b.2：`out_of_scope_connector` 单列，不计入 `unverifiable_sessions`）\n")
     total_unverifiable_sessions = sum(stats["unverifiable_sessions_by_reason"].values())
@@ -1709,6 +1959,19 @@ def write_report(report_path, stats, manifest, session_count):
         "见 `t1b-mission112-report.md`（本棒终报）附的回填前/后对照表；本报告本身是回填**后**（T1b Step 4）"
         "的产物，`codex.bash=exec_command`/`bash_arg_key=cmd` 已生效。\n"
     )
+
+    lines.append("\n## ⑩ `idx≠0` codex user 记忆特征串候选（spec §60；不在锚点 3 内，默认保留）\n")
+    idx_total = stats["idx_ne_0_memory_candidates_total"]
+    lines.append(
+        f"命中数: {idx_total}（全量计数；其中 anchor3_shell_opener 也命中 "
+        f"{stats['idx_ne_0_anchor3_also']} 条）\n"
+    )
+    lines.append(
+        f"列表为前 {len(stats['idx_ne_0_memory_candidates'])} 条，共 {idx_total} 条"
+        "（判据：agent=codex、role=user、idx≠0、正文含 memory/injection-only/workspace-scoped 名单里的任一 basename）：\n"
+    )
+    for sample in stats["idx_ne_0_memory_candidates"]:
+        lines.append(f"- `{sample}`\n")
 
     lines.append(f"\n## manifest 条数\n{len(manifest)}\n")
 
