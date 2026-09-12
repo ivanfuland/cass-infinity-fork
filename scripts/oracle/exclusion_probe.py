@@ -1566,7 +1566,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           missing_nonmanifest_row=False, wrong_raw_idx=False,
                           wrong_marker_sha=False, project_read_anchor=False,
                           legit_sibling_redaction=False, compact_extra_no_body=False,
-                          candidate_only_row=False):
+                          candidate_only_row=False, array_tool_use_result=None):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1645,6 +1645,18 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
             # B07: the SAME redacted placeholder, at a path this exclusion
             # does not own. Pre-fix this passed as a clean exclusion.
             candidate_extra["ordinary"] = redacted
+        if array_tool_use_result is not None:
+            # N-R7arr (任务书 #131 T6-c): the ARRAY form of a top-level
+            # `toolUseResult` (`[{type:text,text:...}]`, what the MCP tool
+            # results record). The candidate replaced element 0's `text` with
+            # the placeholder; the reference's element either IS the excluded
+            # body's own copy (`owned` -- a legitimate exclusion the field map
+            # must admit) or is some other body's (`foreign` -- an over-clear
+            # that must stay a failure).
+            reference_text = body_text if array_tool_use_result == "owned" else "some other tool's body"
+            candidate_extra["toolUseResult"] = [
+                {"type": "text", "text": redacted if with_excluded else reference_text}
+            ]
         conn.execute(
             "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
             "VALUES (1, 1, 'tool_result', ?, ?)",
@@ -1787,6 +1799,14 @@ def verify_selftest_cases():
         # N-fam2 (任务书 #131 追加): zero diff is not a failure when no copy of
         # the body was ever in the extra (the corpus' compact shape).
         ("V13 an unchanged extra with no body anywhere passes", True, ""),
+        # N-R7arr (任务书 #131 T6-c): the ARRAY form of a top-level
+        # `toolUseResult` is a legitimate clearing target exactly when the
+        # element's `text` IS the excluded body's copy (B04's ownership proof,
+        # applied per element).
+        ("V14 an owned array toolUseResult element passes", True, ""),
+        # ... and an element carrying some OTHER body is an over-clear, even
+        # though it wears the same redacted placeholder shape.
+        ("V15 a foreign array toolUseResult element is a failure", False, "redacted a field this exclusion does not own"),
     ]
 
 
@@ -1816,6 +1836,8 @@ def _run_verify_selftest(paths_cfg):
             10: {"project_read_anchor": True},
             11: {"legit_sibling_redaction": True},
             12: {"compact_extra_no_body": True},
+            13: {"array_tool_use_result": "owned"},
+            14: {"array_tool_use_result": "foreign"},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, **flags)
@@ -3074,10 +3096,23 @@ def _allowed_extra_paths(entry, ref_row, ref_extra):
     """Concrete dot-paths (no leading dot) this exclusion may rewrite."""
     allowed = _expand_field_paths(entry.get("agent_slug"), entry.get("blocks") or [])
     if entry.get("agent_slug") == "claude_code" and isinstance(ref_extra, dict):
+        body = ref_row["content"] if ref_row is not None else None
         # The string-form top-level `toolUseResult` is a legitimate target
         # only when it IS the excluded body's copy (B04's ownership proof).
-        if _owned_body_copy(ref_extra.get("toolUseResult"), ref_row["content"] if ref_row is not None else None):
+        if _owned_body_copy(ref_extra.get("toolUseResult"), body):
             allowed.add("toolUseResult")
+        # N-R7arr (任务书 #131 T6-c): the ARRAY form
+        # (`[{"type":"text","text":...}]`, what the MCP tool results such as
+        # `mcp__cass-mcp__cass_expand` record) carries the body in each
+        # element's `text`, which no R7 field path names. Admitted PER
+        # ELEMENT, and only for an element whose reference-side `text` proves
+        # ownership of the body -- the element index is not the block index,
+        # so it cannot be expanded from `blocks` the way the `[*]` paths are.
+        items = ref_extra.get("toolUseResult")
+        if isinstance(items, list):
+            for index, item in enumerate(items):
+                if isinstance(item, dict) and _owned_body_copy(item.get("text"), body):
+                    allowed.add(f"toolUseResult[{index}].text")
     return allowed
 
 

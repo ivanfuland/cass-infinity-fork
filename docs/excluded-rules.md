@@ -127,7 +127,7 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 
 | 连接器 | 承载正文的 JSON 路径 |
 |---|---|
-| `claude_code` | `message.content[*].content`、`message.content[*].text`、`toolUseResult.file.content`；`historical_raw_json` 封装（`sqlite.rs:2046`）内的同名路径同样替换（先解包字符串内 JSON，按同表路径替换，再序列化写回）。另有 `message.content[*].thinking`（`thinking` 块，独立成 `role='reasoning'` 行）与顶层 `content`（`type=system,subtype=away_summary` 事件，独立成 `role='assistant'` 行）——两者是 T1b 探针为对齐 DB `(idx,role)` 序列而发现的正文承载点，供 T2 参考，不在 spec 原始四类锚点范围内，本身不参与排除判定。**顶层字符串型 `toolUseResult`**（R2-B4，任务书 #119a）：区别于上面对象形的 `.file.content` 子路径——同一字段名在不同工具的输出上是两种互斥的形状，对象形携带 `filePath`/`type` 等非正文元数据（子路径精确清除，兄弟字段不动），字符串形是正文本身（整体替换）——**整体替换只在能证明该字符串属于本次被清的块时发生**（B04，#131：字符串等于、或在其长度门内包含，本次被清块之一的清空前正文才清；承载别的块的正文时保留，否则同一事件两个结果块、只排除一个时会留下被排除正文的副本）。冻结库实测（`context_file_read`/`cass_recall` 两类，claude_code）：1,533/1,682 抽样 + 25/28 分别命中字符串形且与 `message.content` 字节相同 |
+| `claude_code` | `message.content[*].content`、`message.content[*].text`、`toolUseResult.file.content`；`historical_raw_json` 封装（`sqlite.rs:2046`）内的同名路径同样替换（先解包字符串内 JSON，按同表路径替换，再序列化写回）。另有 `message.content[*].thinking`（`thinking` 块，独立成 `role='reasoning'` 行）与顶层 `content`（`type=system,subtype=away_summary` 事件，独立成 `role='assistant'` 行）——两者是 T1b 探针为对齐 DB `(idx,role)` 序列而发现的正文承载点，供 T2 参考，不在 spec 原始四类锚点范围内，本身不参与排除判定。**顶层字符串型 `toolUseResult`**（R2-B4，任务书 #119a）：区别于上面对象形的 `.file.content` 子路径——同一字段名在不同工具的输出上是两种互斥的形状，对象形携带 `filePath`/`type` 等非正文元数据（子路径精确清除，兄弟字段不动），字符串形是正文本身（整体替换）——**整体替换只在能证明该字符串属于本次被清的块时发生**（B04，#131：字符串等于、或在其长度门内包含，本次被清块之一的清空前正文才清；承载别的块的正文时保留，否则同一事件两个结果块、只排除一个时会留下被排除正文的副本）。**数组型 `toolUseResult`**（N-R7arr，#131 T6-c）：MCP 类工具结果记为 `[{"type":"text","text":…}]`，同一条归属证明逐元素施加于元素的 `text`（元素下标与块下标无关，由归属证明而非位置决定是否可清）；缺这一路时被排除正文会原样留在 `/toolUseResult[0]/text`（T6-b 候选库实测 595 B，会话 `…cc-workspace…` idx=48 cass_recall）。冻结库实测（`context_file_read`/`cass_recall` 两类，claude_code）：1,533/1,682 抽样 + 25/28 分别命中字符串形且与 `message.content` 字节相同 |
 | `codex` | `payload.output[*].text`（`function_call_output`/`custom_tool_call_output`）、`payload.content[*].text`（`message`）、`payload.arguments`/`payload.input`（tool_call 参数，`function_call`/`custom_tool_call`） |
 | 其它连接器（`gemini`、`openclaw/*` 各分身、`pi_agent`） | **锚点 1/2 不启用**：T1b 探针本轮未实现这些连接器的候选解析器（零覆盖率数据，`t1b-probe-report.md` §⑦ 对应行 `镜像可得=0`），无法确认其 `tool_name`/路径参数结构，按「宁漏勿误」不启用，非「已核实无结构」 |
 
@@ -139,7 +139,7 @@ codex 会话 `idx = 0` 且 `role = user` 的消息，且正文（去首尾空白
 
 三类锚点各自独立 `rule_version`，初值 1。判定条件（谓词 P、配对规则、锚点结构标记）任何语义变化 → 对应锚点 `rule_version + 1`；升版后必须从 raw-mirror 重摄（旧库里的排除标记不回填）。**清单改名不升版**（`config/excluded_context_paths.toml` 四数组的文件名变化，只要匹配语义不变）。
 
-`rule_version 1` = PR6 合入时的语义，含 R4 的位置约束（B03）与 R7 顶层字符串 `toolUseResult` 的归属证明（B04）；PR6 之前的 v1 快照未部署过，不构成升版事件（控制面 2026-09-12 裁）。
+`rule_version 1` = PR6 合入时的语义，含 R4 的位置约束（B03）与 R7 顶层 `toolUseResult` 的归属证明（B04 的字符串形、N-R7arr 的数组形逐元素）；PR6 之前的 v1 快照未部署过，不构成升版事件（控制面 2026-09-12 裁）。
 
 ## R9 · 镜像保留契约
 
