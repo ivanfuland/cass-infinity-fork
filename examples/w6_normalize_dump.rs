@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -52,6 +52,15 @@ fn open_readonly_immutable(path: &std::path::Path) -> anyhow::Result<Connection>
 /// coincides with the other output. Paths are resolved through
 /// `fs::canonicalize` of the nearest existing ancestor so a symlink or a
 /// `..` segment cannot dodge the comparison.
+///
+/// R6-B6 (control-plane adversarial review of #121a, blocker class: data
+/// corruption): canonicalizing does *not* unify hard links -- `ln
+/// db.sqlite alias.jsonl` leaves two distinct canonical paths naming one
+/// inode, and the `fs::write` calls below truncate whatever inode their
+/// path names. Existing paths are therefore compared by file identity
+/// `(st_dev, st_ino)`; a path that does not exist yet (the normal case for
+/// a fresh output) can alias nothing and keeps the canonical-path
+/// comparison.
 fn resolve_for_collision_check(p: &Path) -> PathBuf {
     if let Ok(c) = fs::canonicalize(p) {
         return c;
@@ -69,6 +78,37 @@ fn resolve_for_collision_check(p: &Path) -> PathBuf {
     }
 }
 
+/// R6-B6: are these two paths the same file? `fs::metadata` follows
+/// symlinks, so this is the identity of the inode a write would truncate.
+fn same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+
+/// R6-B6: any file under `root` carrying this `(dev, ino)`? Used to catch
+/// an output path that is a hard link *to a mirror blob* from outside
+/// `--mirror`, which the `starts_with` containment check cannot see.
+fn contains_inode(root: &Path, dev: u64, ino: u64) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let Ok(md) = entry.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(entry.path());
+            } else if md.dev() == dev && md.ino() == ino {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn refuse_output_collisions(db: &Path, mirror: &Path, out: &Path, identity: &Path) -> anyhow::Result<()> {
     let db_r = resolve_for_collision_check(db);
     let mirror_r = resolve_for_collision_check(mirror);
@@ -82,7 +122,7 @@ fn refuse_output_collisions(db: &Path, mirror: &Path, out: &Path, identity: &Pat
         protected.push(PathBuf::from(s));
     }
     for (label, p) in [("--out", &out_r), ("--identity", &id_r)] {
-        if protected.iter().any(|q| q == p) {
+        if protected.iter().any(|q| same_file(q, p)) {
             anyhow::bail!(
                 "{label} {} resolves to the --db file or one of its sqlite siblings; refusing to overwrite the input database",
                 p.display()
@@ -98,8 +138,21 @@ fn refuse_output_collisions(db: &Path, mirror: &Path, out: &Path, identity: &Pat
         if p.is_dir() {
             anyhow::bail!("{label} {} is a directory", p.display());
         }
+        // R6-B6: the containment check above misses a hard link to a blob
+        // placed outside --mirror. Only an existing path with more than one
+        // link can be such an alias, so the walk (the mirror holds
+        // thousands of files) runs for those alone.
+        if let Ok(md) = fs::metadata(p) {
+            if md.nlink() > 1 && contains_inode(&mirror_r, md.dev(), md.ino()) {
+                anyhow::bail!(
+                    "{label} {} is a hard link to a file under --mirror {}; refusing to write into the data directory",
+                    p.display(),
+                    mirror_r.display()
+                );
+            }
+        }
     }
-    if out_r == id_r {
+    if same_file(&out_r, &id_r) {
         anyhow::bail!("--out and --identity resolve to the same file {}", out_r.display());
     }
     Ok(())
