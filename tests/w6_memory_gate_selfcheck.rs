@@ -269,6 +269,54 @@ fn selfcheck_a_short_stage_stays_under_the_measured_stage_ms_threshold() {
     );
 }
 
+/// N-回落 (#128 T6-a2, control-plane 2026-09-12 追加): the door is re-cut as
+/// "record only, judge the fall" -- and a per-cell peak alone cannot show a
+/// fall, so each cell now carries `last_tree` (the tree RSS of the final
+/// sample pass, bytes, same unit as `peak_tree`) and `peak_sample_idx`
+/// (which sample the peak came from, 1-based; 0 when nothing was sampled).
+///
+/// The command is chosen so the fall is *observable*: the memory hog is run
+/// as a child of a longer-lived shell, so the root outlives the drop and the
+/// poller keeps sampling after the tree has shrunk back to the shell itself.
+/// That matters for the mutation below -- writing `last_tree = peak_tree`
+/// would satisfy a bare `last_tree <= peak_tree`, so the strict
+/// `last_tree < peak_tree` assertion is what makes the mutation visible. (No
+/// pre-existing selfcheck command here produces a fall: `/bin/false` is
+/// never sampled at all and the hog holds to the end.)
+#[test]
+fn selfcheck_reports_the_last_sample_and_the_peak_sample_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let command = format!(
+        "{} --mib 150 --hold-ms 500 & sleep 1.2; wait",
+        hog_binary_path().display()
+    );
+    let outcome = run_selfcheck(tmp.path(), &["bash", "-c", &command]);
+
+    let peak = outcome.stage_json["peak_tree"].as_i64().expect("peak_tree present");
+    let last = outcome.stage_json["last_tree"].as_i64().expect("last_tree must be present");
+    let idx = outcome.stage_json["peak_sample_idx"]
+        .as_i64()
+        .expect("peak_sample_idx must be present");
+    let samples = outcome.stage_json["samples"].as_i64().expect("samples present");
+
+    assert!(
+        samples >= 4,
+        "a ~1.2s stage must yield several samples at this cadence: json={:?}",
+        outcome.stage_json
+    );
+    assert!(
+        idx >= 1 && idx <= samples,
+        "peak_sample_idx is a 1-based ordinal into the sample count: idx={idx} samples={samples}"
+    );
+    assert!(last <= peak, "the last sample cannot exceed the peak: last={last} peak={peak}");
+    assert!(
+        last < peak,
+        "this command drops its allocation while the root lives on, so the final sample must sit \
+         below the peak: last={last} peak={peak}, json={:?}",
+        outcome.stage_json
+    );
+}
+
 /// Variant ④: `--judge` with empty stdin must fail loud (exit 2), never
 /// default to a silent pass/fail. Asserts on the stderr message (not just
 /// the exit code): an empty/whitespace-only input is *also* invalid JSON,
