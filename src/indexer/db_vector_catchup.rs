@@ -48,7 +48,11 @@ use crate::storage::vector_domain;
 /// batches) over 200 chunks -- the derivation, the 200-pair distinct-message
 /// negative control (200/200 rejected, max cosine 0.628) and the embedder
 /// identity are frozen in `W6_ARTIFACTS/cosine-calibration.json`
-/// (sha256 `b191f230e56b0f80981ead908d4579990b85855beec8beaca7c5756e633a31a4`).
+/// (sha256 `e55eacd254585dff75429fd0852c9367209ca14eb99f20bcc7b6db98fbf9c7c6`),
+/// which carries the 200 raw `e` values and the 200 raw control cosines so
+/// this number is recomputable from the artifact; a re-run of the same probe
+/// reproduced `max_e` bit-identically, and the earlier summary-only artifact
+/// is kept beside the run's logs.
 /// The T4 placeholder this replaces was `1.0 - 1e-3` (= 0.9990000129f32),
 /// which real re-embedding noise did cross: a `models backfill` activation
 /// audit over this same corpus failed one sampled chunk at cosine

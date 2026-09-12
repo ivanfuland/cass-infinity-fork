@@ -99,6 +99,11 @@
 //! precondition error; **3** `max_e > 2.5e-3` -- a usable measurement that
 //! says the threshold cannot be set this way, which the task book keeps
 //! distinct from "the measurement failed" on purpose.
+//!
+//! The report carries its raw measurements (`chunk_ids` + `e_values`, and the
+//! control's `cosines`), not just the distribution: `max_e`, `e_max` and
+//! `cosine_min` are all recomputable from the artifact alone, so the constant
+//! they set is auditable without re-running the probe.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -936,6 +941,9 @@ struct NegativeControl {
     /// How many of them came out below [`CALIBRATION_NEGATIVE_MAX_COSINE`].
     rejected: usize,
     max_cosine: Option<f32>,
+    /// The raw cosine of every pair, in pair order, so `rejected` can be
+    /// recounted from the artifact instead of trusted.
+    cosines: Vec<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -950,6 +958,13 @@ struct CalibrationReport {
     batch_composition_a: String,
     batch_composition_b: String,
     chunks_compared: usize,
+    /// The probe's chunk ids, in the same order as `e_values`.
+    chunk_ids: Vec<i64>,
+    /// The raw `e = 1 - cos` of every probe chunk, so `e`'s distribution,
+    /// `max_e`, `e_max` and `cosine_min` can all be recomputed from this
+    /// artifact alone rather than taken on trust (T5 #127, control-plane
+    /// request: the summary alone left the threshold unauditable).
+    e_values: Vec<f32>,
     e: EDistribution,
     max_e: f32,
     e_max: f32,
@@ -1030,6 +1045,7 @@ fn compute_calibration(e_values: &[f32], negative_cosines: &[f32]) -> Result<(ED
         required_pairs: CALIBRATION_NEGATIVE_PAIRS,
         rejected,
         max_cosine,
+        cosines: negative_cosines.to_vec(),
     };
     if control.pairs < CALIBRATION_NEGATIVE_PAIRS || rejected < CALIBRATION_NEGATIVE_PAIRS {
         return Err(CalibrationFailure::NegativeControl { rejected, required: CALIBRATION_NEGATIVE_PAIRS, max_cosine });
@@ -1258,6 +1274,8 @@ fn run_calibrate(db_path: &Path, sample: usize, seed: u64, infinity_url: &str) -
                 batch_composition_a: "single: one request per text, input length 1".to_string(),
                 batch_composition_b: format!("batched: EMBED_BATCH={EMBED_BATCH} texts per request"),
                 chunks_compared: e_values.len(),
+                chunk_ids: primary.clone(),
+                e_values,
                 e,
                 max_e,
                 e_max,
@@ -2103,5 +2121,18 @@ mod tests {
         assert_eq!(report.negative_control.pairs, 200);
         assert_eq!(report.negative_control.rejected, 200, "distinct texts must reject every control pair");
         assert!(report.passed);
+
+        // The artifact has to carry the raw measurements, not just the summary:
+        // anything derived from `e_values` (the distribution, max_e, e_max,
+        // cosine_min) is recomputable from the JSON alone.
+        assert_eq!(report.chunk_ids.len(), report.e_values.len());
+        assert_eq!(report.e_values.len(), 200);
+        assert_eq!(report.negative_control.cosines.len(), 200);
+        let recomputed_max = report.e_values.iter().copied().fold(f32::MIN, f32::max);
+        assert_eq!(recomputed_max, report.max_e, "max_e must be the maximum of the published e_values");
+        assert_eq!(report.e_max, (2.0 * recomputed_max).max(1e-3));
+        assert_eq!(report.cosine_min, 1.0 - report.e_max);
+        let recounted = report.negative_control.cosines.iter().filter(|c| c.is_finite() && **c < 0.95).count();
+        assert_eq!(recounted, report.negative_control.rejected);
     }
 }
