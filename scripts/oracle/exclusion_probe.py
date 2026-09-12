@@ -202,8 +202,22 @@ def _anchored_under_cc_workspace(normalized: str, base: str) -> bool:
 def _is_windows_drive_absolute(p: str) -> bool:
     """Mirrors `exclusion.rs::is_windows_drive_absolute` exactly: a
     Windows drive-letter absolute path AFTER `_normalize_path`'s `\\` ->
-    `/` conversion, e.g. `C:/projects/...`."""
-    return len(p) >= 3 and p[0].isalpha() and p[1] == ":" and p[2] == "/"
+    `/` conversion, e.g. `C:/projects/...`.
+
+    R3-N4 (任务书 #125): the drive letter is ASCII-only there
+    (`bytes[0].is_ascii_alphabetic()`), and `str.isalpha()` is Unicode --
+    `é:/projects/cc-workspace/USER.md` was judged an absolute path here and
+    a relative one in Rust, so the probe could freeze a manifest entry
+    production would never produce. `isascii()` restores the equivalence;
+    with the first character ASCII, byte and character indexing agree, so
+    the remaining `[1] == ":"` / `[2] == "/"` tests are unaffected."""
+    return (
+        len(p) >= 3
+        and p[0].isascii()
+        and p[0].isalpha()
+        and p[1] == ":"
+        and p[2] == "/"
+    )
 
 
 def predicate_p(raw_path: str, paths_cfg: dict) -> bool:
@@ -961,6 +975,18 @@ def selftest_cases(paths_cfg):
     cands = [_mk("user", text=text6)]
     cases.append(("R3-N3 cwd in second environment_context block after empty first block", cands, 0, 0, "codex", "codex_host_shell"))
 
+    # 23. R3-N4 (任务书 #125): the Windows drive-letter test must use the
+    # ASCII character class, not Python's Unicode `str.isalpha()`. Rust is
+    # `bytes[0].is_ascii_alphabetic()` (`exclusion.rs:763`), so `é:/...` is
+    # NOT a Windows absolute path there -- and the probe must not invent a
+    # manifest entry production would never produce. `_normalize_path` keeps
+    # the segment intact, so the non-ASCII first character is what decides.
+    cands = [
+        _mk("tool_call", tool_call_id="t1", tool_name="Read", args={"file_path": "é:/projects/cc-workspace/USER.md"}),
+        _mk("tool_result", tool_call_id="t1"),
+    ]
+    cases.append(("R3-N4 non-ASCII drive letter is not an absolute path", cands, 1, 0, "claude_code", None))
+
     return cases
 
 
@@ -1090,7 +1116,7 @@ def selftest_content_cases():
 
 def _run_decide_selftest(paths_cfg):
     cases = selftest_cases(paths_cfg)
-    assert len(cases) == 22, f"selftest must have exactly 22 cases, got {len(cases)}"
+    assert len(cases) == 23, f"selftest must have exactly 23 cases, got {len(cases)}"
     passed = 0
     for name, cands, index, idx_in_session, agent_slug, expect in cases:
         pairing = PairingContext(cands)
