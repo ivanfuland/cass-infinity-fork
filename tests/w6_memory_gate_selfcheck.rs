@@ -1024,3 +1024,111 @@ fn the_gate_script_is_executable_by_its_own_path() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Source the gate and call `p0_for <shape> <stage> <fixture_sha256>` with `W6`
+/// pointing at `w6`, which is where `p0_for` reads `memgate-baseline.json`.
+fn run_p0_for(
+    w6: &std::path::Path,
+    shape: &str,
+    stage: &str,
+    fixture_sha256: &str,
+) -> std::process::Output {
+    Command::new("bash")
+        .arg("-c")
+        .arg(". \"$1\"; p0_for \"$2\" \"$3\" \"$4\"")
+        .arg("--")
+        .arg(gate_script())
+        .arg(shape)
+        .arg(stage)
+        .arg(fixture_sha256)
+        .env("W6", w6)
+        .output()
+        .expect("spawn bash -c 'source memory_gate.sh; p0_for ...'")
+}
+
+/// R9-N06 (任务书 #132): `p0_for` handed out a cell's `max(peak_tree,peak_proc)`
+/// on nothing more than "both fields are integers", so a cell collected on a
+/// DIFFERENT fixture, or from a run that was not `measured`, did not exit 0, or
+/// recorded a zero peak, still produced a `p0_ratio` that reads like a valid
+/// same-fixture comparison. Two zero peaks also divided by zero. A cell now has
+/// to BE a measurement of this fixture, and the reason goes to stderr when it
+/// is not, so a later re-collection can see which cells went unused.
+#[test]
+fn p0_lookup_refuses_a_cell_that_is_not_a_valid_measurement_of_this_fixture() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let fixture = "f".repeat(64);
+    let other_fixture = "e".repeat(64);
+    // One cell, `a`/`index`, with the four fields the validity rule reads and
+    // an optional override for any of them.
+    let cell = |peak_tree: i64, peak_proc: i64, measured: bool, exit_code: i64, fixture_sha: &str| {
+        format!(
+            r#"{{"a":{{"index":{{"measured":{measured},"exit_code":{exit_code},"peak_tree":{peak_tree},"peak_proc":{peak_proc},"fixture_sha256":"{fixture_sha}"}}}}}}"#
+        )
+    };
+    let write = |body: &str| std::fs::write(tmp.path().join("memgate-baseline.json"), body).unwrap();
+
+    // ① the baseline this rule must not reject: a valid cell of THIS fixture.
+    write(&cell(1000, 4000, true, 0, &fixture));
+    let out = run_p0_for(tmp.path(), "a", "index", &fixture);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "4000",
+        "a valid cell of this fixture must still supply its peak; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // ② a cell measured on a DIFFERENT fixture is not a comparison basis.
+    write(&cell(1000, 4000, true, 0, &other_fixture));
+    let out = run_p0_for(tmp.path(), "a", "index", &fixture);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "a cell from another fixture must not supply a peak"
+    );
+    assert!(
+        stderr.contains("fixture_sha256"),
+        "the fixture mismatch must be named on stderr, got: {stderr}"
+    );
+
+    // ③ `measured: false` -- the cell is not a measurement at all.
+    write(&cell(1000, 4000, false, 0, &fixture));
+    let out = run_p0_for(tmp.path(), "a", "index", &fixture);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "", "an unmeasured cell must not supply a peak");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("measured"),
+        "the unmeasured cell must be named on stderr"
+    );
+
+    // ④ a cell whose run did not exit 0.
+    write(&cell(1000, 4000, true, 1, &fixture));
+    let out = run_p0_for(tmp.path(), "a", "index", &fixture);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "a cell from a failed run must not supply a peak"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("exit_code"),
+        "the failed run must be named on stderr"
+    );
+
+    // ⑤ both peaks zero: never a peak, and never a division.
+    write(&cell(0, 0, true, 0, &fixture));
+    let out = run_p0_for(tmp.path(), "a", "index", &fixture);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "",
+        "a zero peak must not supply a peak (p0_ratio would divide by zero)"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not positive"),
+        "the zero peak must be named on stderr"
+    );
+
+    // ⑥ no baseline at all: unchanged, still nothing (and no stderr noise).
+    std::fs::remove_file(tmp.path().join("memgate-baseline.json")).unwrap();
+    let out = run_p0_for(tmp.path(), "a", "index", &fixture);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "");
+    assert_eq!(out.status.code(), Some(0));
+}
