@@ -7319,10 +7319,25 @@ fn spawn_connector_producer(
                         // landed a single row.
                         tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
                         scan_succeeded = false;
-                        let _ = tx.send(IndexMessage::ScanError {
-                            connector_name: name,
-                            error: format!("prepare_conversation_for_ingest failed: {error}"),
-                        });
+                        // R1-N26 (任务书 #129): a failed send means the
+                        // consumer is gone. Discarding it (`let _ = ...`)
+                        // left this producer scanning every remaining scan
+                        // root for nobody. Reuse the same
+                        // `StreamingConsumerDisconnected` type the flush and
+                        // scan arms below already return, so the caller's
+                        // existing `is_streaming_consumer_disconnected`
+                        // guard stops this thread.
+                        if tx
+                            .send(IndexMessage::ScanError {
+                                connector_name: name,
+                                error: format!("prepare_conversation_for_ingest failed: {error}"),
+                            })
+                            .is_err()
+                        {
+                            return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                                connector_name: name,
+                            }));
+                        }
                         Ok(())
                     }
                 }
@@ -7437,10 +7452,25 @@ fn spawn_connector_producer(
                         // callback above.
                         tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
                         scan_succeeded = false;
-                        let _ = tx.send(IndexMessage::ScanError {
-                            connector_name: name,
-                            error: format!("prepare_conversation_for_ingest failed: {error}"),
-                        });
+                        // R1-N26 (任务书 #129): a failed send means the
+                        // consumer is gone. Discarding it (`let _ = ...`)
+                        // left this producer scanning every remaining scan
+                        // root for nobody. Reuse the same
+                        // `StreamingConsumerDisconnected` type the flush and
+                        // scan arms below already return, so the caller's
+                        // existing `is_streaming_consumer_disconnected`
+                        // guard stops this thread.
+                        if tx
+                            .send(IndexMessage::ScanError {
+                                connector_name: name,
+                                error: format!("prepare_conversation_for_ingest failed: {error}"),
+                            })
+                            .is_err()
+                        {
+                            return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                                connector_name: name,
+                            }));
+                        }
                         Ok(())
                     }
                 }
@@ -25986,6 +26016,71 @@ mod tests {
         Box::new(DisconnectAwareConnector)
     }
 
+    /// R1-N26 (任务书 #129): producer-side twin of `DISCONNECT_TEST_COUNTER`
+    /// for the *prepare-failure* path specifically. `spawn_connector_producer`
+    /// has two arms that used to discard their `ScanError` send result with
+    /// `let _ =` (the local-sources callback and the `additional_scan_roots`
+    /// one): with the consumer already gone, the producer kept scanning every
+    /// remaining root for nothing. This fixture makes prepare fail -- a
+    /// `File`-sourced conversation whose source path does not exist, so
+    /// `attach_raw_mirror_capture` fails with NotFound -- and counts
+    /// `scan_with_callback` invocations, so the COUNT is the judge of whether
+    /// the producer stopped: 1 = stopped at the first failed send, 2 = went on
+    /// to scan the next root.
+    static PREPARE_FAILURE_DISCONNECT_SCAN_CALLS: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+    static PREPARE_FAILURE_DISCONNECT_SOURCE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    struct PrepareFailureDisconnectConnector;
+
+    impl PrepareFailureDisconnectConnector {
+        fn conv() -> NormalizedConversation {
+            let source_path = PREPARE_FAILURE_DISCONNECT_SOURCE_PATH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("prepare-failure disconnect test source path should be configured");
+            let mut conv = norm_conv(Some("prepare-failure-disconnect"), vec![norm_msg(0, 1_000)]);
+            conv.source_path = source_path;
+            conv
+        }
+    }
+
+    impl Connector for PrepareFailureDisconnectConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(vec![Self::conv()])
+        }
+
+        fn scan_with_callback(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let counter = PREPARE_FAILURE_DISCONNECT_SCAN_CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("prepare-failure disconnect test counter should be configured");
+            counter.fetch_add(1, Ordering::Relaxed);
+            on_conversation(Self::conv())?;
+            Ok(())
+        }
+    }
+
+    fn prepare_failure_disconnect_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(PrepareFailureDisconnectConnector)
+    }
+
     #[test]
     fn next_streaming_batch_splits_large_message_batches() {
         let limits = StreamingBatchLimits {
@@ -29740,6 +29835,74 @@ mod tests {
         );
 
         *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// R1-N26 (任务书 #129): the prepare-failure arms of
+    /// `spawn_connector_producer` must stop the producer when the
+    /// `ScanError` send fails (consumer already gone), not discard the send
+    /// result and keep scanning the remaining roots. The fixture's
+    /// `scan_with_callback` counts its own invocations, so the assertion is
+    /// on the scan count, not on a log line: 1 = the producer returned as
+    /// soon as it learned the consumer was gone, 2 = it went on to scan the
+    /// configured additional root after the failed send.
+    #[test]
+    fn producer_stops_after_prepare_failure_when_scan_error_send_fails() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        *PREPARE_FAILURE_DISCONNECT_SCAN_CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(counter.clone());
+        // Deliberately NOT created: `attach_raw_mirror_capture` reads this
+        // path, so prepare fails with NotFound -- the `Err` arm this test
+        // exists to exercise (not the hook, not the oversized-batch path).
+        let missing_source = tmp.path().join("deleted-source.jsonl");
+        assert!(!missing_source.exists(), "sanity: the source must stay absent");
+        *PREPARE_FAILURE_DISCONNECT_SOURCE_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(missing_source);
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        drop(rx);
+
+        let handle = spawn_connector_producer(
+            "claude",
+            prepare_failure_disconnect_connector_factory,
+            tx,
+            StreamingProducerConfig {
+                flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                data_dir,
+                additional_scan_roots: vec![ScanRoot::remote(
+                    PathBuf::from("/remote/fixture/claude"),
+                    Origin::remote("fixture-host"),
+                    Some(crate::sources::config::Platform::Linux),
+                )],
+                since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
+                full_scan_source_ids: Arc::new(HashSet::new()),
+                progress: None,
+                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+            },
+        );
+
+        handle
+            .join()
+            .expect("producer should stop cleanly after the consumer disconnect");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "a prepare failure whose ScanError send fails must stop the producer, not leave it \
+             scanning the remaining scan roots for a consumer that is gone"
+        );
+
+        *PREPARE_FAILURE_DISCONNECT_SCAN_CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *PREPARE_FAILURE_DISCONNECT_SOURCE_PATH
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
