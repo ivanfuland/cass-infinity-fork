@@ -974,3 +974,53 @@ fn normal_mode_refuses_to_delete_an_existing_result_tree() {
         "nothing may be written once the door refused"
     );
 }
+
+/// R9-N05 (任务书 #132): the gate script lost its executable bit in this range
+/// (Git mode `100755` -> `100644`), so a normal checkout's
+/// `scripts/oracle/memory_gate.sh …` fails with a permission error. Every
+/// other test in this file starts it through `Command::new("bash")`, which
+/// cannot see that regression at all: `bash <script>` does not need the bit.
+/// This one runs the script BY ITS OWN PATH.
+#[test]
+fn the_gate_script_is_executable_by_its_own_path() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(gate_script())
+            .expect("stat scripts/oracle/memory_gate.sh")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "scripts/oracle/memory_gate.sh must carry an executable bit in the CHECKOUT itself \
+             (Git mode 100755) -- being runnable through `bash <script>` is not the same thing; \
+             mode = {mode:o}"
+        );
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    // ...and really exec it that way, so a bit the OS still refuses cannot
+    // satisfy the assertion above.
+    let output = Command::new(gate_script())
+        .arg("--selfcheck")
+        .arg("--")
+        .arg("/bin/true")
+        .env("RUN_ROOT", tmp.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap_or_else(|e| {
+            panic!(
+                "scripts/oracle/memory_gate.sh must be runnable by its own path, but exec failed: \
+                 {e}"
+            )
+        });
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|l| l.trim_start().starts_with('{')),
+        "running the script by its own path must still produce the stage JSON; rc={:?} \
+         stdout={stdout:?} stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
