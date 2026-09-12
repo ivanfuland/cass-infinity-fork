@@ -1731,6 +1731,15 @@ mod memprobe {
     use super::*;
     use serial_test::serial;
 
+    /// R7-6 (#128 T6-a2): R6-N7's other half -- the env var must be saved and
+    /// handed back rather than blindly removed, because the removed form
+    /// leaves whatever an outer process had set clobbered.
+    ///
+    /// The stand-in value below is what makes that a testable claim rather
+    /// than a comment: with the variable merely unset on entry, "restore"
+    /// and "remove" write the same thing, so deleting the restore would be
+    /// invisible. Setting an outer-process stand-in first is what gives the
+    /// closing assertion something to be red about.
     #[test]
     #[serial]
     fn disabled_by_default_creates_no_file() {
@@ -1738,8 +1747,19 @@ mod memprobe {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log_path = dir.join("memprobe.jsonl");
+        let ambient = dir.join("ambient.jsonl");
+        let original = std::env::var_os("CASS_MEMPROBE_LOG");
         // SAFETY: #[serial] keeps this the only test touching this env key
-        // at a time; it is unset both before and after.
+        // at a time; the value found on entry is put back before returning.
+        unsafe {
+            std::env::set_var("CASS_MEMPROBE_LOG", &ambient);
+        }
+        let prior = std::env::var_os("CASS_MEMPROBE_LOG");
+        assert_eq!(
+            prior.as_deref(),
+            Some(ambient.as_os_str()),
+            "the outer-process stand-in must be in place before the unset case is exercised"
+        );
         unsafe {
             std::env::remove_var("CASS_MEMPROBE_LOG");
         }
@@ -1748,6 +1768,34 @@ mod memprobe {
             !log_path.exists(),
             "memprobe_point must not create a file when CASS_MEMPROBE_LOG is unset"
         );
+        assert!(
+            !ambient.exists(),
+            "the probe must not write while its env var is unset"
+        );
+        // R7-6 (#128 T6-a2): the save/restore the removed form lacked. Without
+        // it this assertion fails on `left: None` against the outer-process
+        // stand-in above -- which is exactly the state the old
+        // `remove_var`-and-forget body left behind.
+        unsafe {
+            match &prior {
+                Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
+                None => std::env::remove_var("CASS_MEMPROBE_LOG"),
+            }
+        }
+        assert_eq!(
+            std::env::var_os("CASS_MEMPROBE_LOG"),
+            prior,
+            "the test must hand the env var back exactly as it found it"
+        );
+        // Hygiene, not the assertion above: put back the value this *process*
+        // held on entry, so a later test -- which need not be `#[serial]` --
+        // does not inherit a path inside this test's temp dir.
+        unsafe {
+            match &original {
+                Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
+                None => std::env::remove_var("CASS_MEMPROBE_LOG"),
+            }
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1772,6 +1820,39 @@ mod memprobe {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
         let dir = std::env::temp_dir().join(format!("cass-memprobe-enabled-{}-{unique}", std::process::id()));
+        // R7-6 (#128 T6-a2): the uniqueness of this path is part of the
+        // claim, not an implementation detail -- it is what keeps two
+        // concurrent *test processes* from appending to each other's file,
+        // since the pid filter below cannot separate them. Assert the shape
+        // it must have, so dropping the nanosecond stamp (leaving the pid
+        // alone, the pre-R6-N7 form) fails here instead of silently
+        // weakening the cross-process defence.
+        let name = dir
+            .file_name()
+            .expect("the probe's temp dir has a file name")
+            .to_str()
+            .expect("the probe's temp dir name is UTF-8");
+        let segments: Vec<&str> = name.split('-').collect();
+        assert_eq!(
+            segments.len(),
+            5,
+            "the enabled probe's temp dir must be cass-memprobe-enabled-<pid>-<nanos>, got {name:?}"
+        );
+        assert_eq!(segments[0..3], ["cass", "memprobe", "enabled"], "unexpected temp dir prefix: {name:?}");
+        assert_eq!(
+            segments[3],
+            std::process::id().to_string(),
+            "the pid segment must be this process's pid: {name:?}"
+        );
+        assert!(
+            !segments[4].is_empty() && segments[4].bytes().all(|b| b.is_ascii_digit()),
+            "the last segment must be the nanosecond stamp, got {:?} in {name:?}",
+            segments[4]
+        );
+        assert_ne!(
+            segments[4], segments[3],
+            "the stamp must be its own segment, not the pid repeated: {name:?}"
+        );
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let log_path = dir.join("memprobe.jsonl");
@@ -1784,11 +1865,20 @@ mod memprobe {
         memprobe_point("ingest", "start");
         memprobe_point("ingest", "end");
         unsafe {
-            match prior {
+            match &prior {
                 Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
                 None => std::env::remove_var("CASS_MEMPROBE_LOG"),
             }
         }
+        // R7-6 (#128 T6-a2): the restore above is a claim, so assert it. This
+        // test sets the variable itself, so deleting the restore leaves it
+        // pointing at this test's own (about to be deleted) temp path --
+        // which is what makes this assertion red under that mutation.
+        assert_eq!(
+            std::env::var_os("CASS_MEMPROBE_LOG"),
+            prior,
+            "the test must hand the env var back exactly as it found it"
+        );
 
         let text = fs::read_to_string(&log_path).unwrap();
         // R7-7 (#124): every line of this file is this probe's own output, so
