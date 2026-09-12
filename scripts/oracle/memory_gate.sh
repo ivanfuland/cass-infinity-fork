@@ -79,8 +79,12 @@
 # a real stage run): memory_gate.sh --judge < stage.json
 #   Reads one stage-result JSON object from stdin, applies the same
 #   judgment `judge_from_stdin` uses internally, exits 0 (pass) / 1 (fail)
-#   / 2 (empty input, invalid JSON, or missing a required field --
-#   fail-loud, never defaults). This is also how run_stage's own judgment
+#   / 2 (empty input, invalid JSON, a field missing, or a field whose type
+#   or value is not a valid measurement -- #123 R6-B1: these are treated
+#   as an adversary's input, so `"false"` is not a bool, a negative peak is
+#   not a count, and `measured=true` needs the samples/stage_ms the
+#   emitter's own rule requires). Fail-loud, never defaults. This is also
+#   how run_stage's own judgment
 #   step is implemented (it pipes the JSON it just built through the same
 #   function), so there is exactly one judgment code path.
 set -u
@@ -226,13 +230,60 @@ if missing:
     print(f"judge: missing required field(s): {missing}", file=sys.stderr)
     sys.exit(2)
 
+def is_int(v):
+    # bool is an int subclass in Python; a JSON `true` is not a count.
+    return isinstance(v, int) and not isinstance(v, bool)
+
+# R6-B1 (control-plane adversarial review of T4, blocker class: false
+# green). The hand-fillable surfaces here (a hand-written P0 entry, or any
+# JSON piped into `--judge`) must be validated as adversarial input, not
+# trusted: `bool(measured)` alone accepted the string `"false"` as true,
+# zero samples and zero stage_ms passed as a valid measurement, negative
+# peaks compared as numbers, and an absent `budget` key silently dropped
+# the budget term (the four reproductions in the review all exited 0).
+# Types are checked before values, and an internally inconsistent object
+# (`measured=true` with fewer than the two samples / 200ms that run_stage
+# itself requires) is malformed input, not a pass.
 measured = obj["measured"]
 exit_code = obj["exit_code"]
 peak_tree = obj["peak_tree"]
 peak_proc = obj["peak_proc"]
-budget = obj.get("budget")
 
-ok = bool(measured) and exit_code == 0
+if not isinstance(measured, bool):
+    print(f"judge: field measured must be a JSON bool, got {measured!r}", file=sys.stderr)
+    sys.exit(2)
+for name, value in (("exit_code", exit_code), ("peak_tree", peak_tree), ("peak_proc", peak_proc)):
+    if not is_int(value) or value < 0:
+        print(f"judge: field {name} must be a non-negative integer, got {value!r}", file=sys.stderr)
+        sys.exit(2)
+for name in ("samples", "stage_ms"):
+    value = obj.get(name)
+    if value is not None and (not is_int(value) or value < 0):
+        print(f"judge: field {name} must be a non-negative integer, got {value!r}", file=sys.stderr)
+        sys.exit(2)
+if measured and not (is_int(obj.get("samples")) and obj["samples"] >= 2
+                     and is_int(obj.get("stage_ms")) and obj["stage_ms"] >= 200):
+    print(
+        "judge: measured=true requires samples>=2 and stage_ms>=200 (the same rule run_stage uses to set measured)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+# `budget` is null only in --collect-baseline/--selfcheck, both of which
+# still *emit* the key; a normal stage result whose key is absent is a
+# hand-trimmed object, not a collected one -- fail loud rather than
+# silently dropping the budget term. (An explicit null for a normal shape
+# stays accepted: --collect-baseline also pipes its stages through this
+# same judgment, and that run legitimately carries null.)
+if "budget" not in obj and obj.get("shape") != "selfcheck":
+    print("judge: missing required field budget for a non-selfcheck stage (fail-loud, not a free pass)", file=sys.stderr)
+    sys.exit(2)
+budget = obj.get("budget")
+if budget is not None and (not is_int(budget) or budget < 0):
+    print(f"judge: field budget must be null or a non-negative integer, got {budget!r}", file=sys.stderr)
+    sys.exit(2)
+
+ok = measured and exit_code == 0
 if budget is not None:
     ok = ok and max(peak_tree, peak_proc) <= budget
 sys.exit(0 if ok else 1)
@@ -384,10 +435,27 @@ entry = (data.get(shape) or {}).get(stage)
 if not entry:
     print(f"memory_gate: P0 baseline missing entry for shape={shape} stage={stage}", file=sys.stderr)
     sys.exit(2)
-if not entry.get("measured") or entry.get("exit_code") != 0:
-    print(f"memory_gate: P0 baseline entry for {shape}/{stage} is not a valid run (measured/exit_code)", file=sys.stderr)
+def is_int(v):
+    # bool is an int subclass in Python; a JSON `true` is not a count.
+    return isinstance(v, int) and not isinstance(v, bool)
+
+# R6-B1: the P0 file is hand-filled (memgate-baseline.json is written by a
+# human copying a collected run's numbers), so its entries get the same
+# adversarial-reading validation `--judge` applies to a stage result:
+# `entry.get("measured")` was a truth test, so a hand-typed string
+# "false" passed as a valid run; `int(...)` coerced a string peak.
+if entry.get("measured") is not True:
+    print(f"memory_gate: P0 baseline entry for {shape}/{stage} is not a valid run (measured must be the JSON boolean true)", file=sys.stderr)
     sys.exit(2)
-p0 = max(int(entry["peak_tree"]), int(entry["peak_proc"]))
+if not is_int(entry.get("exit_code")) or entry.get("exit_code") != 0:
+    print(f"memory_gate: P0 baseline entry for {shape}/{stage} is not a valid run (exit_code must be the integer 0)", file=sys.stderr)
+    sys.exit(2)
+peak_tree = entry.get("peak_tree")
+peak_proc = entry.get("peak_proc")
+if not is_int(peak_tree) or peak_tree < 0 or not is_int(peak_proc) or peak_proc < 0:
+    print(f"memory_gate: P0 baseline entry for {shape}/{stage} has a non-integer or negative peak (peak_tree={peak_tree!r}, peak_proc={peak_proc!r})", file=sys.stderr)
+    sys.exit(2)
+p0 = max(peak_tree, peak_proc)
 budget = int(1.25 * p0 + 256 * 1024 * 1024)
 print(budget)
 PYEOF
