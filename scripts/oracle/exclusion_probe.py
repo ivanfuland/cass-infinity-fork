@@ -384,20 +384,26 @@ def anchor3_shell_opener(text: str):
         open_pos = trimmed.find("<environment_context>", search_from)
         if open_pos == -1:
             return None
-        after_open = trimmed[open_pos + len("<environment_context>"):]
-        close_rel = after_open.find(_CLOSER)
-        if close_rel == -1:
+        # R4-N2 (任务书 #125): offsets, not slices. The old form copied the
+        # whole remaining suffix into `after_open` on EVERY block, so a
+        # message of N empty blocks moved O(N^2) characters (measured 0.697 s
+        # at N=32000). `trimmed[open_end:close_pos]` is exactly what
+        # `after_open[:close_rel]` was, without the copy, and the Rust side
+        # this mirrors already borrows rather than copying.
+        open_end = open_pos + len("<environment_context>")
+        close_pos = trimmed.find(_CLOSER, open_end)
+        if close_pos == -1:
             # No close tag anywhere after this open -- unreachable in
             # practice given the `endswith(_CLOSER)` precondition above and
             # that the opener string is not a substring of the closer
             # string; kept only as a defensive bail (mirrors the Rust side).
             return None
-        if "<cwd>" in after_open[:close_rel]:
+        if trimmed.find("<cwd>", open_end, close_pos) != -1:
             for opener in _OPENERS:
                 if trimmed.startswith(opener):
                     return opener
             return "<environment_context>"
-        search_from = open_pos + len("<environment_context>") + close_rel + len(_CLOSER)
+        search_from = close_pos + len(_CLOSER)
 
 
 def _tool_call_display_text(name, args) -> str:
@@ -1241,6 +1247,44 @@ def _run_pairing_selftest(paths_cfg):
     return passed, len(cases)
 
 
+def selftest_perf_cases():
+    """Family E (任务书 #125, R4-N2): `anchor3_shell_opener` must scan a long
+    message in linear time. The pre-fix loop re-sliced the whole remaining
+    suffix on every block (`after_open = trimmed[open_pos + len(...):]`), so
+    a message of N empty environment-context blocks copied O(N^2) characters
+    -- the reviewer measured 0.659778 s at N=32000 for a function the Rust
+    side (`exclusion.rs`, borrowing slices) does in microseconds.
+
+    Each case is `(name, text, max_seconds, expected_return)`."""
+    blocks = 32000
+    return [
+        (
+            f"E1 {blocks} empty environment-context blocks scan in linear time",
+            "<environment_context></environment_context>" * blocks,
+            0.05,
+            None,
+        ),
+    ]
+
+
+def _run_perf_selftest(paths_cfg):
+    cases = selftest_perf_cases()
+    passed = 0
+    for name, text, max_seconds, expect in cases:
+        start = time.perf_counter()
+        got = anchor3_shell_opener(text)
+        elapsed = time.perf_counter() - start
+        ok = got == expect and elapsed < max_seconds
+        print(
+            f"{'ok  ' if ok else 'FAIL'} {name} "
+            f"({elapsed:.4f}s < {max_seconds}s, result={got!r}, want {expect!r})"
+        )
+        if ok:
+            passed += 1
+    print(f"selftest/perf: {passed}/{len(cases)}")
+    return passed, len(cases)
+
+
 def selftest_report_cases():
     """Family C (任务书 #125, R1-N20 + R2-N15): every number the report prints
     must be derived from `stats` -- no frozen prose about "this run", no count
@@ -1366,7 +1410,8 @@ def _run_report_selftest(paths_cfg):
 def run_selftest(paths_cfg) -> bool:
     passed = total = 0
     for runner in (_run_decide_selftest, _run_content_selftest,
-                   _run_pairing_selftest, _run_report_selftest):
+                   _run_pairing_selftest, _run_perf_selftest,
+                   _run_report_selftest):
         p, t = runner(paths_cfg)
         passed += p
         total += t
