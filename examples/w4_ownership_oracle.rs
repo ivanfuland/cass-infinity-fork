@@ -1294,8 +1294,71 @@ fn run_calibrate(db_path: &Path, sample: usize, seed: u64, infinity_url: &str) -
     }
 }
 
+/// `(canonical path, dev/ino when the file exists)` -- two names for the same
+/// file (a symlink, a hard link, `./x` vs `x`) compare equal, and a path that
+/// does not exist yet still compares by its canonical spelling.
+fn file_identity(path: &Path) -> (PathBuf, Option<(u64, u64)>) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    };
+    #[cfg(not(unix))]
+    let inode: Option<(u64, u64)> = None;
+    (canonical, inode)
+}
+
+/// B01 (任务书 #131): an output path that names the input database -- or one
+/// of its SQLite sidecars -- is data loss, not a usage slip: the final
+/// `fs::write` truncates the very file the run spent its whole budget
+/// reading, and the run still reports success. Refuse BEFORE anything runs,
+/// so a refused invocation writes nothing at all.
+fn refuse_output_over_input(db: &Path, outputs: &[(&str, &Path)]) -> Option<String> {
+    let mut sidecar_names: Vec<(String, PathBuf)> = Vec::new();
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        sidecar_names.push((format!("--db{suffix}"), PathBuf::from(sidecar)));
+    }
+    let mut inputs: Vec<(String, PathBuf)> = vec![("--db".to_string(), db.to_path_buf())];
+    for (label, path) in sidecar_names {
+        if path.exists() {
+            inputs.push((label, path));
+        }
+    }
+    for (label, out) in outputs {
+        let out_identity = file_identity(out);
+        for (input_label, input) in &inputs {
+            if out_identity == file_identity(input) {
+                return Some(format!(
+                    "{label} {} names the input database {input_label} (same file); refusing to run, nothing was written",
+                    out.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let cli = Cli::parse();
+    // B01: the collision check comes before every other precondition and
+    // before any read, so the refusal cannot itself depend on the run.
+    let mut outputs: Vec<(&str, &Path)> = Vec::new();
+    if let Some(out) = cli.out.as_deref() {
+        outputs.push(("--out", out));
+    }
+    if let Some(json) = cli.json.as_deref() {
+        outputs.push(("--json", json));
+    }
+    if let Some(dump) = cli.dump_failures.as_deref() {
+        outputs.push(("--dump-failures", dump));
+    }
+    if let Some(collision) = refuse_output_over_input(&cli.db, &outputs) {
+        eprintln!("precondition error: {collision}");
+        std::process::exit(2);
+    }
     if cli.calibrate {
         let Some(out) = cli.out.as_deref() else {
             eprintln!("precondition error: --calibrate needs --out <json>");
