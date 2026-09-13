@@ -2538,7 +2538,13 @@ def verify_selftest_cases():
         # opposite; the judge was stronger than the rules.)
         ("V2 a retained body the rules do not cover is informational", True, "",
          {"body_retained_unexcludable": 1}),
-        ("V3 a non-target block was cleared", False, "changed somewhere other than a redacted block"),
+        # E1 (任务书 #133): a label must name the SESSION, not just its row --
+        # the same `(agent, reason, idx)` occurs in many sessions, so a failure
+        # line without the identity cannot be traced back to one. The assertion
+        # spans the label and its detail, so it fails when the identity is
+        # missing rather than only when the verdict changes.
+        ("V3 a non-target block was cleared", False,
+         "idx=1|ext=verify-ext-1: extra_bin changed somewhere other than a redacted block"),
         ("V4 a non-manifest row was altered", False, "non-manifest body differs from reference"),
         # B07 (任务书 #131): the same placeholder at a path the exclusion does
         # not own is an over-clear, not a clean exclusion.
@@ -4969,7 +4975,17 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     extra_unchanged_no_body = 0
     candidate_only_rows = 0
     for entry in manifest:
-        label = f"{entry['agent_slug']}/{entry['reason']}/idx={entry['idx']}"
+        # E1 (任务书 #133): the label names the ROW, not the SESSION. On the T6-b
+        # new6 run `claude_code/context_file_read/idx=220` was shared by three
+        # different sessions, so a failure line could not be traced back to the
+        # session it came from; the ident re-run measured the same collision for
+        # `claude_code/context_file_read/idx=77` (6 manifest entries). The
+        # session identity comes last, after every existing part, so label
+        # prefixes stay stable for anything matching on them.
+        label = (
+            f"{entry['agent_slug']}/{entry['reason']}/idx={entry['idx']}"
+            f"|ext={entry.get('external_id')}"
+        )
         row = _fetch_row(conn_cand, sql_cand, entry, entry["idx"])
         if row is None:
             failures.append((label, "manifest row is absent from the candidate"))
@@ -5125,7 +5141,11 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     }
     checked = len(ref_rows)
     for key, ref_row in ref_rows.items():
-        label = f"{key[1]}/{key[0]}/idx={key[3]}"
+        # E1 (任务书 #133): this label's "reason" slot holds the SOURCE, so the
+        # session identity is the only thing that names the session at all --
+        # `key[2]` is `external_id` (falling back to `source_path`, the same
+        # rule `_session_key` uses).
+        label = f"{key[1]}/{key[0]}/idx={key[3]}|ext={key[2]}"
         row = cand_rows.get(key)
         if row is None:
             failures.append((label, "non-manifest row is missing from the candidate"))
@@ -5198,7 +5218,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                 problem = _candidate_only_excluded_problem(row, marker, conn_cand, mirror_root)
                 if problem is not None:
                     subreason, detail = problem
-                    label = f"{key[1]}/{key[0]}/idx={key[3]}"
+                    # E1 (任务书 #133): this label's "reason" slot holds the
+                    # SOURCE, so the session identity is the only thing that
+                    # names the session at all -- `key[2]` is `external_id`
+                    # (falling back to `source_path`, the same rule
+                    # `_session_key` uses).
+                    label = f"{key[1]}/{key[0]}/idx={key[3]}|ext={key[2]}"
                     if subreason == "unverifiable":
                         candidate_only_unjudgeable += 1
                         if len(candidate_only_unjudgeable_samples) < 20:
