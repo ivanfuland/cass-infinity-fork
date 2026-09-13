@@ -3484,6 +3484,45 @@ mod chunk_catchup_v5_tests {
         assert!(all_expected.iter().all(|c| c.message_id == normal_id), "all_expected must only contain the normal (non-zero-chunk) message's chunks: {all_expected:?}");
     }
 
+    /// T6-f (#134): the measured value must not drift silently.
+    /// `OWNERSHIP_COSINE_MIN` gates both the activation audit's
+    /// fresh-vs-stored check and the standalone oracle, so any future edit to
+    /// it changes what "clean activation" means -- this test pins the number
+    /// itself, carrying the evidence behind each bound in the failure message.
+    ///
+    /// The three bounds are the two measured extremes the constant has to sit
+    /// strictly between, not restatements of it:
+    ///   - `> 0.9564` -- the largest cosine seen between two *adjacent* chunks
+    ///     of the same message (400 pairs, controller-side read-only
+    ///     measurement over the `new6` corpus, 2026-09-12): the most
+    ///     confusable wrong object available, so the constant must stay above it.
+    ///   - `< 0.99133` -- the worst *same-text* re-embedding noise observed
+    ///     over a whole corpus (PR4 T12 `min_cosine=0.9913322`; PR6 T6-b run3
+    ///     `min_cosine=0.99166834` over 2,135,246 chunks), rounded down:
+    ///     genuine noise at or above it must never be rejected as a wrong object.
+    #[test]
+    fn ownership_cosine_min_is_pinned_to_the_measured_value() {
+        assert!(
+            (OWNERSHIP_COSINE_MIN - 0.99f32).abs() < 1e-6,
+            "OWNERSHIP_COSINE_MIN is {OWNERSHIP_COSINE_MIN}, not the measured 0.99 (T6-f #134). Changing it changes what a \
+             clean activation means for both the audit (`run_activation_audit`) and the oracle \
+             (examples/w4_ownership_oracle.rs); re-derive from a full-corpus run before retargeting this pin."
+        );
+        assert!(
+            OWNERSHIP_COSINE_MIN > 0.9564,
+            "OWNERSHIP_COSINE_MIN is {OWNERSHIP_COSINE_MIN}, at or below the largest same-message adjacent-chunk cosine \
+             measured (0.9564, 400 pairs, 2026-09-12) -- the constant would start accepting the most confusable wrong \
+             object available; it must sit strictly above that."
+        );
+        assert!(
+            OWNERSHIP_COSINE_MIN < 0.99133,
+            "OWNERSHIP_COSINE_MIN is {OWNERSHIP_COSINE_MIN}, at or above the worst same-text re-embedding noise measured \
+             (PR4 T12 min_cosine=0.9913322; PR6 T6-b run3 min_cosine=0.99166834 over 2,135,246 chunks) -- genuine \
+             re-embedding noise at or above this would be rejected as if it were a wrong object; the constant must stay \
+             below it."
+        );
+    }
+
     /// T4 mission #122a (D), retargeted by T6-f (#134): `OWNERSHIP_COSINE_MIN`
     /// must actually gate the activation audit's fresh-vs-stored ownership
     /// check at `:1234`, not just exist as an unused constant. Corrupts one
