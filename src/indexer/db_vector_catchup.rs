@@ -41,23 +41,58 @@ use crate::storage::vector_domain;
 /// oracle" stop meaning the same thing. Both call sites read this one
 /// constant; neither carries its own copy.
 ///
-/// **Measured value (T5, #127)**: `1 - e_max`, where
-/// `e_max = max(2 * max_e, 1e-3)` and `max_e = 6.631367e-4` is the largest
-/// `e = 1 - cos` observed when the same text was freshly re-embedded under
-/// two batch compositions (one request per text, vs `EMBED_BATCH`-sized
-/// batches) over 200 chunks -- the derivation, the 200-pair distinct-message
-/// negative control (200/200 rejected, max cosine 0.628) and the embedder
-/// identity are frozen in `W6_ARTIFACTS/cosine-calibration.json`
-/// (sha256 `e55eacd254585dff75429fd0852c9367209ca14eb99f20bcc7b6db98fbf9c7c6`),
+/// **Measured value (T6-f, #134): `1.0 - 1e-2` (= 0.99)**, re-derived from
+/// whole-corpus runs instead of a 200-chunk sample. The constant has to
+/// separate two error families, and they turn out to be far apart:
+///
+/// *What must pass* -- the same text freshly re-embedded, i.e. pure
+/// floating-point/batch noise. Two whole-corpus measurements: PR4 T12 saw
+/// `min_cosine=0.9913322` (`cosine_failed=746` at a `0.999` gate), and PR6
+/// T6-b run3 re-ran the standalone oracle over 2,135,246 chunks and saw
+/// `min_cosine=0.99166834` (342 chunks below 0.99867, `vec0_mismatch=0`).
+///
+/// *What must be rejected* -- a genuinely different object. The most
+/// confusable one available is the *adjacent* chunk of the same message: over
+/// 400 such pairs the stored-vector cosine reached `max 0.9564`
+/// (`p99 0.8798`, `p95 0.8430`, `median 0.7192`); over 200 pairs drawn from
+/// *different* messages it reached `max 0.7531`; T5's 200-pair negative
+/// control reached `max 0.6283197`.
+///
+/// 0.99 therefore sits above the worst same-text noise by `1.3e-3` (the
+/// smaller of the two observed minima, 0.9913322; PR6's 0.99166834 leaves
+/// `1.7e-3`) and below the most confusable wrong object by `3.4e-2`. That
+/// gap is the point: the threshold is not being asked to resolve anything
+/// fine, so it can be set with margin instead of at the edge of the data.
+///
+/// *Why the previous value was not enough.* T5 (#127) set this to
+/// `1 - e_max` with `e_max = max(2 * max_e, 1e-3)` and
+/// `max_e = 6.631367e-4`, the largest `e = 1 - cos` observed when the same
+/// text was freshly re-embedded under two batch compositions (one request per
+/// text, vs `EMBED_BATCH`-sized batches) over 200 chunks -- that derivation,
+/// the 200-pair distinct-message negative control (200/200 rejected, max
+/// cosine 0.628) and the embedder identity are still frozen in
+/// `W6_ARTIFACTS/cosine-calibration.json` (sha256
+/// `e55eacd254585dff75429fd0852c9367209ca14eb99f20bcc7b6db98fbf9c7c6`),
 /// which carries the 200 raw `e` values and the 200 raw control cosines so
-/// this number is recomputable from the artifact; a re-run of the same probe
-/// reproduced `max_e` bit-identically, and the earlier summary-only artifact
-/// is kept beside the run's logs.
-/// The T4 placeholder this replaces was `1.0 - 1e-3` (= 0.9990000129f32),
-/// which real re-embedding noise did cross: a `models backfill` activation
-/// audit over this same corpus failed one sampled chunk at cosine
-/// 0.99896365 before the value was measured.
-pub const OWNERSHIP_COSINE_MIN: f32 = 1.0 - 1.3262734e-3;
+/// the number stays recomputable from the artifact; a re-run of the same
+/// probe reproduced `max_e` bit-identically. But 200 chunks cannot show the
+/// tail of a noise distribution: `1 - max_e` reads the largest of 200 samples
+/// as if it bounded the whole corpus, and the value it produced
+/// (`0.99867374`) had essentially no margin -- which is why whole-corpus
+/// noise crossed it.
+/// The T4 placeholder before that was `1.0 - 1e-3` (= 0.9990000129f32),
+/// which the same real re-embedding noise crossed too: a `models backfill`
+/// activation audit over this same corpus failed one sampled chunk at cosine
+/// 0.99896365.
+///
+/// This constant gates production, not just the oracle: `run_activation_
+/// audit` re-embeds a 200-chunk sample of the freshly built generation and
+/// fails the whole activation if **any one** chunk falls below it. At the
+/// previous value the corpus rate was 342/2,135,246 chunks = 1.6e-4, so a
+/// 200-chunk sample tripped roughly 3% of activations on real re-embedding
+/// noise alone; the value is therefore an activation-reliability setting, not
+/// a tuning knob for the oracle.
+pub const OWNERSHIP_COSINE_MIN: f32 = 1.0 - 1.0e-2;
 
 /// Summary of one `run_db_vector_catchup_backfill` call, for attestation
 /// reporting (Step2).
