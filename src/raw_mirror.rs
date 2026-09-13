@@ -21,10 +21,56 @@ static BLOB_CAPTURE_CACHE: OnceLock<Mutex<HashMap<RawMirrorBlobCacheKey, RawMirr
     OnceLock::new();
 static MANIFEST_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+/// PR6 T2c (任务书 #113): prune/摄入互斥判例②的注入点-- fires inside
+/// [`prune`] after the referenced-blob protection set has been computed
+/// (R9 check already passed) but before any file is actually removed, so a
+/// test can, from inside the hook, attempt a concurrent write that
+/// references one of prune's about-to-be-deleted unreferenced blobs and
+/// observe whether `index-run.lock` correctly serializes the two. Always
+/// compiled (not `#[cfg(test)]`, since the integration test lives in a
+/// separate `tests/` crate); zero-cost when unset (`OnceLock` + `Option`
+/// check, no allocation on the hot path).
+static PRUNE_FAULT_HOOK: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_prune_fault_hook(hook: Option<Box<dyn Fn() + Send + Sync>>) {
+    *PRUNE_FAULT_HOOK.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
+}
+
+fn fire_prune_fault_hook() {
+    if let Some(lock) = PRUNE_FAULT_HOOK.get()
+        && let Some(hook) = lock.lock().unwrap().as_ref()
+    {
+        hook();
+    }
+}
+
 fn raw_mirror_fsync_enabled() -> bool {
     dotenvy::var("CASS_RAW_MIRROR_FSYNC")
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+/// R2-B5 (任务书 #119b) test observability: fires once per directory that
+/// [`force_sync_dir`] actually fsyncs -- both `sync_capture_durable`'s
+/// unconditional chain-walk and `replace_manifest_bytes`'s switch-gated one
+/// (via `force_sync_dir_chain`) funnel through `force_sync_dir`, so a single
+/// hook lets tests assert on the exact set of directories synced without
+/// `strace`. Always compiled (zero-cost when unset), same shape as
+/// `PRUNE_FAULT_HOOK` above.
+static DIR_SYNC_PROBE: OnceLock<Mutex<Option<Box<dyn Fn(&Path) + Send + Sync>>>> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_dir_sync_probe(hook: Option<Box<dyn Fn(&Path) + Send + Sync>>) {
+    *DIR_SYNC_PROBE.get_or_init(|| Mutex::new(None)).lock().unwrap() = hook;
+}
+
+fn fire_dir_sync_probe(dir: &Path) {
+    if let Some(lock) = DIR_SYNC_PROBE.get()
+        && let Some(hook) = lock.lock().unwrap().as_ref()
+    {
+        hook(dir);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +224,14 @@ pub struct RawMirrorPruneOptions {
     pub keep_tags: Vec<String>,
     pub safety_hold_down_ms: i64,
     pub apply: bool,
+    /// PR6 T2c (任务书 #113, R9): blob identities referenced by
+    /// `messages.excluded.raw.blob` in the caller's database (manifest-
+    /// relative paths, same encoding as [`RawMirrorPruneManifest::blob_relative_path`]).
+    /// Never pruned, nor is any manifest that captured one of them --
+    /// the caller reads this set via
+    /// `SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL`
+    /// while holding `index-run.lock` (R1-B1).
+    pub referenced_blobs: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -188,6 +242,14 @@ pub struct RawMirrorPruneReport {
     pub manifest_count: u64,
     pub unique_blob_count: u64,
     pub current_blob_bytes: u64,
+    /// R2-N9 (任务书 #125): distinct blobs a manifest names whose file could
+    /// not be stat'ed as a regular non-symlink file. They contribute zero
+    /// bytes to `current_blob_bytes` rather than their declared size.
+    pub unreadable_blob_count: u64,
+    /// R2-N9 (任务书 #125): referenced blobs (`messages.excluded.raw.blob`)
+    /// whose file is missing or not a regular file. Non-empty means the DB
+    /// points at mirror evidence that is not on disk; `apply` refuses.
+    pub missing_referenced_blobs: Vec<String>,
     pub safety_hold_down_ms: i64,
     pub keep_tags: Vec<String>,
     pub pinned_manifest_count: u64,
@@ -239,6 +301,8 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         manifest_count: 0,
         unique_blob_count: 0,
         current_blob_bytes: 0,
+        unreadable_blob_count: 0,
+        missing_referenced_blobs: Vec::new(),
         safety_hold_down_ms: options.safety_hold_down_ms,
         keep_tags: options.keep_tags.clone(),
         pinned_manifest_count: 0,
@@ -255,7 +319,24 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
 
     let metadata = match fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // R2-N9 (任务书 #125): no raw mirror on disk is a fresh install
+            // when nothing references one (the #253 contract: `cass mirror
+            // prune --apply` on an empty data dir still prints its summary).
+            // With live `messages.excluded.raw.blob` references in hand it
+            // means the mirror was removed while the DB still points into
+            // it -- the caller asked for the mirror, and reporting an
+            // ordinary "nothing to prune" success would hide that.
+            if options.referenced_blobs.is_empty() {
+                return Ok(report);
+            }
+            anyhow::bail!(
+                "raw mirror root {} does not exist, but {} blob(s) are still referenced by \
+                 messages.excluded.raw.blob -- the mirror is missing, not empty",
+                root.display(),
+                options.referenced_blobs.len()
+            );
+        }
         Err(err) => {
             return Err(err).with_context(|| format!("stat raw mirror root {}", root.display()));
         }
@@ -274,19 +355,32 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
     let mut blob_to_manifests: HashMap<String, Vec<String>> = HashMap::new();
     let mut manifest_by_id: HashMap<String, &RawMirrorPruneManifest> = HashMap::new();
     let mut blob_size_by_relative: HashMap<String, u64> = HashMap::new();
+    let mut unreadable_blobs: HashSet<String> = HashSet::new();
     for manifest in &manifests {
         manifest_by_id.insert(manifest.manifest_id.clone(), manifest);
         blob_to_manifests
             .entry(manifest.blob_relative_path.clone())
             .or_default()
             .push(manifest.manifest_id.clone());
-        blob_size_by_relative
-            .entry(manifest.blob_relative_path.clone())
-            .or_insert_with(|| {
-                blob_file_size(&root.join(&manifest.blob_relative_path))
-                    .unwrap_or(manifest.blob_size_bytes)
-            });
+        if blob_size_by_relative.contains_key(&manifest.blob_relative_path) {
+            continue;
+        }
+        // R2-N9 (任务书 #125): a blob that cannot be stat'ed as a regular
+        // file counts as ZERO bytes and is tallied. Falling back to
+        // `manifest.blob_size_bytes` let a missing blob contribute the size
+        // the manifest merely DECLARES to the accounting the size-based
+        // prune plans against.
+        match blob_file_size(&root.join(&manifest.blob_relative_path)) {
+            Some(size) => {
+                blob_size_by_relative.insert(manifest.blob_relative_path.clone(), size);
+            }
+            None => {
+                blob_size_by_relative.insert(manifest.blob_relative_path.clone(), 0);
+                unreadable_blobs.insert(manifest.blob_relative_path.clone());
+            }
+        }
     }
+    report.unreadable_blob_count = unreadable_blobs.len() as u64;
     report.unique_blob_count = blob_size_by_relative.len() as u64;
     report.current_blob_bytes = blob_size_by_relative
         .values()
@@ -294,19 +388,78 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .fold(0u64, u64::saturating_add);
 
     let now = now_ms();
-    let pinned_manifests = pinned_prune_manifest_ids(
+    let mut pinned_manifests = pinned_prune_manifest_ids(
         data_dir,
         &manifests,
         &options.keep_tags,
         options.safety_hold_down_ms,
         now,
     )?;
+    // R9 (任务书 #113): a manifest that captured a still-referenced blob is
+    // protected regardless of age/keep-tags -- the mirror retention
+    // contract (spec's "镜像保留契约") outranks ordinary retention policy.
+    for manifest in &manifests {
+        if options.referenced_blobs.contains(&manifest.blob_relative_path) {
+            pinned_manifests.insert(manifest.manifest_id.clone());
+        }
+    }
     report.pinned_manifest_count = pinned_manifests.len() as u64;
-    let pinned_blobs: HashSet<String> = blob_to_manifests
+    // R1-N18 (任务书 #118b): computed WITHOUT `referenced_blobs` chained in --
+    // the old code unioned `referenced_blobs` into `pinned_blobs` *before*
+    // checking `referenced_blobs.is_subset(&pinned_blobs)`, which made that
+    // check vacuously true no matter what (a set is always a subset of
+    // itself-plus-more). This set only contains blobs that actually have a
+    // manifest backing them (including any manifest pinned above specifically
+    // *because* it captured a referenced blob, R9's real protection
+    // mechanism) -- a referenced blob with no manifest at all in the
+    // inventory (a dangling `excluded.raw.blob` pointer) is absent from it,
+    // so the subset check below can actually fail.
+    let pinned_blobs_from_manifests: HashSet<String> = blob_to_manifests
         .iter()
         .filter(|(_, manifest_ids)| manifest_ids.iter().any(|id| pinned_manifests.contains(id)))
         .map(|(blob_relative_path, _)| blob_relative_path.clone())
         .collect();
+
+    if options.apply && !options.referenced_blobs.is_subset(&pinned_blobs_from_manifests) {
+        let missing: Vec<&String> =
+            options.referenced_blobs.difference(&pinned_blobs_from_manifests).collect();
+        anyhow::bail!(
+            "raw mirror prune refused: {} referenced blob(s) have no protected manifest backing them \
+             (R9 invariant violated): {missing:?}",
+            missing.len()
+        );
+    }
+
+    // R2-N9 (任务书 #125): the check above proves every referenced blob has a
+    // manifest NAMING it -- it proves nothing about the blob's file. A blob
+    // deleted out from under the mirror still passed as protected, and the
+    // prune reported success. Every referenced blob must be stat-able as a
+    // regular file; `apply` refuses while any is not, and the paths are
+    // reported either way so a dry run surfaces it too.
+    let mut missing_referenced_blobs: Vec<String> = options
+        .referenced_blobs
+        .iter()
+        .filter(|relative| blob_file_size(&root.join(relative.as_str())).is_none())
+        .cloned()
+        .collect();
+    missing_referenced_blobs.sort();
+    if !missing_referenced_blobs.is_empty() {
+        report.missing_referenced_blobs = missing_referenced_blobs.clone();
+    }
+    if options.apply && !missing_referenced_blobs.is_empty() {
+        anyhow::bail!(
+            "raw mirror prune refused: {} referenced blob(s) are named by a manifest but their \
+             files are missing or are not regular files: {missing_referenced_blobs:?}",
+            missing_referenced_blobs.len()
+        );
+    }
+
+    // Past the check above, `referenced_blobs` is already a subset of
+    // `pinned_blobs_from_manifests` (or `apply` is false and the check never
+    // ran) -- chaining it in here is the same defensive belt-and-suspenders
+    // union the pre-fix code did, just after the check instead of before it.
+    let pinned_blobs: HashSet<String> =
+        pinned_blobs_from_manifests.into_iter().chain(options.referenced_blobs.iter().cloned()).collect();
     report.pinned_blob_count = pinned_blobs.len() as u64;
 
     let mut selected_manifests: HashSet<String> = HashSet::new();
@@ -434,6 +587,7 @@ pub fn prune(data_dir: &Path, options: RawMirrorPruneOptions) -> Result<RawMirro
         .fold(0, u64::saturating_add);
 
     if options.apply {
+        fire_prune_fault_hook();
         for entry in &mut entries {
             let path = root.join(&entry.path);
             let removed = remove_prune_target_file(&path)
@@ -1173,8 +1327,18 @@ fn publish_manifest_bytes_create_new(
 
     match fs::hard_link(&temp_path, manifest_path) {
         Ok(()) => {
+            // R2-B5b (任务书 #119c): this is the manifest's FIRST-EVER
+            // publish for this capture -- `manifests/` may be the directory
+            // `ensure_private_dir_descendant` above just created, so a
+            // single-level `sync_parent` (only `manifests/` itself) leaves
+            // `manifests/`'s own entry in `v1` unsynced. Same gap, same fix
+            // as `replace_manifest_bytes` (#119b R2-B5 场景二): switch-gated
+            // full chain walk via `sync_dir_chain_if_enabled`, not the
+            // unconditional force barrier (this path runs for every
+            // session, not just excluded ones).
             sync_file(manifest_path)?;
-            sync_parent(manifest_path)?;
+            let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
+            sync_dir_chain_if_enabled(manifest_path, root, &mut synced_dirs)?;
             remove_temp_best_effort(&temp_path);
             remove_empty_temp_dir_best_effort(&temp_dir);
             Ok(false)
@@ -1274,7 +1438,8 @@ fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u
     })?;
     set_private_file_permissions(manifest_path)?;
     sync_file(manifest_path)?;
-    sync_parent(manifest_path)?;
+    let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
+    sync_dir_chain_if_enabled(manifest_path, root, &mut synced_dirs)?;
     remove_empty_temp_dir_best_effort(&temp_dir);
     Ok(())
 }
@@ -1389,6 +1554,202 @@ fn ensure_raw_mirror_root(data_dir: &Path) -> Result<PathBuf> {
     let root = root_parent.join(RAW_MIRROR_VERSION_DIR);
     ensure_private_dir(&root)?;
     Ok(root)
+}
+
+/// PR6 T2b (任务书 #114): resolve a just-captured [`RawMirrorCaptureRecord`]
+/// back to `(original_path, blob_bytes)` for `reparse_from_capture` to hand
+/// to the connector's own file parser. Manifest-relative-path validation is
+/// the same `raw_mirror_manifest_path_from_relative` every other manifest
+/// reader uses -- no second path-safety implementation.
+pub(crate) fn read_capture_for_reparse(data_dir: &Path, record: &RawMirrorCaptureRecord) -> Result<(String, Vec<u8>)> {
+    let root = raw_mirror_root(data_dir);
+    let manifest_path = raw_mirror_manifest_path_from_relative(&root, &record.manifest_relative_path)?;
+    let manifest = read_raw_mirror_manifest(&manifest_path)?;
+    let blob_path = root.join(&record.blob_relative_path);
+    let blob = fs::read(&blob_path).with_context(|| format!("read raw mirror blob {}", blob_path.display()))?;
+    Ok((manifest.original_path, blob))
+}
+
+/// PR6 T2b (任务书 #114, R2-B3): force-fsync a session's captured blob and
+/// manifest (plus their parent directories) *unconditionally* -- unlike
+/// [`sync_file`]/[`sync_parent`], this does **not** consult
+/// `CASS_RAW_MIRROR_FSYNC` (Global Constraints: "排除行提交前镜像必须持久化
+/// ...不受 CASS_RAW_MIRROR_FSYNC 默认关闭影响"). Called only when the
+/// session being prepared has at least one exclusion marker; sessions with
+/// none keep the existing (default-off) fsync behavior untouched.
+pub(crate) fn sync_capture_durable(data_dir: &Path, record: &RawMirrorCaptureRecord) -> Result<()> {
+    let root = raw_mirror_root(data_dir);
+    let manifest_path = raw_mirror_manifest_path_from_relative(&root, &record.manifest_relative_path)?;
+    let blob_path = root.join(&record.blob_relative_path);
+
+    force_sync_file(&blob_path)?;
+    force_sync_file(&manifest_path)?;
+
+    // R1-B3 (任务书 #118a): fsync the FULL directory chain up to the mirror
+    // root, not just each file's immediate parent -- a freshly-created
+    // `blobs/blake3/<prefix>/` needs its own entry fsynced in `blake3/`,
+    // and (if also new) `blake3/`'s entry fsynced in `blobs/`, or a crash
+    // can lose an intermediate directory's entry even though the leaf file
+    // itself is durable, making the blob unreachable despite `sync_all`
+    // having "succeeded". `synced_dirs` dedupes across the blob/manifest
+    // chains (they usually share ancestors) within this one call only --
+    // no state carries across separate `sync_capture_durable` invocations.
+    let mut synced_dirs: HashSet<PathBuf> = HashSet::new();
+    force_sync_dir_chain(&blob_path, &root, &mut synced_dirs)?;
+    force_sync_dir_chain(&manifest_path, &root, &mut synced_dirs)?;
+
+    // R2-B5 场景一 (任务书 #119b): `force_sync_dir_chain` stops AT `root`
+    // (inclusive) -- it fsyncs `v1`'s own directory listing but never the
+    // entry FOR `v1` inside `v1`'s parent (`raw-mirror/`). A freshly-created
+    // `v1` (this raw mirror's very first capture) is therefore still not
+    // durable even after both chain-walks above succeed: `raw-mirror/`'s own
+    // directory listing was never fsynced, so `v1`'s directory entry can
+    // still be lost on crash despite everything under it being durable.
+    // Unconditional (same as the rest of this function) and cheap --
+    // `raw-mirror/`'s listing essentially never changes again after the
+    // first capture ever made against this `data_dir`.
+    if let Some(root_parent) = root.parent() {
+        force_sync_dir(root_parent)?;
+    }
+
+    // R3-B1 (任务书 #119d): the fix directly above only carries the chain up
+    // to `raw-mirror/`'s own directory listing -- it never fsyncs `data_dir`
+    // itself, which is `raw-mirror/`'s parent and therefore the directory
+    // that actually holds `raw-mirror/`'s entry. Same gap, one level higher:
+    // a freshly-created `raw-mirror/` (this data_dir's very first capture
+    // ever) is still not durably *reachable from data_dir* even though
+    // everything under it (including `raw-mirror/`'s own listing) is now
+    // durable. Unconditional and cheap regardless of whether `data_dir`
+    // itself happens to be newly created this run -- `data_dir`'s "does it
+    // contain raw-mirror/" fact only changes once, on the first capture ever
+    // made against this `data_dir`.
+    //
+    // R4-B1 (任务书 #120a): this function has no way to create `data_dir`
+    // itself and therefore no way to know whether it was just created --
+    // that's `create_dir_all_durable`'s job, at whichever call site actually
+    // creates `data_dir` (`acquire_index_run_lock` for a normal index run;
+    // `QuarantineState::save`, `prepare_headless_once_tui_artifacts`, and
+    // `cass doctor --fix`'s data-directory auto-repair for the other
+    // production entry points that can create it). Each of those closes
+    // `data_dir`'s OWN durability (its entry in ITS OWN parent) at creation
+    // time, immediately, before any capture can run -- so by the time this
+    // function is ever called, that half of the chain is already someone
+    // else's discharged responsibility. This line's only job is the half
+    // BELOW `data_dir`: making `raw-mirror/`'s entry inside `data_dir`
+    // durable, which is unconditional and cheap for the reason above.
+    force_sync_dir(data_dir)?;
+    Ok(())
+}
+
+fn force_sync_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options.open(path).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror file {}", path.display()))
+}
+
+/// Walk `path`'s parent directory upward through `root` (inclusive),
+/// force-syncing each level not already covered by an earlier call within
+/// the same `synced_dirs` set. Stops at `root` even if further ancestors
+/// exist (never fsyncs outside the mirror tree).
+fn force_sync_dir_chain(path: &Path, root: &Path, synced_dirs: &mut HashSet<PathBuf>) -> Result<()> {
+    let Some(start) = path.parent() else {
+        return Ok(());
+    };
+    for dir in start.ancestors() {
+        if !synced_dirs.insert(dir.to_path_buf()) {
+            break;
+        }
+        force_sync_dir(dir)?;
+        if dir == root {
+            break;
+        }
+    }
+    Ok(())
+}
+
+// R4-B1 (任务书 #120a): `pub(crate)` so `create_dir_all_durable`'s callers
+// outside this module (`acquire_index_run_lock`, `QuarantineState::save`,
+// `prepare_headless_once_tui_artifacts`, `cass doctor --fix`) share the same
+// fsync-a-directory primitive AND the same `DIR_SYNC_PROBE` test hook --
+// visibility change only, behavior unchanged.
+#[cfg(not(windows))]
+pub(crate) fn force_sync_dir(dir: &Path) -> Result<()> {
+    File::open(dir).and_then(|file| file.sync_all()).with_context(|| format!("force-sync raw mirror directory {}", dir.display()))?;
+    fire_dir_sync_probe(dir);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn force_sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// R4-B1 (任务书 #120a): create `path` and any missing ancestors (exactly
+/// like `fs::create_dir_all`, same permissions -- `path` is never treated as
+/// a private raw-mirror directory here, unlike `create_private_dir_all`),
+/// then fsync the PARENT of every ancestor this call actually created, so
+/// each newly-created directory's own entry survives a crash.
+///
+/// This is the fix for the R4-B1 class of bug: four rounds in a row
+/// (`v1` -> `raw-mirror/` -> `data_dir` -> `data_dir`'s own ancestors) each
+/// guessed a fixed upper bound for how far up the fsync chain needed to
+/// reach, and each guess was wrong because SOMETHING ELSE in this codebase
+/// could -- and does -- create the directory one level above the previous
+/// guess's stopping point. This function has no guessed stopping point: it
+/// walks `path`'s ancestors, checking actual filesystem state to find which
+/// ones do NOT yet exist, creates exactly those, and fsyncs exactly their
+/// parents -- "新建到哪就同步到哪" (sync as far up as this call actually
+/// built, nothing more, nothing less, no assumption about what's above).
+///
+/// Existing ancestors are left untouched and unsynced by this function --
+/// this call's contract only covers what IT builds. A directory that
+/// already existed before this call is either a) durable because whoever
+/// created it already made it durable, or b) a residual crash-durability
+/// gap that predates this call entirely and is out of scope for it to fix.
+pub(crate) fn create_dir_all_durable(path: &Path) -> Result<()> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    for ancestor in path.ancestors() {
+        // N06 (任务书 #131): a bare relative path's ancestors are `fresh-data`
+        // and then the EMPTY path -- the current directory, which this call
+        // neither creates nor may fsync. Walking into it pushed `""` into
+        // `missing`, and the sync loop below then opened `""` (ENOENT), so the
+        // first `create_dir_all_durable(Path::new("fresh-data"))` in a fresh
+        // cwd failed. `run_index` / `QuarantineState::save` hit this whenever
+        // `data_dir` is a bare relative name.
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if fs::symlink_metadata(ancestor).is_ok() {
+            break;
+        }
+        missing.push(ancestor.to_path_buf());
+    }
+    // `missing` was collected leaf-first (`path` itself, then its parent,
+    // ...); reverse it so `create_dir_all` below builds shallow-to-deep --
+    // matches `std::fs::create_dir_all`'s own order and doesn't matter for
+    // correctness (it creates the whole chain in one call regardless), but
+    // keeps the syncing loop below in the same intuitive order.
+    missing.reverse();
+
+    fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))?;
+
+    let mut synced_parents: HashSet<PathBuf> = HashSet::new();
+    for created in &missing {
+        // The same empty-parent shape, one level down: for a single-component
+        // relative path the directory to sync IS `.`.
+        let parent = match created.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+            other => other,
+        };
+        if let Some(parent) = parent
+            && synced_parents.insert(parent.to_path_buf())
+        {
+            force_sync_dir(parent)?;
+        }
+    }
+    Ok(())
 }
 
 fn raw_mirror_blob_cache_key(
@@ -1763,6 +2124,23 @@ fn sync_parent(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// R2-B5 场景二 (任务书 #119b): switch-controlled twin of
+/// [`force_sync_dir_chain`]. `sync_parent` only fsyncs `path`'s immediate
+/// parent -- fine for a file whose parent directory already existed, but
+/// `replace_manifest_bytes` can be the call that creates an intermediate
+/// directory for the first time (e.g. `manifests/`, on this mirror root's
+/// very first manifest write, via its own `ensure_private_dir_descendant`
+/// call), and a single-level sync leaves THAT directory's own entry in
+/// `root` unfsynced. Still a no-op when `CASS_RAW_MIRROR_FSYNC` is unset --
+/// Ivan's ruling is "the barrier is complete when the switch is on", not
+/// "every write gets a hard sync by default".
+fn sync_dir_chain_if_enabled(path: &Path, root: &Path, synced_dirs: &mut HashSet<PathBuf>) -> Result<()> {
+    if !raw_mirror_fsync_enabled() {
+        return Ok(());
+    }
+    force_sync_dir_chain(path, root, synced_dirs)
+}
+
 fn unique_temp_path(dir: &Path, label: &str) -> PathBuf {
     let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -2119,6 +2497,13 @@ pub fn rebuild_manifest_db_links(
 mod tests {
     use super::*;
 
+    /// Tests that register [`set_dir_sync_probe`] mutate process-global
+    /// state (like `HOOK_TEST_SERIALIZE` in `tests/w6_exclusion_ingest.rs`)
+    /// and must be serialized against each other, or one test's hook can
+    /// observe -- or clobber -- another's while `cargo test` runs them on
+    /// different threads of the same process.
+    static DIR_SYNC_PROBE_TEST_SERIALIZE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn capture_source_file_writes_doctor_compatible_manifest_idempotently() {
         let temp = tempfile::TempDir::new().expect("tempdir");
@@ -2235,6 +2620,953 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// R1-B3 (任务书 #118a): a freshly-captured blob lives several
+    /// directory levels deep (`raw-mirror/v1/blobs/blake3/<prefix>/`) under
+    /// a mirror root that itself didn't exist before this capture -- every
+    /// one of those levels is a brand-new directory. `sync_capture_durable`
+    /// must walk and fsync the full chain up to the mirror root without
+    /// erroring, not just the blob/manifest's immediate parent.
+    #[test]
+    fn sync_capture_durable_walks_full_directory_chain_to_root() {
+        // R4-N1 (任务书 #120a): this test calls `sync_capture_durable`, which
+        // fires the process-global `DIR_SYNC_PROBE` (via `force_sync_dir`)
+        // just like every other test in this module -- but until now it did
+        // NOT hold `DIR_SYNC_PROBE_TEST_SERIALIZE`. A concurrent test that
+        // has armed the probe (e.g. `..._fsyncs_mirror_root_parent_directory_
+        // entry`) would have this test's fsync calls land in ITS `synced`
+        // collection, corrupting a set-equality assertion made against a
+        // completely different temp tree. This test doesn't install a probe
+        // itself, so holding the lock is a secondary defense only -- the
+        // primary defense is the probe-observer test filtering by its own
+        // `data_dir` prefix (see below), which doesn't depend on every
+        // caller of `sync_capture_durable` remembering to take this lock.
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b3-fixture.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b3\"}\n").expect("write source");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+
+        sync_capture_durable(&data_dir, &record)
+            .expect("sync_capture_durable must succeed across a freshly-created multi-level directory chain");
+    }
+
+    /// R2-B5 场景一 (任务书 #119b): `force_sync_dir_chain` stops AT `root`
+    /// (`raw-mirror/v1`) inclusive -- it never fsyncs `v1`'s own directory
+    /// entry inside `v1`'s parent (`raw-mirror/`). This is the durability
+    /// gap: a freshly-created `v1` can vanish from `raw-mirror/`'s listing
+    /// after a crash even though everything under `v1` is itself durable.
+    /// `sync_capture_durable` must fsync `raw-mirror/` too, unconditionally
+    /// (it is already gated on "session has an exclusion marker" by its one
+    /// caller -- the R1-B3 force barrier -- so this extra level costs
+    /// nothing extra in the common case).
+    ///
+    /// R3-B1 (任务书 #119d): the same gap exists one level higher -- fsyncing
+    /// `raw-mirror/`'s own listing only makes `v1`'s entry durable, not
+    /// `raw-mirror/`'s OWN entry inside `data_dir`. `data_dir` is guaranteed
+    /// pre-existing (the caller already has an open database inside it), so
+    /// this is unconditional and cheap for the same reason as the level
+    /// below it. This test now also asserts chain completeness: the full
+    /// leaf-to-`data_dir` layer enumeration, derived from the capture's own
+    /// relative paths, must equal exactly what the probe observed.
+    #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
+    fn sync_capture_durable_fsyncs_mirror_root_parent_directory_entry() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5-scenario1.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5-1\"}\n").expect("write source");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        // `capture_source_file` (not under test here) creates `v1` and
+        // everything under it *before* the probe is armed, so only
+        // `sync_capture_durable`'s own fsyncs land in `synced`.
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = sync_capture_durable(&data_dir, &record);
+        set_dir_sync_probe(None);
+        result.expect("sync_capture_durable must succeed");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        // R4-N1 (任务书 #120a): `DIR_SYNC_PROBE` is process-global (see its
+        // doc comment above) -- ANY concurrently-running test that calls
+        // into `force_sync_dir` (directly or via `sync_capture_durable`)
+        // while this probe is armed lands its own directories in `synced`
+        // too, even though `DIR_SYNC_PROBE_TEST_SERIALIZE` is held here.
+        // Holding that lock only orders this test against OTHER tests that
+        // also remember to take it -- `sync_capture_durable_walks_full_
+        // directory_chain_to_root` didn't (fixed above, but the fix is a
+        // convention that the next new test could just as easily forget
+        // again). Filtering to only this test's own `data_dir` subtree is
+        // the primary defense: it doesn't depend on every future caller of
+        // `sync_capture_durable` remembering to serialize -- a foreign
+        // test's temp directory can never collide with this filter because
+        // each test gets its own `tempfile::TempDir`.
+        let synced = synced.lock().unwrap();
+        let synced: Vec<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
+        assert!(
+            synced.contains(&v1_dir),
+            "sanity: v1 itself must still be fsynced (R1-B3, unchanged); synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&raw_mirror_dir),
+            "sync_capture_durable must fsync raw-mirror/ itself (v1's own directory entry in \
+             its parent), not just v1 and everything below it; synced dirs: {synced:?}"
+        );
+        // R3-B1 (任务书 #119d): `raw-mirror/`'s own listing being durable
+        // only makes V1'S entry durable -- it does nothing for `raw-mirror/`
+        // itself possibly being a brand-new entry in `data_dir`'s listing.
+        // `data_dir` (this test's own `data_dir` binding) must also be
+        // fsynced -- unconditionally, regardless of whether `data_dir`
+        // itself is newly created this run (R4-B1, 任务书 #120a: whether
+        // `data_dir`'s OWN entry in ITS parent needs syncing is a separate,
+        // OUT-OF-SCOPE-for-this-function concern, handled at whoever
+        // actually creates `data_dir` -- see `sync_capture_durable`'s doc
+        // comment).
+        assert!(
+            synced.contains(&data_dir),
+            "sync_capture_durable must also fsync data_dir itself (raw-mirror/'s own directory \
+             entry in ITS parent) -- fsyncing raw-mirror/ alone only makes v1's entry durable, \
+             not raw-mirror/'s own entry inside data_dir; synced dirs: {synced:?}"
+        );
+
+        // R3-B1 chain-completeness judge: derive the FULL enumerated layer
+        // set (every leaf-to-data_dir directory level from the #119d layer
+        // table) from this capture's OWN relative paths -- not a hardcoded
+        // hash prefix -- and assert the probe observed exactly this set,
+        // deduped, no more and no fewer. This is what turns the manual
+        // layer-by-layer enumeration into a standing regression judge: the
+        // next time a level silently drops out of the chain walk, this
+        // assertion goes red instead of waiting for a reviewer to recount.
+        fn walk_up_inclusive(mut dir: PathBuf, stop_at: &Path, into: &mut HashSet<PathBuf>) {
+            loop {
+                into.insert(dir.clone());
+                if dir == stop_at {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+        let mut expected_dirs: HashSet<PathBuf> = HashSet::new();
+        expected_dirs.insert(data_dir.clone());
+        expected_dirs.insert(raw_mirror_dir.clone());
+        let blob_leaf_dir = v1_dir.join(&record.blob_relative_path).parent().expect("blob path has a parent").to_path_buf();
+        let manifest_leaf_dir = v1_dir.join(&record.manifest_relative_path).parent().expect("manifest path has a parent").to_path_buf();
+        walk_up_inclusive(blob_leaf_dir, &v1_dir, &mut expected_dirs);
+        walk_up_inclusive(manifest_leaf_dir, &v1_dir, &mut expected_dirs);
+        let observed_dirs: HashSet<PathBuf> = synced.iter().cloned().collect();
+        assert_eq!(
+            observed_dirs, expected_dirs,
+            "chain completeness: probe-observed synced directory set must exactly equal the \
+             #119d layer enumeration (every leaf-to-data_dir level), derived from this capture's \
+             own relative paths"
+        );
+    }
+
+    /// R4-N1 (任务书 #120a): the chain-completeness `assert_eq!` above is a
+    /// SET-equality judge over `DIR_SYNC_PROBE` observations, and that probe
+    /// is process-global -- a concurrently-running test's directories can
+    /// land in the same observation stream. This test proves the fix (filter
+    /// by this test's own `data_dir` prefix before comparing) actually does
+    /// its job: it manually injects a foreign path -- shaped exactly like
+    /// another test's temp tree, i.e. NOT under this test's `data_dir` --
+    /// into the same probe stream a real concurrent test would pollute it
+    /// with, then asserts the post-filter set still equals the untouched
+    /// expected set. The mutation (commenting out the filter, done by hand
+    /// during R4-N1's real fix -- see the report) turns this from "probably
+    /// works" into "verified": without the filter, the injected path is an
+    /// extra element the equality assertion cannot tolerate.
+    #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
+    fn sync_capture_durable_probe_filter_rejects_foreign_test_tree_pollution() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-n1-filter.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello n1\"}\n").expect("write source");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+
+        // Shaped like another concurrent test's own tempdir + data_dir -- a
+        // sibling of `temp`, not a descendant of THIS test's `data_dir`.
+        let foreign_pollution = temp
+            .path()
+            .parent()
+            .expect("tempdir has a parent")
+            .join("other-concurrent-test-tree")
+            .join("cass-data")
+            .join("raw-mirror")
+            .join("v1");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        let foreign_for_hook = foreign_pollution.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            let mut guard = synced_for_hook.lock().unwrap();
+            // Simulate the exact interleaving R4-N1 describes: a foreign
+            // test's `force_sync_dir` call lands in this probe stream
+            // alongside ours, once per real observation.
+            guard.push(foreign_for_hook.clone());
+            guard.push(dir.to_path_buf());
+        })));
+        let result = sync_capture_durable(&data_dir, &record);
+        set_dir_sync_probe(None);
+        result.expect("sync_capture_durable must succeed");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let synced = synced.lock().unwrap();
+        // Positive: the foreign path is present in the RAW probe stream --
+        // this is what a real concurrent-test interleaving would produce.
+        assert!(
+            synced.contains(&foreign_pollution),
+            "test setup sanity: foreign pollution must actually be in the raw probe stream"
+        );
+
+        // R4-N1 fix under test: filtering by this test's own `data_dir`
+        // prefix must drop the foreign path before any equality assertion.
+        let filtered: HashSet<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
+        assert!(
+            !filtered.contains(&foreign_pollution),
+            "R4-N1: filtering by this test's own data_dir prefix must reject a foreign \
+             concurrent test's directory tree, not just happen to not contain it"
+        );
+
+        fn walk_up_inclusive(mut dir: PathBuf, stop_at: &Path, into: &mut HashSet<PathBuf>) {
+            loop {
+                into.insert(dir.clone());
+                if dir == stop_at {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+        let mut expected_dirs: HashSet<PathBuf> = HashSet::new();
+        expected_dirs.insert(data_dir.clone());
+        expected_dirs.insert(raw_mirror_dir.clone());
+        let blob_leaf_dir = v1_dir.join(&record.blob_relative_path).parent().expect("blob path has a parent").to_path_buf();
+        let manifest_leaf_dir = v1_dir.join(&record.manifest_relative_path).parent().expect("manifest path has a parent").to_path_buf();
+        walk_up_inclusive(blob_leaf_dir, &v1_dir, &mut expected_dirs);
+        walk_up_inclusive(manifest_leaf_dir, &v1_dir, &mut expected_dirs);
+        assert_eq!(
+            filtered, expected_dirs,
+            "R4-N1: after filtering out the injected foreign pollution, the chain-completeness \
+             equality judge must still pass exactly as it would with no concurrent interference \
+             (variant without the filter: this assertion fails because `filtered` would still \
+             contain `foreign_pollution`, one extra element `expected_dirs` doesn't have)"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 正例①：`data_dir` 本身连同其祖先都是新建的（`temp`
+    /// 下嵌套两层，`nested/` 与 `nested/cass-data` 都不存在）-- 断言
+    /// `create_dir_all_durable` 对每个新建层各自的父目录都做了 fsync：既包括
+    /// `data_dir` 自己的父目录（`nested/`），也包括 `nested/` 自己的父目录
+    /// （`temp.path()`，本就存在，充当自然边界）。这正是"新建到哪就同步到
+    /// 哪"要证明的：边界不是硬编码的一跳，而是由实际文件系统状态动态决定的。
+    #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
+    fn create_dir_all_durable_syncs_parent_of_every_newly_created_level_positive() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let nested = temp.path().join("nested");
+        let data_dir = nested.join("cass-data");
+        assert!(!nested.exists(), "test setup sanity: nested/ must not pre-exist");
+        assert!(!data_dir.exists(), "test setup sanity: data_dir must not pre-exist");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = create_dir_all_durable(&data_dir);
+        set_dir_sync_probe(None);
+        result.expect("create_dir_all_durable must succeed creating a multi-level path");
+
+        assert!(data_dir.is_dir(), "data_dir must actually be created");
+        assert!(nested.is_dir(), "nested/ must actually be created");
+
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&nested),
+            "create_dir_all_durable must fsync data_dir's own parent (nested/), which it newly \
+             created; synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&temp.path().to_path_buf()),
+            "create_dir_all_durable must ALSO fsync nested/'s own parent (temp.path()), because \
+             nested/ itself was newly created too -- this is the 'no hardcoded upper bound' part: \
+             it must keep climbing past data_dir's immediate parent for as long as each level up \
+             was also newly built, not stop after exactly one hop; synced dirs: {synced:?}"
+        );
+        assert_eq!(
+            synced.len(),
+            2,
+            "must sync exactly the two newly-created levels' parents, no more (temp.path() itself, \
+             which pre-existed, must not have its own parent synced -- that's outside this call's \
+             contract); synced dirs: {synced:?}"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 正例②：`data_dir` 已经预先存在（调用方已经
+    /// `fs::create_dir_all` 过）-- 断言 `create_dir_all_durable` 不 fsync
+    /// 任何目录，证明它不是无脑往上刷，只对"这次调用真正新建的"负责。
+    /// N06 (任务书 #131): a bare relative path's direct ancestor is the EMPTY
+    /// path -- the current directory, not a directory this call creates. The
+    /// ancestor walk pushed `""` into the created-set and the sync loop then
+    /// tried to fsync it (`File::open("")` -> ENOENT), so the first
+    /// `create_dir_all_durable(Path::new("fresh-data"))` in a fresh cwd failed.
+    /// `run_index`/`QuarantineState::save` reach this whenever `data_dir` is a
+    /// bare relative name.
+    ///
+    /// R9-N01 (任务书 #132): this test used to `std::env::set_current_dir` --
+    /// PROCESS-GLOBAL -- under the crate's serial lock, on the stated premise
+    /// that "every other test in this binary works from absolute temp paths,
+    /// so the window only affects a `#[serial]` sibling". The premise is
+    /// false: `src/search/canonicalize.rs`'s
+    /// `hard_noise_phrases_json_matches_source` (:1406) and
+    /// `low_signal_phrases_json_matches_source` (:1477) each read the RELATIVE
+    /// path `scripts/oracle/hard_noise_phrases.json` and neither carries
+    /// `#[serial]`, so a read landing inside the chdir window looks for the
+    /// file under an empty temp directory and panics.
+    ///
+    /// The body now runs in a CHILD process -- this same test binary
+    /// re-invoked with `--exact` on this test's name, with its cwd set to the
+    /// tempdir -- so the lib test process' cwd is never touched and the
+    /// `#[serial]` attribute is no longer needed for the same reason.
+    #[test]
+    fn create_dir_all_durable_bare_relative_path_creates_and_syncs_positive() {
+        const CHILD_MARKER: &str = "CASS_RAW_MIRROR_BARE_RELATIVE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let exe = std::env::current_exe().expect("current_exe");
+            let output = std::process::Command::new(exe)
+                .args([
+                    "--exact",
+                    "raw_mirror::tests::create_dir_all_durable_bare_relative_path_creates_and_syncs_positive",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .current_dir(temp.path())
+                .output()
+                .expect("spawn the child test process");
+
+            assert!(
+                output.status.success(),
+                "the child process (cwd = a fresh tempdir) must create and sync the bare relative \
+                 directory; status={:?} stdout={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // The invariant the sibling tests depend on, asserted where it
+            // matters: the LIB test process' cwd still resolves the relative
+            // fixture path `search::canonicalize` reads.
+            assert!(
+                std::env::current_dir()
+                    .expect("cwd")
+                    .join("scripts/oracle/hard_noise_phrases.json")
+                    .is_file(),
+                "the lib test process' cwd must still resolve scripts/oracle/hard_noise_phrases.json"
+            );
+            return;
+        }
+        let result = create_dir_all_durable(Path::new("fresh-data"));
+        result.expect("a bare relative first-run directory must be created and made durable");
+        assert!(
+            Path::new("fresh-data").is_dir(),
+            "the directory must exist after the call (the child's cwd is its tempdir)"
+        );
+    }
+
+    #[test]
+    fn create_dir_all_durable_does_not_sync_when_data_dir_already_exists_positive() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        fs::create_dir_all(&data_dir).expect("pre-create data_dir");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = create_dir_all_durable(&data_dir);
+        set_dir_sync_probe(None);
+        result.expect("create_dir_all_durable must succeed as a no-op when data_dir pre-exists");
+
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.is_empty(),
+            "create_dir_all_durable must not fsync anything when data_dir already existed before \
+             the call; synced dirs: {synced:?}"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 正例③（R4 点名的组合场景的 raw_mirror.rs 侧一半）：
+    /// `create_dir_all_durable` 与 `sync_capture_durable` 各自的职责边界在
+    /// 衔接点上不留缝隙 -- `data_dir` 连同其祖先都是新建的，走完
+    /// `create_dir_all_durable` → `capture_source_file` →
+    /// `sync_capture_durable` 这条真实调用链后，从镜像叶子（blob/manifest）
+    /// 一路到"第一个本来就存在的祖先"（`temp.path()`）之间的每一层都被同步
+    /// 过，恰好衔接、不重不漏。这条判例不依赖谁创建了 `data_dir` 之上还是
+    /// 之下这类实现细节，只断言"整条链没有洞"。
+    #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
+    fn create_dir_all_durable_and_sync_capture_durable_seam_has_no_gap_positive() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let nested = temp.path().join("nested");
+        let data_dir = nested.join("cass-data");
+        let source_path = temp.path().join("rollout-r4b1-seam.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello r4b1\"}\n").expect("write source");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+
+        // Same order as production: `acquire_index_run_lock` creates
+        // `data_dir` (here simulated directly, since it's `indexer::mod.rs`
+        // machinery this module doesn't otherwise need) BEFORE any capture
+        // ever runs.
+        create_dir_all_durable(&data_dir).expect("create_dir_all_durable");
+        let db_link = RawMirrorDbLink {
+            conversation_id: Some(1),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: std::slice::from_ref(&db_link),
+        })
+        .expect("capture");
+        sync_capture_durable(&data_dir, &record).expect("sync_capture_durable");
+
+        set_dir_sync_probe(None);
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        fn walk_up_inclusive(mut dir: PathBuf, stop_at: &Path, into: &mut HashSet<PathBuf>) {
+            loop {
+                into.insert(dir.clone());
+                if dir == stop_at {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) => dir = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+        // Every level from `temp.path()` (the first pre-existing ancestor)
+        // down to `data_dir` -- this is `create_dir_all_durable`'s half.
+        let mut expected: HashSet<PathBuf> = HashSet::new();
+        expected.insert(nested.clone());
+        expected.insert(temp.path().to_path_buf());
+        // `sync_capture_durable`'s half: data_dir itself and everything
+        // below (unchanged mechanism from R1-B3/R2-B5/R3-B1).
+        expected.insert(data_dir.clone());
+        expected.insert(raw_mirror_dir.clone());
+        let blob_leaf_dir = v1_dir.join(&record.blob_relative_path).parent().expect("blob path has a parent").to_path_buf();
+        let manifest_leaf_dir = v1_dir.join(&record.manifest_relative_path).parent().expect("manifest path has a parent").to_path_buf();
+        walk_up_inclusive(blob_leaf_dir, &v1_dir, &mut expected);
+        walk_up_inclusive(manifest_leaf_dir, &v1_dir, &mut expected);
+
+        let synced = synced.lock().unwrap();
+        let observed: HashSet<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(temp.path()))
+            .cloned()
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "seam judge: the union of what create_dir_all_durable synced (data_dir and its newly \
+             built ancestors' parents) and what sync_capture_durable synced (data_dir down to the \
+             mirror leaves) must exactly equal every directory level from the mirror leaves up to \
+             the first pre-existing ancestor -- no gap at the data_dir boundary, no double-sync \
+             beyond it; synced dirs: {synced:?}"
+        );
+    }
+
+    /// R4-B1 (任务书 #120a) 源码级断言门：全仓扫描 `.rs` 文件，找 `create_dir_all(`
+    /// 后面直接跟 `data_dir`/`&data_dir` 的**字面**命中，断言生产代码里一个都
+    /// 没有——所有新建 `data_dir` 的入口都必须走 `create_dir_all_durable`，否
+    /// 则镜像树/数据目录的祖先目录项不会被持久化（见 R4-B1）。这是把这次的
+    /// 人工穷举（`create_private_dir_all`/`ensure_private_dir`/
+    /// `ensure_private_dir_descendant`/`acquire_index_run_lock`/
+    /// `QuarantineState::save`/`prepare_headless_once_tui_artifacts`/`cass
+    /// doctor --fix`）固化成一条会自己复检的规则，不用等下一轮审查者手工去
+    /// 数：往后谁再写一处裸 `create_dir_all(data_dir)`，本地/CI 跑测试就红。
+    ///
+    /// 白名单本应是"仅 `create_dir_all_durable` 函数体内部那一处"，但该函数
+    /// 的形参命名为 `path`（不是 `data_dir` —— 它本来就不是 `data_dir` 专用
+    /// 的，`quarantine.rs`/`lib.rs` 的调用方各自传入的是自己的 `data_dir` 局
+    /// 部变量，被调函数不该以调用方的变量名自居），所以 `create_dir_all_
+    /// durable` 内部那行 `fs::create_dir_all(path)` 天然不匹配这条字面规
+    /// 则——白名单集合因此是**空集**，不需要在扫描逻辑里显式排除任何一行。
+    ///
+    /// **已知局限**（如实写明，不声称穷尽）：① 只做逐行字面文本匹配，抓不到
+    /// "参数名不叫 `data_dir` 但实参确实是 `data_dir`"的间接情形（例如包一层
+    /// 局部变量改名后传入）；② 不是真正的 Rust 语法解析器，用启发式规则（`fn`/
+    /// `mod` 声明是否被 `#[test]`/`#[cfg(test)]` 直接修饰、或位于已经进入的
+    /// test 作用域内）跳过测试代码，行内注释里的花括号或字符串字面量里的花括
+    /// 号理论上能扰乱花括号计数进而错误分类某一行。失效方向以漏报为主（新入
+    /// 口用了扫描抓不到的形态就会被放过），不是误报——按控制面裁定，这个方向
+    /// 可以接受。
+    #[test]
+    fn no_production_create_dir_all_data_dir_literal_outside_durable_helper() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations: Vec<String> = Vec::new();
+        scan_dir_for_bare_create_dir_all_data_dir(&src_dir, &mut violations);
+        assert!(
+            violations.is_empty(),
+            "found production (non-test) code that creates data_dir via a bare \
+             create_dir_all(data_dir)/create_dir_all(&data_dir) instead of going through \
+             create_dir_all_durable -- see R4-B1 (任务书 #120a): the newly-created directory's \
+             ancestor entries won't be made durable. Violations:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    fn scan_dir_for_bare_create_dir_all_data_dir(dir: &Path, violations: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir_for_bare_create_dir_all_data_dir(&path, violations);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else { continue };
+            scan_file_for_bare_create_dir_all_data_dir(&path, &content, violations);
+        }
+    }
+
+    /// Heuristic test-code detector -- see the door test's doc comment above
+    /// for the documented, accepted limitations. Tracks a brace-depth stack
+    /// of `is_test` flags: a new scope (any `{`) inherits its enclosing
+    /// scope's `is_test` unless the line declaring it was itself directly
+    /// preceded by a pending `#[test]`/`#[cfg(test)]` attribute, in which
+    /// case the new scope (and everything nested inside it, transitively --
+    /// this is what correctly classifies helper functions with no attribute
+    /// of their own, like this file's own `f6_fixture`, as test code purely
+    /// because they're lexically inside a `#[cfg(test)] mod tests { ... }`).
+    fn scan_file_for_bare_create_dir_all_data_dir(path: &Path, content: &str, violations: &mut Vec<String>) {
+        let mut is_test_stack: Vec<bool> = vec![false];
+        let mut pending_test_attr = false;
+
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            let currently_test = *is_test_stack.last().unwrap_or(&false);
+
+            if !currently_test
+                && (line.contains("create_dir_all(data_dir)") || line.contains("create_dir_all(&data_dir)"))
+            {
+                violations.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+
+            if trimmed.starts_with("#[cfg(test)]") || trimmed.starts_with("#[test]") {
+                pending_test_attr = true;
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+                // Blank lines, comments, and other attributes don't clear a
+                // pending test attribute -- several attributes/doc comments
+                // can stack before the item they apply to.
+                continue;
+            }
+
+            let new_scope_is_test = pending_test_attr || currently_test;
+            pending_test_attr = false;
+            for ch in line.chars() {
+                match ch {
+                    '{' => is_test_stack.push(new_scope_is_test),
+                    '}' => {
+                        if is_test_stack.len() > 1 {
+                            is_test_stack.pop();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// R2-B5 场景二 (任务书 #119b): `replace_manifest_bytes`'s post-rename
+    /// sync used to be `sync_file` + `sync_parent`, and `sync_parent` only
+    /// fsyncs the manifest's IMMEDIATE parent (`manifests/`) -- when the
+    /// switch is on, it must now walk the full chain up to the mirror root,
+    /// because `manifests/`'s own directory entry inside `v1` may never
+    /// have been synced by any prior call (the unconditional force barrier
+    /// only fires for sessions with an exclusion marker). Exercised through
+    /// `merge_manifest_db_links` -- the real production call site
+    /// (`record_persisted_raw_mirror_db_link` in `indexer/mod.rs`) -- not
+    /// `replace_manifest_bytes` directly (private).
+    #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
+    fn merge_manifest_db_links_walks_full_directory_chain_when_fsync_enabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5-scenario2.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5-2\"}\n").expect("write source");
+
+        // Switch off for the initial capture: this test is only about what
+        // `replace_manifest_bytes` (via `merge_manifest_db_links`) does, not
+        // `publish_manifest_bytes_create_new`'s own (separate, out of this
+        // mission's scope) gap.
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        // SAFETY: tests that touch `CASS_RAW_MIRROR_FSYNC` are serialized
+        // via `DIR_SYNC_PROBE_TEST_SERIALIZE`, same pattern as `ENV_LOCK`
+        // elsewhere in this crate (`indexer/semantic_progress.rs`).
+        unsafe {
+            std::env::set_var("CASS_RAW_MIRROR_FSYNC", "1");
+        }
+        let link = RawMirrorDbLink {
+            conversation_id: Some(7),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let result = merge_manifest_db_links(&data_dir, &record.manifest_relative_path, std::slice::from_ref(&link));
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        set_dir_sync_probe(None);
+        result.expect("merge_manifest_db_links must succeed with the switch on");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let manifests_dir = v1_dir.join("manifests");
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&manifests_dir),
+            "sanity: manifests/ itself must still be fsynced (pre-existing sync_parent \
+             behavior); synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&v1_dir),
+            "replace_manifest_bytes must walk the full chain up to v1 when the switch is on, \
+             not just fsync manifests/ one level; synced dirs: {synced:?}"
+        );
+    }
+
+    /// Negative half of the case above: with the switch off (default),
+    /// `merge_manifest_db_links` must not fsync anything at all -- Ivan's
+    /// ruling is "the barrier is complete when the switch is on", not
+    /// "every write gets a hard sync by default" (不改 `CASS_RAW_MIRROR_FSYNC`
+    /// 默认值).
+    #[test]
+    fn merge_manifest_db_links_does_not_sync_when_fsync_disabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5-scenario2-off.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5-2-off\"}\n").expect("write source");
+
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture");
+
+        // SAFETY: see above -- serialized via DIR_SYNC_PROBE_TEST_SERIALIZE.
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let link = RawMirrorDbLink {
+            conversation_id: Some(8),
+            message_count: Some(1),
+            source_path: Some(source_path.display().to_string()),
+            started_at_ms: Some(1_733_000_000_000),
+        };
+        let result = merge_manifest_db_links(&data_dir, &record.manifest_relative_path, std::slice::from_ref(&link));
+        set_dir_sync_probe(None);
+        result.expect("merge_manifest_db_links must succeed with the switch off");
+
+        // R4-N1 (任务书 #120a): `DIR_SYNC_PROBE_TEST_SERIALIZE` only excludes
+        // OTHER tests that also hold it before touching the probe -- it does
+        // NOT make `CASS_RAW_MIRROR_FSYNC`'s process-global env var reads
+        // atomic with respect to the many OTHER tests in this module that
+        // call `capture_source_file`/manifest-merge functions without ever
+        // needing this lock at all (they don't assert on `synced`, so they
+        // were never "victims" before, but they're still concurrent readers
+        // of the same global env var `std::env::set_var`/`remove_var` mutate
+        // -- real reproduction on baseline HEAD e29d2400 showed exactly this
+        // test observing a foreign tmp tree's directory under
+        // `--test-threads=8`). Filtering by this test's own `data_dir`
+        // prefix is the same primary defense as the chain-completeness judge
+        // above: it doesn't matter WHY a foreign path appeared in the raw
+        // probe stream, only that it isn't part of what THIS test's own
+        // capture actually touched.
+        let synced = synced.lock().unwrap();
+        let synced: Vec<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
+        assert!(
+            synced.is_empty(),
+            "default (switch off) must not fsync anything on manifest db-link merge; \
+             synced dirs: {synced:?}"
+        );
+    }
+
+    /// R2-B5b (任务书 #119c, 上一棒 #119b 主动报告的同构缺口): `publish_manifest_
+    /// bytes_create_new` is the manifest's FIRST-EVER publish for a given
+    /// capture -- `manifests/` may be the directory `ensure_private_dir_
+    /// descendant` just created moments earlier in this same call, so (when
+    /// the switch is on) it needs the same full-chain fsync
+    /// `replace_manifest_bytes` (#119b R2-B5 场景二) already got, not the
+    /// single-level `sync_parent` it had before this fix.
+    #[test]
+    // R3-N6 (任务书 #129): this positive asserts that the directory-fsync probe
+    // OBSERVED syncs, and Windows' `force_sync_dir` returns Ok without firing it,
+    // so the premise only holds on unix.
+    #[cfg(unix)]
+    fn capture_source_file_first_publish_walks_full_directory_chain_when_fsync_enabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5b-scenario.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5b\"}\n").expect("write source");
+
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        // SAFETY: tests that touch `CASS_RAW_MIRROR_FSYNC` are serialized
+        // via `DIR_SYNC_PROBE_TEST_SERIALIZE`.
+        unsafe {
+            std::env::set_var("CASS_RAW_MIRROR_FSYNC", "1");
+        }
+        let result = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        });
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        set_dir_sync_probe(None);
+        result.expect("capture must succeed with the switch on");
+
+        let raw_mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let v1_dir = raw_mirror_dir.join(RAW_MIRROR_VERSION_DIR);
+        let manifests_dir = v1_dir.join("manifests");
+        let synced = synced.lock().unwrap();
+        assert!(
+            synced.contains(&manifests_dir),
+            "sanity: manifests/ itself must still be fsynced (pre-existing sync_parent \
+             behavior); synced dirs: {synced:?}"
+        );
+        assert!(
+            synced.contains(&v1_dir),
+            "publish_manifest_bytes_create_new must walk the full chain up to v1 on the \
+             manifest's first-ever publish when the switch is on, not just fsync manifests/ \
+             one level; synced dirs: {synced:?}"
+        );
+    }
+
+    /// Negative half: switch off (default) must not trigger any extra fsync
+    /// on the manifest's first-ever publish either -- same "barrier only
+    /// complete when the switch is on" contract as #119b R2-B5.
+    #[test]
+    fn capture_source_file_first_publish_does_not_sync_when_fsync_disabled() {
+        let _serialize = DIR_SYNC_PROBE_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-b5b-scenario-off.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"hello b5b-off\"}\n").expect("write source");
+
+        // SAFETY: see above -- serialized via DIR_SYNC_PROBE_TEST_SERIALIZE.
+        unsafe {
+            std::env::remove_var("CASS_RAW_MIRROR_FSYNC");
+        }
+        let synced: std::sync::Arc<Mutex<Vec<PathBuf>>> = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let synced_for_hook = synced.clone();
+        set_dir_sync_probe(Some(Box::new(move |dir: &Path| {
+            synced_for_hook.lock().unwrap().push(dir.to_path_buf());
+        })));
+        let result = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        });
+        set_dir_sync_probe(None);
+        result.expect("capture must succeed with the switch off");
+
+        // R4-N1 (任务书 #120a): same defense as the chain-completeness judge
+        // and `merge_manifest_db_links_does_not_sync_when_fsync_disabled`
+        // above -- filter by this test's own `data_dir` prefix before
+        // asserting, so a foreign concurrent test's directories (real
+        // reproduction on baseline HEAD e29d2400 under `--test-threads=8`)
+        // can't make this assertion fail regardless of how they got into
+        // the raw probe stream.
+        let synced = synced.lock().unwrap();
+        let synced: Vec<PathBuf> = synced
+            .iter()
+            .filter(|dir| dir.starts_with(&data_dir))
+            .cloned()
+            .collect();
+        assert!(
+            synced.is_empty(),
+            "default (switch off) must not fsync anything on the manifest's first-ever \
+             publish; synced dirs: {synced:?}"
+        );
     }
 
     #[test]
@@ -2492,6 +3824,7 @@ mod tests {
         let err = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2508,6 +3841,328 @@ mod tests {
         assert!(manifest_path.exists());
         assert!(blob_path.exists());
         assert!(!root.join("pruned.jsonl").exists());
+    }
+
+    /// R9 (任务书 #113): a blob referenced by `messages.excluded.raw.blob`,
+    /// and the manifest that captured it, both survive an otherwise-total
+    /// prune (`--older-than 0 --safety-hold-down 0`); an unreferenced blob
+    /// with no such protection is deleted as usual.
+    #[test]
+    fn prune_protects_referenced_blob_and_its_manifest_r9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+
+        let referenced_source = temp.path().join("referenced.jsonl");
+        fs::write(&referenced_source, b"{\"type\":\"message\",\"text\":\"still referenced\"}\n").expect("write referenced source");
+        let referenced = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &referenced_source,
+            db_links: &[],
+        })
+        .expect("capture referenced source");
+
+        let unreferenced_source = temp.path().join("unreferenced.jsonl");
+        fs::write(&unreferenced_source, b"{\"type\":\"message\",\"text\":\"no longer referenced\"}\n").expect("write unreferenced source");
+        let unreferenced = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &unreferenced_source,
+            db_links: &[],
+        })
+        .expect("capture unreferenced source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let referenced_manifest_path = root.join(&referenced.manifest_relative_path);
+        let referenced_blob_path = root.join(&referenced.blob_relative_path);
+        let unreferenced_manifest_path = root.join(&unreferenced.manifest_relative_path);
+        let unreferenced_blob_path = root.join(&unreferenced.blob_relative_path);
+        assert!(referenced_blob_path.exists() && unreferenced_blob_path.exists(), "both blobs must exist before pruning");
+
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert(referenced.blob_relative_path.clone());
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect("prune with a protected reference must succeed");
+
+        assert!(referenced_manifest_path.exists(), "referenced manifest must survive prune");
+        assert!(referenced_blob_path.exists(), "referenced blob must survive prune");
+        assert!(!unreferenced_manifest_path.exists(), "unreferenced expired manifest must be pruned");
+        assert!(!unreferenced_blob_path.exists(), "unreferenced expired blob must be pruned");
+        assert_eq!(report.applied_blob_count, 1, "exactly the unreferenced blob should be deleted");
+    }
+
+    /// R2-N9 (任务书 #125) half ①: a manifest that protects a referenced blob
+    /// is not enough -- the blob's FILE has to be there. The reference check
+    /// used to prove only "some manifest names this path", so a blob that had
+    /// been deleted out from under the mirror still passed as protected and
+    /// the prune reported success. It must refuse and name the path.
+    #[test]
+    fn prune_refuses_when_a_referenced_blob_file_is_gone_r2_n9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("referenced.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"referenced\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+        assert!(manifest_path.exists() && blob_path.exists());
+        fs::remove_file(&blob_path).expect("delete the referenced blob");
+
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert(captured.blob_relative_path.clone());
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect_err("a referenced blob whose file is gone must refuse the prune");
+
+        assert!(
+            err.to_string().contains(&captured.blob_relative_path),
+            "refusal must name the missing blob path: {err}"
+        );
+    }
+
+    /// R2-N9 (任务书 #125) half ②: with `messages.excluded.raw.blob`
+    /// references in hand but no raw mirror on disk at all, the DB is telling
+    /// us it has rows pointing at mirror evidence that is not there. That
+    /// used to return the ordinary "nothing to prune" success report, which
+    /// reads as "fine".
+    #[test]
+    fn prune_refuses_when_the_mirror_root_is_absent_but_blobs_are_referenced_r2_n9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert("blobs/blake3/aa/aaaa.raw".to_string());
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: false,
+            },
+        )
+        .expect_err("a missing mirror root with live blob references must not report success");
+
+        assert!(
+            err.to_string().contains("raw mirror root"),
+            "refusal must name the missing root: {err}"
+        );
+    }
+
+    /// R2-N9 (任务书 #125) guard for the #253 contract the change above must
+    /// not break: a data dir with no raw mirror and NO references is a fresh
+    /// install, not a broken mirror, and stays a success report.
+    #[test]
+    fn prune_still_reports_success_when_the_mirror_root_is_absent_and_nothing_is_referenced() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect("a fresh install with no references must still report success");
+
+        assert!(!report.initialized);
+        assert_eq!(report.manifest_count, 0);
+    }
+
+    /// R2-N9 (任务书 #125) half ③: `blob_file_size` failing used to fall back
+    /// to `manifest.blob_size_bytes`, so an unreadable blob still contributed
+    /// its DECLARED size to the accounting the size-based prune plans against.
+    /// A blob path that is not a regular file (here: a directory) must count
+    /// as zero bytes and as an unreadable blob, never as its declared size.
+    #[test]
+    fn prune_does_not_count_an_unreadable_blob_at_its_declared_size_r2_n9_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("unreadable.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"unreadable\"}\n")
+            .expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let blob_path = root.join(&captured.blob_relative_path);
+        let declared = fs::metadata(&blob_path).expect("blob metadata").len();
+        assert!(declared > 0, "the capture must have written a non-empty blob");
+        fs::remove_file(&blob_path).expect("remove blob file");
+        fs::create_dir(&blob_path).expect("replace the blob with a directory");
+
+        let report = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: false,
+            },
+        )
+        .expect("dry-run with an unreadable blob still produces a report");
+
+        assert_eq!(
+            report.current_blob_bytes, 0,
+            "an unreadable blob must not contribute its declared {declared} bytes"
+        );
+        assert_eq!(report.unreadable_blob_count, 1);
+    }
+
+    /// R9 mutation half of the pair above: the SAME two captures, but
+    /// `referenced_blobs` left empty (as if the caller had forgotten to
+    /// read `messages.excluded.raw.blob` before pruning, or the manifest-
+    /// level protection union were missing) -- the blob that would
+    /// otherwise have been protected now gets deleted too, proving the
+    /// protection in the positive test is actually load-bearing.
+    #[test]
+    fn prune_without_referenced_blobs_deletes_what_would_have_been_protected_r9_mutation() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+
+        let source = temp.path().join("would-be-referenced.jsonl");
+        fs::write(&source, b"{\"type\":\"message\",\"text\":\"would be referenced\"}\n").expect("write source");
+        let captured = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source,
+            db_links: &[],
+        })
+        .expect("capture source");
+
+        let root = data_dir.join(RAW_MIRROR_ROOT_DIR).join(RAW_MIRROR_VERSION_DIR);
+        let manifest_path = root.join(&captured.manifest_relative_path);
+        let blob_path = root.join(&captured.blob_relative_path);
+
+        prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(), // mutation: no reference set
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect("prune without a reference set must still succeed (nothing left to protect)");
+
+        assert!(!manifest_path.exists(), "MUTATION: without referenced_blobs, this manifest is wrongly deleted");
+        assert!(!blob_path.exists(), "MUTATION: without referenced_blobs, this blob is wrongly deleted");
+    }
+
+    /// R1-N18 (任务书 #118b): `referenced_blobs` used to be unioned into
+    /// `pinned_blobs` BEFORE checking `referenced_blobs.is_subset(&pinned_
+    /// blobs)`, making that check vacuously true no matter what (a set is
+    /// always a subset of itself-plus-more) -- a reference pointing at a
+    /// blob with no manifest at all in the inventory (a dangling
+    /// `excluded.raw.blob` pointer, e.g. from a corrupted/edited DB row)
+    /// would silently pass the "core in the protected set" check instead of
+    /// refusing `--apply`. This session has one real, legitimately-expired,
+    /// UNREFERENCED capture (so the inventory is non-trivial) plus one
+    /// dangling reference to a blob hash that was never captured at all.
+    #[test]
+    fn prune_apply_refuses_dangling_reference_with_no_backing_manifest_r1_n18_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+
+        let source_path = temp.path().join("unrelated.jsonl");
+        fs::write(&source_path, b"{\"type\":\"message\",\"text\":\"unrelated, real capture\"}\n")
+            .expect("write source");
+        capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture unrelated source");
+
+        let dangling_blob = "blobs/blake3/00/dangling-reference-never-captured.raw".to_string();
+        let mut referenced_blobs = HashSet::new();
+        referenced_blobs.insert(dangling_blob.clone());
+
+        let err = prune(
+            &data_dir,
+            RawMirrorPruneOptions {
+                referenced_blobs,
+                older_than_ms: Some(0),
+                max_size_bytes: None,
+                keep_tags: Vec::new(),
+                safety_hold_down_ms: 0,
+                apply: true,
+            },
+        )
+        .expect_err("a referenced blob with no backing manifest must refuse --apply, not silently pass");
+        let message = err.to_string();
+        assert!(
+            message.contains(&dangling_blob),
+            "error must name the specific missing blob, not just a count: {message}"
+        );
     }
 
     #[test]
@@ -2531,6 +4186,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2586,6 +4242,7 @@ mod tests {
         let err = match prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2647,6 +4304,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2712,6 +4370,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(86_400_000),
                 max_size_bytes: None,
                 keep_tags: Vec::new(),
@@ -2788,6 +4447,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: Some(0),
                 max_size_bytes: Some(0),
                 keep_tags: vec!["keep".to_string()],
@@ -2832,6 +4492,7 @@ mod tests {
         let report = prune(
             &data_dir,
             RawMirrorPruneOptions {
+                referenced_blobs: HashSet::new(),
                 older_than_ms: None,
                 max_size_bytes: Some(0),
                 keep_tags: Vec::new(),

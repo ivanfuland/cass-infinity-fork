@@ -3,9 +3,20 @@
 //! Delegates to [`DefaultCanonicalizer`] for the full preprocessing pipeline
 //! (NFC normalization, markdown stripping that keeps link text and URLs,
 //! whitespace normalization that keeps newlines, and low-signal filtering).
-//! `CANONICALIZE_PIPELINE_VERSION = 2` (T1, plan v5.1): the ingest path is
-//! lossless -- no length truncation and no code-block collapsing. The query
-//! path (`canonicalize_query`) is unchanged and still truncates.
+//! `CANONICALIZE_PIPELINE_VERSION = 3` (T1, plan v5.1; v3: PR6 T3, 任务书
+//! #121a): the ingest path is lossless -- no length truncation and no
+//! code-block collapsing.
+//!
+//! **Two distinct "query" things, not one** (R1-N5 fix, T2 code-ledger
+//! finding): the actual production query path
+//! (`src/search/query.rs:4162`) calls [`canonicalize_for_embedding`] --
+//! the same, non-truncating, v3 function documented above and in
+//! `scripts/oracle/normalize_v3_rules.md` -- so production queries are
+//! NOT truncated. `Canonicalizer::canonicalize_query` (below) is a
+//! separate function that still truncates to [`QUERY_MAX_CHARS`]; it has
+//! exactly one caller left in `src/`, a test in this file
+//! (`canonicalize_query_truncation_unchanged`). It is kept, unmodified,
+//! for that test's sake, not because production queries go through it.
 //!
 //! This module adds content hashing on top of the shared canonicalization logic.
 //!
@@ -58,6 +69,8 @@ const FS_LOW_SIGNAL_CONTENT: &[&str] = &[
     "thanks.",
     "thank you",
     "thank you.",
+    "wait timed out",
+    "bash completed with no output",
 ];
 
 /// Trait for text preprocessing before embedding.
@@ -120,7 +133,7 @@ impl DefaultCanonicalizer {
         let mut in_code_block = false;
 
         for line in text.lines() {
-            if line.starts_with("```") {
+            if fs_is_fence_marker(line) {
                 // Fence line: delete it, just toggle code-block state.
                 in_code_block = !in_code_block;
                 continue;
@@ -140,24 +153,138 @@ impl DefaultCanonicalizer {
     }
 }
 
+/// Fenced code block fence-marker recognition (R1, v3): a line is a fence
+/// marker when it has at most 3 leading spaces followed immediately by
+/// `` ``` `` -- CommonMark's own fence-indentation tolerance. Pre-v3 this
+/// required the marker at column 0 exactly (`line.starts_with("```")`), so
+/// an indented fence fell through to ordinary per-line stripping instead of
+/// toggling the code-block state.
+fn fs_is_fence_marker(line: &str) -> bool {
+    let trimmed = line.trim_start_matches(' ');
+    let leading_spaces = line.len() - trimmed.len();
+    leading_spaces <= 3 && trimmed.starts_with("```")
+}
+
+/// ATX header recognition and stripping (R2, v3): a line is a header when it
+/// matches at most 3 leading spaces, then 1-6 `#` characters, then either a
+/// space or end-of-line. On a match, the `#` run and (if present) one
+/// following space are removed; everything else -- including the leading
+/// spaces -- is kept verbatim. A line that does not match this shape is
+/// returned completely unchanged.
+///
+/// Pre-v3 this was `result.trim_start_matches('#').trim_start()`: it
+/// required the `#` at byte 0 (so any leading whitespace defeated
+/// recognition entirely, while the unconditional trailing `.trim_start()`
+/// still silently ate that whitespace anyway), had no 1-6 count cap, and
+/// never checked for a following space/end-of-line -- wrong in both
+/// directions (under-strips an indented real header, over-strips a `#` that
+/// isn't a heading marker at all, e.g. a shebang or issue reference).
+fn fs_strip_atx_header(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b' ' && i < 3 {
+        i += 1;
+    }
+    let hash_start = i;
+    let mut hash_count = 0;
+    while i < bytes.len() && bytes[i] == b'#' && hash_count < 6 {
+        i += 1;
+        hash_count += 1;
+    }
+    if hash_count == 0 {
+        return line.to_string();
+    }
+    // A 7th (or later) consecutive '#' disqualifies the whole run -- it's
+    // not a 1-6-count heading marker at all.
+    if i < bytes.len() && bytes[i] == b'#' {
+        return line.to_string();
+    }
+    // Must be followed by a space or end-of-line.
+    if i < bytes.len() && bytes[i] != b' ' {
+        return line.to_string();
+    }
+    let rest_start = if i < bytes.len() { i + 1 } else { i };
+    format!("{}{}", &line[..hash_start], &line[rest_start..])
+}
+
+/// Paired backtick-run stripping (R3, v3): a run of N consecutive backticks
+/// pairs with the *next* run of exactly N consecutive backticks encountered
+/// scanning forward (any non-backtick content, and any differently-sized
+/// backtick run, may sit between them); both runs are deleted and the
+/// content between them is kept verbatim. A run with no same-length partner
+/// later in the line is left untouched, backticks included. This is only
+/// equal-length run pairing -- deliberately not full CommonMark
+/// inline-code-span semantics (no leading/trailing single-space stripping,
+/// no backslash escaping).
+///
+/// Pre-v3 this was `result.replace('`', "")`: every backtick removed
+/// unconditionally, paired or not.
+fn fs_strip_paired_backticks(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if chars[i] == '`' {
+            let start = i;
+            let mut len = 0;
+            while i < n && chars[i] == '`' {
+                i += 1;
+                len += 1;
+            }
+            runs.push((start, len));
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut delete = vec![false; runs.len()];
+    let mut idx = 0;
+    while idx < runs.len() {
+        if delete[idx] {
+            idx += 1;
+            continue;
+        }
+        let len_a = runs[idx].1;
+        let partner = ((idx + 1)..runs.len()).find(|&j| !delete[j] && runs[j].1 == len_a);
+        if let Some(j) = partner {
+            delete[idx] = true;
+            delete[j] = true;
+        }
+        idx += 1;
+    }
+
+    let mut result = String::with_capacity(line.len());
+    let mut pos = 0;
+    for (k, &(start, len)) in runs.iter().enumerate() {
+        if delete[k] {
+            result.extend(chars[pos..start].iter().copied());
+            pos = start + len;
+        }
+    }
+    result.extend(chars[pos..n].iter().copied());
+    result
+}
+
 /// Strip markdown formatting from a single line.
 fn fs_strip_markdown_line(line: &str) -> String {
     let mut result = line.to_string();
 
-    // Remove bold/italic markers
+    // Remove bold/italic markers, then run the shared single-marker
+    // neighbor rule (R4) over whatever `*`/`_` remain.
     result = result.replace("**", "");
     result = result.replace("__", "");
-    result = result.replace('*', "");
     result = fs_strip_italic_underscores(&result);
 
-    // Remove inline code backticks
-    result = result.replace('`', "");
+    // Remove paired backtick runs (R3).
+    result = fs_strip_paired_backticks(&result);
 
     // Convert links [text](url) to just text
     result = fs_strip_markdown_links(&result);
 
-    // Remove headers (# prefix)
-    result = result.trim_start_matches('#').trim_start().to_string();
+    // Remove headers (R2).
+    result = fs_strip_atx_header(&result);
 
     // Remove blockquote prefix
     result = result.trim_start_matches('>').trim_start().to_string();
@@ -168,25 +295,41 @@ fn fs_strip_markdown_line(line: &str) -> String {
     result
 }
 
-/// Strip italic underscore markers (`_word_`) while preserving underscores inside
-/// identifiers (`snake_case`). An underscore is treated as an italic marker only
-/// when it lies on a word boundary: no adjacent alphanumeric or underscore on
-/// the side facing away from the emphasized span.
+/// Strip single `*`/`_` emphasis markers (`_word_`, `*word*`) while
+/// preserving them inside identifiers/tokens (`snake_case`, `a*b`). A marker
+/// is treated as an opening/closing emphasis marker -- and deleted -- only
+/// when it lies on a word boundary: *exactly one* immediate neighbor is
+/// Unicode-alphanumeric (a missing neighbor at line start/end counts as
+/// "not alphanumeric"); when both neighbors are alphanumeric, or neither
+/// is, the marker is kept.
+///
+/// R4 (v3): `*` now goes through this same rule (call site no longer does a
+/// separate unconditional `result.replace('*', "")` first). Pre-v3 this
+/// function only handled `_`, and had an extra special case treating an
+/// immediately-adjacent `_` as "not a word neighbor" (via `is_word(c) = c
+/// .is_alphanumeric() || c == '_'` combined with `&& c != '_'` at each call
+/// site). That combination is algebraically identical to plain
+/// `c.is_alphanumeric()` for every possible `c` -- the `c == '_'` disjunct
+/// of `is_word` is always cancelled by the `&& c != '_'` guard -- so the
+/// special case was already a no-op; dropped here (see
+/// `canonicalize_v3_underscore_adjacent_underscore_special_case_is_unreachable`
+/// for the pinned before/after examples that would have distinguished it,
+/// had it ever mattered).
 fn fs_strip_italic_underscores(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let mut keep = vec![true; n];
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let is_marker = |c: char| c == '_' || c == '*';
 
     for i in 0..n {
-        if chars[i] != '_' {
+        if !is_marker(chars[i]) {
             continue;
         }
-        let prev_is_word = i > 0 && is_word(chars[i - 1]) && chars[i - 1] != '_';
-        let next_is_word = i + 1 < n && is_word(chars[i + 1]) && chars[i + 1] != '_';
+        let prev_is_word = i > 0 && chars[i - 1].is_alphanumeric();
+        let next_is_word = i + 1 < n && chars[i + 1].is_alphanumeric();
         // Opening marker: preceded by non-word (or BOL), followed by word
         // Closing marker: preceded by word, followed by non-word (or EOL)
-        if (!prev_is_word && next_is_word) || (prev_is_word && !next_is_word) {
+        if prev_is_word != next_is_word {
             keep[i] = false;
         }
     }
@@ -406,7 +549,7 @@ fn fs_truncate_to_chars(text: &str, max_chars: usize) -> String {
 /// or mismatched fingerprint as failing generation activation by default;
 /// callers that have performed the attestation stamp the accepted version
 /// explicitly rather than relying on an inferred match.
-pub const CANONICALIZE_PIPELINE_VERSION: u32 = 2;
+pub const CANONICALIZE_PIPELINE_VERSION: u32 = 3;
 
 /// Maximum characters to keep for a canonicalized *query* (unchanged by
 /// v2 -- the ingest path no longer truncates, but the query path still
@@ -440,6 +583,8 @@ const LOW_SIGNAL_CONTENT: &[&str] = &[
     "thanks.",
     "thank you",
     "thank you.",
+    "wait timed out",
+    "bash completed with no output",
 ];
 
 /// Return `Some(canonical)` when `text` can be processed by the cheap
@@ -618,7 +763,9 @@ pub fn is_tool_acknowledgement(role: Option<&str>, text: &str) -> bool {
         || lower == "no changes"
         || lower == "already up to date"
         || lower == "up to date"
-        || lower == "file written";
+        || lower == "file written"
+        || lower == "wait timed out"
+        || lower == "bash completed with no output";
     if short_tool_ack && (toolish || lower.contains("file") || lower.contains("match")) {
         return true;
     }
@@ -1082,6 +1229,24 @@ See [docs](http://docs.rs) for more.
                 "OK",
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
+            // v3 resample (T3, 任务书 #121a): none of the 4 samples above
+            // change hash under v3's R1-R4 (fence/header/backtick/asterisk)
+            // fixes -- each happens to only exercise shapes where v2 and v3
+            // already agreed (verified: full `canonicalize::` test suite
+            // passes unchanged with the old hashes still pinned above). Per
+            // the task book, that means these 4 pins don't actually nail
+            // anything about v3's behavior, so two new samples are added
+            // that DO change: an indented header (R2) and an
+            // alphanumeric-flanked asterisk (R4). v2 hashes recorded for
+            // contrast, not asserted.
+            (
+                " ## indented heading",
+                "611766c43731c66fcdc6b18540c51cfb953fac323dfa6c4030bdf5545d2c3a73",
+            ),
+            (
+                "a*b",
+                "15eb0a792505b1914ccd7f8d39a6b0f1985d86b37566faf73a589ea9e8454d8b",
+            ),
         ];
         for (input, expected_hex) in cases {
             let canonical = canonicalize_for_embedding(input);
@@ -1189,6 +1354,47 @@ See [docs](http://docs.rs) for more.
         );
     }
 
+    /// PR6 T1 (任务书 #111): two new hard-noise receipts must be recognized
+    /// on both sides -- the lexical/word-level side (`is_hard_message_noise`,
+    /// whose real source is `is_short_acknowledgement` at :558) and the
+    /// block/embedding side (`canonicalize_for_embedding`, which must hit the
+    /// pure-ASCII fast path since both phrases contain no markdown
+    /// discriminator bytes or non-ASCII bytes).
+    #[test]
+    fn hard_noise_two_receipts_are_noise_on_both_sides() {
+        assert!(
+            is_hard_message_noise(Some("tool_result"), "Wait timed out"),
+            "lexical side: \"Wait timed out\" must be hard message noise"
+        );
+        assert!(
+            is_hard_message_noise(Some("tool_result"), "Bash completed with no output"),
+            "lexical side: \"Bash completed with no output\" must be hard message noise"
+        );
+
+        assert_eq!(
+            canonicalize_for_embedding("Wait timed out"),
+            "",
+            "block side: \"Wait timed out\" must canonicalize to empty"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("Bash completed with no output"),
+            "",
+            "block side: \"Bash completed with no output\" must canonicalize to empty"
+        );
+
+        // Both phrases must be fast-path eligible (pure ASCII, no markdown
+        // discriminator bytes) so this test actually exercises the fast path,
+        // not a fallthrough to the slow pipeline.
+        assert!(
+            canonicalize_fast_path("Wait timed out").is_some(),
+            "\"Wait timed out\" must be fast-path eligible"
+        );
+        assert!(
+            canonicalize_fast_path("Bash completed with no output").is_some(),
+            "\"Bash completed with no output\" must be fast-path eligible"
+        );
+    }
+
     /// T1 (plan v5.1, Step 6b): `scripts/oracle/hard_noise_phrases.json` must
     /// stay in sync with the actual `is_short_acknowledgement` /
     /// `is_tool_acknowledgement` source logic it transcribes. This can't
@@ -1225,7 +1431,7 @@ See [docs](http://docs.rs) for more.
             .expect("short_tool_acks.phrases must be an array");
         assert_eq!(
             short_tool_acks.len(),
-            6,
+            8,
             "short_tool_acks count drifted from source"
         );
         for phrase in short_tool_acks {
@@ -1316,6 +1522,169 @@ See [docs](http://docs.rs) for more.
         assert_eq!(
             fs_filter_low_signal("The authentication module needs a retry policy."),
             "The authentication module needs a retry policy."
+        );
+    }
+
+    // =========================================================================
+    // T3 v3 (任务书 #121a, `scripts/oracle/normalize_v3_rules.md` R1-R4): fence
+    // indentation tolerance, ATX header recognition, paired backtick runs,
+    // and a unified `*`/`_` neighbor rule. Written red against v2 first
+    // (TDD); each positive case here also serves as its own regression
+    // guard against reverting to the corresponding v2 behavior.
+    // =========================================================================
+
+    #[test]
+    fn canonicalize_v3_fence_tolerates_up_to_three_space_indent() {
+        let text = " ```\nindented fence body\n ```\nafter";
+        let canonical = canonicalize_for_embedding(text);
+        assert_eq!(
+            canonical, "indented fence body\nafter",
+            "a fence indented by <=3 spaces must be recognized (R1) and its \
+             body kept verbatim, matching the already-correct column-0 case"
+        );
+    }
+
+    #[test]
+    fn canonicalize_v3_fence_four_space_indent_not_recognized() {
+        // 4 spaces exceeds R1's <=3 tolerance -- this codebase does not
+        // implement CommonMark indented-code-block recognition, so a >3
+        // space line still falls through to ordinary per-line stripping
+        // (same as v2's column-0 rule did for any indent at all). The
+        // *recognition* is therefore not a v2/v3 diff -- this is a
+        // boundary check that R1's tolerance is exactly <=3, not
+        // unlimited. The final output does still differ from v2, via R3
+        // rather than R1: v2 deleted the lone backtick runs
+        // unconditionally, v3 keeps them (asserted below).
+        let text = "    ```\nbody\n    ```\nafter";
+        let canonical = canonicalize_for_embedding(text);
+        assert!(canonical.contains("body"));
+        assert!(canonical.contains("after"));
+        assert!(
+            canonical.contains("```"),
+            "R1's <=3-space tolerance excludes a 4-space indent, so these \
+             lines are not recognized as fences; R3's paired-backtick rule \
+             then finds no partner for either lone length-3 backtick run \
+             (each line only has one run of its own) and leaves it \
+             untouched -- unlike v2's unconditional backtick deletion, \
+             which would have erased it either way. Got: {canonical:?}"
+        );
+    }
+
+    #[test]
+    fn canonicalize_v3_header_tolerates_leading_indent_and_caps_hash_run() {
+        assert_eq!(
+            canonicalize_for_embedding(" ## docs/m7-arch"),
+            "docs/m7-arch",
+            "R2: <=3 leading spaces + 1-6 '#' + space must be recognized as \
+             a header (stage 2 keeps the leading space as 'everything \
+             else', but stage 3's per-line leading-whitespace trim removes \
+             it from the final canonicalize_for_embedding output either way)"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("#!/usr/bin/env bash"),
+            "#!/usr/bin/env bash",
+            "R2: '#' not followed by a space/EOL is not a header marker at \
+             all and must be left completely untouched"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("#76"),
+            "#76",
+            "R2: '#' immediately followed by a digit (not a space/EOL) must \
+             be left untouched"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("####### not a heading"),
+            "####### not a heading",
+            "R2: 7 consecutive '#'s exceed the 1-6 count cap, so the whole \
+             line is left untouched, not partially stripped"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("## Real Heading"),
+            "Real Heading",
+            "R2: a genuine column-0, in-range, space-terminated header must \
+             still strip correctly (regression check, not a v3 change)"
+        );
+    }
+
+    #[test]
+    fn canonicalize_v3_backtick_pairs_by_equal_run_length_only() {
+        assert_eq!(
+            canonicalize_for_embedding("`code`"),
+            "code",
+            "R3: two length-1 runs pair with each other and both delete"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("text with `one backtick"),
+            "text with `one backtick",
+            "R3: an unpaired backtick (no later run of the same length) is \
+             left in place, not deleted"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("``a`b``"),
+            "a`b",
+            "R3: the two length-2 runs pair with EACH OTHER, skipping over \
+             the length-1 run in between (which has no partner of its own \
+             and survives as literal content)"
+        );
+    }
+
+    #[test]
+    fn canonicalize_v3_asterisk_and_underscore_share_neighbor_rule() {
+        assert_eq!(
+            canonicalize_for_embedding("*bold*"),
+            "bold",
+            "boundary case: exactly one side alphanumeric on each marker -- \
+             strips, same output v2's unconditional removal happened to \
+             already produce here"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("a*b"),
+            "a*b",
+            "R4: both neighbors alphanumeric -- '*' must now be preserved, \
+             matching '_'s existing rule (v2 deleted every '*' \
+             unconditionally regardless of neighbors)"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("5*3"),
+            "5*3",
+            "R4: digit neighbors on both sides -- preserved"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("snake_case"),
+            "snake_case",
+            "regression check: '_' already had this rule pre-v3, must still \
+             hold once merged with '*' into one function"
+        );
+    }
+
+    /// Pre-v3, `fs_strip_italic_underscores` special-cased an
+    /// immediately-adjacent `_` as "not a word neighbor" (distinct from
+    /// plain non-alphanumeric). That special case is algebraically a no-op
+    /// for every possible neighbor character: the old test
+    /// `is_word(c) && c != '_'` (where `is_word(c) = c.is_alphanumeric() ||
+    /// c == '_'`) reduces to exactly `c.is_alphanumeric()`, because the `c
+    /// == '_'` disjunct of `is_word` is always cancelled by the `&& c !=
+    /// '_'` guard, and `c.is_alphanumeric()` and `c == '_'` are mutually
+    /// exclusive. `**`/`__` are still stripped in an earlier, separate step
+    /// before this function ever runs, so two bare adjacent `_`s can't even
+    /// arise from an `__` remnant. These two inputs are exactly the shapes
+    /// that would have distinguished the old special case from a plain
+    /// alphanumeric check, if it had ever been reachable -- both confirm
+    /// the plain check alone reproduces the intended output.
+    #[test]
+    fn canonicalize_v3_underscore_adjacent_underscore_special_case_is_unreachable() {
+        assert_eq!(
+            canonicalize_for_embedding("___x___"),
+            "x",
+            "'__' pairs strip first, leaving '_x_'; each remaining single \
+             '_' has exactly one alphanumeric neighbor ('x') and one \
+             non-word neighbor (line start/end) -- both delete"
+        );
+        assert_eq!(
+            canonicalize_for_embedding("a__b"),
+            "ab",
+            "'__' strips first, leaving no single '_' at all to run the \
+             neighbor rule on"
         );
     }
 }

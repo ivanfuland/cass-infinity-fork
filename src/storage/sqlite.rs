@@ -762,6 +762,19 @@ fn franken_read_message_extra_compat(
     serde_json::Value::Null
 }
 
+/// PR6 T2c (任务书 #113): decode a `json(excluded)`-projected column value
+/// (`NULL` for untouched rows) into [`Message::excluded`]. Shared by every
+/// SELECT that reconstructs a full `Message` from storage.
+fn franken_decode_excluded_column(
+    excluded_json: Option<String>,
+) -> std::result::Result<Option<crate::indexer::exclusion::ExcludedMarker>, StorageError> {
+    excluded_json
+        .as_deref()
+        .map(crate::indexer::exclusion::ExcludedMarker::from_json_str)
+        .transpose()
+        .map_err(|e| StorageError::Other { code: None, detail: format!("decoding messages.excluded: {e}") })
+}
+
 const DAILY_STATS_HEALTH_META_KEY: &str = "daily_stats_archive_fingerprint";
 const DAILY_STATS_HEALTH_GENERATION_META_KEY: &str = "daily_stats_health_generation";
 const DAILY_STATS_HEALTH_GENERATION: i64 = 1;
@@ -4112,6 +4125,18 @@ pub struct InsertOutcome {
     pub inserted_indices: Vec<i64>,
 }
 
+/// R3-N5 (任务书 #129): one conversation a batch refused to insert, with the
+/// position it held in the caller's slice -- callers pair outcomes with their
+/// own conversation lists positionally (raw-mirror db links do exactly that),
+/// so a skip has to be reported with its index rather than just omitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BatchSkippedConversation {
+    pub index: usize,
+    pub source_path: String,
+    pub external_id: Option<String>,
+    pub error: String,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 struct MessageInsertSubstageProfile {
@@ -4333,39 +4358,103 @@ fn borrowed_messages_tail_state(messages: &[&Message]) -> (Option<i64>, Option<i
     )
 }
 
-fn message_merge_fingerprint(msg: &Message) -> MessageMergeFingerprint {
-    MessageMergeFingerprint {
+/// PR6 T2c (任务书 #113, R10): unified dedup-identity fingerprint. Excluded
+/// rows use the pre-redaction, post-desensitization BLAKE3 recorded in the
+/// marker (`excluded.fingerprint_blake3`) instead of hashing the now-empty
+/// `content` (which would collide every excluded row together and silently
+/// drop real messages during merge); untouched rows hash `content` directly,
+/// byte-for-byte unchanged from the pre-PR6 algorithm.
+fn fingerprint_hash_for(content: &str, excluded: Option<&crate::indexer::exclusion::ExcludedMarker>) -> anyhow::Result<[u8; 32]> {
+    match excluded {
+        Some(marker) => {
+            let bytes = hex::decode(&marker.fingerprint_blake3).with_context(|| {
+                format!("excluded.fingerprint_blake3 is not valid hex: {:?}", marker.fingerprint_blake3)
+            })?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|v: Vec<u8>| anyhow!("excluded.fingerprint_blake3 decodes to {} bytes, expected 32", v.len()))?;
+            Ok(arr)
+        }
+        None => Ok(*blake3::hash(content.as_bytes()).as_bytes()),
+    }
+}
+
+/// `fn fingerprint_hash(msg: &Message) -> anyhow::Result<[u8; 32]>` per plan
+/// T2 Interfaces -- thin wrapper over [`fingerprint_hash_for`] for the
+/// in-memory (already-a-`Message`) call sites.
+fn fingerprint_hash(msg: &Message) -> anyhow::Result<[u8; 32]> {
+    fingerprint_hash_for(&msg.content, msg.excluded.as_ref())
+}
+
+/// R3-N5 (任务书 #129, control-plane 亲核抓出（二）): the same check
+/// [`uninsertable_excluded_fingerprint_error`] performs, for the
+/// CONNECTOR-side marker (`PreparedConversation.excluded`) -- the persist
+/// entry needs it BEFORE it builds internal conversations, to decide whether
+/// the begin-concurrent path may take this batch at all.
+pub(crate) fn excluded_fingerprint_error(
+    marker: &crate::indexer::exclusion::ExcludedMarker,
+) -> Option<String> {
+    fingerprint_hash_for("", Some(marker))
+        .err()
+        .map(|error| format!("{error:#}"))
+}
+
+/// R3-N5 (任务书 #129): the reason this conversation cannot be inserted at
+/// all, if any -- one of its messages carries an `excluded` marker whose
+/// `fingerprint_blake3` is not 32-byte hex. Exactly the check
+/// [`fingerprint_hash_for`] performs, run before the transaction so one bad
+/// conversation costs only itself (R2-B7 turned this from a `panic` into an
+/// `Err`; this keeps that `Err` from taking every sibling conversation's
+/// insert down with it).
+fn uninsertable_excluded_fingerprint_error(conv: &Conversation) -> Option<String> {
+    conv.messages.iter().find_map(|msg| {
+        msg.excluded
+            .as_ref()
+            .and_then(|_| fingerprint_hash_for(&msg.content, msg.excluded.as_ref()).err())
+            .map(|error| format!("message idx {}: {error:#}", msg.idx))
+    })
+}
+
+/// R2-B7 (任务书 #119a): a `fingerprint_hash` failure means either `apply()`
+/// (`indexer::exclusion`, T2a) wrote a malformed `fingerprint_blake3` (would
+/// be a data-corruption bug upstream of storage), OR -- the actually
+/// reachable case the review round found -- a library caller constructed
+/// `Message.excluded` directly or via `derive(Deserialize)`, both of which
+/// bypass `ExcludedMarker::from_json_str`'s hex-format validation (only that
+/// one constructor validates). Release builds are `panic = "abort"`, so a
+/// `.expect()` here does not unwind into a catchable per-session error --
+/// it terminates the whole process. Propagating `anyhow::Result` instead
+/// lets every caller (all of which already sit inside `Result`-returning
+/// functions, per the R2-B7 call-graph audit) turn this into an ordinary
+/// per-conversation `Err` a session-level `ScanError` can wrap, matching
+/// the design's "该错误传播为会话错误，而不是 panic" requirement. A
+/// well-formed marker (the only kind `apply()` ever produces) hits neither
+/// change: `content_hash`'s value is byte-identical to before.
+fn message_merge_fingerprint(msg: &Message) -> anyhow::Result<MessageMergeFingerprint> {
+    Ok(MessageMergeFingerprint {
         idx: msg.idx,
         created_at: msg.created_at,
         role: msg.role.clone(),
         author: msg.author.clone(),
-        content_hash: *blake3::hash(msg.content.as_bytes()).as_bytes(),
-    }
+        content_hash: fingerprint_hash(msg)?,
+    })
 }
 
-fn message_replay_fingerprint(msg: &Message) -> MessageReplayFingerprint {
-    MessageReplayFingerprint {
+fn message_replay_fingerprint(msg: &Message) -> anyhow::Result<MessageReplayFingerprint> {
+    Ok(MessageReplayFingerprint {
         created_at: msg.created_at,
         role: msg.role.clone(),
         author: msg.author.clone(),
-        content_hash: *blake3::hash(msg.content.as_bytes()).as_bytes(),
-    }
+        content_hash: fingerprint_hash(msg)?,
+    })
 }
 
-fn conversation_message_fingerprints(conv: &Conversation) -> HashSet<MessageMergeFingerprint> {
-    conv.messages
-        .iter()
-        .map(message_merge_fingerprint)
-        .collect()
+fn conversation_message_fingerprints(conv: &Conversation) -> anyhow::Result<HashSet<MessageMergeFingerprint>> {
+    conv.messages.iter().map(message_merge_fingerprint).collect()
 }
 
-fn conversation_message_replay_fingerprints(
-    conv: &Conversation,
-) -> HashSet<MessageReplayFingerprint> {
-    conv.messages
-        .iter()
-        .map(message_replay_fingerprint)
-        .collect()
+fn conversation_message_replay_fingerprints(conv: &Conversation) -> anyhow::Result<HashSet<MessageReplayFingerprint>> {
+    conv.messages.iter().map(message_replay_fingerprint).collect()
 }
 
 fn replay_fingerprint_from_merge(
@@ -4394,14 +4483,14 @@ fn collect_new_messages_for_existing_conversation<'a>(
     existing_messages: &mut HashMap<i64, MessageMergeFingerprint>,
     existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
     replay_skip_log: &'static str,
-) -> ExistingConversationNewMessages<'a> {
+) -> anyhow::Result<ExistingConversationNewMessages<'a>> {
     let mut idx_collision_count = 0usize;
     let mut first_collision_idx: Option<i64> = None;
     let mut new_chars: i64 = 0;
     let mut messages = Vec::new();
 
     for msg in &conv.messages {
-        let incoming_fingerprint = message_merge_fingerprint(msg);
+        let incoming_fingerprint = message_merge_fingerprint(msg)?;
         if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
             if existing_fingerprint != &incoming_fingerprint {
                 idx_collision_count = idx_collision_count.saturating_add(1);
@@ -4427,12 +4516,12 @@ fn collect_new_messages_for_existing_conversation<'a>(
         messages.push(msg);
     }
 
-    ExistingConversationNewMessages {
+    Ok(ExistingConversationNewMessages {
         messages,
         new_chars,
         idx_collision_count,
         first_collision_idx,
-    }
+    })
 }
 
 fn franken_existing_conversation_append_tail_state(
@@ -4804,7 +4893,16 @@ fn collect_append_only_tail_messages<'a>(
             return None;
         }
 
-        let replay_fingerprint = message_replay_fingerprint(msg);
+        // R2-B7 (任务书 #119a): this function returns `Option`, not
+        // `Result` -- `None` here means "this fast path doesn't apply",
+        // not "an error occurred", and the caller (`franken_collect_
+        // batched_existing_new_messages`) falls back to the bounded lookup
+        // path on `None`, which recomputes fingerprints through the
+        // already-`?`-propagating call sites -- a malformed marker still
+        // surfaces as a real `Err` there, just not via this fast path.
+        let Ok(replay_fingerprint) = message_replay_fingerprint(msg) else {
+            return None;
+        };
         if !seen_tail_replay.insert(replay_fingerprint) {
             return None;
         }
@@ -4890,7 +4988,13 @@ fn collect_existing_conversation_tail_from_ended_at<'a>(
     let mut new_chars = 0i64;
     let mut messages = Vec::new();
     for msg in &conv.messages {
-        let replay_fingerprint = message_replay_fingerprint(msg);
+        // R2-B7 (任务书 #119a): see the sibling site in
+        // `collect_append_only_tail_messages` above -- `None` here means
+        // "fast path not applicable", falling back to the bounded lookup
+        // where a real fingerprint failure surfaces as `Err`, not silently.
+        let Ok(replay_fingerprint) = message_replay_fingerprint(msg) else {
+            return None;
+        };
         if !seen_tail_replay.insert(replay_fingerprint) {
             return None;
         }
@@ -6556,17 +6660,19 @@ impl FrankenStorage {
 
     /// Fetch messages for a conversation.
     pub fn fetch_messages(&self, conversation_id: i64) -> Result<Vec<Message>> {
-        let hinted_sql = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
+        let hinted_sql = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded) \
              FROM messages INDEXED BY sqlite_autoindex_messages_1 \
              WHERE conversation_id = ?1 ORDER BY idx";
-        let fallback_sql = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin \
+        let fallback_sql = "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded) \
              FROM messages \
              WHERE conversation_id = ?1 ORDER BY idx";
 
         self.conn
             .query_all_map(hinted_sql, fparams![conversation_id], |row| {
                 let role: String = row.get_typed(2)?;
+                let excluded_json: Option<String> = row.get_typed(8)?;
                 Ok(Message {
+                    excluded: franken_decode_excluded_column(excluded_json)?,
                     id: Some(row.get_typed(0)?),
                     idx: row.get_typed(1)?,
                     role: role_from_str(&role),
@@ -6587,7 +6693,9 @@ impl FrankenStorage {
                         fparams![conversation_id],
                         |row| {
                             let role: String = row.get_typed(2)?;
+                            let excluded_json: Option<String> = row.get_typed(8)?;
                             Ok(Message {
+                                excluded: franken_decode_excluded_column(excluded_json)?,
                                 id: Some(row.get_typed(0)?),
                                 idx: row.get_typed(1)?,
                                 role: role_from_str(&role),
@@ -6752,17 +6860,23 @@ impl FrankenStorage {
         &self,
         conversation_id: i64,
     ) -> Result<Vec<Message>> {
-        let hinted_sql = "SELECT id, idx, role, author, created_at, content \
+        // T2b.3 (B段): 第三条候选 SELECT — 之前两条 SQL 都没有 select `excluded`
+        // 列（不是解码遗漏，是列本身没进查询），下游 lexical rebuild 消费者
+        // 因此永远读不到排除 marker。补 `json(excluded)`，与 `fetch_messages`
+        // 同一解码函数 `franken_decode_excluded_column`。
+        let hinted_sql = "SELECT id, idx, role, author, created_at, content, json(excluded) \
                  FROM messages INDEXED BY sqlite_autoindex_messages_1 \
                  WHERE conversation_id = ?1 ORDER BY idx";
-        let fallback_sql = "SELECT id, idx, role, author, created_at, content \
+        let fallback_sql = "SELECT id, idx, role, author, created_at, content, json(excluded) \
                  FROM messages \
                  WHERE conversation_id = ?1 ORDER BY idx";
 
         self.conn
             .query_all_map(hinted_sql, fparams![conversation_id], |row| {
                 let role: String = row.get_typed(2)?;
+                let excluded_json: Option<String> = row.get_typed(6)?;
                 Ok(Message {
+                    excluded: franken_decode_excluded_column(excluded_json)?,
                     id: Some(row.get_typed(0)?),
                     idx: row.get_typed(1)?,
                     role: role_from_str(&role),
@@ -6783,7 +6897,9 @@ impl FrankenStorage {
                         fparams![conversation_id],
                         |row| {
                             let role: String = row.get_typed(2)?;
+                            let excluded_json: Option<String> = row.get_typed(6)?;
                             Ok(Message {
+                                excluded: franken_decode_excluded_column(excluded_json)?,
                                 id: Some(row.get_typed(0)?),
                                 idx: row.get_typed(1)?,
                                 role: role_from_str(&role),
@@ -7558,10 +7674,26 @@ impl FrankenStorage {
             })
             .context("querying historical conversations")?;
 
-        let msg_sql = "SELECT idx, role, author, created_at, content, extra_json
+        // B02 (任务书 #131): a v6 source library carries an `excluded` marker
+        // on its excluded messages. This SELECT never projected that column,
+        // so `Message.excluded` was built as a hard `None` and every marker a
+        // recovered session carried was silently dropped -- the identity/audit
+        // anchor (and the prune reference protection that reads it) went with
+        // it, while the import still reported success. The column is PROBED,
+        // not assumed: v4/v5 bundles predate it and keep the `None` they
+        // always had.
+        let source_has_excluded = franken_table_column_names(source_conn, "messages")?.contains("excluded");
+        let msg_sql = if source_has_excluded {
+            "SELECT idx, role, author, created_at, content, extra_json, json(excluded)
              FROM messages
              WHERE conversation_id = ?1
-             ORDER BY idx";
+             ORDER BY idx"
+        } else {
+            "SELECT idx, role, author, created_at, content, extra_json
+             FROM messages
+             WHERE conversation_id = ?1
+             ORDER BY idx"
+        };
 
         let mut imported_conversations = resume_progress
             .as_ref()
@@ -7706,7 +7838,10 @@ impl FrankenStorage {
             let messages: Vec<Message> = source_conn
                 .query_all_map(msg_sql, fparams![conversation_row_id], |msg_row| {
                     let role: String = msg_row.get_typed(1)?;
+                    let excluded_json: Option<String> =
+                        if source_has_excluded { msg_row.get_typed(6)? } else { None };
                     Ok(Message {
+                        excluded: franken_decode_excluded_column(excluded_json)?,
                         id: None,
                         idx: msg_row.get_typed(0)?,
                         role: role_from_str(&role),
@@ -8051,7 +8186,7 @@ impl FrankenStorage {
                             &mut existing_messages,
                             &mut existing_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx",
-                        );
+                        )?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
@@ -8135,7 +8270,7 @@ impl FrankenStorage {
                 let mut first_collision_idx: Option<i64> = None;
                 let mut new_messages = Vec::new();
                 for msg in &conv.messages {
-                    let incoming_fingerprint = message_merge_fingerprint(msg);
+                    let incoming_fingerprint = message_merge_fingerprint(msg)?;
                     if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
                         if existing_fingerprint != &incoming_fingerprint {
                             idx_collision_count = idx_collision_count.saturating_add(1);
@@ -8143,7 +8278,7 @@ impl FrankenStorage {
                         }
                         continue;
                     }
-                    let incoming_replay = message_replay_fingerprint(msg);
+                    let incoming_replay = message_replay_fingerprint(msg)?;
                     if pending_replay_fingerprints.contains(&incoming_replay) {
                         tracing::debug!(
                             conversation_id = conv_id,
@@ -8262,7 +8397,7 @@ impl FrankenStorage {
         let mut new_messages = Vec::new();
 
         for msg in &conv.messages {
-            let incoming_fingerprint = message_merge_fingerprint(msg);
+            let incoming_fingerprint = message_merge_fingerprint(msg)?;
             if let Some(existing_fingerprint) = pending_messages.get(&msg.idx) {
                 if existing_fingerprint != &incoming_fingerprint {
                     idx_collision_count = idx_collision_count.saturating_add(1);
@@ -8271,7 +8406,7 @@ impl FrankenStorage {
                 continue;
             }
 
-            let incoming_replay = message_replay_fingerprint(msg);
+            let incoming_replay = message_replay_fingerprint(msg)?;
             if pending_replay_fingerprints.contains(&incoming_replay) {
                 tracing::debug!(
                     conversation_id = conv_id,
@@ -8414,7 +8549,7 @@ impl FrankenStorage {
                 &mut existing_messages,
                 &mut existing_replay_fingerprints,
                 "skipping replay-equivalent profiled append message with shifted idx",
-            )
+            )?
         };
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
 
@@ -8566,7 +8701,7 @@ impl FrankenStorage {
                 &mut existing_messages,
                 &mut existing_replay_fingerprints,
                 "skipping replay-equivalent recovered message with shifted idx",
-            )
+            )?
         };
 
         let mut inserted_indices = Vec::new();
@@ -9087,9 +9222,76 @@ impl FrankenStorage {
         &self,
         conversations: &[(i64, Option<i64>, &Conversation)],
     ) -> Result<Vec<InsertOutcome>> {
+        let mut skipped = Vec::new();
+        let outcomes = self.insert_conversations_batched_reporting(conversations, &mut skipped)?;
+        if !skipped.is_empty() {
+            // B06 (任务书 #131): this wrapper's callers have no other way to
+            // learn that a conversation was refused -- `skipped` is not part
+            // of the public signature, so pre-fix the only trace was a
+            // `tracing::warn!` and a caller's `?` carried on as if every
+            // conversation had been written (`Ok([])` for a batch whose only
+            // conversation was refused, `Ok([A])` for an A/B batch). The
+            // internal ingest path calls `_reporting` directly and turns each
+            // entry into a per-session `ScanError`, so nothing there depends
+            // on this wrapper.
+            let detail = skipped
+                .iter()
+                .map(|skip| {
+                    format!(
+                        "{} (external_id={:?}): {}",
+                        skip.source_path, skip.external_id, skip.error
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "{} conversation(s) were refused for an unusable excluded fingerprint: {detail}",
+                skipped.len()
+            );
+        }
+        Ok(outcomes)
+    }
+
+    /// R3-N5 (任务书 #129): the batch entry point that also reports the
+    /// conversations it refused. `insert_conversations_batched` is a thin
+    /// delegate over this (log-and-drop), so the ~40 existing call sites keep
+    /// their signature while the ingest path gets the per-session report it
+    /// needs to raise a `ScanError` for each skipped session.
+    ///
+    /// Pre-flight check rather than an in-loop catch: `fingerprint_hash_for`
+    /// can only fail on a conversation's OWN messages (a malformed
+    /// `fingerprint_blake3`), so deciding up front which conversations are
+    /// acceptable costs no correctness and leaves the insert loop (300+ lines
+    /// of shared accumulator state) untouched. The rest of the batch then
+    /// commits normally in one transaction.
+    pub(crate) fn insert_conversations_batched_reporting(
+        &self,
+        conversations: &[(i64, Option<i64>, &Conversation)],
+        skipped: &mut Vec<BatchSkippedConversation>,
+    ) -> Result<Vec<InsertOutcome>> {
         if conversations.is_empty() {
             return Ok(Vec::new());
         }
+
+        let mut acceptable: Vec<(i64, Option<i64>, &Conversation)> =
+            Vec::with_capacity(conversations.len());
+        for (index, &(agent_id, workspace_id, conv)) in conversations.iter().enumerate() {
+            match uninsertable_excluded_fingerprint_error(conv) {
+                Some(error) => skipped.push(BatchSkippedConversation {
+                    index,
+                    source_path: conv.source_path.display().to_string(),
+                    external_id: conv.external_id.clone(),
+                    error,
+                }),
+                None => acceptable.push((agent_id, workspace_id, conv)),
+            }
+        }
+        if acceptable.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Shadow the parameter: everything below operates on the acceptable
+        // subset, and `skipped` already carries the caller's positions.
+        let conversations: &[(i64, Option<i64>, &Conversation)] = &acceptable;
 
         self.ensure_sources_for_batch(conversations)?;
 
@@ -9254,13 +9456,13 @@ impl FrankenStorage {
                                     .or_default();
                                 let mut new_messages = Vec::new();
                                 for msg in &conv.messages {
-                                    let incoming_replay = message_replay_fingerprint(msg);
+                                    let incoming_replay = message_replay_fingerprint(msg)?;
                                     if pending_messages.contains_key(&msg.idx)
                                         || pending_replay_fingerprints.contains(&incoming_replay)
                                     {
                                         continue;
                                     }
-                                    pending_messages.insert(msg.idx, message_merge_fingerprint(msg));
+                                    pending_messages.insert(msg.idx, message_merge_fingerprint(msg)?);
                                     pending_replay_fingerprints.insert(incoming_replay);
                                     new_messages.push(msg);
                                 }
@@ -10250,11 +10452,11 @@ fn franken_find_existing_conversation_by_key_impl(
             let Some(conv) = conv else {
                 return Ok(None);
             };
-            let incoming_fingerprints = conversation_message_fingerprints(conv);
+            let incoming_fingerprints = conversation_message_fingerprints(conv)?;
             if incoming_fingerprints.is_empty() {
                 return Ok(None);
             }
-            let incoming_replay_fingerprints = conversation_message_replay_fingerprints(conv);
+            let incoming_replay_fingerprints = conversation_message_replay_fingerprints(conv)?;
 
             let candidates: Vec<(i64, Option<i64>)> = tx.query_all_map(
                 "SELECT
@@ -10498,10 +10700,11 @@ fn franken_insert_new_message(
 ) -> Result<i64> {
     let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
     let extra_bin_bytes = extra_bin.as_deref();
+    let excluded_json = msg.excluded.as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
 
     tx.execute(
-        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin, excluded)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,jsonb(?9))",
             fparams![
                 conversation_id,
                 msg.idx,
@@ -10510,7 +10713,8 @@ fn franken_insert_new_message(
                 msg.created_at,
                 msg.content.as_str(),
                 extra_json_str.as_deref(),
-                extra_bin_bytes
+                extra_bin_bytes,
+                excluded_json.as_deref()
         ],
     )?;
     franken_last_rowid(tx)
@@ -10523,10 +10727,11 @@ fn franken_insert_new_message_ignore_duplicate(
 ) -> Result<Option<i64>> {
     let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
     let extra_bin_bytes = extra_bin.as_deref();
+    let excluded_json = msg.excluded.as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
 
     let changed = tx.execute(
-        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        "INSERT OR IGNORE INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin, excluded)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,jsonb(?9))",
             fparams![
                 conversation_id,
                 msg.idx,
@@ -10535,7 +10740,8 @@ fn franken_insert_new_message_ignore_duplicate(
                 msg.created_at,
                 msg.content.as_str(),
                 extra_json_str.as_deref(),
-                extra_bin_bytes
+                extra_bin_bytes,
+                excluded_json.as_deref()
         ],
     )?;
     if changed == 0 {
@@ -10566,8 +10772,9 @@ fn franken_message_insert_payload(msg: &Message) -> Result<MessageInsertPayload<
 
 /// Batch size for proven-new message inserts.
 ///
-/// Each row binds 8 values, so 100 rows stays well under SQLite's default
-/// `SQLITE_MAX_VARIABLE_NUMBER` limit of 999 while still amortizing parse cost.
+/// Each row binds 9 values (PR6 T2c added `excluded`), so 100 rows stays
+/// well under SQLite's default `SQLITE_MAX_VARIABLE_NUMBER` limit of 999
+/// while still amortizing parse cost.
 const MESSAGE_INSERT_BATCH_SIZE: usize = 100;
 
 /// Append workloads profile fastest with larger chunks on current the legacy embedded engine.
@@ -10587,9 +10794,9 @@ fn message_insert_batch_sql(row_count: usize) -> &'static str {
         for row_count in 1..=max_batch_size {
             let placeholders = (0..row_count)
                 .map(|idx| {
-                    let base = idx * 8;
+                    let base = idx * 9;
                     format!(
-                        "(?{},?{},?{},?{},?{},?{},?{},?{})",
+                        "(?{},?{},?{},?{},?{},?{},?{},?{},jsonb(?{}))",
                         base + 1,
                         base + 2,
                         base + 3,
@@ -10597,13 +10804,14 @@ fn message_insert_batch_sql(row_count: usize) -> &'static str {
                         base + 5,
                         base + 6,
                         base + 7,
-                        base + 8
+                        base + 8,
+                        base + 9
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(",");
             sql_by_row_count.push(format!(
-                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES {placeholders}"
+                "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin, excluded) VALUES {placeholders}"
             ));
         }
         sql_by_row_count
@@ -10678,9 +10886,10 @@ fn franken_batch_insert_new_messages_with_batch_size(
         }
         let sql = message_insert_batch_sql(chunk.len());
 
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 9);
         for msg in chunk {
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+            let excluded_json = msg.excluded.as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
             param_values.push(SqliteValue::from(conversation_id));
             param_values.push(SqliteValue::from(msg.idx));
             param_values.push(SqliteValue::from(role_as_str(&msg.role)));
@@ -10689,6 +10898,7 @@ fn franken_batch_insert_new_messages_with_batch_size(
             param_values.push(SqliteValue::from(msg.content.as_str()));
             param_values.push(SqliteValue::from(extra_json_str.as_deref()));
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
+            param_values.push(SqliteValue::from(excluded_json.as_deref()));
         }
 
         tx.execute(sql, &param_values)?;
@@ -10754,11 +10964,12 @@ fn franken_insert_new_message_with_profile(
     let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
     profile.payload_duration += payload_start.elapsed();
     let extra_bin_bytes = extra_bin.as_deref();
+    let excluded_json = msg.excluded.as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
 
     let execute_start = Instant::now();
     tx.execute(
-        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        "INSERT INTO messages(conversation_id, idx, role, author, created_at, content, extra_json, extra_bin, excluded)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,jsonb(?9))",
             fparams![
                 conversation_id,
                 msg.idx,
@@ -10767,7 +10978,8 @@ fn franken_insert_new_message_with_profile(
                 msg.created_at,
                 msg.content.as_str(),
                 extra_json_str.as_deref(),
-                extra_bin_bytes
+                extra_bin_bytes,
+                excluded_json.as_deref()
         ],
     )?;
     profile.execute_duration += execute_start.elapsed();
@@ -10838,13 +11050,14 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
         let sql = message_insert_batch_sql(chunk.len());
         profile.sql_build_duration += sql_build_start.elapsed();
 
-        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 8);
+        let mut param_values: Vec<SqliteValue> = Vec::with_capacity(chunk.len() * 9);
         for msg in chunk {
             let payload_start = Instant::now();
             let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
             profile.payload_duration += payload_start.elapsed();
 
             let param_build_start = Instant::now();
+            let excluded_json = msg.excluded.as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
             param_values.push(SqliteValue::from(conversation_id));
             param_values.push(SqliteValue::from(msg.idx));
             param_values.push(SqliteValue::from(role_as_str(&msg.role)));
@@ -10853,6 +11066,7 @@ fn franken_batch_insert_new_messages_with_profile_batch_size(
             param_values.push(SqliteValue::from(msg.content.as_str()));
             param_values.push(SqliteValue::from(extra_json_str.as_deref()));
             param_values.push(SqliteValue::from(extra_bin.as_deref()));
+            param_values.push(SqliteValue::from(excluded_json.as_deref()));
             profile.param_build_duration += param_build_start.elapsed();
         }
 
@@ -10905,24 +11119,33 @@ fn franken_existing_message_fingerprints(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
 ) -> Result<HashSet<MessageMergeFingerprint>> {
-    let rows = tx.query_all_map(
-        "SELECT idx, role, author, created_at, content
+    // R10: `excluded` (JSONB) must go through `json(...)` to come back as
+    // text; the fingerprint computation itself happens outside the closure
+    // (below) since `fingerprint_hash_for` is `anyhow::Result`-typed while
+    // this closure's own `?` calls must stay in `StorageError`.
+    let rows: Vec<(i64, String, Option<String>, Option<i64>, String, Option<String>)> = tx.query_all_map(
+        "SELECT idx, role, author, created_at, content, json(excluded)
          FROM messages
          WHERE conversation_id = ?1",
         fparams![conversation_id],
         |row| {
-            let role: String = row.get_typed(1)?;
-            let content: String = row.get_typed(4)?;
-            Ok(MessageMergeFingerprint {
-                idx: row.get_typed(0)?,
-                created_at: row.get_typed(3)?,
-                role: role_from_str(&role),
-                author: row.get_typed(2)?,
-                content_hash: *blake3::hash(content.as_bytes()).as_bytes(),
-            })
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+            ))
         },
     )?;
-    Ok(rows.into_iter().collect())
+    rows.into_iter()
+        .map(|(idx, role, author, created_at, content, excluded_json)| {
+            let excluded = excluded_json.as_deref().map(crate::indexer::exclusion::ExcludedMarker::from_json_str).transpose()?;
+            let content_hash = fingerprint_hash_for(&content, excluded.as_ref())?;
+            Ok(MessageMergeFingerprint { idx, created_at, role: role_from_str(&role), author, content_hash })
+        })
+        .collect()
 }
 
 struct ExistingMessageLookup {
@@ -10941,6 +11164,8 @@ struct FrankenMessageLookupRow {
     author: Option<String>,
     created_at: Option<i64>,
     content: String,
+    /// R10: `json(excluded)` text, `None` for untouched rows.
+    excluded: Option<String>,
 }
 
 fn existing_message_lookup_from_rows(
@@ -10958,7 +11183,8 @@ fn existing_message_lookup_from_rows(
         let created_at = row.created_at;
         let content = row.content;
         let role = role_from_str(&row.role);
-        let content_hash = *blake3::hash(content.as_bytes()).as_bytes();
+        let excluded = row.excluded.as_deref().map(crate::indexer::exclusion::ExcludedMarker::from_json_str).transpose()?;
+        let content_hash = fingerprint_hash_for(&content, excluded.as_ref())?;
 
         if idx >= min_idx && idx <= max_idx {
             by_idx.insert(
@@ -11034,7 +11260,7 @@ fn franken_existing_message_lookup(
             // Same-idx messages are skipped by merge policy even when content has
             // diverged. Use the incoming fingerprint as a lightweight presence
             // marker so normal reprocessing does not need to read stored content.
-            by_idx.insert(msg.idx, message_merge_fingerprint(msg));
+            by_idx.insert(msg.idx, message_merge_fingerprint(msg)?);
         } else {
             missing_messages.push(msg);
         }
@@ -11064,7 +11290,7 @@ fn franken_existing_message_lookup(
     let mut replay = HashSet::new();
     if requires_full_scan {
         let rows = tx.query_all_map(
-            "SELECT idx, role, author, created_at, content
+            "SELECT idx, role, author, created_at, content, json(excluded)
              FROM messages INDEXED BY sqlite_autoindex_messages_1
              WHERE conversation_id = ?1",
             fparams![conversation_id],
@@ -11075,6 +11301,7 @@ fn franken_existing_message_lookup(
                     author: row.get_typed(2)?,
                     created_at: row.get_typed(3)?,
                     content: row.get_typed(4)?,
+                    excluded: row.get_typed(5)?,
                 })
             },
         )?;
@@ -11085,7 +11312,7 @@ fn franken_existing_message_lookup(
         replay.extend(content_lookup.replay);
     } else if let Some((min_created_at, max_created_at)) = created_bounds {
         let rows = tx.query_all_map(
-            "SELECT idx, role, author, created_at, content
+            "SELECT idx, role, author, created_at, content, json(excluded)
              FROM messages INDEXED BY sqlite_autoindex_messages_1
              WHERE conversation_id = ?1
                AND created_at IS NOT NULL
@@ -11099,6 +11326,7 @@ fn franken_existing_message_lookup(
                     author: row.get_typed(2)?,
                     created_at: row.get_typed(3)?,
                     content: row.get_typed(4)?,
+                    excluded: row.get_typed(5)?,
                 })
             },
         )?;
@@ -11123,9 +11351,16 @@ fn franken_existing_message_lookup_with_pending(
         pending_message_fingerprints.get(&conversation_id),
         pending_message_replay_fingerprints.get(&conversation_id),
     ) {
-        if incoming_messages.iter().all(|msg| {
-            by_idx.contains_key(&msg.idx) || replay.contains(&message_replay_fingerprint(msg))
-        }) {
+        // R2-B7 (任务书 #119a): the `.all(...)` closure below must return
+        // `bool`, so a `?` cannot propagate a fingerprint failure out of it
+        // directly. Treating that failure as "not a replay match" here is
+        // safe, not a silent swallow: it only ever widens `missing_messages`
+        // in the same direction a cache-miss already does, sending this
+        // conversation to the `franken_existing_message_lookup` fallback
+        // just below, which recomputes the SAME fingerprint through the
+        // already-`?`-propagating call at :11122 -- a real malformed marker
+        // surfaces there as an `Err`, never silently as `false` here.
+        if incoming_messages.iter().all(|msg| by_idx.contains_key(&msg.idx) || message_replay_fingerprint(msg).is_ok_and(|fp| replay.contains(&fp))) {
             return Ok(ExistingMessageLookup {
                 by_idx: by_idx.clone(),
                 replay: replay.clone(),
@@ -11179,7 +11414,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .remove(&conversation_id)
             .unwrap_or_default();
         for msg in &tail_plan.messages {
-            let fingerprint = message_merge_fingerprint(msg);
+            let fingerprint = message_merge_fingerprint(msg)?;
             by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
         }
@@ -11214,7 +11449,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .remove(&conversation_id)
             .unwrap_or_default();
         for msg in &tail_plan.messages {
-            let fingerprint = message_merge_fingerprint(msg);
+            let fingerprint = message_merge_fingerprint(msg)?;
             by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
         }
@@ -11237,7 +11472,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
             .remove(&conversation_id)
             .unwrap_or_default();
         for msg in &tail_plan.messages {
-            let fingerprint = message_merge_fingerprint(msg);
+            let fingerprint = message_merge_fingerprint(msg)?;
             by_idx.insert(msg.idx, fingerprint.clone());
             replay.insert(replay_fingerprint_from_merge(&fingerprint));
         }
@@ -11267,7 +11502,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
         &mut existing_messages,
         &mut existing_replay_fingerprints,
         replay_skip_log,
-    );
+    )?;
     Ok((
         new_messages,
         existing_messages,
@@ -12337,7 +12572,7 @@ fn franken_update_conversation_token_summaries_in_tx(
 // 传了进来，但**编排自己也还没有调用方**，dead-code 从可达根传递判定，于是整条链
 // 依旧不可达。真正的根是 E8 把 `mirror-restore --apply` 的 CLI 接上那一刻。
 // E9 的 clippy 门以「相对基线零新增告警」为判据，这几条属本 PR 新增，故在此消掉。
-const REPLACE_MESSAGE_INSERT_SQL: &str = "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)";
+const REPLACE_MESSAGE_INSERT_SQL: &str = "INSERT INTO messages(id, conversation_id, idx, role, author, created_at, content, extra_json, extra_bin, excluded) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,jsonb(?10))";
 
 /// `franken_replace_conversation_messages_in_tx` 的产出。
 pub(crate) struct ReplaceConversationMessagesOutcome {
@@ -12425,6 +12660,7 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
     for (offset, msg) in conv.messages.iter().enumerate() {
         let message_id = old_global_max_message_id + 1 + offset as i64;
         let (extra_json_str, extra_bin) = franken_message_insert_payload(msg)?;
+        let excluded_json = msg.excluded.as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
         tx.execute(
             REPLACE_MESSAGE_INSERT_SQL,
             fparams![
@@ -12436,7 +12672,8 @@ pub(crate) fn franken_replace_conversation_messages_in_tx(
                 msg.created_at,
                 msg.content.as_str(),
                 extra_json_str.as_deref(),
-                extra_bin.as_deref()
+                extra_bin.as_deref(),
+                excluded_json.as_deref()
             ],
         )?;
         franken_insert_snippets(tx, message_id, &msg.snippets)?;
@@ -15145,6 +15382,7 @@ mod tests {
             messages: idx_created_at
                 .iter()
                 .map(|(idx, created_at)| Message {
+                    excluded: None,
                     id: None,
                     idx: *idx,
                     role: MessageRole::User,
@@ -15685,6 +15923,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -15695,6 +15934,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -15782,6 +16022,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -16009,6 +16250,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -16019,6 +16261,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Other("tool_result".into()),
@@ -16029,6 +16272,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::User,
@@ -16249,6 +16493,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![crate::model::types::Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: crate::model::types::MessageRole::User,
@@ -16421,6 +16666,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -16431,6 +16677,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -16564,6 +16811,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::MessageRole::User,
@@ -16574,6 +16822,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::MessageRole::Assistant,
@@ -16721,6 +16970,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, role)| crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: idx as i64,
                 role: role.clone(),
@@ -16857,6 +17107,7 @@ mod tests {
         const MESSAGE_COUNT: i64 = 1_200; // > 2x LEXICAL_SYNC_BATCH_ROWS/PAGE_SIZE (500)
         let messages = (0..MESSAGE_COUNT)
             .map(|idx| crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx,
                 role: crate::model::types::MessageRole::User,
@@ -17536,6 +17787,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -17546,6 +17798,7 @@ mod tests {
                     snippets: vec![],
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -17556,6 +17809,7 @@ mod tests {
                     snippets: vec![],
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: MessageRole::User,
@@ -18013,6 +18267,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -18023,6 +18278,7 @@ mod tests {
                     snippets: vec![],
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -18033,6 +18289,7 @@ mod tests {
                     snippets: vec![],
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: MessageRole::User,
@@ -18226,6 +18483,7 @@ mod tests {
             metadata_json: serde_json::json!({ "bench": true }),
             messages: (0..msg_count)
                 .map(|idx| Message {
+                    excluded: None,
                     id: None,
                     idx: idx as i64,
                     role: if idx % 2 == 0 {
@@ -18266,6 +18524,7 @@ mod tests {
             metadata_json: serde_json::json!({ "bench": true }),
             messages: (0..msg_count)
                 .map(|idx| Message {
+                    excluded: None,
                     id: None,
                     idx: idx as i64,
                     role: if idx % 2 == 0 {
@@ -19293,6 +19552,7 @@ mod tests {
 
         let conv_a = base_conv(vec![
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -19303,6 +19563,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 1,
                 role: MessageRole::Agent,
@@ -19315,6 +19576,7 @@ mod tests {
         ]);
         let conv_b = base_conv(vec![
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -19325,6 +19587,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 1,
                 role: MessageRole::Agent,
@@ -19335,6 +19598,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 2,
                 role: MessageRole::User,
@@ -19345,6 +19609,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 3,
                 role: MessageRole::Agent,
@@ -19479,6 +19744,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -19560,6 +19826,7 @@ mod tests {
 
         let conv_a = base_conv(vec![
             Message {
+                excluded: None,
                 id: None,
                 idx: 2,
                 role: MessageRole::User,
@@ -19570,6 +19837,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 3,
                 role: MessageRole::Agent,
@@ -19582,6 +19850,7 @@ mod tests {
         ]);
         let conv_b = base_conv(vec![
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -19592,6 +19861,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 1,
                 role: MessageRole::Agent,
@@ -19602,6 +19872,7 @@ mod tests {
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: None,
                 idx: 3,
                 role: MessageRole::Agent,
@@ -19649,6 +19920,7 @@ mod tests {
         let agent_id = storage.ensure_agent(&agent).unwrap();
 
         let make_message = |idx: i64, content: &str| Message {
+            excluded: None,
             id: None,
             idx,
             role: if idx == 0 {
@@ -19743,6 +20015,7 @@ mod tests {
 
         let messages: Vec<Message> = (0..MESSAGE_COUNT)
             .map(|idx| Message {
+                excluded: None,
                 id: None,
                 idx,
                 role: if idx % 2 == 0 {
@@ -20113,6 +20386,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -20123,6 +20397,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -20133,6 +20408,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -20210,6 +20486,7 @@ mod tests {
                 None,
                 &base_conv(vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -20220,6 +20497,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -20239,6 +20517,7 @@ mod tests {
                 None,
                 &base_conv(vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -20249,6 +20528,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::User,
@@ -20317,6 +20597,7 @@ mod tests {
                     Some(1_700_000_000_000),
                     vec![
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 0,
                             role: MessageRole::User,
@@ -20327,6 +20608,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 1,
                             role: MessageRole::Agent,
@@ -20349,6 +20631,7 @@ mod tests {
                     Some(1_700_000_004_000),
                     vec![
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 1,
                             role: MessageRole::Agent,
@@ -20359,6 +20642,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 2,
                             role: MessageRole::User,
@@ -20407,6 +20691,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx,
                 role: MessageRole::User,
@@ -20427,6 +20712,7 @@ mod tests {
                 &Conversation {
                     messages: vec![
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 0,
                             role: MessageRole::User,
@@ -20437,6 +20723,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 1,
                             role: MessageRole::Agent,
@@ -20498,6 +20785,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -20577,6 +20865,7 @@ mod tests {
                     1_700_000_000_000,
                     vec![
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 0,
                             role: MessageRole::User,
@@ -20587,6 +20876,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 1,
                             role: MessageRole::Agent,
@@ -20609,6 +20899,7 @@ mod tests {
                     1_700_000_900_000,
                     vec![
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 10,
                             role: MessageRole::User,
@@ -20619,6 +20910,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 11,
                             role: MessageRole::Agent,
@@ -20629,6 +20921,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 12,
                             role: MessageRole::User,
@@ -20688,6 +20981,7 @@ mod tests {
             "/tmp/shared-history.jsonl",
             vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -20698,6 +20992,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -20713,6 +21008,7 @@ mod tests {
             "/tmp/shared-history.jsonl",
             vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -20723,6 +21019,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: MessageRole::User,
@@ -20737,6 +21034,7 @@ mod tests {
         let unique = Conversation {
             source_path: PathBuf::from("/tmp/unique-history.jsonl"),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -20787,6 +21085,216 @@ mod tests {
         assert_eq!(second.messages_imported, 0);
     }
 
+    /// B02 (任务书 #131): a v6 source library carries `excluded` markers on its
+    /// messages, and the historical-salvage SELECT did not project that
+    /// column -- every imported marker came back as `excluded: None`, so the
+    /// recovered row lost its identity/audit anchor (and the prune reference
+    /// protection that reads it) while the import still reported success.
+    /// v4/v5 bundles have no such column and keep the `None` they always had.
+    /// B06 (任务书 #131): the public `insert_conversations_batched` returned
+    /// `Ok` even when its pre-flight refused a conversation for an unusable
+    /// `excluded` fingerprint. `skipped` is not part of the public signature
+    /// (the wrapper only logged it), so a caller's `?` carried on as if every
+    /// conversation had been written -- and `Ok([A])` for an A/B batch hid B
+    /// entirely.
+    #[test]
+    fn insert_conversations_batched_reports_skipped_conversations_as_err() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("batched-skipped.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = |name: &str, fingerprint: Option<&str>| Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some(name.to_string()),
+            title: None,
+            source_path: PathBuf::from(format!("/tmp/{name}.jsonl")),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: fingerprint.map(|fp| ExcludedMarker {
+                    reason: ExclusionReason::CassRecall,
+                    rule_version: 1,
+                    bytes: 2,
+                    sha256: "a".repeat(64),
+                    fingerprint_blake3: fp.to_string(),
+                    anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: None },
+                    src: None,
+                    parse_error: None,
+                    raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 0, event_key: "ek-1".into(), blocks: vec![] },
+                }),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        // (a) A healthy batch still returns Ok.
+        let healthy = conversation("healthy", None);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &healthy)])
+            .expect("a batch with no refused conversation keeps returning Ok");
+
+        // (b) A batch whose only conversation is refused is an Err that names it.
+        let refused = conversation("refused", Some("zz"));
+        let err = storage
+            .insert_conversations_batched(&[(agent_id, None, &refused)])
+            .map(|_| ())
+            .expect_err("a refused conversation must not be reported as an Ok batch");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("/tmp/refused.jsonl") && message.contains("refused"),
+            "the error must name the conversation it refused: {message}"
+        );
+
+        // (c) A healthy-and-refused pair must not come back as Ok([A]).
+        let healthy_second = conversation("healthy-second", None);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &healthy_second), (agent_id, None, &refused)])
+            .map(|_| ())
+            .expect_err("one refused conversation must fail the whole public call");
+        let persisted: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE external_id = 'healthy-second'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 1, "the acceptable conversation is still written; the Err is about the refused one");
+
+        // (d) The per-session entry point still skips ONLY the bad one -- the
+        // ingest path turns each entry into a per-session ScanError.
+        let mut skipped = Vec::new();
+        let a = conversation("reporting-a", None);
+        let b = conversation("reporting-b", Some("zz"));
+        let c = conversation("reporting-c", None);
+        let outcomes = storage
+            .insert_conversations_batched_reporting(
+                &[(agent_id, None, &a), (agent_id, None, &b), (agent_id, None, &c)],
+                &mut skipped,
+            )
+            .expect("the reporting entry point never fails the batch for one bad conversation");
+        assert_eq!(outcomes.len(), 2, "A and C must be inserted");
+        assert_eq!(skipped.len(), 1, "only B is skipped");
+        assert_eq!(skipped[0].external_id.as_deref(), Some("reporting-b"));
+        assert_eq!(skipped[0].source_path, "/tmp/reporting-b.jsonl");
+        assert!(skipped[0].error.contains("fingerprint"), "the skip must say why: {}", skipped[0].error);
+    }
+
+    #[test]
+    fn salvage_historical_databases_preserves_v6_excluded_markers() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+        use crate::model::types::{Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let canonical_db = dir.path().join("agent_search.db");
+        let storage = SqliteStorage::open(&canonical_db).unwrap();
+
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CodexHostShell,
+            rule_version: 1,
+            bytes: 11,
+            sha256: "a".repeat(64),
+            fingerprint_blake3: "b".repeat(64),
+            anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 1, event_key: "ek-excluded".into(), blocks: vec![0] },
+        };
+
+        let backup_conv = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: None,
+            title: Some("v6 backup with a marker".into()),
+            source_path: PathBuf::from("/tmp/v6-backup.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: "ordinary recovered row".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_050),
+                    content: String::new(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+
+        let bundle_path = dir.path().join("backups/agent_search.db.20260912T000000.bak");
+        seed_historical_db_direct(&bundle_path, std::slice::from_ref(&backup_conv));
+        // The seeder writes the legacy core schema, which predates v6. Add the
+        // column exactly as a real v6 backup carries it, and write the marker
+        // through the same `jsonb(?)` the v6 writer uses.
+        {
+            let conn = FrankenConnection::open_writable(&bundle_path, crate::storage::api::Profile::Production).unwrap();
+            conn.execute("ALTER TABLE messages ADD COLUMN excluded BLOB", fparams![]).unwrap();
+            conn.execute("UPDATE messages SET excluded = jsonb(?1) WHERE idx = 1", fparams![marker.to_json_string().as_str()])
+                .unwrap();
+        }
+
+        let outcome = storage.salvage_historical_databases(&canonical_db).unwrap();
+        assert_eq!(outcome.bundles_imported, 1);
+        assert_eq!(outcome.messages_imported, 2);
+
+        let conversation_id = storage
+            .list_conversations(10, 0)
+            .unwrap()
+            .into_iter()
+            .find(|conv| conv.source_path == std::path::Path::new("/tmp/v6-backup.jsonl"))
+            .and_then(|conv| conv.id)
+            .expect("the bundle's conversation must have been imported");
+        let messages = storage.fetch_messages(conversation_id).unwrap();
+        let excluded_row = messages.iter().find(|msg| msg.idx == 1).expect("the idx=1 row must have been imported");
+        assert_eq!(
+            excluded_row.excluded,
+            Some(marker),
+            "a v6 backup's excluded marker must survive the import, not degrade to None"
+        );
+        assert!(
+            messages.iter().find(|msg| msg.idx == 0).unwrap().excluded.is_none(),
+            "an unmarked row must stay unmarked"
+        );
+    }
+
     #[test]
     fn salvage_historical_databases_normalizes_host_only_remote_provenance() {
         use crate::model::types::{Conversation, Message, MessageRole};
@@ -20808,6 +21316,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -20881,6 +21390,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: (0..4)
                     .map(|idx| Message {
+                        excluded: None,
                         id: None,
                         idx,
                         role: MessageRole::User,
@@ -20953,6 +21463,7 @@ mod tests {
                 approx_tokens: None,
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -21058,6 +21569,7 @@ mod tests {
                 approx_tokens: None,
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -21168,6 +21680,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -21306,6 +21819,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -21403,6 +21917,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -21523,6 +22038,7 @@ mod tests {
             1_700_000_000_000,
             vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -21533,6 +22049,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -21549,6 +22066,7 @@ mod tests {
             "footprint-utf8",
             1_700_000_002_000,
             vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Tool,
@@ -21563,6 +22081,7 @@ mod tests {
             "footprint-sparse",
             1_700_000_003_000,
             vec![Message {
+                excluded: None,
                 id: None,
                 idx: 10,
                 role: MessageRole::User,
@@ -21643,6 +22162,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 10,
                         role: MessageRole::User,
@@ -21724,6 +22244,7 @@ mod tests {
                     metadata_json: serde_json::Value::Null,
                     messages: (0..3)
                         .map(|idx| Message {
+                            excluded: None,
                             id: None,
                             idx,
                             role: MessageRole::User,
@@ -21807,6 +22328,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 10,
                         role: MessageRole::User,
@@ -21905,6 +22427,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -21993,6 +22516,7 @@ mod tests {
             approx_tokens: Some(42),
             metadata_json: serde_json::json!({"seed": true}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Agent,
@@ -22144,6 +22668,7 @@ mod tests {
             approx_tokens: Some(42),
             metadata_json: serde_json::json!({"seed": "bad"}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Agent,
@@ -22245,6 +22770,7 @@ mod tests {
             approx_tokens: Some(42),
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Agent,
@@ -22277,6 +22803,366 @@ mod tests {
         assert_eq!(lexical[0].content, "indexed text");
         assert_eq!(lexical[0].author.as_deref(), Some("assistant"));
         assert!(lexical[0].extra_json.is_null());
+    }
+
+    /// PR6 T2a Step 5 (任务书 #113): a message carrying an `excluded` marker
+    /// round-trips through `jsonb(?)` (write) / `json(excluded)` (read)
+    /// with every field intact, and `json_extract(excluded,'$.raw.blob')`
+    /// is queryable directly against the stored JSONB column (R6/R9).
+    #[test]
+    fn excluded_marker_round_trips_through_jsonb_write_and_json_read() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("excluded-roundtrip.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CassRecall,
+            rule_version: 1,
+            bytes: 42,
+            sha256: "a".repeat(64),
+            fingerprint_blake3: "b".repeat(64),
+            anchor: ExclusionAnchor { tool_call_id: Some("toolu_01".into()), tool_name: Some("mcp__cass-mcp__cass_search".into()), paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 3, event_key: "ek-1".into(), blocks: vec![1] },
+        };
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("excluded-roundtrip".into()),
+            title: Some("excluded roundtrip".into()),
+            source_path: PathBuf::from("/tmp/excluded-roundtrip.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: Some(marker.clone()),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let conversation_id = inserted.conversation_id;
+
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].excluded, Some(marker), "marker must round-trip field-for-field through jsonb(?)/json(excluded)");
+
+        let blob: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT json_extract(excluded, '$.raw.blob') FROM messages WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(blob, "blobs/blake3/ab/abcd.raw", "json_extract must work directly against the stored JSONB column");
+    }
+
+    /// R2-N16⑥ (任务书 #129): two EXCLUDED rows agreeing on `created_at`,
+    /// `role` and `author`, differing only in body, must BOTH persist -- and
+    /// must both still be there after an incremental re-insert of the same
+    /// conversation. Their dedup identity is the marker's pre-redaction
+    /// `fingerprint_blake3`: `content` is empty for both, so a merge keyed on
+    /// `content` (or on the other three fields alone) silently collapses two
+    /// real messages into one. Plan T2 called this shape out and the ledger's
+    /// ⑥ found it had no test.
+    #[test]
+    fn two_excluded_rows_same_time_role_author_different_body_persist_through_merge() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        fn excluded_marker(fingerprint: &str, idx: u32) -> ExcludedMarker {
+            ExcludedMarker {
+                reason: ExclusionReason::ContextFileRead,
+                rule_version: 1,
+                bytes: 42,
+                sha256: "a".repeat(64),
+                fingerprint_blake3: fingerprint.repeat(64),
+                anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: Some(vec!["/x".into()]), shell: None },
+                src: None,
+                parse_error: None,
+                raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx, event_key: format!("ek-{idx}"), blocks: vec![0] },
+            }
+        }
+        fn row(idx: i64, marker: ExcludedMarker) -> Message {
+            Message {
+                excluded: Some(marker),
+                id: None,
+                idx,
+                role: MessageRole::Agent,
+                author: Some("assistant".into()),
+                // Identical instant, role and author for both rows: the
+                // marker fingerprint is the only thing telling them apart.
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("two-excluded-rows.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("two-excluded-rows".into()),
+            title: Some("two excluded rows".into()),
+            source_path: PathBuf::from("/tmp/two-excluded-rows.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![row(0, excluded_marker("b", 0)), row(1, excluded_marker("c", 1))],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        fn fingerprints(rows: &[Message]) -> std::collections::BTreeSet<String> {
+            rows.iter()
+                .filter_map(|m| m.excluded.as_ref().map(|e| e.fingerprint_blake3.clone()))
+                .collect()
+        }
+
+        let inserted = storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let conversation_id = inserted.conversation_id;
+        let stored = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(stored.len(), 2, "two excluded rows differing only in body must both persist: {stored:?}");
+        assert_eq!(fingerprints(&stored).len(), 2, "both distinct marker fingerprints must survive: {stored:?}");
+
+        // The incremental path: re-insert the same conversation (this is the
+        // lookup/merge route the ledger asks to cover for excluded rows).
+        storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let after_merge = storage.fetch_messages(conversation_id).unwrap();
+        assert_eq!(
+            after_merge.len(),
+            2,
+            "an incremental re-insert must merge against BOTH excluded rows, not collapse them into one: {after_merge:?}"
+        );
+        assert_eq!(fingerprints(&after_merge), fingerprints(&stored), "both markers must survive the merge unchanged");
+    }
+
+    /// R2-B7 (任务书 #119a): `ExcludedMarker` has two construction paths that
+    /// bypass `from_json_str`'s hex-format validation -- public fields
+    /// (direct struct construction, this test) and `derive(Deserialize)`
+    /// (the sibling test below). Before this fix, `message_merge_fingerprint`/
+    /// `message_replay_fingerprint` `.expect()`ed `fingerprint_hash`'s
+    /// result; since release builds are `panic = "abort"`, a caller hitting
+    /// either bypass path with a malformed `fingerprint_blake3` would abort
+    /// the whole process on the very first insert. This asserts the input-
+    /// boundary defect is closed: the same illegal marker now surfaces as an
+    /// ordinary `Err` a caller can turn into a per-session `ScanError`.
+    #[test]
+    fn insert_conversation_tree_returns_err_not_panic_for_directly_constructed_illegal_fingerprint() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("illegal-fingerprint-direct.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        // Public fields, never routed through `ExcludedMarker::from_json_str`
+        // -- this is exactly the "library caller constructs `Message.excluded`
+        // directly" bypass R2-B7 names.
+        let illegal_marker = ExcludedMarker {
+            reason: ExclusionReason::CassRecall,
+            rule_version: 1,
+            bytes: 2,
+            sha256: "a".repeat(64),
+            fingerprint_blake3: "zz".to_string(),
+            anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: None },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/ab/abcd.raw".into(), idx: 0, event_key: "ek-1".into(), blocks: vec![] },
+        };
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("illegal-fingerprint-direct".into()),
+            title: None,
+            source_path: PathBuf::from("/tmp/illegal-fingerprint-direct.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: Some(illegal_marker),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let result = storage.insert_conversation_tree(agent_id, None, &conversation);
+        assert!(result.is_err(), "an illegal fingerprint_blake3 must surface as Err, not panic the process");
+    }
+
+    /// R2-B7 sibling of the test above: the OTHER bypass path,
+    /// `derive(Deserialize)` reading a hand-built JSON payload directly
+    /// (`serde_json::from_str::<ExcludedMarker>`), never touching
+    /// `from_json_str`'s validation wrapper.
+    #[test]
+    fn insert_conversation_tree_returns_err_not_panic_for_deserialize_constructed_illegal_fingerprint() {
+        use crate::indexer::exclusion::ExcludedMarker;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("illegal-fingerprint-deserialize.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let agent = Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let illegal_marker_json = format!(
+            r#"{{"reason":"cass_recall","rule_version":1,"bytes":2,"sha256":"{}","fingerprint_blake3":"zz","anchor":{{}},"raw":{{"blob":"blobs/blake3/ab/abcd.raw","idx":0,"event_key":"ek-1","blocks":[]}}}}"#,
+            "a".repeat(64)
+        );
+        let illegal_marker: ExcludedMarker = serde_json::from_str(&illegal_marker_json).expect("fixture JSON must at least deserialize (only the hex-format check is bypassed)");
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: None,
+            external_id: Some("illegal-fingerprint-deserialize".into()),
+            title: None,
+            source_path: PathBuf::from("/tmp/illegal-fingerprint-deserialize.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: Some(illegal_marker),
+                id: None,
+                idx: 0,
+                role: MessageRole::Tool,
+                author: None,
+                created_at: Some(1_700_000_000_050),
+                content: String::new(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let result = storage.insert_conversation_tree(agent_id, None, &conversation);
+        assert!(result.is_err(), "an illegal fingerprint_blake3 built via derive(Deserialize) must surface as Err, not panic the process");
+    }
+
+    /// T2b.3 (B段, mission #116 授权项⑤): `fetch_messages_for_conversation`
+    /// (the lexical-rebuild message loader) is the third candidate SELECT --
+    /// prior to this fix its SQL didn't even project the `excluded` column
+    /// (two hardcoded `excluded: None` construction sites, not a decode
+    /// omission). Round-trips the same marker shape as the `fetch_messages`
+    /// test above through this second reader. The `.or_else` fallback branch
+    /// (no `sqlite_autoindex_messages_1`) is not independently exercised
+    /// here: SQLite refuses `DROP INDEX` on an index backing a UNIQUE
+    /// constraint (`"index associated with a UNIQUE or PRIMARY KEY
+    /// constraint cannot be dropped"`), so there is no way to force that
+    /// branch short of a second, hand-rolled schema fixture; the fallback
+    /// SQL string is mechanically identical to the hinted one (same column
+    /// list, same decode call) and covered by inspection/compile-check.
+    #[test]
+    fn fetch_messages_for_conversation_round_trips_excluded_marker() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("excluded-lexical-roundtrip.db");
+        let storage = SqliteStorage::open(&db_path).unwrap();
+
+        let agent = Agent { id: None, slug: "codex".into(), name: "Codex".into(), version: None, kind: AgentKind::Cli };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+
+        let marker = ExcludedMarker {
+            reason: ExclusionReason::CodexHostShell,
+            rule_version: 1,
+            bytes: 7,
+            sha256: "c".repeat(64),
+            fingerprint_blake3: "d".repeat(64),
+            anchor: ExclusionAnchor { tool_call_id: None, tool_name: None, paths: None, shell: Some(crate::indexer::exclusion::ShellAnchor { opener: "<environment_context>".into(), closer: "</environment_context>".into() }) },
+            src: None,
+            parse_error: None,
+            raw: RawRef { blob: "blobs/blake3/cd/cdef.raw".into(), idx: 0, event_key: "ek-lexical".into(), blocks: vec![0] },
+        };
+
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("excluded-lexical-roundtrip".into()),
+            title: Some("excluded lexical roundtrip".into()),
+            source_path: PathBuf::from("/tmp/excluded-lexical-roundtrip.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    excluded: Some(marker.clone()),
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_000),
+                    content: String::new(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(1_700_000_000_010),
+                    content: "not excluded".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: Vec::new(),
+                },
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+
+        let inserted = storage.insert_conversation_tree(agent_id, None, &conversation).unwrap();
+        let conversation_id = inserted.conversation_id;
+
+        let lexical = storage.fetch_messages_for_conversation(conversation_id).unwrap();
+        assert_eq!(lexical.len(), 2);
+        assert_eq!(
+            lexical[0].excluded,
+            Some(marker),
+            "excluded marker must round-trip through fetch_messages_for_conversation's json(excluded) projection"
+        );
+        assert_eq!(lexical[1].excluded, None, "unexcluded row must stay None");
     }
 
     /// franken 6-role normalization contract (task 2.1): `"assistant"` must
@@ -22312,6 +23198,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: role_from_str("user"),
@@ -22322,6 +23209,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: role_from_str("assistant"),
@@ -22332,6 +23220,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: role_from_str("tool_result"),
@@ -22427,6 +23316,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: role_from_str("tool_result"),
@@ -22508,6 +23398,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -22518,6 +23409,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -22544,6 +23436,7 @@ mod tests {
             approx_tokens: Some(84),
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Tool,
@@ -22561,6 +23454,7 @@ mod tests {
             title: Some("Lexical batch 3".into()),
             source_path: PathBuf::from("/tmp/lexical-batch-3.jsonl"),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::System,
@@ -22690,6 +23584,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -22700,6 +23595,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -22783,6 +23679,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -22793,6 +23690,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -22819,6 +23717,7 @@ mod tests {
             approx_tokens: Some(84),
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Tool,
@@ -22913,6 +23812,7 @@ mod tests {
             approx_tokens: Some(42),
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -22938,6 +23838,7 @@ mod tests {
             approx_tokens: Some(84),
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Tool,
@@ -23039,6 +23940,7 @@ mod tests {
                     messages: message_specs
                         .iter()
                         .map(|(idx, role, author, created_at, content)| Message {
+                            excluded: None,
                             id: None,
                             idx: *idx,
                             role: role.clone(),
@@ -23227,6 +24129,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -23237,6 +24140,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -23488,6 +24392,7 @@ mod tests {
             approx_tokens: Some(42),
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Agent,
@@ -23908,6 +24813,7 @@ mod tests {
             approx_tokens: Some(16),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24014,6 +24920,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24082,6 +24989,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24153,6 +25061,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24215,6 +25124,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24350,6 +25260,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24396,6 +25307,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24454,6 +25366,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24541,6 +25454,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24601,6 +25515,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24660,6 +25575,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -24719,6 +25635,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: metadata_json.clone(),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -25783,6 +26700,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -25843,6 +26761,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -25932,6 +26851,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -26131,6 +27051,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -26141,6 +27062,7 @@ mod tests {
                     snippets: vec![],
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -26226,6 +27148,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -26236,6 +27159,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -26327,6 +27251,7 @@ mod tests {
                 approx_tokens: None,
                 metadata_json: serde_json::Value::Null,
                 messages: vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -26967,6 +27892,7 @@ mod e5_replace_tests {
 
     fn msg(idx: i64, role: MessageRole, content: &str, extra: serde_json::Value) -> Message {
         Message {
+            excluded: None,
             id: None,
             idx,
             role,

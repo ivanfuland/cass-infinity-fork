@@ -127,6 +127,11 @@ pub struct Message {
     pub content: String,
     pub extra_json: serde_json::Value,
     pub snippets: Vec<Snippet>,
+    /// PR6 T2a (任务书 #113, schema v6): the injected-context exclusion
+    /// marker for rows whose body text was scrubbed at ingest time.
+    /// `None` for every row except cass-mcp recall echoes, context-file
+    /// reads, and codex host-shell preambles (`crate::indexer::exclusion`).
+    pub excluded: Option<crate::indexer::exclusion::ExcludedMarker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +157,7 @@ mod tests {
 
     fn message_fixture(content: impl Into<String>) -> Message {
         Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: MessageRole::User,
@@ -453,6 +459,7 @@ mod tests {
     #[test]
     fn message_serde_roundtrip() {
         let message = Message {
+            excluded: None,
             id: Some(42),
             idx: 0,
             role: MessageRole::User,

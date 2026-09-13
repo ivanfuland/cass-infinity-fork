@@ -167,6 +167,7 @@ fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn 
             metadata_json: Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::System,
@@ -177,6 +178,7 @@ fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn 
                     snippets: vec![],
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::User,
@@ -207,10 +209,10 @@ fn isolated_search_demo_data_for_current_workspace() -> Result<TempDir, Box<dyn 
             approx_tokens: None,
             metadata_json: Value::Null,
             messages: vec![
-                Message { id: None, idx: 0, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "/add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
-                Message { id: None, idx: 1, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Added src/main.rs to the chat.\n\n#### /add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
-                Message { id: None, idx: 2, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "Please refactor.".into(), extra_json: Value::Null, snippets: vec![] },
-                Message { id: None, idx: 3, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Sure, here is the code.".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 0, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "/add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 1, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Added src/main.rs to the chat.\n\n#### /add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 2, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "Please refactor.".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 3, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Sure, here is the code.".into(), extra_json: Value::Null, snippets: vec![] },
             ],
             source_id: "local".into(),
             origin_host: None,

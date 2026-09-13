@@ -45,6 +45,7 @@ fn sample_conversation(external_id: &str, content: &str) -> Conversation {
         approx_tokens: None,
         metadata_json: json!({"fixture": "cass-257-status-quality-tier"}),
         messages: vec![Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: MessageRole::User,

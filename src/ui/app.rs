@@ -19425,6 +19425,7 @@ impl super::ftui_adapter::Model for CassApp {
                 {
                     ftui::Cmd::task(move || {
                         let opts = crate::indexer::IndexOptions {
+                            no_ingest: false,
                             full: false,
                             force_rebuild: false,
                             watch: false,
@@ -30261,6 +30262,7 @@ mod tests {
         });
         cv.messages = vec![
             crate::model::types::Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -30271,6 +30273,7 @@ mod tests {
                 snippets: vec![],
             },
             crate::model::types::Message {
+                excluded: None,
                 id: Some(2),
                 idx: 1,
                 role: crate::model::types::MessageRole::Agent,
@@ -31315,6 +31318,7 @@ not jsonl",
         cached_view.convo.source_path = std::path::PathBuf::from(&selected_hit.source_path);
         cached_view.convo.source_id = selected_hit.source_id.clone();
         cached_view.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 1,
             role: MessageRole::User,
@@ -32221,6 +32225,7 @@ not jsonl",
             "cass": { "workspace_original": "/loaded/original" }
         });
         cv.messages = vec![crate::model::types::Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: crate::model::types::MessageRole::User,
@@ -32914,6 +32919,7 @@ not jsonl",
         cached_view.convo.source_path = std::path::PathBuf::from(&hit.source_path);
         cached_view.convo.source_id = "local".to_string();
         cached_view.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: crate::model::types::MessageRole::User,
@@ -33191,6 +33197,7 @@ not jsonl",
         loaded_view.convo.source_path = std::path::PathBuf::from(&hit.source_path);
         loaded_view.messages = vec![
             Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -33201,6 +33208,7 @@ not jsonl",
                 snippets: Vec::new(),
             },
             Message {
+                excluded: None,
                 id: Some(2),
                 idx: 1,
                 role: crate::model::types::MessageRole::Agent,
@@ -33274,6 +33282,7 @@ not jsonl",
         cached_view.convo.source_path = std::path::PathBuf::from(&selected_hit.source_path);
         cached_view.convo.source_id = selected_hit.source_id.clone();
         cached_view.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::User,
@@ -33341,6 +33350,7 @@ not jsonl",
         loaded_view.convo.source_path = std::path::PathBuf::from(&first_hit.source_path);
         loaded_view.convo.source_id = first_hit.source_id.clone();
         loaded_view.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::User,
@@ -33376,6 +33386,7 @@ not jsonl",
         cached_view.convo.source_path = std::path::PathBuf::from(&hit.source_path);
         cached_view.convo.source_id = "local".to_string();
         cached_view.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: crate::model::types::MessageRole::User,
@@ -33442,6 +33453,7 @@ not jsonl",
         cv.convo.source_path = std::path::PathBuf::from(&hit.source_path);
         cv.convo.source_id = hit.source_id.clone();
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::Agent,
@@ -33842,6 +33854,7 @@ not jsonl",
         let mut app = CassApp::default();
         let mut cv = make_test_conversation_view();
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::Agent,
@@ -33886,6 +33899,7 @@ not jsonl",
         let mut app = CassApp::default();
         let mut cv = make_test_conversation_view();
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::Agent,
@@ -33926,6 +33940,7 @@ not jsonl",
         let mut app = CassApp::default();
         let mut cv = make_test_conversation_view();
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::Agent,
@@ -34003,6 +34018,7 @@ not jsonl",
         let mut cv = make_test_conversation_view();
         cv.messages = vec![
             Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::Agent,
@@ -34025,6 +34041,7 @@ not jsonl",
                 snippets: vec![],
             },
             Message {
+                excluded: None,
                 id: Some(2),
                 idx: 1,
                 role: MessageRole::User,
@@ -38286,6 +38303,7 @@ not jsonl",
 
         fn msg(role: MessageRole, content: &str) -> Message {
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role,
@@ -38328,6 +38346,7 @@ not jsonl",
 
         fn msg(role: MessageRole, content: &str) -> Message {
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role,
@@ -38373,6 +38392,7 @@ not jsonl",
 
         fn msg(role: MessageRole, content: &str, ts: Option<i64>) -> Message {
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role,
@@ -38415,6 +38435,7 @@ not jsonl",
 
         fn msg(ts: i64) -> Message {
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -38442,6 +38463,7 @@ not jsonl",
     fn build_text_sparkline_empty_for_single_message() {
         use crate::model::types::{Message, MessageRole};
         let messages = vec![Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: MessageRole::User,
@@ -38479,6 +38501,7 @@ not jsonl",
 
         fn msg(role: MessageRole, content: &str, ts: Option<i64>) -> Message {
             Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role,
@@ -38547,6 +38570,7 @@ not jsonl",
             display_name: Some("Loaded View Workspace".to_string()),
         });
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::User,
@@ -38582,6 +38606,7 @@ not jsonl",
         cv.convo.id = Some(42);
         cv.convo.agent_slug.clear();
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::User,
@@ -38617,6 +38642,7 @@ not jsonl",
         cv.convo.id = Some(42);
         cv.convo.agent_slug.clear();
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::User,
@@ -38652,6 +38678,7 @@ not jsonl",
         cv.convo.workspace = None;
         cv.workspace = None;
         cv.messages = vec![Message {
+            excluded: None,
             id: Some(1),
             idx: 0,
             role: MessageRole::User,
@@ -39044,6 +39071,7 @@ not jsonl",
 
         fn msg(idx: i64, role: MessageRole, content: &str, ts: Option<i64>) -> Message {
             Message {
+                excluded: None,
                 id: None,
                 idx,
                 role,
@@ -41433,6 +41461,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     fn make_markdown_messages(count: usize) -> Vec<crate::model::types::Message> {
         (0..count)
             .map(|i| crate::model::types::Message {
+                excluded: None,
                 id: Some(i as i64),
                 idx: i as i64,
                 role: if i % 2 == 0 {
@@ -41560,6 +41589,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         let mut app = app_with_hits(3);
         let plain_messages: Vec<crate::model::types::Message> = (0..10)
             .map(|i| crate::model::types::Message {
+                excluded: None,
                 id: Some(i),
                 idx: i,
                 role: MessageRole::User,
@@ -45893,6 +45923,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
     fn role_gutter_snapshot_messages() -> Vec<Message> {
         vec![
             Message {
+                excluded: None,
                 id: Some(1),
                 idx: 0,
                 role: MessageRole::User,
@@ -45903,6 +45934,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 snippets: vec![],
             },
             Message {
+                excluded: None,
                 id: Some(2),
                 idx: 1,
                 role: MessageRole::Agent,
@@ -45914,6 +45946,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 snippets: vec![],
             },
             Message {
+                excluded: None,
                 id: Some(3),
                 idx: 2,
                 role: MessageRole::Tool,
@@ -45925,6 +45958,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 snippets: vec![],
             },
             Message {
+                excluded: None,
                 id: Some(4),
                 idx: 3,
                 role: MessageRole::System,
@@ -46153,6 +46187,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
         if let Some((_, ref mut cv)) = app.cached_detail {
             cv.messages = vec![
                 crate::model::types::Message {
+                    excluded: None,
                     id: Some(1),
                     idx: 0,
                     role: crate::model::types::MessageRole::User,
@@ -46163,6 +46198,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                     snippets: vec![],
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: Some(2),
                     idx: 1,
                     role: crate::model::types::MessageRole::Agent,

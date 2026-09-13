@@ -26,6 +26,7 @@ fn sample_agent() -> Agent {
 
 fn msg(idx: i64, created_at: i64, content: &str) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role: MessageRole::User,

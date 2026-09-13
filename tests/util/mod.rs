@@ -720,6 +720,7 @@ impl ConversationFixtureBuilder {
                     .unwrap_or_else(|| format!("{}-{}", self.content_prefix, i));
 
                 Message {
+                    excluded: None,
                     id: None,
                     idx: i as i64,
                     role,

@@ -1812,6 +1812,7 @@ mod tests {
         test_conversation_fixture(
             external_id,
             vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -2255,6 +2256,7 @@ mod tests {
                 "packet-memo-conv-one",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -2265,6 +2267,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -2284,6 +2287,7 @@ mod tests {
                 "packet-memo-conv-two",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::Tool,
@@ -2294,6 +2298,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -2347,6 +2352,7 @@ mod tests {
                 "packet-projection",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -2357,6 +2363,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Tool,
@@ -2367,6 +2374,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::System,
@@ -2418,6 +2426,7 @@ mod tests {
             &test_conversation_with_messages(
                 "before-watermark",
                 vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -2451,6 +2460,7 @@ mod tests {
                 "before-watermark",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -2461,6 +2471,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -2536,6 +2547,7 @@ mod tests {
             &test_conversation_with_messages(
                 "long-lived",
                 vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -2577,6 +2589,7 @@ mod tests {
                 "long-lived",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -2587,6 +2600,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -2791,6 +2805,7 @@ mod tests {
                     external_id,
                     vec![
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 0,
                             role: MessageRole::User,
@@ -2801,6 +2816,7 @@ mod tests {
                             snippets: Vec::new(),
                         },
                         Message {
+                            excluded: None,
                             id: None,
                             idx: 1,
                             role: MessageRole::Agent,
@@ -2869,6 +2885,7 @@ mod tests {
                 "packet-delta",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -2879,6 +2896,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -2904,6 +2922,7 @@ mod tests {
                 "packet-delta",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -2914,6 +2933,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -2924,6 +2944,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::Agent,
@@ -2934,6 +2955,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 3,
                         role: MessageRole::System,
@@ -2992,6 +3014,7 @@ mod tests {
                 "legacy-packet-semantics",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -3002,6 +3025,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -3028,6 +3052,7 @@ mod tests {
                 "legacy-packet-semantics",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -3038,6 +3063,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -3048,6 +3074,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::Agent,
@@ -3058,6 +3085,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 3,
                         role: MessageRole::System,
@@ -3077,6 +3105,7 @@ mod tests {
                 "legacy-packet-semantics-second-conv",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::Tool,
@@ -3087,6 +3116,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::System,
@@ -3152,6 +3182,7 @@ mod tests {
                 "selected-vs-since",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -3162,6 +3193,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -3188,6 +3220,7 @@ mod tests {
                 "selected-vs-since",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -3198,6 +3231,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -3208,6 +3242,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::Tool,
@@ -3218,6 +3253,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 3,
                         role: MessageRole::System,
@@ -3236,6 +3272,7 @@ mod tests {
             &test_conversation_with_messages(
                 "selected-vs-since-second",
                 vec![Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::Agent,
@@ -3375,6 +3412,7 @@ mod tests {
                 "packet-equiv-1",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -3385,6 +3423,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -3395,6 +3434,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 2,
                         role: MessageRole::System,
@@ -3415,6 +3455,7 @@ mod tests {
                 "packet-equiv-2",
                 vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::Tool,
@@ -3425,6 +3466,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,

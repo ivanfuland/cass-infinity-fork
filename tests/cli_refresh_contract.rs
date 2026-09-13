@@ -270,6 +270,7 @@ fn raw_mirror_and_doctor_modules_are_public_embedding_surfaces() -> Result<(), S
             keep_tags: Vec::new(),
             safety_hold_down_ms: 0,
             apply: false,
+            referenced_blobs: Default::default(),
         },
     )
     .map_err(|err| format!("dry-run raw mirror prune: {err}"))?;

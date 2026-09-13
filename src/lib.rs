@@ -365,6 +365,13 @@ pub enum Commands {
         #[arg(long)]
         semantic: bool,
 
+        /// PR6 T5: skip the entire source scan/ingest phase and only run the
+        /// semantic hole-draining/reconciliation. Requires `--semantic`; refuses
+        /// `--watch`, `--watch-once`, `--full` and `--force-rebuild` (exit 2).
+        /// Used by the T12 protocol v2 exam hall so the corpus stays identical.
+        #[arg(long, default_value_t = false)]
+        no_ingest: bool,
+
         /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
         /// requires the `semantic` build feature, retired in this build --
         /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
@@ -6825,6 +6832,7 @@ async fn execute_cli(
                     watch_interval,
                     data_dir,
                     semantic,
+                    no_ingest,
                     embedder,
                     idempotency_key,
                     json,
@@ -6842,6 +6850,7 @@ async fn execute_cli(
                         watch_interval,
                         data_dir,
                         semantic,
+                        no_ingest,
                         embedder,
                         progress,
                         structured_format,
@@ -9336,24 +9345,87 @@ fn run_mirror_prune(
     let max_size_bytes = max_size.as_deref().map(parse_size_bytes).transpose()?;
     let safety_hold_down_ms = parse_duration_millis(&safety_hold_down)?;
 
-    if apply
-        && let Some(active_index) =
-            active_index_run_details(&data_dir, &data_dir.join("agent_search.db"))
-    {
-        return Err(CliError {
-            code: 7,
-            kind: "lock-busy",
-            message: format!(
-                "refusing to apply raw-mirror prune while an index run is active in {}",
-                active_index.data_dir.display()
-            ),
-            hint: Some(
-                "Wait for indexing/watch work to finish, then rerun `cass mirror prune --apply`."
-                    .to_string(),
-            ),
-            retryable: true,
-        });
-    }
+    // PR6 T2c (任务书 #113, R1-B1/R9): `--apply` takes `index-run.lock`
+    // exclusively and HOLDS it (not a point-in-time check like the old
+    // `active_index_run_details` probe -- see this same file's `git blame`
+    // for that prior form) until this function returns, i.e. through both
+    // the referenced-blob read below and the whole `prune()` call.
+    // `dry-run` never takes the lock.
+    let db_path = data_dir.join("agent_search.db");
+    let _index_run_lock_guard = if apply {
+        match crate::indexer::acquire_index_run_lock(
+            &data_dir,
+            &db_path,
+            crate::search::asset_state::SearchMaintenanceMode::Index,
+        ) {
+            Ok(guard) => Some(guard),
+            Err(_err) => {
+                return Err(CliError {
+                    code: 2,
+                    kind: "lock-busy",
+                    message: format!(
+                        "refusing to apply raw-mirror prune while an index run is active in {}",
+                        data_dir.display()
+                    ),
+                    hint: Some(
+                        "Wait for indexing/watch work to finish, then rerun `cass mirror prune --apply`."
+                            .to_string(),
+                    ),
+                    retryable: true,
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // R9: read the reference set only after the lock is held (apply path)
+    // -- a failure to read here must NOT silently degrade to "nothing
+    // referenced" (that would let prune delete a blob the caller can't
+    // currently see is still in use), so `apply` hard-fails on a read error.
+    // R1-N18 (任务书 #118b): dry-run now reads the same reference set
+    // (previously it always used an empty set, so its preview could report
+    // an actually-protected blob as deletable) -- but a dry-run has no
+    // destructive stake in getting this right, so a read failure there
+    // degrades to an empty set with a warning instead of failing the whole
+    // preview.
+    let referenced_blobs: HashSet<String> = if db_path.exists() {
+        let read_result: Result<HashSet<String>, crate::storage::api::StorageError> = (|| {
+            let conn = crate::storage::api::Conn::open_read(&db_path)?;
+            let blobs = conn.query_all_map(
+                "SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL",
+                &[],
+                |row| row.get_typed::<Option<String>>(0),
+            )?;
+            Ok(blobs.into_iter().flatten().collect())
+        })();
+        match read_result {
+            Ok(blobs) => blobs,
+            Err(err) if apply => {
+                return Err(CliError {
+                    code: 9,
+                    kind: "raw-mirror",
+                    message: format!(
+                        "reading excluded.raw.blob references from {} before prune --apply: {err}",
+                        db_path.display()
+                    ),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    db_path = %db_path.display(),
+                    error = %err,
+                    "dry-run: failed to read excluded.raw.blob references; this preview may \
+                     understate which blobs are actually protected"
+                );
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
+    };
 
     let report = crate::raw_mirror::prune(
         &data_dir,
@@ -9363,6 +9435,7 @@ fn run_mirror_prune(
             keep_tags,
             safety_hold_down_ms,
             apply,
+            referenced_blobs,
         },
     )
     .map_err(|err| CliError {
@@ -17936,6 +18009,20 @@ struct StateDbSnapshot {
     /// regular-file metadata alone in that case; callers needing the actual
     /// open-success signal use `cass diag` / `cass doctor`.
     open_skipped: bool,
+    /// T2b.3 (B段, mission #116⑥): `last_index.*` meta keys -- same cheap
+    /// single-row-per-key reads as `last_scan_ts`/`last_indexed_at` above,
+    /// so read unconditionally (not gated on `include_counts`). `None`
+    /// when the key was never written (no run has completed since PR6
+    /// landed, or every run since has failed and left the prior value in
+    /// place -- indistinguishable from "never written" without a separate
+    /// existence marker, and `cass status --json` surfaces both as null).
+    codex_host_shell_hits: Option<u64>,
+    codex_idx0_user_total: Option<u64>,
+    event_align_failed: Option<u64>,
+    /// R2-N8 (任务书 #129): the two capture-outcome counts, same `last_index.*`
+    /// meta keys and same null-when-never-written semantics as the three above.
+    capture_na: Option<u64>,
+    capture_failed: Option<u64>,
 }
 
 fn probe_state_db(
@@ -18015,6 +18102,46 @@ fn probe_state_db_modes(
     )
     .ok()
     .and_then(|s| s.parse::<i64>().ok());
+    snapshot.codex_host_shell_hits = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.codex_host_shell_hits'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.codex_idx0_user_total = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.codex_idx0_user_total'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.event_align_failed = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.event_align_failed'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.capture_na = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.capture_na'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
+    snapshot.capture_failed = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.capture_failed'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<u64>().ok());
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -18715,6 +18842,11 @@ fn state_meta_json_inner(
     let db_open_retryable = db_snapshot.open_retryable;
     let counts_skipped = db_snapshot.counts_skipped;
     let open_skipped = db_snapshot.open_skipped;
+    let codex_host_shell_hits = db_snapshot.codex_host_shell_hits;
+    let codex_idx0_user_total = db_snapshot.codex_idx0_user_total;
+    let event_align_failed = db_snapshot.event_align_failed;
+    let capture_na = db_snapshot.capture_na;
+    let capture_failed = db_snapshot.capture_failed;
 
     let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
@@ -18993,6 +19125,17 @@ fn state_meta_json_inner(
     };
 
     serde_json::json!({
+        // T2b.3 (B段, mission #116⑥): `last_index.*` meta three keys --
+        // null when the key was never written (no run has landed the
+        // meta-write since PR6, or the most recent run failed and left the
+        // prior value, indistinguishable from "never written" here).
+        "last_index": {
+            "codex_host_shell_hits": codex_host_shell_hits,
+            "codex_idx0_user_total": codex_idx0_user_total,
+            "event_align_failed": event_align_failed,
+            "capture_na": capture_na,
+            "capture_failed": capture_failed,
+        },
         "index": {
             "exists": lexical.exists,
             "status": lexical.status,
@@ -20062,7 +20205,12 @@ fn prepare_headless_once_tui_artifacts(
     data_dir: &Path,
     asciicast_path: Option<&Path>,
 ) -> Result<()> {
-    std::fs::create_dir_all(data_dir).map_err(|e| {
+    // R4-B1 (任务书 #120a): this TUI headless `--once` entry point creates
+    // `data_dir` and opens a DB inside it moments later, independent of
+    // `acquire_index_run_lock` -- `create_dir_all_durable` fsyncs the parent
+    // of every ancestor it actually creates, so a fresh `data_dir` here is
+    // just as durable as one created via the normal index-run path.
+    crate::raw_mirror::create_dir_all_durable(data_dir).map_err(|e| {
         anyhow::anyhow!(
             "create headless --once data directory {}: {e}",
             data_dir.display()
@@ -22529,6 +22677,7 @@ mod search_lexical_self_heal_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -41977,6 +42126,7 @@ fn doctor_candidate_parse_raw_mirror_messages(
             Ok(value) => {
                 let content = doctor_candidate_json_message_content(&value);
                 messages.push(crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: messages.len() as i64,
                     role: doctor_candidate_message_role(&value),
@@ -42008,6 +42158,7 @@ fn doctor_candidate_parse_raw_mirror_messages(
                     "raw_content_included": false
                 }));
                 messages.push(crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: messages.len() as i64,
                     role: crate::model::types::MessageRole::Other(
@@ -42034,6 +42185,7 @@ fn doctor_candidate_parse_raw_mirror_messages(
     }
     if messages.is_empty() {
         messages.push(crate::model::types::Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: crate::model::types::MessageRole::Other("raw_mirror_blob".to_string()),
@@ -70814,6 +70966,12 @@ fn run_status(
             "warnings": warnings,
             "data_dir": data_dir.display().to_string(),
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
+            // T2b.3 (B段, mission #116⑦): `run_status` builds this payload by
+            // selectively copying named keys out of `state` (`state_meta_json_
+            // inner`'s full output), not by merging it wholesale -- `last_index`
+            // needs its own explicit copy here or it never reaches `cass status
+            // --json`, same as every other `state.get("...")` line in this block.
+            "last_index": state.get("last_index").cloned().unwrap_or(serde_json::Value::Null),
             "database": serde_json::json!({
                 "exists": db_exists,
                 "opened": db_opened,
@@ -72289,7 +72447,7 @@ mod cli_read_db_tests {
             ended_at: Some(0),
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
-            messages: vec![Message { id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status json fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
+            messages: vec![Message { excluded: None, id: None, idx: 0, role: MessageRole::User, author: None, created_at: Some(0), content: "status json fixture message".into(), extra_json: serde_json::Value::Null, snippets: vec![] }],
             source_id: "local".into(),
             origin_host: None,
         };
@@ -74181,7 +74339,12 @@ pub(crate) fn run_doctor_impl(
             );
         }
     } else if fix_can_mutate {
-        if std::fs::create_dir_all(&data_dir).is_ok() {
+        // R4-B1 (任务书 #120a): `cass doctor --fix` can be the thing that
+        // creates `data_dir` on this machine -- a later `cass index` in the
+        // same power-on cycle would otherwise commit into a `data_dir` whose
+        // own directory entry was never made durable. `create_dir_all_durable`
+        // fsyncs the parent of every ancestor it actually creates.
+        if crate::raw_mirror::create_dir_all_durable(&data_dir).is_ok() {
             checks.push(Check {
                 name: "data_directory".to_string(),
                 status: "pass".to_string(),
@@ -75807,6 +75970,7 @@ pub(crate) fn run_doctor_impl(
                 needs_rebuild = true;
             } else {
                 let index_opts = indexer::IndexOptions {
+                    no_ingest: false,
                     // When the database is missing or corrupted, doctor must
                     // rebuild from source sessions using the full path rather
                     // than the incremental UPSERT-based path.
@@ -85584,6 +85748,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let progress = Arc::new(indexer::IndexingProgress::default());
     let opts = indexer::IndexOptions {
+        no_ingest: false,
         full: false,
         force_rebuild: false,
         watch: false,
@@ -85709,6 +85874,7 @@ fn run_index_with_data(
     watch_interval: u64,
     data_dir_override: Option<PathBuf>,
     semantic: bool,
+    no_ingest: bool,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -85741,6 +85907,7 @@ fn run_index_with_data(
         force_rebuild.hash(&mut hasher);
         watch.hash(&mut hasher);
         semantic.hash(&mut hasher);
+        no_ingest.hash(&mut hasher);
         embedder.hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
@@ -85819,6 +85986,45 @@ fn run_index_with_data(
     }
 
     let watch_once_paths = resolve_watch_once_paths(watch, watch_once);
+
+    // PR6 T5 (任务书 #126, spec §五 考场不拉源): `--no-ingest` means "do not
+    // touch the corpus" -- it is only meaningful next to `--semantic` (which
+    // is the phase that still runs: hole-draining/reconciliation), and it is
+    // incompatible with every mode that exists to scan sources. All five
+    // rejections are exit 2 per the plan's parameter freeze table.
+    if no_ingest {
+        let conflict = if watch {
+            Some("--watch")
+        } else if watch_once_paths.as_ref().is_some_and(|p| !p.is_empty()) {
+            Some("--watch-once")
+        } else if full {
+            Some("--full")
+        } else if force_rebuild {
+            Some("--force-rebuild")
+        } else {
+            None
+        };
+        if let Some(flag) = conflict {
+            return Err(CliError::usage(
+                format!("--no-ingest cannot be combined with {flag}"),
+                Some(
+                    "--no-ingest skips the source scan/ingest phase entirely; a mode that \
+                     scans sources has nothing to do without it"
+                        .to_string(),
+                ),
+            ));
+        }
+        if !semantic {
+            return Err(CliError::usage(
+                "--no-ingest requires --semantic",
+                Some(
+                    "--no-ingest only skips scanning: without --semantic there is nothing left \
+                     to run (hole-draining/reconciliation)"
+                        .to_string(),
+                ),
+            ));
+        }
+    }
     let entrypoint = index_entrypoint_diagnostics(
         full,
         force_rebuild,
@@ -85911,6 +86117,7 @@ fn run_index_with_data(
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
         semantic,
+        no_ingest,
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
@@ -86348,10 +86555,26 @@ fn run_index_with_data(
             payload["activated"] = serde_json::json!(activated);
         }
 
-        // Add structured indexing stats if available (T7.4)
+        // Add structured indexing stats if available (T7.4). PR6 T5 also
+        // lifts the two `--no-ingest` fields to the payload's top level:
+        // `indexing_stats` keeps them too (single source), but the plan's
+        // interface and the T6 exam step read them as top-level keys.
         if let Ok(stats) = index_progress.stats.lock()
             && let serde_json::Value::Object(ref mut map) = payload
         {
+            map.insert(
+                "scan_invocations".to_string(),
+                serde_json::json!(stats.scan_invocations),
+            );
+            map.insert("no_ingest".to_string(), serde_json::json!(stats.no_ingest));
+            // B05 (任务书 #131): `scan_invocations: 0` + `no_ingest: true` do
+            // not by themselves mean "nothing entered the corpus" -- the
+            // historical salvage preflight also imports, and this says
+            // whether `--no-ingest` suppressed it for this run.
+            map.insert(
+                "salvage_skipped_by_no_ingest".to_string(),
+                serde_json::json!(stats.salvage_skipped_by_no_ingest),
+            );
             map.insert(
                 "indexing_stats".to_string(),
                 serde_json::to_value(&*stats).unwrap_or_default(),
@@ -90694,6 +90917,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90768,6 +90992,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90796,6 +91021,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90864,6 +91090,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90929,6 +91156,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -90957,6 +91185,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: Some(10),
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91027,6 +91256,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91103,6 +91333,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91284,6 +91515,7 @@ mod indexed_conversation_fallback_tests {
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91347,6 +91579,7 @@ local second line
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91410,6 +91643,7 @@ local second line
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91475,6 +91709,7 @@ This is not JSONL.
             metadata_json: serde_json::json!({}),
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -91485,6 +91720,7 @@ This is not JSONL.
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -91572,6 +91808,7 @@ This is not JSONL.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91642,6 +91879,7 @@ This should stay behind the indexed export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91709,6 +91947,7 @@ This should stay behind the indexed export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91789,6 +92028,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91866,6 +92106,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91923,6 +92164,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -91981,6 +92223,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -92039,6 +92282,7 @@ This should stay behind the indexed html export.
             approx_tokens: None,
             metadata_json: serde_json::json!({}),
             messages: vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::User,
@@ -95623,6 +95867,7 @@ fn run_sources_sync(
             30,             // watch_interval (default)
             Some(data_dir), // data_dir
             false,          // semantic
+            false,          // no_ingest
             "fastembed".to_string(),
             progress,
             output_format,
@@ -95775,6 +96020,7 @@ fn run_sources_reingest(
         30,                     // watch_interval (default)
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
+        false,                  // no_ingest
         "fastembed".to_string(),
         progress,
         output_format,
@@ -97493,17 +97739,122 @@ fn run_models_backfill(
     }
 
     let tier = parse_models_backfill_tier(tier_raw)?;
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let db_path = db_override.unwrap_or_else(default_db_path);
-    if !db_path.is_file() {
+    // T4 mission #122a (C, R2-01/R3-F3/R1-N12): canonicalize `data_dir` up
+    // front so both the mismatch check below and the lock file path
+    // (`acquire_index_run_lock` keys its lock file off `data_dir`) see the
+    // same normalized path a concurrent `cass index`/`watch` on the same
+    // directory would. `data_dir` may not exist yet -- this function has
+    // no directory-creation duty (unlike `acquire_index_run_lock` itself,
+    // which does create it once actually called below); canonicalize only
+    // resolves existing paths, so a nonexistent one falls back to its own
+    // (uncanonicalized) form here, letting the `db_path_for_open.is_file()` check
+    // below still correctly report `IndexMissing` instead of a raw "no
+    // such file or directory" from canonicalize itself.
+    let data_dir_raw = data_dir_override.unwrap_or_else(default_data_dir);
+    let data_dir = std::fs::canonicalize(&data_dir_raw).unwrap_or(data_dir_raw);
+    let expected_db_path = data_dir.join("agent_search.db");
+    // Before this task book, `db_path` resolved independently of
+    // `data_dir` (`db_override.unwrap_or_else(default_db_path)`): a bare
+    // `--data-dir X` with no `--db` silently fell through to the *global*
+    // default database, not `X`'s (R1-N6). Now an explicit `--db` is only
+    // accepted when it names this same `data_dir`'s own database; the
+    // default (no `--db`) is always `data_dir`-derived, matching `cass
+    // index`'s own `db_override.unwrap_or_else(|| data_dir.join(...))`.
+    // R6-N11 (#123): both sides of the comparison below must be resolved
+    // the same way. Only the `--db` side used to be canonicalized, so a
+    // `data_dir/agent_search.db` that is itself a symlink compared as its
+    // *target* against the unresolved data_dir join -- the same request
+    // rejected as a mismatch (code 2) when `--db` named that path
+    // explicitly, while the implicit form passed. (`.unwrap_or` keeps the
+    // "no such file" case falling through to the `IndexMissing` check
+    // below, exactly as `data_dir`'s own canonicalize above does.)
+    let expected_db_path = std::fs::canonicalize(&expected_db_path).unwrap_or(expected_db_path);
+    // R7-5 (#124): the resolved path is a *comparison* value only. The
+    // storage layer derives its doctor mutation-open lock from the db
+    // path's file NAME (`src/storage/sqlite.rs::
+    // doctor_mutation_lock_path_for_db_open` returns a lock path only for a
+    // path ending in `agent_search.db`), so handing it the resolved target
+    // of a symlinked `agent_search.db` silently drops that protection --
+    // same directory, so the cross-directory exemption does not apply.
+    //
+    // N08 (任务书 #131 T6-c, from R8): R7-5 pinned that for the path the
+    // caller *named*. The caller's other legitimate form names the symlink's
+    // TARGET (`--db D/real.db`): it passes the identity check just above
+    // (`canonicalize` on both sides resolves to the same file) and then
+    // handed the storage layer `real.db` -- a name that derives no lock at
+    // all, so that form skipped the protection the symlinked-name form keeps.
+    // Whichever alias was named, what is opened (and what the lock is derived
+    // from) is now the `data_dir`-derived name; it resolves to the same file
+    // the identity check just approved.
+    let db_path = match db_override {
+        Some(raw) => std::fs::canonicalize(&raw).unwrap_or(raw),
+        None => expected_db_path.clone(),
+    };
+    let db_path_for_open = data_dir.join("agent_search.db");
+    if db_path != expected_db_path {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "--db {} is not the database under --data-dir {} (expected {}); models backfill only operates on data_dir-scoped databases",
+                db_path.display(),
+                data_dir.display(),
+                expected_db_path.display()
+            ),
+            hint: Some(format!(
+                "Drop --db to use {} directly, or point --data-dir at the directory containing the intended database.",
+                expected_db_path.display()
+            )),
+            retryable: false,
+        });
+    }
+    if !db_path_for_open.is_file() {
         return Err(CliError {
             code: 3,
             kind: CliErrorKind::IndexMissing.kind_str(),
-            message: format!("cass database not found: {}", db_path.display()),
+            message: format!("cass database not found: {}", db_path_for_open.display()),
             hint: Some("Run 'cass index --full' before semantic backfill".into()),
             retryable: true,
         });
     }
+
+    // T4 mission #122a (C, spec §四.4): take the same `index-run.lock`
+    // `cass index`/`watch` take, keyed off this same canonicalized
+    // `data_dir` -- held for the rest of this function (dropped on every
+    // return path, including the scheduler-skip early return below) so a
+    // concurrent `cass index --semantic` (or another `models backfill`)
+    // can't drain the same chunk_holes generation at the same time.
+    // Lock-busy uses the exact same code/message `run_index` itself
+    // produces on contention (`ActiveIndexRunDetails::to_cli_error()`,
+    // code 7, `IndexBusy`) -- control-plane ruling 2026-09-11: spec's
+    // originally-drafted "exit 2" for this case was a drafting error (it
+    // never checked what `run_index` actually does), not an intentional
+    // divergence; "exit 2" is correct only for the `--db`/`data_dir`
+    // mismatch case just above, which is a genuinely different failure.
+    let _index_run_lock_guard = crate::indexer::acquire_index_run_lock(
+        &data_dir,
+        &db_path_for_open,
+        crate::search::asset_state::SearchMaintenanceMode::Index,
+    )
+    .map_err(|err| {
+        let chain = err
+            .chain()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if error_chain_indicates_active_cass_index(&chain) {
+            let details = active_index_run_details(&data_dir, &db_path_for_open)
+                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path_for_open));
+            return details.to_cli_error();
+        }
+        CliError {
+            code: 5,
+            kind: CliErrorKind::Storage.kind_str(),
+            message: format!("failed to acquire index-run lock for {}: {chain}", data_dir.display()),
+            hint: None,
+            retryable: true,
+        }
+    })?;
 
     let embedder_type = embedder_override
         .map(str::trim)
@@ -97572,7 +97923,7 @@ fn run_models_backfill(
                     "tier": tier.as_str(),
                     "embedder_id": embedder_type,
                     "data_dir": data_dir.display().to_string(),
-                    "db_path": db_path.display().to_string(),
+                    "db_path": db_path_for_open.display().to_string(),
                     "batch_conversations_limit": batch_conversations,
                     "scheduler": decision,
                 }))
@@ -97595,10 +97946,10 @@ fn run_models_backfill(
         return Ok(());
     }
 
-    let storage = FrankenStorage::open_writer(&db_path).map_err(|e| CliError {
+    let storage = FrankenStorage::open_writer(&db_path_for_open).map_err(|e| CliError {
         code: 5,
         kind: CliErrorKind::Storage.kind_str(),
-        message: format!("Failed to open cass database {}: {e}", db_path.display()),
+        message: format!("Failed to open cass database {}: {e}", db_path_for_open.display()),
         hint: Some("Run 'cass health --json' to inspect the archive database".into()),
         retryable: true,
     })?;
@@ -97695,7 +98046,7 @@ fn run_models_backfill(
                         "tier": "quality",
                         "embedder_id": report.embedder_id,
                         "data_dir": data_dir.display().to_string(),
-                        "db_path": db_path.display().to_string(),
+                        "db_path": db_path_for_open.display().to_string(),
                         "generation_id": report.generation_id,
                         "reused_existing_generation": report.reused_existing_generation,
                         "eligible_seeded": report.eligible_seeded,
@@ -97805,6 +98156,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                 metadata_json: serde_json::json!(null),
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -97815,6 +98167,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                         snippets: vec![],
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -97862,6 +98215,287 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             embedded_count, 2,
             "both seeded messages must be embedded via the CLI path"
         );
+    }
+
+    /// T4 mission #122a (C, Step 3 case ①): `models backfill` must refuse
+    /// to run while another process already holds `index-run.lock` for
+    /// the same `data_dir` -- same lock, same contention outcome `cass
+    /// index` gets. Control-plane ruling 2026-09-11: the exit code is 7
+    /// (`IndexBusy`, `ActiveIndexRunDetails::to_cli_error()`), matching
+    /// `run_index`'s real behavior -- the mission's originally-drafted
+    /// "exit 2" was a spec-drafting error (spec's own text never actually
+    /// checked what `run_index` does on lock contention), not a real
+    /// requirement to diverge from it.
+    #[test]
+    fn models_backfill_returns_index_busy_when_lock_is_held() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("agent_search.db");
+        {
+            let _ = FrankenStorage::open(&db_path).unwrap();
+        }
+
+        let _held_by_someone_else = crate::indexer::acquire_index_run_lock(
+            &data_dir,
+            &db_path,
+            crate::search::asset_state::SearchMaintenanceMode::Index,
+        )
+        .expect("test setup: acquiring the lock first must succeed");
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let err = result.expect_err("models backfill must refuse to run while another index run holds the lock");
+        assert_eq!(err.code, 7, "lock-busy must use the same exit code run_index uses (IndexBusy), not a bespoke one: {err:?}");
+        assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
+        assert!(
+            err.message.contains("already active for data dir"),
+            "must reuse run_index's own ActiveIndexRunDetails wording verbatim, not a bespoke message: {}",
+            err.message
+        );
+    }
+
+    /// T4 mission #122a (C, Step 3 case ②): a `--db` outside `--data-dir`
+    /// must be rejected as a usage error, not silently accepted and
+    /// operated on.
+    #[test]
+    fn models_backfill_rejects_db_outside_data_dir() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let outside_dir = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_db = outside_dir.join("agent_search.db");
+        {
+            let _ = FrankenStorage::open(&outside_db).unwrap();
+        }
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(outside_db.clone()), None);
+        let err = result.expect_err("a --db outside --data-dir must be rejected");
+        assert_eq!(err.code, 2, "data_dir/db_path mismatch must be a usage error: {err:?}");
+        assert_eq!(err.kind, CliErrorKind::Usage.kind_str());
+    }
+
+    /// R6-N11 (#123): when `data_dir/agent_search.db` is itself a symlink,
+    /// an *explicit* `--db` naming that same path must behave like the
+    /// implicit (no `--db`) form. Before this fix only the `--db` side was
+    /// canonicalized, so the link's target was compared against the
+    /// unresolved `data_dir` join and the same request was rejected as a
+    /// `--db`/`data_dir` mismatch (code 2) purely for having said it out
+    /// loud. `--tier fast` is the `hash` embedder, retired by W3-5, so
+    /// reaching that error (code 20) -- which happens after the path check,
+    /// the lock, and opening the database -- is the evidence the path check
+    /// accepted the symlinked db.
+    #[test]
+    fn models_backfill_accepts_explicit_db_that_is_a_symlink_to_the_data_dir_db() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real_db = data_dir.join("real.db");
+        {
+            let _ = FrankenStorage::open(&real_db).unwrap();
+        }
+        let linked_db = data_dir.join("agent_search.db");
+        std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(linked_db.clone()), None);
+        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence that the explicit --db was accepted");
+        assert_eq!(
+            err.code, 20,
+            "an explicit --db naming the data_dir's own (symlinked) database must not be rejected as a --db/--data-dir mismatch: {err:?}"
+        );
+
+        // The implicit form (no --db) is the behaviour the explicit form has
+        // to match -- it resolves the same symlink through
+        // `expected_db_path`. Asserted here too so a future reordering that
+        // canonicalizes only after the `db_path` match cannot pass this
+        // test: it would break this direction instead.
+        let implicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let implicit_err = implicit.expect_err("same retired embedder, reached via the default db path");
+        assert_eq!(implicit_err.code, 20, "the implicit (no --db) form must keep working against a symlinked agent_search.db: {implicit_err:?}");
+    }
+
+    /// R7-5 (#124, control-plane adversarial review of #123). The doctor
+    /// mutation lock is derived from the db path's file NAME
+    /// (`src/storage/sqlite.rs::doctor_mutation_lock_path_for_db_open`:
+    /// only a path whose file name is `agent_search.db` gets one), so the
+    /// canonicalized path R6-N11 introduced must stay a *comparison* value:
+    /// with `data_dir/agent_search.db` symlinked to the same file under
+    /// another name, handing the storage layer the resolved path silently
+    /// drops the lock -- same directory, so the cross-directory exemption
+    /// does not apply. What gets opened (and what the lock is derived from)
+    /// is the user's own path.
+    ///
+    /// Runtime note: a contended lock reports itself only after
+    /// `DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT` (`src/storage/sqlite.rs`, a 30s
+    /// const with no env override), so ~30s of this test is that wait, not a
+    /// hang.
+    #[test]
+    fn models_backfill_keeps_the_doctor_lock_on_a_symlinked_data_dir_db() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real_db = data_dir.join("real.db");
+        {
+            let _ = FrankenStorage::open(&real_db).unwrap();
+        }
+        let linked_db = data_dir.join("agent_search.db");
+        std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
+
+        // A doctor repair holds the mutation lock. Its metadata must not
+        // carry this process's pid: `doctor_lock_file_pid_is_current_process`
+        // reads exactly that line and hands back a lock-free guard for it.
+        let lock_path = data_dir.join("doctor").join("locks").join("doctor-repair.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the doctor mutation lock file");
+        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold the doctor mutation lock");
+        writeln!(
+            lock_file,
+            "schema_version=1\npid={}\nmode=safe_auto_run",
+            std::process::id().saturating_add(1)
+        )
+        .unwrap();
+        lock_file.flush().unwrap();
+
+        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let err = result.expect_err(
+            "a held doctor mutation lock must stop the open; a canonicalized path must not be what the storage layer is given",
+        );
+        assert_eq!(err.code, 5, "the doctor lock must fail the storage open, not be skipped past it: {err:?}");
+        assert!(
+            err.message.contains("doctor mutation lock"),
+            "expected the doctor-lock wording, got: {}",
+            err.message
+        );
+    }
+
+    /// N08 (任务书 #131 T6-c, from R8). R7-5's test above names the
+    /// *symlinked* path (`data_dir/agent_search.db`), so it got the doctor
+    /// lock by accident of that name. The user's other legitimate form names
+    /// the symlink's TARGET (`--db D/real.db`): the identity comparison
+    /// passes -- `canonicalize` on both sides resolves to the same file --
+    /// but the storage layer was handed `real.db`, whose file name derives NO
+    /// doctor mutation lock at all (`doctor_mutation_lock_path_for_db_open`
+    /// returns a lock path only for a name ending in `agent_search.db`). Same
+    /// directory, so the cross-directory exemption does not apply: the
+    /// protection was simply gone. The open path is now always the
+    /// `data_dir`-derived name, whichever alias the caller named.
+    ///
+    /// Runtime note: same ~30 s wait as the R7-5 test above
+    /// (`DOCTOR_MUTATION_DB_OPEN_LOCK_TIMEOUT`, a const with no env
+    /// override), so this is one of the suite's slow tests.
+    #[test]
+    fn models_backfill_keeps_the_doctor_lock_on_an_explicitly_named_symlink_target() {
+        use std::io::Write as _;
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let real_db = data_dir.join("real.db");
+        {
+            let _ = FrankenStorage::open(&real_db).unwrap();
+        }
+        let linked_db = data_dir.join("agent_search.db");
+        std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
+
+        let lock_path = data_dir.join("doctor").join("locks").join("doctor-repair.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the doctor mutation lock file");
+        fs2::FileExt::try_lock_exclusive(&lock_file).expect("hold the doctor mutation lock");
+        writeln!(
+            lock_file,
+            "schema_version=1\npid={}\nmode=safe_auto_run",
+            std::process::id().saturating_add(1)
+        )
+        .unwrap();
+        lock_file.flush().unwrap();
+
+        let explicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(real_db), None);
+        let err = explicit.expect_err(
+            "a held doctor mutation lock must stop the open even when --db names the symlink's target; deriving the lock from the caller's alias is what lets this form skip it",
+        );
+        assert_eq!(
+            err.code, 5,
+            "the doctor lock must fail the storage open for the explicit target-name form too, not be skipped past it: {err:?}"
+        );
+        assert!(
+            err.message.contains("doctor mutation lock"),
+            "expected the doctor-lock wording, got: {}",
+            err.message
+        );
+    }
+
+    /// T4 mission #122a (C, Step 3 case ③): `--data-dir` with no `--db`
+    /// must operate on *that* data_dir's own database, not the process-
+    /// global default (`default_db_path()`) -- R1-N6. `--tier fast`
+    /// (hash embedder) is used deliberately, not as a stand-in embedder:
+    /// W3-5 retired the hash/fastembed fsvi path entirely (see the
+    /// unconditional "embedder '{embedder_type}' is retired" `Err` this
+    /// function falls through to below its `embedder_type == "infinity"`
+    /// branch), so this call is expected to fail there -- but only
+    /// *after* resolving data_dir/db_path, opening the side database via
+    /// `FrankenStorage::open_writer`, and acquiring the lock, all of
+    /// which happen earlier in the function. Reaching that specific
+    /// "retired" error (code 20), not `IndexMissing` (3) or the mismatch
+    /// `Usage` error (2) case ② covers, is itself the proof this call
+    /// really operated on the side database rather than the default.
+    #[test]
+    fn models_backfill_default_db_path_is_derived_from_data_dir_not_global_default() {
+        let dir = TempDir::new().unwrap();
+        let side_dir = dir.path().join("side");
+        std::fs::create_dir_all(&side_dir).unwrap();
+        let side_db_path = side_dir.join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&side_db_path).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
+                .unwrap();
+            let conv = Conversation {
+                id: None,
+                agent_slug: "claude_code".into(),
+                workspace: None,
+                external_id: Some("t4-122a-c3-sentinel".into()),
+                title: Some("t4 122a C3 sentinel".into()),
+                source_path: std::path::PathBuf::from("/fixtures/t4-122a-c3-sentinel.jsonl"),
+                started_at: Some(1_000),
+                ended_at: Some(1_000),
+                approx_tokens: None,
+                metadata_json: serde_json::json!(null),
+                messages: vec![],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage.insert_conversation_tree(agent_id, None, &conv).expect("seed sentinel conversation into the side db");
+        }
+
+        let result = run_models_backfill("fast", None, 100, false, Some(side_dir.clone()), None, None);
+        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence of which db got opened");
+        assert_eq!(err.code, 20, "must reach the retired-embedder error, proving data_dir/db_path resolution and lock acquisition both succeeded against the side db first: {err:?}");
+
+        let lock_path = side_dir.join("index-run.lock");
+        assert!(lock_path.is_file(), "index-run.lock must have been created under --data-dir, not wherever the global default would be: {}", lock_path.display());
+
+        let storage = FrankenStorage::open_readonly(&side_db_path).unwrap();
+        let sentinel_count: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE external_id = ?1",
+                &crate::storage::api::params!["t4-122a-c3-sentinel"],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(sentinel_count, 1, "the side db's own sentinel session must still be there and readable -- confirms this call opened *this* file, not some other data_dir's database");
     }
 }
 

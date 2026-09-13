@@ -7,24 +7,33 @@
 //!
 //! For every old-side conversation: its session key must exist on the new
 //! side, its new-side `messages` row count must be `>=` its old-side count,
-//! and every old-side message's `(idx, content_hash_hex(content))` identity
-//! must exist among the new-side conversation's messages (raw-content hash,
-//! *not* the chunking-domain's normalized-text hash -- this gate is about
-//! content preservation, not chunking correctness).
+//! and every old-side message's `(idx, sha)` identity must exist among the
+//! new-side conversation's messages (raw-content hash, *not* the
+//! chunking-domain's normalized-text hash -- this gate is about content
+//! preservation, not chunking correctness).
+//!
+//! PR6 T5 (spec §五 corpus_diff 行) changed what that `sha` is. An exclusion
+//! row -- ingest cleared `content` and recorded the body's pre-clear sha in
+//! `messages.excluded` -- used to hash to the empty string and read as a
+//! lost message. Its identity is now `excluded.sha256`, i.e. the same value
+//! the old side still holds. The old side is allowed to predate schema v6
+//! (the frozen `copy/` is v4), so the column is probed with
+//! `PRAGMA table_info(messages)` rather than assumed.
 //!
 //! Usage: `cargo run --release --no-default-features --features
 //! qr,encryption,infinity --example w4_corpus_diff -- --old <path> --new
-//! <path> --json <out>`. Exit codes: 0 no loss detected; 1
-//! `conversations_missing > 0` or `messages_missing > 0`; 2 precondition
-//! error (either db path missing).
+//! <path> --json <out> [--exempt-null-rewrites <jsonl>]`. Exit codes: 0 no
+//! loss detected; 1 `conversations_missing > 0` or `messages_missing > 0`; 2
+//! precondition error (either db path missing, an unreadable
+//! `--exempt-null-rewrites` file, or a duplicate session key).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use coding_agent_search::search::canonicalize::content_hash_hex;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(name = "w4_corpus_diff")]
@@ -35,6 +44,14 @@ struct Cli {
     new: PathBuf,
     #[arg(long)]
     json: PathBuf,
+    /// JSONL of `{source_id, agent_slug, old_source_path, new_source_path}`.
+    /// Every session with a NULL `external_id` is keyed by `source_path`, so a
+    /// legitimate path rewrite (a mirror-home materialization pass) reads as a
+    /// missing session. Each line exempts one such rewrite from the diff. T6
+    /// Step 3a generates it from the two databases and the control plane
+    /// reviews it before use.
+    #[arg(long)]
+    exempt_null_rewrites: Option<PathBuf>,
 }
 
 // R1-B4 (exec92): must match `idx_conversations_provenance`'s real unique
@@ -72,6 +89,15 @@ struct ConvRecord {
     source_path: String,
 }
 
+/// One `--exempt-null-rewrites` line.
+#[derive(Debug, Deserialize)]
+struct ExemptNullRewrite {
+    source_id: String,
+    agent_slug: String,
+    old_source_path: String,
+    new_source_path: String,
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 struct CorpusDiffReport {
     conversations_missing: i64,
@@ -80,9 +106,22 @@ struct CorpusDiffReport {
     /// Informational only, not part of the match key: how many matched
     /// sessions have a different `source_path` between `--old` and `--new`
     /// (expected whenever a mirror-home materialization pass ran; see T12 3a).
+    /// An `--exempt-null-rewrites` hit does not count here.
     source_path_changed: i64,
     old_conversations_total: i64,
     new_conversations_total: i64,
+    /// PR6 T5: how many new-side exclusion rows carried their identity across
+    /// via `excluded.sha256` -- i.e. how many old-side `(idx, sha)` pairs were
+    /// matched by a marker rather than by a still-present body. This is the
+    /// count the corpus-diff gate compares against the exclusion manifest.
+    /// Disclosure only: a wrong value here cannot fail the gate, because a
+    /// wrong value also shows up as `messages_missing`.
+    excluded_transform_ok: i64,
+    /// PR6 T5: duplicate session keys seen while loading either side. Always 0
+    /// in a report that was written out; a non-zero count is a precondition
+    /// error (exit 2) and the report is emitted anyway so the colliding keys
+    /// are visible.
+    duplicates_fail_loud: i64,
 }
 
 impl CorpusDiffReport {
@@ -91,30 +130,93 @@ impl CorpusDiffReport {
     }
 }
 
-fn load_conversations(storage: &FrankenStorage) -> anyhow::Result<HashMap<SessionKey, ConvRecord>> {
+fn load_conversations(
+    storage: &FrankenStorage,
+) -> anyhow::Result<(HashMap<SessionKey, ConvRecord>, Vec<String>)> {
     let rows: Vec<(i64, String, String, Option<String>, String)> = storage.raw().query_all_map(
         "SELECT c.id, c.source_id, a.slug, c.external_id, c.source_path FROM conversations c JOIN agents a ON a.id = c.agent_id",
         &[],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?, row.get_typed(3)?, row.get_typed(4)?)),
     )?;
     let mut map = HashMap::with_capacity(rows.len());
+    let mut duplicates = Vec::new();
     for (id, source_id, agent_slug, external_id, source_path) in rows {
         let key = session_key(&source_id, &agent_slug, external_id.as_deref(), &source_path);
+        // PR6 T5: a duplicate key used to be a silent last-write-wins
+        // `insert` -- the earlier row stopped being compared at all, so a
+        // whole lost session could hide behind its twin. Two rows sharing the
+        // provenance unique key are a broken corpus, not something to guess
+        // about: keep the first and report the collision.
+        if map.contains_key(&key) {
+            duplicates.push(format!("{key:?} (second row id {id})"));
+            continue;
+        }
         map.insert(key, ConvRecord { id, source_path });
     }
-    Ok(map)
+    Ok((map, duplicates))
 }
 
+/// Whether `messages` carries the schema-v6 `excluded` column. The old side of
+/// a corpus diff is routinely a v4 database (the frozen `copy/`), where any
+/// SQL naming that column is a hard error rather than a NULL.
+fn messages_has_excluded_column(storage: &FrankenStorage) -> anyhow::Result<bool> {
+    let columns: Vec<String> = storage
+        .raw()
+        .query_all_map("PRAGMA table_info(messages)", &[], |row| row.get_typed::<String>(1))?;
+    Ok(columns.iter().any(|column| column == "excluded"))
+}
+
+/// The `sha256` inside an `excluded` marker, or `None` when the column is NULL,
+/// unparseable, or shaped without one.
+fn excluded_sha(excluded_json: &Option<String>) -> Option<String> {
+    let text = excluded_json.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value.get("sha256")?.as_str().map(str::to_string)
+}
+
+/// `(idx, sha)` identities for one conversation, plus the `idx -> excluded.sha256`
+/// map for the rows that carried one.
+///
+/// PR6 T5: sha is `content_hash_hex(content)` for a normal row, but for an
+/// exclusion row it is `excluded.sha256` -- the hash of the body that was there
+/// before ingest cleared `content`. Hashing the cleared (empty) body made every
+/// legitimately excluded row read as a lost message.
 fn message_identity_set(
     storage: &FrankenStorage,
     conversation_id: i64,
-) -> anyhow::Result<std::collections::HashSet<(i64, String)>> {
+    has_excluded_column: bool,
+) -> anyhow::Result<(std::collections::HashSet<(i64, String)>, HashMap<i64, String>)> {
+    let conversation = coding_agent_search::storage::api::Value::from(conversation_id);
+    let mut identities = std::collections::HashSet::new();
+    let mut excluded_shas = HashMap::new();
+
+    if has_excluded_column {
+        let rows: Vec<(i64, String, Option<String>)> = storage.raw().query_all_map(
+            "SELECT idx, content, json(excluded) FROM messages WHERE conversation_id = ?1",
+            &[conversation],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        for (idx, content, excluded_json) in rows {
+            match excluded_sha(&excluded_json) {
+                Some(sha) => {
+                    excluded_shas.insert(idx, sha.clone());
+                    identities.insert((idx, sha));
+                }
+                None => {
+                    identities.insert((idx, content_hash_hex(&content)));
+                }
+            }
+        }
+        return Ok((identities, excluded_shas));
+    }
+
     let rows: Vec<(i64, String)> = storage.raw().query_all_map(
         "SELECT idx, content FROM messages WHERE conversation_id = ?1",
-        &[coding_agent_search::storage::api::Value::from(conversation_id)],
+        &[conversation],
         |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     )?;
-    Ok(rows.into_iter().map(|(idx, content)| (idx, content_hash_hex(&content))).collect())
+    identities.extend(rows.into_iter().map(|(idx, content)| (idx, content_hash_hex(&content))));
+    Ok((identities, excluded_shas))
 }
 
 fn message_count(storage: &FrankenStorage, conversation_id: i64) -> anyhow::Result<i64> {
@@ -126,23 +228,87 @@ fn message_count(storage: &FrankenStorage, conversation_id: i64) -> anyhow::Resu
     Ok(count)
 }
 
-fn compute_diff(old: &FrankenStorage, new: &FrankenStorage) -> anyhow::Result<CorpusDiffReport> {
-    let old_convs = load_conversations(old)?;
-    let new_convs = load_conversations(new)?;
+/// The `--exempt-null-rewrites` lookup key for a session, or `None` for a key
+/// that cannot be rewritten in the first place (anything with an
+/// `external_id`, which is what the exemption list is for).
+fn exempt_key(key: &SessionKey) -> Option<(String, String, String)> {
+    match key {
+        SessionKey::ByPath(source_id, agent_slug, source_path) => {
+            Some((source_id.clone(), agent_slug.clone(), source_path.clone()))
+        }
+        SessionKey::ByExternalId(..) => None,
+    }
+}
+
+fn remapped_key(key: &SessionKey, new_source_path: &str) -> SessionKey {
+    match key {
+        SessionKey::ByPath(source_id, agent_slug, _) => SessionKey::ByPath(
+            source_id.clone(),
+            agent_slug.clone(),
+            new_source_path.to_string(),
+        ),
+        SessionKey::ByExternalId(..) => key.clone(),
+    }
+}
+
+fn load_exempt_null_rewrites(
+    path: &Path,
+) -> anyhow::Result<HashMap<(String, String, String), String>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let mut exemptions = HashMap::new();
+    for (line_number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: ExemptNullRewrite = serde_json::from_str(line)
+            .map_err(|e| anyhow::anyhow!("parsing {}:{}: {e}", path.display(), line_number + 1))?;
+        exemptions.insert(
+            (entry.source_id, entry.agent_slug, entry.old_source_path),
+            entry.new_source_path,
+        );
+    }
+    Ok(exemptions)
+}
+
+fn compute_diff(
+    old: &FrankenStorage,
+    new: &FrankenStorage,
+    exempt_null_rewrites: &HashMap<(String, String, String), String>,
+) -> anyhow::Result<CorpusDiffReport> {
+    let (old_convs, mut duplicates) = load_conversations(old)?;
+    let (new_convs, new_duplicates) = load_conversations(new)?;
+    duplicates.extend(new_duplicates);
+    let old_has_excluded = messages_has_excluded_column(old)?;
+    let new_has_excluded = messages_has_excluded_column(new)?;
 
     let mut conversations_missing = 0i64;
     let mut messages_missing = 0i64;
     let mut conversations_grown = 0i64;
     let mut source_path_changed = 0i64;
+    let mut excluded_transform_ok = 0i64;
 
     for (key, old_rec) in &old_convs {
-        match new_convs.get(key) {
+        // A NULL-`external_id` session is keyed by `source_path`, so a
+        // legitimate rewrite of that path looks like a lost session. An
+        // exemption line says "this exact path became that one" and is the
+        // only thing allowed to re-point the lookup.
+        let mut new_rec = new_convs.get(key);
+        let mut matched_via_exemption = false;
+        if new_rec.is_none()
+            && let Some(new_path) = exempt_key(key).and_then(|k| exempt_null_rewrites.get(&k))
+        {
+            new_rec = new_convs.get(&remapped_key(key, new_path));
+            matched_via_exemption = new_rec.is_some();
+        }
+
+        match new_rec {
             None => {
                 conversations_missing += 1;
                 messages_missing += message_count(old, old_rec.id)?;
             }
             Some(new_rec) => {
-                if old_rec.source_path != new_rec.source_path {
+                if !matched_via_exemption && old_rec.source_path != new_rec.source_path {
                     source_path_changed += 1;
                 }
                 let old_count = message_count(old, old_rec.id)?;
@@ -150,9 +316,15 @@ fn compute_diff(old: &FrankenStorage, new: &FrankenStorage) -> anyhow::Result<Co
                 if new_count > old_count {
                     conversations_grown += 1;
                 }
-                let old_ids = message_identity_set(old, old_rec.id)?;
-                let new_ids = message_identity_set(new, new_rec.id)?;
+                let (old_ids, _) = message_identity_set(old, old_rec.id, old_has_excluded)?;
+                let (new_ids, new_excluded_shas) =
+                    message_identity_set(new, new_rec.id, new_has_excluded)?;
                 messages_missing += old_ids.difference(&new_ids).count() as i64;
+                for (idx, sha) in &new_excluded_shas {
+                    if old_ids.contains(&(*idx, sha.clone())) {
+                        excluded_transform_ok += 1;
+                    }
+                }
             }
         }
     }
@@ -164,19 +336,32 @@ fn compute_diff(old: &FrankenStorage, new: &FrankenStorage) -> anyhow::Result<Co
         source_path_changed,
         old_conversations_total: old_convs.len() as i64,
         new_conversations_total: new_convs.len() as i64,
+        excluded_transform_ok,
+        duplicates_fail_loud: duplicates.len() as i64,
     })
 }
 
 /// Returns `(exit_code, report)`. `report` is `None` only for a precondition
-/// failure (exit 2), in which case the caller should not attempt to write
-/// `--json`.
-fn run(old_path: &std::path::Path, new_path: &std::path::Path) -> (i32, Option<CorpusDiffReport>, String) {
+/// failure that produced no diff at all; a duplicate-session-key failure
+/// carries its report so the colliding keys are visible.
+fn run(
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+    exempt_null_rewrites_path: Option<&Path>,
+) -> (i32, Option<CorpusDiffReport>, String) {
     if !old_path.is_file() {
         return (2, None, format!("precondition error: --old db {} does not exist", old_path.display()));
     }
     if !new_path.is_file() {
         return (2, None, format!("precondition error: --new db {} does not exist", new_path.display()));
     }
+    let exempt = match exempt_null_rewrites_path {
+        Some(path) => match load_exempt_null_rewrites(path) {
+            Ok(map) => map,
+            Err(e) => return (2, None, format!("precondition error: {e:#}")),
+        },
+        None => HashMap::new(),
+    };
     let old = match FrankenStorage::open_readonly(old_path) {
         Ok(s) => s,
         Err(e) => return (2, None, format!("precondition error opening --old: {e:#}")),
@@ -185,19 +370,28 @@ fn run(old_path: &std::path::Path, new_path: &std::path::Path) -> (i32, Option<C
         Ok(s) => s,
         Err(e) => return (2, None, format!("precondition error opening --new: {e:#}")),
     };
-    match compute_diff(&old, &new) {
+    match compute_diff(&old, &new, &exempt) {
         Err(e) => (2, None, format!("precondition error computing diff: {e:#}")),
         Ok(report) => {
-            let code = if report.passed() { 0 } else { 1 };
+            let code = if report.duplicates_fail_loud > 0 {
+                2
+            } else if report.passed() {
+                0
+            } else {
+                1
+            };
             let msg = format!(
                 "corpus_diff: conversations_missing={} messages_missing={} conversations_grown={} \
-                 source_path_changed={} old_conversations_total={} new_conversations_total={}",
+                 source_path_changed={} old_conversations_total={} new_conversations_total={} \
+                 excluded_transform_ok={} duplicates_fail_loud={}",
                 report.conversations_missing,
                 report.messages_missing,
                 report.conversations_grown,
                 report.source_path_changed,
                 report.old_conversations_total,
-                report.new_conversations_total
+                report.new_conversations_total,
+                report.excluded_transform_ok,
+                report.duplicates_fail_loud,
             );
             (code, Some(report), msg)
         }
@@ -206,7 +400,7 @@ fn run(old_path: &std::path::Path, new_path: &std::path::Path) -> (i32, Option<C
 
 fn main() {
     let cli = Cli::parse();
-    let (code, report, message) = run(&cli.old, &cli.new);
+    let (code, report, message) = run(&cli.old, &cli.new, cli.exempt_null_rewrites.as_deref());
     println!("{message}");
     if let Some(report) = &report {
         let json = serde_json::to_string_pretty(report).expect("CorpusDiffReport must serialize");
@@ -241,6 +435,7 @@ mod tests {
                     content: format!("corpus-diff fixture message {c}-{i} with enough text to be non-trivial."),
                     extra_json: serde_json::json!({}),
                     snippets: Vec::new(),
+                    excluded: None,
                 });
             }
             conversations.push(Conversation {
@@ -263,6 +458,202 @@ mod tests {
         storage.insert_conversations_batched(&batch).unwrap();
     }
 
+    /// PR6 T5: turn one already-seeded message into an exclusion row the way
+    /// ingest does -- `content` cleared, `excluded` JSONB carrying the sha256
+    /// of the (redacted) body that was there before. `seed_db`'s message text
+    /// is deterministic, so the caller can name the conversation/message
+    /// index and let this recompute the pre-clear sha.
+    fn mark_message_excluded(path: &std::path::Path, conversation_id: i64, message_idx: i64) {
+        let body = format!(
+            "corpus-diff fixture message {}-{message_idx} with enough text to be non-trivial.",
+            conversation_id - 1
+        );
+        let marker = serde_json::json!({
+            "reason": "cass_recall",
+            "rule_version": 1,
+            "bytes": body.len(),
+            "sha256": content_hash_hex(&body),
+            "fingerprint_blake3": "00".repeat(32),
+            "parse_error": null,
+            "anchor": {"tool_call_id": null, "tool_name": null, "paths": null, "shell": null},
+            "src": null,
+            "raw": {"blob": "blobs/blake3/aa/aa.raw", "idx": message_idx, "event_key": "evt", "blocks": [0]},
+        });
+        let writer = FrankenStorage::open_writer(path).unwrap();
+        let updated = writer
+            .raw()
+            .execute(
+                "UPDATE messages SET content = '', excluded = jsonb(?1) WHERE conversation_id = ?2 AND idx = ?3",
+                &[
+                    coding_agent_search::storage::api::Value::from(marker.to_string()),
+                    coding_agent_search::storage::api::Value::from(conversation_id),
+                    coding_agent_search::storage::api::Value::from(message_idx),
+                ],
+            )
+            .unwrap();
+        assert_eq!(updated, 1, "the fixture message to exclude must exist");
+    }
+
+    /// PR6 T5 (spec §五 corpus_diff 行): the identity of an excluded message is
+    /// `excluded.sha256` -- the sha of the body as it was BEFORE the ingest
+    /// cleared it -- not the sha of the now-empty `content` column. Keyed on
+    /// `content`, every legitimately excluded row reads as a lost message.
+    #[test]
+    fn excluded_row_is_not_counted_as_a_missing_message() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+        seed_db(&old, 2, 3);
+        seed_db(&new, 2, 3);
+        mark_message_excluded(&new, 1, 1);
+
+        let (code, report, message) = run(&old, &new, None);
+        assert_eq!(
+            code, 0,
+            "an excluded row carries its pre-clear sha in the marker; it must not read as a missing message: {message}"
+        );
+        let report = report.unwrap();
+        assert_eq!(
+            report.messages_missing, 0,
+            "the excluded row's identity must come from excluded.sha256: {report:?}"
+        );
+        assert_eq!(
+            report.excluded_transform_ok, 1,
+            "the marker-carried identity must be counted for the manifest comparison: {report:?}"
+        );
+        assert_eq!(report.duplicates_fail_loud, 0);
+    }
+
+    /// Rewrite a freshly-built v6 database into the v4 shape the frozen
+    /// `copy/` actually has: no `excluded` column at all, and therefore no
+    /// expression index over it. `ALTER TABLE ... DROP COLUMN` refuses while an
+    /// index references the column, so the index goes first.
+    fn drop_excluded_column(path: &std::path::Path) {
+        let writer = FrankenStorage::open_writer(path).unwrap();
+        writer
+            .raw()
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_messages_excluded_blob; \
+                 ALTER TABLE messages DROP COLUMN excluded;",
+            )
+            .unwrap();
+        drop(writer);
+    }
+
+    /// The old side of a T6 corpus diff is the PR4 reingest library, which
+    /// predates schema v6 -- so `json(excluded)` there must never be issued.
+    #[test]
+    fn v4_old_corpus_without_the_excluded_column_is_read() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+        seed_db(&old, 2, 3);
+        drop_excluded_column(&old);
+        seed_db(&new, 2, 3);
+
+        let (code, report, message) = run(&old, &new, None);
+        assert_eq!(code, 0, "a v4 old side must not error out: {message}");
+        let report = report.unwrap();
+        assert_eq!(report.messages_missing, 0);
+        assert_eq!(
+            report.excluded_transform_ok, 0,
+            "a v4 side has no markers to carry an identity across: {report:?}"
+        );
+    }
+
+    /// Two rows sharing the provenance unique key are a broken corpus. The
+    /// pre-fix map kept whichever row came last, so the other row's messages
+    /// were never compared at all and a whole lost session could hide.
+    #[test]
+    fn duplicate_session_key_fails_loud_exit_2() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+        seed_db(&old, 2, 3);
+        seed_db(&new, 2, 3);
+
+        let writer = FrankenStorage::open_writer(&old).unwrap();
+        writer
+            .raw()
+            .execute_batch("DROP INDEX IF EXISTS idx_conversations_provenance;")
+            .unwrap();
+        writer
+            .raw()
+            .execute(
+                "INSERT INTO conversations(id, agent_id, source_id, external_id, source_path) \
+                 SELECT 999, agent_id, source_id, external_id, '/tmp/duplicate.jsonl' \
+                 FROM conversations WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        drop(writer);
+
+        let (code, report, message) = run(&old, &new, None);
+        assert_eq!(
+            code, 2,
+            "a duplicate session key must fail loud rather than pick a winner: {message}"
+        );
+        let report = report.expect("the report carries which keys collided");
+        assert_eq!(report.duplicates_fail_loud, 1, "{report:?}");
+    }
+
+    fn exempt_line(old_source_path: &str, new_source_path: &str) -> String {
+        serde_json::json!({
+            "source_id": LOCAL_SOURCE_ID,
+            "agent_slug": "codex",
+            "old_source_path": old_source_path,
+            "new_source_path": new_source_path,
+        })
+        .to_string()
+    }
+
+    /// A NULL-`external_id` session is keyed by `source_path`, so a legitimate
+    /// mirror-home rewrite reads as a lost session. An exemption line is the
+    /// only thing allowed to re-point that lookup -- and when it does, the
+    /// rewrite must not also be counted as a `source_path_changed`.
+    #[test]
+    fn exempt_null_rewrite_repoints_a_null_external_id_session() {
+        let dir = TempDir::new().unwrap();
+        let old = dir.path().join("old.db");
+        let new = dir.path().join("new.db");
+        seed_null_external_id_pair(&old);
+        seed_null_external_id_pair(&new);
+
+        let writer = FrankenStorage::open_writer(&new).unwrap();
+        writer
+            .raw()
+            .execute(
+                "UPDATE conversations SET source_path = '/tmp/mirror-home/local-a.jsonl' \
+                 WHERE source_path LIKE '%local-a%'",
+                &[],
+            )
+            .unwrap();
+        drop(writer);
+
+        let (code, report, message) = run(&old, &new, None);
+        assert_eq!(code, 1, "the rewrite must be visible without an exemption: {message}");
+        assert_eq!(report.unwrap().conversations_missing, 1);
+
+        let exempt = dir.path().join("exempt.jsonl");
+        std::fs::write(
+            &exempt,
+            format!(
+                "{}\n",
+                exempt_line("/tmp/local-a.jsonl", "/tmp/mirror-home/local-a.jsonl")
+            ),
+        )
+        .unwrap();
+
+        let (code, report, message) = run(&old, &new, Some(&exempt));
+        assert_eq!(code, 0, "an exempted rewrite is not a loss: {message}");
+        let report = report.unwrap();
+        assert_eq!(report.conversations_missing, 0, "{report:?}");
+        assert_eq!(
+            report.source_path_changed, 0,
+            "the exemption already accounts for the rewrite; it must not be counted again: {report:?}"
+        );
+    }
+
     #[test]
     fn identical_corpora_pass_with_zero_missing() {
         let dir = TempDir::new().unwrap();
@@ -271,7 +662,7 @@ mod tests {
         seed_db(&old, 5, 10);
         seed_db(&new, 5, 10);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 0, "identical corpora must pass: {message}");
         let report = report.unwrap();
         assert_eq!(report.conversations_missing, 0);
@@ -290,7 +681,7 @@ mod tests {
         writer.raw().execute("DELETE FROM conversations WHERE id = 1", &[]).unwrap();
         drop(writer);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 1, "a deleted conversation must fail the gate: {message}");
         let report = report.unwrap();
         assert_eq!(report.conversations_missing, 1);
@@ -309,7 +700,7 @@ mod tests {
         writer.raw().execute("DELETE FROM messages WHERE conversation_id = 2 AND idx = 3", &[]).unwrap();
         drop(writer);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 1, "a deleted message must fail the gate: {message}");
         let report = report.unwrap();
         assert_eq!(report.conversations_missing, 0);
@@ -336,7 +727,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 1, "a mutated message content must fail the gate (hash mismatch): {message}");
         let report = report.unwrap();
         assert_eq!(report.conversations_missing, 0);
@@ -374,6 +765,7 @@ mod tests {
                 content: format!("cross-source fixture message for {source_id}"),
                 extra_json: serde_json::json!({}),
                 snippets: Vec::new(),
+                excluded: None,
             }],
             source_id: source_id.into(),
             origin_host: None,
@@ -400,7 +792,7 @@ mod tests {
         writer.raw().execute("DELETE FROM conversations WHERE source_id = 'work-laptop'", &[]).unwrap();
         drop(writer);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 1, "a whole session lost behind a cross-source (agent, external_id) collision must fail the gate: {message}");
         let report = report.unwrap();
         assert_eq!(
@@ -439,6 +831,7 @@ mod tests {
                 content: format!("null-external-id fixture message for {path_suffix}"),
                 extra_json: serde_json::json!({}),
                 snippets: Vec::new(),
+                excluded: None,
             }],
             source_id: LOCAL_SOURCE_ID.into(),
             origin_host: None,
@@ -465,7 +858,7 @@ mod tests {
         writer.raw().execute("DELETE FROM conversations WHERE source_path LIKE '%local-b%'", &[]).unwrap();
         drop(writer);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 1, "a whole null-external-id session lost behind a source_path collision must fail the gate: {message}");
         let report = report.unwrap();
         assert_eq!(
@@ -497,7 +890,7 @@ mod tests {
             .unwrap();
         drop(writer);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 0, "growth alone must not fail the gate: {message}");
         let report = report.unwrap();
         assert_eq!(report.conversations_missing, 0);
@@ -548,6 +941,7 @@ mod tests {
                     ),
                     extra_json: serde_json::json!({}),
                     snippets: Vec::new(),
+                    excluded: None,
                 });
             }
             conversations.push(Conversation {
@@ -604,7 +998,7 @@ mod tests {
             }],
         );
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(
             code, 0,
             "source_path alone changing (mirror-home materialization) must not fail the gate: {message}"
@@ -645,7 +1039,7 @@ mod tests {
             }],
         );
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(
             code, 1,
             "same external_id under a different agent slug must count as a missing session: {message}"
@@ -662,7 +1056,7 @@ mod tests {
         let new = dir.path().join("new.db");
         seed_db(&new, 1, 1);
 
-        let (code, report, message) = run(&old, &new);
+        let (code, report, message) = run(&old, &new, None);
         assert_eq!(code, 2, "missing --old db must be a precondition error: {message}");
         assert!(report.is_none());
     }

@@ -407,6 +407,7 @@ mod tests {
                 content: content.to_string(),
                 extra_json: serde_json::json!({}),
                 snippets: Vec::new(),
+                excluded: None,
             })
             .collect();
         let conversation = Conversation {

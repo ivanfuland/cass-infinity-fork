@@ -51,6 +51,7 @@ fn seed_archive_row(db_path: &Path, source_path: &str, source_id: &str, origin_h
         approx_tokens: None,
         metadata_json: serde_json::json!({}),
         messages: vec![Message {
+            excluded: None,
             id: None,
             idx: 0,
             role: MessageRole::User,

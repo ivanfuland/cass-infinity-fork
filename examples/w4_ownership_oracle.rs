@@ -23,7 +23,9 @@
 //!   - cosine: re-embed (via Infinity, using the *stored* span's text,
 //!     sliced from `eligibility::normalized_for_chunks`) and compare
 //!     against the stored `message_chunks.embedding` via cosine similarity
-//!     -- must be `>= 0.999`.
+//!     -- must be `>= OWNERSHIP_COSINE_MIN`, the same constant the
+//!     activation audit gates on (T5 measured it; the number is not
+//!     restated here on purpose).
 //!   - vec0: `message_chunks.embedding` vs the `vec0` mirror's raw BLOB for
 //!     the same `chunk_id` (`rowid`) -- must be byte-identical.
 //!
@@ -82,6 +84,26 @@
 //! generation, zero chunks, Infinity unreachable, or the
 //! `ownership_oracle.py` subprocess failed to start/speak its protocol, or
 //! stalled/exited before finishing this run's verdicts).
+//!
+//! T5 (#127) adds a second mode, `--calibrate --db <v6 lib> --sample <N>
+//! --seed <S> --infinity <url> --out <json>`: it takes `N` chunks from
+//! `message_chunks`, re-embeds each one's stored span text **twice** -- once
+//! per-request, once inside [`EMBED_BATCH`]-sized batches -- and reports the
+//! `e = 1 - cos` distribution, `max_e`, `e_max = max(2 * max_e, 1e-3)` and
+//! `cosine_min = 1 - e_max` that `OWNERSHIP_COSINE_MIN` (see
+//! `crate::indexer::db_vector_catchup`) is set from. A `N`-pair
+//! distinct-message control must reject all `N` pairs at cosine < 0.95, or
+//! the probe cannot tell "same text" from "different text" and the run fails.
+//! Exit codes for this mode: 0 measured; **1** a failed measurement (a
+//! non-finite `e`, or a control that did not reject every pair); **2**
+//! precondition error; **3** `max_e > 2.5e-3` -- a usable measurement that
+//! says the threshold cannot be set this way, which the task book keeps
+//! distinct from "the measurement failed" on purpose.
+//!
+//! The report carries its raw measurements (`chunk_ids` + `e_values`, and the
+//! control's `cosines`), not just the distribution: `max_e`, `e_max` and
+//! `cosine_min` are all recomputable from the artifact alone, so the constant
+//! they set is auditable without re-running the probe.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
@@ -92,6 +114,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use clap::Parser;
+use coding_agent_search::indexer::db_vector_catchup::OWNERSHIP_COSINE_MIN;
 use coding_agent_search::search::eligibility::normalized_for_chunks;
 use coding_agent_search::storage::api::Value;
 use coding_agent_search::storage::schema::le_blob_to_f32_vector;
@@ -132,8 +155,23 @@ struct Cli {
     seed: Option<u64>,
     #[arg(long)]
     infinity: String,
+    /// The ownership report this file has always written. Required for
+    /// `--full`/`--sample`; `--calibrate` writes [`Cli::out`] instead.
     #[arg(long)]
-    json: PathBuf,
+    json: Option<PathBuf>,
+    /// T5 (#127): cosine calibration. Sample `--sample` chunks from the
+    /// target library's `message_chunks`, re-embed each one's stored span
+    /// text twice -- once as a single-text request, once inside
+    /// [`EMBED_BATCH`]-sized batches -- and report the `e = 1 - cos`
+    /// distribution, `max_e`, `e_max = max(2 * max_e, 1e-3)` and
+    /// `cosine_min = 1 - e_max` that `OWNERSHIP_COSINE_MIN` is calibrated
+    /// from. Mutually exclusive with `--full`/`--json`/`--dump-failures`/
+    /// `--max-pages`.
+    #[arg(long)]
+    calibrate: bool,
+    /// `--calibrate`'s output document (`cosine-calibration.json`).
+    #[arg(long)]
+    out: Option<PathBuf>,
     /// Debug-only (T11.8 investigation): dump up to [`DUMP_FAILURES_CAP`]
     /// span/cosine/vec0 failure records (chunk_id, message_id, chunk_idx,
     /// stored span, independent oracle span/error, cosine) as a JSON
@@ -482,7 +520,10 @@ fn flush_embed_pending(
         let item_failed = match cos {
             Some(c) => {
                 *min_cosine = Some(min_cosine.map_or(c, |m: f32| m.min(c)));
-                c < 0.999
+                // T5 (#127): this threshold is the audit's own constant, not a
+                // second copy of its value -- see `OWNERSHIP_COSINE_MIN`'s doc
+                // comment for how the number was measured.
+                c < OWNERSHIP_COSINE_MIN
             }
             None => true,
         };
@@ -839,13 +880,526 @@ fn run(
     }
 }
 
+// ---------------------------------------------------------------------------
+// T5 (#127): cosine calibration
+// ---------------------------------------------------------------------------
+
+/// `--calibrate`'s stop condition: a `max_e` above this means re-embedding the
+/// same text under two batch compositions is far from identical, so the
+/// threshold the ownership audit gates on cannot be set from this measurement
+/// -- the task book says to stop and report rather than pick a number.
+const CALIBRATION_STOP_MAX_E: f32 = 2.5e-3;
+
+/// Floor on `e_max`, so a measurement below the noise the calibration can
+/// resolve still leaves the threshold strictly below 1.0.
+const CALIBRATION_E_MAX_FLOOR: f32 = 1e-3;
+
+/// Negative-control pairs required: two *different* messages must embed to
+/// clearly different vectors, or the measurement says nothing.
+const CALIBRATION_NEGATIVE_PAIRS: usize = 200;
+
+/// A negative-control pair whose cosine is at or above this is not evidence of
+/// anything (the pair may genuinely be near-duplicate text), and the run fails.
+const CALIBRATION_NEGATIVE_MAX_COSINE: f32 = 0.95;
+
+/// The probe's cosine, computed in `f64` from the `f32` components. The
+/// quantity being measured is `1 - cos`, i.e. a difference of order 1e-5 from
+/// a value of order 1: evaluating that difference in `f32` would put this
+/// file's own rounding (`f32::EPSILON` alone is ~1.2e-7 near 1.0) into the
+/// measurement of the embedder's noise. The stored vectors are `f32`, so this
+/// only buys precision in the accumulation and the subtraction, not in the
+/// inputs -- but that is exactly where the cancellation happens.
+fn cosine_similarity_f64(a: &[f32], b: &[f32]) -> f64 {
+    let mut dot = 0.0f64;
+    let mut norm_a = 0.0f64;
+    let mut norm_b = 0.0f64;
+    for (x, y) in a.iter().zip(b) {
+        dot += f64::from(*x) * f64::from(*y);
+        norm_a += f64::from(*x) * f64::from(*x);
+        norm_b += f64::from(*y) * f64::from(*y);
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EDistribution {
+    min: f32,
+    median: f32,
+    p95: f32,
+    max: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct NegativeControl {
+    /// Distinct-message pairs embedded and compared.
+    pairs: usize,
+    required_pairs: usize,
+    /// How many of them came out below [`CALIBRATION_NEGATIVE_MAX_COSINE`].
+    rejected: usize,
+    max_cosine: Option<f32>,
+    /// The raw cosine of every pair, in pair order, so `rejected` can be
+    /// recounted from the artifact instead of trusted.
+    cosines: Vec<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CalibrationReport {
+    schema_version: u32,
+    db: String,
+    infinity: String,
+    embedder_id: String,
+    dim: i64,
+    sample: usize,
+    seed: u64,
+    batch_composition_a: String,
+    batch_composition_b: String,
+    chunks_compared: usize,
+    /// The probe's chunk ids, in the same order as `e_values`.
+    chunk_ids: Vec<i64>,
+    /// The raw `e = 1 - cos` of every probe chunk, so `e`'s distribution,
+    /// `max_e`, `e_max` and `cosine_min` can all be recomputed from this
+    /// artifact alone rather than taken on trust (T5 #127, control-plane
+    /// request: the summary alone left the threshold unauditable).
+    e_values: Vec<f32>,
+    e: EDistribution,
+    max_e: f32,
+    e_max: f32,
+    cosine_min: f32,
+    non_finite_e: usize,
+    negative_control: NegativeControl,
+    threshold_stop_max_e: f32,
+    passed: bool,
+}
+
+/// Why a calibration could not produce a threshold. The exit code is part of
+/// the variant, not of the message: the task book's three outcomes must never
+/// collapse into "non-zero".
+#[derive(Debug, PartialEq)]
+enum CalibrationFailure {
+    /// `e` was not a finite number for these chunks -- the measurement itself
+    /// is unusable.
+    NonFiniteE { count: usize },
+    /// Fewer than [`CALIBRATION_NEGATIVE_PAIRS`] distinct-message pairs came
+    /// out below [`CALIBRATION_NEGATIVE_MAX_COSINE`]: the probe cannot tell
+    /// "same text" from "different text" here.
+    NegativeControl { rejected: usize, required: usize, max_cosine: Option<f32> },
+    /// `max_e` exceeded [`CALIBRATION_STOP_MAX_E`]. Stop and report.
+    ThresholdExceeded { max_e: f32, limit: f32 },
+}
+
+impl CalibrationFailure {
+    fn exit_code(&self) -> i32 {
+        match self {
+            // The task book's separate third outcome: a usable measurement
+            // that says the threshold cannot be set this way.
+            Self::ThresholdExceeded { .. } => 3,
+            // A failed measurement, like every other ownership failure.
+            Self::NonFiniteE { .. } | Self::NegativeControl { .. } => 1,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::NonFiniteE { count } => format!("calibration failed: {count} of the sampled re-embeddings produced a non-finite e"),
+            Self::NegativeControl { rejected, required, max_cosine } => {
+                format!("calibration failed: only {rejected}/{required} distinct-message control pairs came out below {CALIBRATION_NEGATIVE_MAX_COSINE} (max cosine {max_cosine:?})")
+            }
+            Self::ThresholdExceeded { max_e, limit } => format!("calibration stopped: max_e {max_e} exceeds {limit}; the batch-composition noise is too large to set OWNERSHIP_COSINE_MIN from this measurement"),
+        }
+    }
+}
+
+/// The calibration arithmetic, as a pure function of the two measured sets, so
+/// the distribution, the floor and the three failure classes can be pinned
+/// against synthetic inputs without a database or an embedding server.
+fn compute_calibration(e_values: &[f32], negative_cosines: &[f32]) -> Result<(EDistribution, f32, f32, f32, NegativeControl), CalibrationFailure> {
+    let non_finite = e_values.iter().filter(|e| !e.is_finite()).count();
+    if non_finite > 0 || e_values.is_empty() {
+        return Err(CalibrationFailure::NonFiniteE { count: if e_values.is_empty() { 0 } else { non_finite } });
+    }
+    let mut sorted: Vec<f32> = e_values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("checked finite above"));
+    let n = sorted.len();
+    let max_e = *sorted.last().expect("non-empty");
+    let min = sorted[0];
+    let median = sorted[n / 2];
+    // Nearest-rank p95: the smallest value at or above 95% of the samples.
+    let p95 = sorted[((0.95 * n as f64).ceil() as usize).saturating_sub(1).min(n - 1)];
+    let e_max = (2.0 * max_e).max(CALIBRATION_E_MAX_FLOOR);
+    let cosine_min = 1.0 - e_max;
+
+    let mut rejected = 0usize;
+    let mut max_cosine: Option<f32> = None;
+    for c in negative_cosines {
+        if c.is_finite() && *c < CALIBRATION_NEGATIVE_MAX_COSINE {
+            rejected += 1;
+        }
+        max_cosine = Some(max_cosine.map_or(*c, |m: f32| m.max(*c)));
+    }
+    let control = NegativeControl {
+        pairs: negative_cosines.len(),
+        required_pairs: CALIBRATION_NEGATIVE_PAIRS,
+        rejected,
+        max_cosine,
+        cosines: negative_cosines.to_vec(),
+    };
+    if control.pairs < CALIBRATION_NEGATIVE_PAIRS || rejected < CALIBRATION_NEGATIVE_PAIRS {
+        return Err(CalibrationFailure::NegativeControl { rejected, required: CALIBRATION_NEGATIVE_PAIRS, max_cosine });
+    }
+    if max_e > CALIBRATION_STOP_MAX_E {
+        return Err(CalibrationFailure::ThresholdExceeded { max_e, limit: CALIBRATION_STOP_MAX_E });
+    }
+    Ok((
+        EDistribution { min, median, p95, max: max_e },
+        max_e,
+        e_max,
+        cosine_min,
+        control,
+    ))
+}
+
+/// Load the stored span text of every chunk in `needed`, in `chunk_id` order.
+/// The span is sliced from the same `normalized_for_chunks` text the ownership
+/// path uses (this file never re-derives a span; the calibration only re-reads
+/// the text a stored span already points at).
+fn load_chunk_texts(storage: &FrankenStorage, generation_id: i64, needed: &HashSet<i64>) -> anyhow::Result<Vec<(i64, i64, String)>> {
+    let mut out: Vec<(i64, i64, String)> = Vec::new();
+    let mut after_chunk_id = 0i64;
+    let mut cache: Option<(i64, String)> = None; // (message_id, normalized)
+    loop {
+        let page = fetch_chunk_page(storage, generation_id, after_chunk_id, PAGE_ROWS)?;
+        if page.is_empty() {
+            break;
+        }
+        after_chunk_id = page.last().expect("just checked non-empty").chunk_id;
+        for c in page {
+            if !needed.contains(&c.chunk_id) {
+                continue;
+            }
+            if cache.as_ref().map(|(mid, _)| *mid) != Some(c.message_id) {
+                let content: String = storage
+                    .raw()
+                    .query_row_map("SELECT content FROM messages WHERE id = ?1", &[Value::from(c.message_id)], |row| row.get_typed(0))?;
+                cache = Some((c.message_id, normalized_for_chunks(&content)));
+            }
+            let (_, normalized) = cache.as_ref().expect("just set above");
+            let (start, end) = (c.byte_start as usize, c.byte_end as usize);
+            anyhow::ensure!(
+                end <= normalized.len() && start <= end,
+                "chunk {} span [{start},{end}) is out of bounds for message {}'s normalized text (len {})",
+                c.chunk_id,
+                c.message_id,
+                normalized.len()
+            );
+            let text = normalized.get(start..end).ok_or_else(|| anyhow::anyhow!("chunk {} span [{start},{end}) is not on a char boundary", c.chunk_id))?;
+            out.push((c.chunk_id, c.message_id, text.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// Build up to [`CALIBRATION_NEGATIVE_PAIRS`] distinct-message pairs from
+/// `pool` (already in `chunk_id` order), pairing the first half against the
+/// second. The halves matter: chunks of one multi-chunk message are adjacent
+/// in `chunk_id` order, so pairing neighbours would keep hitting same-message
+/// pairs (the real 400-chunk pool yielded only 195 that way) -- a chunk drawn
+/// from the far half is ~`pool.len() / 2` chunk ids away from its partner.
+/// A lone collision walks forward deterministically rather than reusing a
+/// message. Returns fewer than requested rather than guessing.
+fn negative_pairs(pool: &[(i64, i64, String)]) -> Vec<((i64, i64, String), (i64, i64, String))> {
+    let half = pool.len() / 2;
+    let mut pairs = Vec::new();
+    for i in 0..half {
+        if pairs.len() == CALIBRATION_NEGATIVE_PAIRS {
+            break;
+        }
+        let left = &pool[i];
+        let right = (0..half).map(|k| &pool[half + ((i + k) % half)]).find(|c| c.1 != left.1);
+        if let Some(right) = right {
+            pairs.push((left.clone(), right.clone()));
+        }
+    }
+    pairs
+}
+
+fn run_calibrate(db_path: &Path, sample: usize, seed: u64, infinity_url: &str) -> (i32, Option<CalibrationReport>, String) {
+    if !db_path.is_file() {
+        return (2, None, format!("precondition error: db {} does not exist", db_path.display()));
+    }
+    let storage = match FrankenStorage::open_readonly(db_path) {
+        Ok(s) => s,
+        Err(e) => return (2, None, format!("precondition error opening db: {e:#}")),
+    };
+    let (generation_id, dim, embedder_id) = match active_generation(&storage) {
+        Ok(v) => v,
+        Err(e) => return (2, None, format!("precondition error: no active generation: {e:#}")),
+    };
+    match generation_has_any_chunks(&storage, generation_id) {
+        Ok(true) => {}
+        Ok(false) => return (2, None, "precondition error: active generation has zero message_chunks rows".to_string()),
+        Err(e) => return (2, None, format!("precondition error checking message_chunks: {e:#}")),
+    }
+
+    let all_ids = match all_chunk_ids(&storage, generation_id) {
+        Ok(ids) => ids,
+        Err(e) => return (2, None, format!("precondition error listing chunk_ids: {e:#}")),
+    };
+    // The calibration probe needs `sample` chunks plus three times that many
+    // to draw the negative-control pairs from (the first `sample` of the same
+    // seeded shuffle are the probe's, the next 2*sample are the control's).
+    let wanted = sample.saturating_mul(3);
+    if all_ids.len() < wanted {
+        return (2, None, format!("precondition error: the active generation holds {} chunks, fewer than the {wanted} (3 x --sample {sample}) this probe needs", all_ids.len()));
+    }
+    let primary_set = select_sample_ids(all_ids.clone(), sample, seed);
+    let wide = select_sample_ids(all_ids, wanted, seed);
+    let mut primary: Vec<i64> = primary_set.iter().copied().collect();
+    primary.sort_unstable();
+    // `wide` is the same seeded shuffle truncated further out, so its first
+    // `sample` entries are exactly `primary`; what remains is the pool the
+    // negative control draws from.
+    let mut pool: Vec<i64> = wide.difference(&primary_set).copied().collect();
+    pool.sort_unstable();
+
+    let mut needed: HashSet<i64> = primary.iter().copied().collect();
+    needed.extend(pool.iter().copied());
+    let texts = match load_chunk_texts(&storage, generation_id, &needed) {
+        Ok(t) => t,
+        Err(e) => return (2, None, format!("precondition error reading chunk texts: {e:#}")),
+    };
+    if texts.len() != needed.len() {
+        return (2, None, format!("precondition error: {} of the {} sampled chunk_ids have no message_chunks row", needed.len() - texts.len(), needed.len()));
+    }
+    let text_by_id: HashMap<i64, &(i64, i64, String)> = texts.iter().map(|t| (t.0, t)).collect();
+    let primary_texts: Vec<&(i64, i64, String)> = primary.iter().map(|id| *text_by_id.get(id).expect("membership checked above")).collect();
+    let pool_texts: Vec<(i64, i64, String)> = pool.iter().map(|id| (*text_by_id.get(id).expect("membership checked above")).clone()).collect();
+
+    let client = reqwest::blocking::Client::new();
+
+    // Composition A: every text in a request of its own.
+    let mut single: HashMap<i64, Vec<f32>> = HashMap::with_capacity(primary_texts.len());
+    for t in &primary_texts {
+        match http_embed_batch(&client, infinity_url, &embedder_id, &[t.2.as_str()]) {
+            Ok(mut got) => match got.remove(&0) {
+                Some(v) => {
+                    single.insert(t.0, v);
+                }
+                None => return (2, None, format!("precondition error: Infinity returned no embedding for chunk {}", t.0)),
+            },
+            Err(e) => return (2, None, format!("precondition error re-embedding chunk {}: {e:#}", t.0)),
+        }
+    }
+    // Composition B: the same texts, batched EMBED_BATCH at a time.
+    let mut batched: HashMap<i64, Vec<f32>> = HashMap::with_capacity(primary_texts.len());
+    for batch in primary_texts.chunks(EMBED_BATCH) {
+        let refs: Vec<&str> = batch.iter().map(|t| t.2.as_str()).collect();
+        match http_embed_batch(&client, infinity_url, &embedder_id, &refs) {
+            Ok(got) => {
+                for (i, t) in batch.iter().enumerate() {
+                    match got.get(&i) {
+                        Some(v) => {
+                            batched.insert(t.0, v.clone());
+                        }
+                        None => return (2, None, format!("precondition error: Infinity returned no embedding for batched chunk {}", t.0)),
+                    }
+                }
+            }
+            Err(e) => return (2, None, format!("precondition error batch re-embedding: {e:#}")),
+        }
+    }
+
+    let mut e_values: Vec<f32> = Vec::with_capacity(primary_texts.len());
+    for t in &primary_texts {
+        let a = single.get(&t.0).expect("embedded above");
+        let b = batched.get(&t.0).expect("embedded above");
+        e_values.push((1.0 - cosine_similarity_f64(a, b)) as f32);
+    }
+
+    // Negative control: the same probe on pairs of *different* messages.
+    let pairs = negative_pairs(&pool_texts);
+    if pairs.len() < CALIBRATION_NEGATIVE_PAIRS {
+        return (
+            2,
+            None,
+            format!(
+                "precondition error: only {} distinct-message control pairs could be formed from {} control chunks (need {CALIBRATION_NEGATIVE_PAIRS})",
+                pairs.len(),
+                pool_texts.len()
+            ),
+        );
+    }
+    let mut control_vectors: HashMap<i64, Vec<f32>> = HashMap::with_capacity(pool_texts.len());
+    for start in (0..pool_texts.len()).step_by(EMBED_BATCH) {
+        let end = (start + EMBED_BATCH).min(pool_texts.len());
+        let batch = &pool_texts[start..end];
+        let refs: Vec<&str> = batch.iter().map(|t| t.2.as_str()).collect();
+        match http_embed_batch(&client, infinity_url, &embedder_id, &refs) {
+            Ok(got) => {
+                for (i, t) in batch.iter().enumerate() {
+                    match got.get(&i) {
+                        Some(v) => {
+                            control_vectors.insert(t.0, v.clone());
+                        }
+                        None => return (2, None, format!("precondition error: Infinity returned no embedding for control chunk {}", t.0)),
+                    }
+                }
+            }
+            Err(e) => return (2, None, format!("precondition error embedding control chunks: {e:#}")),
+        }
+    }
+    let negative_cosines: Vec<f32> = pairs
+        .iter()
+        .map(|(l, r)| {
+            let a = control_vectors.get(&l.0).expect("embedded above");
+            let b = control_vectors.get(&r.0).expect("embedded above");
+            cosine_similarity_f64(a, b) as f32
+        })
+        .collect();
+
+    match compute_calibration(&e_values, &negative_cosines) {
+        Err(failure) => (failure.exit_code(), None, failure.message()),
+        Ok((e, max_e, e_max, cosine_min, control)) => {
+            let report = CalibrationReport {
+                schema_version: 1,
+                db: db_path.display().to_string(),
+                infinity: infinity_url.to_string(),
+                embedder_id,
+                dim,
+                sample,
+                seed,
+                batch_composition_a: "single: one request per text, input length 1".to_string(),
+                batch_composition_b: format!("batched: EMBED_BATCH={EMBED_BATCH} texts per request"),
+                chunks_compared: e_values.len(),
+                chunk_ids: primary.clone(),
+                e_values,
+                e,
+                max_e,
+                e_max,
+                cosine_min,
+                non_finite_e: 0,
+                negative_control: control,
+                threshold_stop_max_e: CALIBRATION_STOP_MAX_E,
+                passed: true,
+            };
+            let msg = format!(
+                "calibration: chunks={} max_e={} e_max={} cosine_min={} negative_control={}/{}",
+                report.chunks_compared, report.max_e, report.e_max, report.cosine_min, report.negative_control.rejected, report.negative_control.required_pairs
+            );
+            (0, Some(report), msg)
+        }
+    }
+}
+
+/// `(canonical path, dev/ino when the file exists)` -- two names for the same
+/// file (a symlink, a hard link, `./x` vs `x`) compare equal, and a path that
+/// does not exist yet still compares by its canonical spelling.
+fn file_identity(path: &Path) -> (PathBuf, Option<(u64, u64)>) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+    };
+    #[cfg(not(unix))]
+    let inode: Option<(u64, u64)> = None;
+    (canonical, inode)
+}
+
+/// R9-B01 (任务书 #132): two names are the same file when their canonical
+/// paths agree OR when both resolve to the same `(dev, ino)`. Comparing the
+/// whole identity tuple at once demanded BOTH halves at the same time, so a
+/// hard link -- two distinct canonical paths, one inode -- compared unequal
+/// and slipped through the guard: the calibration ran, and its final
+/// `fs::write` truncated the input database through the other name.
+fn same_file(left: &(PathBuf, Option<(u64, u64)>), right: &(PathBuf, Option<(u64, u64)>)) -> bool {
+    left.0 == right.0 || (left.1.is_some() && left.1 == right.1)
+}
+
+/// B01 (任务书 #131): an output path that names the input database -- or one
+/// of its SQLite sidecars -- is data loss, not a usage slip: the final
+/// `fs::write` truncates the very file the run spent its whole budget
+/// reading, and the run still reports success. Refuse BEFORE anything runs,
+/// so a refused invocation writes nothing at all.
+fn refuse_output_over_input(db: &Path, outputs: &[(&str, &Path)]) -> Option<String> {
+    let mut sidecar_names: Vec<(String, PathBuf)> = Vec::new();
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        sidecar_names.push((format!("--db{suffix}"), PathBuf::from(sidecar)));
+    }
+    let mut inputs: Vec<(String, PathBuf)> = vec![("--db".to_string(), db.to_path_buf())];
+    for (label, path) in sidecar_names {
+        if path.exists() {
+            inputs.push((label, path));
+        }
+    }
+    for (label, out) in outputs {
+        let out_identity = file_identity(out);
+        for (input_label, input) in &inputs {
+            if same_file(&out_identity, &file_identity(input)) {
+                return Some(format!(
+                    "{label} {} names the input database {input_label} (same file); refusing to run, nothing was written",
+                    out.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let cli = Cli::parse();
+    // B01: the collision check comes before every other precondition and
+    // before any read, so the refusal cannot itself depend on the run.
+    let mut outputs: Vec<(&str, &Path)> = Vec::new();
+    if let Some(out) = cli.out.as_deref() {
+        outputs.push(("--out", out));
+    }
+    if let Some(json) = cli.json.as_deref() {
+        outputs.push(("--json", json));
+    }
+    if let Some(dump) = cli.dump_failures.as_deref() {
+        outputs.push(("--dump-failures", dump));
+    }
+    if let Some(collision) = refuse_output_over_input(&cli.db, &outputs) {
+        eprintln!("precondition error: {collision}");
+        std::process::exit(2);
+    }
+    if cli.calibrate {
+        let Some(out) = cli.out.as_deref() else {
+            eprintln!("precondition error: --calibrate needs --out <json>");
+            std::process::exit(2);
+        };
+        if cli.full || cli.json.is_some() || cli.dump_failures.is_some() || cli.max_pages.is_some() {
+            eprintln!("precondition error: --calibrate is mutually exclusive with --full/--json/--dump-failures/--max-pages");
+            std::process::exit(2);
+        }
+        let (Some(sample), Some(seed)) = (cli.sample, cli.seed) else {
+            eprintln!("precondition error: --calibrate needs both --sample and --seed");
+            std::process::exit(2);
+        };
+        let (code, report, message) = run_calibrate(&cli.db, sample, seed, &cli.infinity);
+        println!("{message}");
+        if let Some(report) = &report {
+            let json = serde_json::to_string_pretty(report).expect("CalibrationReport must serialize");
+            std::fs::write(out, json).expect("writing --out output must succeed");
+        }
+        std::process::exit(code);
+    }
+
     let (code, report, message) = run(&cli.db, cli.full, cli.sample, cli.seed, &cli.infinity, cli.dump_failures.as_deref(), cli.max_pages);
     println!("{message}");
     if let Some(report) = &report {
+        let Some(json_path) = cli.json.as_deref() else {
+            eprintln!("precondition error: --json <path> is required unless --calibrate is set");
+            std::process::exit(2);
+        };
         let json = serde_json::to_string_pretty(report).expect("OwnershipReport must serialize");
-        std::fs::write(&cli.json, json).expect("writing --json output must succeed");
+        std::fs::write(json_path, json).expect("writing --json output must succeed");
     }
     std::process::exit(code);
 }
@@ -1300,5 +1854,358 @@ mod tests {
         assert_eq!(select_sample_ids(ids.clone(), ids.len(), 7), all);
         let ids_len = ids.len();
         assert_eq!(select_sample_ids(ids, ids_len + 1, 7), all);
+    }
+
+    // ---- T5 (#127): cosine calibration ---------------------------------
+
+    fn a_control_of(n: usize, cosine: f32) -> Vec<f32> {
+        vec![cosine; n]
+    }
+
+    #[test]
+    fn the_calibration_derives_e_max_and_cosine_min_from_the_measurements() {
+        // All e below 5e-4: twice the largest is still under the 1e-3 floor,
+        // so the floor is what the threshold comes from.
+        let e = vec![1e-6f32, 2e-6, 3e-6, 4e-6, 5e-6];
+        let (dist, max_e, e_max, cosine_min, control) = compute_calibration(&e, &a_control_of(200, 0.5)).expect("a clean measurement must pass");
+        assert_eq!(max_e, 5e-6);
+        assert_eq!(e_max, 1e-3, "the floor must take over below 5e-4");
+        assert_eq!(cosine_min, 1.0 - 1e-3);
+        assert_eq!(dist.min, 1e-6);
+        assert_eq!(dist.max, 5e-6);
+        assert_eq!(dist.median, 3e-6);
+        assert_eq!(control.rejected, 200);
+
+        // Above the floor, twice the largest e is what sets the threshold.
+        let e = vec![1e-4f32, 2e-4, 1.5e-3];
+        let (dist, max_e, e_max, cosine_min, _) = compute_calibration(&e, &a_control_of(200, 0.5)).expect("still under the stop threshold");
+        assert_eq!(max_e, 1.5e-3);
+        assert_eq!(e_max, 3e-3);
+        assert_eq!(cosine_min, 1.0 - 3e-3);
+        assert_eq!(dist.p95, 1.5e-3, "nearest-rank p95 of three samples is the largest");
+    }
+
+    #[test]
+    fn a_non_finite_e_fails_the_calibration() {
+        let mut e = vec![1e-6f32; 200];
+        e[7] = f32::NAN;
+        e[9] = f32::INFINITY;
+        let failure = compute_calibration(&e, &a_control_of(200, 0.5)).expect_err("non-finite e is unusable");
+        assert_eq!(failure, CalibrationFailure::NonFiniteE { count: 2 });
+        assert_eq!(failure.exit_code(), 1, "a failed measurement is not the stop-and-report outcome");
+    }
+
+    #[test]
+    fn a_negative_control_that_does_not_reject_every_pair_fails_the_calibration() {
+        // Every pair but one is clearly different text.
+        let mut control = a_control_of(200, 0.1);
+        control[42] = 0.97;
+        let failure = compute_calibration(&vec![1e-6f32; 200], &control).expect_err("a near-identical control pair means the probe cannot tell texts apart");
+        match failure {
+            CalibrationFailure::NegativeControl { rejected, required, max_cosine } => {
+                assert_eq!(rejected, 199);
+                assert_eq!(required, 200);
+                assert_eq!(max_cosine, Some(0.97));
+            }
+            other => panic!("expected a negative-control failure, got {other:?}"),
+        }
+        assert_eq!(failure.exit_code(), 1);
+
+        // Too few pairs at all is the same class of failure, not a pass.
+        let failure = compute_calibration(&vec![1e-6f32; 200], &a_control_of(199, 0.1)).expect_err("199 pairs is not 200");
+        assert_eq!(failure.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_max_e_above_the_stop_threshold_takes_the_separate_exit_code() {
+        let e = vec![1e-6f32, 3e-3];
+        let failure = compute_calibration(&e, &a_control_of(200, 0.1)).expect_err("3e-3 > 2.5e-3 stops the calibration");
+        assert_eq!(failure, CalibrationFailure::ThresholdExceeded { max_e: 3e-3, limit: 2.5e-3 });
+        assert_eq!(failure.exit_code(), 3, "the task book keeps this outcome distinct from a failed measurement");
+    }
+
+    /// A fixture of `messages` one-chunk messages, message `k` carrying
+    /// `calib-text-<k>` so the mock below can address it by index.
+    fn calibration_fixture(messages: usize, dim: usize) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        for k in 0..messages {
+            insert_message_parent_chain(&storage, 1, 1, k as i64 + 1, "user", &format!("calib-text-{k}"));
+        }
+        let generation_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", dim as i64, 1, 1, b"fp", 1_700_000_000_000))
+            .unwrap();
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &[Value::from(generation_id)])
+            .unwrap();
+        let embedding = schema::f32_vector_to_le_blob(&vec![0.0f32; dim]);
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                for k in 0..messages {
+                    let message_id = k as i64 + 1;
+                    let content = format!("calib-text-{k}");
+                    let chunks = coding_agent_search::search::eligibility::expected_chunks(message_id, 1, "user", &content);
+                    assert_eq!(chunks.len(), 1, "fixture messages must each produce exactly one chunk");
+                    let chunk = &chunks[0];
+                    tx.execute(
+                        "INSERT INTO message_chunks(chunk_id, generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+                         VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, 1.0, 1700000000000)",
+                        &[
+                            Value::from(k as i64 + 1),
+                            Value::from(generation_id),
+                            Value::from(message_id),
+                            Value::from(chunk.chunk_idx as i64),
+                            Value::from(chunk.byte_start as i64),
+                            Value::from(chunk.byte_end as i64),
+                            Value::from(chunk.content_hash.clone()),
+                            Value::from(embedding.clone()),
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, dim as i64).unwrap();
+        (dir, path)
+    }
+
+    /// A mock Infinity whose reply depends on the batch composition: a text
+    /// sent on its own comes back one-hot, and the same text sent inside a
+    /// batch comes back with a tiny second component added. That is what makes
+    /// "the probe really embedded this text twice, under two compositions"
+    /// observable -- against a composition-blind mock both embeddings would be
+    /// identical and `e` would be exactly 0, which no real probe should report.
+    fn start_mock_composition_infinity(dim: usize, messages: usize, eps: f32) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let body_end = loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) else { continue };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + len {
+                        break header_end + len;
+                    }
+                };
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let request: serde_json::Value = serde_json::from_slice(&buf[header_end..body_end.min(buf.len())]).unwrap_or(serde_json::Value::Null);
+                let inputs: Vec<String> = request["input"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                let batched = inputs.len() > 1;
+                let mut items = Vec::with_capacity(inputs.len());
+                for (i, text) in inputs.iter().enumerate() {
+                    let k: usize = text.trim_start_matches("calib-text-").trim().parse().unwrap_or(0);
+                    let mut v = vec![0.0f32; dim];
+                    v[k % dim] = 1.0;
+                    if batched {
+                        v[(k + 1) % messages.min(dim)] += eps;
+                    }
+                    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                    for x in v.iter_mut() {
+                        *x /= norm;
+                    }
+                    items.push(serde_json::json!({"index": i, "embedding": v}));
+                }
+                // Reversed, on purpose: the client must align by each item's
+                // own `index`, never by response-array position.
+                items.reverse();
+                let payload = serde_json::json!({ "data": items }).to_string();
+                // `Connection: close`: this handler serves exactly one request per
+                // accepted connection, and without the header reqwest's pool would
+                // keep the connection and race the close on the next request.
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (addr, stop)
+    }
+
+    /// One conversation, one message, one chunk, whose stored embedding is
+    /// `[1,0,0,0]` -- so a mock that answers with `[c, sqrt(1-c^2), 0, 0]`
+    /// pins this oracle's measured cosine at exactly `c`, and the threshold it
+    /// gates on becomes observable from the outside.
+    fn seed_single_chunk_with_unit_embedding(path: &std::path::Path, content: &str) {
+        let storage = FrankenStorage::open(path).unwrap();
+        insert_message_parent_chain(&storage, 1, 1, 1, "user", content);
+        let generation_id = storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| schema::create_embedding_generation(tx, "bge-m3", 4, 1, 1, b"fp", 1_700_000_000_000))
+            .unwrap();
+        storage
+            .raw()
+            .execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &[Value::from(generation_id)])
+            .unwrap();
+        let chunks = coding_agent_search::search::eligibility::expected_chunks(1, 1, "user", content);
+        assert_eq!(chunks.len(), 1, "the fixture message must produce exactly one chunk");
+        let chunk = &chunks[0];
+        storage
+            .raw()
+            .with_tx_no_replay(TxMode::Immediate, |tx| {
+                tx.execute(
+                    "INSERT INTO message_chunks(chunk_id, generation_id, message_id, conversation_id, chunk_idx, byte_start, byte_end, content_hash, embedding, norm, created_at) \
+                     VALUES (1, ?1, 1, 1, ?2, ?3, ?4, ?5, ?6, 1.0, 1700000000000)",
+                    &[
+                        Value::from(generation_id),
+                        Value::from(chunk.chunk_idx as i64),
+                        Value::from(chunk.byte_start as i64),
+                        Value::from(chunk.byte_end as i64),
+                        Value::from(chunk.content_hash.clone()),
+                        Value::from(schema::f32_vector_to_le_blob(&[1.0f32, 0.0, 0.0, 0.0])),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(), generation_id, 4).unwrap();
+    }
+
+    /// A mock Infinity that answers every request with one fixed vector --
+    /// `seed_single_chunk_with_unit_embedding`'s counterpart.
+    fn start_mock_fixed_infinity(vector: Vec<f32>) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                let mut buf: Vec<u8> = Vec::new();
+                let mut tmp = [0u8; 8192];
+                let body_end = loop {
+                    let n = stream.read(&mut tmp).unwrap_or(0);
+                    if n == 0 {
+                        break buf.len();
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) else { continue };
+                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let len: usize = headers
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0)))
+                        .unwrap_or(0);
+                    if buf.len() >= header_end + len {
+                        break header_end + len;
+                    }
+                };
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let request: serde_json::Value = serde_json::from_slice(&buf[header_end..body_end.min(buf.len())]).unwrap_or(serde_json::Value::Null);
+                let n = request["input"].as_array().map(Vec::len).unwrap_or(0);
+                let items: Vec<serde_json::Value> = (0..n).map(|i| serde_json::json!({"index": i, "embedding": vector.clone()})).collect();
+                let payload = serde_json::json!({ "data": items }).to_string();
+                // `Connection: close`: this handler serves exactly one request per
+                // accepted connection, and without the header reqwest's pool would
+                // keep the connection and race the close on the next request.
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (addr, stop)
+    }
+
+    /// T5 (#127): the oracle's cosine gate must be the audit's constant, not a
+    /// second copy of its value. A fixture measured at a cosine strictly
+    /// between `OWNERSHIP_COSINE_MIN` and the old hardcoded `0.999` passes
+    /// only if the oracle reads the constant: reverting line ~485's
+    /// `c < OWNERSHIP_COSINE_MIN` to `c < 0.999` makes this fail exactly as
+    /// the placeholder constant did against real re-embedding noise.
+    #[test]
+    fn the_oracle_gates_on_the_shared_ownership_constant() {
+        assert!(
+            OWNERSHIP_COSINE_MIN < 0.999,
+            "OWNERSHIP_COSINE_MIN is {OWNERSHIP_COSINE_MIN}, i.e. the 1e-3 floor took over and equals the value this \
+             test discriminates against; the constant is still read from one place, but no behavioural test can tell \
+             a reference from a copy at that value"
+        );
+        let target = (f64::from(OWNERSHIP_COSINE_MIN) + 0.999) / 2.0;
+        let companion = (1.0 - target * target).sqrt();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent_search.db");
+        seed_single_chunk_with_unit_embedding(&path, "A probe message whose re-embedding is a controlled cosine away from its stored vector.");
+        let (addr, stop) = start_mock_fixed_infinity(vec![target as f32, companion as f32, 0.0, 0.0]);
+        let (code, report, message) = run(&path, true, None, None, &format!("http://{addr}"), None, None);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let report = report.unwrap_or_else(|| panic!("the fixture must produce a report: {message}"));
+        assert_eq!(
+            report.cosine_failed, 0,
+            "a cosine of {target} is at or above OWNERSHIP_COSINE_MIN ({OWNERSHIP_COSINE_MIN}) and must pass; failing it \
+             means this gate is not reading that constant (min_cosine seen: {:?})",
+            report.min_cosine
+        );
+        assert_eq!(code, 0, "{message}");
+    }
+
+    #[test]
+    fn calibrate_measures_two_batch_compositions_end_to_end() {
+        const DIM: usize = 1024;
+        const MESSAGES: usize = 700;
+        const EPS: f32 = 0.01;
+        let (_dir, path) = calibration_fixture(MESSAGES, DIM);
+        let (addr, stop) = start_mock_composition_infinity(DIM, MESSAGES, EPS);
+        let (code, report, message) = run_calibrate(&path, 200, 6, &format!("http://{addr}"));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let report = report.unwrap_or_else(|| panic!("a clean end-to-end calibration must produce a report: {message}"));
+        assert_eq!(code, 0, "{message}");
+        assert_eq!(report.chunks_compared, 200);
+        assert_eq!(report.sample, 200);
+        assert_eq!(report.seed, 6);
+        // cos(one-hot, one-hot + eps * e_{k+1}) = 1 / sqrt(1 + eps^2).
+        let expected_e = 1.0 - 1.0 / (1.0 + f64::from(EPS) * f64::from(EPS)).sqrt();
+        let got = f64::from(report.e.max);
+        assert!(
+            (got - expected_e).abs() < expected_e * 0.1,
+            "measured e {} must be the composition difference {expected_e} -- a composition-blind mock would give exactly 0",
+            report.e.max
+        );
+        assert_eq!(report.e.min, report.e.max, "every sampled text is measured the same way");
+        assert_eq!(report.e_max, 1e-3, "twice 5e-5 is under the 1e-3 floor");
+        assert_eq!(report.cosine_min, 1.0 - 1e-3);
+        assert_eq!(report.non_finite_e, 0);
+        assert_eq!(report.negative_control.pairs, 200);
+        assert_eq!(report.negative_control.rejected, 200, "distinct texts must reject every control pair");
+        assert!(report.passed);
+
+        // The artifact has to carry the raw measurements, not just the summary:
+        // anything derived from `e_values` (the distribution, max_e, e_max,
+        // cosine_min) is recomputable from the JSON alone.
+        assert_eq!(report.chunk_ids.len(), report.e_values.len());
+        assert_eq!(report.e_values.len(), 200);
+        assert_eq!(report.negative_control.cosines.len(), 200);
+        let recomputed_max = report.e_values.iter().copied().fold(f32::MIN, f32::max);
+        assert_eq!(recomputed_max, report.max_e, "max_e must be the maximum of the published e_values");
+        assert_eq!(report.e_max, (2.0 * recomputed_max).max(1e-3));
+        assert_eq!(report.cosine_min, 1.0 - report.e_max);
+        let recounted = report.negative_control.cosines.iter().filter(|c| c.is_finite() && **c < 0.95).count();
+        assert_eq!(recounted, report.negative_control.rejected);
     }
 }

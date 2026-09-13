@@ -35,6 +35,7 @@ fn sample_conv(external_id: Option<&str>, messages: Vec<Message>) -> Conversatio
 
 fn msg(idx: i64, created_at: i64) -> Message {
     Message {
+        excluded: None,
         id: None,
         idx,
         role: MessageRole::User,

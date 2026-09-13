@@ -8,7 +8,7 @@
     },
     "consumed_by": "pub fn is_hard_message_noise (:687-689), via is_tool_acknowledgement",
     "sync_guard_test": "hard_noise_phrases_json_matches_source (src/search/canonicalize.rs)",
-    "note": "Frozen for T1 (plan v5.1); not modified by v2. `canonicalize_low_signal` below is a SEPARATE, smaller list -- canonicalize()'s own stage-4 whole-text low-signal filter (FS_LOW_SIGNAL_CONTENT / LOW_SIGNAL_CONTENT, 15 exact-match phrases), applied inside canonicalize()/canonicalize_fast_path() itself, not by the indexer's pre-filter. Frozen as a T1 rules-doc gap fix folded into T2 (plan v5.1)."
+    "note": "Frozen for T1 (plan v5.1); not modified by v2. `canonicalize_low_signal` below is a SEPARATE, smaller list -- canonicalize()'s own stage-4 whole-text low-signal filter (FS_LOW_SIGNAL_CONTENT / LOW_SIGNAL_CONTENT, 17 exact-match phrases), applied inside canonicalize()/canonicalize_fast_path() itself, not by the indexer's pre-filter. Frozen as a T1 rules-doc gap fix folded into T2 (plan v5.1). PR6 T1 (任务书 #111) added two hard-noise receipts (\"wait timed out\", \"bash completed with no output\") to short_tool_acks and canonicalize_low_signal -- both sides, matching the Rust source additions to `is_tool_acknowledgement`'s `short_tool_ack` gate and to `FS_LOW_SIGNAL_CONTENT`/`LOW_SIGNAL_CONTENT`."
   },
   "short_acknowledgements": {
     "match": "trimmed text, ASCII-lowercased, exact equality; only applies when trimmed.len() <= 200",
@@ -43,7 +43,9 @@
       "no changes",
       "already up to date",
       "up to date",
-      "file written"
+      "file written",
+      "wait timed out",
+      "bash completed with no output"
     ]
   },
   "prefixed_tool_acks": {
@@ -84,7 +86,9 @@
       "thanks",
       "thanks.",
       "thank you",
-      "thank you."
+      "thank you.",
+      "wait timed out",
+      "bash completed with no output"
     ]
   }
 }

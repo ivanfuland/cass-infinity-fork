@@ -83,8 +83,17 @@ struct SearchHitSourcePath {
 }
 
 #[derive(Debug, Deserialize)]
+struct SearchMeta {
+    search_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct SearchJsonResponse {
     hits: Vec<SearchHitSourcePath>,
+    /// Only present with `--robot-meta`; absent means "the candidate told us
+    /// nothing about which mode it realized".
+    #[serde(default, rename = "_meta")]
+    meta: Option<SearchMeta>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
@@ -92,6 +101,19 @@ struct ChannelVerdict {
     baseline: Option<usize>,
     candidate: Option<usize>,
     ok: bool,
+    /// PR6 T5 (R3-F9): the channel did not run as requested (a `--mode hybrid`
+    /// search that realized as lexical, or reported no mode at all), so its
+    /// rank comparison cannot be trusted. Distinct from `ok=false`, which is a
+    /// real regression on a channel that DID run.
+    not_exercised: bool,
+}
+
+/// One channel's response: the rank of the target document plus the realized
+/// `_meta.search_mode` the candidate reported for this invocation.
+#[derive(Debug, Clone, PartialEq)]
+struct ChannelSearch {
+    rank: Option<usize>,
+    search_mode: Option<String>,
 }
 
 fn rank_or_inf(rank: Option<usize>) -> f64 {
@@ -100,11 +122,38 @@ fn rank_or_inf(rank: Option<usize>) -> f64 {
 
 fn channel_verdict(baseline: Option<usize>, candidate: Option<usize>) -> ChannelVerdict {
     let ok = rank_or_inf(candidate) <= rank_or_inf(baseline);
-    ChannelVerdict { baseline, candidate, ok }
+    ChannelVerdict { baseline, candidate, ok, not_exercised: false }
 }
 
 trait JudgmentSearch {
-    fn rank_of_source_path(&self, channel: &str, query: &str, source_path: &str) -> anyhow::Result<Option<usize>>;
+    fn rank_of_source_path(&self, channel: &str, query: &str, source_path: &str) -> anyhow::Result<ChannelSearch>;
+}
+
+/// The argv one channel's candidate search runs with. Split out of
+/// `SubprocessJudgmentSearch` so the hybrid/semantic `--robot-meta` plumbing
+/// is assertable without a candidate binary.
+fn search_args(channel: &str, query: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "search".into(),
+        query.into(),
+        "--mode".into(),
+        channel.into(),
+        "--limit".into(),
+        "5000".into(),
+        "--json".into(),
+        "--fields".into(),
+        "source_path".into(),
+    ];
+    if channel == "semantic" || channel == "hybrid" {
+        args.push("--daemon".into());
+        args.push("--model".into());
+        args.push("bge-m3".into());
+        // PR6 T5: `_meta.search_mode` is emitted only alongside `--robot-meta`
+        // (`include_meta` in src/lib.rs); without it the realized-mode check
+        // below has nothing to read.
+        args.push("--robot-meta".into());
+    }
+    args
 }
 
 struct SubprocessJudgmentSearch {
@@ -114,23 +163,8 @@ struct SubprocessJudgmentSearch {
 }
 
 impl JudgmentSearch for SubprocessJudgmentSearch {
-    fn rank_of_source_path(&self, channel: &str, query: &str, source_path: &str) -> anyhow::Result<Option<usize>> {
-        let mut args: Vec<String> = vec![
-            "search".into(),
-            query.into(),
-            "--mode".into(),
-            channel.into(),
-            "--limit".into(),
-            "5000".into(),
-            "--json".into(),
-            "--fields".into(),
-            "source_path".into(),
-        ];
-        if channel == "semantic" || channel == "hybrid" {
-            args.push("--daemon".into());
-            args.push("--model".into());
-            args.push("bge-m3".into());
-        }
+    fn rank_of_source_path(&self, channel: &str, query: &str, source_path: &str) -> anyhow::Result<ChannelSearch> {
+        let args = search_args(channel, query);
         let output = Command::new(&self.binary)
             .env("XDG_CONFIG_HOME", &self.config_dir)
             .env("CASS_DATA_DIR", &self.data_dir)
@@ -144,7 +178,10 @@ impl JudgmentSearch for SubprocessJudgmentSearch {
         );
         let response: SearchJsonResponse = serde_json::from_slice(&output.stdout)
             .map_err(|e| anyhow::anyhow!("parsing candidate JSON for channel={channel} query={query:?}: {e}"))?;
-        Ok(response.hits.iter().position(|h| h.source_path == source_path).map(|i| i + 1))
+        Ok(ChannelSearch {
+            rank: response.hits.iter().position(|h| h.source_path == source_path).map(|i| i + 1),
+            search_mode: response.meta.and_then(|meta| meta.search_mode),
+        })
     }
 }
 
@@ -174,8 +211,17 @@ fn compute_report(cases: &[JudgmentCase], baseline: &BaselineFile, search: &dyn 
             let baseline_rank: Option<usize> = *baseline_channels.get(channel).ok_or_else(|| {
                 anyhow::anyhow!("case {:?} baseline lacks channel {channel:?}", case.case)
             })?;
-            let candidate_rank = search.rank_of_source_path(channel, &case.query, &case.a_source_path)?;
-            channel_verdicts.insert(channel.to_string(), channel_verdict(baseline_rank, candidate_rank));
+            let found = search.rank_of_source_path(channel, &case.query, &case.a_source_path)?;
+            // R3-F9: only the hybrid channel has a fallback worth checking --
+            // `--mode hybrid` is a *request*, and a request that realized as
+            // lexical ran a different search. `_meta.search_mode` is the
+            // realized mode; absent (no `_meta` at all) is not evidence it ran
+            // as asked either, so it counts as not exercised too.
+            let mut verdict = channel_verdict(baseline_rank, found.rank);
+            if channel == "hybrid" && found.search_mode.as_deref() != Some("hybrid") {
+                verdict.not_exercised = true;
+            }
+            channel_verdicts.insert(channel.to_string(), verdict);
         }
         report.insert(case.case.clone(), channel_verdicts);
     }
@@ -230,12 +276,30 @@ fn run(fixture_path: &std::path::Path, baseline_path: &std::path::Path, search: 
     match compute_report(&cases, &baseline, search) {
         Err(e) => (2, None, format!("precondition error: {e}")),
         Ok(report) => {
+            let any_not_exercised = report
+                .values()
+                .any(|channels| channels.values().any(|v| v.not_exercised));
             let any_fail = report.values().any(|channels| channels.values().any(|v| !v.ok));
-            let code = if any_fail { 1 } else { 0 };
+            // A channel that did not run as requested is a precondition problem,
+            // not a regression: there is no measurement to compare. The report
+            // is still emitted so the degraded case is named.
+            let code = if any_not_exercised {
+                2
+            } else if any_fail {
+                1
+            } else {
+                0
+            };
             let msg = format!(
                 "judgment_compare: {} case(s), {}",
                 report.len(),
-                if any_fail { "at least one channel regressed" } else { "all channels non-regressed" }
+                if any_not_exercised {
+                    "at least one channel did not run as requested (not_exercised)"
+                } else if any_fail {
+                    "at least one channel regressed"
+                } else {
+                    "all channels non-regressed"
+                }
             );
             (code, Some(report), msg)
         }
@@ -263,13 +327,28 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[derive(Default)]
     struct FakeSearch {
         // (channel, query) -> rank
         ranks: HashMap<(String, String), Option<usize>>,
+        // channel -> the `_meta.search_mode` the candidate reported for it.
+        // A channel absent here reported the mode it was asked for, which is
+        // what an honest candidate does.
+        modes: HashMap<String, String>,
+        // Simulates a candidate that emitted no `_meta` at all.
+        omit_meta: bool,
     }
     impl JudgmentSearch for FakeSearch {
-        fn rank_of_source_path(&self, channel: &str, query: &str, _source_path: &str) -> anyhow::Result<Option<usize>> {
-            Ok(self.ranks.get(&(channel.to_string(), query.to_string())).copied().flatten())
+        fn rank_of_source_path(&self, channel: &str, query: &str, _source_path: &str) -> anyhow::Result<ChannelSearch> {
+            let search_mode = if self.omit_meta {
+                None
+            } else {
+                Some(self.modes.get(channel).cloned().unwrap_or_else(|| channel.to_string()))
+            };
+            Ok(ChannelSearch {
+                rank: self.ranks.get(&(channel.to_string(), query.to_string())).copied().flatten(),
+                search_mode,
+            })
         }
     }
 
@@ -311,7 +390,7 @@ mod tests {
         ranks.insert(("lexical".to_string(), "foo".to_string()), Some(2));
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(5));
         ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(1));
-        let search = FakeSearch { ranks };
+        let search = FakeSearch { ranks, ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 0, "candidate at or better than baseline on all channels must pass: {message}");
@@ -330,7 +409,7 @@ mod tests {
         ranks.insert(("lexical".to_string(), "foo".to_string()), Some(2));
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(9)); // worse than baseline 5
         ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(1));
-        let search = FakeSearch { ranks };
+        let search = FakeSearch { ranks, ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 1, "one regressed channel must fail the gate: {message}");
@@ -348,7 +427,7 @@ mod tests {
         ranks.insert(("lexical".to_string(), "foo".to_string()), None);
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(100));
         ranks.insert(("hybrid".to_string(), "foo".to_string()), None);
-        let search = FakeSearch { ranks };
+        let search = FakeSearch { ranks, ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 0, "baseline null (+inf) must be satisfied by any candidate rank, including candidate null: {message}");
@@ -366,7 +445,7 @@ mod tests {
         ranks.insert(("lexical".to_string(), "foo".to_string()), None);
         ranks.insert(("semantic".to_string(), "foo".to_string()), Some(3));
         ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(3));
-        let search = FakeSearch { ranks };
+        let search = FakeSearch { ranks, ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 1, "candidate not-found against a finite baseline must fail: {message}");
@@ -379,11 +458,93 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
         let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({})));
-        let search = FakeSearch { ranks: HashMap::new() };
+        let search = FakeSearch { ranks: HashMap::new(), ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 2, "case absent from baseline must be a precondition error: {message}");
         assert!(report.is_none());
+    }
+
+    /// PR6 T5 (R3-F9): `_meta.search_mode` is the realized mode, not the
+    /// requested one. A `--mode hybrid` that fell open to lexical never ran
+    /// the hybrid channel, so its rank comparison is meaningless -- scoring it
+    /// anyway lets a fail-open masquerade as a non-regression (here the fake
+    /// candidate even "improves" 2 -> 1). The case must be marked
+    /// `not_exercised` and the process must exit 2.
+    #[test]
+    fn hybrid_channel_degraded_to_lexical_is_not_exercised_exit_2() {
+        let dir = TempDir::new().unwrap();
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(
+            dir.path(),
+            "baseline.json",
+            &baseline_file(serde_json::json!({"c1": {"lexical": 3, "semantic": 5, "hybrid": 2}})),
+        );
+        let mut ranks = HashMap::new();
+        ranks.insert(("lexical".to_string(), "foo".to_string()), Some(3));
+        ranks.insert(("semantic".to_string(), "foo".to_string()), Some(5));
+        ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(1));
+        let mut modes = HashMap::new();
+        modes.insert("hybrid".to_string(), "lexical".to_string());
+        let search = FakeSearch { ranks, modes, ..Default::default() };
+
+        let (code, report, message) = run(&fixture, &baseline, &search);
+        assert_eq!(
+            code, 2,
+            "a hybrid channel that realized as lexical must not be scored at all: {message}"
+        );
+        let report = report.expect("an unexercised channel is a disclosure, not a discarded run");
+        assert!(
+            report["c1"]["hybrid"].not_exercised,
+            "the degraded hybrid channel must be marked not_exercised: {message}"
+        );
+        assert!(!report["c1"]["lexical"].not_exercised, "lexical ran as requested");
+        assert!(!report["c1"]["semantic"].not_exercised, "semantic ran as requested");
+    }
+
+    /// PR6 T5 (控制面 #126 #0 裁定 4): no `_meta` at all, or a `_meta` without
+    /// `search_mode`, cannot prove the hybrid channel ran. "Cannot tell" is
+    /// treated the same as "degraded" here -- the whole point of R3-F9 was that
+    /// an unverifiable channel must not silently pass.
+    #[test]
+    fn hybrid_without_a_reported_search_mode_is_not_exercised() {
+        let dir = TempDir::new().unwrap();
+        let fixture = write_file(dir.path(), "fixture.jsonl", &fixture_line("c1", "foo", "/a.jsonl"));
+        let baseline = write_file(
+            dir.path(),
+            "baseline.json",
+            &baseline_file(serde_json::json!({"c1": {"lexical": 3, "semantic": 5, "hybrid": 2}})),
+        );
+        let mut ranks = HashMap::new();
+        ranks.insert(("lexical".to_string(), "foo".to_string()), Some(3));
+        ranks.insert(("semantic".to_string(), "foo".to_string()), Some(5));
+        ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(1));
+        let search = FakeSearch { ranks, omit_meta: true, ..Default::default() };
+
+        let (code, report, _message) = run(&fixture, &baseline, &search);
+        assert_eq!(code, 2, "an unreported search_mode leaves the hybrid channel unverified");
+        let report = report.unwrap();
+        assert!(report["c1"]["hybrid"].not_exercised);
+    }
+
+    /// The `_meta.search_mode` this check reads is only emitted alongside
+    /// `--robot-meta` (`include_meta` in `src/lib.rs`); a plain `--json` search
+    /// carries no `_meta` at all, so every honest hybrid run would look
+    /// "unreported" without it.
+    #[test]
+    fn hybrid_and_semantic_requests_carry_robot_meta() {
+        for channel in ["semantic", "hybrid"] {
+            let args = search_args(channel, "q");
+            assert!(
+                args.iter().any(|a| a == "--robot-meta"),
+                "{channel} must ask for `_meta`: {args:?}"
+            );
+        }
+        let lexical = search_args("lexical", "q");
+        assert!(
+            !lexical.iter().any(|a| a == "--robot-meta"),
+            "the lexical channel never reads `_meta`: {lexical:?}"
+        );
     }
 
     /// R1-B7 (exec92): a baseline case whose object simply has no
@@ -403,7 +564,7 @@ mod tests {
         ranks.insert(("lexical".to_string(), "foo".to_string()), Some(3));
         ranks.insert(("semantic".to_string(), "foo".to_string()), None); // would trivially "pass" against a missing-key-as-null bug
         ranks.insert(("hybrid".to_string(), "foo".to_string()), Some(3));
-        let search = FakeSearch { ranks };
+        let search = FakeSearch { ranks, ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 2, "a channel missing from the baseline case's object must be a precondition error, not a silent pass: {message}");
@@ -436,7 +597,7 @@ mod tests {
         ranks.insert(("lexical".to_string(), "bar".to_string()), Some(1));
         ranks.insert(("semantic".to_string(), "bar".to_string()), Some(1));
         ranks.insert(("hybrid".to_string(), "bar".to_string()), Some(1));
-        let search = FakeSearch { ranks };
+        let search = FakeSearch { ranks, ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 2, "a duplicate case id must be a precondition error, not let a later row mask an earlier regression: {message}");
@@ -454,7 +615,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let fixture = write_file(dir.path(), "fixture.jsonl", "\n\n   \n");
         let baseline = write_file(dir.path(), "baseline.json", &baseline_file(serde_json::json!({})));
-        let search = FakeSearch { ranks: HashMap::new() };
+        let search = FakeSearch { ranks: HashMap::new(), ..Default::default() };
 
         let (code, report, message) = run(&fixture, &baseline, &search);
         assert_eq!(code, 2, "a zero-case fixture must be a precondition error, not a vacuous pass: {message}");

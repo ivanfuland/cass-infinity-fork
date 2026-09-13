@@ -202,6 +202,7 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
     }
 
     let opts = IndexOptions {
+        no_ingest: false,
         full: false,
         force_rebuild: false,
         watch: false,

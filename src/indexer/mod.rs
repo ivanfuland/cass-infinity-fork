@@ -1,5 +1,6 @@
 #[cfg(feature = "infinity")]
 pub mod db_vector_catchup;
+pub mod exclusion;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
@@ -955,6 +956,39 @@ pub struct IndexingStats {
     /// case (nothing failed to clean up).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cleanup_failures: Vec<SemanticCleanupFailure>,
+    /// T2b.3 (B段, mission #116⑥): anchor-3 (`codex_host_shell`) hit rate
+    /// for this run -- same run-level counters that get persisted to the
+    /// `last_index.*` `meta` keys at a successful collection-run boundary
+    /// (see `persist_last_index_run_meta_counters`), surfaced here too so
+    /// `cass index --json` discloses it per-run without a second `cass
+    /// status` round-trip.
+    pub codex_host_shell_hits: u64,
+    /// Candidate denominator for `codex_host_shell_hits` (every codex
+    /// `idx==0`/`role==user` message judged, hit or not).
+    pub codex_idx0_user_total: u64,
+    /// Sessions where `events_from_blob`'s flat event count didn't match
+    /// the reparsed message count, so judgment was skipped entirely for
+    /// that session (宁漏勿误, not an error).
+    pub event_align_failed: u64,
+    /// R2-N8 (任务书 #129): sessions whose source is connector-internal
+    /// ("logical", no backing file), so raw-mirror capture and exclusion
+    /// judgment are both inapplicable -- a legitimate skip, not a failure.
+    pub capture_na: u64,
+    /// R2-N8 (任务书 #129): sessions whose raw-mirror capture actually
+    /// FAILED (a hard `CaptureFailed`). The pair with `capture_na` is what
+    /// separates "not applicable" from "went wrong".
+    pub capture_failed: u64,
+    /// PR6 T5: connector scan invocations started by this run (see
+    /// `SCAN_INVOCATIONS`). Must be 0 for `--no-ingest`.
+    pub scan_invocations: u64,
+    /// PR6 T5: whether this run was `cass index --semantic --no-ingest`.
+    pub no_ingest: bool,
+    /// B05 (任务书 #131): this run was `--no-ingest`, so the historical
+    /// salvage preflight (bundle discovery + import) was suppressed by that
+    /// flag rather than by the corpus' own state. Disclosed because
+    /// `scan_invocations: 0` alone cannot tell "nothing was imported" apart
+    /// from "nothing was scanned, but a backup was imported".
+    pub salvage_skipped_by_no_ingest: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -991,6 +1025,10 @@ struct NonWatchIngestOutcome {
     lexical_update_deferred: bool,
     scanned_connectors: BTreeSet<String>,
     scan_had_errors: bool,
+    /// R3-N5 (任务书 #129): conversations this batch refused to insert (an
+    /// unusable excluded fingerprint). Carried up so the consumer reports
+    /// them as scan errors for their connector.
+    skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
 }
 
 impl NonWatchIngestOutcome {
@@ -1010,6 +1048,11 @@ impl NonWatchIngestOutcome {
             lexical_update_deferred: self.lexical_update_deferred || other.lexical_update_deferred,
             scanned_connectors,
             scan_had_errors: self.scan_had_errors || other.scan_had_errors,
+            skipped_conversations: {
+                let mut skipped = self.skipped_conversations;
+                skipped.extend(other.skipped_conversations);
+                skipped
+            },
         }
     }
 }
@@ -1550,6 +1593,12 @@ pub struct IndexOptions {
     pub data_dir: PathBuf,
     /// Build semantic vector index after text indexing.
     pub semantic: bool,
+    /// PR6 T5 (`cass index --semantic --no-ingest`): skip the entire source
+    /// scan/ingest phase and run only hole-draining/reconciliation/audit.
+    /// The scan counters in `scan_invocations` must stay 0 and the scan
+    /// watermark must not advance (this is T12 v2's exam-hall mode: the
+    /// corpus must be byte-identical before and after).
+    pub no_ingest: bool,
     /// Embedder ID to use for semantic indexing (hash, fastembed).
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
@@ -1581,7 +1630,8 @@ struct RobotIngestTraceSpan {
 
 fn robot_trace_ingest_start(
     stage: &'static str,
-    convs: &[NormalizedConversation],
+    batch_conversations: usize,
+    batch_msgs: usize,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
 ) -> Option<RobotIngestTraceSpan> {
@@ -1596,8 +1646,8 @@ fn robot_trace_ingest_start(
         stage,
         lexical_strategy: lexical_strategy.as_str(),
         defer_checkpoints,
-        batch_conversations: convs.len(),
-        batch_msgs: convs.iter().map(|conv| conv.messages.len()).sum(),
+        batch_conversations,
+        batch_msgs,
         started: Instant::now(),
         lookup_before: crate::storage::sqlite::message_lookup_trace_snapshot(),
     })
@@ -1638,6 +1688,301 @@ fn robot_trace_ingest_finish(
     }
     if let Ok(line) = serde_json::to_string(&payload) {
         eprintln!("{line}");
+    }
+}
+
+/// #122b-2 (T14-2, spec §四.2 / plan Task 4 Step 5): `CASS_MEMPROBE_LOG=<path>`
+/// gated `/proc/self/status` VmRSS/VmHWM snapshot, appended as one JSONL
+/// line per call -- same env-switch + zero-cost-when-unset + JSONL shape as
+/// `robot_trace_ingest_start`/`finish` above. Deliberately reads the env var
+/// directly on each call instead of caching it in a `OnceLock` (as the task
+/// book suggested): caching would make the two unit tests below order-
+/// dependent on whatever other test in this file's ~740-test binary happens
+/// to touch an instrumented stage first and lock the cache to "disabled".
+/// `std::env::var_os` is a process-table lookup, not a syscall; this fires
+/// at most 6 times per real index run (three stages x start/end). Two of
+/// the three stages have more than one call site because their real
+/// dispatch is command/flag-dependent, but only one call site per stage
+/// executes on any given run: ingest is `run_streaming_index` (default) or
+/// `run_batch_index` (`CASS_STREAMING_INDEX=0` fallback); lexical is
+/// `rebuild_lex_domain_from_db_full` (`--full`) or the readonly-preflight
+/// fast path in `try_readonly_canonical_force_rebuild` (plain
+/// `--force-rebuild` on a populated db -- the common real dispatch, and the
+/// one `memory_gate.sh`'s stage 2 actually exercises). The cost against a
+/// cached atomic read is immaterial next to the I/O each call brackets.
+///
+/// N05 (任务书 #131 T6-c): `site` is the CALLER's identity, written into every
+/// line. Before it, the only thing separating two writers of the same file
+/// was the `pid`, which is a property of the process, not of the call: a
+/// non-`#[serial]` test reaching one of these production call sites while
+/// another test holds `CASS_MEMPROBE_LOG` writes into that test's file, in
+/// that test's process, with that test's pid -- indistinguishable from its
+/// own lines. Production sites pass their enclosing function's name (fixed
+/// strings, so the JSONL stays greppable); a test passes its own name and
+/// reads back only the lines carrying it.
+fn memprobe_point(site: &str, stage: &str, point: &str) {
+    let Some(path) = std::env::var_os("CASS_MEMPROBE_LOG") else {
+        return;
+    };
+    let mut vm_rss_kb: Option<u64> = None;
+    let mut vm_hwm_kb: Option<u64> = None;
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                vm_rss_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                vm_hwm_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+            }
+        }
+    }
+    let payload = serde_json::json!({
+        "ts_ms": chrono::Utc::now().timestamp_millis(),
+        "site": site,
+        "stage": stage,
+        "point": point,
+        "vm_rss_kb": vm_rss_kb,
+        "vm_hwm_kb": vm_hwm_kb,
+        "pid": std::process::id(),
+    });
+    let Ok(mut line) = serde_json::to_string(&payload) else {
+        return;
+    };
+    line.push('\n');
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::warn!(error = %e, path = ?path, "CASS_MEMPROBE_LOG: failed to write line");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = ?path, "CASS_MEMPROBE_LOG: failed to open log file");
+        }
+    }
+}
+
+#[cfg(test)]
+mod memprobe {
+    use super::*;
+    use serial_test::serial;
+
+    /// R7-6 (#128 T6-a2): R6-N7's other half -- the env var must be saved and
+    /// handed back rather than blindly removed, because the removed form
+    /// leaves whatever an outer process had set clobbered.
+    ///
+    /// The stand-in value below is what makes that a testable claim rather
+    /// than a comment: with the variable merely unset on entry, "restore"
+    /// and "remove" write the same thing, so deleting the restore would be
+    /// invisible. Setting an outer-process stand-in first is what gives the
+    /// closing assertion something to be red about.
+    #[test]
+    #[serial]
+    fn disabled_by_default_creates_no_file() {
+        let dir = std::env::temp_dir().join(format!("cass-memprobe-disabled-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("memprobe.jsonl");
+        let ambient = dir.join("ambient.jsonl");
+        let original = std::env::var_os("CASS_MEMPROBE_LOG");
+        // SAFETY: #[serial] keeps this the only test touching this env key
+        // at a time; the value found on entry is put back before returning.
+        unsafe {
+            std::env::set_var("CASS_MEMPROBE_LOG", &ambient);
+        }
+        let prior = std::env::var_os("CASS_MEMPROBE_LOG");
+        assert_eq!(
+            prior.as_deref(),
+            Some(ambient.as_os_str()),
+            "the outer-process stand-in must be in place before the unset case is exercised"
+        );
+        unsafe {
+            std::env::remove_var("CASS_MEMPROBE_LOG");
+        }
+        memprobe_point("test_disabled_by_default_creates_no_file", "ingest", "start");
+        assert!(
+            !log_path.exists(),
+            "memprobe_point must not create a file when CASS_MEMPROBE_LOG is unset"
+        );
+        assert!(
+            !ambient.exists(),
+            "the probe must not write while its env var is unset"
+        );
+        // R7-6 (#128 T6-a2): the save/restore the removed form lacked. Without
+        // it this assertion fails on `left: None` against the outer-process
+        // stand-in above -- which is exactly the state the old
+        // `remove_var`-and-forget body left behind.
+        unsafe {
+            match &prior {
+                Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
+                None => std::env::remove_var("CASS_MEMPROBE_LOG"),
+            }
+        }
+        assert_eq!(
+            std::env::var_os("CASS_MEMPROBE_LOG"),
+            prior,
+            "the test must hand the env var back exactly as it found it"
+        );
+        // Hygiene, not the assertion above: put back the value this *process*
+        // held on entry, so a later test -- which need not be `#[serial]` --
+        // does not inherit a path inside this test's temp dir.
+        unsafe {
+            match &original {
+                Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
+                None => std::env::remove_var("CASS_MEMPROBE_LOG"),
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn enabled_writes_two_well_formed_lines() {
+        // N05 (任务书 #131 T6-c): this test's own caller identity, passed to
+        // the two `memprobe_point` calls it counts and used as the filter.
+        const TEST_SITE: &str = "test_enabled_writes_two_well_formed_lines";
+        // R6-N7 (#123): the log path is unique per run (pid *and* a
+        // nanosecond stamp), and the env var is restored to whatever it held
+        // before rather than merely removed.
+        //
+        // N05 (任务书 #131 T6-c): the residual limit R6-N7 stated here -- a
+        // non-`#[serial]` test reaching an instrumented production path
+        // while this env var is set appends to this file, in this process,
+        // with this pid, so a pid filter cannot exclude it -- is what the
+        // `site` field closes. The neighbour call further down makes that
+        // executable instead of hypothetical; the count below filters by
+        // site. The unique path still keeps two concurrent *processes*
+        // (other test binaries) apart.
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("cass-memprobe-enabled-{}-{unique}", std::process::id()));
+        // R7-6 (#128 T6-a2): the uniqueness of this path is part of the
+        // claim, not an implementation detail -- it is what keeps two
+        // concurrent *test processes* from appending to each other's file,
+        // since the pid filter below cannot separate them. Assert the shape
+        // it must have, so dropping the nanosecond stamp (leaving the pid
+        // alone, the pre-R6-N7 form) fails here instead of silently
+        // weakening the cross-process defence.
+        let name = dir
+            .file_name()
+            .expect("the probe's temp dir has a file name")
+            .to_str()
+            .expect("the probe's temp dir name is UTF-8");
+        let segments: Vec<&str> = name.split('-').collect();
+        assert_eq!(
+            segments.len(),
+            5,
+            "the enabled probe's temp dir must be cass-memprobe-enabled-<pid>-<nanos>, got {name:?}"
+        );
+        assert_eq!(segments[0..3], ["cass", "memprobe", "enabled"], "unexpected temp dir prefix: {name:?}");
+        assert_eq!(
+            segments[3],
+            std::process::id().to_string(),
+            "the pid segment must be this process's pid: {name:?}"
+        );
+        assert!(
+            !segments[4].is_empty() && segments[4].bytes().all(|b| b.is_ascii_digit()),
+            "the last segment must be the nanosecond stamp, got {:?} in {name:?}",
+            segments[4]
+        );
+        assert_ne!(
+            segments[4], segments[3],
+            "the stamp must be its own segment, not the pid repeated: {name:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("memprobe.jsonl");
+        let prior = std::env::var_os("CASS_MEMPROBE_LOG");
+        // SAFETY: #[serial] keeps this the only test touching this env key
+        // at a time; the prior value is restored before returning.
+        unsafe {
+            std::env::set_var("CASS_MEMPROBE_LOG", &log_path);
+        }
+        memprobe_point(TEST_SITE, "ingest", "start");
+        memprobe_point(TEST_SITE, "ingest", "end");
+        // N05 (任务书 #131 T6-c): the same-process neighbour the doc comment
+        // above concedes to, made executable. A non-`#[serial]` test reaching
+        // an instrumented production path while this env var is set appends
+        // to this very file, in THIS process -- same pid. Calling a production
+        // site's own `memprobe_point` here is that neighbour, with no
+        // scheduling luck involved.
+        memprobe_point("run_streaming_index", "ingest", "start");
+        unsafe {
+            match &prior {
+                Some(value) => std::env::set_var("CASS_MEMPROBE_LOG", value),
+                None => std::env::remove_var("CASS_MEMPROBE_LOG"),
+            }
+        }
+        // R7-6 (#128 T6-a2): the restore above is a claim, so assert it. This
+        // test sets the variable itself, so deleting the restore leaves it
+        // pointing at this test's own (about to be deleted) temp path --
+        // which is what makes this assertion red under that mutation.
+        assert_eq!(
+            std::env::var_os("CASS_MEMPROBE_LOG"),
+            prior,
+            "the test must hand the env var back exactly as it found it"
+        );
+
+        let text = fs::read_to_string(&log_path).unwrap();
+        // R7-7 (#124): every line of this file is this probe's own output, so
+        // parse all of them and require the `pid` field *before* filtering by
+        // it. The previous form (`.filter_map(.. .ok())` straight into the
+        // pid filter) silently dropped a corrupt line and a line without a
+        // pid, so "two well-formed lines" held for a file that also contained
+        // garbage -- the assertion below is about the whole file.
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap_or_else(|err| panic!("memprobe line is not valid JSON ({err}): {line:?}"))
+            })
+            .collect();
+        for value in &values {
+            assert!(
+                value["pid"].is_u64(),
+                "every memprobe line must carry an integer `pid` field, got {value:?}"
+            );
+            assert!(
+                value["site"].is_string(),
+                "every memprobe line must carry a string `site` field, got {value:?}"
+            );
+        }
+        // N05 (任务书 #131 T6-c): the identity that separates two writers of
+        // this file is the CALLER, not the process. The neighbour call above
+        // runs in *this* process, so its line carries this process's pid and
+        // a pid filter counts three lines here.
+        let mine: Vec<serde_json::Value> = values
+            .iter()
+            .filter(|value| value["site"].as_str() == Some(TEST_SITE))
+            .cloned()
+            .collect();
+        assert_eq!(
+            mine.len(),
+            2,
+            "expected exactly two JSONL lines carrying this test's own site, got {} of {} lines: {text:?}",
+            mine.len(),
+            text.lines().count()
+        );
+        // Asserted as "at least one foreign line", not "exactly three lines":
+        // an ADDITIONAL neighbour (any other test reaching an instrumented
+        // path inside this window) is exactly the interference this test is
+        // about, and a third-party line count would make the test fail for
+        // the very reason it exists.
+        assert!(
+            values.iter().any(|value| value["site"].as_str() != Some(TEST_SITE)),
+            "the file must also hold the neighbour production-site line -- with the neighbour \
+             missing, the site filter above is never exercised: {text:?}"
+        );
+        for (value, expected_point) in mine.iter().zip(["start", "end"]) {
+            assert_eq!(value["site"], TEST_SITE);
+            assert_eq!(value["stage"], "ingest");
+            assert_eq!(value["point"], expected_point);
+            assert!(value["ts_ms"].is_i64());
+            assert!(value["pid"].is_u64());
+            let vm_rss = value["vm_rss_kb"].as_u64().expect("vm_rss_kb must be present");
+            let vm_hwm = value["vm_hwm_kb"].as_u64().expect("vm_hwm_kb must be present");
+            assert!(vm_hwm >= vm_rss, "vm_hwm_kb ({vm_hwm}) must be >= vm_rss_kb ({vm_rss})");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
@@ -2188,6 +2533,7 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
     // whole force-rebuild call (via `?`), not just a logged warning --
     // otherwise "tantivy rebuilt fine" would silently mask "the lexical
     // domain didn't."
+    memprobe_point("try_readonly_canonical_force_rebuild", "lexical", "start");
     let lex_storage = FrankenStorage::open(&opts.db_path).with_context(|| {
         format!(
             "opening canonical database writable for lex domain rebuild: {}",
@@ -2223,6 +2569,7 @@ fn try_readonly_canonical_force_rebuild(opts: &IndexOptions) -> Result<bool> {
         )
     })?;
 
+    memprobe_point("try_readonly_canonical_force_rebuild", "lexical", "end");
     Ok(true)
 }
 
@@ -2457,7 +2804,7 @@ fn lexical_rebuild_db_state_matches_legacy(
 }
 
 #[derive(Debug)]
-struct IndexRunLockGuard {
+pub(crate) struct IndexRunLockGuard {
     // Keep the file handle alive for the lifetime of the lock.
     file: File,
     _path: PathBuf,
@@ -3568,6 +3915,7 @@ fn lexical_rebuild_contract_from_grouped_messages(
     let canonical_messages = messages
         .iter()
         .map(|message| crate::model::types::Message {
+            excluded: None,
             id: None,
             idx: message.idx,
             // Preserve the full 6-role string via the unified codec instead
@@ -4181,12 +4529,17 @@ impl LexicalRebuildState {
     }
 }
 
-fn acquire_index_run_lock(
+pub(crate) fn acquire_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
     mode: SearchMaintenanceMode,
 ) -> Result<IndexRunLockGuard> {
-    fs::create_dir_all(data_dir)
+    // R4-B1 (任务书 #120a): this can be `data_dir`'s very first creation for
+    // this run -- `crate::raw_mirror::create_dir_all_durable` fsyncs the
+    // parent of every ancestor it actually creates, so `data_dir`'s own
+    // directory entry is durable before anything else in this run (capture,
+    // sync_capture_durable, DB commit) can happen.
+    crate::raw_mirror::create_dir_all_durable(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
     let lock_path = data_dir.join("index-run.lock");
     let file = OpenOptions::new()
@@ -5168,8 +5521,15 @@ fn should_salvage_historical_databases(
     canonical_sessions_before_salvage: usize,
     has_pending_historical_bundles: bool,
     canonical_only_full_rebuild: bool,
+    no_ingest: bool,
 ) -> bool {
-    if canonical_only_full_rebuild {
+    // B05 (任务书 #131): `--no-ingest` must not import anything. This
+    // preflight runs BEFORE the `no_ingest` branch that guards the connector
+    // scan, so without this the salvage wrote a discoverable backup's
+    // sessions into `messages` while the run still reported
+    // `scan_invocations: 0` and `no_ingest: true` -- i.e. the "this run did
+    // not touch the corpus" reading was false.
+    if no_ingest || canonical_only_full_rebuild {
         return false;
     }
     canonical_storage_rebuilt
@@ -5183,8 +5543,12 @@ fn should_probe_pending_historical_bundles(
     canonical_sessions_before_salvage: usize,
     canonical_only_full_rebuild: bool,
     operator_requested_discovery: bool,
+    no_ingest: bool,
 ) -> bool {
-    if canonical_only_full_rebuild {
+    // B05: same reason as `should_salvage_historical_databases` above --
+    // discovery opens candidate backup/snapshot DBs, and every bundle it
+    // finds is a bundle the salvage step would import.
+    if no_ingest || canonical_only_full_rebuild {
         return false;
     }
     full_rebuild
@@ -5935,12 +6299,20 @@ pub(crate) fn lexical_storage_fingerprint_for_db(db_path: &Path) -> Result<Strin
     lexical_rebuild_storage_fingerprint(db_path)
 }
 
+/// T2b.3 (B段, mission #116⑥): `write_last_index_run_counters` gates whether
+/// this collection-run boundary also persists the `last_index.*` meta three
+/// keys -- `false` at the "nothing changed, no scan happened" early-exit
+/// call site (writing zeros there would clobber a previous successful run's
+/// real counts with a run that never judged anything), `true` only at the
+/// real "scan completed with no errors" call site (mission: "成功收尾（无
+/// scan 错误）同事务写...失败保留旧值").
 fn persist_final_index_run_metadata(
     storage: &FrankenStorage,
     db_path: &Path,
     performed_scan: bool,
     scan_start_ts: i64,
     now_ms: i64,
+    write_last_index_run_counters: bool,
 ) -> Result<()> {
     persist_final_index_run_metadata_with_writer(
         db_path,
@@ -5954,15 +6326,55 @@ fn persist_final_index_run_metadata(
                     false,
                     "updating final index run metadata",
                     |writer| {
+                        // R1-N17 (任务书 #118b): `last_scan_ts`/`last_indexed_at`/the
+                        // three `last_index.*` counters must land in one commit --
+                        // three independent autocommitted statements let a crash
+                        // between them leave `last_indexed_at` advanced while the
+                        // counters (or vice versa) still reflect the previous run.
+                        let tx = writer.raw().transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
                         if performed_scan {
                             writer.set_last_scan_ts(scan_start_ts)?;
                         }
-                        writer.set_last_indexed_at(now_ms)
+                        writer.set_last_indexed_at(now_ms)?;
+                        if write_last_index_run_counters {
+                            persist_last_index_run_meta_counters(writer)?;
+                        }
+                        tx.commit()?;
+                        Ok(())
                     },
                 )
             })
         },
     )
+}
+
+/// T2b.3 (B段, mission #116⑥): writes the `last_index.codex_host_shell_hits`
+/// / `last_index.codex_idx0_user_total` / `last_index.event_align_failed`
+/// `meta` keys from the current run-level counter snapshot. Always called
+/// from inside the same `with_ephemeral_writer` closure that updates
+/// `last_scan_ts`/`last_indexed_at` (same transaction, same commit).
+fn persist_last_index_run_meta_counters(writer: &FrankenStorage) -> Result<()> {
+    let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
+        last_index_run_counters_snapshot();
+    // R2-N8 (任务书 #129): the two capture-outcome counts land in the same
+    // statement (and therefore the same commit) as the three anchor counts.
+    let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+    writer.raw().execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES \
+         ('last_index.codex_host_shell_hits', ?1), \
+         ('last_index.codex_idx0_user_total', ?2), \
+         ('last_index.event_align_failed', ?3), \
+         ('last_index.capture_na', ?4), \
+         ('last_index.capture_failed', ?5)",
+        &crate::storage::api::params![
+            codex_host_shell_hits.to_string(),
+            codex_idx0_user_total.to_string(),
+            event_align_failed.to_string(),
+            capture_na.to_string(),
+            capture_failed.to_string()
+        ],
+    )?;
+    Ok(())
 }
 
 /// Bead zz8ni: the expensive index + lexical rebuild work above this call
@@ -6425,13 +6837,13 @@ fn should_repair_daily_stats_after_historical_salvage(
 ///
 /// Producers (connector scan threads) send batches of conversations through
 /// the channel. The consumer (main indexing thread) receives and ingests them.
-pub enum IndexMessage {
+pub(crate) enum IndexMessage {
     /// A batch of conversations from a connector scan.
     Batch {
         /// Connector name (e.g., "claude", "codex")
         connector_name: &'static str,
-        /// Scanned conversations
-        conversations: Vec<NormalizedConversation>,
+        /// Scanned conversations (with per-message exclusion markers from prepare)
+        conversations: Vec<crate::indexer::exclusion::PreparedConversation>,
         /// Whether this connector was newly discovered
         is_discovered: bool,
         /// Message count in this batch (for stats)
@@ -6702,7 +7114,7 @@ struct StreamingBatchSender<'a> {
     flow_limiter: Arc<StreamingByteLimiter>,
     connector_name: &'static str,
     next_batch_is_discovered: bool,
-    conversations: Vec<NormalizedConversation>,
+    conversations: Vec<crate::indexer::exclusion::PreparedConversation>,
     message_count: usize,
     char_count: usize,
     byte_reservation: usize,
@@ -6737,8 +7149,8 @@ impl<'a> StreamingBatchSender<'a> {
         self.next_batch_is_discovered = true;
     }
 
-    fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
-        let (message_count, char_count) = conversation_batch_footprint(&conversation);
+    fn push(&mut self, conversation: crate::indexer::exclusion::PreparedConversation) -> Result<()> {
+        let (message_count, char_count) = conversation_batch_footprint(&conversation.conv);
         let would_exceed_limits = !self.conversations.is_empty()
             && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
                 || self.message_count.saturating_add(message_count)
@@ -6827,8 +7239,12 @@ fn send_conversation_batches(
         is_discovered,
     );
     for conversation in conversations {
+        let n = conversation.messages.len();
         sender
-            .push(conversation)
+            .push(crate::indexer::exclusion::PreparedConversation {
+                conv: conversation,
+                excluded: vec![None; n],
+            })
             .expect("test batch sender should deliver to in-memory receiver");
     }
     sender
@@ -7026,7 +7442,6 @@ fn spawn_connector_producer(
                 .get(name)
                 .copied()
                 .unwrap_or(config.since_ts);
-
             // Scan local sources
             let ctx = crate::connectors::ScanContext::local_default(
                 config.data_dir.clone(),
@@ -7050,6 +7465,7 @@ fn spawn_connector_producer(
                 local_since_ts,
                 config.active_source_filter.as_ref(),
             );
+            record_scan_invocation();
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
@@ -7062,14 +7478,39 @@ fn spawn_connector_producer(
                 if should_skip_subagent_source(&conversation.source_path) {
                     return Ok(());
                 }
-                prepare_conversation_for_ingest(
-                    &config.data_dir,
-                    name,
-                    &local_origin,
-                    None,
-                    &mut conversation,
-                );
-                batch_sender.push(conversation)
+                let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
+                match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
+                    Ok(prepared) => batch_sender.push(prepared),
+                    Err(error) => {
+                        // R1-B1 (任务书 #118a): a prepare failure must be a
+                        // real ScanError, not a silent warn+skip -- otherwise
+                        // `Done`'s `scan_succeeded` stays true and the
+                        // watermark advances past a session that never
+                        // landed a single row.
+                        tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                        scan_succeeded = false;
+                        // R1-N26 (任务书 #129): a failed send means the
+                        // consumer is gone. Discarding it (`let _ = ...`)
+                        // left this producer scanning every remaining scan
+                        // root for nobody. Reuse the same
+                        // `StreamingConsumerDisconnected` type the flush and
+                        // scan arms below already return, so the caller's
+                        // existing `is_streaming_consumer_disconnected`
+                        // guard stops this thread.
+                        if tx
+                            .send(IndexMessage::ScanError {
+                                connector_name: name,
+                                error: format!("prepare_conversation_for_ingest failed: {error}"),
+                            })
+                            .is_err()
+                        {
+                            return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                                connector_name: name,
+                            }));
+                        }
+                        Ok(())
+                    }
+                }
             }) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
@@ -7149,6 +7590,7 @@ fn spawn_connector_producer(
                 root_since_ts,
                 config.active_source_filter.as_ref(),
             );
+            record_scan_invocation();
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 if should_skip_active_session_source(
                     config.active_source_filter.as_ref(),
@@ -7161,13 +7603,9 @@ fn spawn_connector_producer(
                 if should_skip_subagent_source(&conversation.source_path) {
                     return Ok(());
                 }
-                prepare_conversation_for_ingest(
-                    &config.data_dir,
-                    name,
-                    &root.origin,
-                    Some(root),
-                    &mut conversation,
-                );
+                let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
+                let prepared =
+                    prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conversation);
 
                 if !was_detected && !is_discovered {
                     if let Some(p) = &config.progress {
@@ -7177,7 +7615,35 @@ fn spawn_connector_producer(
                     batch_sender.mark_next_batch_discovered();
                 }
 
-                batch_sender.push(conversation)
+                match prepared {
+                    Ok(prepared) => batch_sender.push(prepared),
+                    Err(error) => {
+                        // R1-B1 (任务书 #118a): same fix as the local-sources
+                        // callback above.
+                        tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                        scan_succeeded = false;
+                        // R1-N26 (任务书 #129): a failed send means the
+                        // consumer is gone. Discarding it (`let _ = ...`)
+                        // left this producer scanning every remaining scan
+                        // root for nobody. Reuse the same
+                        // `StreamingConsumerDisconnected` type the flush and
+                        // scan arms below already return, so the caller's
+                        // existing `is_streaming_consumer_disconnected`
+                        // guard stops this thread.
+                        if tx
+                            .send(IndexMessage::ScanError {
+                                connector_name: name,
+                                error: format!("prepare_conversation_for_ingest failed: {error}"),
+                            })
+                            .is_err()
+                        {
+                            return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                                connector_name: name,
+                            }));
+                        }
+                        Ok(())
+                    }
+                }
             }) {
                 Ok(()) => {
                     if let Err(error) = batch_sender.flush() {
@@ -7404,7 +7870,7 @@ fn run_streaming_consumer(
                 byte_reservation,
             }) => {
                 // Accumulators start with the first-received batch.
-                let mut combined_conversations: Vec<NormalizedConversation> = conversations;
+                let mut combined_conversations: Vec<crate::indexer::exclusion::PreparedConversation> = conversations;
                 let mut combined_message_count = message_count;
                 let mut combined_byte_reservation = byte_reservation;
                 let mut combined_batch_size = combined_conversations.len();
@@ -7503,7 +7969,7 @@ fn run_streaming_consumer(
 
                 // Ingest the combined batch (== original single batch when
                 // combine_enabled = false or no extras were drained).
-                let batch_outcome = ingest_non_watch_batch_with_oom_split(
+                let batch_result = ingest_non_watch_batch_with_oom_split(
                     storage,
                     data_dir,
                     &combined_conversations,
@@ -7513,7 +7979,33 @@ fn run_streaming_consumer(
                     progress_bump,
                 );
                 flow_limiter.release(combined_byte_reservation);
-                ingest_outcome = ingest_outcome.accumulate(batch_outcome?);
+                // R3-N5 (任务书 #129): conversations this batch skipped (an
+                // unusable excluded fingerprint) are a scan error for the
+                // connector -- the same accounting the ScanError arm below
+                // does, since the pass did not fully succeed for it. The rest
+                // of the batch landed normally, so this does NOT return Err.
+                let skipped_in_batch = batch_result
+                    .as_ref()
+                    .map_or(0, |outcome| outcome.skipped_conversations.len());
+                ingest_outcome = ingest_outcome.accumulate(batch_result?);
+                if skipped_in_batch > 0 {
+                    ingest_outcome.scan_had_errors = true;
+                    failed_scan_connectors.insert(connector_name.to_string());
+                    let stats = connector_stats
+                        .entry(connector_name.to_string())
+                        .or_insert_with(|| ConnectorStats {
+                            name: connector_name.to_string(),
+                            ..Default::default()
+                        });
+                    stats.error = Some(format!(
+                        "{skipped_in_batch} conversation(s) skipped: an excluded fingerprint is unusable"
+                    ));
+                    tracing::warn!(
+                        connector = connector_name,
+                        skipped = skipped_in_batch,
+                        "streaming batch skipped conversations whose excluded fingerprint is unusable"
+                    );
+                }
 
                 // For tracing parity with the per-message path, use the
                 // first batch's connector_name + the combined totals.
@@ -7700,7 +8192,8 @@ fn run_streaming_index(
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
-    run_streaming_index_with_connector_factories(
+    memprobe_point("run_streaming_index", "ingest", "start");
+    let result = run_streaming_index_with_connector_factories(
         storage,
         opts,
         since_ts,
@@ -7710,7 +8203,9 @@ fn run_streaming_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
-    )
+    );
+    memprobe_point("run_streaming_index", "ingest", "end");
+    result
 }
 
 type ConnectorFactory = fn() -> Box<dyn Connector + Send>;
@@ -7923,7 +8418,8 @@ fn run_batch_index(
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
-    run_batch_index_with_connector_factories(
+    memprobe_point("run_batch_index", "ingest", "start");
+    let result = run_batch_index_with_connector_factories(
         storage,
         opts,
         since_ts,
@@ -7933,7 +8429,9 @@ fn run_batch_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
-    )
+    );
+    memprobe_point("run_batch_index", "ingest", "end");
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7970,7 +8468,7 @@ fn run_batch_index_with_connector_factories(
 
     struct PendingBatchScan {
         name: &'static str,
-        convs: Vec<NormalizedConversation>,
+        convs: Vec<crate::indexer::exclusion::PreparedConversation>,
         is_discovered: bool,
         scan_succeeded: bool,
         scan_error: Option<String>,
@@ -8035,6 +8533,7 @@ fn run_batch_index_with_connector_factories(
                         local_since_ts,
                         active_source_filter.as_ref(),
                     );
+                    record_scan_invocation();
                     match conn.scan(&ctx) {
                         Ok(mut local_convs) => {
                             let local_origin = Origin::local();
@@ -8046,16 +8545,17 @@ fn run_batch_index_with_connector_factories(
                                     &conv.source_path,
                                 )
                             });
-                            for conv in &mut local_convs {
-                                prepare_conversation_for_ingest(
-                                    &data_dir,
-                                    name,
-                                    &local_origin,
-                                    None,
-                                    conv,
-                                );
+                            for conv in local_convs {
+                                let source_kind = capture_source_kind_for(name, conv.source_path.clone());
+                                match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conv) {
+                                    Ok(prepared) => convs.push(prepared),
+                                    Err(error) => {
+                                        scan_succeeded = false;
+                                        scan_errors.push(error.to_string());
+                                        tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                                    }
+                                }
                             }
-                            convs.extend(local_convs);
                         }
                         Err(e) => {
                             // Note: agent was counted as discovered but scan failed
@@ -8097,6 +8597,7 @@ fn run_batch_index_with_connector_factories(
                             root_since_ts,
                             active_source_filter.as_ref(),
                         );
+                        record_scan_invocation();
                         match conn.scan(&ctx) {
                             Ok(mut remote_convs) => {
                                 remote_convs.retain(|conv| {
@@ -8107,16 +8608,17 @@ fn run_batch_index_with_connector_factories(
                                         &conv.source_path,
                                     )
                                 });
-                                for conv in &mut remote_convs {
-                                    prepare_conversation_for_ingest(
-                                        &data_dir,
-                                        name,
-                                        &root.origin,
-                                        Some(root),
-                                        conv,
-                                    );
+                                for conv in remote_convs {
+                                    let source_kind = capture_source_kind_for(name, conv.source_path.clone());
+                                    match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conv) {
+                                        Ok(prepared) => convs.push(prepared),
+                                        Err(error) => {
+                                            scan_succeeded = false;
+                                            scan_errors.push(error.to_string());
+                                            tracing::warn!(connector = name, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                                        }
+                                    }
                                 }
-                                convs.extend(remote_convs);
                             }
                             Err(e) => {
                                 scan_succeeded = false;
@@ -8198,7 +8700,7 @@ fn run_batch_index_with_connector_factories(
             pending
                 .convs
                 .iter()
-                .map(|c| c.messages.len())
+                .map(|c| c.conv.messages.len())
                 .sum::<usize>()
         })
         .sum();
@@ -8206,7 +8708,7 @@ fn run_batch_index_with_connector_factories(
         .iter()
         .filter(|pending| !pending.convs.is_empty() || pending.scan_error.is_some())
         .map(|pending| {
-            let msgs: usize = pending.convs.iter().map(|c| c.messages.len()).sum();
+            let msgs: usize = pending.convs.iter().map(|c| c.conv.messages.len()).sum();
             ConnectorStats {
                 name: pending.name.to_string(),
                 conversations: pending.convs.len(),
@@ -8495,6 +8997,7 @@ fn run_semantic_db_vector_catchup(
     opts: &IndexOptions,
     caller: &str,
 ) -> Result<SemanticDbVectorCatchupOutcome> {
+    memprobe_point("run_semantic_db_vector_catchup", "holes", "start");
     if opts.embedder != "infinity" {
         anyhow::bail!(
             "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
@@ -8561,6 +9064,7 @@ fn run_semantic_db_vector_catchup(
              same command to continue draining chunk_holes"
         );
     }
+    memprobe_point("run_semantic_db_vector_catchup", "holes", "end");
     Ok(SemanticDbVectorCatchupOutcome {
         activated: report.activated,
         cleanup_failures: report.cleanup_failures,
@@ -8578,11 +9082,53 @@ fn run_semantic_db_vector_catchup(
     );
 }
 
+/// R2-B1 (任务书 #119a): an actionable message for the `scan_had_errors`
+/// bail below -- naming which connector(s) failed and why, not a bare "one
+/// or more sessions failed". This matters especially for `--watch`: a
+/// startup-scan failure here means the SAME bad file/session is still there
+/// on the next invocation, so a vague message becomes a silent,
+/// undiagnosable restart loop. Reads the per-connector `error` strings
+/// already recorded on `opts.progress` by the streaming/batch scan (the
+/// common `CaptureFailed` case already embeds the failing session's
+/// `source_path` in that string -- see `prepare_conversation_for_ingest`'s
+/// `raw-mirror capture failed for {path}` -- though not every `PrepareError`
+/// variant does; this surfaces whatever detail the scan already captured
+/// rather than re-deriving it).
+fn scan_had_errors_bail_message(opts: &IndexOptions, context: &str) -> String {
+    const MAX_LISTED: usize = 5;
+    let failed: Vec<(String, String)> = opts
+        .progress
+        .as_ref()
+        .and_then(|p| p.stats.lock().ok())
+        .map(|stats| stats.connectors.iter().filter_map(|c| c.error.as_ref().map(|e| (c.name.clone(), e.clone()))).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if failed.is_empty() {
+        return format!(
+            "cass index {context}: one or more sessions failed capture/prepare during this run and were skipped without landing any rows (no per-connector error detail was recorded for this call)"
+        );
+    }
+    let listed: Vec<String> = failed.iter().take(MAX_LISTED).map(|(name, err)| format!("{name}: {err}")).collect();
+    let mut message = format!(
+        "cass index {context}: {} connector scan(s) reported a session that failed capture/prepare and was skipped without landing any rows -- {}",
+        failed.len(),
+        listed.join(" | ")
+    );
+    if failed.len() > MAX_LISTED {
+        message.push_str(&format!(" (and {} more)", failed.len() - MAX_LISTED));
+    }
+    message
+}
+
 pub fn run_index(
     opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    // mission #116⑥: run_index 入口归零 meta 三键计数器 -- "watch 模式每 cycle
+    // 视为一次 run" 的归零边界见 watch 循环内 `ingest_watch_batch_with_oom_split`
+    // 前的同名调用。
+    reset_last_index_run_counters();
+    reset_scan_invocations();
     // Analytics tables are derived assets and can be rebuilt by doctor/rebuild
     // flows. Keep routine indexing focused on the canonical conversation store
     // and lexical assets; set CASS_INLINE_ANALYTICS_UPDATES=1 to restore the
@@ -8866,7 +9412,7 @@ pub fn run_index(
 
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage)? {
         let now_ms = FrankenStorage::now_millis();
-        persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms)?;
+        persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms, false)?;
         record_lexical_population_strategy_if_unset(
             opts.progress.as_ref(),
             LexicalPopulationStrategy::IncrementalInline,
@@ -9299,6 +9845,7 @@ pub fn run_index(
             canonical_sessions_before_salvage,
             canonical_only_full_rebuild,
             preflight_historical_salvage_discovery_enabled(),
+            opts.no_ingest,
         );
         let mut has_pending_historical_bundles = if probe_pending_historical_bundles {
             storage.has_pending_historical_bundles(&opts.db_path)?
@@ -9327,6 +9874,7 @@ pub fn run_index(
                 canonical_sessions_before_salvage,
                 has_pending_historical_bundles,
                 canonical_only_full_rebuild,
+                opts.no_ingest,
             );
         tracing::warn!(
             db_path = %opts.db_path.display(),
@@ -9560,7 +10108,21 @@ pub fn run_index(
                 needs_rebuild = false;
             }
 
-            if targeted_watch_once_only {
+            if opts.no_ingest {
+                // PR6 T5 (任务书 #126): `cass index --semantic --no-ingest`
+                // skips the entire scan/ingest phase -- no connector
+                // discovery, no `capture_connector_sources_before_parse`
+                // source-row writes, and no watermark movement (the branch
+                // that sets `performed_scan = true` is never entered, so
+                // `persist_final_index_run_metadata` keeps `last_scan_ts`).
+                // Only hole-draining/reconciliation/audit run. The
+                // `scan_invocations` counter is the machine check for this.
+                tracing::info!(
+                    db_path = %opts.db_path.display(),
+                    scan_invocations = scan_invocations_snapshot(),
+                    "--no-ingest: skipping the source scan and ingest phase entirely"
+                );
+            } else if targeted_watch_once_only {
                 tracing::info!(
                     db_path = %opts.db_path.display(),
                     "skipping broad incremental scan because targeted watch-once paths were supplied"
@@ -9971,6 +10533,24 @@ pub fn run_index(
     // the DB vector domain catch-up (ingest-time hole registration + genesis
     // rescan safety net) replaces the old bulk-build/watermark-gated design;
     // see run_semantic_db_vector_catchup's doc comment.
+    // PR6 T5: publish this run's scan-invocation count here, BEFORE the
+    // semantic phase -- a `--no-ingest` run that then fails in hole-draining
+    // (e.g. no reachable Infinity) must still report `scan_invocations` and
+    // `no_ingest`, because that assertion is exactly what proves the scan
+    // phase was skipped.
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        stats.scan_invocations = scan_invocations_snapshot();
+        stats.no_ingest = opts.no_ingest;
+        // B05 (任务书 #131): with `--no-ingest` the historical salvage
+        // preflight is suppressed by that flag (see
+        // `should_probe_pending_historical_bundles` /
+        // `should_salvage_historical_databases`), so this run may not have
+        // imported anything even when discoverable bundles existed.
+        stats.salvage_skipped_by_no_ingest = opts.no_ingest;
+    }
+
     if opts.semantic && targeted_semantic_watch_once {
         tracing::info!(
             embedder = %opts.embedder,
@@ -9988,6 +10568,23 @@ pub fn run_index(
                 .map(|(generation_id, error)| SemanticCleanupFailure { generation_id, error })
                 .collect();
         }
+    }
+
+    // mission #116⑥: `--json` scan report fields, disclosed unconditionally
+    // (unlike the `meta` persistence below, which is gated on no scan
+    // errors) -- these are diagnostic counters for *this* run, not the
+    // "last successful run" record `cass status` reads.
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) =
+            last_index_run_counters_snapshot();
+        stats.codex_host_shell_hits = codex_host_shell_hits;
+        stats.codex_idx0_user_total = codex_idx0_user_total;
+        stats.event_align_failed = event_align_failed;
+        let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+        stats.capture_na = capture_na;
+        stats.capture_failed = capture_failed;
     }
 
     if targeted_watch_once_only_run {
@@ -10033,6 +10630,7 @@ pub fn run_index(
             performed_scan_for_global_watermark,
             scan_start_ts,
             now_ms,
+            !scan_had_errors,
         )?;
         if !connector_watermarks_to_persist.is_empty() {
             persist_connector_scan_watermarks(
@@ -10104,7 +10702,32 @@ pub fn run_index(
 
     reset_progress_to_idle(opts.progress.as_ref());
 
-    if opts.watch || opts.watch_once_paths.is_some() {
+    // PR6 T5: a `no_ingest` run must never enter the watch accept-loop (it
+    // would block forever scanning sources). The CLI rejects
+    // `--no-ingest --watch/--watch-once` outright; this guard also covers a
+    // direct library caller that sets both.
+    if (opts.watch || opts.watch_once_paths.is_some()) && !opts.no_ingest {
+        // R2-B1 (任务书 #119a): the startup scan just above (shared with the
+        // non-watch streaming/batch path, and run for plain `--watch` too --
+        // `targeted_watch_once_only_run` is the only case that skips it, and
+        // that mode never sets `scan_had_errors` in the first place) could
+        // have failed capture/prepare for one or more sessions. Pre-fix, a
+        // failed startup scan still fell through into the long-running
+        // watch loop below and this function only ever returned `Ok(())`
+        // once the loop eventually exited -- the one-shot "did this run
+        // succeed" question a plain `cass index` answers with a nonzero
+        // exit code went unanswered for `--watch`. This check is deliberately
+        // scoped to the STARTUP scan only: a prepare failure inside a later
+        // watch CYCLE (the `explicit_watch_once=false` branch in the scan
+        // loop below) intentionally keeps retrying rather than bailing --
+        // that is a different, long-running-service semantics (N4's area),
+        // not this one-shot "did the run that's about to start watching
+        // begin from a clean scan" check.
+        if scan_had_errors {
+            let message = scan_had_errors_bail_message(&opts, "watch startup scan");
+            close_storage_after_index(storage, &opts.db_path, "watch startup scan")?;
+            anyhow::bail!(message);
+        }
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
@@ -10364,7 +10987,23 @@ pub fn run_index(
     if let Some(progress) = opts.progress.as_ref() {
         progress.finalizing.store(true, Ordering::Relaxed);
     }
-    close_storage_after_index(storage, &opts.db_path, "index run")
+    // R2-B1 (任务书 #119a): `scan_had_errors` was, until this fix, ONLY
+    // consulted above for watermark-preservation/meta-persistence decisions
+    // (:10101-:10138 in the pre-fix layout) -- never turned into the
+    // function's own `Err`. A capture/prepare failure on the plain
+    // streaming or batch (`CASS_STREAMING_INDEX=0`) path -- and on a
+    // force-rebuild run that falls through to this same scan (the readonly
+    // `try_readonly_canonical_force_rebuild` fast path never reaches here at
+    // all: it has no prepare/scan step of its own) -- would leave the CLI
+    // reporting `"success":true` and exiting 0 even though the failed
+    // session landed zero rows. Close the storage handle cleanly FIRST
+    // (never leave the DB mid-checkpoint on the error path), then fail.
+    let close_result = close_storage_after_index(storage, &opts.db_path, "index run");
+    if scan_had_errors {
+        close_result?;
+        anyhow::bail!(scan_had_errors_bail_message(&opts, "index run"));
+    }
+    close_result
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
@@ -11378,6 +12017,7 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     db_path: &Path,
     progress: Option<Arc<IndexingProgress>>,
 ) -> Result<usize> {
+    memprobe_point("rebuild_lex_domain_from_db_full", "lexical", "start");
     // R1-B4: unconditional drop+recreate before resync, matching
     // `repair_lexical_index_from_canonical_db_for_search`'s pattern below --
     // `rebuild_lex_domain_from_db` only resyncs conversations that still
@@ -11412,6 +12052,7 @@ pub(crate) fn rebuild_lex_domain_from_db_full(
     storage
         .close()
         .with_context(|| format!("closing database after full lex domain rebuild: {}", db_path.display()))?;
+    memprobe_point("rebuild_lex_domain_from_db_full", "lexical", "end");
     Ok(stats.lex_docs_count)
 }
 
@@ -11628,10 +12269,17 @@ fn ingest_batch(
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
 ) -> Result<CanonicalMutationCounts> {
+    let prepared: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+        .iter()
+        .map(|conv| {
+            let n = conv.messages.len();
+            crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] }
+        })
+        .collect();
     let outcome = ingest_batch_detailed(
         storage,
         data_dir,
-        convs,
+        &prepared,
         progress,
         lexical_strategy,
         defer_checkpoints,
@@ -11644,14 +12292,19 @@ fn ingest_batch(
 fn ingest_batch_detailed(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    let trace_span =
-        robot_trace_ingest_start("ingest_batch", convs, lexical_strategy, defer_checkpoints);
+    let trace_span = robot_trace_ingest_start(
+        "ingest_batch",
+        convs.len(),
+        convs.iter().map(|p| p.conv.messages.len()).sum(),
+        lexical_strategy,
+        defer_checkpoints,
+    );
     // Persistence now uses short-lived writer connections internally so the
     // long-lived watch/session handle does not accumulate retained MVCC state
     // on older the legacy embedded engine builds that ignore autocommit_retain.
@@ -11703,6 +12356,7 @@ fn ingest_batch_detailed(
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
+        skipped_conversations: batch_outcome.skipped_conversations,
     })
 }
 
@@ -11710,7 +12364,7 @@ fn ingest_batch_detailed(
 fn ingest_non_watch_batch_with_oom_split(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
@@ -11768,13 +12422,13 @@ fn ingest_non_watch_batch_with_oom_split(
 fn ingest_non_watch_batch_once(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    if should_inject_non_watch_ingest_test_oom(convs) {
+    if should_inject_non_watch_ingest_test_oom(convs.iter().map(|p| &p.conv)) {
         // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
         // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
         // of relying on the plain-string fallback.
@@ -11794,7 +12448,7 @@ fn ingest_non_watch_batch_once(
         data_dir,
         INDEX_INGEST_POISON_FILE,
         "index-ingest-out-of-memory",
-        convs,
+        convs.iter().map(|p| &p.conv),
     );
     Ok(outcome)
 }
@@ -11803,7 +12457,7 @@ fn ingest_non_watch_batch_once(
 fn ingest_non_watch_oom_retry_or_quarantine(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     _lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
@@ -11842,7 +12496,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         return Ok(left);
     }
 
-    let conv = &convs[0];
+    let conv = &convs[0].conv;
 
     // #298: mirror the watch-path plausibility gate. the legacy embedded engine raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
@@ -11875,8 +12529,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             quarantined_conversations: 0,
             deferred_conversations: 1,
             lexical_update_deferred: true,
-            scanned_connectors: BTreeSet::new(),
-            scan_had_errors: false,
+            ..NonWatchIngestOutcome::default()
         });
     }
 
@@ -11899,8 +12552,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         quarantined_conversations: 1,
         deferred_conversations: 0,
         lexical_update_deferred: true,
-        scanned_connectors: BTreeSet::new(),
-        scan_had_errors: false,
+        ..NonWatchIngestOutcome::default()
     })
 }
 
@@ -11908,7 +12560,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
 fn ingest_batch_with_semantic_delta(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
@@ -11916,7 +12568,8 @@ fn ingest_batch_with_semantic_delta(
 ) -> Result<persist::PersistBatchOutcome> {
     let trace_span = robot_trace_ingest_start(
         "ingest_batch_with_semantic_delta",
-        convs,
+        convs.len(),
+        convs.iter().map(|p| p.conv.messages.len()).sum(),
         lexical_strategy,
         defer_checkpoints,
     );
@@ -11949,7 +12602,7 @@ fn ingest_batch_with_semantic_delta(
         data_dir,
         WATCH_INGEST_POISON_FILE,
         "watch-ingest-out-of-memory",
-        convs,
+        convs.iter().map(|p| &p.conv),
     );
 
     if let Some(p) = progress {
@@ -12018,7 +12671,7 @@ enum WatchOomIngestMode {
 fn ingest_watch_batch_with_oom_split(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
@@ -12038,7 +12691,7 @@ fn ingest_watch_batch_with_oom_split(
 fn ingest_watch_batch_with_oom_split_inner(
     storage: &FrankenStorage,
     data_dir: &Path,
-    convs: &[NormalizedConversation],
+    convs: &[crate::indexer::exclusion::PreparedConversation],
     progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     capture_semantic_delta: bool,
@@ -12047,7 +12700,9 @@ fn ingest_watch_batch_with_oom_split_inner(
     debug_assert!(!convs.is_empty());
 
     let batch_result =
-        if mode == WatchOomIngestMode::Standard && should_inject_watch_ingest_test_oom(convs) {
+        if mode == WatchOomIngestMode::Standard
+            && should_inject_watch_ingest_test_oom(convs.iter().map(|p| &p.conv))
+        {
             // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
             // exercises the downcast path that real the legacy embedded engine OOMs hit, instead
             // of relying on the plain-string fallback.
@@ -12071,7 +12726,9 @@ fn ingest_watch_batch_with_oom_split_inner(
             processed_conversations: convs.len(),
             quarantined_conversations: 0,
             deferred_conversations: 0,
-            max_payload_watermark_ms: conversations_payload_watermark_ms(convs),
+            max_payload_watermark_ms: conversations_payload_watermark_ms(
+                convs.iter().map(|p| &p.conv),
+            ),
         }),
         Err(error) if error_is_out_of_memory(&error) && convs.len() > 1 => {
             let split_at = convs.len() / 2;
@@ -12112,7 +12769,8 @@ fn ingest_watch_batch_with_oom_split_inner(
                 return Err(error);
             }
 
-            let conv = &convs[0];
+            let prepared_conv = &convs[0];
+            let conv = &prepared_conv.conv;
 
             // #298: a typed `FrankenError::OutOfMemory` (NoMem) on the batch
             // path is NOT proof of real host memory exhaustion — the legacy embedded engine
@@ -12138,7 +12796,7 @@ fn ingest_watch_batch_with_oom_split_inner(
                 ingest_watch_batch_with_oom_split_inner(
                     storage,
                     data_dir,
-                    std::slice::from_ref(conv),
+                    std::slice::from_ref(prepared_conv),
                     progress,
                     defer_checkpoints,
                     capture_semantic_delta,
@@ -12252,19 +12910,23 @@ fn quarantine_single_watch_conversation(
     })
 }
 
-fn conversations_payload_watermark_ms(convs: &[NormalizedConversation]) -> Option<i64> {
+fn conversations_payload_watermark_ms<'a>(
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> Option<i64> {
     convs
-        .iter()
+        .into_iter()
         .filter_map(conversation_payload_watermark_ms)
         .max()
 }
 
-fn sort_watch_conversations_for_watermark(convs: &mut [NormalizedConversation]) {
+fn sort_watch_conversations_for_watermark(
+    convs: &mut [crate::indexer::exclusion::PreparedConversation],
+) {
     convs.sort_by(|left, right| {
-        conversation_payload_watermark_ms(left)
-            .cmp(&conversation_payload_watermark_ms(right))
-            .then_with(|| left.source_path.cmp(&right.source_path))
-            .then_with(|| left.external_id.cmp(&right.external_id))
+        conversation_payload_watermark_ms(&left.conv)
+            .cmp(&conversation_payload_watermark_ms(&right.conv))
+            .then_with(|| left.conv.source_path.cmp(&right.conv.source_path))
+            .then_with(|| left.conv.external_id.cmp(&right.conv.external_id))
     });
 }
 
@@ -12773,19 +13435,19 @@ fn mark_stale_index_ingest_structured_retry_attempted(data_dir: &Path) -> usize 
     marked
 }
 
-fn clear_poison_conversations_after_successful_ingest(
+fn clear_poison_conversations_after_successful_ingest<'a>(
     data_dir: &Path,
     file_name: &str,
     reason: &str,
-    convs: &[NormalizedConversation],
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
 ) {
-    if convs.is_empty() {
-        return;
-    }
     let conversation_ids = convs
-        .iter()
+        .into_iter()
         .map(poison_conversation_id)
         .collect::<BTreeSet<_>>();
+    if conversation_ids.is_empty() {
+        return;
+    }
 
     let jsonl_cleared =
         match clear_poison_jsonl_records(data_dir, file_name, reason, &conversation_ids) {
@@ -13377,7 +14039,10 @@ fn ingest_quarantine_circuit_limit() -> usize {
 }
 
 #[cfg(test)]
-fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+fn should_inject_watch_ingest_test_oom<'a>(
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
+    let convs: Vec<&NormalizedConversation> = convs.into_iter().collect();
     // Selective variant: OOM only the chunk containing this external id, so
     // multi-chunk ordering tests can defer one conversation while letting
     // later chunks succeed.
@@ -13395,7 +14060,9 @@ fn should_inject_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool
 }
 
 #[cfg(not(test))]
-fn should_inject_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
+fn should_inject_watch_ingest_test_oom<'a>(
+    _convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
     false
 }
 
@@ -13414,15 +14081,20 @@ fn should_force_watch_solo_retry_oom() -> bool {
 }
 
 #[cfg(test)]
-fn should_inject_non_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> bool {
+fn should_inject_non_watch_ingest_test_oom<'a>(
+    convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
+    let count = convs.into_iter().count();
     dotenvy::var("CASS_TEST_NON_WATCH_INGEST_OOM_MIN_CONVS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|min| min > 0 && convs.len() >= min)
+        .is_some_and(|min| min > 0 && count >= min)
 }
 
 #[cfg(not(test))]
-fn should_inject_non_watch_ingest_test_oom(_convs: &[NormalizedConversation]) -> bool {
+fn should_inject_non_watch_ingest_test_oom<'a>(
+    _convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+) -> bool {
     false
 }
 
@@ -13805,7 +14477,7 @@ fn reindex_paths_with_semantic_delta(
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    let triggers = classify_paths(
+    let mut triggers = classify_paths(
         paths,
         roots,
         opts.watch_once_paths
@@ -13815,6 +14487,39 @@ fn reindex_paths_with_semantic_delta(
     if triggers.is_empty() {
         return Ok(0);
     }
+    // R3-N1 (任务书 #120b): `classify_paths` builds its batch map as a
+    // `HashMap<(ConnectorKind, PathBuf), _>` and returns `.into_iter()`
+    // straight off it -- HashMap iteration order is randomized per
+    // construction (a fresh random seed every time), not input-preserving.
+    // This is a real production concern independent of any test: the same
+    // inputs and the same fault produce a DIFFERENT processing order (and
+    // therefore different interleaved log lines) on every run, which one
+    // trigger's failure poisons another's persist below depends on, and a
+    // reproducibility gap on top of an already-intermittent failure is
+    // exactly the kind of thing that turns into an expensive "flaky, can't
+    // repro" investigation later (this batch already hit that class of bug
+    // once, in the concurrent probe tests). Sorting by `(kind.slug(),
+    // root.path)` costs nothing meaningful (this list is per-cycle trigger
+    // count, not per-session) and makes a watch cycle's processing order --
+    // and therefore its log trace and its cross-trigger failure/persist
+    // interactions below -- reproducible from the same inputs.
+    triggers.sort_by(|(kind_a, root_a, ..), (kind_b, root_b, ..)| {
+        kind_a.slug().cmp(kind_b.slug()).then_with(|| root_a.path.cmp(&root_b.path))
+    });
+
+    // mission #117③: this function is called exactly once per watch/watch-once
+    // *cycle* (the three call sites are the three mutually-exclusive branches
+    // of the single `watch_sources` callback invoked once per debounced
+    // cycle; the non-watch broad-scan path in `run_index` never calls this
+    // function). A single cycle can still iterate over *multiple*
+    // `(kind, root)` triggers below, so the reset must happen here -- once,
+    // before that loop -- not inside it (which would zero out an earlier
+    // kind's counts from this same cycle). `run_index`'s own entry-point
+    // reset (`reset_last_index_run_counters` at its top) covers the
+    // non-watch case and this function's first cycle; this call is what
+    // makes every *subsequent* cycle of a long-running `--watch` process
+    // "视为一次 run" instead of accumulating across the whole process.
+    reset_last_index_run_counters();
 
     let mut total_indexed = 0usize;
 
@@ -13840,6 +14545,33 @@ fn reindex_paths_with_semantic_delta(
     let mut pending_watch_watermarks: HashMap<ConnectorKind, i64> = HashMap::new();
     let mut watch_preserve_by_kind: HashMap<ConnectorKind, bool> = HashMap::new();
     let mut remaining_triggers_by_kind: HashMap<ConnectorKind, usize> = HashMap::new();
+    // R1-B1 (任务书 #118a): an explicit `--watch-once <path>` invocation has
+    // no "next cycle" to self-heal on -- the watermark-preserve mechanism
+    // that makes a prepare failure a soft, retryable no-op for the
+    // continuous `--watch` loop would otherwise make a one-shot invocation
+    // report success while silently landing zero rows for the one path it
+    // was asked to index. Scoped to `explicit_watch_once` only: the
+    // continuous loop's existing soft-fail-and-retry semantics are
+    // untouched.
+    let mut explicit_watch_once_prepare_failures: usize = 0;
+    // R3-N1 (任务书 #120b): `scan_failed` below is declared fresh inside the
+    // `for (kind, root, ...) in triggers` loop, once per trigger -- it only
+    // ever reflects THIS trigger's own scan/prepare outcome. R2-N4 (#119c)
+    // already made a later chunk within the SAME trigger not clobber an
+    // earlier chunk's failure in the same trigger; this is the other half:
+    // across DIFFERENT triggers in the same cycle. Root A failing (its own
+    // `scan_failed = true`) does not stop root B's iteration from starting
+    // fresh with `scan_failed = false` and persisting `last_indexed_at`/the
+    // run counters as if the whole cycle succeeded, silently discarding
+    // A's failure. `cycle_had_failure` accumulates across the whole loop
+    // (never reset inside it) so the persist-skip check below can see A's
+    // failure even while processing B. Deliberately NOT a per-`ConnectorKind`
+    // map like `watch_preserve_by_kind`: that map governs which kind's
+    // WATERMARK may advance (legitimately per-kind, since watermarks are
+    // per-kind), but `last_indexed_at` and the run counters are single,
+    // cycle-wide values -- whether writing them this cycle is trustworthy
+    // is a cycle-level question, not a per-kind one.
+    let mut cycle_had_failure = false;
     for (kind, _, _, _) in &triggers {
         *remaining_triggers_by_kind.entry(*kind).or_default() += 1;
     }
@@ -13973,6 +14705,7 @@ fn reindex_paths_with_semantic_delta(
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
         let mut scan_failed = false;
+        record_scan_invocation();
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
@@ -13986,6 +14719,11 @@ fn reindex_paths_with_semantic_delta(
                 // "nothing new" — flag it so this kind's shared watermark is
                 // not advanced past whatever the scan failed to see.
                 scan_failed = true;
+                // R3-N1 (任务书 #120b): see this cycle-level flag's own doc
+                // comment above the `for` loop -- a later trigger in this
+                // same cycle must not persist as if this failure never
+                // happened.
+                cycle_had_failure = true;
                 Vec::new()
             }
         };
@@ -14010,22 +14748,38 @@ fn reindex_paths_with_semantic_delta(
             );
         }
         let preserve_this_watch_watermark = preserve_watch_watermark || active_sources_skipped > 0;
+
+        // Provenance injection, path rewriting, capture + exclusion judgment.
+        let mut prepared_convs: Vec<crate::indexer::exclusion::PreparedConversation> =
+            Vec::with_capacity(convs.len());
+        for conv in convs {
+            let source_kind = capture_source_kind_for(kind.slug(), conv.source_path.clone());
+            match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
+                Ok(prepared) => prepared_convs.push(prepared),
+                Err(error) => {
+                    // R1-B1 (任务书 #118a): a prepare failure must poison
+                    // this kind's watermark the same way a scan-level
+                    // failure already does (`scan_failed` below) -- the
+                    // watermark-preserve check was moved from before this
+                    // loop to after it so a prepare failure discovered here
+                    // is not missed by a check that already ran.
+                    tracing::warn!(?kind, error = %error, "prepare_conversation_for_ingest failed; skipping session");
+                    scan_failed = true;
+                    // R3-N1 (任务书 #120b): see `cycle_had_failure`'s own
+                    // doc comment above the `for` loop.
+                    cycle_had_failure = true;
+                    if explicit_watch_once {
+                        explicit_watch_once_prepare_failures += 1;
+                    }
+                }
+            }
+        }
         // No-ledger holdbacks poison the whole kind's watermark publication
         // (deferrals are added at the end of the iteration when known).
         if !explicit_watch_once && (scan_failed || active_sources_skipped > 0) {
             watch_preserve_by_kind.insert(kind, true);
         }
-
-        // Provenance injection and path rewriting
-        for conv in &mut convs {
-            prepare_conversation_for_ingest(
-                &opts.data_dir,
-                kind.slug(),
-                &root.origin,
-                Some(&root),
-                conv,
-            );
-        }
+        let mut convs = prepared_convs;
         if !explicit_watch_once {
             sort_watch_conversations_for_watermark(&mut convs);
         }
@@ -14054,6 +14808,9 @@ fn reindex_paths_with_semantic_delta(
         // `last_indexed_at`, and must not trigger downstream optimize/merge.
         // See issue #194.
         if conv_count == 0 {
+            // N09 (#131): an empty cycle can be an empty cycle BECAUSE every
+            // capture failed; report the counters before leaving.
+            refresh_run_counters_in_stats(opts);
             publish_watch_watermark_if_kind_complete(
                 &opts.data_dir,
                 state,
@@ -14109,18 +14866,68 @@ fn reindex_paths_with_semantic_delta(
 
                 // Keep last_indexed_at current so `cass status` doesn't report stale during watch mode.
                 let lexical_update_deferred = chunk_outcome.batch_outcome.lexical_update_deferred;
-                if lexical_update_deferred {
+                // R2-N4 (任务书 #119c): `scan_failed` (set above this chunk
+                // loop, stable by the time we get here -- the prepare loop
+                // that can set it always finishes before this chunk/ingest
+                // loop starts) tracks whether ANY conversation in this same
+                // trigger's batch failed scan/prepare -- e.g. conversation A
+                // failed prepare, conversation B succeeded and is the one
+                // whose chunk we're persisting right now. Without this
+                // check, B's successful chunk would overwrite the
+                // `last_index.*` counters/`last_indexed_at` with a value
+                // that only reflects B, silently discarding the fact that
+                // A's failure happened in the very same cycle -- the
+                // previous successful run's real counts get clobbered by a
+                // run that didn't actually complete cleanly.
+                //
+                // R3-N1 (任务书 #120b): `scan_failed` alone only catches a
+                // failure within THIS SAME trigger (root A failing does not
+                // make root B's own `scan_failed` true -- it's reset fresh
+                // per trigger). `cycle_had_failure` is the other half: it
+                // accumulates across every trigger this cycle has processed
+                // so far, so root B's otherwise-clean persist still skips
+                // when an earlier root A in the same cycle failed.
+                if lexical_update_deferred || scan_failed || cycle_had_failure {
                     tracing::warn!(
-                        "skipping watch last_indexed_at update after deferred lexical update so health/status report stale lexical assets"
+                        scan_failed,
+                        cycle_had_failure,
+                        "skipping watch last_indexed_at update after a deferred lexical update or \
+                         a prepare/scan failure this cycle so health/status report stale lexical assets"
                     );
                 } else {
+                    // mission #116⑥: watch mode has no single "run_index
+                    // entry" boundary per cycle to reset against without
+                    // risking a double-reset on the non-watch call path that
+                    // also runs through this same ingest chunk loop, so the
+                    // three counters here are cumulative since the last
+                    // `run_index`-level reset rather than strictly
+                    // per-watch-cycle -- still monotonic, still reflects
+                    // real judge activity, just not zeroed every debounce
+                    // callback.
+                    //
+                    // R2-N4 (任务书 #119c): both writes now land in ONE
+                    // transaction, same pattern as the non-watch path's own
+                    // `persist_final_index_run_metadata` (R1-N17, #118b) --
+                    // pre-fix, these were two independent autocommitted
+                    // statements, so a crash (or induced failure) between
+                    // them could advance `last_indexed_at` while leaving the
+                    // counters at their previous value, or vice versa.
                     persist::with_ephemeral_writer(
                         &storage,
                         false,
                         "updating watch last_indexed_at",
-                        |writer| writer.set_last_indexed_at(FrankenStorage::now_millis()),
+                        |writer| {
+                            let tx = writer.raw().transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
+                            writer.set_last_indexed_at(FrankenStorage::now_millis())?;
+                            persist_last_index_run_meta_counters(writer)?;
+                            tx.commit()?;
+                            Ok(())
+                        },
                     )?;
                 }
+                // mission #116⑥ / N09 (#131): see
+                // `refresh_run_counters_in_stats`.
+                refresh_run_counters_in_stats(opts);
 
                 // Deferred check is CUMULATIVE, not per-chunk: once any earlier
                 // chunk deferred a conversation, a later successful chunk must
@@ -14160,7 +14967,7 @@ fn reindex_paths_with_semantic_delta(
         {
             let connector_name = convs
                 .first()
-                .map(|conv| conv.agent_slug.clone())
+                .map(|conv| conv.conv.agent_slug.clone())
                 .unwrap_or_else(|| format!("{kind:?}").to_ascii_lowercase());
             stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
             stats.index_ms = stats.index_ms.saturating_add(index_ms);
@@ -14259,6 +15066,16 @@ fn reindex_paths_with_semantic_delta(
 
     // Reset phase to idle if progress exists
     reset_progress_to_idle(opts.progress.as_ref());
+
+    // R1-B1 (任务书 #118a): see the counter's declaration comment above --
+    // an explicit `--watch-once` invocation that failed to prepare every
+    // requested session must return a hard `Err`, not `Ok` with rows silently
+    // missing and no other cycle to retry it.
+    if explicit_watch_once_prepare_failures > 0 {
+        anyhow::bail!(
+            "cass index --watch-once: {explicit_watch_once_prepare_failures} session(s) failed capture/prepare and were skipped without landing any rows"
+        );
+    }
 
     Ok(total_indexed)
 }
@@ -14507,7 +15324,15 @@ fn unique_failed_seed_backup_root(backups_dir: &Path, db_name: &str) -> PathBuf 
 fn save_watch_state(data_dir: &Path, state: &HashMap<ConnectorKind, i64>) -> Result<()> {
     let path = state_path(data_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        // T2T-2 (任务书 #129): `state_path` puts the file directly under
+        // `data_dir`, so `parent` IS the data directory -- this call can be
+        // the one that creates it, and R4-B1's rule is that every place that
+        // creates `data_dir` does so durably. The literal source-level guard
+        // cannot see this one: its argument is spelled `parent`, which is
+        // exactly the "parameter not named data_dir but the argument is
+        // data_dir" shape the gate's death criterion names (and it did
+        // trigger here -- see the mission report).
+        crate::raw_mirror::create_dir_all_durable(parent)?;
     }
     let watch_state = WatchState {
         version: 1,
@@ -15089,20 +15914,716 @@ pub(crate) fn canonicalize_claude_external_id(
     }
 }
 
+/// T2b R1 (control-plane 裁定): count of sessions where `events_from_blob`'s
+/// flat event count didn't match the reparsed message count, so judgment was
+/// skipped entirely for that session (see the `judge_and_redact_reparsed`
+/// call site). **Not yet wired into any scan report or `cass status --json`
+/// field** -- that's T5's job (the plan's `codex_host_shell_hits`-style
+/// meta-key persistence); this counter exists so the behavior is observable
+/// (tests, `EVENT_ALIGN_FAILED.load(Ordering::Relaxed)`) before that lands.
+static EVENT_ALIGN_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_event_align_failed() {
+    EVENT_ALIGN_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// R2-N7 (任务书 #129): WHICH session an `EVENT_ALIGN_FAILED` increment was
+/// about. The counter alone says "some session somewhere was skipped without
+/// judgment" (宁漏勿误); whoever has to act on it needs the identity and the
+/// size of the mismatch. Bounded by a literal cap: past it the counter stays
+/// exact and only the detail stops accumulating, so a pathological corpus
+/// can't grow this list without limit (no config knob -- one literal).
+const EVENT_ALIGN_FAILED_DETAIL_CAP: usize = 1_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventAlignFailure {
+    pub agent_slug: String,
+    pub external_id: Option<String>,
+    pub source_path: String,
+    /// How many events `events_from_blob` produced. A blob READ failure
+    /// surfaces here as 0 -- that function returns an empty `Vec` for an
+    /// unreadable blob -- so "0 events against N messages" is what a
+    /// corrupt/unreadable blob looks like in this list, as opposed to a
+    /// parseable blob whose events simply don't line up.
+    pub event_count: usize,
+    pub message_count: usize,
+}
+
+static EVENT_ALIGN_FAILURES: std::sync::Mutex<Vec<EventAlignFailure>> = std::sync::Mutex::new(Vec::new());
+
+fn record_event_align_failure(conv: &NormalizedConversation, event_count: usize) {
+    let failure = EventAlignFailure {
+        agent_slug: conv.agent_slug.clone(),
+        external_id: conv.external_id.clone(),
+        source_path: conv.source_path.display().to_string(),
+        event_count,
+        message_count: conv.messages.len(),
+    };
+    tracing::warn!(
+        agent = %failure.agent_slug,
+        external_id = ?failure.external_id,
+        source_path = %failure.source_path,
+        event_count = failure.event_count,
+        message_count = failure.message_count,
+        "event/message alignment failed for this session; exclusion judgment skipped entirely (宁漏勿误)"
+    );
+    let mut failures = EVENT_ALIGN_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failures.len() < EVENT_ALIGN_FAILED_DETAIL_CAP {
+        failures.push(failure);
+    }
+}
+
+/// Per-session detail recorded since the last [`reset_last_index_run_counters`]
+/// (same run boundary the `EVENT_ALIGN_FAILED` counter itself uses).
+pub(crate) fn last_index_event_align_failures_snapshot() -> Vec<EventAlignFailure> {
+    EVENT_ALIGN_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// T2b.3 (B段, mission #116 授权项⑥): run-level counters for the `meta`
+/// keys `last_index.codex_host_shell_hits` / `last_index.codex_idx0_user_total`
+/// / `last_index.event_align_failed` (`EVENT_ALIGN_FAILED` above is the third).
+/// Zeroed at `run_index` entry (and at each watch cycle's start -- one cycle
+/// = one run for this accounting); written into `meta` at successful
+/// collection-run boundaries alongside `persist_final_index_run_metadata`
+/// (gated on no scan errors, same as that call's `performed_scan` gating);
+/// a failed run leaves the previously-persisted `meta` values untouched.
+/// Incremented in [`judge_and_redact_reparsed`], not in
+/// `exclusion::decide`/`apply` (mission scope explicitly excludes touching
+/// their semantics) -- counting happens purely from the `Decision` those
+/// functions already hand back.
+static CODEX_HOST_SHELL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CODEX_IDX0_USER_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_codex_host_shell_hit() {
+    CODEX_HOST_SHELL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn record_codex_idx0_user_candidate() {
+    CODEX_IDX0_USER_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// R2-N8 (任务书 #129): the two capture-outcome counters the frozen report
+/// interface needs, in the same shape as the three counters above (statics +
+/// `record_*` + snapshot + the same `reset_last_index_run_counters` boundary
+/// + `last_index.*` meta keys + an `IndexStats` field pair). `capture_na` =
+/// the session's source is connector-internal ("logical", no backing file),
+/// so raw-mirror capture and exclusion judgment are both inapplicable -- a
+/// legitimate skip. `capture_failed` = capture was attempted and failed --
+/// a real error. Both were previously indistinguishable: only a
+/// `tracing::debug!` line and a `PrepareError` existed.
+static CAPTURE_NA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CAPTURE_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_capture_na() {
+    CAPTURE_NA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// mission #116⑥ / N09 (#131): copy this run's process-wide counters into the
+/// caller-visible `IndexingStats`. Two call sites need it now: the chunk loop
+/// below (where a successful chunk can report) and the `conv_count == 0`
+/// early `continue` above it -- a cycle whose EVERY source failed in the
+/// capture stage has no chunk to report from, and pre-fix it left
+/// `capture_failed` at whatever it was before (0), i.e. the machine-readable
+/// "how many captures failed" was blanked on exactly the cycle where every
+/// capture failed.
+fn refresh_run_counters_in_stats(opts: &IndexOptions) {
+    if let Some(p) = &opts.progress
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        let (codex_host_shell_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
+        stats.codex_host_shell_hits = codex_host_shell_hits;
+        stats.codex_idx0_user_total = codex_idx0_user_total;
+        stats.event_align_failed = event_align_failed;
+        let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+        stats.capture_na = capture_na;
+        stats.capture_failed = capture_failed;
+    }
+}
+
+fn record_capture_failed() {
+    CAPTURE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// R2-N8: separate accessor rather than a five-tuple widening of
+/// [`last_index_run_counters_snapshot`] -- the anchor counters and the
+/// capture counters are consumed at the same three places but are two
+/// different facts, and widening the tuple would rewrite five unrelated
+/// destructuring sites (including tests that assert only on the anchors).
+pub(crate) fn last_index_capture_counters_snapshot() -> (u64, u64) {
+    (
+        CAPTURE_NA.load(std::sync::atomic::Ordering::Relaxed),
+        CAPTURE_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Reset all three run-level counters. Call at `run_index` entry and at the
+/// start of each watch cycle -- "each cycle = one run" per mission #116⑥.
+pub(crate) fn reset_last_index_run_counters() {
+    CODEX_HOST_SHELL_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+    CODEX_IDX0_USER_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
+    EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE_NA.store(0, std::sync::atomic::Ordering::Relaxed);
+    CAPTURE_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // R2-N7 (任务书 #129): the per-session detail list is the counter's
+    // detail side, so it shares the counter's run boundary.
+    EVENT_ALIGN_FAILURES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// PR6 T5 (任务书 #126): how many connector scan invocations this run has
+/// started. Incremented immediately before every `conn.scan*` call site in
+/// `run_index`'s reachable graph -- local-default scan (streaming and batch),
+/// `additional_scan_roots` (configured sources / `list_sources()` fallback),
+/// and the watch-path reindex scan. `--no-ingest` must leave this at 0: that
+/// is the machine check for "the whole scan/ingest phase was skipped"
+/// (spec §五 考场不拉源), not a code-reading assertion.
+static SCAN_INVOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn record_scan_invocation() {
+    SCAN_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Zeroed at `run_index` entry (the run boundary this counter reports on).
+fn reset_scan_invocations() {
+    SCAN_INVOCATIONS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn scan_invocations_snapshot() -> u64 {
+    SCAN_INVOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Snapshot the three run-level counters (for `--json` scan report fields
+/// and for writing the `meta` keys at a successful collection-run boundary).
+pub(crate) fn last_index_run_counters_snapshot() -> (u64, u64, u64) {
+    (
+        CODEX_HOST_SHELL_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        CODEX_IDX0_USER_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        EVENT_ALIGN_FAILED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// PR6 T2b (任务书 #114): whether a scanned [`NormalizedConversation`] came
+/// from a real filesystem path (must exist at capture time; `NotFound`/
+/// `NotADirectory` is a hard `CaptureFailed`) or a connector-internal
+/// "logical" source with no backing file at all (raw-mirror capture and
+/// exclusion judgment are both inapplicable -- `capture_na`). Set by the
+/// scan call site, which is the only layer that actually knows how it
+/// obtained the conversation; `attach_raw_mirror_capture` no longer infers
+/// this from a filesystem stat (that conflated "file briefly missing" with
+/// "logical source", Global Constraints §硬约束).
+pub(crate) enum CaptureSourceKind {
+    File(std::path::PathBuf),
+    Logical,
+}
+
+/// R1-N6 (任务书 #118a): connector slugs whose `source_path` is not a real
+/// filesystem path at all (a DB-derived key, a synthetic id, etc.) -- their
+/// sessions must be classified `CaptureSourceKind::Logical`, not `File`. The
+/// upstream `Connector` trait (`franken_agent_detection`, a pinned external
+/// dependency) cannot be given a new method from this repo, so this is the
+/// fallback the mission anticipated: a static table keyed by `connector_name`,
+/// consulted at every capture-source-classifying call site instead. Confirmed
+/// via the pinned dependency (`opencode.rs:522`): `OpenCodeConnector` builds
+/// `source_path` as `db_path.join(session_id)`, which is never a readable
+/// file on its own.
+const LOGICAL_SOURCE_CONNECTORS: &[&str] = &["opencode"];
+
+fn capture_source_kind_for(connector_name: &str, source_path: std::path::PathBuf) -> CaptureSourceKind {
+    if LOGICAL_SOURCE_CONNECTORS.contains(&connector_name) {
+        CaptureSourceKind::Logical
+    } else {
+        CaptureSourceKind::File(source_path)
+    }
+}
+
+#[cfg(test)]
+mod capture_source_kind_for_tests {
+    use super::*;
+
+    /// R1-N6 (任务书 #118a) positive: a connector on the logical-source
+    /// table must classify Logical regardless of what its `source_path`
+    /// looks like.
+    #[test]
+    fn opencode_is_classified_logical() {
+        let kind = capture_source_kind_for("opencode", std::path::PathBuf::from("/data/opencode.db/session-abc"));
+        assert!(matches!(kind, CaptureSourceKind::Logical), "opencode must be Logical, not File");
+    }
+
+    /// Mutation for the above: reverting to the pre-fix unconditional
+    /// `CaptureSourceKind::File(source_path)` (no table lookup at all)
+    /// would make this assert fail -- confirmed by inspection, the pre-fix
+    /// code had no branch that could ever produce `Logical` in production.
+    #[test]
+    fn claude_code_stays_file_with_its_own_path() {
+        let path = std::path::PathBuf::from("/home/u/.claude/projects/x/session.jsonl");
+        match capture_source_kind_for("claude_code", path.clone()) {
+            CaptureSourceKind::File(p) => assert_eq!(p, path),
+            CaptureSourceKind::Logical => panic!("claude_code must stay File, not Logical"),
+        }
+    }
+}
+
+/// PR6 T2b: session-wide R4 pairing candidates, derived directly from the
+/// reparsed connector's own `role`/`invocations`/`extra.tool_call_id`
+/// (already connector-normalized, uncompacted at this point in the
+/// pipeline -- compaction runs *after* judgment) rather than by
+/// reimplementing each connector's tool-call/result detection a second time
+/// against the raw blob. `decide`'s `idx == 0` check (R3) and
+/// `ctx.paired_call_for(idx)` (R4) both key off the message's *real*
+/// session position, so this Vec must be exactly `messages.len()` long, one
+/// candidate per message. Messages that are neither a turn boundary nor a
+/// tool call/result (assistant text, reasoning, ...) get an inert filler:
+/// a `ToolResult` candidate whose `tool_call_id` cannot collide with any
+/// real connector-issued id, which `PairingContext::build`'s existing
+/// id-lookup branch already treats as a complete no-op (no match found in
+/// `by_id` => neither `unpaired` nor `resolved` is touched) -- this reuses
+/// exclusion.rs's unmodified pairing logic rather than adding a new
+/// `PairingCandidate` variant, which is outside this round's "只加
+/// events_from_blob/RecallSrc/PreparedConversation" authorization.
+fn build_pairing_candidates(
+    conv: &NormalizedConversation,
+) -> Vec<crate::indexer::exclusion::PairingCandidate> {
+    use crate::indexer::exclusion::{PairedTool, PairingCandidate};
+
+    conv.messages
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| match m.role.as_str() {
+            "user" => PairingCandidate::TurnBoundary,
+            "tool_call" => {
+                let inv = m.invocations.first();
+                PairingCandidate::ToolCall(PairedTool {
+                    tool_call_id: inv.and_then(|i| i.call_id.clone()),
+                    tool_name: inv.map(|i| i.name.clone()).unwrap_or_default(),
+                    args: inv.and_then(|i| i.arguments.clone()),
+                })
+            }
+            "tool_result" => PairingCandidate::ToolResult {
+                tool_call_id: m.extra.get("tool_call_id").and_then(|v| v.as_str()).map(str::to_string),
+            },
+            _ => PairingCandidate::ToolResult { tool_call_id: Some(format!("__cass_pairing_neutral_{idx}__")) },
+        })
+        .collect()
+}
+
+/// PR6 T2b: run R1-R4 judgment + redaction over every message in `conv`
+/// using `events` (message-position-aligned per `events_from_blob`'s
+/// contract; short/`None` entries just mean that position isn't judged --
+/// 宁漏勿误). Returns the per-message markers (`PreparedConversation.excluded`
+/// alignment) and mutates `conv.messages` in place via `apply`/
+/// `apply_sibling` exactly as `docs/excluded-rules.md` §处理顺序 specifies:
+/// decide (all rows) -> apply (hit rows) -> apply_sibling (same-`event_key`
+/// rows, second pass, so a sibling's own block replacement never races
+/// against a not-yet-applied primary hit in the same event).
+fn judge_and_redact_reparsed(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::RawEvent],
+    blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
+) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
+    use crate::indexer::exclusion::{PairingContext, apply, apply_sibling, decide, field_map_for};
+
+    let candidates = build_pairing_candidates(conv);
+    let pairing_ctx = PairingContext::build(&candidates);
+    let field_map = field_map_for(&conv.agent_slug);
+    let mut redactor = crate::indexer::redact_secrets::MemoizingRedactor::new();
+
+    let mut markers: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+    let mut hits: Vec<(usize, crate::indexer::exclusion::ExcludedMarker)> = Vec::new();
+    for idx in 0..conv.messages.len() {
+        // R1-N16 (任务书 #118b): the codex idx0-user candidate count used
+        // to be taken here, but this loop never runs at all when alignment
+        // fails (`judge_reparsed_conversation` short-circuits before
+        // calling this function) -- moved to `judge_reparsed_conversation`
+        // itself so the denominator doesn't shrink on alignment failure.
+        let Some(event) = events.get(idx) else { continue };
+        let decision = decide(&conv.messages[idx], idx, event, &pairing_ctx, &conv.agent_slug, paths_cfg);
+        let Some(decision) = decision else { continue };
+        if matches!(decision.reason, crate::indexer::exclusion::ExclusionReason::CodexHostShell) {
+            record_codex_host_shell_hit();
+        }
+        // R1-N2 (任务书 #118a): title cleanup happens HERE, in judge, before
+        // `apply()` clears `msg.content` -- `pre_redaction_content` is saved
+        // just above so the comparison below has the excluded row's ORIGINAL
+        // text to compare `title` against.
+        //
+        // R2-N3 (任务书 #119c): this comparison is against `title` on the
+        // LEFT and `pre_redaction_content` on the RIGHT -- both UNREDACTED,
+        // per spec §2.2's own wording ("若 title 是任一被排除消息**原文**的
+        // 子串"). The prior implementation compared against
+        // `redactor.redact_text(&pre_redaction_content)` instead, on the
+        // theory that "sha/title 判定都用脱敏后正文口径" -- but spec §2.2
+        // only says that for sha/bytes (the very next clause: "对象 = 脱敏
+        // 后、本应写入 content 的字符串"); the title clause is separate and
+        // explicitly says 原文. Comparing redacted content against an
+        // unredacted title breaks exactly when it matters most: if the
+        // excluded row (and hence the title derived from it) contains a
+        // secret, redaction removes that secret substring from the
+        // right-hand side, the two no longer match, and the secret-bearing
+        // title is left un-cleared in the database. Comparing both sides
+        // unredacted also means this needs no `redaction_enabled()` check --
+        // there is nothing here for that switch to gate.
+        let pre_redaction_content = conv.messages[idx].content.clone();
+        let marker = apply(&mut conv.messages[idx], &decision, &mut redactor, blob_relative_path, idx as u32, field_map);
+        if let Some(title) = conv.title.as_ref().filter(|t| !t.is_empty())
+            && pre_redaction_content.contains(title.as_str())
+        {
+            conv.title = Some(String::new());
+        }
+        markers[idx] = Some(marker.clone());
+        hits.push((idx, marker));
+    }
+    for (hit_idx, marker) in &hits {
+        for (idx, msg) in conv.messages.iter_mut().enumerate() {
+            if idx == *hit_idx {
+                continue;
+            }
+            if events.get(idx).map(|e| e.event_key.as_str()) == Some(marker.raw.event_key.as_str()) {
+                apply_sibling(msg, marker, field_map);
+            }
+        }
+    }
+    markers
+}
+
+/// Shared by [`prepare_conversation_for_ingest`] and
+/// [`prepare_conversation_for_restore`] (T2b.2, control-plane approved
+/// 2026-09-07): the event/message-count alignment self-check that guards
+/// [`judge_and_redact_reparsed`] was previously inlined only in the ingest
+/// path. Extracted here so restore's reparse-then-judge step gets the same
+/// `EVENT_ALIGN_FAILED` accounting (宁漏勿误) instead of a second,
+/// independently-maintained copy of the same three lines.
+pub(crate) fn judge_reparsed_conversation(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::RawEvent],
+    blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
+) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
+    // R1-N16 (任务书 #118b): meta 三键之二（mission #116⑥）候选总数在这里
+    // 计，与 `events`/`conv.messages` 是否对齐无关（分母不应因为对齐失败而
+    // 缩水）——候选口径与 R3 锚点定义一致（`agent_slug=="codex" && idx==0 &&
+    // role=="user"`），只有 idx 0 能匹配，故直接判第一条消息而不整段循环。
+    if conv.agent_slug == "codex" && conv.messages.first().map(|m| m.role.as_str()) == Some("user") {
+        record_codex_idx0_user_candidate();
+    }
+    // R1-N16 (任务书 #118b): connectors with no exclusion-judgment support
+    // at all (`events_from_blob` returns `Vec::new()` for anything but
+    // claude_code/codex) always have `events.len() == 0`; comparing that
+    // against a non-empty `conv.messages.len()` below would count every
+    // such session as an alignment *failure*, which is a narrower, real
+    // thing this counter tracks (a claude_code/codex session whose events
+    // genuinely don't line up with its messages) -- not "this connector
+    // doesn't have structural facts to align in the first place".
+    if !crate::indexer::exclusion::structural_facts_available(&conv.agent_slug) {
+        return vec![None; conv.messages.len()];
+    }
+    // T2b R1 (control-plane 裁定): events_from_blob's alignment is a
+    // disclosed positional approximation (see events_from_blob's own doc
+    // comment) -- when the flat event count doesn't even match the
+    // reparsed message count, positional indexing can't be trusted at
+    // all for this session, so skip judgment entirely (宁漏勿误: no
+    // exclusion rather than a wrong one) instead of silently judging
+    // against misaligned events.
+    if events.len() == conv.messages.len() {
+        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg)
+    } else {
+        record_event_align_failed();
+        // R2-N7 (任务书 #129): name the session, not just count it.
+        record_event_align_failure(conv, events.len());
+        vec![None; conv.messages.len()]
+    }
+}
+
+/// `connector` is the *same* connector instance the caller already used for
+/// the first scan pass (streaming/batch/watch each hold one in scope), not a
+/// fresh lookup by `connector_name` in `crate::connectors::get_connector_factories()`
+/// -- the batch/streaming entry points accept an injected
+/// `connector_factories: Vec<(&'static str, ConnectorFactory)>` specifically
+/// so tests can substitute a fake connector under a real registry key (e.g.
+/// `watermark_sensitive_remote_connector_factory` registered as `"claude"`);
+/// reparsing via the global registry would silently re-parse with the *real*
+/// claude connector instead and drop every such test's fixture as
+/// unparseable (`CaptureFailed`, discovered running the full indexer test
+/// module after the first draft of this function looked up by name).
+/// T2b.3 (B段, mission #116⑧): fault-injection points inside
+/// [`prepare_conversation_for_ingest`] only ("只接 ingest 侧") -- restore's
+/// prepare path has its own separate, already-real failure surfaces (a
+/// missing/corrupt manifest, an unreadable blob) that don't need a second,
+/// parallel injection mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PrepareStage {
+    /// Right before `attach_raw_mirror_capture` (File-sourced sessions
+    /// only) -- lets a test delete/append-to the source file, or otherwise
+    /// perturb the filesystem, between the scan pass that produced `conv`
+    /// and the capture pass that materializes it into the mirror.
+    BeforeCapture,
+    /// Right before `raw_mirror::sync_capture_durable` (only reached when
+    /// at least one message in this session was excluded) -- lets a test
+    /// make the durable-fsync step fail (e.g. chmod the blob directory
+    /// read-only) without needing a real disk fault.
+    BeforeDurableSync,
+}
+
+/// `tests/w6_exclusion_ingest.rs` is a black-box integration binary: it runs
+/// in a separate process/crate, cannot see `#[cfg(test)]` items, and cannot
+/// spawn a `cass` subprocess and inject state into it after the fact. This
+/// hook is the only way such a test can perturb `prepare_conversation_for_
+/// ingest`'s filesystem inputs mid-run while calling the real library entry
+/// point (`run_index_with_options`) in-process. `#[doc(hidden)] pub` (not
+/// `#[cfg(test)]`) so it always compiles into the library -- unset, it costs
+/// one `OnceLock` read + an `Option::is_none` check per prepare call.
+///
+/// #122b-1 D-R1-1: the hook is process-global (one `RwLock`, not
+/// thread-local), and every thread's `prepare_conversation_for_ingest` call
+/// invokes it -- under `cargo test`'s default parallelism, a `#[serial]`
+/// test that sets this hook is NOT protected from a concurrently running
+/// NON-serial test's own ingest also triggering it. The closure itself was
+/// the missing guard: a stage-only match (no session identity) fires for
+/// *any* thread's conversation reaching that stage, not just the session
+/// the test that installed the hook actually cares about (confirmed: a
+/// concurrently running non-serial test's ingest would silently delete a
+/// `#[serial]` test's fixture file out from under it, turning an expected
+/// `Err` into a false `Ok` with `row_count==0` -- the file was just gone
+/// before the `#[serial]` test's own scan ever ran into it). The `&Path`
+/// parameter lets every caller's closure scope itself to the one session it
+/// actually means to fault, closing that hole without needing a lock this
+/// hook doesn't otherwise require.
+static PREPARE_FAULT_HOOK: std::sync::OnceLock<
+    std::sync::RwLock<Option<Box<dyn Fn(PrepareStage, &Path) + Send + Sync>>>,
+> = std::sync::OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_prepare_fault_hook(hook: Option<Box<dyn Fn(PrepareStage, &Path) + Send + Sync>>) {
+    let lock = PREPARE_FAULT_HOOK.get_or_init(|| std::sync::RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = hook;
+    }
+}
+
+fn invoke_prepare_fault_hook(stage: PrepareStage, source_path: &Path) {
+    let Some(lock) = PREPARE_FAULT_HOOK.get() else { return };
+    if let Ok(guard) = lock.read()
+        && let Some(hook) = guard.as_ref()
+    {
+        hook(stage, source_path);
+    }
+}
+
 fn prepare_conversation_for_ingest(
     data_dir: &Path,
     connector_name: &str,
+    connector: &(dyn crate::connectors::Connector + Send),
     origin: &Origin,
     workspace_rewrite_root: Option<&ScanRoot>,
-    conv: &mut NormalizedConversation,
-) {
-    inject_provenance(conv, origin);
-    canonicalize_claude_external_id(connector_name, conv);
+    source_kind: CaptureSourceKind,
+    mut conv: NormalizedConversation,
+) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
+    use crate::indexer::exclusion::{PrepareError, PreparedConversation};
+
+    inject_provenance(&mut conv, origin);
+    canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
-        apply_workspace_rewrite(conv, root);
+        apply_workspace_rewrite(&mut conv, root);
     }
-    compact_large_connector_extras(connector_name, conv);
-    attach_raw_mirror_capture(data_dir, conv);
+
+    let original_source_path = conv.source_path.clone();
+    let original_external_id = conv.external_id.clone();
+    // R1-N5 (任务书 #118b): captured alongside `original_source_path`/
+    // `original_external_id` for the same reason -- once `conv = reparsed`
+    // (below) replaces `conv` wholesale, the first parse's own values are
+    // gone. `workspace` must be the FIRST PARSE'S FINAL value (i.e. already
+    // through `apply_workspace_rewrite` above if a rewrite fired), not
+    // re-derived from whatever the connector infers scanning the scratch
+    // copy (the scratch tree's ancestor shape is a *reconstruction*, not
+    // guaranteed identical to the original scan root a real deployment's
+    // connector saw workspace from). This is a DIFFERENT concept from the
+    // one below.
+    let original_agent_slug = conv.agent_slug.clone();
+    let original_workspace = conv.workspace.clone();
+    // R2-N2 (任务书 #119c): the PROVENANCE `apply_workspace_rewrite` (just
+    // above) recorded, if it fired -- `metadata.cass.workspace_original`,
+    // the pre-rewrite value. Captured here (before `conv = reparsed` below
+    // discards this `conv.metadata` object entirely) so it can be carried
+    // into `reparsed` directly. Do NOT call `apply_workspace_rewrite` a
+    // second time against `reparsed` to "re-derive" this: `reparsed.
+    // workspace` gets set to `original_workspace` above -- the ALREADY-
+    // rewritten value -- so a second call would run the rewrite logic
+    // against its own output. With a single mapping that's a no-op
+    // (`rewritten == original_workspace`), so the whole "record original"
+    // branch never fires and this provenance is silently lost; with a
+    // second mapping that happens to match the rewritten value (e.g.
+    // `/local -> /archive` on top of `/remote -> /local`), it applies an
+    // unintended SECOND transformation instead.
+    let original_workspace_original_meta = conv
+        .metadata
+        .pointer("/cass/workspace_original")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+
+    let record = match source_kind {
+        CaptureSourceKind::Logical => {
+            tracing::debug!(agent = %conv.agent_slug, "prepare: logical source, capture/judgment inapplicable (capture_na)");
+            // R2-N8 (任务书 #129): count it, don't just log it -- the report
+            // must tell this legitimate skip apart from a real failure.
+            record_capture_na();
+            None
+        }
+        CaptureSourceKind::File(_) => {
+            invoke_prepare_fault_hook(PrepareStage::BeforeCapture, &original_source_path);
+            Some(attach_raw_mirror_capture(data_dir, &mut conv).map_err(|err| {
+                record_capture_failed();
+                PrepareError(format!("raw-mirror capture failed for {}: {err:#}", original_source_path.display()))
+            })?)
+        }
+    };
+
+    let mut excluded: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+
+    if let Some(record) = &record {
+        let scratch = tempfile::Builder::new()
+            .prefix("cass-reparse-")
+            .tempdir_in(data_dir)
+            .map_err(|e| PrepareError(format!("reparse scratch dir: {e}")))?;
+        let materialized = crate::phase3_restore::materialize_capture_to_scratch(data_dir, record, scratch.path())
+            .map_err(|e| PrepareError(format!("reparse materialize: {e}")))?;
+
+        let scan_root = crate::connectors::ScanRoot::local(materialized.clone());
+        let scan_data_dir = materialized.parent().map(Path::to_path_buf).unwrap_or_else(|| materialized.clone());
+        let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
+        let reparsed_conversations =
+            connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
+        // R1-N5 safety dependency (R-E-34, control-plane 核实 2026-09-07):
+        // the identity check below is only safe for a genuinely-unchanged
+        // file because of an invariant that lives ELSEWHERE --
+        // `materialize_capture_to_scratch` (via `materialize_sealed_blob`'s
+        // `rebuild_relative_shape(canonical_original_path)`,
+        // `phase3_restore.rs:2164/:2250`) reconstructs the scratch copy's
+        // ancestor directory shape purely from the ORIGINAL file's own real
+        // path (`agent`/`Origin::ClaudeCode` at `:2493` is an inert
+        // placeholder there, documented not to participate in path
+        // reconstruction). Both connectors wired into this crate derive
+        // `external_id` as a pure function of that reconstructed shape --
+        // codex: `source_path.strip_prefix(&sessions_dir)` (pinned
+        // `codex.rs:704-717`); claude_code: `projects_root_for_explicit_
+        // file` (pinned `claude_code.rs:453-458`) -- neither depends on
+        // `ctx.scan_roots`, timestamps, or scan order, so this reparse's id
+        // matches the first parse's id byte-for-byte for either connector.
+        // If shape reconstruction is ever changed to key off anything OTHER
+        // than the original file's own path (e.g. connector/agent kind),
+        // this check will start rejecting every real session of the
+        // affected connector as `CaptureFailed`, with nothing in the error
+        // message pointing back to this dependency -- confirmed NOT
+        // currently the case, but the failure mode is silent and total if
+        // it ever becomes one, hence written down here rather than only at
+        // the definition of `rebuild_relative_shape` itself.
+        let mut reparsed = if reparsed_conversations.len() == 1 {
+            let candidate = reparsed_conversations.into_iter().next().expect("len checked above");
+            // R1-N5 (任务书 #118b): the single-session branch used to accept
+            // whatever `connector.scan()` produced unconditionally -- if the
+            // source file had been replaced with a *different* session's
+            // content between the first scan and this capture/reparse, the
+            // mismatch went undetected and `raw.event_key`/`raw.blocks`
+            // would end up describing the wrong conversation entirely. Same
+            // identity check the multi-session branch below already does.
+            if candidate.agent_slug != original_agent_slug || candidate.external_id != original_external_id {
+                return Err(PrepareError(format!(
+                    "reparse identity mismatch for {}: first parse was agent={original_agent_slug:?} external_id={original_external_id:?}, reparse produced agent={:?} external_id={:?}",
+                    original_source_path.display(),
+                    candidate.agent_slug,
+                    candidate.external_id
+                )));
+            }
+            candidate
+        } else {
+            reparsed_conversations
+                .into_iter()
+                .find(|c| c.agent_slug == original_agent_slug && c.external_id == original_external_id)
+                .ok_or_else(|| PrepareError("reparse produced no session matching the first parse's agent/external_id".to_string()))?
+        };
+
+        // Provenance from the first parse, not re-derived from the scratch
+        // path (Global Constraints/plan Task 2 Interfaces).
+        reparsed.source_path = original_source_path.clone();
+        // R1-N5 (任务书 #118b): same rationale -- `workspace` is the first
+        // parse's FINAL value, not whatever the connector derived scanning
+        // the scratch copy.
+        reparsed.workspace = original_workspace.clone();
+        inject_provenance(&mut reparsed, origin);
+        canonicalize_claude_external_id(connector_name, &mut reparsed);
+        // R2-N2 (任务书 #119c): carry the first parse's rewrite provenance
+        // forward directly -- do NOT call `apply_workspace_rewrite` again
+        // here (see the capture site's comment above for why a second call
+        // against the already-rewritten `reparsed.workspace` either loses
+        // the true original or applies an unintended second rewrite).
+        if let Some(original) = &original_workspace_original_meta {
+            if !reparsed.metadata.is_object() {
+                reparsed.metadata = serde_json::json!({});
+            }
+            if let Some(obj) = reparsed.metadata.as_object_mut() {
+                let cass = obj
+                    .entry("cass".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if !cass.is_object() {
+                    *cass = serde_json::json!({});
+                }
+                if let Some(cass_obj) = cass.as_object_mut() {
+                    cass_obj.insert(
+                        "workspace_original".to_string(),
+                        serde_json::Value::String(original.clone()),
+                    );
+                }
+            }
+        }
+
+        // R1-N8 (任务书 #118b): `.unwrap_or_default()` used to swallow a
+        // load failure (syntax error, unreadable file) and silently fall
+        // back to the built-in default rule set -- exactly backwards for a
+        // user who edited the config to *narrow* what gets excluded. `?`
+        // here propagates to this function's own `Result`, so a broken
+        // config fails the whole ingest of this session (not a silent
+        // widening of what leaves the mirror).
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
+            PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
+        })?;
+        let events = crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
+        let markers = judge_reparsed_conversation(&mut reparsed, &events, &record.blob_relative_path, &paths_cfg);
+
+        conv = reparsed;
+        excluded = markers;
+        // R1-N4 (任务书 #118a): `attach_raw_mirror_capture` above put
+        // `record` on the FIRST parse's `conv.metadata` -- the `conv =
+        // reparsed` reassignment just above discards that object wholesale
+        // (reparsed is a fresh scan of the scratch file, never attached).
+        // Without this, `record_persisted_raw_mirror_db_link` finds no
+        // `metadata.cass.raw_mirror` on the conversation that actually gets
+        // persisted and early-returns, leaving the manifest's `db_links`
+        // stale for every normal (non-restore) ingest.
+        attach_raw_mirror_metadata(&mut conv, record);
+
+        if excluded.iter().any(Option::is_some) {
+            invoke_prepare_fault_hook(PrepareStage::BeforeDurableSync, &original_source_path);
+            crate::raw_mirror::sync_capture_durable(data_dir, record).map_err(|e| {
+                // N09 (#131): the capture-failure exit on either side of this
+                // one reports through `record_capture_failed`; a failure to
+                // make the capture durable is the same class of "the capture
+                // did not land" and was the one error exit that left the
+                // counter at 0.
+                record_capture_failed();
+                PrepareError(format!("排除行提交前镜像持久化失败: {e}"))
+            })?;
+        }
+    }
+
+    compact_large_connector_extras(connector_name, &mut conv);
+    Ok(PreparedConversation { conv, excluded })
 }
 
 /// restore / oracle 侧的 ③ —— 与上面的 [`prepare_conversation_for_ingest`] 是一对，
@@ -15123,20 +16644,57 @@ fn prepare_conversation_for_ingest(
 /// 前三步（`inject_provenance` / `canonicalize_claude_external_id` /
 /// `apply_workspace_rewrite`）与 ingest 版逐字相同：三者只读 `conv` 自身与封存的 root
 /// 集合，是纯函数。
+/// T2b.3 (B段，control-plane 裁定 2026-09-07)：加 `materialized: &Path` 入参，
+/// **不二次物化** —— 两个调用点（`phase3_restore.rs:2716`/`:2849`）已经用
+/// `scan_materialized_file`/等价路径从这份 `materialized` 解析出了 `conv`，
+/// 这里只需要对同一份字节跑 [`crate::indexer::exclusion::events_from_blob`]
+/// 取结构，再与 ingest 共用 [`judge_reparsed_conversation`]。占位 record
+/// （`consumed_manifest.manifest_relative_path` 为空，E5 摘要比对子系统的合成
+/// provenance）短路成全 `None`（capture_na 语义），不经 events_from_blob/judge
+/// —— 空路径喂给它只会产生一个恒不对齐的 `RawEvent` 列表。顺序：provenance →
+/// judge → compact → attach（judge 必须在 compact 之前，否则 `tool_name`/
+/// 参数已被压缩白名单丢弃，判定拿不到结构）。
+///
+/// R2-B6 (任务书 #119b): returns `Result`, not a bare `PreparedConversation`
+/// -- `ExcludedContextPaths::load()` used to be `.unwrap_or_default()` here
+/// ("restore has no fallible step, so it can't propagate"), which meant a
+/// syntactically-broken or unreadable override config silently widened
+/// restore to the built-in default exclusion rules while normal ingest
+/// (`prepare_conversation_for_ingest`, #118b) fails the whole session --
+/// same operator config, two different outcomes depending on which path
+/// happened to read it. Both `phase3_restore.rs` call sites already sit
+/// behind a `Result`-returning function (`ProjectionError`/`ProjectionFault`
+/// respectively), so there is somewhere for this to propagate to now.
 pub(crate) fn prepare_conversation_for_restore(
     connector_name: &str,
     origin: &Origin,
     workspace_rewrite_root: Option<&ScanRoot>,
     sealed_source_size_bytes: u64,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
-    conv: &mut NormalizedConversation,
-) {
-    inject_provenance(conv, origin);
-    canonicalize_claude_external_id(connector_name, conv);
+    materialized: &Path,
+    mut conv: NormalizedConversation,
+) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
+    use crate::indexer::exclusion::PrepareError;
+
+    inject_provenance(&mut conv, origin);
+    canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
-        apply_workspace_rewrite(conv, root);
+        apply_workspace_rewrite(&mut conv, root);
     }
-    compact_large_connector_extras_for_size(connector_name, conv, Some(sealed_source_size_bytes));
+
+    let excluded = if consumed_manifest.manifest_relative_path.is_empty() {
+        vec![None; conv.messages.len()]
+    } else {
+        // 任务书 #118b N8 同口径 (#119b 收口, R2-B6): 恢复侧与摄入侧共用同一份
+        // 操作者配置，坏配置必须让整条恢复失败，不能静默退回内置默认清单。
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
+            PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
+        })?;
+        let events = crate::indexer::exclusion::events_from_blob(&conv.agent_slug, materialized);
+        judge_reparsed_conversation(&mut conv, &events, &consumed_manifest.blob_relative_path, &paths_cfg)
+    };
+
+    compact_large_connector_extras_for_size(connector_name, &mut conv, Some(sealed_source_size_bytes));
     // §A.1.1 第 3 条是**两句话**：排除 `attach_raw_mirror_capture`（它会 `capture_source_file`
     // 产生文件系统写副作用），**并且**「`metadata.cass.raw_mirror` 由 restore 按被消费的那份
     // manifest 直接填写，字段取值以该 manifest 为准」。只做前半句会让恢复出来的会话查不出
@@ -15144,7 +16702,9 @@ pub(crate) fn prepare_conversation_for_restore(
     //
     // **复用既有的 `attach_raw_mirror_metadata`，不在消费侧重拼那八个键**：那八个键的形状
     // 只能有一处定义，否则基线下次加一个键时两处静默分叉。
-    attach_raw_mirror_metadata(conv, consumed_manifest);
+    attach_raw_mirror_metadata(&mut conv, consumed_manifest);
+
+    Ok(crate::indexer::exclusion::PreparedConversation { conv, excluded })
 }
 
 fn capture_connector_sources_before_parse(
@@ -15218,19 +16778,6 @@ fn capture_connector_sources_before_parse(
                 );
             }
         }
-    }
-}
-
-fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            let file_type = metadata.file_type();
-            !file_type.is_file() && !file_type.is_symlink()
-        }
-        Err(error) => matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        ),
     }
 }
 
@@ -15449,19 +16996,18 @@ fn capture_scan_root_file_before_parse(
     }
 }
 
-fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
-    if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
-        tracing::debug!(
-            agent = %conv.agent_slug,
-            source_path = %conv.source_path.display(),
-            "skipping raw-mirror capture for logical non-file parsed conversation source"
-        );
-        return;
-    }
-
+/// PR6 T2b: `SourceKind::Logical` skipping is now the caller's job
+/// (`prepare_conversation_for_ingest`), so this function always attempts a
+/// real capture and **propagates** failure instead of warn-and-continue --
+/// Global Constraints: a `SourceKind::File` whose capture fails is a hard
+/// `CaptureFailed` (session skipped, not silently ingested with no mirror).
+fn attach_raw_mirror_capture(
+    data_dir: &Path,
+    conv: &mut NormalizedConversation,
+) -> anyhow::Result<crate::raw_mirror::RawMirrorCaptureRecord> {
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
     let db_link = raw_mirror_db_link_for_conversation(conv);
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+    let record = crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
         data_dir,
         provider: &conv.agent_slug,
         source_id: &source_id,
@@ -15469,28 +17015,17 @@ fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation)
         origin_host: origin_host.as_deref(),
         source_path: &conv.source_path,
         db_links: std::slice::from_ref(&db_link),
-    }) {
-        Ok(record) => {
-            attach_raw_mirror_metadata(conv, &record);
-            tracing::debug!(
-                agent = %conv.agent_slug,
-                source_id = %source_id,
-                manifest_id = %record.manifest_id,
-                blob_blake3 = %record.blob_blake3,
-                already_present = record.already_present,
-                "captured parsed conversation source into raw mirror before archive upsert"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                agent = %conv.agent_slug,
-                source_id = %source_id,
-                source_path = %conv.source_path.display(),
-                error = %error,
-                "failed to capture parsed conversation source into raw mirror before archive upsert"
-            );
-        }
-    }
+    })?;
+    attach_raw_mirror_metadata(conv, &record);
+    tracing::debug!(
+        agent = %conv.agent_slug,
+        source_id = %source_id,
+        manifest_id = %record.manifest_id,
+        blob_blake3 = %record.blob_blake3,
+        already_present = record.already_present,
+        "captured parsed conversation source into raw mirror before archive upsert"
+    );
+    Ok(record)
 }
 
 fn raw_mirror_db_link_for_conversation(
@@ -15752,6 +17287,12 @@ pub mod persist {
         pub semantic_delta_inputs: Vec<EmbeddingInput>,
         pub lexical_update_deferred: bool,
         pub lexical_update_error: Option<String>,
+        /// R3-N5 (任务书 #129): conversations this batch refused to insert
+        /// because an excluded marker's `fingerprint_blake3` is unusable.
+        /// They are not an error for the batch (the rest commits), but the
+        /// connector's scan must report a skipped session, so callers turn
+        /// each of these into a `ScanError`.
+        pub skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
     }
 
     impl PersistBatchOutcome {
@@ -15795,6 +17336,7 @@ pub mod persist {
                     self.lexical_update_error = other.lexical_update_error;
                 }
             }
+            self.skipped_conversations.extend(other.skipped_conversations);
         }
     }
 
@@ -15908,15 +17450,15 @@ pub mod persist {
         }
     }
 
-    fn record_persisted_raw_mirror_db_links(
+    fn record_persisted_raw_mirror_db_links<'a>(
         data_dir: Option<&Path>,
-        convs: &[NormalizedConversation],
+        convs: impl IntoIterator<Item = &'a NormalizedConversation>,
         outcomes: &[InsertOutcome],
     ) {
         let Some(data_dir) = data_dir else {
             return;
         };
-        for (conv, outcome) in convs.iter().zip(outcomes.iter()) {
+        for (conv, outcome) in convs.into_iter().zip(outcomes.iter()) {
             record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
         }
     }
@@ -16348,20 +17890,21 @@ pub mod persist {
     fn persist_chunk_with_writer(
         franken: &FrankenStorage,
         base_idx: usize,
-        chunk: &[NormalizedConversation],
+        chunk: &[crate::indexer::exclusion::PreparedConversation],
         internal_chunk: &[Conversation],
         max_retries: usize,
     ) -> Result<ChunkPersistResult> {
         debug_assert_eq!(
             chunk.len(),
             internal_chunk.len(),
-            "parallel pre-map must produce one Conversation per NormalizedConversation"
+            "parallel pre-map must produce one Conversation per PreparedConversation"
         );
         let mut outcomes = Vec::with_capacity(chunk.len());
         let mut agent_cache: HashMap<String, i64> = HashMap::new();
         let mut workspace_cache: HashMap<std::path::PathBuf, i64> = HashMap::new();
 
-        for (offset, (conv, internal)) in chunk.iter().zip(internal_chunk.iter()).enumerate() {
+        for (offset, (prepared, internal)) in chunk.iter().zip(internal_chunk.iter()).enumerate() {
+            let conv = &prepared.conv;
             let idx = base_idx + offset;
 
             // Wrap the entire ensure_agent + ensure_workspace +
@@ -16422,7 +17965,7 @@ pub mod persist {
     fn persist_chunk_serial_fallback(
         writer_handle: &crate::storage::api::WriterHandle<FrankenStorage>,
         base_idx: usize,
-        chunk: &[NormalizedConversation],
+        chunk: &[crate::indexer::exclusion::PreparedConversation],
         internal_chunk: &[Conversation],
         max_retries: usize,
     ) -> Result<Vec<(usize, InsertOutcome)>> {
@@ -16458,8 +18001,10 @@ pub mod persist {
         ))
     }
 
-    fn duplicate_conversation_keys_present(convs: &[NormalizedConversation]) -> bool {
-        let mut seen = HashSet::with_capacity(convs.len());
+    fn duplicate_conversation_keys_present<'a>(
+        convs: impl IntoIterator<Item = &'a NormalizedConversation>,
+    ) -> bool {
+        let mut seen = HashSet::new();
         for conv in convs {
             let (source_id, _) = extract_provenance(&conv.metadata);
             let key = if let Some(external_id) = conv.external_id.as_deref() {
@@ -16490,7 +18035,7 @@ pub mod persist {
     fn persist_conversations_batched_begin_concurrent(
         storage: &FrankenStorage,
         db_path: &Path,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         _lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
@@ -16618,8 +18163,8 @@ pub mod persist {
         ordered.sort_by_key(|(idx, _)| *idx);
         if let Some(data_dir) = raw_mirror_data_dir {
             for (idx, outcome) in &ordered {
-                if let Some(conv) = convs.get(*idx) {
-                    record_persisted_raw_mirror_db_link(data_dir, conv, outcome);
+                if let Some(prepared) = convs.get(*idx) {
+                    record_persisted_raw_mirror_db_link(data_dir, &prepared.conv, outcome);
                 }
             }
         }
@@ -16672,13 +18217,24 @@ pub mod persist {
     /// Applies secret redaction to message content and extra_json before storage
     /// (security fix for #112: tool-result secrets were persisted unredacted).
     pub fn map_to_internal(conv: &NormalizedConversation) -> Conversation {
-        map_to_internal_with_redactor(conv, None)
+        // Mechanical propagation boundary (T2b.2, control-plane approved
+        // 2026-09-07): this entry point only carries a bare
+        // `NormalizedConversation` (single-conversation restore/test paths,
+        // not the batch transport chain), so there is no exclusion marker
+        // to thread through -- wrap it as an all-`None` `PreparedConversation`
+        // rather than duplicating `map_to_internal_with_redactor`'s body.
+        let n = conv.messages.len();
+        map_to_internal_with_redactor(
+            &crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] },
+            None,
+        )
     }
 
     pub(crate) fn map_to_internal_with_redactor(
-        conv: &NormalizedConversation,
+        prepared: &crate::indexer::exclusion::PreparedConversation,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
     ) -> Conversation {
+        let conv = &prepared.conv;
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
         let should_redact = super::redact_secrets::redaction_enabled();
@@ -16715,7 +18271,8 @@ pub mod persist {
             messages: conv
                 .messages
                 .iter()
-                .map(|m| {
+                .enumerate()
+                .map(|(msg_idx, m)| {
                     let content = if should_redact {
                         if let Some(r) = redactor.as_mut() {
                             r.redact_text(&m.content)
@@ -16735,6 +18292,7 @@ pub mod persist {
                         m.extra.clone()
                     };
                     Message {
+                        excluded: prepared.excluded.get(msg_idx).cloned().flatten(),
                         id: None,
                         idx: m.idx,
                         role: map_role(&m.role),
@@ -16812,9 +18370,21 @@ pub mod persist {
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
+        // Test-only convenience wrapper (T2b.2, control-plane approved
+        // 2026-09-07): callers in this module's unit tests build plain
+        // `NormalizedConversation` fixtures and have no exclusion markers to
+        // thread through, so wrap them as all-`None` `PreparedConversation`s
+        // here rather than pushing that boilerplate into every test.
+        let prepared: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+            .iter()
+            .map(|conv| {
+                let n = conv.messages.len();
+                crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] }
+            })
+            .collect();
         persist_conversations_batched_inner(
             storage,
-            convs,
+            &prepared,
             lexical_strategy,
             defer_checkpoints,
             false,
@@ -16825,7 +18395,7 @@ pub mod persist {
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
         storage: &FrankenStorage,
         data_dir: &Path,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
@@ -16842,7 +18412,7 @@ pub mod persist {
     pub(super) fn persist_conversations_batched_with_semantic_delta_and_raw_mirror_links(
         storage: &FrankenStorage,
         data_dir: &Path,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
     ) -> Result<PersistBatchOutcome> {
@@ -16858,7 +18428,7 @@ pub mod persist {
 
     fn persist_conversations_batched_inner(
         storage: &FrankenStorage,
-        convs: &[NormalizedConversation],
+        convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
         defer_checkpoints: bool,
         capture_semantic_delta: bool,
@@ -16869,10 +18439,23 @@ pub mod persist {
         }
 
         let begin_concurrent_enabled = begin_concurrent_writes_enabled();
-        let duplicate_keys_present =
-            begin_concurrent_enabled && duplicate_conversation_keys_present(convs);
+        let duplicate_keys_present = begin_concurrent_enabled
+            && duplicate_conversation_keys_present(convs.iter().map(|p| &p.conv));
 
-        if begin_concurrent_enabled && !duplicate_keys_present {
+        // R3-N5 (任务书 #129): control plane's second finding -- the
+        // begin-concurrent path never reaches `insert_conversations_batched_reporting`,
+        // where the serial path's per-conversation skip lives, so a batch
+        // carrying an unusable excluded fingerprint still failed wholesale on
+        // that path. The same pre-check is hoisted to the branch decision:
+        // such a batch routes to the serial path, which skips and reports
+        // that ONE conversation and commits the rest.
+        let uninsertable_fingerprint_present = convs.iter().any(|prepared| {
+            prepared.excluded.iter().flatten().any(|marker| {
+                crate::storage::sqlite::excluded_fingerprint_error(marker).is_some()
+            })
+        });
+
+        if begin_concurrent_enabled && !duplicate_keys_present && !uninsertable_fingerprint_present {
             let db_path = storage
                 .database_path()
                 .with_context(|| "resolving database path for begin-concurrent write mode")?;
@@ -16888,6 +18471,13 @@ pub mod persist {
                 defer_checkpoints,
                 capture_semantic_delta,
                 raw_mirror_data_dir,
+            );
+        }
+
+        if uninsertable_fingerprint_present {
+            tracing::info!(
+                conversations = convs.len(),
+                "batch carries a conversation with an unusable excluded fingerprint; using the serial path, which skips it per conversation"
             );
         }
 
@@ -16914,7 +18504,7 @@ pub mod persist {
             )
             .collect();
 
-        let outcomes = with_ephemeral_writer(
+        let (outcomes, skipped_conversations) = with_ephemeral_writer(
             storage,
             defer_checkpoints,
             "serial batched indexing",
@@ -16926,7 +18516,8 @@ pub mod persist {
                 let mut prepared: Vec<(i64, Option<i64>, Conversation)> =
                     Vec::with_capacity(convs.len());
 
-                for (conv, internal_conv) in convs.iter().zip(internal_convs) {
+                for (prepared_conv, internal_conv) in convs.iter().zip(internal_convs) {
+                    let conv = &prepared_conv.conv;
                     let agent = Agent {
                         id: None,
                         slug: conv.agent_slug.clone(),
@@ -16970,18 +18561,48 @@ pub mod persist {
                     prepared.iter().map(|(a, w, c)| (*a, *w, c)).collect();
                 let chunk_size = serial_batch_chunk_size().min(refs.len().max(1));
                 let mut outcomes = Vec::with_capacity(refs.len());
+                // R3-N5 (任务书 #129): a conversation the batch refuses
+                // (unusable excluded fingerprint) is skipped and reported
+                // instead of failing the whole chunk.
+                let mut skipped: Vec<crate::storage::sqlite::BatchSkippedConversation> = Vec::new();
 
                 for start in (0..refs.len()).step_by(chunk_size) {
                     let end = (start + chunk_size).min(refs.len());
                     let chunk_refs = &refs[start..end];
-                    outcomes.extend(writer.insert_conversations_batched(chunk_refs)?);
+                    let mut chunk_skipped = Vec::new();
+                    outcomes.extend(
+                        writer.insert_conversations_batched_reporting(chunk_refs, &mut chunk_skipped)?,
+                    );
+                    for mut skip in chunk_skipped {
+                        // The reporting call reports positions within ITS
+                        // slice; lift them back to `refs`/`convs` positions.
+                        skip.index += start;
+                        skipped.push(skip);
+                    }
                 }
 
-                Ok(outcomes)
+                Ok((outcomes, skipped))
             },
         )?;
         let mut batch_outcome = PersistBatchOutcome::default();
-        record_persisted_raw_mirror_db_links(raw_mirror_data_dir, convs, &outcomes);
+        // R3-N5 (任务书 #129): `record_persisted_raw_mirror_db_links` pairs
+        // conversations with outcomes POSITIONALLY, so a skipped conversation
+        // left in the list would shift every later conversation's db_link
+        // onto its neighbour. Drop the skipped ones from the conversation
+        // side instead -- they were never inserted, so they have no link to
+        // record.
+        let skipped_positions: std::collections::HashSet<usize> =
+            skipped_conversations.iter().map(|skip| skip.index).collect();
+        batch_outcome.skipped_conversations = skipped_conversations;
+        record_persisted_raw_mirror_db_links(
+            raw_mirror_data_dir,
+            convs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !skipped_positions.contains(index))
+                .map(|(_, prepared)| &prepared.conv),
+            &outcomes,
+        );
         for outcome in &outcomes {
             batch_outcome.record_insert_outcome(outcome);
         }
@@ -17099,36 +18720,42 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_flag_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "1");
             assert!(begin_concurrent_writes_enabled());
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_chunk_size_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "7");
             assert_eq!(begin_concurrent_chunk_size(), 7);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_retry_limit_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_RETRIES", "9");
             assert_eq!(begin_concurrent_retry_limit(), 9);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_writer_cache_parsing() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "2048");
             assert_eq!(begin_concurrent_writer_cache_kib(), 2048);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_writer_cache_invalid_defaults() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_WRITER_CACHE_KIB", "0");
             assert_eq!(begin_concurrent_writer_cache_kib(), 4096);
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_knobs_are_clamped_to_safe_caps() {
             // Pathological values (typos, overflow-adjacent integers) must be
             // clamped, not honored verbatim. Each knob here is exercised at the
@@ -17278,6 +18905,7 @@ pub mod persist {
                 metadata_json: serde_json::json!({}),
                 messages: vec![
                     crate::model::types::Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -17288,6 +18916,7 @@ pub mod persist {
                         snippets: Vec::new(),
                     },
                     crate::model::types::Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -17454,6 +19083,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_persist_writes_all_conversations() {
             use crate::connectors::NormalizedConversation;
 
@@ -17495,6 +19125,13 @@ pub mod persist {
 
             // Set chunk size < conversation count to exercise multiple parallel writers
             let _chunk_guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "3");
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
@@ -17570,6 +19207,7 @@ pub mod persist {
         /// `par_chunks().map()`, so a chunk size smaller than the corpus
         /// drives the peak above 1.
         #[test]
+        #[serial]
         fn begin_concurrent_persist_never_exceeds_one_live_writer_connection() {
             use crate::connectors::NormalizedConversation;
             use crate::storage::api::{reset_writer_connection_peak, writer_connection_peak};
@@ -17606,6 +19244,13 @@ pub mod persist {
                             })
                             .collect(),
                     }
+                })
+                .collect();
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
                 })
                 .collect();
 
@@ -17685,6 +19330,13 @@ pub mod persist {
                     invocations: Vec::new(),
                 }],
             }];
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
@@ -18136,6 +19788,13 @@ pub mod persist {
                     },
                 ],
             }];
+            let convs: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+                .into_iter()
+                .map(|conv| {
+                    let n = conv.messages.len();
+                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                })
+                .collect();
 
             persist_conversations_batched_begin_concurrent(
                 &FrankenStorage::open(&db_path).unwrap(),
@@ -18171,6 +19830,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn default_serial_batched_hot_path_syncs_fts_lex_domain() {
             // w2 F1 regression: `insert_conversations_batched` is the
             // crate's highest-traffic write path, reached by default (no
@@ -18305,6 +19965,7 @@ pub mod persist {
             db_path: std::path::PathBuf,
         ) -> crate::indexer::IndexOptions {
             crate::indexer::IndexOptions {
+                no_ingest: false,
                 full: false,
                 force_rebuild: false,
                 watch: false,
@@ -19930,6 +21591,7 @@ pub mod persist {
         }
 
         #[test]
+        #[serial]
         fn begin_concurrent_disabled_falls_through_to_default() {
             let _guard = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
             assert!(!begin_concurrent_writes_enabled());
@@ -19952,6 +21614,19 @@ mod tests {
     use crate::storage::api::Value as SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    // T4-F1 / #122b-1 invariant: any test in this module (or in
+    // `persist_internal_tests` above, or in `exclusion::tests`) that reads
+    // OR writes process env must carry `#[serial]`. `#[serial]`'s
+    // unnamed/default lock is the one real cross-file lock here -- it is
+    // shared crate-wide by every unnamed `#[serial]` in this binary
+    // regardless of which module or file the test lives in.
+    // `persist_internal_tests`'s own `ENV_LOCK`/`acquire_env_lock` Mutex is
+    // NOT that lock: it only serializes calls within that one nested
+    // module and does nothing to protect against a non-serial test
+    // anywhere else touching the same env key concurrently. The parallel
+    // door is `cargo test --lib -- indexer::` (default threads) 10x all
+    // green; a missing `#[serial]` here is a flake, not a fluke.
 
     fn scratch_db_with_one_message(content_text: &str) -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("tempdir");
@@ -19982,6 +21657,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -20117,6 +21793,7 @@ mod tests {
                     approx_tokens: None,
                     metadata_json: serde_json::Value::Null,
                     messages: vec![Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -20142,6 +21819,7 @@ mod tests {
         }
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -20284,7 +21962,7 @@ mod tests {
         };
         inject_provenance(&mut conv, &Origin::local());
 
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
         let raw_mirror = &conv.metadata["cass"]["raw_mirror"];
         let manifest_id = raw_mirror["manifest_id"]
@@ -20828,12 +22506,19 @@ mod tests {
     }
 
     #[test]
-    fn raw_mirror_capture_skips_logical_non_file_conversation_sources() {
+    fn attach_raw_mirror_capture_fails_for_a_source_path_with_no_backing_file() {
+        // PR6 T2b (任务书 #114): `should_skip_raw_mirror_capture_for_logical_source`
+        // is gone -- the logical/file decision is now the *caller's*
+        // (`prepare_conversation_for_ingest`'s `SourceKind`), not something
+        // `attach_raw_mirror_capture` infers from a stat. Called directly (as
+        // this unit test does, bypassing `SourceKind::Logical`'s skip), a
+        // non-existent source path is a hard capture failure, not a silent
+        // skip -- Global Constraints: "File 来源在 prepare 时已不存在
+        // (NotFound/NotADirectory) = CaptureFailed".
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         let db_path = temp.path().join("opencode.db");
-        std::fs::write(&db_path, b"not a real sqlite fixture for this test")
-            .expect("logical db source");
+        std::fs::write(&db_path, b"not a real sqlite fixture for this test").expect("logical db source");
 
         let mut conv = NormalizedConversation {
             agent_slug: "opencode".to_string(),
@@ -20856,45 +22541,19 @@ mod tests {
             }],
         };
 
-        attach_raw_mirror_capture(&data_dir, &mut conv);
-
         assert!(
-            conv.metadata
-                .get("cass")
-                .and_then(|cass| cass.get("raw_mirror"))
-                .is_none(),
-            "logical DB-backed conversation paths must not receive file raw-mirror metadata"
+            attach_raw_mirror_capture(&data_dir, &mut conv).is_err(),
+            "a source_path with no backing file must now propagate an error, not skip silently"
+        );
+        assert!(
+            conv.metadata.get("cass").and_then(|cass| cass.get("raw_mirror")).is_none(),
+            "a failed capture must not attach raw-mirror metadata"
         );
         assert!(
             raw_mirror_manifest_values(&data_dir).is_empty(),
-            "logical non-file conversation paths must not publish failed raw-mirror manifests"
+            "a failed capture must not publish a manifest"
         );
-        assert_eq!(
-            std::fs::read(&db_path).expect("db source remains"),
-            b"not a real sqlite fixture for this test"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn raw_mirror_logical_source_skip_preserves_symlink_validation_path() {
-        let temp = TempDir::new().expect("tempdir");
-        let real_source = temp.path().join("real.jsonl");
-        let symlink_source = temp.path().join("link.jsonl");
-        std::fs::write(&real_source, b"real source bytes\n").expect("real source");
-        std::os::unix::fs::symlink(&real_source, &symlink_source).expect("source symlink");
-
-        assert!(
-            !should_skip_raw_mirror_capture_for_logical_source(&symlink_source),
-            "symlink source paths should still reach raw-mirror's validator"
-        );
-
-        let db_path = temp.path().join("opencode.db");
-        std::fs::write(&db_path, b"not a directory").expect("db source");
-        assert!(
-            should_skip_raw_mirror_capture_for_logical_source(&db_path.join("session-row-id")),
-            "logical DB row paths should be treated as non-file source identifiers"
-        );
+        assert_eq!(std::fs::read(&db_path).expect("db source remains"), b"not a real sqlite fixture for this test");
     }
 
     #[cfg(unix)]
@@ -21021,7 +22680,7 @@ mod tests {
             }],
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
         let manifests = std::fs::read_dir(&manifest_root)
@@ -21077,7 +22736,7 @@ mod tests {
             }],
         };
         inject_provenance(&mut conv, &Origin::local());
-        attach_raw_mirror_capture(&data_dir, &mut conv);
+        attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
         let manifest_relative = conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
             .as_str()
             .expect("manifest relative path")
@@ -21142,6 +22801,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("storage");
         ensure_fts_schema(&storage);
         let opts = IndexOptions {
+            no_ingest: false,
             full: true,
             force_rebuild: false,
             watch: false,
@@ -22246,6 +23906,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_orphan_fk_rows_preflight_is_opt_in() {
         {
             let _guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
@@ -22273,6 +23934,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn cleanup_orphan_fk_rows_skip_does_not_imply_opt_in() {
         let _cleanup_guard = unset_env_var("CASS_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS");
         let _skip_guard = set_env_var("CASS_SKIP_PREFLIGHT_CLEANUP_ORPHAN_FK_ROWS", "1");
@@ -22555,6 +24217,15 @@ mod tests {
         }
     }
 
+    /// Wrap a bare test fixture as a `PreparedConversation` with no
+    /// exclusion markers -- the marker-less shape every unit test that
+    /// predates T2b's transport-chain change needs at the `push`/persist
+    /// boundary.
+    fn prep_conv(conv: NormalizedConversation) -> crate::indexer::exclusion::PreparedConversation {
+        let n = conv.messages.len();
+        crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+    }
+
     fn seed_lexical_rebuild_fixture(storage: &FrankenStorage) {
         let agent = Agent {
             id: None,
@@ -22582,6 +24253,7 @@ mod tests {
                 metadata_json: serde_json::Value::Null,
                 messages: vec![
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 0,
                         role: MessageRole::User,
@@ -22592,6 +24264,7 @@ mod tests {
                         snippets: Vec::new(),
                     },
                     Message {
+                        excluded: None,
                         id: None,
                         idx: 1,
                         role: MessageRole::Agent,
@@ -22679,6 +24352,7 @@ mod tests {
             metadata_json: raw_conv.metadata.clone(),
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -22689,6 +24363,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -22794,6 +24469,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::role_from_str("user"),
@@ -22804,6 +24480,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::role_from_str("assistant"),
@@ -22814,6 +24491,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: crate::model::types::role_from_str("tool_call"),
@@ -22824,6 +24502,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 3,
                     role: crate::model::types::role_from_str("tool_result"),
@@ -22834,6 +24513,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 4,
                     role: crate::model::types::role_from_str("reasoning"),
@@ -22978,6 +24658,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::role_from_str("user"),
@@ -22988,6 +24669,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::role_from_str("assistant"),
@@ -22998,6 +24680,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     // "already up to date" is a tool-result acknowledgement that
@@ -23760,6 +25443,7 @@ mod tests {
             1_700_000_000_000,
             vec![
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: MessageRole::User,
@@ -23770,6 +25454,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: MessageRole::Agent,
@@ -23786,6 +25471,7 @@ mod tests {
             "planner-utf8",
             1_700_000_002_000,
             vec![Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: MessageRole::Tool,
@@ -23843,6 +25529,7 @@ mod tests {
             let external_id = format!("footprint-plan-{conversation_idx}");
             let messages = (0..4)
                 .map(|message_idx| Message {
+                    excluded: None,
                     id: None,
                     idx: message_idx,
                     role: MessageRole::User,
@@ -24359,6 +26046,19 @@ mod tests {
         .expect("done message should send");
     }
 
+    // T2b (任务书 #114, control-plane 裁定 (a)(b)): `prepare_conversation_for_ingest`
+    // now reparses the captured raw-mirror blob via this same connector
+    // instance before a session can survive ingest, so any synthetic
+    // conversation this connector hands back needs a *real* backing file at
+    // `source_path` for `attach_raw_mirror_capture` to actually capture --
+    // the old code tolerated a missing file (warn + continue with no
+    // mirror), the new `CaptureSourceKind::File` contract treats it as a
+    // hard `CaptureFailed` (session dropped) by design. `ConnectorFactory`
+    // is a bare fn pointer (no closure capture), so the test-owned tempdir
+    // path is threaded in via this static, same pattern as
+    // `FAILING_EXPLICIT_FILE_ROOT`/`DISCONNECT_TEST_COUNTER` below.
+    static DEFERRED_BATCH_SOURCE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
     struct DeferredBatchConnector;
 
     impl Connector for DeferredBatchConnector {
@@ -24374,13 +26074,20 @@ mod tests {
             &self,
             _ctx: &crate::connectors::ScanContext,
         ) -> anyhow::Result<Vec<NormalizedConversation>> {
-            Ok(vec![norm_conv(
+            let source_path = DEFERRED_BATCH_SOURCE_PATH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("deferred batch source path should be configured");
+            let mut conv = norm_conv(
                 Some("deferred-batch"),
                 vec![
                     norm_msg(0, 1_700_000_000_000),
                     norm_msg(1, 1_700_000_000_100),
                 ],
-            )])
+            );
+            conv.source_path = source_path;
+            Ok(vec![conv])
         }
 
         fn scan_with_callback(
@@ -24598,8 +26305,56 @@ mod tests {
     }
 
     static DISCONNECT_TEST_COUNTER: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+    // T2b (任务书 #114, control-plane 裁定 (a)(b)): same reasoning as
+    // `DEFERRED_BATCH_SOURCE_PATH` above -- `prepare_conversation_for_ingest`
+    // reparses via this connector's own `scan()`, so both `scan()` and
+    // `scan_with_callback()`'s conversations need a real backing file. The
+    // two methods were already inconsistent before this round (`scan()`
+    // returned an empty Vec while `scan_with_callback()` produced three
+    // conversations independently) -- `scan()` now returns one conversation
+    // matching what `scan_with_callback()` emits for the same `ctx`
+    // (`external_id: Some(scope)` is identical across all three of its
+    // iterations, so any one of them is a valid single-match reparse result).
+    static DISCONNECT_TEST_SOURCE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
     struct DisconnectAwareConnector;
+
+    impl DisconnectAwareConnector {
+        fn oversized_conv(scope: &str) -> NormalizedConversation {
+            let source_path = DISCONNECT_TEST_SOURCE_PATH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("disconnect test source path should be configured");
+            let oversized = NormalizedMessage {
+                content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
+                ..norm_msg(0, 2_000)
+            };
+            // R1-N5 (任务书 #118b, control-plane 核实 2026-09-07): `external_id`
+            // must be stable across the ORIGINAL `scan_with_callback`
+            // iteration and `prepare_conversation_for_ingest`'s own internal
+            // reparse-via-`connector.scan()` call, which always builds a
+            // `ScanContext` with one non-empty local `ScanRoot` pointing at
+            // the materialized scratch copy -- so the `ctx.scan_roots.
+            // is_empty()`-based `scope` this fixture used to compute (this
+            // function's caller) evaluated to "remote" on EVERY reparse
+            // regardless of which real scope ("local" or "remote") the
+            // original scan came from, tripping N5's new identity check on
+            // every "local" iteration. A real connector's `external_id` has
+            // no such dependency (pure function of the file's own path
+            // structure via `materialize_sealed_blob`'s `rebuild_relative_
+            // shape`, confirmed against pinned `codex.rs`/`claude_code.rs`),
+            // so this fixture's scope-in-identity shortcut was never
+            // faithful to production behavior -- it only went unnoticed
+            // because prepare never validated reparse identity before N5.
+            // `scope` is kept in `title` (purely informational, no
+            // assertion reads it) rather than fed into `external_id`.
+            let mut conv = norm_conv(Some("disconnect-test"), vec![oversized]);
+            conv.title = Some(format!("disconnect-test-{scope}"));
+            conv.source_path = source_path;
+            conv
+        }
+    }
 
     impl Connector for DisconnectAwareConnector {
         fn detect(&self) -> DetectionResult {
@@ -24612,9 +26367,10 @@ mod tests {
 
         fn scan(
             &self,
-            _ctx: &crate::connectors::ScanContext,
+            ctx: &crate::connectors::ScanContext,
         ) -> anyhow::Result<Vec<NormalizedConversation>> {
-            Ok(Vec::new())
+            let scope = if ctx.scan_roots.is_empty() { "local" } else { "remote" };
+            Ok(vec![Self::oversized_conv(scope)])
         }
 
         fn scan_with_callback(
@@ -24633,13 +26389,9 @@ mod tests {
                 "remote"
             };
 
-            for idx in 0..3 {
+            for _ in 0..3 {
                 counter.fetch_add(1, Ordering::Relaxed);
-                let oversized = NormalizedMessage {
-                    content: "x".repeat(DEFAULT_STREAMING_BATCH_LIMITS.max_chars + 1),
-                    ..norm_msg(idx, 2_000 + idx)
-                };
-                on_conversation(norm_conv(Some(scope), vec![oversized]))?;
+                on_conversation(Self::oversized_conv(scope))?;
             }
 
             Ok(())
@@ -24648,6 +26400,87 @@ mod tests {
 
     fn disconnect_aware_connector_factory() -> Box<dyn Connector + Send> {
         Box::new(DisconnectAwareConnector)
+    }
+
+    /// R2-N8/R2-N7 (任务书 #129): the run-level counters (`CAPTURE_NA`,
+    /// `CAPTURE_FAILED`, `EVENT_ALIGN_FAILED`) and the alignment-failure
+    /// list are PROCESS-GLOBAL statics, so a test that reads their absolute
+    /// values is only correct while nothing else can increment or reset them
+    /// -- under `cargo test`'s default parallelism that was luck, not a
+    /// property. Control plane reproduced the failure on the un-fixed tree:
+    /// this module's own prepare-failure fixture bumped `capture_failed` from
+    /// 1 to 2 inside the reader's window.
+    ///
+    /// Rule: every test that can WRITE these globals (anything driving
+    /// `prepare_conversation_for_ingest`, or `judge_reparsed_conversation`
+    /// with a misaligned session) and every test that READS them takes this
+    /// lock; readers additionally assert DELTAS, so a writer that has not
+    /// been converted yet makes the assertion stale rather than wrong.
+    static GLOBAL_COUNTER_TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// R1-N26 (任务书 #129): producer-side twin of `DISCONNECT_TEST_COUNTER`
+    /// for the *prepare-failure* path specifically. `spawn_connector_producer`
+    /// has two arms that used to discard their `ScanError` send result with
+    /// `let _ =` (the local-sources callback and the `additional_scan_roots`
+    /// one): with the consumer already gone, the producer kept scanning every
+    /// remaining root for nothing. This fixture makes prepare fail -- a
+    /// `File`-sourced conversation whose source path does not exist, so
+    /// `attach_raw_mirror_capture` fails with NotFound -- and counts
+    /// `scan_with_callback` invocations, so the COUNT is the judge of whether
+    /// the producer stopped: 1 = stopped at the first failed send, 2 = went on
+    /// to scan the next root.
+    static PREPARE_FAILURE_DISCONNECT_SCAN_CALLS: Mutex<Option<Arc<AtomicUsize>>> = Mutex::new(None);
+    static PREPARE_FAILURE_DISCONNECT_SOURCE_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    struct PrepareFailureDisconnectConnector;
+
+    impl PrepareFailureDisconnectConnector {
+        fn conv() -> NormalizedConversation {
+            let source_path = PREPARE_FAILURE_DISCONNECT_SOURCE_PATH
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("prepare-failure disconnect test source path should be configured");
+            let mut conv = norm_conv(Some("prepare-failure-disconnect"), vec![norm_msg(0, 1_000)]);
+            conv.source_path = source_path;
+            conv
+        }
+    }
+
+    impl Connector for PrepareFailureDisconnectConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec!["fixture".to_string()],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(vec![Self::conv()])
+        }
+
+        fn scan_with_callback(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let counter = PREPARE_FAILURE_DISCONNECT_SCAN_CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .expect("prepare-failure disconnect test counter should be configured");
+            counter.fetch_add(1, Ordering::Relaxed);
+            on_conversation(Self::conv())?;
+            Ok(())
+        }
+    }
+
+    fn prepare_failure_disconnect_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(PrepareFailureDisconnectConnector)
     }
 
     #[test]
@@ -24741,9 +26574,10 @@ mod tests {
             ..norm_msg(0, 1_000)
         };
         let conversation = norm_conv(Some("huge"), vec![oversized]);
+        let n = conversation.messages.len();
 
         sender
-            .push(conversation)
+            .push(crate::indexer::exclusion::PreparedConversation { conv: conversation, excluded: vec![None; n] })
             .expect("oversized conversation should still flush even in tests");
 
         match rx
@@ -24759,7 +26593,7 @@ mod tests {
             } => {
                 assert_eq!(connector_name, "gemini");
                 assert_eq!(conversations.len(), 1);
-                assert_eq!(conversations[0].external_id.as_deref(), Some("huge"));
+                assert_eq!(conversations[0].conv.external_id.as_deref(), Some("huge"));
                 assert_eq!(message_count, 1);
                 assert_eq!(
                     byte_reservation,
@@ -24795,8 +26629,9 @@ mod tests {
             }],
         );
 
+        let n = conversation.messages.len();
         sender
-            .push(conversation)
+            .push(crate::indexer::exclusion::PreparedConversation { conv: conversation, excluded: vec![None; n] })
             .expect("pending conversation should fit in the streaming budget");
 
         assert_eq!(
@@ -24820,7 +26655,7 @@ mod tests {
             } => {
                 assert_eq!(connector_name, "codex");
                 assert_eq!(conversations.len(), 1);
-                assert_eq!(conversations[0].external_id.as_deref(), Some("pending"));
+                assert_eq!(conversations[0].conv.external_id.as_deref(), Some("pending"));
                 assert_eq!(message_count, 1);
                 assert_eq!(byte_reservation, expected_bytes);
                 assert_eq!(limiter.bytes_in_flight(), expected_bytes);
@@ -24844,13 +26679,13 @@ mod tests {
         {
             let mut sender = StreamingBatchSender::new(&tx, limiter.clone(), "cursor", false);
             sender
-                .push(norm_conv(
+                .push(prep_conv(norm_conv(
                     Some("unflushed"),
                     vec![NormalizedMessage {
                         content,
                         ..norm_msg(0, 1_000)
                     }],
-                ))
+                )))
                 .expect("pending conversation should reserve bytes");
 
             assert_eq!(limiter.bytes_in_flight(), expected_bytes);
@@ -24877,13 +26712,13 @@ mod tests {
         let expected_bytes = content.len();
 
         sender
-            .push(norm_conv(
+            .push(prep_conv(norm_conv(
                 Some("disconnected"),
                 vec![NormalizedMessage {
                     content,
                     ..norm_msg(0, 1_000)
                 }],
-            ))
+            )))
             .expect("push should only reserve bytes before flush");
         assert_eq!(limiter.bytes_in_flight(), expected_bytes);
 
@@ -25631,6 +27466,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn streaming_consumer_always_dual_writes_lex_docs_regardless_of_strategy() {
         // W2-6 exec36 Task甲3 (control-plane 2026-08-31 ruling, ④判死批准):
         // sibling of `batch_index_always_dual_writes_lex_docs_regardless_of_
@@ -25920,6 +27756,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -25945,6 +27782,359 @@ mod tests {
             Some(1_100),
             "a post-scan error must not strand the streaming connector watermark past a deferred conversation"
         );
+    }
+
+    /// R2-B1 (任务书 #119a): builds a minimal, discoverable (real
+    /// connector-auto-discovery, not `watch_once_paths`) codex rollout
+    /// fixture and returns its path, for the streaming/batch/watch
+    /// terminal-state tests below -- the three existing `capture_failed_*`
+    /// judgments in `tests/w6_exclusion_ingest.rs` all go through
+    /// `watch_once_paths` instead, which is a DIFFERENT code path
+    /// (`targeted_watch_once_only_run` skips the shared streaming/batch
+    /// scan block entirely -- R2-B1's report: "三条捕获失败判例...全部...落在
+    /// --watch-once 这条非默认路径, 生产默认路径零覆盖"), so they cannot stand
+    /// in for these.
+    fn write_r2_b1_codex_fixture(codex_home: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let session = codex_home.join(format!("sessions/2026/07/17/rollout-{name}.jsonl"));
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            format!(
+                "{{\"timestamp\":\"2026-07-17T01:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{name}\",\"cwd\":\"/tmp/project\"}}}}\n{{\"timestamp\":\"2026-07-17T01:00:01.000Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"this session will fail to capture\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        session
+    }
+
+    fn r2_b1_message_row_count(db_path: &std::path::Path) -> i64 {
+        FrankenStorage::open(db_path).unwrap().raw().query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0)).unwrap()
+    }
+
+    /// R2-B1 member "streaming": a plain `cass index` run (`CASS_STREAMING_INDEX`
+    /// unset/"1", the default) whose only discoverable session fails
+    /// capture/prepare must return `Err` -- pre-fix, `scan_had_errors` was
+    /// only ever consulted for watermark/meta-persistence decisions and the
+    /// function fell through to `Ok(())` via `close_storage_after_index`,
+    /// so the CLI would have reported `"success":true` and exited 0 with
+    /// zero rows landed for that session.
+    #[test]
+    #[serial]
+    fn streaming_capture_failure_returns_err_not_ok() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-streaming");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let result = run_index(
+            super::IndexOptions {
+                no_ingest: false,
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        assert!(result.is_err(), "a streaming run with a capture-failed session must return Err, not Ok: {result:?}");
+        assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
+    }
+
+    /// N09 (任务书 #131): a watch-once cycle whose ONLY source fails in the
+    /// capture stage ends with `prepared_convs` empty, so the cycle hits the
+    /// `conv_count == 0` early `continue` -- which sat BEFORE the block that
+    /// copies the run counters into the public stats. The run itself reports
+    /// the failure (Err), but `IndexingStats::capture_failed` kept whatever it
+    /// had before (0), i.e. the machine-readable "how many captures failed"
+    /// was blanked on exactly the cycle where every capture failed.
+    #[test]
+    #[serial]
+    fn watch_once_all_capture_failures_are_counted_in_stats_negative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("08")
+            .join("rollout-n09-all-capture-fail.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"n09 fixture\"}]}}\n",
+        )
+        .unwrap();
+
+        let to_delete = session.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let progress = std::sync::Arc::new(super::IndexingProgress::default());
+        let result = run_index(
+            super::IndexOptions {
+                no_ingest: false,
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                watch_once_paths: Some(vec![session.clone()]),
+                db_path: data_dir.join("agent_search.db"),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "fastembed".to_string(),
+                progress: Some(std::sync::Arc::clone(&progress)),
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        let capture_failed = progress
+            .stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capture_failed;
+        assert!(
+            capture_failed >= 1,
+            "a cycle whose every capture failed must disclose capture_failed >= 1 in the public stats (run result: {result:?})"
+        );
+    }
+
+    /// R2-B1 member "batch" (`CASS_STREAMING_INDEX=0`): the SAME
+    /// `scan_had_errors` variable and the SAME unconditional-`Ok` terminal
+    /// return this fix touches are shared between `run_streaming_index` and
+    /// `run_batch_index` (mod.rs's non-watch scan dispatch is a single
+    /// `if streaming_index_enabled() { .. } else { .. }` feeding one
+    /// function-scope `scan_had_errors`), so this is the same code path
+    /// under the other toggle, not an independent implementation to audit
+    /// separately.
+    #[test]
+    #[serial]
+    fn batch_capture_failure_returns_err_not_ok() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-batch");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "0");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let result = run_index(
+            super::IndexOptions {
+                no_ingest: false,
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        assert!(result.is_err(), "a batch (CASS_STREAMING_INDEX=0) run with a capture-failed session must return Err, not Ok: {result:?}");
+        assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
+    }
+
+    /// R2-B1 regression check (任务书 #119d R3-N7 纠正): this test calls the
+    /// CURRENT (fixed) `run_index` exactly once and asserts the resulting
+    /// `Err`'s formatted message contains both "capture/prepare" and "index
+    /// run" -- i.e. it checks the bail message names the failure kind AND
+    /// the run context, not a generic string. It does **not** switch to the
+    /// old unconditional-`Ok` implementation, and it does not call
+    /// `streaming_capture_failure_returns_err_not_ok` (a different test) --
+    /// this test's body only calls `run_index` once and checks its error
+    /// message, nothing else. (A `#[test]` fn is still an ordinary function
+    /// and CAN be called directly like any other; that would just make its
+    /// assertions part of the caller's own pass/fail, not spawn a second,
+    /// independent test-framework result -- this test's body does not do
+    /// that either way.) The original doc comment here claimed both of
+    /// those things; neither is true of what the test body actually does,
+    /// so it overstated this test's evidentiary weight. The real manual mutation verification
+    /// (reverting the fix and confirming `streaming_capture_failure_returns_
+    /// err_not_ok` goes red) was done once, by hand, during development,
+    /// and is recorded in `W6_ARTIFACTS/r2fix-mission119a-report.md` -- this
+    /// test's own pass/fail is not a re-run of that mutation and must not be
+    /// read as one.
+    #[test]
+    #[serial]
+    fn streaming_capture_failure_err_message_names_the_failure_not_generic() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-msg");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let result = run_index(
+            super::IndexOptions {
+                no_ingest: false,
+                full: false,
+                watch: false,
+                force_rebuild: false,
+                db_path: db_path.clone(),
+                data_dir: data_dir.clone(),
+                semantic: false,
+                embedder: "hash".to_string(),
+                progress: None,
+                watch_once_paths: None,
+                watch_interval_secs: 30,
+            },
+            None,
+        );
+        set_prepare_fault_hook(None);
+
+        let err = result.expect_err("must be Err");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("capture/prepare") && message.contains("index run"),
+            "bail message must name the failure kind and the run context, not a generic string: {message:?}"
+        );
+    }
+
+    /// R2-B1 member "watch" (startup scan only, N4's per-cycle retry
+    /// semantics untouched): a plain `--watch` invocation whose STARTUP
+    /// scan (shared with the non-watch path above, run before entering the
+    /// long-lived `watch_sources` loop) fails capture/prepare must return
+    /// `Err` and never enter the loop -- pre-fix, the startup scan's
+    /// `scan_had_errors` was silently dropped once control reached the
+    /// `if opts.watch || ...` branch, and the function only ever returned
+    /// `Ok(())` once the (never-entered-here, post-fix) loop exited.
+    #[test]
+    #[serial]
+    fn watch_startup_scan_capture_failure_returns_err_before_entering_loop() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = home.join(".codex");
+        let session = write_r2_b1_codex_fixture(&codex_home, "r2-b1-watch");
+
+        let _home_guard = set_env("HOME", home.to_str().unwrap());
+        let _codex_guard = set_env("CODEX_HOME", codex_home.to_str().unwrap());
+        let _xdg_data_guard = set_env("XDG_DATA_HOME", tmp.path().join("xdg-data").to_str().unwrap());
+        let _xdg_config_guard = set_env("XDG_CONFIG_HOME", tmp.path().join("xdg-config").to_str().unwrap());
+        let _ignore_sources_guard = set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+        let _streaming_guard = set_env("CASS_STREAMING_INDEX", "1");
+        // R2-B1 diagnostic (control-plane-directed triage before touching
+        // product code): `--watch`'s startup scan enables the anti-#251
+        // "recent write window" (streaming producer config's
+        // `enable_recent_write_window = opts.watch && ...`) that DEFERS any
+        // session modified within the last 120s (default) to a later watch
+        // cycle rather than risk reading a partial write. A freshly-written
+        // test fixture is always inside that window -- without disabling it
+        // here, `should_skip_active_session_source` returns early (skip,
+        // not capture, not error) before the session ever reaches
+        // `prepare_conversation_for_ingest`, making this judgment vacuous
+        // regardless of the fix under test. Confirmed empirically: with the
+        // window enabled, `scan_had_errors` stayed `false` and
+        // `inserted_conversations` stayed `0` -- the session was silently
+        // deferred, not captured and not failed.
+        let _write_window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+
+        let to_delete = session;
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == to_delete.as_path() {
+                std::fs::remove_file(&to_delete).ok();
+            }
+        })));
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let db_path = data_dir.join("db.sqlite");
+        let opts = super::IndexOptions {
+            no_ingest: false,
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "hash".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+        // `run_index(watch=true)` blocks forever inside `watch_sources`'s
+        // long-lived loop if the startup-scan failure does NOT short-circuit
+        // before it (the pre-fix bug this test guards against). Run it on
+        // its own thread and bound the wait with `recv_timeout` so a
+        // regression fails this test loudly instead of hanging the whole
+        // suite -- if it times out, the spawned thread is abandoned still
+        // running (std::thread has no cancellation), which is an accepted
+        // cost of a red result here, never a green one.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_index(opts, None);
+            let _ = done_tx.send(result.is_err());
+        });
+        let returned_is_err = done_rx.recv_timeout(std::time::Duration::from_secs(20));
+        set_prepare_fault_hook(None);
+
+        match returned_is_err {
+            Ok(is_err) => assert!(is_err, "a --watch run whose startup scan capture-fails must return Err before entering the watch loop, not Ok"),
+            Err(_) => panic!(
+                "run_index(watch=true) did not return within 20s -- it entered the long-lived watch loop instead of bailing on the startup scan's capture failure (pre-fix behavior)"
+            ),
+        }
+        assert_eq!(r2_b1_message_row_count(&db_path), 0, "the capture-failed session must not land any rows");
     }
 
     /// Guard-pinning test (codex R10 P2): with ZERO deferrals the explicit
@@ -25990,6 +28180,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -26067,6 +28258,7 @@ mod tests {
 
         run_index(
             super::IndexOptions {
+                no_ingest: false,
                 full: false,
                 watch: false,
                 force_rebuild: false,
@@ -26400,10 +28592,12 @@ mod tests {
         })
         .collect();
 
+        let prepared_conversations: Vec<crate::indexer::exclusion::PreparedConversation> =
+            conversations.iter().cloned().map(prep_conv).collect();
         let outcome = ingest_non_watch_batch_with_oom_split(
             &storage,
             &data_dir,
-            &conversations,
+            &prepared_conversations,
             &progress,
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             true,
@@ -27589,6 +29783,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -27671,6 +29866,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -27714,6 +29910,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -27775,6 +29972,7 @@ mod tests {
         ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -27858,6 +30056,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -27909,6 +30108,7 @@ mod tests {
             ensure_fts_schema(&storage);
             let progress = Arc::new(IndexingProgress::default());
             let opts = IndexOptions {
+                no_ingest: false,
                 full: false,
                 force_rebuild: false,
                 watch: false,
@@ -27975,10 +30175,21 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
+        // T2b (任务书 #114): `DeferredBatchConnector` now needs a real
+        // backing file for its canned conversation's `source_path` --
+        // `attach_raw_mirror_capture` (now hard-fails on a missing file)
+        // reads and hashes these bytes, but the connector's `scan()` itself
+        // ignores the file's content entirely (returns canned data
+        // regardless), so any non-empty content suffices.
+        let source_path = tmp.path().join("deferred-batch-source.jsonl");
+        std::fs::write(&source_path, b"{}\n").unwrap();
+        *DEFERRED_BATCH_SOURCE_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(source_path);
+
         let db_path = data_dir.join("db.sqlite");
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            no_ingest: false,
             full: true,
             force_rebuild: false,
             watch: false,
@@ -28050,6 +30261,12 @@ mod tests {
         *DISCONNECT_TEST_COUNTER
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(counter.clone());
+        // T2b (任务书 #114): real backing file so `attach_raw_mirror_capture`
+        // (now hard-fails on a missing file) and reparse both succeed --
+        // content is irrelevant, `DisconnectAwareConnector::scan()` ignores it.
+        let source_path = tmp.path().join("disconnect-source.jsonl");
+        std::fs::write(&source_path, b"{}\n").unwrap();
+        *DISCONNECT_TEST_SOURCE_PATH.lock().unwrap_or_else(|e| e.into_inner()) = Some(source_path);
 
         let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
         drop(rx);
@@ -28084,6 +30301,79 @@ mod tests {
         );
 
         *DISCONNECT_TEST_COUNTER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// R1-N26 (任务书 #129): the prepare-failure arms of
+    /// `spawn_connector_producer` must stop the producer when the
+    /// `ScanError` send fails (consumer already gone), not discard the send
+    /// result and keep scanning the remaining roots. The fixture's
+    /// `scan_with_callback` counts its own invocations, so the assertion is
+    /// on the scan count, not on a log line: 1 = the producer returned as
+    /// soon as it learned the consumer was gone, 2 = it went on to scan the
+    /// configured additional root after the failed send.
+    #[test]
+    fn producer_stops_after_prepare_failure_when_scan_error_send_fails() {
+        // This fixture drives a real prepare failure, which increments the
+        // global `capture_failed` counter -- see GLOBAL_COUNTER_TEST_SERIALIZE.
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        *PREPARE_FAILURE_DISCONNECT_SCAN_CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(counter.clone());
+        // Deliberately NOT created: `attach_raw_mirror_capture` reads this
+        // path, so prepare fails with NotFound -- the `Err` arm this test
+        // exists to exercise (not the hook, not the oversized-batch path).
+        let missing_source = tmp.path().join("deleted-source.jsonl");
+        assert!(!missing_source.exists(), "sanity: the source must stay absent");
+        *PREPARE_FAILURE_DISCONNECT_SOURCE_PATH
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(missing_source);
+
+        let (tx, rx) = bounded(STREAMING_CHANNEL_SIZE);
+        drop(rx);
+
+        let handle = spawn_connector_producer(
+            "claude",
+            prepare_failure_disconnect_connector_factory,
+            tx,
+            StreamingProducerConfig {
+                flow_limiter: Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT)),
+                data_dir,
+                additional_scan_roots: vec![ScanRoot::remote(
+                    PathBuf::from("/remote/fixture/claude"),
+                    Origin::remote("fixture-host"),
+                    Some(crate::sources::config::Platform::Linux),
+                )],
+                since_ts: None,
+                local_since_ts_by_connector: Arc::new(HashMap::new()),
+                full_scan_source_ids: Arc::new(HashSet::new()),
+                progress: None,
+                active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
+            },
+        );
+
+        handle
+            .join()
+            .expect("producer should stop cleanly after the consumer disconnect");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "a prepare failure whose ScanError send fails must stop the producer, not leave it \
+             scanning the remaining scan roots for a consumer that is gone"
+        );
+
+        *PREPARE_FAILURE_DISCONNECT_SCAN_CALLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *PREPARE_FAILURE_DISCONNECT_SOURCE_PATH
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -28548,6 +30838,7 @@ mod tests {
                         .messages
                         .iter()
                         .map(|m| crate::model::types::Message {
+                            excluded: None,
                             id: None,
                             idx: m.idx,
                             role: crate::model::types::MessageRole::User,
@@ -28669,6 +30960,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -28738,6 +31030,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -28835,6 +31128,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::MessageRole::User,
@@ -28845,6 +31139,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::MessageRole::Tool,
@@ -28855,6 +31150,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: crate::model::types::MessageRole::Agent,
@@ -28881,6 +31177,7 @@ mod tests {
             metadata_json: serde_json::Value::Null,
             messages: vec![
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 0,
                     role: crate::model::types::MessageRole::System,
@@ -28891,6 +31188,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 1,
                     role: crate::model::types::MessageRole::Other("narrator".into()),
@@ -28901,6 +31199,7 @@ mod tests {
                     snippets: Vec::new(),
                 },
                 crate::model::types::Message {
+                    excluded: None,
                     id: None,
                     idx: 2,
                     role: crate::model::types::MessageRole::User,
@@ -28963,6 +31262,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -29014,39 +31314,53 @@ mod tests {
 
     #[test]
     fn historical_salvage_decision_skips_populated_canonical_db() {
-        assert!(!should_salvage_historical_databases(false, 1, false, false));
+        assert!(!should_salvage_historical_databases(false, 1, false, false, false));
         assert!(!should_salvage_historical_databases(
-            false, 43_678, false, false
-        ));
+            false, 43_678, false, false, false));
     }
 
     #[test]
     fn historical_salvage_decision_keeps_empty_or_rebuilt_storage() {
-        assert!(should_salvage_historical_databases(false, 0, false, false));
-        assert!(should_salvage_historical_databases(true, 0, false, false));
+        assert!(should_salvage_historical_databases(false, 0, false, false, false));
+        assert!(should_salvage_historical_databases(true, 0, false, false, false));
         assert!(should_salvage_historical_databases(
-            true, 43_678, false, false
-        ));
+            true, 43_678, false, false, false));
     }
 
     #[test]
     fn historical_salvage_decision_keeps_populated_canonical_when_more_bundles_are_pending() {
         assert!(should_salvage_historical_databases(
-            false, 43_678, true, false
-        ));
+            false, 43_678, true, false, false));
     }
 
     #[test]
     fn historical_salvage_decision_skips_pending_bundles_during_canonical_only_full_rebuild() {
         assert!(!should_salvage_historical_databases(
-            false, 43_678, true, true
-        ));
+            false, 43_678, true, true, false));
+    }
+
+    /// B05 (任务书 #131): `--no-ingest` suppresses both the bundle discovery
+    /// probe and the salvage itself, whatever the canonical corpus' own
+    /// state says -- a `--no-ingest` run must not import anything.
+    #[test]
+    fn historical_salvage_decision_is_suppressed_by_no_ingest() {
+        assert!(
+            !should_salvage_historical_databases(false, 0, true, false, true),
+            "--no-ingest must suppress salvage even for an empty canonical archive"
+        );
+        assert!(
+            !should_salvage_historical_databases(true, 0, true, false, true),
+            "--no-ingest must suppress salvage even for freshly rebuilt storage"
+        );
+        assert!(
+            !should_probe_pending_historical_bundles(true, true, 0, false, true, true),
+            "--no-ingest must suppress the discovery probe even on the explicit recovery paths"
+        );
     }
 
     #[test]
-    fn pending_historical_bundle_probe_skips_populated_incremental_by_default() {
-        assert!(
-            !should_probe_pending_historical_bundles(false, false, 43_678, false, false),
+    fn pending_historical_bundle_probe_skips_populated_incremental_by_default() {        assert!(
+            !should_probe_pending_historical_bundles(false, false, 43_678, false, false, false),
             "routine populated incremental index must not open historical backup bundles before indexing"
         );
     }
@@ -29054,23 +31368,23 @@ mod tests {
     #[test]
     fn pending_historical_bundle_probe_keeps_recovery_paths() {
         assert!(
-            should_probe_pending_historical_bundles(true, false, 43_678, false, false),
+            should_probe_pending_historical_bundles(true, false, 43_678, false, false, false),
             "--full is an explicit heavy recovery/rebuild path and keeps historical discovery"
         );
         assert!(
-            should_probe_pending_historical_bundles(false, true, 43_678, false, false),
+            should_probe_pending_historical_bundles(false, true, 43_678, false, false, false),
             "freshly rebuilt canonical storage keeps historical discovery"
         );
         assert!(
-            should_probe_pending_historical_bundles(false, false, 0, false, false),
+            should_probe_pending_historical_bundles(false, false, 0, false, false, false),
             "empty canonical archives keep historical discovery so seed recovery still works"
         );
         assert!(
-            should_probe_pending_historical_bundles(false, false, 43_678, false, true),
+            should_probe_pending_historical_bundles(false, false, 43_678, false, true, false),
             "operators can explicitly request populated-incremental historical discovery"
         );
         assert!(
-            !should_probe_pending_historical_bundles(true, true, 0, true, true),
+            !should_probe_pending_historical_bundles(true, true, 0, true, true, false),
             "canonical-only full rebuilds must not broaden into historical salvage"
         );
     }
@@ -29110,6 +31424,7 @@ mod tests {
         watch_once_paths: Option<Vec<std::path::PathBuf>>,
     ) -> IndexOptions {
         IndexOptions {
+            no_ingest: false,
             full: false,
             force_rebuild: false,
             watch: false,
@@ -29298,6 +31613,7 @@ mod tests {
                             .messages
                             .iter()
                             .map(|m| crate::model::types::Message {
+                                excluded: None,
                                 id: None,
                                 idx: m.idx,
                                 role: crate::model::types::MessageRole::User,
@@ -29386,6 +31702,7 @@ mod tests {
                             .messages
                             .iter()
                             .map(|m| crate::model::types::Message {
+                                excluded: None,
                                 id: None,
                                 idx: m.idx,
                                 role: crate::model::types::MessageRole::User,
@@ -29692,6 +32009,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -29719,6 +32037,82 @@ mod tests {
         assert_eq!(message_count, 2);
     }
 
+    /// 任务书 #117③: `reindex_paths_with_semantic_delta` is called exactly once
+    /// per watch/watch-once *cycle* (confirmed by code-path tracing: its three
+    /// call sites are the three mutually-exclusive branches of the single
+    /// `watch_sources` callback, invoked once per debounced cycle -- see the
+    /// `reset_last_index_run_counters()` call added at this function's top).
+    /// Two direct calls to `reindex_paths` here simulate two such cycles of a
+    /// single long-running `--watch` process without needing a real
+    /// filesystem-watcher/timer loop: cycle 1's codex fixture trips anchor 3
+    /// (`codex_host_shell`); cycle 2's fixture has no anchors at all. If the
+    /// per-cycle reset were missing (this test's mutation), cycle 2's snapshot
+    /// would still show cycle 1's hit -- "cumulative across the whole
+    /// process" instead of "视为一次 run" per cycle.
+    #[test]
+    #[serial]
+    fn reindex_paths_zeroes_codex_host_shell_hits_between_watch_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let sessions_dir = tmp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Cycle 1 fixture: idx0 is a real host-shell wrapper (anchor 3).
+        let cycle1_session = sessions_dir.join("rollout-w117-cycle1-hostshell.jsonl");
+        std::fs::write(
+            &cycle1_session,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"# AGENTS.md instructions for X\\nbe nice\\n<environment_context>\\n<cwd>/home/u/project</cwd>\\n</environment_context>\"}]}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"real follow-up\"}]}}\n",
+        )
+        .unwrap();
+
+        // Cycle 2 fixture: a completely different session, no anchors at all
+        // (plain idx0 user message, no environment-context wrapper).
+        let cycle2_session = sessions_dir.join("rollout-w117-cycle2-plain.jsonl");
+        std::fs::write(
+            &cycle2_session,
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"msg_0\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"just a normal question, no wrapper here\"}]}}\n",
+        )
+        .unwrap();
+
+        let opts = |watch_once_path: PathBuf| super::IndexOptions {
+            no_ingest: false,
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![watch_once_path]),
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+        let storage = FrankenStorage::open(&data_dir.join("agent_search.db")).unwrap();
+        let state = Mutex::new(HashMap::new());
+        let storage = Mutex::new(storage);
+
+        // Cycle 1: the host-shell hit must be visible right after this call.
+        let cycle1_opts = opts(cycle1_session.clone());
+        reindex_paths(&cycle1_opts, vec![cycle1_session], &[], &state, &storage, false).unwrap();
+        let (cycle1_hits, _total, _align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(cycle1_hits, 1, "cycle 1's fixture must trip anchor 3 exactly once");
+
+        // Cycle 2: a second, independent call simulating the *next* watch
+        // cycle. Its fixture has zero anchors, so if the reset genuinely runs
+        // once per cycle (not once per whole `run_index` process lifetime),
+        // the snapshot right after this call must show 0, not cycle 1's 1.
+        let cycle2_opts = opts(cycle2_session.clone());
+        reindex_paths(&cycle2_opts, vec![cycle2_session], &[], &state, &storage, false).unwrap();
+        let (cycle2_hits, _total2, _align_failed2) = last_index_run_counters_snapshot();
+        assert_eq!(
+            cycle2_hits, 0,
+            "cycle 2 has no anchors; a genuinely per-cycle reset must show 0 here, not cycle 1's leftover count"
+        );
+    }
+
     #[test]
     #[serial]
     fn run_index_watch_once_reindexes_changed_explicit_codex_path_already_in_db() {
@@ -29740,6 +32134,7 @@ mod tests {
         std::fs::write(&session, initial).unwrap();
 
         let opts = |data_dir: &Path, session: &Path| super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -29798,6 +32193,7 @@ mod tests {
         progress: Arc<IndexingProgress>,
     ) -> super::IndexOptions {
         super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -29864,6 +32260,7 @@ mod tests {
         // populated (F1's fix covers this path) -- exactly why the next
         // step reverts it, rather than trusting that as the test's proof.
         let seed_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -29924,6 +32321,7 @@ mod tests {
         // The real dispatch this bug lived in:
         // `should_try_readonly_canonical_force_rebuild`'s exact condition.
         let force_rebuild_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: true,
@@ -30029,6 +32427,7 @@ mod tests {
         // normal watch-once entry point (not a direct storage call) so the
         // `--full` run below starts from a real populated-DB state.
         let seed_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -30061,6 +32460,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let full_opts = super::IndexOptions {
+            no_ingest: false,
             full: true,
             watch: false,
             force_rebuild: false,
@@ -30137,6 +32537,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let seed_opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -30172,6 +32573,7 @@ mod tests {
         }
 
         let full_opts = super::IndexOptions {
+            no_ingest: false,
             full: true,
             watch: false,
             force_rebuild: false,
@@ -30235,6 +32637,7 @@ mod tests {
             approx_tokens: None,
             metadata_json: serde_json::Value::Null,
             messages: vec![crate::model::types::Message {
+                excluded: None,
                 id: None,
                 idx: 0,
                 role: crate::model::types::MessageRole::User,
@@ -30444,6 +32847,29 @@ mod tests {
         assert_eq!(loaded.get(&ConnectorKind::Gemini), Some(&456));
     }
 
+    /// T2T-2 (任务书 #129): `save_watch_state` writes `data_dir/watch_state.json`,
+    /// so its `create_dir_all(parent)` can be the call that creates
+    /// `data_dir` itself. It now goes through `create_dir_all_durable`;
+    /// this test only pins the functional half (a missing data dir is
+    /// created and the state round-trips) -- durability itself is not
+    /// observable from here and is not claimed as tested.
+    #[test]
+    #[serial]
+    fn save_watch_state_creates_a_missing_data_dir_and_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("nested").join("cass-data");
+        assert!(!data_dir.exists(), "sanity: the data dir must not exist yet");
+
+        let mut state = HashMap::new();
+        state.insert(ConnectorKind::Codex, 123);
+
+        save_watch_state(&data_dir, &state).unwrap();
+
+        assert!(data_dir.is_dir(), "the data dir must have been created by the save");
+        assert!(data_dir.join("watch_state.json").is_file(), "the state file must be written under it");
+        assert_eq!(load_watch_state(&data_dir).get(&ConnectorKind::Codex), Some(&123));
+    }
+
     #[test]
     #[serial]
     fn watch_state_overwrites_existing_file() {
@@ -30558,6 +32984,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -30644,6 +33071,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -30727,6 +33155,7 @@ mod tests {
         let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -30757,6 +33186,317 @@ mod tests {
                 .join("quarantine/watch_ingest_poison.jsonl")
                 .exists(),
             "watch OOM should still be recorded for operator visibility"
+        );
+    }
+
+    /// R2-N4 (任务书 #119c): within ONE watch cycle, conversation A fails
+    /// prepare (its own source file removed right before ITS capture, via
+    /// the existing `PrepareStage::BeforeCapture` fault hook -- #119a's
+    /// established mechanism, not a new one) while conversation B (an
+    /// untouched, distinct file in the same root) succeeds. B's successful
+    /// chunk write must NOT advance `last_indexed_at`/the three
+    /// `last_index.*` counters past their pre-cycle baseline -- pre-fix,
+    /// the persist branch only checked `lexical_update_deferred`, so B's
+    /// chunk silently overwrote the previous successful run's real counts
+    /// even though A's failure happened in the very same cycle.
+    #[test]
+    #[serial]
+    fn watch_reindex_prepare_failure_does_not_clobber_last_index_counters_from_a_successful_sibling() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-n4-clobber");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+
+        let file_a = amp_dir.join("thread-n4-a.json");
+        let file_b = amp_dir.join("thread-n4-b.json");
+        std::fs::write(
+            &file_a,
+            r#"{"id":"thread-n4-a","messages":[{"role":"user","text":"a","createdAt":1700000000000}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &file_b,
+            r#"{"id":"thread-n4-b","messages":[{"role":"user","text":"b","createdAt":1700000001000}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            no_ingest: false,
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.set_last_indexed_at(111).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES \
+                 ('last_index.codex_host_shell_hits', '7'), \
+                 ('last_index.codex_idx0_user_total', '9'), \
+                 ('last_index.event_align_failed', '3')",
+                &[] as &[ParamValue],
+            )
+            .unwrap();
+
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        let file_a_for_hook = file_a.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == file_a_for_hook.as_path() {
+                let _ = std::fs::remove_file(&file_a_for_hook);
+            }
+        })));
+        let result = reindex_paths(&opts, vec![file_a.clone(), file_b.clone()], &roots, &state, &storage, false);
+        set_prepare_fault_hook(None);
+        result.expect("reindex_paths itself must not error -- a prepare failure inside one cycle is a soft, per-conversation skip, not a hard stop");
+
+        let storage = storage.into_inner().unwrap();
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(111),
+            "last_indexed_at must not advance past its pre-cycle baseline when this cycle had a prepare failure"
+        );
+        for (key, expected) in [
+            ("last_index.codex_host_shell_hits", "7"),
+            ("last_index.codex_idx0_user_total", "9"),
+            ("last_index.event_align_failed", "3"),
+        ] {
+            let value: String = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    &crate::storage::api::params![key],
+                    |row| row.get_typed(0),
+                )
+                .unwrap_or_else(|e| panic!("meta key {key} must still exist: {e}"));
+            assert_eq!(value, expected, "meta key {key} must keep its pre-cycle value, not be overwritten by B's successful chunk");
+        }
+
+        // Sanity: B really was ingested this cycle -- the counters not
+        // advancing is not because nothing happened.
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |row| row.get_typed(0))
+            .unwrap();
+        assert!(message_count > 0, "conversation B must have been ingested despite A's prepare failure");
+    }
+
+    /// R3-N1 (任务书 #120b): the OTHER half of R2-N4 above -- that test put
+    /// A and B under the SAME root, so both land in the same `for (kind,
+    /// root, ...) in triggers` loop iteration and share that iteration's
+    /// one `scan_failed` local, which is exactly why it couldn't have
+    /// caught this. Here A and B are under two DIFFERENT root directories
+    /// (still the same `ConnectorKind::Amp`, per control-plane's ruling
+    /// that same-kind-different-root already exercises the bug -- it lives
+    /// in "does a failure survive across trigger loop ITERATIONS", not in
+    /// cross-`ConnectorKind` behavior), so `classify_paths` (keyed by
+    /// `(kind, root.path)`) produces two SEPARATE trigger tuples. Directory
+    /// names are chosen (`amp-a` < `amp-b`) so the deterministic sort added
+    /// alongside this fix (see the comment on `triggers.sort_by` above)
+    /// puts A's trigger BEFORE B's, matching this test's fixture order --
+    /// without that sort this would depend on `HashMap` iteration order.
+    ///
+    /// **Known one-directional limitation (not fixed by this test or this
+    /// batch, control-plane tracked for T6)**: `cycle_had_failure` only
+    /// looks backward -- it can only make a LATER trigger's persist see an
+    /// EARLIER trigger's failure. If the sort order instead put the
+    /// succeeding root before the failing one, the succeeding root's
+    /// persist would still land before the failure is known, and this
+    /// invariant would NOT hold. A fully symmetric "any failure anywhere in
+    /// the cycle blocks every persist in the cycle" guarantee would require
+    /// deferring all persistence to the end of the trigger loop, which
+    /// control-plane ruled out of this batch's scope (it would change the
+    /// deliberate "keep `last_indexed_at` fresh mid-cycle" behavior). This
+    /// test only proves the direction the review actually named: an
+    /// earlier failure is no longer invisible to a later trigger's persist.
+    #[test]
+    #[serial]
+    fn watch_reindex_cross_root_prepare_failure_does_not_clobber_last_index_counters() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-r3n1-cross-root");
+        let amp_dir_a = data_dir.join("amp-a");
+        let amp_dir_b = data_dir.join("amp-b");
+        std::fs::create_dir_all(&amp_dir_a).unwrap();
+        std::fs::create_dir_all(&amp_dir_b).unwrap();
+
+        let file_a = amp_dir_a.join("thread-r3n1-a.json");
+        let file_b = amp_dir_b.join("thread-r3n1-b.json");
+        std::fs::write(
+            &file_a,
+            r#"{"id":"thread-r3n1-a","messages":[{"role":"user","text":"a","createdAt":1700000000000}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &file_b,
+            r#"{"id":"thread-r3n1-b","messages":[{"role":"user","text":"b","createdAt":1700000001000}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            no_ingest: false,
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.set_last_indexed_at(222).unwrap();
+        storage
+            .raw()
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES \
+                 ('last_index.codex_host_shell_hits', '11'), \
+                 ('last_index.codex_idx0_user_total', '13'), \
+                 ('last_index.event_align_failed', '5')",
+                &[] as &[ParamValue],
+            )
+            .unwrap();
+
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        // R3-N1: two SEPARATE roots, same kind -- classify_paths keys its
+        // batch map by (kind, root.path), so this becomes two distinct
+        // trigger tuples in the `for (kind, root, ...) in triggers` loop,
+        // not one trigger covering both files (which is what R2-N4's test
+        // above exercises instead).
+        let roots = vec![
+            (ConnectorKind::Amp, ScanRoot::local(amp_dir_a.clone())),
+            (ConnectorKind::Amp, ScanRoot::local(amp_dir_b.clone())),
+        ];
+
+        let file_a_for_hook = file_a.clone();
+        set_prepare_fault_hook(Some(Box::new(move |stage, path| {
+            if stage == PrepareStage::BeforeCapture && path == file_a_for_hook.as_path() {
+                let _ = std::fs::remove_file(&file_a_for_hook);
+            }
+        })));
+        let result = reindex_paths(&opts, vec![file_a.clone(), file_b.clone()], &roots, &state, &storage, false);
+        set_prepare_fault_hook(None);
+        result.expect("reindex_paths itself must not error -- a prepare failure inside one cycle is a soft, per-conversation skip, not a hard stop");
+
+        let storage = storage.into_inner().unwrap();
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(222),
+            "last_indexed_at must not advance past its pre-cycle baseline when an EARLIER root in \
+             this cycle had a prepare failure, even though a LATER root's own trigger iteration \
+             succeeded cleanly"
+        );
+        for (key, expected) in [
+            ("last_index.codex_host_shell_hits", "11"),
+            ("last_index.codex_idx0_user_total", "13"),
+            ("last_index.event_align_failed", "5"),
+        ] {
+            let value: String = storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    &crate::storage::api::params![key],
+                    |row| row.get_typed(0),
+                )
+                .unwrap_or_else(|e| panic!("meta key {key} must still exist: {e}"));
+            assert_eq!(
+                value, expected,
+                "meta key {key} must keep its pre-cycle value, not be overwritten by root B's \
+                 own clean trigger iteration"
+            );
+        }
+
+        // Sanity: B really was ingested this cycle in its own trigger --
+        // the counters not advancing is not because nothing happened.
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |row| row.get_typed(0))
+            .unwrap();
+        assert!(message_count > 0, "conversation B (a different root's own trigger) must have been ingested despite root A's earlier prepare failure this cycle");
+    }
+
+    /// R2-N4 (任务书 #119c) atomicity variant: `last_indexed_at` and the
+    /// three `last_index.*` counters must land in ONE transaction on the
+    /// WATCH path too -- R1-N17 (#118b) already proved this for the
+    /// non-watch `persist_final_index_run_metadata` path; this reuses the
+    /// exact same SQL-trigger fault-injection technique (no new hook) to
+    /// prove the watch path (a separate call site, fixed in this same
+    /// commit) now has the same guarantee. A successful single-conversation
+    /// cycle (no prepare failures) is used so the assertion isolates the
+    /// atomicity question from the `scan_failed` gate above.
+    #[test]
+    #[serial]
+    fn watch_reindex_rolls_back_last_indexed_at_when_counters_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("watch-n4-atomicity");
+        let amp_dir = data_dir.join("amp");
+        std::fs::create_dir_all(&amp_dir).unwrap();
+
+        let file_a = amp_dir.join("thread-n4-atomic.json");
+        std::fs::write(
+            &file_a,
+            r#"{"id":"thread-n4-atomic","messages":[{"role":"user","text":"a","createdAt":1700000000000}]}"#,
+        )
+        .unwrap();
+
+        let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
+        let opts = super::IndexOptions {
+            no_ingest: false,
+            full: false,
+            watch: true,
+            force_rebuild: false,
+            db_path: data_dir.join("agent_search.db"),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_once_paths: None,
+            watch_interval_secs: 30,
+        };
+
+        let storage = FrankenStorage::open(&opts.db_path).unwrap();
+        storage.set_last_indexed_at(222).unwrap();
+        storage
+            .raw()
+            .execute_batch(
+                "CREATE TRIGGER n4_atomicity_guard BEFORE INSERT ON meta \
+                 WHEN NEW.key LIKE 'last_index.%' \
+                 BEGIN SELECT RAISE(FAIL, 'induced failure for N4 watch-path atomicity test'); END;",
+            )
+            .unwrap();
+
+        let state = std::sync::Mutex::new(std::collections::HashMap::new());
+        let storage = std::sync::Mutex::new(storage);
+        let roots = vec![(ConnectorKind::Amp, ScanRoot::local(amp_dir))];
+
+        // The induced trigger failure surfaces as an `Err` from the
+        // ephemeral-writer closure, which `reindex_paths` propagates (this
+        // is a hard storage error, not a soft prepare/scan skip).
+        let result = reindex_paths(&opts, vec![file_a.clone()], &roots, &state, &storage, false);
+        assert!(result.is_err(), "the induced meta-write failure must surface as an error, not be swallowed");
+
+        let storage = storage.into_inner().unwrap();
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(222),
+            "last_indexed_at must roll back to its pre-call value when the same-transaction \
+             counters write fails on the watch path"
         );
     }
 
@@ -30794,6 +33534,7 @@ mod tests {
         let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -30874,6 +33615,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -30960,6 +33702,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -31048,6 +33791,7 @@ mod tests {
 
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "600");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -31194,6 +33938,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -31265,6 +34010,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31356,6 +34102,7 @@ mod tests {
         let _active_guard = set_env("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS", &active_paths);
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31438,6 +34185,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600");
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -31499,17 +34247,20 @@ mod tests {
             }
         }
 
-        let mut convs = vec![
+        let mut convs: Vec<crate::indexer::exclusion::PreparedConversation> = vec![
             conv("/tmp/c", "c", Some(30)),
             conv("/tmp/a", "a", None),
             conv("/tmp/b", "b", Some(10)),
-        ];
+        ]
+        .into_iter()
+        .map(prep_conv)
+        .collect();
 
         sort_watch_conversations_for_watermark(&mut convs);
 
         let ordered: Vec<_> = convs
             .iter()
-            .map(|conv| conv.external_id.as_deref().unwrap())
+            .map(|conv| conv.conv.external_id.as_deref().unwrap())
             .collect();
         assert_eq!(ordered, vec!["a", "b", "c"]);
     }
@@ -31559,6 +34310,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: true,
             force_rebuild: false,
@@ -31671,6 +34423,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31723,6 +34476,7 @@ mod tests {
         std::fs::write(&amp_file, "not valid json").unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31806,6 +34560,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31873,6 +34628,7 @@ mod tests {
 
         let progress = Arc::new(IndexingProgress::default());
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -31943,6 +34699,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -32062,6 +34819,7 @@ mod tests {
         save_watch_state(&data_dir, &persisted_state).unwrap();
 
         let opts = super::IndexOptions {
+            no_ingest: false,
             full: false,
             watch: false,
             force_rebuild: false,
@@ -32453,57 +35211,929 @@ mod tests {
         assert_eq!(large_claude.messages[0].extra, raw_extra);
     }
 
+    /// R2-N16⑤ (任务书 #129): the `#[ignore]`d test this replaces sized a
+    /// sparse ZERO-BYTE file to `CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES`
+    /// and asserted compaction ran. The reparse step added later cannot parse
+    /// a sparse file, so it had been asserting nothing since -- it was kept
+    /// as a repro fixture, not as acceptance. This is the regression it stood
+    /// in for, with real parseable codex JSONL: the SAME session, once above
+    /// the threshold and once below it, through the real
+    /// `prepare_conversation_for_ingest`. Comparing the two extra key SETS is
+    /// what pins the size threshold -- asserting only "compaction happened"
+    /// would also pass for a build that compacts unconditionally.
     #[test]
-    fn prepare_conversation_for_ingest_compacts_large_codex_batch_extras() {
+    fn prepare_conversation_for_ingest_compacts_a_real_large_codex_session_but_not_a_small_one() {
+        fn write_codex_rollout(dir: &Path, name: &str, filler_bytes: usize) -> PathBuf {
+            let sessions = dir.join(".codex").join("sessions").join("2026").join("09");
+            std::fs::create_dir_all(&sessions).expect("mkdir .codex/sessions/2026/09");
+            let path = sessions.join(name);
+            let events = [
+                serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_0","role":"user","content":[{"type":"input_text","text":"hello from a real codex session"}]}}).to_string(),
+                serde_json::json!({"type":"response_item","payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"x".repeat(filler_bytes)}]}}).to_string(),
+            ];
+            std::fs::write(&path, events.join("\n") + "\n").expect("write codex fixture");
+            path
+        }
+
+        /// The id the connector itself derives for this file -- the reparse
+        /// inside `prepare_conversation_for_ingest` reconstructs the same
+        /// path shape, so this is the id that must match (R1-N5's identity
+        /// check), and deriving it here keeps the fixture honest rather than
+        /// hardcoding a shape that could drift.
+        fn derived_external_id(source_path: &Path) -> String {
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let ctx = crate::connectors::ScanContext::with_roots(
+                source_path.parent().expect("fixture has a parent").to_path_buf(),
+                vec![ScanRoot::local(source_path.to_path_buf())],
+                None,
+            );
+            let mut conversations = connector.scan(&ctx).expect("scan the real fixture");
+            assert_eq!(conversations.len(), 1, "the fixture must parse into exactly one session");
+            conversations
+                .remove(0)
+                .external_id
+                .expect("the codex connector derives an external_id from this path shape")
+        }
+
+        fn prepare_fixture(source_path: &Path, data_dir: &Path) -> NormalizedConversation {
+            let connector = crate::connectors::codex::CodexConnector::new();
+            let external_id = derived_external_id(source_path);
+            let mut conv = norm_conv(Some(&external_id), vec![norm_msg(0, 100)]);
+            conv.agent_slug = "codex".to_string();
+            conv.source_path = source_path.to_path_buf();
+            prepare_conversation_for_ingest(
+                data_dir,
+                "codex",
+                &connector,
+                &Origin::local(),
+                None,
+                CaptureSourceKind::File(source_path.to_path_buf()),
+                conv,
+            )
+            .expect("a real, parseable codex session must prepare -- capture AND reparse both succeed")
+            .conv
+        }
+
+        fn extra_keys(conv: &NormalizedConversation) -> std::collections::BTreeSet<String> {
+            conv.messages
+                .iter()
+                .filter_map(|message| message.extra.as_object())
+                .flat_map(|object| object.keys().cloned().collect::<Vec<_>>())
+                .collect()
+        }
+
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let source_path = temp.path().join("rollout-large.jsonl");
-        std::fs::File::create(&source_path)
-            .expect("create sparse source")
-            .set_len(CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES)
-            .expect("size sparse source");
 
-        let mut conv = norm_conv(Some("codex-large-batch"), vec![norm_msg(0, 100)]);
-        conv.agent_slug = "codex".to_string();
-        conv.source_path = source_path;
-        conv.messages[0].extra = serde_json::json!({
-            "payload": {
-                "delta": "duplicated raw codex event payload"
-            },
-            "response": {
-                "model": "gpt-5.4"
-            },
-            "cass": {
-                "event_line": 42
+        let large = write_codex_rollout(temp.path(), "rollout-pr6-large-extras.jsonl", 17 * 1024 * 1024);
+        let large_size = std::fs::metadata(&large).expect("stat the large fixture").len();
+        assert!(
+            large_size >= CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES,
+            "sanity: the large fixture must clear the threshold; it is {large_size} bytes"
+        );
+        let small = write_codex_rollout(temp.path(), "rollout-pr6-small-extras.jsonl", 64);
+
+        let large_keys = extra_keys(&prepare_fixture(&large, &data_dir));
+        let small_keys = extra_keys(&prepare_fixture(&small, &data_dir));
+
+        assert!(
+            !large_keys.is_empty() && !small_keys.is_empty(),
+            "both sessions must yield at least one message extra; large={large_keys:?} small={small_keys:?}"
+        );
+        assert!(
+            large_keys.is_subset(&small_keys),
+            "indexer-side compaction may only REMOVE keys, never add one; large={large_keys:?} small={small_keys:?}"
+        );
+        assert!(
+            large_keys.len() < small_keys.len(),
+            "a session above the compact threshold must drop the raw envelope keys a below-threshold one keeps; \
+             large={large_keys:?} small={small_keys:?}"
+        );
+    }
+
+    /// R3-N5 (任务书 #129): the A/B/C batch judge, through the production
+    /// persist entry point. Three conversations go into ONE batch; B's
+    /// excluded marker has an illegal `fingerprint_blake3`.
+    ///   - A and C must land, B must not;
+    ///   - the batch must report exactly one skip, naming B's position and
+    ///     its source path;
+    ///   - the raw-mirror db link recorded for A and for C must carry THAT
+    ///     conversation's own id. This is the trap the ledger called out:
+    ///     `record_persisted_raw_mirror_db_links` pairs conversations with
+    ///     outcomes POSITIONALLY, so skipping B without also dropping it from
+    ///     the conversation side silently attributes C's outcome to B (and
+    ///     shifts everything after it) -- a silent data-attribution bug, not
+    ///     a failure.
+    #[test]
+    #[serial]
+    fn batched_insert_skips_only_the_conversation_with_an_unusable_fingerprint() {
+        use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef, PreparedConversation};
+
+        const ENV_KEY: &str = "CASS_INDEXER_BEGIN_CONCURRENT";
+        // R3-N5 (任务书 #129, control plane's second finding): the persist
+        // entry has TWO production paths and the skip must hold on both. The
+        // begin-concurrent one is selected by a PROCESS-GLOBAL env var that
+        // other `#[serial]` tests in this module set (`set_env`, :18538+), so
+        // reading the ambient value made this test exercise whichever path a
+        // neighbour happened to leave behind -- under parallelism that is how
+        // the unfixed concurrent path produced its red. This test now pins
+        // the var itself for each half (`#[serial]` keeps those in-process
+        // setters out of its window) and restores it afterwards.
+        let previous_env = std::env::var(ENV_KEY).ok();
+
+        for (path_label, concurrent) in [("serial", false), ("begin-concurrent", true)] {
+            let temp = TempDir::new().expect("tempdir");
+            let data_dir = temp.path().join("cass-data");
+            std::fs::create_dir_all(&data_dir).expect("create data dir");
+            let storage = crate::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
+                .expect("open storage");
+
+            let mut convs: Vec<PreparedConversation> = Vec::new();
+            for (label, illegal) in [("a", false), ("b", true), ("c", false)] {
+                let source_path = temp.path().join(format!("rollout-r3n5-{label}.jsonl"));
+                std::fs::write(&source_path, format!("{{\"type\":\"message\",\"text\":\"{label}\"}}\n"))
+                    .expect("write source");
+                let mut conv = norm_conv(Some(&format!("r3-n5-{label}")), vec![norm_msg(0, 1_000)]);
+                conv.agent_slug = "codex".to_string();
+                conv.source_path = source_path;
+                inject_provenance(&mut conv, &Origin::local());
+                attach_raw_mirror_capture(&data_dir, &mut conv).expect("raw-mirror capture");
+                let marker = illegal.then(|| ExcludedMarker {
+                    reason: ExclusionReason::CassRecall,
+                    rule_version: 1,
+                    bytes: 4,
+                    sha256: "a".repeat(64),
+                    // Illegal: not hex, not 32 bytes -- the shape R2-B7
+                    // turned from a process abort into an `Err`.
+                    fingerprint_blake3: "zz".to_string(),
+                    anchor: ExclusionAnchor::default(),
+                    src: None,
+                    parse_error: None,
+                    raw: RawRef {
+                        blob: "blobs/blake3/ab/abcd.raw".into(),
+                        idx: 0,
+                        event_key: "ek-0".into(),
+                        blocks: vec![0],
+                    },
+                });
+                convs.push(PreparedConversation { conv, excluded: vec![marker] });
             }
-        });
 
-        prepare_conversation_for_ingest(&data_dir, "codex", &Origin::local(), None, &mut conv);
+            // Pin the var for the persist call ONLY, then restore at once:
+            // it is process-global, and tests outside this module's serial
+            // lock can still be persisting while this one runs. A few
+            // hundred milliseconds of leak is exactly how the un-fixed
+            // concurrent path produced its parallel red -- the same window,
+            // in the other direction, must not be opened by this test.
+            match concurrent {
+                true => unsafe { std::env::set_var(ENV_KEY, "1") },
+                false => unsafe { std::env::remove_var(ENV_KEY) },
+            }
+            let outcome = persist::persist_conversations_batched_with_raw_mirror_links(
+                &storage,
+                &data_dir,
+                &convs,
+                LexicalPopulationStrategy::IncrementalInline,
+                false,
+            );
+            match &previous_env {
+                Some(value) => unsafe { std::env::set_var(ENV_KEY, value) },
+                None => unsafe { std::env::remove_var(ENV_KEY) },
+            }
+            let outcome = outcome.unwrap_or_else(|error| {
+                panic!("[{path_label}] a batch is not failed by one unusable excluded fingerprint: {error:#}")
+            });
 
-        let extra = &conv.messages[0].extra;
-        assert_eq!(
-            extra
-                .pointer("/cass/model")
-                .and_then(serde_json::Value::as_str),
-            Some("gpt-5.4")
+            assert_eq!(
+                outcome.skipped_conversations.len(),
+                1,
+                "[{path_label}] exactly the illegal conversation must be reported as skipped: {:?}",
+                outcome.skipped_conversations
+            );
+            let skipped = &outcome.skipped_conversations[0];
+            assert_eq!(
+                skipped.index,
+                1,
+                "[{path_label}] the skip must carry its own position in the input slice"
+            );
+            assert_eq!(
+                skipped.external_id.as_deref(),
+                Some("r3-n5-b"),
+                "[{path_label}] the skip must name its session"
+            );
+            assert!(
+                skipped.source_path.contains("rollout-r3n5-b.jsonl"),
+                "[{path_label}] the skip must name the session it dropped: {skipped:?}"
+            );
+            assert_eq!(outcome.inserted_conversations, 2, "[{path_label}] A and C must both land");
+
+            let conversation_id_for = |external_id: &str| -> Option<i64> {
+                storage
+                    .raw()
+                    .query_row_map(
+                        "SELECT id FROM conversations WHERE external_id = ?1",
+                        &[ParamValue::from(external_id)],
+                        |row| row.get_typed::<i64>(0),
+                    )
+                    .ok()
+            };
+            let a_id = conversation_id_for("r3-n5-a")
+                .unwrap_or_else(|| panic!("[{path_label}] A must be in the database"));
+            let c_id = conversation_id_for("r3-n5-c")
+                .unwrap_or_else(|| panic!("[{path_label}] C must be in the database"));
+            assert!(
+                conversation_id_for("r3-n5-b").is_none(),
+                "[{path_label}] B's rows must not be in the database at all"
+            );
+
+            // The capture itself leaves a placeholder link with a null
+            // conversation id, so the assertion looks at every NON-NULL id the
+            // manifest ended up carrying.
+            let db_link_conversation_ids = |conv: &PreparedConversation| -> Vec<i64> {
+                let relative = conv.conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
+                    .as_str()
+                    .expect("manifest relative path")
+                    .to_string();
+                let manifest: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(data_dir.join("raw-mirror/v1").join(relative)).expect("read manifest"),
+                )
+                .expect("manifest json");
+                manifest["db_links"]
+                    .as_array()
+                    .expect("db_links array")
+                    .iter()
+                    .filter_map(|link| link["conversation_id"].as_i64())
+                    .collect()
+            };
+            assert_eq!(
+                db_link_conversation_ids(&convs[0]),
+                vec![a_id],
+                "[{path_label}] A's manifest must record A's conversation id, and only that"
+            );
+            assert_eq!(
+                db_link_conversation_ids(&convs[2]),
+                vec![c_id],
+                "[{path_label}] C's manifest must record C's OWN conversation id -- a positional shift from B's skipped outcome would put B's or A's id here"
+            );
+        }
+
+    }
+
+
+    #[test]
+    fn prepare_conversation_for_ingest_logical_source_skips_capture_and_judgment() {
+        // Records one `capture_na` -- see GLOBAL_COUNTER_TEST_SERIALIZE.
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 任务书 #117④: `CaptureSourceKind::Logical` is pub(crate), so a
+        // black-box `tests/w6_exclusion_ingest.rs` case can't construct it --
+        // this is the "对照" the mission asks for, driven inline instead.
+        //
+        // `data_dir` is deliberately never created: if the `Logical` branch
+        // ever mistakenly fell through to `attach_raw_mirror_capture` (the
+        // `File` branch's capture step), that call would fail fast on the
+        // missing directory and this test would see `Err`, not `Ok`. Seeing
+        // `Ok` with an untouched `data_dir` is therefore proof capture was
+        // never attempted, not just an assumption about the `match` arm.
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data-never-created");
+
+        let conv = norm_conv(Some("logical-src"), vec![norm_msg(0, 100)]);
+        let original_content = conv.messages[0].content.clone();
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &codex_connector,
+            &Origin::local(),
+            None,
+            CaptureSourceKind::Logical,
+            conv,
+        )
+        .expect("Logical source must succeed without touching data_dir");
+
+        assert!(
+            prepared.excluded.iter().all(Option::is_none),
+            "capture_na: Logical sources skip judgment entirely, so every \
+             marker slot must be None"
         );
         assert_eq!(
-            extra.pointer("/cass/event_line"),
-            Some(&serde_json::json!(42))
+            prepared.conv.messages[0].content, original_content,
+            "Logical sources must not be touched by redaction/exclusion"
         );
-        assert!(extra.get("payload").is_none());
-        assert!(extra.get("response").is_none());
+    }
+
+    /// R1-N4 (任务书 #118a): `attach_raw_mirror_capture` attaches `record`
+    /// to the FIRST parse's `conv.metadata`; the reparse step's `conv =
+    /// reparsed` then discards that object entirely by replacing it with a
+    /// fresh scan of the scratch file that was never attached. Without
+    /// re-attaching after reparse, the persisted conversation's
+    /// `metadata.cass.raw_mirror` is missing and
+    /// `record_persisted_raw_mirror_db_link` early-returns, leaving the
+    /// manifest's `db_links` stale for every normal (non-restore) ingest.
+    #[test]
+    fn prepare_conversation_for_ingest_reattaches_raw_mirror_metadata_after_reparse() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118a-n4.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        // R1-N5 (任务书 #118b): the first parse's `external_id` must match
+        // what the real codex connector derives when it rescans this same
+        // fixture's ancestor path (`sessions_dir`-relative, extension
+        // stripped) -- otherwise the new reparse-identity check added for
+        // N5 rejects this fixture as a mismatch before N4's own assertion
+        // ever runs.
+        let mut conv = norm_conv(Some("2026/09/rollout-w118a-n4"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        let expected_external_id = conv.external_id.clone();
+        let expected_agent_slug = conv.agent_slug.clone();
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        // R1-N5 (任务书 #118b) explicit coverage: this is the real codex
+        // path-shape (`.codex/sessions/YYYY/MM/rollout-*.jsonl`) case N5's
+        // identity check depends on being byte-stable across first parse
+        // and reparse (see the safety-dependency comment on R-E-34 at the
+        // call site) -- assert it directly rather than relying only on
+        // `prepare` not having returned `Err` above (which N4's own
+        // assertion below doesn't touch at all).
         assert_eq!(
-            conv.metadata.pointer("/cass/origin/source_id"),
-            Some(&serde_json::json!("local"))
+            prepared.conv.external_id, expected_external_id,
+            "a real codex session's external_id must reparse to the identical value, not just \"prepare succeeded\""
+        );
+        assert_eq!(prepared.conv.agent_slug, expected_agent_slug);
+
+        assert!(
+            prepared.conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes").is_some(),
+            "raw_mirror metadata must survive the `conv = reparsed` reassignment: {:?}",
+            prepared.conv.metadata
+        );
+    }
+
+    /// R2-N2 (任务书 #119c): a single workspace-rewrite mapping's provenance
+    /// (`metadata.cass.workspace_original`, the PRE-rewrite value) must
+    /// survive the `conv = reparsed` reassignment -- pre-fix, the reparse
+    /// branch called `apply_workspace_rewrite` a SECOND time against the
+    /// already-rewritten `reparsed.workspace`, found "no change" (single
+    /// mapping, already at its fixed point), and never recorded the
+    /// provenance at all.
+    #[test]
+    fn prepare_conversation_for_ingest_preserves_workspace_original_after_reparse_single_mapping() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w119c-n2-single.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w119c-n2-single"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        conv.workspace = Some(PathBuf::from("/remote/projects/app"));
+
+        let mut root = crate::connectors::ScanRoot::local(sessions_dir);
+        root.workspace_rewrites = vec![crate::sources::config::PathMapping::new("/remote", "/local")];
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert_eq!(
+            prepared.conv.workspace,
+            Some(PathBuf::from("/local/projects/app")),
+            "final workspace must be the single-mapping rewrite result"
         );
         assert_eq!(
-            conv.metadata.pointer("/cass/raw_mirror/blob_size_bytes"),
-            Some(&serde_json::json!(
-                CODEX_INDEXER_EXTRA_COMPACT_THRESHOLD_BYTES
-            ))
+            prepared.conv.metadata.pointer("/cass/workspace_original").and_then(serde_json::Value::as_str),
+            Some("/remote/projects/app"),
+            "workspace_original metadata must survive reparse, not be silently dropped because \
+             the reparse's second apply_workspace_rewrite call saw an already-rewritten \
+             (no-op) value: {:?}",
+            prepared.conv.metadata
         );
+    }
+
+    /// R2-N2 (任务书 #119c) chained-mapping variant: pre-fix, calling
+    /// `apply_workspace_rewrite` a second time against the reparsed
+    /// conversation could match a SECOND mapping the already-rewritten
+    /// value happens to satisfy, applying an unintended extra
+    /// transformation the first parse never actually produced.
+    #[test]
+    fn prepare_conversation_for_ingest_does_not_double_rewrite_workspace_after_reparse_chained_mapping() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w119c-n2-chained.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w119c-n2-chained"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        conv.workspace = Some(PathBuf::from("/remote/projects/app"));
+
+        let mut root = crate::connectors::ScanRoot::local(sessions_dir);
+        root.workspace_rewrites = vec![
+            crate::sources::config::PathMapping::new("/remote", "/local"),
+            crate::sources::config::PathMapping::new("/local", "/archive"),
+        ];
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert_eq!(
+            prepared.conv.workspace,
+            Some(PathBuf::from("/local/projects/app")),
+            "must stop at the FIRST parse's rewrite result (/remote -> /local); a second, \
+             unintended application of /local -> /archive must not happen just because reparse \
+             re-derived the rewrite against its own output"
+        );
+        assert_eq!(
+            prepared.conv.metadata.pointer("/cass/workspace_original").and_then(serde_json::Value::as_str),
+            Some("/remote/projects/app"),
+            "workspace_original must be the TRUE original (/remote/...), not the intermediate \
+             /local/... a second rewrite pass would have recorded: {:?}",
+            prepared.conv.metadata
+        );
+    }
+
+    /// R1-N5 (任务书 #118b) mutation/negative: if the source file were
+    /// replaced with an unrelated session's content between the first scan
+    /// and this capture/reparse, the single-session branch used to accept
+    /// whatever `connector.scan()` produced on the scratch copy
+    /// unconditionally -- `raw.event_key`/`raw.blocks` on any marker
+    /// produced from it would then describe a completely different
+    /// conversation. The first parse's own `external_id` ("totally-
+    /// different-session") deliberately does NOT match what the real codex
+    /// connector derives from this fixture's ancestor path
+    /// ("2026/09/rollout-w118b-n5"), simulating exactly that mismatch.
+    #[test]
+    fn prepare_conversation_for_ingest_rejects_reparse_identity_mismatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118b-n5.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("totally-different-session"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let err = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect_err("a first-parse identity that the reparse doesn't reproduce must be rejected, not silently accepted");
+        assert!(
+            err.0.contains("reparse identity mismatch"),
+            "error must name the mismatch, got: {}",
+            err.0
+        );
+    }
+
+    /// R1-N5 (任务书 #118b) positive: the first parse's `workspace` must
+    /// survive `conv = reparsed`, not be silently re-derived from whatever
+    /// the connector infers scanning the scratch copy. This fixture's raw
+    /// codex event has no `cwd`/`environment_context` at all, so a real
+    /// reparse derives no workspace of its own -- if the first-parse value
+    /// weren't explicitly preserved, it would come out `None` here instead
+    /// of the original `/original/first-parse/workspace`.
+    #[test]
+    fn prepare_conversation_for_ingest_preserves_first_parse_workspace_after_reparse() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118b-n5-workspace.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w118b-n5-workspace"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+        conv.workspace = Some(PathBuf::from("/original/first-parse/workspace"));
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+            .expect("prepare should succeed against a real, parseable codex fixture");
+
+        assert_eq!(
+            prepared.conv.workspace,
+            Some(PathBuf::from("/original/first-parse/workspace")),
+            "first parse's workspace must survive reparse, not be re-derived from the scratch scan"
+        );
+    }
+
+    /// R1-N8 (任务书 #118b): a broken `excluded_context_paths.toml` must
+    /// fail the whole ingest of the session loudly, not be swallowed and
+    /// silently replaced by the built-in default (wider) rule set.
+    /// Control-plane 裁定 2026-09-07 (N8 待裁项): exit-code plumbing is out
+    /// of this mission's mod.rs-only scope (no `CliError` downcast
+    /// mechanism exists anywhere in this crate -- `grep -rn
+    /// "downcast_ref::<CliError>" src/` is empty, and `run_index`'s own
+    /// callers in lib.rs don't preserve a specific numeric code either), so
+    /// this only asserts `prepare_conversation_for_ingest` returns `Err`
+    /// naming the failure, not a process exit code.
+    ///
+    /// `#[serial]`: mutates the process-wide `XDG_CONFIG_HOME` env var,
+    /// which `ExcludedContextPaths::load()` (and `SourcesConfig::load()`)
+    /// read from any thread; serializes against every other `#[serial]`
+    /// test in this crate the same way `reindex_paths_zeroes_codex_host_
+    /// shell_hits_between_watch_cycles` above already does for its own
+    /// global-state mutation.
+    #[test]
+    #[serial]
+    fn prepare_conversation_for_ingest_fails_loud_on_broken_excluded_context_paths_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let xdg_config_home = temp.path().join("xdg-config");
+        let config_dir = xdg_config_home.join("cass");
+        std::fs::create_dir_all(&config_dir).expect("mkdir xdg config dir");
+        std::fs::write(config_dir.join("excluded_context_paths.toml"), "memory_files = [this is not valid toml")
+            .expect("write broken config");
+
+        let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        }
+
+        let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
+        std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
+        let source_path = sessions_dir.join("rollout-w118b-n8.jsonl");
+        let line = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
+        })
+        .to_string();
+        std::fs::write(&source_path, line + "\n").expect("write codex fixture");
+
+        let mut conv = norm_conv(Some("2026/09/rollout-w118b-n8"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "codex".to_string();
+        conv.source_path = source_path.clone();
+
+        let source_kind = CaptureSourceKind::File(conv.source_path.clone());
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+        let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv);
+
+        unsafe {
+            match &prior_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        let err = result.expect_err("a broken excluded_context_paths.toml must fail the whole ingest, not silently fall back to defaults");
+        assert!(
+            err.0.contains("excluded_context_paths.toml") && err.0.contains("加载失败"),
+            "error must name the config file and that loading it failed, got: {}",
+            err.0
+        );
+    }
+
+    /// R1-N2 (任务书 #118a): a session `title` that is a substring of an
+    /// excluded row's (redacted) content must be cleared -- plan T2 named
+    /// this explicitly (`:16691-16700`), but nothing in the diff ever
+    /// checked `conv.title` against excluded content; the frozen corpus's
+    /// 1,665 codex host-shell titles all satisfy this exact condition.
+    #[test]
+    fn judge_clears_title_that_is_substring_of_excluded_host_shell_content() {
+        use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+
+        let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+        let mut conv = norm_conv(
+            Some("n2-fixture"),
+            vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(0),
+                content: host_shell_text.to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        );
+        conv.agent_slug = "codex".to_string();
+        conv.title = Some("AGENTS.md instructions for X".to_string());
+
+        let events = vec![RawEvent {
+            event_key: "ek1".to_string(),
+            blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
+        }];
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2.raw", &paths_cfg);
+
+        assert!(markers[0].is_some(), "the host-shell row must be excluded (anchor 3)");
+        assert_eq!(conv.title, Some(String::new()), "title matching the excluded row's redacted content must be cleared");
+    }
+
+    /// Sibling to the above: a normal session whose title is NOT a
+    /// substring of any excluded content must be left untouched.
+    #[test]
+    fn judge_leaves_unrelated_title_untouched() {
+        use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+
+        let host_shell_text = "# AGENTS.md instructions for X\nbe nice\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>";
+        let mut conv = norm_conv(
+            Some("n2-negative-fixture"),
+            vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(0),
+                content: host_shell_text.to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        );
+        conv.agent_slug = "codex".to_string();
+        conv.title = Some("Fix the flaky retry test".to_string());
+
+        let events = vec![RawEvent {
+            event_key: "ek1".to_string(),
+            blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
+        }];
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n2neg.raw", &paths_cfg);
+
+        assert!(markers[0].is_some(), "the host-shell row must still be excluded");
+        assert_eq!(
+            conv.title,
+            Some("Fix the flaky retry test".to_string()),
+            "an unrelated title must not be cleared just because SOME row in the session was excluded"
+        );
+    }
+
+    /// R2-N3 (任务书 #119c): a title that is a substring of the excluded
+    /// row's ORIGINAL (pre-redaction) content must still be cleared even
+    /// when that content contains a secret -- pre-fix, the comparison used
+    /// `redactor.redact_text(&pre_redaction_content)` on the right-hand
+    /// side, so the secret substring was scrubbed out of the comparison
+    /// target while `title` (never itself redacted at this point) still
+    /// carried it, and `.contains()` failed, leaving the secret-bearing
+    /// title un-cleared in the database. `AKIAIOSFODNN7EXAMPLE` is AWS's own
+    /// public documentation example access key ID (also used by this
+    /// crate's own `redact_secrets.rs` tests) -- not a real credential.
+    #[test]
+    fn judge_clears_title_containing_secret_from_excluded_content() {
+        use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+
+        let secret_line = "key AKIAIOSFODNN7EXAMPLE here";
+        let host_shell_text = format!(
+            "# AGENTS.md instructions for X\n{secret_line}\n<environment_context>\n<cwd>/home/u/project</cwd>\n</environment_context>"
+        );
+        let mut conv = norm_conv(
+            Some("n3-fixture"),
+            vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(0),
+                content: host_shell_text.clone(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        );
+        conv.agent_slug = "codex".to_string();
+        conv.title = Some(secret_line.to_string());
+
+        let events = vec![RawEvent {
+            event_key: "ek1".to_string(),
+            blocks: vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }],
+        }];
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n3.raw", &paths_cfg);
+
+        assert!(markers[0].is_some(), "the host-shell row must be excluded (anchor 3)");
+        assert_eq!(
+            conv.title,
+            Some(String::new()),
+            "a title containing a secret from the excluded row's original content must still be \
+             cleared, not survive because the redacted comparison target no longer matches it"
+        );
+    }
+
+    /// R1-N16 (任务书 #118b) positive: the codex idx0-user candidate
+    /// denominator must count a session even when its events end up
+    /// misaligned with its messages -- pre-fix, the count only happened
+    /// inside `judge_and_redact_reparsed`'s loop, which
+    /// `judge_reparsed_conversation` never enters at all once alignment
+    /// fails, so a misaligned codex session with a real idx0 user message
+    /// silently vanished from its own denominator.
+    #[test]
+    #[serial]
+    fn judge_reparsed_conversation_counts_codex_idx0_candidate_even_when_alignment_fails() {
+        reset_last_index_run_counters();
+        let mut conv = norm_conv(Some("n16-misaligned-codex"), vec![norm_msg(0, 10), norm_msg(1, 20)]);
+        conv.agent_slug = "codex".to_string();
+        // One event for two messages: `events.len() != conv.messages.len()`,
+        // a genuine claude_code/codex alignment failure.
+        let events = vec![crate::indexer::exclusion::RawEvent { event_key: "ek1".to_string(), blocks: Vec::new() }];
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n16.raw", &paths_cfg);
+
+        assert!(markers.iter().all(Option::is_none), "misaligned session must judge nothing (宁漏勿误)");
+        let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(codex_idx0_user_total, 1, "denominator must count this session's idx0 user message even though alignment failed");
+        assert_eq!(event_align_failed, 1, "a real claude_code/codex misalignment must still be counted as one");
+    }
+
+    /// R2-N7 (任务书 #129): an alignment failure must name the session it
+    /// skipped, not just bump a global counter. The blob here is a REAL
+    /// truncated JSONL file parsed by the real `events_from_blob` (not a
+    /// hand-built `Vec<RawEvent>`): its unparseable trailing line is dropped
+    /// by the per-line parse, so the event count it yields cannot match the
+    /// session's own message count and the session lands in the failure list
+    /// with its identity and both real numbers.
+    #[test]
+    #[serial]
+    fn judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment() {
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_last_index_run_counters();
+        let dir = TempDir::new().unwrap();
+        let blob = dir.path().join("session.jsonl");
+        // Two well-formed events plus a truncated third line.
+        std::fs::write(
+            &blob,
+            concat!(
+                r#"{"uuid":"e1","type":"user","message":{"role":"user","content":[{"type":"text","text":"a"}]}}"#,
+                "\n",
+                r#"{"uuid":"e2","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"b"}]}}"#,
+                "\n",
+                r#"{"uuid":"e3","type":"user","message":{"role":"user","cont"#
+            ),
+        )
+        .unwrap();
+        let events = crate::indexer::exclusion::events_from_blob("claude_code", &blob);
+        assert_eq!(events.len(), 2, "sanity: the truncated line must not parse into an event");
+
+        let mut conv = norm_conv(
+            Some("r2-n7-corrupt-session"),
+            vec![norm_msg(0, 10), norm_msg(1, 20), norm_msg(2, 30)],
+        );
+        conv.agent_slug = "claude_code".to_string();
+        conv.source_path = PathBuf::from("/logs/r2-n7-corrupt-session.jsonl");
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/r2n7.raw", &paths_cfg);
+        assert!(markers.iter().all(Option::is_none), "misaligned session must judge nothing (宁漏勿误)");
+
+        let (_hits, _total, event_align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(event_align_failed, 1);
+        // Containment rather than "the list has exactly one entry": the list
+        // is process-global, so another test's misaligned session must not be
+        // able to break this assertion (see GLOBAL_COUNTER_TEST_SERIALIZE).
+        let failures = last_index_event_align_failures_snapshot();
+        let mine: Vec<&EventAlignFailure> = failures
+            .iter()
+            .filter(|failure| failure.external_id.as_deref() == Some("r2-n7-corrupt-session"))
+            .collect();
+        assert_eq!(mine.len(), 1, "the skipped session must be listed by identity, not just counted: {failures:?}");
+        assert_eq!(mine[0].agent_slug, "claude_code");
+        assert_eq!(mine[0].source_path, "/logs/r2-n7-corrupt-session.jsonl");
+        assert_eq!(mine[0].event_count, 2, "the real (truncated) event count");
+        assert_eq!(mine[0].message_count, 3, "the real message count -- the delta IS the lead");
+
+        reset_last_index_run_counters();
+        assert!(
+            last_index_event_align_failures_snapshot()
+                .iter()
+                .all(|failure| failure.external_id.as_deref() != Some("r2-n7-corrupt-session")),
+            "reset must clear the detail list"
+        );
+    }
+
+    /// R2-N8 (任务书 #129): the report must distinguish "this session's
+    /// source has no backing file at all, so raw-mirror capture and exclusion
+    /// judgment are both inapplicable" (`capture_na`, a legitimate skip) from
+    /// "capture was attempted and failed" (`capture_failed`, a real error).
+    /// The plan's gate asserts exactly this pair against a fixture with one
+    /// real failure.
+    #[test]
+    #[serial]
+    fn prepare_records_capture_na_and_capture_failed_separately() {
+        let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reset_last_index_run_counters();
+        // Delta, not absolute: the counters are process-global, so only what
+        // THIS test added is its business (see GLOBAL_COUNTER_TEST_SERIALIZE).
+        let (capture_na_before, capture_failed_before) = last_index_capture_counters_snapshot();
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let codex_connector = crate::connectors::codex::CodexConnector::new();
+
+        // (a) A connector whose `source_path` is a DB-derived key, never a
+        // real file (R1-N6's `LOGICAL_SOURCE_CONNECTORS`), classified
+        // `Logical` by the scan call site -> capture_na.
+        let logical_conv = norm_conv(Some("r2-n8-logical"), vec![norm_msg(0, 10)]);
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "opencode",
+            &codex_connector,
+            &Origin::local(),
+            None,
+            CaptureSourceKind::Logical,
+            logical_conv,
+        )
+        .expect("a logical source must prepare fine -- capture and judgment are inapplicable");
+
+        // (b) A `File` source that does not exist -> the capture really runs
+        // and really fails -> capture_failed.
+        let missing = temp.path().join("r2-n8-missing.jsonl");
+        let mut failing_conv = norm_conv(Some("r2-n8-failing"), vec![norm_msg(0, 10)]);
+        failing_conv.source_path = missing.clone();
+        prepare_conversation_for_ingest(
+            &data_dir,
+            "codex",
+            &codex_connector,
+            &Origin::local(),
+            None,
+            CaptureSourceKind::File(missing),
+            failing_conv,
+        )
+        .expect_err("a missing source file must fail capture");
+
+        let (capture_na_after, capture_failed_after) = last_index_capture_counters_snapshot();
+        assert_eq!(
+            capture_na_after.saturating_sub(capture_na_before),
+            1,
+            "the logical-source session must count as capture_na (a delta, so a concurrent reset shows up here as 0 rather than as a false pass)"
+        );
+        assert_eq!(
+            capture_failed_after.saturating_sub(capture_failed_before),
+            1,
+            "the missing-file session must count as capture_failed"
+        );
+    }
+
+    /// R1-N16 (任务书 #118b) mutation/negative: a connector with no
+    /// exclusion-judgment support at all (`events_from_blob` always returns
+    /// `Vec::new()` for it) must NOT be counted as an alignment failure just
+    /// because its empty event list doesn't match its non-empty message
+    /// count -- that mismatch is the connector's normal "not applicable"
+    /// shape, not a real claude_code/codex positional-alignment defect.
+    #[test]
+    #[serial]
+    fn judge_reparsed_conversation_does_not_count_event_align_failed_for_connectors_without_structural_facts() {
+        reset_last_index_run_counters();
+        let mut conv = norm_conv(Some("n16-opencode-session"), vec![norm_msg(0, 10)]);
+        conv.agent_slug = "opencode".to_string();
+        let events: Vec<crate::indexer::exclusion::RawEvent> = Vec::new();
+        let paths_cfg = crate::sources::config::ExcludedContextPaths::default();
+        let markers = judge_reparsed_conversation(&mut conv, &events, "blobs/blake3/ab/n16b.raw", &paths_cfg);
+
+        assert!(markers.iter().all(Option::is_none));
+        let (_hits, codex_idx0_user_total, event_align_failed) = last_index_run_counters_snapshot();
+        assert_eq!(event_align_failed, 0, "a connector with no exclusion-judgment support must not count as an alignment failure");
+        assert_eq!(codex_idx0_user_total, 0, "non-codex sessions must not bump the codex-specific denominator");
     }
 
     #[test]
@@ -33626,6 +37256,7 @@ mod tests {
                         .messages
                         .iter()
                         .map(|m| crate::model::types::Message {
+                            excluded: None,
                             id: None,
                             idx: m.idx,
                             role: crate::model::types::MessageRole::User,
@@ -33666,7 +37297,7 @@ mod tests {
         let db_path = tmp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
-        persist_final_index_run_metadata(&storage, &db_path, true, 123, 456).unwrap();
+        persist_final_index_run_metadata(&storage, &db_path, true, 123, 456, false).unwrap();
 
         assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
@@ -33679,7 +37310,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         storage.set_last_scan_ts(123).unwrap();
 
-        persist_final_index_run_metadata(&storage, &db_path, false, 999, 456).unwrap();
+        persist_final_index_run_metadata(&storage, &db_path, false, 999, 456, false).unwrap();
 
         assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
@@ -33751,8 +37382,47 @@ mod tests {
         );
     }
 
+    /// R1-N17 (任务书 #118b) mutation/negative: `last_scan_ts`/
+    /// `last_indexed_at` and the three `last_index.*` run counters must
+    /// land in ONE commit. A trigger that rejects any `meta` row whose key
+    /// starts with `last_index.` forces `persist_last_index_run_meta_
+    /// counters`'s INSERT to fail while leaving `set_last_scan_ts`/
+    /// `set_last_indexed_at`'s own keys (`last_scan_ts`/`last_indexed_at`,
+    /// which don't match that prefix) untouched by the trigger itself --
+    /// pre-fix (three independent autocommitted statements), those two
+    /// writes would already be durably committed by the time the third
+    /// statement fails, so `last_indexed_at` would advance to the new run's
+    /// value despite the write overall failing. Fixed (one `BEGIN
+    /// IMMEDIATE` transaction), the failing third statement rolls the
+    /// whole transaction back via `Tx`'s `Drop`, so neither earlier write
+    /// survives either. `persist_final_index_run_metadata` itself always
+    /// swallows the writer's `Err` into `Ok(())` regardless (Bead zz8ni,
+    /// unrelated to N17), so this asserts the actual DB state, not the
+    /// call's own return value.
+    #[test]
+    fn persist_final_index_run_metadata_rolls_back_last_scan_ts_and_last_indexed_at_when_counters_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.set_last_indexed_at(111).unwrap();
+        storage
+            .raw()
+            .execute_batch(
+                "CREATE TRIGGER n17_atomicity_guard BEFORE INSERT ON meta \
+                 WHEN NEW.key LIKE 'last_index.%' \
+                 BEGIN SELECT RAISE(FAIL, 'induced failure for N17 atomicity test'); END;",
+            )
+            .unwrap();
 
+        let result = persist_final_index_run_metadata(&storage, &db_path, true, 999, 456, true);
 
+        assert!(result.is_ok(), "the outer function always swallows writer errors into Ok (Bead zz8ni), unrelated to N17");
+        assert_eq!(
+            storage.get_last_indexed_at().unwrap(),
+            Some(111),
+            "last_indexed_at must roll back to its pre-call value when the same-transaction counters write fails"
+        );
+    }
 
     #[test]
     fn lexical_rebuild_commit_intervals_keep_initial_slice_bounded_before_first_commit() {

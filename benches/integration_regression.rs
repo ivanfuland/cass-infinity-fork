@@ -85,6 +85,7 @@ fn make_conversation(conv_id: i64, msg_count: i64) -> Conversation {
     let base_ts = 1_700_000_000_000 + conv_id * 100_000;
     let messages: Vec<Message> = (0..msg_count)
         .map(|m| Message {
+            excluded: None,
             id: None,
             idx: m,
             role: if m % 2 == 0 {

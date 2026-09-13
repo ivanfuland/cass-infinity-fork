@@ -141,7 +141,10 @@ fn schema_ensure_fresh_on_empty_v0() {
     let version: i64 =
         storage.raw().query_row_map("PRAGMA user_version;", &[], |row| row.get_typed(0)).unwrap();
     assert_eq!(version, schema::CURRENT_SCHEMA_VERSION);
-    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 5);
+    // PR6 T2a (任务书 #113) bumped CURRENT_SCHEMA_VERSION 5 -> 6
+    // (`messages.excluded` JSONB); this file's own name/purpose (asserting
+    // the v5 chunk-domain DDL shape) is unaffected, only the literal here.
+    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 6);
 }
 
 // =============================================================================

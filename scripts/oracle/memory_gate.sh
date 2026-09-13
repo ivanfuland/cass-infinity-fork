@@ -1,208 +1,1113 @@
 #!/bin/bash
-# T10 (plan v5.1): memory_gate.sh -- the memory door's four-stage runner.
+# #122b-1 (spec v4.5 §四.3 / plan Task 4 Step 4 / parameter-freeze "内存门"
+# row): memory_gate.sh -- the memory door's process-tree gate, replacing the
+# PR4 T10 single-process/absolute-relative-budget form (T12 复盘已判该预算
+# 模型连基线都过不了, retired).
 #
-# Normal mode: memory_gate.sh <shape:a|b|c> <cass_wrapper>
-#   Requires env: RUN_ROOT, GATES, EXAMPLES (matching this PR's run-root
-#   env.sh conventions). Builds the shape's raw fixture once (via
-#   $EXAMPLES/w4_memory_fixture) into $RUN_ROOT/mem-<shape>-fixture, then
-#   runs 4 stages against an isolated data dir $RUN_ROOT/mem-<shape>, each a
-#   fresh background invocation:
+# Measurement object = the cass PROCESS TREE, not one pid. The wrapper
+# under test must `exec` itself into the measured binary (cass-cand.sh does
+# this already), so the pid this script backgrounds via `"$@" &` IS the
+# tree's root. Each poll samples, then sleeps 100ms -- so the cycle is one
+# sample pass plus 100ms, not a fixed 100ms period (R6-N5, #128 T6-a2):
+# measured 169-176ms per cycle on this host, and higher while the machine is
+# loaded, because the /proc sweep is the dominant term. This script does not
+# implement the spec's "阶段短于2个周期用50ms" adaptive-interval exception:
+# that requires knowing a stage's duration before it finishes, which a live
+# single-pass poll cannot; whether a stage is `measured` depends only on
+# `samples>=2 ∧ stage_ms>=200`, both of which this cadence still resolves
+# correctly for any stage lasting >=1 poll period -- 2026-09-11 control-
+# plane approved this reading over the spec's literal adaptive wording.
+# one sample = one pass over /proc/[0-9]*/stat (pure bash builtins, no
+# forked `ps`/`pgrep`/`awk` per sample -- see collect_process_maps below)
+# to rebuild the whole system's pid->ppid map, then a BFS closure from the
+# root pid gives this poll's tree membership. For each tree member still
+# alive, one read of /proc/<pid>/status (again pure bash, no fork) gives
+# VmRSS (summed into this sample's tree_rss) and VmHWM (folded into that
+# pid's running-max, kept in PEAK_PROC_KB even after the pid exits and
+# drops out of /proc, since VmHWM is monotonic and its last reading before
+# exit is real "peak-and-not-yet-reused-since" data).
+#
+# Two limits of what this can see, recorded rather than left implied:
+#   - The tree is the root's descendants *while the root is alive*: once the
+#     root exits, any surviving descendant is neither measured nor waited for
+#     (R6-B3, #128 T6-a2). The object under test here is single-process, so
+#     the root's exit is the end of its work; a wrapper that leaves work
+#     behind would be under-measured from that moment.
+#   - VmHWM is monotonic, which bounds what the CASS_MEMPROBE_LOG
+#     instrumentation can separate: it is only valid for stages that run as
+#     *independent processes*, and on a failed path only the `start` reading
+#     survives -- a per-stage peak inside one process is not available from it
+#     (R6-N8, #128 T6-a2).
+#
+# Normal mode: memory_gate.sh [--collect-baseline] [--stage4-db <path>]
+#   <shape:a|b|c> <cass_wrapper>
+#   Requires env RUN_ROOT, EXAMPLES, XDG_CONFIG_HOME, W6 (W6 holds
+#   memgate-baseline.json, read for the budget unless --collect-baseline).
+#   Builds the shape's fixture once (via $EXAMPLES/w4_memory_fixture, which
+#   also freezes <fixture_dir>/manifest.json) into
+#   $RUN_ROOT/mem-<shape>-fixture, then runs 4 stages against an isolated
+#   data dir $RUN_ROOT/mem-<shape>:
 #     1. index                        (ingest the fixture)
 #     2. index --force-rebuild
 #     3. index --semantic
-#     4. $EXAMPLES/w4_completeness_gate --db <data_dir>/agent_search.db
-#        --json <stage 4 report>
+#     4. $EXAMPLES/w4_completeness_gate --db <stage4 db> --json <report>
+#   Stage 4 always measures against its OWN db (--stage4-db, or
+#   <data_dir>-stage4/agent_search.db by default) -- per parameter-freeze,
+#   stage 4's baseline binary (82cd5f0a) differs from stages 1-3's
+#   (4423e48b) and never shares a measurement unit with them. The
+#   `stage_merge` key that used to be read from the fixture manifest for
+#   combining stages within 1-3 is gone (R6-N4, #128 T6-a2): nothing read it
+#   and the `merged_from` it would have fed is always empty, so there is no
+#   cross-stage merge to describe.
+#   Stage 4 records only; it carries no budget judgement. `--stage4-db` is
+#   also not bound to the fixture's identity: pointing it at a different
+#   (smaller) complete db under the same shape would still be recorded with
+#   this fixture's sha256 and budget blocks. Binding the two belongs with
+#   whatever restores a judgement here (R7-3, #128 T6-a2).
+#   Ingestion amplification is recorded, not fixed: stage 1 normalizes each
+#   message twice (drain's `normalized` plus the `expected_chunks`
+#   re-normalization of the full text), so a 512MiB message keeps two copies
+#   alive at once. Accepted-not-fixed per the T4-F8 ruling (R6-N9, #128
+#   T6-a2) -- this gate reports the peak; it does not judge the mechanism.
 #   Prints one JSON object per stage to stdout (one line each) and to
-#   $RUN_ROOT/mem-<shape>-stage<N>.json, per the interface's report shape:
-#   {shape, stage, pid, startup_rss, min_rss, peak_hwm, max_message_bytes,
-#   pass_absolute, pass_relative}. Exit code = 1 if any stage fails either
-#   judgment criterion (parameter-freeze "内存门" row: absolute PRIMARY,
-#   relative secondary -- both must hold), 0 otherwise.
+#   $RUN_ROOT/mem-<shape>-stage<N>.json:
+#   {shape, stage, pid, peak_tree, peak_proc, last_tree, peak_sample_idx,
+#   samples, stage_ms, measured, merged_from, budget, exit_code,
+#   binary_sha256, fixture_sha256} (bytes throughout, budget/merged_from may
+#   be null/[]). `last_tree` is the tree RSS of the final sample pass and
+#   `peak_sample_idx` the 1-based ordinal of the sample that produced the
+#   peak (0 when nothing was sampled) -- N-回落 (#128 T6-a2 追加), recorded
+#   so a later "judge the fall" rule has the series' endpoints per cell; a
+#   peak alone cannot show a fall. Stage 1's JSON also
+#   carries `ingested_sessions` (session count read from the stage db's
+#   `conversations` table -- the other option the mission text allows,
+#   `cass index --json`'s own field, isn't used because this script never
+#   parses the wrapped binary's stdout for anything else today and adding
+#   that parsing path is exactly the kind of scope growth #122b-1's
+#   boundary order forbids for a single-field readout).
+#   T6-c N07 (任务书 #131 / T7 勘误, Ivan 2026-09-12 裁): normal mode only
+#   RECORDS. The `1.25 x P0 + 256 MiB` budget and its exit-2-on-missing-P0
+#   are retired: a stage is never failed for a peak, a missing P0 baseline is
+#   not a precondition failure, and each cell carries `p0_ratio` (peak over
+#   its P0 cell, null when there is no cell) alongside the two fall keys
+#   (`last_tree`/`peak_tree`, `peak_sample_idx`/`samples`) the control plane
+#   judges the twelve cells by. The four stages are merged into
+#   $RUN_ROOT/memgate-cells.json, keyed `<shape>/<stage>`, written by rename.
+#   Exit code = 1 only when a stage's own process failed (or its ingest
+#   totals disagreed with the manifest, an operator-visible `overall_rc=1`),
+#   2 for a precondition failure (no fixture, wrong hash, an output that
+#   cannot be written, or a result tree already sitting at $RUN_ROOT/mem-<shape>).
+#   `--judge` keeps the old verdict as its own subcommand, and `--selfcheck`
+#   keeps judging the one stage it runs. --collect-baseline additionally
+#   asserts `pgrep -x cargo`/`pgrep -x cass` are both empty before sampling.
 #
-# --selfcheck mode (added for the interface's "门自验两例" -- not part of
-# the plan's literal 4-arg signature, since the two self-checks need to run
-# a stand-in process instead of `<cass_wrapper> index ...`):
-#   memory_gate.sh --selfcheck <max_message_bytes> <startup_rss> -- <binary>
-#   [binary-args...]
+# --selfcheck mode (the interface's own self-test surface, T14-3 /
+# tests/w6_memory_gate_selfcheck.rs's entry point):
+#   memory_gate.sh --selfcheck -- <binary> [binary-args...]
 #   Runs exactly ONE stage against `<binary> [binary-args...]` (no
-#   ingestion, no completeness gate -- the binary itself IS the process
-#   under test), using the given max_message_bytes/startup_rss directly
-#   instead of measuring/reading them from a real fixture+db, and prints the
-#   same per-stage JSON shape (with `shape` and `stage` fixed to
-#   "selfcheck"). Same exit-code convention.
+#   fixture, no ingestion, no completeness gate -- the binary itself IS the
+#   process under test), shape/stage fixed to "selfcheck", budget/
+#   merged_from/binary_sha256/fixture_sha256 all null (there is no P0, no
+#   fixture, and hashing an arbitrary selfcheck binary buys nothing).
+#   Verdict = measured && exit_code==0 (no budget term). Same JSON/exit
+#   convention as normal mode, written to
+#   $RUN_ROOT/memory-selfcheck-$$.json (or /tmp if RUN_ROOT unset).
 #
-# Methodology note (interface text, verbatim): "fork 后立即 50 ms 轮询
-# /proc/<pid>/status: min_rss = min(VmRSS), peak = VmHWM (末次读数, 与
-# /usr/bin/time -v 交叉核)". This script implements the poll-loop half of
-# that; the `/usr/bin/time -v` cross-check is NOT implemented here (left as
-# a documented gap, not silently skipped) -- `peak_hwm` is the last
-# successfully read `VmHWM` value before the process exits (a kernel-
-# monotonic counter, so "last reading before exit" is the true peak *unless*
-# the process allocates, frees, and exits within a single 50ms poll gap,
-# which the interface's own sampling cadence accepts as a known blind spot
-# of external polling, not something this script can close).
+# --judge mode (standalone judgment, for testing "空输入 fail-loud" without
+# a real stage run): memory_gate.sh --judge [--allow-null-budget] < stage.json
+#   Reads one stage-result JSON object from stdin, applies the same
+#   judgment `judge_from_stdin` uses internally, exits 0 (pass) / 1 (fail)
+#   / 2 (empty input, invalid JSON, a field missing, a missing/null budget,
+#   or a field whose type or value is not a valid measurement -- #123 R6-B1:
+#   these are treated as an adversary's input, so `"false"` is not a bool, a
+#   negative peak is not a count, and `measured=true` needs the samples/
+#   stage_ms the emitter's own rule requires). Fail-loud, never defaults.
+#   #124 R7-4: the judged object's own `shape` never decides whether a
+#   budget is required -- `--allow-null-budget` is the caller's statement
+#   that this mode (`--selfcheck`, `--collect-baseline`) has no P0 budget,
+#   and without it a missing or null budget is malformed input. This is also
+#   how run_stage's own judgment
+#   step is implemented (it pipes the JSON it just built through the same
+#   function), so there is exactly one judgment code path.
 set -u
 
 usage() {
-  echo "usage: memory_gate.sh <shape:a|b|c> <cass_wrapper>" >&2
-  echo "       memory_gate.sh --selfcheck <max_message_bytes> <startup_rss> -- <binary> [args...]" >&2
+  echo "usage: memory_gate.sh [--collect-baseline] [--stage4-db <path>] <shape:a|b|c> <cass_wrapper>" >&2
+  echo "       memory_gate.sh --selfcheck -- <binary> [args...]" >&2
+  echo "       memory_gate.sh --judge [--allow-null-budget]   # reads one stage JSON object from stdin" >&2
   exit 2
 }
 
-poll_and_wait() {
-  # $1 = pid to poll; on return, sets globals MIN_RSS_KB and PEAK_HWM_KB
-  # (both in KiB, as /proc/<pid>/status reports VmRSS/VmHWM).
-  local pid="$1"
-  MIN_RSS_KB=""
-  PEAK_HWM_KB=""
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ -r "/proc/$pid/status" ]; then
-      local rss hwm
-      rss=$(awk '/^VmRSS:/{print $2}' "/proc/$pid/status" 2>/dev/null)
-      hwm=$(awk '/^VmHWM:/{print $2}' "/proc/$pid/status" 2>/dev/null)
-      if [ -n "$rss" ]; then
-        if [ -z "$MIN_RSS_KB" ] || [ "$rss" -lt "$MIN_RSS_KB" ]; then
-          MIN_RSS_KB="$rss"
-        fi
-      fi
-      if [ -n "$hwm" ]; then
-        PEAK_HWM_KB="$hwm"
-      fi
-    fi
-    sleep 0.05
+POLL_INTERVAL_S=0.1
+
+# R7-4 (#124): whether a stage result may carry no budget is decided by the
+# mode the caller selected (--selfcheck, --collect-baseline), never by the
+# judged JSON's own fields. Everything else leaves this at 0.
+ALLOW_NULL_BUDGET=0
+
+# T6-c N07-reg (任务书 #131): whether `run_stage` judges a stage's budget.
+# Declared HERE, with the other mode defaults, and NOT next to the normal-mode
+# CLI parse where N07 introduced it: the `--selfcheck` and `--judge` dispatch
+# blocks run BEFORE that parse, and `run_stage` reads this under `set -u`. Left
+# undeclared there, every `--selfcheck` run died with
+# `JUDGE_STAGES: unbound variable` and rc=1 -- AFTER `tee` had already emitted
+# the stage JSON, so the failure looked like a judgment (measured=true,
+# budget=null, exit_code=0, gate rc=1) and only the release-档 selfcheck target
+# noticed. `--judge` is its own subcommand and never reaches `run_stage`.
+JUDGE_STAGES=0
+
+# ---------------------------------------------------------------------
+# Process-tree sampling (no forked ps/pgrep/awk in the poll loop).
+# ---------------------------------------------------------------------
+
+declare -A PPID_OF
+declare -A CHILDREN
+declare -A PEAK_PROC_KB
+
+# One pass over /proc/[0-9]*/stat -> PPID_OF[pid]=ppid, CHILDREN[ppid]="pid1
+# pid2 ...". /proc/<pid>/stat's format is "<pid> (<comm>) <state> <ppid>
+# ..."; comm may itself contain spaces or parens, so this splits on the
+# LAST ") " rather than trusting field position, matching the kernel's own
+# documented escaping convention for this file.
+collect_process_maps() {
+  PPID_OF=()
+  CHILDREN=()
+  local f pid line after ppid
+  for f in /proc/[0-9]*/stat; do
+    [ -r "$f" ] || continue
+    read -r line < "$f" 2>/dev/null || continue
+    pid="${f#/proc/}"
+    pid="${pid%/stat}"
+    after="${line##*) }"   # "<state> <ppid> <pgrp> ..."
+    set -- $after
+    ppid="${2:-0}"
+    PPID_OF["$pid"]="$ppid"
+    CHILDREN["$ppid"]+=" $pid"
   done
-  wait "$pid"
-  return $?
 }
 
-# Judgment (parameter-freeze "内存门" row): both must hold.
-#   absolute: VmHWM <= startup_rss + 2*max_message_bytes + 256MiB
-#   relative: VmHWM - min_VmRSS <= 2*max_message_bytes + 256MiB
-# All arithmetic in bytes; /proc reports KiB, so callers pass *_kb and this
-# converts. Sets PASS_ABSOLUTE / PASS_RELATIVE globals ("true"/"false").
-judge() {
-  local peak_hwm_kb="$1" min_rss_kb="$2" startup_rss_bytes="$3" max_message_bytes="$4"
-  python3 - "$peak_hwm_kb" "$min_rss_kb" "$startup_rss_bytes" "$max_message_bytes" <<'PYEOF'
+# BFS closure of $1's descendants (including $1 itself), one pid per line.
+tree_pids_of() {
+  local root="$1"
+  local -a queue=("$root")
+  local -A seen=(["$root"]=1)
+  local i=0 qpid c
+  while [ "$i" -lt "${#queue[@]}" ]; do
+    qpid="${queue[$i]}"
+    i=$((i + 1))
+    echo "$qpid"
+    for c in ${CHILDREN[$qpid]:-}; do
+      if [ -z "${seen[$c]:-}" ]; then
+        seen["$c"]=1
+        queue+=("$c")
+      fi
+    done
+  done
+}
+
+# Pure-bash read of /proc/<pid>/status's VmRSS/VmHWM lines (kB), no fork.
+# Sets STATUS_VMRSS_KB / STATUS_VMHWM_KB (empty string if unreadable/absent).
+read_status_kb() {
+  STATUS_VMRSS_KB=""
+  STATUS_VMHWM_KB=""
+  local line val
+  while IFS= read -r line; do
+    case "$line" in
+      VmRSS:*)
+        val="${line#VmRSS:}"; val="${val%kB}"; val="${val// /}"
+        STATUS_VMRSS_KB="$val"
+        ;;
+      VmHWM:*)
+        val="${line#VmHWM:}"; val="${val%kB}"; val="${val// /}"
+        STATUS_VMHWM_KB="$val"
+        ;;
+    esac
+  done < "/proc/$1/status" 2>/dev/null
+}
+
+# One sample against $1=root pid: rebuilds the process maps, sums VmRSS
+# across the current tree into SAMPLE_TREE_RSS_KB, folds VmHWM into the
+# (persistent, across-samples) PEAK_PROC_KB per-pid running max.
+# SAMPLE_PID_COUNT = how many tree members were actually readable this
+# sample (0 means the sample caught nothing, e.g. the process had already
+# exited -- callers must not count that as a sample).
+sample_tree() {
+  local root="$1"
+  collect_process_maps
+  local pid sum=0 count=0
+  for pid in $(tree_pids_of "$root"); do
+    [ -r "/proc/$pid/status" ] || continue
+    read_status_kb "$pid"
+    if [ -n "$STATUS_VMRSS_KB" ]; then
+      sum=$((sum + STATUS_VMRSS_KB))
+      count=$((count + 1))
+    fi
+    if [ -n "$STATUS_VMHWM_KB" ]; then
+      local prev="${PEAK_PROC_KB[$pid]:-0}"
+      if [ "$STATUS_VMHWM_KB" -gt "$prev" ]; then
+        PEAK_PROC_KB["$pid"]="$STATUS_VMHWM_KB"
+      fi
+    fi
+  done
+  SAMPLE_TREE_RSS_KB="$sum"
+  SAMPLE_PID_COUNT="$count"
+}
+
+# ---------------------------------------------------------------------
+# Judgment (single code path for both run_stage's internal use and the
+# standalone `--judge` CLI surface).
+# ---------------------------------------------------------------------
+
+# Reads one stage-result JSON object from stdin; exits 0 (pass) / 1 (fail)
+# / 2 (empty input, invalid JSON, missing a required field, or a missing/null
+# budget in a mode that requires one). $1="1" is the caller's statement that
+# this mode has no P0 budget to compare against (`--selfcheck`,
+# `--collect-baseline`); it is never read from the judged object (#124 R7-4).
+judge_from_stdin() {
+  local allow_null_budget="${1:-0}"
+  # NOTE: this must be `python3 -c '<code>'`, NOT `python3 - <<'PYEOF'`.
+  # `python3 -` reads its own PROGRAM from stdin, so a heredoc there
+  # supplies the code and leaves nothing in stdin for `sys.stdin.read()`
+  # to see -- every caller would get a false "empty input". `-c` takes the
+  # code as an argv string instead, leaving the piped JSON on stdin where
+  # `sys.stdin.read()` can actually read it (caught via the --selfcheck
+  # smoke test below, which is why this note exists).
+  python3 -c '
+import json
 import sys
-peak_hwm_kb, min_rss_kb, startup_rss, max_message_bytes = (int(x) for x in sys.argv[1:5])
-peak_hwm = peak_hwm_kb * 1024
-min_rss = min_rss_kb * 1024
-budget = 2 * max_message_bytes + 256 * 1024 * 1024
-pass_absolute = peak_hwm <= startup_rss + budget
-pass_relative = (peak_hwm - min_rss) <= budget
-print(f"{'true' if pass_absolute else 'false'} {'true' if pass_relative else 'false'}")
+
+allow_null_budget = len(sys.argv) > 1 and sys.argv[1] == "1"
+
+raw = sys.stdin.read()
+if not raw.strip():
+    print("judge: empty input", file=sys.stderr)
+    sys.exit(2)
+try:
+    obj = json.loads(raw)
+except json.JSONDecodeError as e:
+    print(f"judge: invalid JSON: {e}", file=sys.stderr)
+    sys.exit(2)
+
+required = ["measured", "exit_code", "peak_tree", "peak_proc"]
+missing = [k for k in required if k not in obj]
+if missing:
+    print(f"judge: missing required field(s): {missing}", file=sys.stderr)
+    sys.exit(2)
+
+def is_int(v):
+    # bool is an int subclass in Python; a JSON `true` is not a count.
+    return isinstance(v, int) and not isinstance(v, bool)
+
+# R6-B1 (control-plane adversarial review of T4, blocker class: false
+# green). The hand-fillable surfaces here (a hand-written P0 entry, or any
+# JSON piped into `--judge`) must be validated as adversarial input, not
+# trusted: `bool(measured)` alone accepted the string `"false"` as true,
+# zero samples and zero stage_ms passed as a valid measurement, negative
+# peaks compared as numbers, and an absent `budget` key silently dropped
+# the budget term (the four reproductions in the review all exited 0).
+# Types are checked before values, and an internally inconsistent object
+# (`measured=true` with fewer than the two samples / 200ms that run_stage
+# itself requires) is malformed input, not a pass.
+measured = obj["measured"]
+exit_code = obj["exit_code"]
+peak_tree = obj["peak_tree"]
+peak_proc = obj["peak_proc"]
+
+if not isinstance(measured, bool):
+    print(f"judge: field measured must be a JSON bool, got {measured!r}", file=sys.stderr)
+    sys.exit(2)
+for name, value in (("exit_code", exit_code), ("peak_tree", peak_tree), ("peak_proc", peak_proc)):
+    if not is_int(value) or value < 0:
+        print(f"judge: field {name} must be a non-negative integer, got {value!r}", file=sys.stderr)
+        sys.exit(2)
+for name in ("samples", "stage_ms"):
+    value = obj.get(name)
+    if value is not None and (not is_int(value) or value < 0):
+        print(f"judge: field {name} must be a non-negative integer, got {value!r}", file=sys.stderr)
+        sys.exit(2)
+if measured and not (is_int(obj.get("samples")) and obj["samples"] >= 2
+                     and is_int(obj.get("stage_ms")) and obj["stage_ms"] >= 200):
+    print(
+        "judge: measured=true requires samples>=2 and stage_ms>=200 (the same rule run_stage uses to set measured)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+# N-回落 (#128 T6-a2 追加): the two keys the "record only, judge the fall" cut
+# needs. Optional in the same way `samples`/`stage_ms` are -- a cell that
+# predates them is not reported -- but one that carries them must be
+# internally consistent: an ordinal cannot exceed the sample count it indexes.
+for name in ("last_tree", "peak_sample_idx"):
+    value = obj.get(name)
+    if value is not None and (not is_int(value) or value < 0):
+        print(f"judge: field {name} must be a non-negative integer, got {value!r}", file=sys.stderr)
+        sys.exit(2)
+if (is_int(obj.get("peak_sample_idx")) and is_int(obj.get("samples"))):
+    picked = obj["peak_sample_idx"]
+    count = obj["samples"]
+    # NOTE: this source reaches Python through the shell, which strips quotes
+    # out of it before the interpreter ever sees them -- so keep every string
+    # literal double-quoted and write no single quote anywhere in this block.
+    # The interpreter here is also 3.10, where an f-string cannot reuse its own
+    # quote character for a nested subscript (PEP 701 is 3.12+) -- hence the
+    # two locals rather than a subscript written inside the f-string.
+    if picked > count:
+        print(
+            f"judge: peak_sample_idx ({picked}) must not exceed samples ({count})",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+# R7-4 (#124): a budget is required unless the *caller* said this mode has
+# none. The old rule read the `shape` field of the judged object, so any
+# hand-written result could declare itself `selfcheck` and drop the budget
+# term -- and an explicit null for a normal shape was accepted as well
+# (the #122b-1 A-ruling left that door open). A missing or null budget is now
+# malformed input in every mode that did not pass --allow-null-budget.
+budget = obj.get("budget")
+if budget is None and not allow_null_budget:
+    print(
+        "judge: stage result carries no budget, and this invocation does not allow one "
+        "(pass --allow-null-budget for a --selfcheck/--collect-baseline run)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if budget is not None and (not is_int(budget) or budget < 0):
+    print(f"judge: field budget must be null or a non-negative integer, got {budget!r}", file=sys.stderr)
+    sys.exit(2)
+
+ok = measured and exit_code == 0
+if budget is not None:
+    ok = ok and max(peak_tree, peak_proc) <= budget
+sys.exit(0 if ok else 1)
+' "$allow_null_budget"
+}
+
+# ---------------------------------------------------------------------
+# JSON assembly (one place, via python3 json.dumps -- never hand-printf'd,
+# since budget/merged_from/binary_sha256/fixture_sha256 can all be null).
+# ---------------------------------------------------------------------
+
+emit_stage_json() {
+  # $1=shape $2=stage $3=pid $4=peak_tree_bytes $5=peak_proc_bytes
+  # $6=last_tree_bytes $7=peak_sample_idx $8=samples $9=stage_ms
+  # $10=measured(true/false) $11=merged_from_csv $12=budget_bytes("" -> null)
+  # $13=exit_code $14=binary_sha256("" -> null) $15=fixture_sha256("" -> null)
+  # $16=p0_bytes (the P0 cell's max(peak_tree,peak_proc); "" -> a null p0_ratio)
+  python3 - "$@" <<'PYEOF'
+import json
+import sys
+
+(shape, stage, pid, peak_tree, peak_proc, last_tree, peak_sample_idx, samples,
+ stage_ms, measured, merged_from_csv, budget, exit_code, binary_sha256,
+ fixture_sha256, p0_bytes) = sys.argv[1:17]
+
+obj = {
+    "shape": shape,
+    "stage": stage,
+    "pid": int(pid),
+    "peak_tree": int(peak_tree),
+    "peak_proc": int(peak_proc),
+    # N-回落 (#128 T6-a2 追加): the last sample pass's tree RSS, and the
+    # 1-based ordinal of the sample that produced the peak (0 = no samples).
+    "last_tree": int(last_tree),
+    "peak_sample_idx": int(peak_sample_idx),
+    "samples": int(samples),
+    "stage_ms": int(stage_ms),
+    "measured": measured == "true",
+    "merged_from": [s for s in merged_from_csv.split(",") if s] if merged_from_csv else [],
+    "budget": None if budget == "" else int(budget),
+    "exit_code": int(exit_code),
+    "binary_sha256": binary_sha256 or None,
+    "fixture_sha256": fixture_sha256 or None,
+    # T6-c N07 (任务书 #131): the door no longer judges the budget -- it
+    # records the peak against the P0 cell it was collected from, and there
+    # is no P0 cell for this (shape, stage) is a fact to record, not a reason
+    # to refuse to run.
+    # R9-N06: a zero (or unparsable) P0 peak must not divide. `p0_for` already
+    # refuses to hand one out, but this is the arithmetic's own guard.
+    "p0_ratio": (
+        None
+        if not p0_bytes or not p0_bytes.lstrip("-").isdigit() or int(p0_bytes) <= 0
+        else round(max(int(peak_tree), int(peak_proc)) / int(p0_bytes), 3)
+    ),
+}
+print(json.dumps(obj))
 PYEOF
 }
 
+# ---------------------------------------------------------------------
+# One stage: background the command, poll its process tree until it
+# exits, judge, emit+tee the JSON, return the judgment's exit code.
+# ---------------------------------------------------------------------
+
 run_stage() {
-  # $1=shape $2=stage_name $3=startup_rss_bytes $4=max_message_bytes $5=out_json -- rest: command to run
-  local shape="$1" stage="$2" startup_rss="$3" max_message_bytes="$4" out_json="$5"
-  shift 5
+  # $1=shape $2=stage $3=budget_bytes("" -> null) $4=merged_from_csv
+  # $5=binary_sha256 $6=fixture_sha256 $7=p0_bytes("" -> null p0_ratio)
+  # $8=out_json -- rest: the command to run
+  local shape="$1" stage="$2" budget="$3" merged_from_csv="$4"
+  local binary_sha256="$5" fixture_sha256="$6" p0_bytes="$7" out_json="$8"
+  shift 8
 
   "$@" &
-  local pid=$!
-  poll_and_wait "$pid"
+  local root_pid=$!
+
+  PEAK_PROC_KB=()
+  local peak_tree_kb=0 samples=0
+  local last_tree_kb=0 peak_sample_idx=0
+  local start_ns end_ns
+  start_ns=$(date +%s%N)
+
+  # R6-B2 (#128 T6-a2): the liveness check runs BEFORE the sample pass, and
+  # `end_ns` is taken at the moment it first reports the root gone. The old
+  # order (sample -> check -> sleep) paid a full /proc sweep for a tree that
+  # had already died, and then took `end_ns` after `wait`. Five runs against
+  # the pre-fix script measured a `sleep 0.12` command as stage_ms = 235 /
+  # 243 / 244 on an idle host and 263 / 287 while a parallel cargo build held
+  # the machine, all with samples=1 -- above this door's own 200ms `measured`
+  # threshold, from a stage that had really finished in 120ms.
+  #
+  # Timed breakdown of one pre-fix run of that command (instrumented copy of
+  # this script; the script itself was not modified):
+  #   sample pass 1   0.6ms ->  69ms   root alive, samples=1
+  #   sleep           100ms
+  #   sample pass 2   170ms -> 241ms   root already dead, samples stays 1
+  #   kill -0 fails   242ms
+  #   wait            1.5ms
+  # `wait` was 1.5ms of those 243ms; the trailing sweep of the dead tree was
+  # the rest, which is why moving `end_ns` alone is not enough and the check
+  # has to come first.
+  #
+  # Residual overshoot bound: <= one poll period, i.e. one sample pass plus
+  # `POLL_INTERVAL_S` (measured 169-176ms per cycle on an unloaded host;
+  # higher while the machine is loaded, since the sweep cost is the dominant
+  # term). The loop can only learn the root is gone at a check, and death is
+  # detected at the first check after it happens.
+  while :; do
+    if ! kill -0 "$root_pid" 2>/dev/null; then
+      end_ns=$(date +%s%N)
+      break
+    fi
+    sample_tree "$root_pid"
+    # N-回落 (#128 T6-a2 追加): the RSS of this final-so-far sample pass.
+    # A peak alone cannot show a fall; this is what a "judge the fall" rule
+    # will need, so it is recorded rather than recomputed later.
+    last_tree_kb="${SAMPLE_TREE_RSS_KB:-0}"
+    if [ "${SAMPLE_PID_COUNT:-0}" -gt 0 ]; then
+      samples=$((samples + 1))
+      if [ "$SAMPLE_TREE_RSS_KB" -gt "$peak_tree_kb" ]; then
+        peak_tree_kb="$SAMPLE_TREE_RSS_KB"
+        peak_sample_idx="$samples"
+      fi
+    fi
+    sleep "$POLL_INTERVAL_S"
+  done
+
+  wait "$root_pid"
   local rc=$?
+  local stage_ms=$(( (end_ns - start_ns) / 1000000 ))
 
-  local peak_hwm_kb="${PEAK_HWM_KB:-0}"
-  local min_rss_kb="${MIN_RSS_KB:-0}"
+  local peak_proc_kb=0 pid
+  for pid in "${!PEAK_PROC_KB[@]}"; do
+    if [ "${PEAK_PROC_KB[$pid]}" -gt "$peak_proc_kb" ]; then
+      peak_proc_kb="${PEAK_PROC_KB[$pid]}"
+    fi
+  done
 
-  # R1-B6 (exec92): rc != 0 or a zero peak_hwm_kb means no real /proc/<pid>/
-  # status sample was ever read for this stage (the command didn't exist,
-  # or exited/crashed before poll_and_wait's first 50ms poll caught a
-  # reading) -- there is no measurement to judge. Feeding a bare 0 into
-  # judge() below trivially satisfies both budget comparisons (0 is never
-  # over budget), so a stage that never ran at all used to report a clean
-  # PASS. `measurement_valid=false` makes that distinguishable from a real
-  # in-budget pass; the stage itself is judged false regardless of what
-  # judge() would have said.
-  local measurement_valid="true"
-  if [ "$rc" -ne 0 ] || [ "$peak_hwm_kb" -eq 0 ]; then
-    measurement_valid="false"
+  local measured="false"
+  if [ "$samples" -ge 2 ] && [ "$stage_ms" -ge 200 ]; then
+    measured="true"
   fi
 
-  local pass_absolute pass_relative
-  if [ "$measurement_valid" = "true" ]; then
-    local verdict
-    verdict=$(judge "$peak_hwm_kb" "$min_rss_kb" "$startup_rss" "$max_message_bytes")
-    pass_absolute=$(echo "$verdict" | awk '{print $1}')
-    pass_relative=$(echo "$verdict" | awk '{print $2}')
-  else
-    pass_absolute="false"
-    pass_relative="false"
-  fi
-
-  local peak_hwm_bytes=$((peak_hwm_kb * 1024))
-  local min_rss_bytes=$((min_rss_kb * 1024))
+  local peak_tree_bytes=$((peak_tree_kb * 1024))
+  local peak_proc_bytes=$((peak_proc_kb * 1024))
+  local last_tree_bytes=$((last_tree_kb * 1024))
 
   local json
-  json=$(printf '{"shape":"%s","stage":"%s","pid":%d,"startup_rss":%d,"min_rss":%d,"peak_hwm":%d,"max_message_bytes":%d,"pass_absolute":%s,"pass_relative":%s,"exit_code":%d,"measurement_valid":%s}' \
-    "$shape" "$stage" "$pid" "$startup_rss" "$min_rss_bytes" "$peak_hwm_bytes" "$max_message_bytes" "$pass_absolute" "$pass_relative" "$rc" "$measurement_valid")
-  echo "$json" | tee "$out_json"
+  json=$(emit_stage_json "$shape" "$stage" "$root_pid" "$peak_tree_bytes" "$peak_proc_bytes" \
+    "$last_tree_bytes" "$peak_sample_idx" "$samples" "$stage_ms" "$measured" "$merged_from_csv" \
+    "$budget" "$rc" "$binary_sha256" "$fixture_sha256" "$p0_bytes")
+  # B12 (任务书 #131): the record IS this door's product. Pre-fix the
+  # `tee`'s exit status was never checked (the header only sets `set -u`), so
+  # a stage whose measurement never reached disk still got judged from the
+  # in-memory JSON and could hand back success -- with T7's record-only
+  # contract that is a lost run reported as a good one. Fail-loud instead.
+  if ! echo "$json" | tee "$out_json"; then
+    echo "memory_gate: cannot write the stage measurement to $out_json; refusing to continue without the record" >&2
+    exit 2
+  fi
 
-  if [ "$measurement_valid" = "true" ] && [ "$pass_absolute" = "true" ] && [ "$pass_relative" = "true" ]; then
-    return 0
+  if [ "$JUDGE_STAGES" -eq 1 ]; then
+    echo "$json" | judge_from_stdin "$ALLOW_NULL_BUDGET"
   else
-    return 1
+    # T6-c N07 (任务书 #131 / T7 勘误): the door RECORDS, it no longer judges
+    # a budget. The only verdict left in normal mode is the measured process'
+    # own exit code -- a stage that ran fine is not made a failure by a peak
+    # the (now retired) formula would have called over-budget.
+    [ "$rc" -eq 0 ]
   fi
 }
 
-max_message_bytes_of_db() {
-  sqlite3 "$1" "SELECT COALESCE(MAX(LENGTH(CAST(content AS BLOB))), 0) FROM messages;"
+# ---------------------------------------------------------------------
+# --selfcheck: one stage, no fixture, no budget.
+# ---------------------------------------------------------------------
+
+run_selfcheck() {
+  local out_json="${RUN_ROOT:-/tmp}/memory-selfcheck-$$.json"
+  run_stage "selfcheck" "selfcheck" "" "" "" "" "" "$out_json" "$@"
 }
 
-startup_rss_from_gates() {
-  python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['startup_rss'])" "$GATES/startup-rss.json"
+# ---------------------------------------------------------------------
+# Normal-mode helpers.
+# ---------------------------------------------------------------------
+
+manifest_field() {
+  # $1=manifest.json path $2=field name
+  python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])" "$1" "$2"
 }
+
+# R6-B4 (#123, control-plane adversarial review of T4): the fixture's own
+# identity, recomputed from the bytes on disk -- every `*.jsonl` under the
+# fixture root, path-sorted, concatenated in that order, one sha256 over
+# the concatenation. This is the *same algorithm* `examples/
+# w4_memory_fixture.rs`'s `fixture_sha256` freezes into manifest.json
+# (`collect_jsonl_files_sorted` + `hasher.update(read(path))` per file);
+# the manifest's recorded value is therefore verified against reality
+# here, never copied on trust. `sort` under `LC_ALL=C` is byte-ordered,
+# matching Rust's `Vec<PathBuf>::sort` for the shared absolute prefix these
+# paths all have.
+fixture_sha256_of() {
+  local dir="$1"
+  find "$dir" -type f -name '*.jsonl' -print0 2>/dev/null \
+    | LC_ALL=C sort -z \
+    | xargs -0 -r cat \
+    | sha256sum | awk '{print $1}'
+}
+
+# Fail-loud (exit 2, never a silent 0) lookup of budget bytes for
+# [shape,stage] from $W6/memgate-baseline.json. Schema assumed (this file
+# does not exist yet -- it's #122b-3's Step 6 deliverable):
+#   {"<shape>": {"<stage>": {"binary_sha": "...", "peak_tree": <bytes>,
+#     "peak_proc": <bytes>, "exit_code": 0, "measured": true,
+#     "max_over_min": <float>, "fixture_sha256": "...",
+#     "samples": <int>, "stage_ms": <int>}}}
+# `fixture_sha256` (R6-B4) is the fourth argument's counterpart: the
+# entry's recorded value must equal the fixture actually measured, or the
+# budget belongs to a different workload.
+# `samples`/`stage_ms` (R7-8) are optional: a cell that carries them is held
+# to the same consistency rule `--judge` applies to a stage result, and one
+# that predates them is reported rather than retro-invalidated (every cell
+# frozen so far carries neither).
+# If #122b-3 lands a different shape, this function is the one place to
+# update.
+budget_bytes_for_stage() {
+  local shape="$1" stage="$2" baseline_json="$3" fixture_sha256="${4:-}"
+  if [ ! -f "$baseline_json" ]; then
+    echo "memory_gate: P0 baseline file not found: $baseline_json (fail-loud, not defaulting to 0 budget)" >&2
+    return 2
+  fi
+  python3 - "$baseline_json" "$shape" "$stage" "$fixture_sha256" <<'PYEOF'
+import json
+import sys
+
+path, shape, stage, fixture_sha256 = sys.argv[1:5]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception as e:
+    print(f"memory_gate: cannot parse P0 baseline {path}: {e}", file=sys.stderr)
+    sys.exit(2)
+entry = (data.get(shape) or {}).get(stage)
+if not entry:
+    print(f"memory_gate: P0 baseline missing entry for shape={shape} stage={stage}", file=sys.stderr)
+    sys.exit(2)
+def is_int(v):
+    # bool is an int subclass in Python; a JSON `true` is not a count.
+    return isinstance(v, int) and not isinstance(v, bool)
+
+# R6-B1: the P0 file is hand-filled (memgate-baseline.json is written by a
+# human copying a collected run's numbers), so its entries get the same
+# adversarial-reading validation `--judge` applies to a stage result:
+# `entry.get("measured")` was a truth test, so a hand-typed string
+# "false" passed as a valid run; `int(...)` coerced a string peak.
+if entry.get("measured") is not True:
+    print(f"memory_gate: P0 baseline entry for {shape}/{stage} is not a valid run (measured must be the JSON boolean true)", file=sys.stderr)
+    sys.exit(2)
+if not is_int(entry.get("exit_code")) or entry.get("exit_code") != 0:
+    print(f"memory_gate: P0 baseline entry for {shape}/{stage} is not a valid run (exit_code must be the integer 0)", file=sys.stderr)
+    sys.exit(2)
+peak_tree = entry.get("peak_tree")
+peak_proc = entry.get("peak_proc")
+if not is_int(peak_tree) or peak_tree < 0 or not is_int(peak_proc) or peak_proc < 0:
+    print(f"memory_gate: P0 baseline entry for {shape}/{stage} has a non-integer or negative peak (peak_tree={peak_tree!r}, peak_proc={peak_proc!r})", file=sys.stderr)
+    sys.exit(2)
+# R7-8 (#128 T6-a2): the P0 file is hand-fillable too, so a cell that
+# *carries* `samples`/`stage_ms` is held to the same consistency rule
+# `--judge` applies to a stage result: claiming measured=true with a sample
+# count or duration below what run_stage requires to set measured is
+# malformed, not a valid budget source.
+#
+# Presence is not required, and that asymmetry with `--judge` is deliberate:
+# the nine frozen cells of memgate-baseline.json (each measured once,
+# 2026-09-11) carry neither key, so requiring them here would make every cell
+# unusable and the door unable to read any budget at all -- feeding such a
+# cell to `--judge` exits 2 with "measured=true requires samples>=2 and
+# stage_ms>=200". Absence is therefore reported on stderr and left
+# unverified; half of the pair is malformed.
+samples = entry.get("samples")
+stage_ms = entry.get("stage_ms")
+if (samples is None) != (stage_ms is None):
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} carries only one of samples/stage_ms (samples={samples!r}, stage_ms={stage_ms!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if samples is None:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} carries no samples/stage_ms (pre-#128 format); its measured flag is checked, the sample/duration rule is not",
+        file=sys.stderr,
+    )
+elif not is_int(samples) or not is_int(stage_ms) or samples < 0 or stage_ms < 0:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} has a non-integer or negative samples/stage_ms (samples={samples!r}, stage_ms={stage_ms!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+elif samples < 2 or stage_ms < 200:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} is measured=true but its samples/stage_ms do not satisfy the rule run_stage uses to set measured (samples={samples}, stage_ms={stage_ms}; requires samples>=2 and stage_ms>=200)",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+# R6-B4: the P0 cells are only meaningful for the workload they were
+# collected on. Without this, shrinking the fixture (fewer/shorter
+# messages) keeps the same shape/stage key and inherits the old budget.
+entry_fixture_sha256 = entry.get("fixture_sha256")
+if not isinstance(entry_fixture_sha256, str) or entry_fixture_sha256 != fixture_sha256:
+    print(
+        f"memory_gate: P0 baseline entry for {shape}/{stage} is not bound to the fixture under test "
+        f"(entry fixture_sha256={entry_fixture_sha256!r}, measured fixture={fixture_sha256!r})",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+p0 = max(peak_tree, peak_proc)
+budget = int(1.25 * p0 + 256 * 1024 * 1024)
+print(budget)
+PYEOF
+}
+
+p0_for() {
+  # $1=shape $2=stage $3=the fixture sha THIS run is measuring. Prints that
+  # cell's max(peak_tree,peak_proc) in bytes, or nothing when there is no
+  # USABLE cell. NEVER exits: T7's record-only contract means a run with no P0
+  # baseline (or with an unusable cell for this shape/stage) still collects its
+  # twelve cells, with `p0_ratio` null.
+  #
+  # R9-N06 (任务书 #132): "the two peak fields are integers" was the whole
+  # test, so a cell collected on a DIFFERENT fixture, or from a run that was
+  # not measured / did not exit 0 / recorded a zero peak, still produced a
+  # `p0_ratio` that read like a valid same-fixture comparison -- and two zero
+  # peaks divided by zero. A cell now has to BE a measurement of this fixture;
+  # when it is not, the reason goes to stderr so a later re-collection can see
+  # which cells went unused.
+  local shape="$1" stage="$2" fixture_sha256="${3:-}"
+  local baseline="${W6:-}/memgate-baseline.json"
+  [ -f "$baseline" ] || return 0
+  python3 - "$baseline" "$shape" "$stage" "$fixture_sha256" <<'PYEOF'
+import json
+import sys
+
+path, shape, stage, fixture_sha256 = sys.argv[1:5]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+entry = (data.get(shape) or {}).get(stage)
+if not isinstance(entry, dict):
+    sys.exit(0)
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def unusable(reason):
+    print(
+        f"memory_gate: P0 cell {shape}/{stage} is not usable ({reason}); "
+        "p0_ratio will be null",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+
+peak_tree = entry.get("peak_tree")
+peak_proc = entry.get("peak_proc")
+if not is_int(peak_tree) or not is_int(peak_proc):
+    unusable("peak_tree/peak_proc are not integers")
+if entry.get("fixture_sha256") != fixture_sha256:
+    unusable(
+        f"fixture_sha256={entry.get('fixture_sha256')!r} != this run's fixture {fixture_sha256!r}"
+    )
+if entry.get("measured") is not True:
+    unusable(f"measured={entry.get('measured')!r}")
+if entry.get("exit_code") != 0:
+    unusable(f"exit_code={entry.get('exit_code')!r}")
+peak = max(peak_tree, peak_proc)
+if peak <= 0:
+    unusable(f"peak={peak} is not positive")
+print(peak)
+PYEOF
+}
+
+assert_sources_toml_only_lists_fixture_root() {
+  # $1=XDG_CONFIG_HOME $2=fixture_dir
+  # T4-F7 (#122b-3): normal mode both exports HOME=$fixture_dir (Claude
+  # Code connector auto-discovery) AND used to require an explicit
+  # [[sources]] entry here -- both discovery paths scanned the same tree,
+  # double-ingesting the fixture (#122b-2 exec112: conversations=2,
+  # messages=20,000 against a 10,000-message manifest). This now asserts
+  # the opposite: sources.toml must declare ZERO sources, so normal mode
+  # relies solely on HOME=$fixture_dir auto-discovery.
+  #
+  # R6-N2 (#123, control-plane adversarial review of T4): the check used
+  # to grep for the literal `[[sources]]` header, which is only one of the
+  # legal spellings -- `sources = [{name="extra", ...}]` (the reviewer's
+  # bypass), `["sources"]`, `[ [ sources ] ]` and outright malformed TOML
+  # all passed it. The file is now parsed as TOML (src/sources/config.rs
+  # reads a `sources: Vec<SourceDefinition>`, so the parsed value -- not
+  # the text -- is what the binary actually sees). `tomllib` is stdlib
+  # only from Python 3.11 and this host's `python3` is 3.10, so the first
+  # interpreter that can import it is used; having none is a fail-loud
+  # exit 2, never a silently skipped isolation check.
+  local xdg="$1" fixture_dir="$2"
+  local toml="$xdg/cass/sources.toml"
+  [ -f "$toml" ] || { echo "memory_gate: $toml not found before running the gate" >&2; return 2; }
+  local toml_py="" candidate
+  for candidate in python3 python3.12 python3.11; do
+    if "$candidate" -c 'import tomllib' 2>/dev/null; then
+      toml_py="$candidate"
+      break
+    fi
+  done
+  if [ -z "$toml_py" ]; then
+    echo "memory_gate: no python3 with tomllib (>=3.11) is on PATH, so $toml cannot be parsed; refusing to run the gate with the sources isolation check skipped" >&2
+    return 2
+  fi
+  "$toml_py" - "$toml" "$fixture_dir" <<'PYEOF'
+import sys
+import tomllib
+
+path, fixture_dir = sys.argv[1:3]
+try:
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+except Exception as e:
+    print(f"memory_gate: cannot parse {path} as TOML: {e}", file=sys.stderr)
+    sys.exit(2)
+sources = data.get("sources")
+if isinstance(sources, list) and sources:
+    names = [s.get("name") if isinstance(s, dict) else s for s in sources]
+    print(
+        f"memory_gate: {path} declares {len(sources)} source(s) {names} -- normal mode relies solely on "
+        f"HOME={fixture_dir} auto-discovery (T4-F7), remove them",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+if sources is not None and not isinstance(sources, list):
+    print(
+        f"memory_gate: {path} declares `sources` as a {type(sources).__name__} (e.g. the [sources] table header), "
+        f"not the list of source tables the real config reads (sources: Vec<SourceDefinition>); remove it",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+PYEOF
+}
+
+ingested_sessions_of() {
+  sqlite3 "$1" "SELECT COUNT(*) FROM conversations;" 2>/dev/null || echo 0
+}
+
+# R7-2 (#124, control-plane adversarial review of #123, blocker class: false
+# green): the frozen manifest's identity has to cover how much of the fixture
+# actually reached the database, not just the bytes on disk. `fixture_sha256`
+# is the sorted concatenation of every `*.jsonl` with no path or length
+# framing, so splitting one session file into a scanned half plus an
+# unscanned `z-unscanned/rest.jsonl` leaves the hash identical while the
+# connector ingests only the scanned half -- a smaller workload would then
+# inherit the bigger fixture's P0 budget. `messages` and `total_bytes` are
+# already frozen in the manifest, and both are read back from the stage db
+# with the same accounting `examples/w4_memory_fixture.rs` used to freeze
+# them (one row per message, `byte_len` content bytes each); measured equal
+# for shapes a/b/c on 2026-09-11. Fail-loud exit 2, the same class as a
+# fixture-hash mismatch: a stage db that does not hold the fixture under test
+# is a precondition failure, not a stage failure.
+check_ingest_totals() {
+  # $1=stage db path $2=manifest.json path
+  local db="$1" manifest="$2"
+  local manifest_messages manifest_total_bytes totals db_messages db_total_bytes
+  manifest_messages=$(manifest_field "$manifest" messages) || return 2
+  manifest_total_bytes=$(manifest_field "$manifest" total_bytes) || return 2
+  if ! totals=$(sqlite3 "$db" "SELECT COUNT(*), COALESCE(SUM(length(CAST(content AS BLOB))), 0) FROM messages;"); then
+    echo "memory_gate: cannot read message totals from $db" >&2
+    return 2
+  fi
+  db_messages="${totals%%|*}"
+  db_total_bytes="${totals##*|}"
+  if [ "$db_messages" = "$totals" ] || [ -z "$db_messages" ] || [ -z "$db_total_bytes" ]; then
+    echo "memory_gate: cannot parse message totals from $db (sqlite3 printed '$totals')" >&2
+    return 2
+  fi
+  if [ "$db_messages" != "$manifest_messages" ] || [ "$db_total_bytes" != "$manifest_total_bytes" ]; then
+    echo "memory_gate: the stage db holds $db_messages message(s) / $db_total_bytes content byte(s), which is not the ingested workload the fixture manifest describes ($manifest_messages message(s) / $manifest_total_bytes content byte(s)) -- refusing to measure a workload the P0 baseline was not collected on" >&2
+    return 2
+  fi
+}
+
+binary_sha256_of() {
+  sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# R7-2 (#124): tests/w6_memory_gate_selfcheck.rs exercises
+# `check_ingest_totals` directly, which means sourcing this file for its
+# functions. Sourcing must not fall through into the dispatch below: its
+# `usage` calls `exit 2`, which would kill the caller's shell instead of
+# handing it the function.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
+# ---------------------------------------------------------------------
+# CLI dispatch.
+# ---------------------------------------------------------------------
 
 if [ "${1:-}" = "--selfcheck" ]; then
-  max_message_bytes="${2:?missing max_message_bytes}"
-  startup_rss="${3:?missing startup_rss}"
-  shift 3
-  if [ "${1:-}" != "--" ]; then
-    usage
-  fi
+  shift
+  [ "${1:-}" = "--" ] || usage
   shift
   [ $# -ge 1 ] || usage
-  out_json="${RUN_ROOT:-/tmp}/memory-selfcheck-$$.json"
-  run_stage "selfcheck" "selfcheck" "$startup_rss" "$max_message_bytes" "$out_json" "$@"
+  # R7-4 (#124): this mode has no P0 and no fixture, so its stage result
+  # legitimately carries a null budget -- said by the caller, not by the
+  # judged JSON.
+  ALLOW_NULL_BUDGET=1
+  # T6-c N07-reg (任务书 #131): `--selfcheck` KEEPS judging the single stage it
+  # runs (the header says so, and `tests/w6_memory_gate_selfcheck.rs` asserts
+  # both directions: a measured, zero-exit stage passes, an unmeasured one
+  # still judges failed). N07's `JUDGE_STAGES` wrapper around `judge_from_stdin`
+  # governs the four-stage driver only, so the normal-mode default stays 0 --
+  # but the selfcheck dispatch runs BEFORE that parse and must say 1 itself.
+  JUDGE_STAGES=1
+  run_selfcheck "$@"
   exit $?
 fi
+
+if [ "${1:-}" = "--judge" ]; then
+  shift
+  # R7-4 (#124): standalone judgment has no stage run to infer the mode
+  # from, so the caller states it. `--allow-null-budget` is the only
+  # argument this surface accepts.
+  if [ "${1:-}" = "--allow-null-budget" ]; then
+    ALLOW_NULL_BUDGET=1
+    shift
+  fi
+  [ $# -eq 0 ] || usage
+  judge_from_stdin "$ALLOW_NULL_BUDGET"
+  exit $?
+fi
+
+# T6-c N07 (任务书 #131 / T7 勘误): normal mode RECORDS, it does not judge.
+# `--judge` stays as its own subcommand for callers that want the old verdict
+# on one stage result, and `--selfcheck` keeps judging the single stage it
+# runs; this switch only governs the four-stage driver. (The default lives in
+# the top-of-file defaults with the other mode switches -- see there.)
+COLLECT_BASELINE=0
+STAGE4_DB=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    # R7-4 (#124): the collection run's own stages have no P0 budget to
+    # compare against; every other mode does.
+    --collect-baseline) COLLECT_BASELINE=1; ALLOW_NULL_BUDGET=1; shift ;;
+    --stage4-db) STAGE4_DB="${2:?missing --stage4-db path}"; shift 2 ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
 
 [ $# -eq 2 ] || usage
 shape="$1"
 cass_wrapper="$2"
 : "${RUN_ROOT:?RUN_ROOT must be set}"
-: "${GATES:?GATES must be set}"
 : "${EXAMPLES:?EXAMPLES must be set}"
+if [ "$COLLECT_BASELINE" -eq 0 ]; then
+  : "${W6:?W6 must be set (holds memgate-baseline.json)}"
+fi
+
+if [ "$COLLECT_BASELINE" -eq 1 ]; then
+  if pgrep -x cargo >/dev/null 2>&1; then
+    echo "memory_gate: --collect-baseline requires no running cargo process" >&2
+    exit 2
+  fi
+  if pgrep -x cass >/dev/null 2>&1; then
+    echo "memory_gate: --collect-baseline requires no running cass process" >&2
+    exit 2
+  fi
+fi
 
 fixture_dir="$RUN_ROOT/mem-${shape}-fixture"
 data_dir="$RUN_ROOT/mem-${shape}"
-rm -rf "$data_dir"
+# T6-c N07 (任务书 #131): this used to `rm -rf` whatever sat at the door's own
+# output path -- including an earlier run's result tree (the T4 `mem-a`/
+# `mem-b`/`mem-c` trees, their fixtures and stage JSONs). A result tree that
+# is still there is the operator's decision, not the gate's.
+if [ -e "$data_dir" ]; then
+  echo "memory_gate: $data_dir already exists; refusing to delete it (rename it aside first, e.g. mv $data_dir $data_dir.bak-$(date +%Y%m%d%H%M%S))" >&2
+  exit 2
+fi
 mkdir -p "$data_dir"
 
 if [ ! -d "$fixture_dir" ]; then
   "$EXAMPLES/w4_memory_fixture" --shape "$shape" --out "$fixture_dir" || exit 2
 fi
+manifest="$fixture_dir/manifest.json"
+[ -f "$manifest" ] || { echo "memory_gate: $manifest missing (fixture must be frozen by w4_memory_fixture)" >&2; exit 2; }
+fixture_sha256=$(manifest_field "$manifest" fixture_sha256) || exit 2
 
-startup_rss=$(startup_rss_from_gates) || exit 2
+# R6-B4: the frozen manifest is a *claim* about the fixture; verify it
+# against the bytes actually on disk before any stage runs. Without this,
+# trimming the fixture's messages keeps the same shape/stage keys -- one
+# conversation, still over 200ms -- and inherits the larger fixture's P0
+# budget, so "same fixture" had no machine-checkable meaning.
+fixture_sha256_measured=$(fixture_sha256_of "$fixture_dir")
+if [ "$fixture_sha256_measured" != "$fixture_sha256" ]; then
+  echo "memory_gate: fixture under $fixture_dir does not match the hash frozen in $manifest (recomputed $fixture_sha256_measured, manifest $fixture_sha256) -- refusing to measure a workload the P0 baseline was not collected on" >&2
+  exit 2
+fi
+
+# #122b-3c: hash the binary the wrapper execs into, not the wrapper shim
+# (a per-run-root constant, so baseline and candidate rounds shared it).
+binary_path="${CASS_CAND_BIN:-$RUN_ROOT/cass-candidate}"
+binary_sha256=$(binary_sha256_of "$binary_path")
+[ -n "$binary_sha256" ] || { echo "memory_gate: cannot hash the binary under test: $binary_path" >&2; exit 2; }
+
+baseline_json="${W6:-}/memgate-baseline.json"
+
+# N07 (任务书 #131): `budget_for` -- the normal-mode wrapper that turned a P0
+# cell into `1.25 x P0 + 256 MiB` and exited 2 when the cell was missing -- was
+# the only caller this change removed. `budget_bytes_for_stage` below is NOT
+# dead: it still validates a hand-filled baseline cell and
+# tests/w6_memory_gate_selfcheck.rs drives it directly.
+
+record_cell() {
+  # $1=shape $2=stage $3=that stage's JSON path. Merges this cell into
+  # $RUN_ROOT/memgate-cells.json -- three shapes x four stages = the door's
+  # twelve cells -- writing a temp file and renaming it into place, so an
+  # interrupted run never leaves a half-written matrix behind.
+  local shape="$1" stage="$2" out_json="$3"
+  local cells="$RUN_ROOT/memgate-cells.json"
+  python3 - "$cells" "$shape" "$stage" "$out_json" <<'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+cells_path, shape, stage, stage_path = sys.argv[1:5]
+data = {}
+if os.path.exists(cells_path):
+    try:
+        with open(cells_path) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"memory_gate: cannot read {cells_path}: {e}", file=sys.stderr)
+        sys.exit(2)
+try:
+    with open(stage_path) as f:
+        cell = json.load(f)
+except Exception as e:
+    print(f"memory_gate: cannot read the stage record {stage_path}: {e}", file=sys.stderr)
+    sys.exit(2)
+data[f"{shape}/{stage}"] = cell
+directory = os.path.dirname(cells_path) or "."
+fd, tmp = tempfile.mkstemp(dir=directory, prefix=".memgate-cells-")
+with os.fdopen(fd, "w") as f:
+    json.dump(data, f, sort_keys=True)
+    f.write("\n")
+os.replace(tmp, cells_path)
+print(f"memory_gate: cells recorded: {len(data)}")
+PYEOF
+}
 
 overall_rc=0
 
 export CASS_DATA_DIR="$data_dir"
 export HOME="$fixture_dir"
 
-run_stage "$shape" "index" "$startup_rss" 0 "$RUN_ROOT/mem-${shape}-stage1.json" \
+assert_sources_toml_only_lists_fixture_root "${XDG_CONFIG_HOME:-}" "$fixture_dir" || exit 2
+
+p0_1=$(p0_for "$shape" index "$fixture_sha256")
+run_stage "$shape" "index" "" "" "$binary_sha256" "$fixture_sha256" "$p0_1" \
+  "$RUN_ROOT/mem-${shape}-stage1.json" \
   "$cass_wrapper" index || overall_rc=1
-max_message_bytes=$(max_message_bytes_of_db "$data_dir/agent_search.db")
 
-run_stage "$shape" "index_force_rebuild" "$startup_rss" "$max_message_bytes" "$RUN_ROOT/mem-${shape}-stage2.json" \
+# Stage 1 has now actually ingested the fixture -- patch ingested_sessions
+# (the mission's "阶段 1 JSON" requirement) into the JSON just written,
+# rather than trying to know it before the stage runs.
+ingested=$(ingested_sessions_of "$data_dir/agent_search.db")
+python3 - "$RUN_ROOT/mem-${shape}-stage1.json" "$ingested" <<'PYEOF'
+import json
+import sys
+
+path, ingested = sys.argv[1], int(sys.argv[2])
+with open(path) as f:
+    obj = json.load(f)
+obj["ingested_sessions"] = ingested
+with open(path, "w") as f:
+    json.dump(obj, f)
+    f.write("\n")
+print(json.dumps(obj))
+PYEOF
+
+# T4-F7 (#122b-3): the fixture generator (examples/w4_memory_fixture.rs R2)
+# writes exactly one session file per shape -- HOME-based auto-discovery
+# must therefore see exactly one session regardless of shape. This is a
+# structural fact of the fixture layout, not a manifest/config value.
+expected_sessions=1
+if [ "$ingested" != "$expected_sessions" ]; then
+  echo "memory_gate: stage 1 ingested_sessions=$ingested, expected=$expected_sessions (T4-F7)" >&2
+  overall_rc=1
+fi
+
+# R7-2 (#124): `ingested_sessions` counts conversations; the fixture's own
+# message count and content-byte total are the two numbers that actually
+# bound the workload the P0 budget was collected on. Stages 2-4 measure the
+# same data dir, so this runs before any of them.
+check_ingest_totals "$data_dir/agent_search.db" "$manifest" || exit 2
+record_cell "$shape" "index" "$RUN_ROOT/mem-${shape}-stage1.json" || exit 2
+
+p0_2=$(p0_for "$shape" index_force_rebuild "$fixture_sha256")
+run_stage "$shape" "index_force_rebuild" "" "" "$binary_sha256" "$fixture_sha256" "$p0_2" \
+  "$RUN_ROOT/mem-${shape}-stage2.json" \
   "$cass_wrapper" index --force-rebuild || overall_rc=1
+record_cell "$shape" "index_force_rebuild" "$RUN_ROOT/mem-${shape}-stage2.json" || exit 2
 
-run_stage "$shape" "index_semantic" "$startup_rss" "$max_message_bytes" "$RUN_ROOT/mem-${shape}-stage3.json" \
+p0_3=$(p0_for "$shape" index_semantic "$fixture_sha256")
+run_stage "$shape" "index_semantic" "" "" "$binary_sha256" "$fixture_sha256" "$p0_3" \
+  "$RUN_ROOT/mem-${shape}-stage3.json" \
   "$cass_wrapper" index --semantic || overall_rc=1
+record_cell "$shape" "index_semantic" "$RUN_ROOT/mem-${shape}-stage3.json" || exit 2
 
-run_stage "$shape" "completeness_gate" "$startup_rss" "$max_message_bytes" "$RUN_ROOT/mem-${shape}-stage4.json" \
-  "$EXAMPLES/w4_completeness_gate" --db "$data_dir/agent_search.db" --json "$RUN_ROOT/mem-${shape}-completeness.json" || overall_rc=1
+stage4_db="${STAGE4_DB:-$data_dir-stage4/agent_search.db}"
+p0_4=$(p0_for "$shape" completeness_gate "$fixture_sha256")
+# R6-N3 (#123): stage 4 executes $EXAMPLES/w4_completeness_gate, not the
+# candidate -- recording $binary_sha256 here misidentified the measured
+# program (#122b-3c fixed exactly this wrapper-vs-binary confusion for the
+# stages that *do* run the candidate; stage 4 was left behind). Hash the
+# binary this stage actually runs.
+gate_sha256=$(binary_sha256_of "$EXAMPLES/w4_completeness_gate")
+[ -n "$gate_sha256" ] || { echo "memory_gate: cannot hash the stage 4 binary under test: $EXAMPLES/w4_completeness_gate" >&2; exit 2; }
+run_stage "$shape" "completeness_gate" "" "" "$gate_sha256" "$fixture_sha256" "$p0_4" \
+  "$RUN_ROOT/mem-${shape}-stage4.json" \
+  "$EXAMPLES/w4_completeness_gate" --db "$stage4_db" --json "$RUN_ROOT/mem-${shape}-completeness.json" || overall_rc=1
+record_cell "$shape" "completeness_gate" "$RUN_ROOT/mem-${shape}-stage4.json" || exit 2
 
 exit "$overall_rc"
