@@ -1742,6 +1742,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           legit_sibling_redaction=False, compact_extra_no_body=False,
                           candidate_only_row=False, array_tool_use_result=None,
                           excludable_sibling_leak=False,
+                          unexcludable_sibling_leak=False,
                           beyond_manifest_excluded=None,
                           fragmented_array_tool_use_result=False,
                           foreign_array_tool_use_result_cleared=False,
@@ -1799,12 +1800,18 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         ]},
     }
     second_pair = []
-    if excludable_sibling_leak:
+    if excludable_sibling_leak or unexcludable_sibling_leak:
         # N-fam4 (任务书 #131 T6-c): a SECOND call/result pair whose result
         # carries the same body AND is itself excludable -- the shape a real
         # leak has (the body survives in a row the rules would have excluded),
         # as opposed to the `sibling_leak` shape above (a plain user row the
         # rules never cover).
+        #
+        # E3 (任务书 #133) needs both halves of that pair to exist as CANDIDATES
+        # for `unexcludable_sibling_leak` too: the claim under test is "the row
+        # carrying the body is not one the rules cover, even though another
+        # excludable candidate in the same session also carries it", and the
+        # "another excludable candidate" is the pair's result (position 3).
         second_pair = [
             {"type": "assistant", "uuid": "u3", "message": {"role": "assistant", "content": [
                 {"type": "tool_use", "name": "Read", "id": "t2",
@@ -2015,10 +2022,34 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                     [beyond_content, msgpack.packb(beyond_extra, use_bin_type=True)],
                 )
         if excludable_sibling_leak:
+            # E3 (任务书 #133): the row sits at idx=3, the position of the second
+            # pair's `tool_result` -- the copy is a leak precisely because the
+            # rules DO cover the row it survives in, and the judge now asks
+            # about the leaking row's own position. At idx=2 (the second Read
+            # CALL, never excludable) the same fixture asserted a leak the rules
+            # never had an event for.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 3, 'user', ?, ?)",
+                [f"sibling turn {body_text}", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if unexcludable_sibling_leak:
+            # E3 (任务书 #133): the other half. The same surviving copy, this
+            # time in a row the rules do NOT cover (idx=2 is the second Read
+            # call), while the pair's result at idx=3 is excludable and carries
+            # the body too -- so `any(body in text for text in excludable)` said
+            # "leak" on a copy the rules never covered. The extra deliberately
+            # does NOT carry the body: this case is the CONTENT limb's.
             conn.execute(
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
-                [f"sibling turn {body_text}", msgpack.packb(sibling_extra, use_bin_type=True)],
+                [
+                    f"sibling turn {body_text}",
+                    msgpack.packb(
+                        {"message": {"content": [{"type": "text", "text": "sibling turn"}]}},
+                        use_bin_type=True,
+                    ),
+                ],
             )
         if candidate_only_excluded_row is not None and with_excluded:
             # R9-B05 (任务书 #132): a session the CANDIDATE alone has (the
@@ -2650,6 +2681,14 @@ def verify_selftest_cases():
         # did not know about.
         ("V32 a legit string toolUseResult sibling redaction passes", True, ""),
         ("V33 a legit array toolUseResult sibling redaction passes", True, ""),
+        # E3 (任务书 #133): the copy that survives is in a row the rules do NOT
+        # cover, even though another excludable candidate in the same session
+        # carries the same body. Asking `any(body in text for text in
+        # excludable)` called this a leak; every one of the 30
+        # `retained_excludable` failures on the T6-b new6 run was that misfire.
+        ("V34 a body in a row the rules do not cover is informational, even when "
+         "an excludable candidate elsewhere carries it", True, "",
+         {"body_retained_unexcludable": 1}),
     ]
 
 
@@ -2701,6 +2740,7 @@ def _run_verify_selftest(paths_cfg):
             30: {"null_raw_event_key": True},
             31: {"legit_sibling_redaction": True, "tool_use_result_shape": "string"},
             32: {"legit_sibling_redaction": True, "tool_use_result_shape": "array"},
+            33: {"unexcludable_sibling_leak": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -3066,10 +3106,17 @@ def _run_verify_selftest(paths_cfg):
         else:
             print(f"FAIL B02 probe refuses a report inside the mirror: rc={rc!r} rewritten={after != before}")
 
-    # R9-N03 (任务书 #132): `_excludable_session_bodies` answers "other than
-    # MY position", so its cache key must carry that position. A blob with two
-    # excludable results is processed entry by entry; the second one must not
-    # inherit the first one's answer.
+    # R9-N03 (任务书 #132): the cached answer depends on the entry that asked,
+    # so its cache key had to carry that entry's own position -- a blob with two
+    # excludable results is processed entry by entry, and the second one must
+    # not inherit the first one's answer.
+    #
+    # E3 (任务书 #133): the answer no longer depends on the asking entry at all
+    # (it is the session's excludable POSITIONS, its own position included), so
+    # the bug R9-N03 fixed is gone by construction. The assertion is kept and
+    # strengthened: both entries must see the SAME whole set, which pins the
+    # set itself instead of two one-element lists that a wrong-but-equal pair
+    # could have satisfied.
     total += 1
     with tempfile.TemporaryDirectory() as root:
         mirror = os.path.join(root, "mirror")
@@ -3098,10 +3145,12 @@ def _run_verify_selftest(paths_cfg):
             return {"raw": {"blob": blob_rel, "idx": idx, "event_key": "x", "blocks": [0]}}
 
         shared = {}
-        first = _excludable_session_bodies(entry, marker_for(1), mirror, paths_cfg, shared)
-        second = _excludable_session_bodies(entry, marker_for(3), mirror, paths_cfg, shared)
-        fresh = _excludable_session_bodies(entry, marker_for(3), mirror, paths_cfg, {})
-        if first == [body_b] and second == [body_a] and fresh == second:
+        first = _session_exclusion_map(entry, marker_for(1), mirror, paths_cfg, shared)
+        second = _session_exclusion_map(entry, marker_for(3), mirror, paths_cfg, shared)
+        fresh = _session_exclusion_map(entry, marker_for(3), mirror, paths_cfg, {})
+        # Both results are the pair's two `tool_result` positions (1 and 3) out
+        # of 4 candidates -- the same answer whoever asked.
+        if first == second == fresh and first == (frozenset({1, 3}), 4):
             passed += 1
             print("ok   N03 the excludable set does not depend on manifest processing order")
         else:
@@ -4620,10 +4669,11 @@ def _session_rows(conn, sql, entry):
     return conn.execute(f"{sql} WHERE {predicate}", params).fetchall()
 
 
-def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
-    """The projected texts of this session's EXCLUDABLE candidates, other than
-    the entry's own recorded position -- `None` when the session cannot be
-    rebuilt (then the caller keeps the old, stronger verdict).
+def _session_exclusion_map(entry, marker, mirror_root, paths_cfg, cache):
+    """`(excludable_positions, candidate_count)` for this session -- the
+    candidate positions the probe's OWN rules would exclude, and how many
+    candidates the session has. `None` when the session cannot be rebuilt
+    (then callers keep the old, stronger verdict).
 
     N-fam4 (任务书 #131 T6-c): "some row of the session still contains the
     body" is stronger than the rules themselves. A body legitimately survives
@@ -4635,6 +4685,27 @@ def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
     guessing: rebuild the session's candidates from the recorded blob, run
     `PairingContext` + `decide` over them, and let only candidates that would
     themselves be excluded count.
+
+    E3 (任务书 #133): the answer is a set of POSITIONS, not the texts of
+    "excludable candidates other than mine". The old text list was consumed as
+    `any(body in text for text in excludable)` -- "does SOME other excludable
+    candidate contain the body" -- which is a different question from "is THE
+    ROW CARRYING THE BODY one the rules would exclude". On the T6-b new6 run
+    every one of the 30 `retained_excludable` failures was that misfire: the
+    row holding the body was a `Bash`/MCP error result the rules never cover,
+    while another candidate in the same session was excludable and happened to
+    carry the same text.
+
+    `positions` includes this entry's own position on purpose: an excluded row
+    IS one the rules cover, and leaving it out is exactly what made the cache
+    key depend on the entry's own `raw.idx` (R9-N03). The answer now depends on
+    the blob alone, so a blob-keyed cache is correct by construction.
+
+    Position == the row's `messages.idx`. Two measurements back that: every
+    manifest entry records `entry['idx'] == raw['idx']` (6882/6882), and
+    indexing a rebuilt list by a sampled row's own db idx reproduces that row's
+    content on 99.83% of ordinary rows (the exceptions are the same message
+    with a differing tail). Both are in the mission #133 report.
     """
     raw = marker.get("raw") or {}
     blob_rel = raw.get("blob")
@@ -4643,14 +4714,7 @@ def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
     blob_path = os.path.join(mirror_root, blob_rel)
     if not os.path.exists(blob_path):
         return None
-    # R9-N03 (任务书 #132): the cached answer is "this session's excludable
-    # bodies OTHER THAN the entry's own position", so it depends on that
-    # position. Keyed on the blob alone, the second entry of a blob reused the
-    # first entry's list -- which still contained the second entry's own body,
-    # so a legitimate informational copy of it looked like an excludable one
-    # left in place (`retained_excludable`) and the count depended on the
-    # manifest's processing order.
-    key = (blob_path, entry.get("agent_slug"), raw.get("idx"))
+    key = (blob_path, entry.get("agent_slug"))
     if key in cache:
         return cache[key]
     builder = {
@@ -4661,18 +4725,31 @@ def _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, cache):
         return None
     candidates = builder(load_blob_events(blob_path))
     pairing = PairingContext(candidates)
-    own_idx = raw.get("idx")
-    bodies = []
-    for index, candidate in enumerate(candidates):
-        if index == own_idx:
-            # The entry's own message: it IS excludable (that is why this
-            # entry exists) and it was excluded -- its body lives in the
-            # excluded row, not in a surviving one.
-            continue
-        if decide(candidates, index, index, entry["agent_slug"], paths_cfg, pairing) is not None:
-            bodies.append(candidate.text or "")
-    cache[key] = bodies
-    return bodies
+    positions = frozenset(
+        index
+        for index in range(len(candidates))
+        if decide(candidates, index, index, entry["agent_slug"], paths_cfg, pairing) is not None
+    )
+    cache[key] = (positions, len(candidates))
+    return cache[key]
+
+
+def _sib_exclusion_state(exclusion_map, sib):
+    """`"excludable"` / `"not_excludable"` / `"not_locatable"` for one row of
+    the session; `None` when the session could not be rebuilt at all.
+
+    E3 (任务书 #133): "this row has no candidate to judge it by" is its own
+    answer, not a synonym for "the rules do not cover it" -- a row beyond the
+    rebuilt candidate list has no event the rules could have judged, and the
+    caller counts those separately (`sib_not_locatable`) so the distinction
+    stays visible instead of passing silently."""
+    if exclusion_map is None:
+        return None
+    positions, candidate_count = exclusion_map
+    idx = _field(sib, "idx")
+    if not isinstance(idx, int) or isinstance(idx, bool) or idx < 0 or idx >= candidate_count:
+        return "not_locatable"
+    return "excludable" if idx in positions else "not_excludable"
 
 
 EXCLUSION_REASONS = ("cass_recall", "context_file_read", "codex_host_shell")
@@ -4971,6 +5048,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     candidate_only_unjudgeable = 0
     candidate_only_unjudgeable_samples = []
     body_retained_unexcludable_samples = []
+    # E3 (任务书 #133): rows carrying the body that the rebuilt candidate list
+    # cannot place at all -- the rules never had an event here to judge. Kept
+    # apart from `body_retained_unexcludable` (the rules saw the row and do not
+    # cover it) so neither answer hides inside the other.
+    sib_not_locatable = 0
+    sib_not_locatable_samples = []
     excludable_cache = {}
     extra_unchanged_no_body = 0
     candidate_only_rows = 0
@@ -5074,10 +5157,27 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         # about the next.
         body = ref_row["content"]
         if body:
-            excludable = _excludable_session_bodies(entry, marker, mirror_root, paths_cfg, excludable_cache)
+            exclusion_map = _session_exclusion_map(entry, marker, mirror_root, paths_cfg, excludable_cache)
             for sib in _session_rows(conn_cand, sql_cand, entry):
-                if body in (sib["content"] or ""):
-                    if excludable is not None and any(body in text for text in excludable):
+                content_hit = body in (sib["content"] or "")
+                sib_extra = _decode_extra(sib["extra_bin"])
+                extra_hit = sib_extra is not None and _extra_carries_body(
+                    sib_extra, body, entry["agent_slug"]
+                )
+                state = _sib_exclusion_state(exclusion_map, sib)
+                if state == "not_locatable" and (content_hit or extra_hit):
+                    # E3 (任务书 #133): a row carrying the body that the rebuild
+                    # cannot place at all is RECORDED rather than folded into
+                    # the informational count -- a run that stops being able to
+                    # locate rows has to be visible, not a silent pass.
+                    sib_not_locatable += 1
+                    if len(sib_not_locatable_samples) < 20:
+                        sib_not_locatable_samples.append([label, sib["idx"]])
+                if content_hit:
+                    if state != "not_excludable" and state != "not_locatable":
+                        # `None` (session not rebuildable) keeps the old,
+                        # stronger verdict; "excludable" is the row's own
+                        # position being one the rules exclude.
                         failures.append(
                             (
                                 label,
@@ -5086,12 +5186,13 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                         )
                     else:
                         # N-fam4: the rules do not cover this copy -- recorded,
-                        # not failed. See `_excludable_session_bodies`.
+                        # not failed. E3: "not covered" is this row's OWN
+                        # position, not "some other excludable candidate
+                        # elsewhere in the session happens to carry the body".
                         body_retained_unexcludable += 1
                         if len(body_retained_unexcludable_samples) < 20:
                             body_retained_unexcludable_samples.append([label, sib["idx"]])
-                sib_extra = _decode_extra(sib["extra_bin"])
-                if sib_extra is not None and _extra_carries_body(sib_extra, body, entry["agent_slug"]):
+                if extra_hit:
                     failures.append(
                         (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
                     )
@@ -5265,6 +5366,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "extra_unchanged_no_body": extra_unchanged_no_body,
         "body_retained_unexcludable": body_retained_unexcludable,
         "body_retained_unexcludable_samples": body_retained_unexcludable_samples,
+        "sib_not_locatable": sib_not_locatable,
+        "sib_not_locatable_samples": sib_not_locatable_samples,
         "candidate_excluded_beyond_manifest": candidate_excluded_beyond_manifest,
         "candidate_excluded_beyond_manifest_samples": candidate_excluded_beyond_manifest_samples,
         # R9-B04: an exclusion beyond the manifest whose raw-mirror blob is not
@@ -5447,7 +5550,8 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
     informational = {
         key: report[key]
         for key in ("extra_unchanged_no_body", "candidate_only_rows",
-                    "body_retained_unexcludable", "candidate_excluded_beyond_manifest",
+                    "body_retained_unexcludable", "sib_not_locatable",
+                    "candidate_excluded_beyond_manifest",
                     "beyond_manifest_unverifiable", "candidate_only_excluded",
                     "candidate_only_unjudgeable")
         if key in report
