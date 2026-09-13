@@ -1743,6 +1743,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           candidate_only_row=False, array_tool_use_result=None,
                           excludable_sibling_leak=False,
                           unexcludable_sibling_leak=False,
+                          excludable_extra_leak=False, unexcludable_extra_leak=False,
                           beyond_manifest_excluded=None,
                           fragmented_array_tool_use_result=False,
                           foreign_array_tool_use_result_cleared=False,
@@ -1800,18 +1801,28 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         ]},
     }
     second_pair = []
-    if excludable_sibling_leak or unexcludable_sibling_leak:
+    # Every case below hangs on the SAME structural fact: candidate positions 2
+    # and 3 exist (the second Read's call and its result), so a fixture row at
+    # those positions has an event the rules can actually be asked about.
+    # E3 (任务书 #133) needs it for the two sibling-leak flags (the claim is
+    # "this row's OWN position is/ is not covered, even though another
+    # excludable candidate carries the body"); E2 needs it for every leak flag
+    # whose row sits at idx 3 (a leak is a body surviving in a row the rules DO
+    # cover, so that position has to be a covered one).
+    needs_second_pair = (
+        excludable_sibling_leak
+        or unexcludable_sibling_leak
+        or excludable_extra_leak
+        or unexcludable_extra_leak
+        or leak_multiline_body
+        or short_body
+    )
+    if needs_second_pair:
         # N-fam4 (任务书 #131 T6-c): a SECOND call/result pair whose result
         # carries the same body AND is itself excludable -- the shape a real
         # leak has (the body survives in a row the rules would have excluded),
         # as opposed to the `sibling_leak` shape above (a plain user row the
         # rules never cover).
-        #
-        # E3 (任务书 #133) needs both halves of that pair to exist as CANDIDATES
-        # for `unexcludable_sibling_leak` too: the claim under test is "the row
-        # carrying the body is not one the rules cover, even though another
-        # excludable candidate in the same session also carries it", and the
-        # "another excludable candidate" is the pair's result (position 3).
         second_pair = [
             {"type": "assistant", "uuid": "u3", "message": {"role": "assistant", "content": [
                 {"type": "tool_use", "name": "Read", "id": "t2",
@@ -2032,6 +2043,26 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 3, 'user', ?, ?)",
                 [f"sibling turn {body_text}", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if excludable_extra_leak:
+            # E2 (任务书 #133): the body survives in the EXTRA of a row the rules
+            # DO cover (idx=3, the second pair's `tool_result`) -- the real leak
+            # this limb exists for. It has to keep failing once the limb starts
+            # asking about the leaking row's own position.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 3, 'user', ?, ?)",
+                ["a later turn", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if unexcludable_extra_leak:
+            # E2 (任务书 #133): the other half, and the shape the T6-b new6 run
+            # was full of -- the same surviving body in the extra of a row the
+            # rules do NOT cover (idx=2 is the second Read's CALL). The content
+            # carries no body, so only the extra limb can see this copy.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 2, 'user', ?, ?)",
+                ["a later turn", msgpack.packb(sibling_extra, use_bin_type=True)],
             )
         if unexcludable_sibling_leak:
             # E3 (任务书 #133): the other half. The same surviving copy, this
@@ -2342,8 +2373,24 @@ def _write_b07_fixture(root):
             {"type": "text", "text": "ordinary prose of the mixed event"},
             {"type": "tool_result", "tool_use_id": "a", "content": redacted}]},
     }
+    # E2 (任务书 #133): a SECOND Read pair, so candidate positions 3 and 4 exist
+    # (that call and its result). This session's second leak sits at idx=4, and
+    # a leak is a body surviving in a row the rules DO cover -- with only two
+    # events (three candidates) idx=4 had no event at all, so the new "ask about
+    # the leaking row's OWN position" judge could not have called it covered.
+    second_call = {
+        "type": "assistant", "uuid": "b07-call-2",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Read", "id": "b",
+             "input": {"file_path": "/srv/cc-workspace/MEMORY.md"}}]},
+    }
+    second_result = {
+        "type": "user", "uuid": "b07-result-2",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b", "content": body}]},
+    }
     with open(blob_path, "w", encoding="utf-8") as handle:
-        for event in (call_event, mixed_dirty):
+        for event in (call_event, mixed_dirty, second_call, second_result):
             handle.write(json.dumps(event) + "\n")
 
     marker = {
@@ -2689,6 +2736,18 @@ def verify_selftest_cases():
         ("V34 a body in a row the rules do not cover is informational, even when "
          "an excludable candidate elsewhere carries it", True, "",
          {"body_retained_unexcludable": 1}),
+        # E2 (任务书 #133): the extra limb asks the same question as the content
+        # limb -- a body left in a row the rules do not cover is informational
+        # there too. N-fam4 made that true for the content limb and left this
+        # one failing, so ONE copy got two verdicts: on the T6-b new6 run 20 of
+        # the 57 `body_retained_in_extra` failures were the same (label,
+        # sib_idx) the content limb had already recorded as informational.
+        ("V35 a body in an uncovered row's extra is informational", True, "",
+         {"body_retained_in_extra_unexcludable": 1}),
+        # ...and its boundary: the same body in the extra of a row the rules DO
+        # cover is the leak this limb exists for, and keeps failing.
+        ("V36 a body in a covered row's extra is still a failure", False,
+         "still carries the body in extra_bin"),
     ]
 
 
@@ -2741,6 +2800,8 @@ def _run_verify_selftest(paths_cfg):
             31: {"legit_sibling_redaction": True, "tool_use_result_shape": "string"},
             32: {"legit_sibling_redaction": True, "tool_use_result_shape": "array"},
             33: {"unexcludable_sibling_leak": True},
+            34: {"unexcludable_extra_leak": True},
+            35: {"excludable_extra_leak": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -5048,6 +5109,11 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
     candidate_only_unjudgeable = 0
     candidate_only_unjudgeable_samples = []
     body_retained_unexcludable_samples = []
+    # E2 (任务书 #133): the extra limb's own informational count -- a body left
+    # in the extra of a row the rules do not cover. Kept apart from the content
+    # limb's so the two limbs can be compared instead of summed.
+    body_retained_in_extra_unexcludable = 0
+    body_retained_in_extra_unexcludable_samples = []
     # E3 (任务书 #133): rows carrying the body that the rebuilt candidate list
     # cannot place at all -- the rules never had an event here to judge. Kept
     # apart from `body_retained_unexcludable` (the rules saw the row and do not
@@ -5193,9 +5259,22 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                         if len(body_retained_unexcludable_samples) < 20:
                             body_retained_unexcludable_samples.append([label, sib["idx"]])
                 if extra_hit:
-                    failures.append(
-                        (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
-                    )
+                    if state != "not_excludable" and state != "not_locatable":
+                        failures.append(
+                            (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
+                        )
+                    else:
+                        # E2 (任务书 #133): the SAME copy, judged by the same
+                        # question as the content limb. N-fam4 made "a body the
+                        # rules do not cover is informational" true for the
+                        # content limb and left this one failing, so one copy
+                        # got two verdicts -- on the T6-b new6 run 20 of the 57
+                        # `body_retained_in_extra` failures were the same
+                        # (label, sib_idx) the content limb had already recorded
+                        # as informational.
+                        body_retained_in_extra_unexcludable += 1
+                        if len(body_retained_in_extra_unexcludable_samples) < 20:
+                            body_retained_in_extra_unexcludable_samples.append([label, sib["idx"]])
         if body and body in (row["title"] or ""):
             failures.append((label, "the session title still contains the body"))
 
@@ -5366,6 +5445,8 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
         "extra_unchanged_no_body": extra_unchanged_no_body,
         "body_retained_unexcludable": body_retained_unexcludable,
         "body_retained_unexcludable_samples": body_retained_unexcludable_samples,
+        "body_retained_in_extra_unexcludable": body_retained_in_extra_unexcludable,
+        "body_retained_in_extra_unexcludable_samples": body_retained_in_extra_unexcludable_samples,
         "sib_not_locatable": sib_not_locatable,
         "sib_not_locatable_samples": sib_not_locatable_samples,
         "candidate_excluded_beyond_manifest": candidate_excluded_beyond_manifest,
@@ -5550,7 +5631,8 @@ def run_verify(candidate, manifest_path, reference, mirror_root, sample_rebuild,
     informational = {
         key: report[key]
         for key in ("extra_unchanged_no_body", "candidate_only_rows",
-                    "body_retained_unexcludable", "sib_not_locatable",
+                    "body_retained_unexcludable", "body_retained_in_extra_unexcludable",
+                    "sib_not_locatable",
                     "candidate_excluded_beyond_manifest",
                     "beyond_manifest_unverifiable", "candidate_only_excluded",
                     "candidate_only_unjudgeable")
