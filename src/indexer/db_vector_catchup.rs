@@ -3449,16 +3449,22 @@ mod chunk_catchup_v5_tests {
         assert!(all_expected.iter().all(|c| c.message_id == normal_id), "all_expected must only contain the normal (non-zero-chunk) message's chunks: {all_expected:?}");
     }
 
-    /// T4 mission #122a (D): `OWNERSHIP_COSINE_MIN` must actually gate the
-    /// activation audit's fresh-vs-stored ownership check at `:1162`, not
-    /// just exist as an unused constant. Corrupts one stored chunk's
-    /// embedding by a perturbation whose cosine similarity to the
-    /// unmodified vector -- measured via the *same* `cosine_similarity`
-    /// the audit itself calls, not hand-derived -- lands in a fixed band
-    /// `(0.5, 0.999)`: comfortably below the placeholder constant
-    /// (`1.0 - 1e-3`) but comfortably above a wrong-by-a-lot mutant like
-    /// `0.5`, so this test is sensitive to the constant's actual value,
-    /// not just to "some cosine, however low, gets rejected".
+    /// T4 mission #122a (D), retargeted by T6-f (#134): `OWNERSHIP_COSINE_MIN`
+    /// must actually gate the activation audit's fresh-vs-stored ownership
+    /// check at `:1234`, not just exist as an unused constant. Corrupts one
+    /// stored chunk's embedding by a perturbation whose cosine similarity to
+    /// the unmodified vector -- measured via the *same* `cosine_similarity`
+    /// the audit itself calls, not hand-derived -- lands *below the constant*
+    /// but comfortably above a wrong-by-a-lot mutant like `0.5`, so this test
+    /// is sensitive to the constant's actual value, not just to "some cosine,
+    /// however low, gets rejected".
+    ///
+    /// The fixture bound is written against `OWNERSHIP_COSINE_MIN` itself
+    /// rather than a literal band: a future retarget of the constant now
+    /// fails *here*, in the fixture assumption, saying the perturbation is no
+    /// longer below the gate -- instead of the audit quietly ceasing to bail
+    /// and the behaviour assertion below turning into a test that asserts the
+    /// opposite of its name.
     #[test]
     fn ownership_check_bails_below_cosine_min_using_the_named_constant() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -3471,11 +3477,14 @@ mod chunk_catchup_v5_tests {
             .unwrap();
         let stored_vec = schema::le_blob_to_f32_vector(&stored_blob).unwrap();
         let mut perturbed = stored_vec.clone();
-        perturbed[0] += 0.5;
+        perturbed[0] += 1.5;
         let cos = cosine_similarity(&stored_vec, &perturbed);
         assert!(
-            cos < 0.999 && cos > 0.5,
-            "test fixture assumption: the chosen perturbation must land the cosine strictly between 0.5 and 0.999 for this test to be sensitive to OWNERSHIP_COSINE_MIN's actual value (got {cos})"
+            cos < OWNERSHIP_COSINE_MIN && cos > 0.5,
+            "test fixture assumption: the chosen perturbation must land the cosine strictly between 0.5 and \
+             OWNERSHIP_COSINE_MIN (={OWNERSHIP_COSINE_MIN}) for this test to be sensitive to the constant's actual value; \
+             if this fails on the upper bound, the perturbation is no longer below the gate and the assertions below \
+             would be testing the wrong thing (got {cos})"
         );
 
         storage
