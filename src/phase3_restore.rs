@@ -8751,11 +8751,14 @@ fn conversation_ids_for_session_key(
 ) -> anyhow::Result<Vec<i64>> {
     use crate::storage::api::Value as ParamValue;
 
-    // `identity_host` 维尚未进 SQL：`conversations.identity_host` 列由 PR8 C1 引入，C1 合入后补 `AND c.identity_host = ?3`。
-    let _ = identity_host;
+    // PR8 C1 introduced `conversations.identity_host`; the session key binds all three dimensions.
     let sql = "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
-               WHERE a.slug = ?1 AND c.external_id = ?2 ORDER BY c.id";
-    let params = vec![ParamValue::from(agent), ParamValue::from(external_id)];
+               WHERE a.slug = ?1 AND c.external_id = ?2 AND c.identity_host = ?3 ORDER BY c.id";
+    let params = vec![
+        ParamValue::from(agent),
+        ParamValue::from(external_id),
+        ParamValue::from(identity_host),
+    ];
     let ids: Vec<i64> = storage
         .raw()
         .query_all_map(sql, &params, |row| row.get_typed(0))?;
