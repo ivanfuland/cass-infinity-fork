@@ -1750,7 +1750,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           candidate_only_excluded_row=None,
                           fragmented_extra_text_blocks=False,
                           duplicate_source_row=False, null_raw_event_key=False,
-                          sibling_tool_use_result=None, tool_use_result_shape=None):
+                          sibling_tool_use_result=None, tool_use_result_shape=None,
+                          same_event_extra_leak=False):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1811,6 +1812,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     # cover, so that position has to be a covered one).
     needs_second_pair = (
         excludable_sibling_leak
+        or same_event_extra_leak
         or unexcludable_sibling_leak
         or excludable_extra_leak
         or unexcludable_extra_leak
@@ -2161,6 +2163,18 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
                 ["assistant commentary, must stay", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if same_event_extra_leak:
+            # R10-B1 (PR8 C7): a row projected from the EXCLUDED event itself
+            # (its extra carries `uuid: u2`, the marker's `raw.event_key`) that
+            # still holds the body, identical on both sides. Its own position
+            # (idx=2, the second Read's call) is one the rules do not cover, and
+            # the extra limb used to excuse it on that ground -- but a copy in
+            # the excluded event's own sibling is the exclusion's to clear.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 2, 'user', ?, ?)",
+                ["a later turn", msgpack.packb(_verify_extra(body_text), use_bin_type=True)],
             )
         if leak_multiline_body or short_body:
             # B08: the body survives verbatim in a later row's extra,
@@ -2748,6 +2762,10 @@ def verify_selftest_cases():
         # cover is the leak this limb exists for, and keeps failing.
         ("V36 a body in a covered row's extra is still a failure", False,
          "still carries the body in extra_bin"),
+        # R10-B1 (PR8 C7): a sibling row of the EXCLUDED event still carrying
+        # the body in its extra is a leak whatever its own position is.
+        ("V_R10_B1 a same-event sibling row still carrying the body in its extra is a failure", False,
+         "still carries the body in extra_bin"),
     ]
 
 
@@ -2802,6 +2820,7 @@ def _run_verify_selftest(paths_cfg):
             33: {"unexcludable_sibling_leak": True},
             34: {"unexcludable_extra_leak": True},
             35: {"excludable_extra_leak": True},
+            36: {"same_event_extra_leak": True},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -4563,6 +4582,7 @@ def _allowed_extra_paths(entry, ref_row, ref_extra):
     return allowed
 
 
+
 def _extra_event_key(extra):
     """The event identity a decoded extra carries: claude's top-level `uuid`,
     codex's `payload.id`."""
@@ -5259,7 +5279,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                         if len(body_retained_unexcludable_samples) < 20:
                             body_retained_unexcludable_samples.append([label, sib["idx"]])
                 if extra_hit:
-                    if state != "not_excludable" and state != "not_locatable":
+                    # R10-B1 (PR8 C7): a row carrying the EXCLUDED event's own
+                    # identity is a projection of that event, so the copy is the
+                    # exclusion's to clear whatever this row's own position is.
+                    marker_event_key = ((marker or {}).get("raw") or {}).get("event_key")
+                    same_event = isinstance(marker_event_key, str) and _extra_event_key(sib_extra) == marker_event_key
+                    if same_event or (state != "not_excludable" and state != "not_locatable"):
                         failures.append(
                             (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
                         )
