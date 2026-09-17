@@ -1307,8 +1307,13 @@ fn strip_claude_array_tool_use_result(value: &mut serde_json::Value, owned_bodie
     // `text` is replaced.
     let joined = project_parts(items);
     if !joined.is_empty() && owned_bodies.iter().any(|body| joined == *body) {
+        // R10-B2 (PR8 C7): only the elements the join is made of. An element
+        // `content_part_text` does not render from its `text` (an `image`
+        // carrying one, a `tool_use`) is not part of the copy.
         for item in items.iter_mut() {
-            if let Some(slot) = item.get_mut("text") {
+            if is_joined_text_part(item)
+                && let Some(slot) = item.get_mut("text")
+            {
                 *slot = placeholder.clone();
             }
         }
@@ -1323,6 +1328,14 @@ fn strip_claude_array_tool_use_result(value: &mut serde_json::Value, owned_bodie
             *slot = placeholder.clone();
         }
     }
+}
+
+/// Whether `content_part_text` renders this element from its own non-empty
+/// `text`, i.e. whether that `text` is part of [`project_parts`]'s join.
+fn is_joined_text_part(item: &serde_json::Value) -> bool {
+    let item_type = item.get("type").and_then(|v| v.as_str());
+    (item_type.is_none() || matches!(item_type, Some("text" | "input_text" | "output_text")))
+        && item.get("text").and_then(serde_json::Value::as_str).is_some_and(|text| !text.is_empty())
 }
 
 /// How much decoration a string-form `toolUseResult` may carry around a body
@@ -3095,6 +3108,46 @@ mod tests {
             m.extra["toolUseResult"][1]["text"],
             serde_json::json!("tool's body"),
             "fragments of a DIFFERENT body must survive, got {:?}",
+            m.extra["toolUseResult"]
+        );
+    }
+
+    /// R10-B2 (PR8 C7): the join rule cleared the `text` slot of EVERY
+    /// element, including ones `content_part_text` does not render -- an
+    /// `image` element carrying its own `text` field contributed nothing to
+    /// the join, yet its unrelated text was replaced. Only the elements that
+    /// make up the joined copy are that copy.
+    #[test]
+    fn array_join_clears_only_contributing_parts() {
+        let mut m = msg("tool_result", "secret A\nsecret B");
+        m.extra = serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": [
+                    {"type": "text", "text": "secret A"},
+                    {"type": "text", "text": "secret B"}
+                ]}
+            ]},
+            "toolUseResult": [
+                {"type": "text", "text": "secret A"},
+                {"type": "image", "text": "caption kept"},
+                {"type": "text", "text": "secret B"}
+            ]
+        });
+        apply(&mut m, &decision_cass_recall(vec![0]), &mut MemoizingRedactor::new(), "blobs/blake3/ab/abcd.raw", 1, field_map_for("claude_code"));
+
+        for index in [0, 2] {
+            assert_eq!(
+                m.extra["toolUseResult"][index]["text"]["redacted"],
+                serde_json::json!(true),
+                "contributing element {index} must be cleared, got {:?}",
+                m.extra["toolUseResult"]
+            );
+        }
+        assert_eq!(
+            m.extra["toolUseResult"][1]["text"],
+            serde_json::json!("caption kept"),
+            "a non-text element does not contribute to the join and its text must survive, got {:?}",
             m.extra["toolUseResult"]
         );
     }
