@@ -58,9 +58,10 @@ use crate::storage::vector_domain;
 /// *different* messages it reached `max 0.7531`; T5's 200-pair negative
 /// control reached `max 0.6283197`.
 ///
-/// 0.99 therefore sits above the worst same-text noise by `1.3e-3` (the
-/// smaller of the two observed minima, 0.9913322; PR6's 0.99166834 leaves
-/// `1.7e-3`) and below the most confusable wrong object by `3.4e-2`. That
+/// 0.99 therefore sits below the lowest same-text cosine that must pass by
+/// `1.3e-3` (the smaller of the two observed minima, 0.9913322; PR6's
+/// 0.99166834 leaves `1.7e-3`) and above the highest wrong-object cosine that
+/// must be rejected (0.9564) by `3.4e-2`. That
 /// gap is the point: the threshold is not being asked to resolve anything
 /// fine, so it can be set with margin instead of at the edge of the data.
 ///
