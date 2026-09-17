@@ -399,6 +399,28 @@ fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
     }
 }
 
+/// PR8 C8: did taking the doctor mutation lock fail because the path cannot
+/// be written, as opposed to another holder keeping it busy?
+///
+/// `acquire_doctor_mutation_db_open_guard` has exactly two write-side steps
+/// before it ever tries the advisory lock -- `fs::create_dir_all` on the
+/// lock's parent and a `create(true).write(true)` open of the lock file
+/// itself -- so an EACCES/EROFS from either is what a read-only directory
+/// produces. `ReadOnlyFilesystem` covers the mount case; `PermissionDenied`
+/// covers the mode/ownership case. The two are kept apart from
+/// [`doctor_mutation_lock_error_is_active`]'s `WouldBlock`, which means
+/// "someone else holds it", not "this path is not writable".
+fn doctor_lock_failure_is_write_permission(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        })
+    })
+}
+
 fn acquire_doctor_mutation_db_open_guard(
     db_path: &Path,
     timeout: Duration,
@@ -2756,7 +2778,36 @@ impl FrankenStorage {
     /// not enter the archive while `cass doctor --fix` owns the repair lock.
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
-        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout).map_err(|err| {
+            // PR8 C8: `acquire_doctor_mutation_db_open_guard` opens (and
+            // creates) `<db_dir>/doctor/locks/doctor-repair.lock` with
+            // `read(true).write(true).create(true)`. A read-only database
+            // *directory* -- or a read-only mount -- therefore fails here
+            // before SQLite is ever asked to open anything, and the bare io
+            // error reads like a corrupt or busy database rather than "this
+            // open needs a writable sidecar". Name it, with a fixed code, so
+            // doctor output, logs and CI can tell the two apart.
+            if doctor_lock_failure_is_write_permission(&err) {
+                tracing::error!(
+                    code = "E-READONLY-LOCK-WRITE",
+                    db_path = %path.display(),
+                    error = %err,
+                    "read-only open needs a writable doctor mutation lock"
+                );
+                anyhow!(
+                    "E-READONLY-LOCK-WRITE: opening {} read-only requires a writable doctor \
+                     mutation lock at {} (the lock file is created and opened for writing before \
+                     the database itself is touched, so a read-only directory or mount cannot \
+                     host a read-only open); underlying failure: {err:#}",
+                    path.display(),
+                    doctor_mutation_lock_path_for_db_open(path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unresolved>".to_string()),
+                )
+            } else {
+                err
+            }
+        })?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening the legacy embedded engine db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
