@@ -70978,6 +70978,13 @@ fn run_status(
             "explanation": explanation,
             "warnings": warnings,
             "data_dir": data_dir.display().to_string(),
+            // C9 (T6B): same fact as `index --json`'s `index_run_lock_path`, on
+            // the read-only surface. It is current configuration, not a result
+            // of the last index run, so it belongs at the top level next to
+            // `data_dir` rather than inside the `last_index` block.
+            "index_run_lock_path": crate::search::asset_state::index_run_lock_path(&data_dir)
+                .display()
+                .to_string(),
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             // T2b.3 (B段, mission #116⑦): `run_status` builds this payload by
             // selectively copying named keys out of `state` (`state_meta_json_
@@ -86552,6 +86559,14 @@ fn run_index_with_data(
             "force_rebuild": force_rebuild,
             "entrypoint": entrypoint,
             "data_dir": data_dir.display().to_string(),
+            // C9 (T6B): the run lock this binary itself takes, published so an
+            // external controller can watch the same file without re-deriving
+            // the name from source or from the wrapper scripts' own flock.
+            // Single source of truth: `search::asset_state::index_run_lock_path`
+            // (the same function `acquire_index_run_lock` opens).
+            "index_run_lock_path": crate::search::asset_state::index_run_lock_path(&data_dir)
+                .display()
+                .to_string(),
             "db_path": db_path.display().to_string(),
             "conversations": conversations,
             "messages": messages,

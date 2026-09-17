@@ -18218,7 +18218,19 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_analytics_repopulates_from_messages() {
+        // 与 `analytics_ingest_populates_metrics_and_rollups`（本文件上方）同一个
+        // 机制：本用例经 `insert_conversations_batched` 间接读**进程级**开关
+        // `DEFAULT_DEFER_ANALYTICS_UPDATES`，而 `run_index()` 一进门就把它翻成
+        // 「延后」，本文件里读该开关的用例也各自 push 自己的值。没有 `#[serial]`
+        // 时它与那些用例并发跑到一起，`orig_mm`（下方 `assert_eq!(orig_mm, 3)`）
+        // 会读到 0。PR6 期间本用例并行 flake 两棒两现（STATUS [cass-54]）。
+        //
+        // 修法按任务书优先序 ①：入组既有 `#[serial]`，不改产品语义、不改断言口径。
+        // 这里不额外加 `default_defer_analytics_updates_guard(false)` 钉死 —— 上方
+        // 用例的 M1 实验已实测：持有者栈语义下「后 push 者生效」，钉死比并发用例
+        // 的 guard 来得晚，钉了也不保护（8/8 仍红）。
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 

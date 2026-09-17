@@ -25,6 +25,9 @@
     "data_dir": {
       "type": "string"
     },
+    "index_run_lock_path": {
+      "type": "string"
+    },
     "index": {
       "type": "object",
       "properties": {
