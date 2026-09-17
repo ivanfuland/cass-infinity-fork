@@ -170,6 +170,34 @@ pub struct SourceDefinition {
     /// same protection configured remote mirror roots already rely on.
     #[serde(default)]
     pub full_scan: bool,
+
+    /// The machine the sessions in this source were produced on. **Required**
+    /// for every configured source root: it is written to
+    /// `conversations.identity_host` for rows ingested from this root, so two
+    /// machines that happen to share an absolute session path stay two
+    /// conversations (PR8 spec §S4, hard constraint 8).
+    ///
+    /// No derivation and no default: an explicit value is the whole point, so a
+    /// `sources.toml` entry that omits it is rejected at load with a migration
+    /// hint rather than silently inheriting a guess. Must match
+    /// `^[A-Za-z0-9._-]{1,64}$`.
+    #[serde(default)]
+    pub origin_host: String,
+
+    /// The root is read-only for ingest: nothing under its directory tree may be
+    /// created or modified — not even a lock or watermark sidecar (PR8 hard
+    /// constraint 10). Only meaningful for `local` sources; an `ssh` source's
+    /// mirror is written by cass itself, so `readonly` is rejected there.
+    #[serde(default)]
+    pub readonly: bool,
+
+    /// Overrides `data_dir/remotes/<name>/mirror` as this source's mirror root,
+    /// and becomes the authorization root `prepare_local_sync_root` checks
+    /// against (PR8 hard constraint 11). Must be absolute or `~`-prefixed; read
+    /// the expanded value through [`SourceDefinition::effective_mirror_dir`].
+    /// Only meaningful for `ssh` sources.
+    #[serde(default)]
+    pub mirror_dir: Option<PathBuf>,
 }
 
 impl SourceDefinition {
@@ -178,14 +206,24 @@ impl SourceDefinition {
         Self {
             name: name.into(),
             source_type: SourceKind::Local,
+            // The machine-local root is fixed to "local" (PR8 spec §S4). This is
+            // a Rust constructor, not the TOML path: a `sources.toml` entry that
+            // omits `origin_host` still fails validation.
+            origin_host: BUILT_IN_LOCAL_SOURCE_NAME.to_string(),
             ..Default::default()
         }
     }
 
     /// Create a new SSH source definition.
+    ///
+    /// The source's own name is used as its `origin_host` — for the documented
+    /// `ivanmac` case the source name *is* the machine identity. Holds for
+    /// programmatic construction only; `sources.toml` never derives this field.
     pub fn ssh(name: impl Into<String>, host: impl Into<String>) -> Self {
+        let name = name.into();
         Self {
-            name: name.into(),
+            origin_host: name.clone(),
+            name,
             source_type: SourceKind::Ssh,
             host: Some(host.into()),
             ..Default::default()
@@ -207,6 +245,59 @@ impl SourceDefinition {
         validate_source_name(&self.name)
     }
 
+    pub(crate) fn validate_origin_host(&self) -> Result<(), ConfigError> {
+        if self.origin_host.trim().is_empty() {
+            // The legacy-shape failure: a `sources.toml` written before PR8 has
+            // no `origin_host`. Say exactly what to add, in the file's own
+            // syntax, instead of letting a raw serde "missing field" through.
+            return Err(ConfigError::Validation(format!(
+                "source '{}' is missing the required field `origin_host`; add `origin_host = \"{}\"` to [[sources]] `{}`",
+                self.name, self.name, self.name
+            )));
+        }
+
+        if !is_valid_origin_host(&self.origin_host) {
+            return Err(ConfigError::Validation(format!(
+                "source '{}' has an invalid `origin_host` '{}': must match ^[A-Za-z0-9._-]{{1,{MAX_ORIGIN_HOST_LEN}}}$",
+                self.name, self.origin_host
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// The mirror root this source actually uses, with `~` expanded.
+    ///
+    /// `None` when the source keeps the built-in `data_dir/remotes/<name>/mirror`
+    /// layout, in which case the caller falls back to that.
+    pub fn effective_mirror_dir(&self) -> Option<PathBuf> {
+        self.mirror_dir.as_deref().map(expand_home_prefix)
+    }
+
+    fn validate_mirror_dir(&self) -> Result<(), ConfigError> {
+        let Some(dir) = self.mirror_dir.as_deref() else {
+            return Ok(());
+        };
+
+        let raw = dir.to_string_lossy();
+        if !dir.is_absolute() && !raw.starts_with('~') {
+            return Err(ConfigError::Validation(format!(
+                "source '{}' has a relative `mirror_dir` '{}': must be an absolute path or start with `~`",
+                self.name, raw
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Validate the source's own structure.
+    ///
+    /// Ordering is deliberate: the PR8 checks (`origin_host`, `readonly`,
+    /// `mirror_dir`) run *after* every check that predates them, so an input that
+    /// was already invalid before PR8 keeps reporting the same first error it
+    /// used to — a whitespace SSH host alias still says "SSH host cannot contain
+    /// whitespace" even though such an alias also fails the `origin_host`
+    /// character set. New fields must not re-rank old failures.
     pub(crate) fn validate_structure(&self) -> Result<(), ConfigError> {
         self.validate_name()?;
 
@@ -247,6 +338,30 @@ impl SourceDefinition {
                 }
             }
         }
+
+        // -- PR8 additions, kept after every pre-existing check (see above) --
+
+        self.validate_origin_host()?;
+
+        // `readonly` says "ingest must not write under this root". For an ssh
+        // source the mirror directory is cass's own scratch space, so the flag
+        // would either be a no-op or would break sync; reject the combination
+        // rather than ignore it (PR8 spec §S4).
+        if self.is_remote() && self.readonly {
+            return Err(ConfigError::Validation(format!(
+                "source '{}' sets `readonly = true` on a type = \"ssh\" source; ssh mirrors are written by cass itself, so `readonly` only applies to type = \"local\"",
+                self.name
+            )));
+        }
+
+        if !self.is_remote() && self.mirror_dir.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "source '{}' sets `mirror_dir` on a type = \"local\" source; `mirror_dir` only applies to type = \"ssh\" sources",
+                self.name
+            )));
+        }
+
+        self.validate_mirror_dir()?;
 
         Ok(())
     }
@@ -302,6 +417,68 @@ pub(crate) fn normalize_generated_remote_source_name(name: &str) -> String {
 fn has_dot_components(path: &Path) -> bool {
     path.components()
         .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
+/// Longest accepted `origin_host`; bounded so the value stays a usable label in
+/// the manifest and `conversations.identity_host`.
+const MAX_ORIGIN_HOST_LEN: usize = 64;
+
+/// `^[A-Za-z0-9._-]{1,64}$` — the character set a machine label may use. Kept as
+/// a predicate rather than a regex so the check has no dependency and cannot
+/// drift from the documented pattern.
+pub(crate) fn is_valid_origin_host(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ORIGIN_HOST_LEN
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Expand a leading `~` against the current user's home.
+///
+/// Used for `mirror_dir`, which may be written either absolute or `~`-prefixed.
+/// A value with no leading `~` is returned unchanged; an unresolvable home
+/// leaves the `~` in place (the caller then fails its own existence checks
+/// rather than silently writing somewhere unexpected).
+fn expand_home_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    let Some(rest) = raw.strip_prefix('~') else {
+        return path.to_path_buf();
+    };
+
+    let Some(home) = dirs::home_dir() else {
+        return path.to_path_buf();
+    };
+
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    if rest.is_empty() {
+        home
+    } else {
+        home.join(rest)
+    }
+}
+
+/// Normalize a configured path for duplicate-root comparison.
+///
+/// Expands `~`, drops a trailing separator, and canonicalizes the part that
+/// exists on disk. A path that does not exist yet compares literally — the
+/// check is about two sources claiming one directory, and a not-yet-synced
+/// mirror must still be detectable.
+pub(crate) fn normalize_source_path_for_comparison(path: &str) -> PathBuf {
+    let expanded = expand_home_prefix(Path::new(path));
+    let trimmed = if expanded.as_os_str().len() > 1 {
+        let trailing_trimmed = expanded
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+        PathBuf::from(trailing_trimmed)
+    } else {
+        expanded.clone()
+    };
+
+    trimmed
+        .canonicalize()
+        .unwrap_or_else(|_| trimmed.clone())
 }
 
 fn validate_source_name(name: &str) -> Result<(), ConfigError> {
@@ -551,11 +728,47 @@ impl SourcesConfig {
             }
         }
 
+        self.validate_no_duplicate_source_paths()?;
+
         for (idx, agent) in self.disabled_agents.iter().enumerate() {
             if normalize_agent_config_name(agent).is_none() {
                 return Err(ConfigError::Validation(format!(
                     "disabled_agents[{idx}] cannot be empty"
                 )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reject two **local** sources that register the same normalized path.
+    ///
+    /// Two configured roots over one local directory would ingest the same files
+    /// twice under two `source_id`s, which is exactly the double-counting PR8's
+    /// identity keys exist to prevent. Normalization is
+    /// [`normalize_source_path_for_comparison`], so `~/.codex/sessions`,
+    /// `/home/me/.codex/sessions/` and a symlinked equivalent all collide
+    /// (PR8 spec §S4, hard constraint 9).
+    ///
+    /// `ssh` sources are deliberately out of scope: their `paths` are *remote*
+    /// paths, and two machines each holding `~/.claude/projects` is the ordinary
+    /// multi-host case, not a conflict — PR8's identity model exists precisely so
+    /// that same-path sessions from different `origin_host`s stay two
+    /// conversations (spec §S1/S4).
+    fn validate_no_duplicate_source_paths(&self) -> Result<(), ConfigError> {
+        let mut seen: std::collections::HashMap<PathBuf, &str> = std::collections::HashMap::new();
+
+        for source in self.sources.iter().filter(|source| !source.is_remote()) {
+            for path in &source.paths {
+                let normalized = normalize_source_path_for_comparison(path);
+                if let Some(previous) = seen.insert(normalized.clone(), &source.name) {
+                    return Err(ConfigError::Validation(format!(
+                        "sources '{}' and '{}' register the same path '{}'",
+                        previous,
+                        source.name,
+                        normalized.display()
+                    )));
+                }
             }
         }
 
@@ -1161,6 +1374,12 @@ impl SourceConfigGenerator {
         let platform = self.detect_platform(probe);
         let name = normalize_generated_remote_source_name(host_name);
 
+        // The wizard's source name *is* the machine identity for a freshly added
+        // host (the documented `ivanmac` source has `host = "ivanmac"` and
+        // `origin_host = "ivanmac"`), so it seeds `origin_host`. The operator can
+        // still edit the generated entry to name the machine differently.
+        let origin_host = name.clone();
+
         SourceDefinition {
             name,
             source_type: SourceKind::Ssh,
@@ -1170,6 +1389,9 @@ impl SourceConfigGenerator {
             path_mappings,
             platform,
             full_scan: false,
+            origin_host,
+            readonly: false,
+            mirror_dir: None,
         }
     }
 
@@ -2091,6 +2313,7 @@ paths = ["/mnt/histories/laptop"]
 name = "laptop"
 type = "ssh"
 host = "user@host"
+origin_host = "laptop"
 paths = [" ~/.claude/projects", "~/.codex/sessions"]
 "#,
         )
@@ -2117,6 +2340,7 @@ paths = [" ~/.claude/projects", "~/.codex/sessions"]
 name = "laptop"
 type = "ssh"
 host = "user@host withspace"
+origin_host = "laptop"
 paths = ["~/.claude/projects"]
 "#,
         )
@@ -2434,6 +2658,9 @@ paths = ["~/.claude/projects"]
             path_mappings: vec![PathMapping::new("/home/user", "/Users/me")],
             platform: Some(Platform::Linux),
             full_scan: false,
+            origin_host: "laptop".into(),
+            readonly: false,
+            mirror_dir: None,
         });
 
         let serialized = toml::to_string_pretty(&config).unwrap();
@@ -2462,6 +2689,9 @@ paths = ["~/.claude/projects"]
             ],
             platform: None,
             full_scan: false,
+            origin_host: "remote".into(),
+            readonly: false,
+            mirror_dir: None,
         });
 
         let serialized = toml::to_string_pretty(&config).unwrap();
