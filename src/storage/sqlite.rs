@@ -5828,6 +5828,115 @@ impl FrankenStorage {
         Ok(())
     }
 
+    /// PR8 C3 (spec hard constraint 4/5): read this `(root_id, connector)`
+    /// scan watermark. `None` means "no row" and therefore "scan the whole
+    /// root" -- there is deliberately no bootstrap to the current time.
+    pub fn get_scan_watermark(&self, root_id: &str, connector: &str) -> Result<Option<i64>> {
+        let result: Result<i64, _> = self.conn.query_row_map(
+            "SELECT last_scan_ts FROM scan_watermarks WHERE root_id = ?1 AND connector = ?2",
+            fparams![root_id, connector],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(ts) => Ok(ts),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write this `(root_id, connector)` scan watermark. Callers only reach
+    /// here for a root whose scan completed without error (hard constraint 5).
+    pub fn set_scan_watermark(&self, root_id: &str, connector: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_watermarks(root_id, connector, last_scan_ts)
+             VALUES(?1, ?2, ?3)",
+            fparams![root_id, connector, ts],
+        )?;
+        Ok(())
+    }
+
+    /// `cass index --full` for one root: drop that root's watermark row only.
+    /// A fake home's `--full` must not touch the real home's row (hard
+    /// constraint 5: "`--full` 只把当前扫描根的全部行置零").
+    pub fn clear_scan_watermarks_for_root(&self, root_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM scan_watermarks WHERE root_id = ?1",
+            fparams![root_id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop one root's per-file state, the companion of
+    /// [`Self::clear_scan_watermarks_for_root`] on a `--full` scan. Rows of
+    /// other roots and other connectors are untouched.
+    pub fn clear_scan_file_state_for_root(&self, root_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM scan_file_state WHERE root_id = ?1",
+            fparams![root_id],
+        )?;
+        Ok(())
+    }
+
+    /// One file's recorded `(size, mtime, last_seen_ts)` for this
+    /// `(root_id, connector)`. Keyed with the connector on purpose: one
+    /// connector's successful scan must not erase another connector's pending
+    /// re-read of the same file (spec R3-B2).
+    pub fn get_scan_file_state(
+        &self,
+        root_id: &str,
+        connector: &str,
+        relative_path: &str,
+    ) -> Result<Option<(i64, i64, i64)>> {
+        let result: Result<(i64, i64, i64), _> = self.conn.query_row_map(
+            "SELECT size, mtime, last_seen_ts FROM scan_file_state
+             WHERE root_id = ?1 AND connector = ?2 AND relative_path = ?3",
+            fparams![root_id, connector, relative_path],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        );
+        match result.optional() {
+            Ok(state) => Ok(state),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every recorded `relative_path -> (size, mtime)` for one
+    /// `(root_id, connector)`, read once per scan instead of per file.
+    pub fn scan_file_states_for_root_connector(
+        &self,
+        root_id: &str,
+        connector: &str,
+    ) -> Result<HashMap<String, (i64, i64)>> {
+        let rows: Vec<(String, i64, i64)> = self.conn.query_all_map(
+            "SELECT relative_path, size, mtime FROM scan_file_state
+             WHERE root_id = ?1 AND connector = ?2",
+            fparams![root_id, connector],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, size, mtime)| (path, (size, mtime)))
+            .collect())
+    }
+
+    /// Record that this `(root_id, connector)` scan saw `relative_path` with
+    /// the given size/mtime. Written only for roots whose scan had no error.
+    pub fn upsert_scan_file_state(
+        &self,
+        root_id: &str,
+        connector: &str,
+        relative_path: &str,
+        size: i64,
+        mtime: i64,
+        last_seen_ts: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_file_state
+             (root_id, connector, relative_path, size, mtime, last_seen_ts)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            fparams![root_id, connector, relative_path, size, mtime, last_seen_ts],
+        )?;
+        Ok(())
+    }
+
     /// Snapshot every scan watermark (global `last_scan_ts` + all per-connector
     /// rows) as raw meta rows, so a run that deferred conversations can restore
     /// them verbatim instead of advancing past unindexed sources.
