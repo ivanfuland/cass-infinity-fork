@@ -2144,6 +2144,13 @@ pub enum SourcesCommand {
         /// Skip connectivity test
         #[arg(long)]
         no_test: bool,
+        /// The machine these sessions were produced on (e.g. "ivanmac").
+        /// Required: it becomes `conversations.identity_host` for rows ingested
+        /// from this source, so two machines that happen to share an absolute
+        /// session path stay two conversations. Never derived from `url` or
+        /// `--name`; must match ^[A-Za-z0-9._-]{1,64}$.
+        #[arg(long = "origin-host", value_name = "HOST")]
+        origin_host: String,
     },
     /// Remove a configured source
     Remove {
@@ -65269,6 +65276,7 @@ mod doctor_asset_taxonomy_tests {
 name = "laptop"
 type = "ssh"
 host = "user@host"
+origin_host = "laptop"
 paths = [" ~/.claude/projects"]
 "#,
         )
@@ -65297,6 +65305,7 @@ paths = [" ~/.claude/projects"]
 name = "laptop"
 type = "ssh"
 host = "user@host"
+origin_host = "laptop"
 paths = ["~/.claude/projects"]
 "#,
         )
@@ -94007,7 +94016,8 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             preset,
             paths,
             no_test,
-        } => run_sources_add(&url, name, preset, paths, no_test),
+            origin_host,
+        } => run_sources_add(&url, name, preset, paths, no_test, origin_host),
         SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
         SourcesCommand::Doctor { source, json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -94443,9 +94453,30 @@ fn run_sources_add(
     preset: Option<String>,
     paths_arg: Vec<String>,
     no_test: bool,
+    origin_host: String,
 ) -> CliResult<()> {
-    use crate::sources::config::{Platform, SourceDefinition, SourcesConfig, get_preset_paths};
+    use crate::sources::config::{
+        Platform, SourceDefinition, SourcesConfig, get_preset_paths, is_valid_origin_host,
+    };
     use crate::sources::provenance::SourceKind;
+
+    // Reject a malformed origin_host here, with the CLI's own error shape,
+    // rather than letting `add_source` surface it as a generic validation
+    // failure. The rule is the same predicate the config loader applies.
+    if !is_valid_origin_host(&origin_host) {
+        return Err(CliError {
+            code: 10,
+            kind: CliErrorKind::Config.kind_str(),
+            message: format!(
+                "Invalid --origin-host '{origin_host}': must match ^[A-Za-z0-9._-]{{1,64}}$"
+            ),
+            hint: Some(
+                "Pass the machine these sessions were produced on, e.g. --origin-host ivanmac"
+                    .into(),
+            ),
+            retryable: false,
+        });
+    }
 
     // Parse URL to extract host
     let (host, source_id) = parse_source_url(url, name.as_deref())?;
@@ -94516,6 +94547,7 @@ fn run_sources_add(
         host: Some(host.clone()),
         paths: paths.clone(),
         platform,
+        origin_host,
         ..Default::default()
     };
 
