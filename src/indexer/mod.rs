@@ -4541,7 +4541,7 @@ pub(crate) fn acquire_index_run_lock(
     // sync_capture_durable, DB commit) can happen.
     crate::raw_mirror::create_dir_all_durable(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = crate::search::asset_state::index_run_lock_path(data_dir);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
