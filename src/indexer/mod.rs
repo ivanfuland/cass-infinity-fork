@@ -7479,7 +7479,7 @@ fn spawn_connector_producer(
                     return Ok(());
                 }
                 let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
-                match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
+                match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, &IngestIdentity::local(), None, source_kind, conversation) {
                     Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
                         // R1-B1 (任务书 #118a): a prepare failure must be a
@@ -7605,7 +7605,7 @@ fn spawn_connector_producer(
                 }
                 let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
                 let prepared =
-                    prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conversation);
+                    prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, &ingest_identity_for_root(root), Some(root), source_kind, conversation);
 
                 if !was_detected && !is_discovered {
                     if let Some(p) = &config.progress {
@@ -8547,7 +8547,7 @@ fn run_batch_index_with_connector_factories(
                             });
                             for conv in local_convs {
                                 let source_kind = capture_source_kind_for(name, conv.source_path.clone());
-                                match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conv) {
+                                match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, &IngestIdentity::local(), None, source_kind, conv) {
                                     Ok(prepared) => convs.push(prepared),
                                     Err(error) => {
                                         scan_succeeded = false;
@@ -8610,7 +8610,7 @@ fn run_batch_index_with_connector_factories(
                                 });
                                 for conv in remote_convs {
                                     let source_kind = capture_source_kind_for(name, conv.source_path.clone());
-                                    match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conv) {
+                                    match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, &ingest_identity_for_root(root), Some(root), source_kind, conv) {
                                         Ok(prepared) => convs.push(prepared),
                                         Err(error) => {
                                             scan_succeeded = false;
@@ -14754,7 +14754,7 @@ fn reindex_paths_with_semantic_delta(
             Vec::with_capacity(convs.len());
         for conv in convs {
             let source_kind = capture_source_kind_for(kind.slug(), conv.source_path.clone());
-            match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
+            match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, &ingest_identity_for_root(&root), Some(&root), source_kind, conv) {
                 Ok(prepared) => prepared_convs.push(prepared),
                 Err(error) => {
                     // R1-B1 (任务书 #118a): a prepare failure must poison
@@ -15834,13 +15834,59 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
     roots
 }
 
+/// PR8 C2 (spec S1 / hard constraint 2): the machine a scanned session came
+/// from, plus the scan root it arrived through.
+///
+/// This is the **single** place C2 turns a scan root into an ingest identity, and
+/// it is deliberately transitional: C2 runs against `ScanRoot`s that carry no
+/// `ScanRootMeta` yet (C3 adds it), so every root resolves to `local`/`local`
+/// here. The only non-`local` values that reach storage in this task are the ones
+/// `tests/w8_identity_merge.rs` puts on the conversation metadata directly. C3
+/// replaces this function's body with a `ScanRootMeta` lookup and changes nothing
+/// else on this path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestIdentity {
+    pub identity_host: String,
+    pub root_id: String,
+}
+
+impl IngestIdentity {
+    /// The identity of every root C2 can see: local ingest, restore of a
+    /// pre-PR8 capture, and any caller that has no root metadata at all.
+    pub fn local() -> Self {
+        Self {
+            identity_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+            root_id: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+        }
+    }
+}
+
+/// C2 transitional implementation -- see [`IngestIdentity`]. The root argument is
+/// taken (and its callers already compute it) so that C3 only has to fill in the
+/// body; nothing reads it yet.
+pub fn ingest_identity_for_root(_root: &ScanRoot) -> IngestIdentity {
+    IngestIdentity::local()
+}
+
 /// Inject provenance metadata into a conversation from a scan root's origin.
 ///
 /// This adds the `cass.origin` field to the conversation's metadata JSON
 /// so that persistence can extract and store the source_id.
 ///
 /// Part of P2.2 - provenance injection.
-fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
+///
+/// PR8 C2 adds `cass.identity` alongside it -- the `identity_host` that becomes
+/// part of the conversation dedup key, and the `root_id` that names the scan root
+/// in `merge_conflicts` entries. It is written here, in the same single place
+/// everything else about a conversation's provenance is written, and read back by
+/// `storage::sqlite` (`conversation_identity_host` / `conversation_root_id`). The
+/// whole `cass.identity` object is replaced on every call, exactly like
+/// `cass.origin`, so connector-authored metadata can never spoof it.
+fn inject_provenance(
+    conv: &mut NormalizedConversation,
+    origin: &Origin,
+    identity: &IngestIdentity,
+) {
     // Ensure metadata is an object
     if !conv.metadata.is_object() {
         conv.metadata = serde_json::json!({});
@@ -15855,6 +15901,13 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
             *cass = serde_json::json!({});
         }
         if let Some(cass_obj) = cass.as_object_mut() {
+            cass_obj.insert(
+                "identity".to_string(),
+                serde_json::json!({
+                    "identity_host": identity.identity_host,
+                    "root_id": identity.root_id
+                }),
+            );
             cass_obj.insert(
                 "origin".to_string(),
                 serde_json::json!({
@@ -16422,13 +16475,14 @@ fn prepare_conversation_for_ingest(
     connector_name: &str,
     connector: &(dyn crate::connectors::Connector + Send),
     origin: &Origin,
+    identity: &IngestIdentity,
     workspace_rewrite_root: Option<&ScanRoot>,
     source_kind: CaptureSourceKind,
     mut conv: NormalizedConversation,
 ) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
     use crate::indexer::exclusion::{PrepareError, PreparedConversation};
 
-    inject_provenance(&mut conv, origin);
+    inject_provenance(&mut conv, origin, identity);
     canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(&mut conv, root);
@@ -16560,7 +16614,9 @@ fn prepare_conversation_for_ingest(
         // parse's FINAL value, not whatever the connector derived scanning
         // the scratch copy.
         reparsed.workspace = original_workspace.clone();
-        inject_provenance(&mut reparsed, origin);
+        // Same identity as the first parse: the reparse of a captured copy is
+        // the same session from the same root, never a second identity.
+        inject_provenance(&mut reparsed, origin, identity);
         canonicalize_claude_external_id(connector_name, &mut reparsed);
         // R2-N2 (任务书 #119c): carry the first parse's rewrite provenance
         // forward directly -- do NOT call `apply_workspace_rewrite` again
@@ -16680,7 +16736,13 @@ pub(crate) fn prepare_conversation_for_restore(
 ) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
     use crate::indexer::exclusion::PrepareError;
 
-    inject_provenance(&mut conv, origin);
+    // PR8 C2: restore has no `ScanRoot` in hand, and the identity it will
+    // eventually use is the one recorded in the consumed capture's manifest
+    // (`identity_host` column) -- that is C4's change, not this one. Until then
+    // restore writes the same transitional `local` that every C2 ingest root
+    // resolves to, so restore and ingest agree on the identity of any session
+    // this task can actually produce.
+    inject_provenance(&mut conv, origin, &IngestIdentity::local());
     canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(&mut conv, root);
@@ -18028,11 +18090,17 @@ pub mod persist {
     ) -> bool {
         let mut seen = HashSet::new();
         for conv in convs {
-            let (source_id, _) = extract_provenance(&conv.metadata);
+            // PR8 C2: this pre-check decides whether a batch needs the serial
+            // fallback, so it must use the same key dimension the storage layer
+            // deduplicates on. Two roots of the same host produce one key (and
+            // fall back); the same external_id on two hosts produces two, and
+            // must not be mistaken for a duplicate.
+            let identity_host =
+                crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata);
             let key = if let Some(external_id) = conv.external_id.as_deref() {
                 (
                     conv.agent_slug.clone(),
-                    source_id,
+                    identity_host,
                     Some(external_id.to_owned()),
                     None,
                     conv.started_at,
@@ -18040,7 +18108,7 @@ pub mod persist {
             } else {
                 (
                     conv.agent_slug.clone(),
-                    source_id,
+                    identity_host,
                     None,
                     Some(conv.source_path.to_string_lossy().to_string()),
                     None,
@@ -18412,6 +18480,44 @@ pub mod persist {
             false,
             None,
         )
+    }
+
+    /// PR8 C2 test seam: persist already-scanned conversations through the real
+    /// dispatcher and report `(inserted_conversations, inserted_messages)`.
+    ///
+    /// [`persist_conversations_batched_inner`] is the single decision point for
+    /// the serial vs begin-concurrent write paths, and spec hard constraint 2
+    /// requires **both** of them to write `identity_host`. It is `pub(super)` and
+    /// takes `pub(crate)` types, so a black-box integration test cannot reach it
+    /// directly -- this follows the existing `set_prepare_fault_hook` precedent of
+    /// a `#[doc(hidden)] pub` seam. It adds no behavior of its own: same
+    /// dispatcher, same feature set, and the `CASS_INDEXER_BEGIN_CONCURRENT`
+    /// read happens inside `persist_conversations_batched_inner` as usual.
+    #[doc(hidden)]
+    pub fn persist_normalized_conversations_for_tests(
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        convs: Vec<NormalizedConversation>,
+    ) -> Result<(usize, usize)> {
+        let prepared: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+            .into_iter()
+            .map(|conv| {
+                let excluded = vec![None; conv.messages.len()];
+                crate::indexer::exclusion::PreparedConversation { conv, excluded }
+            })
+            .collect();
+        let outcome = persist_conversations_batched_inner(
+            storage,
+            &prepared,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+            false,
+            Some(data_dir),
+        )?;
+        Ok((
+            outcome.inserted_conversations,
+            outcome.inserted_messages,
+        ))
     }
 
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
@@ -21982,7 +22088,7 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        inject_provenance(&mut conv, &Origin::local());
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
 
         attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
@@ -22701,7 +22807,7 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        inject_provenance(&mut conv, &Origin::local());
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
         attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
@@ -22757,7 +22863,7 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        inject_provenance(&mut conv, &Origin::local());
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
         attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
         let manifest_relative = conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
             .as_str()
@@ -34894,12 +35000,71 @@ mod tests {
         assert!(conv.metadata.get("cass").is_none());
 
         let origin = Origin::local();
-        inject_provenance(&mut conv, &origin);
+        inject_provenance(&mut conv, &origin, &IngestIdentity::local());
 
         let cass = conv.metadata.get("cass").expect("cass field should exist");
         let origin_obj = cass.get("origin").expect("origin should exist");
         assert_eq!(origin_obj.get("source_id").unwrap().as_str(), Some("local"));
         assert_eq!(origin_obj.get("kind").unwrap().as_str(), Some("local"));
+
+        // PR8 C2: the identity carrier rides alongside, and the storage layer
+        // reads it back to the same value (single definition of the shape).
+        let identity_obj = cass.get("identity").expect("cass.identity should exist");
+        assert_eq!(identity_obj.get("identity_host").unwrap().as_str(), Some("local"));
+        assert_eq!(identity_obj.get("root_id").unwrap().as_str(), Some("local"));
+        assert_eq!(
+            crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata),
+            "local"
+        );
+    }
+
+    /// PR8 C2: the transitional identity hook is the single place C3 will edit,
+    /// so pin its C2 contract -- every root resolves to `local`/`local`, and a
+    /// `ScanRoot` is genuinely not consulted yet.
+    #[test]
+    fn ingest_identity_for_root_is_local_for_every_root() {
+        let root = ScanRoot::local(std::path::PathBuf::from("/some/scan/root"));
+        let identity = ingest_identity_for_root(&root);
+        assert_eq!(identity.identity_host, "local");
+        assert_eq!(identity.root_id, "local");
+
+        // The carrier path storage actually reads is what `inject_provenance`
+        // writes, so a round trip through both must agree.
+        let mut conv = norm_conv(Some("identity-roundtrip"), vec![norm_msg(0, 10)]);
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity {
+            identity_host: "ivanmac".to_string(),
+            root_id: "root-ivanmac".to_string(),
+        });
+        assert_eq!(
+            crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata),
+            "ivanmac"
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/identity/root_id").and_then(serde_json::Value::as_str),
+            Some("root-ivanmac")
+        );
+    }
+
+    /// PR8 C2: `cass.identity` is *replaced*, never merged, so connector-authored
+    /// metadata cannot spoof the identity a conversation is deduplicated under.
+    #[test]
+    fn inject_provenance_overwrites_a_connector_authored_identity() {
+        let mut conv = norm_conv(Some("spoofed-identity"), vec![norm_msg(0, 10)]);
+        conv.metadata = serde_json::json!({
+            "cass": {"identity": {"identity_host": "ivanmac", "root_id": "spoofed"}}
+        });
+
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
+
+        assert_eq!(
+            crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata),
+            "local",
+            "a connector-supplied identity must be overwritten, not honored"
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/identity/root_id").and_then(serde_json::Value::as_str),
+            Some("local")
+        );
     }
 
     #[test]
@@ -34907,7 +35072,7 @@ mod tests {
         let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
 
         let origin = Origin::remote_with_host("laptop", "user@laptop.local");
-        inject_provenance(&mut conv, &origin);
+        inject_provenance(&mut conv, &origin, &IngestIdentity::local());
 
         let cass = conv.metadata.get("cass").expect("cass field should exist");
         let origin_obj = cass.get("origin").expect("origin should exist");
@@ -34931,7 +35096,7 @@ mod tests {
         });
 
         let origin = Origin::remote_with_host("laptop", "user@laptop.local");
-        inject_provenance(&mut conv, &origin);
+        inject_provenance(&mut conv, &origin, &IngestIdentity::local());
 
         assert_eq!(
             conv.metadata.pointer("/other"),
@@ -35288,6 +35453,7 @@ mod tests {
                 "codex",
                 &connector,
                 &Origin::local(),
+                &IngestIdentity::local(),
                 None,
                 CaptureSourceKind::File(source_path.to_path_buf()),
                 conv,
@@ -35379,7 +35545,7 @@ mod tests {
                 let mut conv = norm_conv(Some(&format!("r3-n5-{label}")), vec![norm_msg(0, 1_000)]);
                 conv.agent_slug = "codex".to_string();
                 conv.source_path = source_path;
-                inject_provenance(&mut conv, &Origin::local());
+                inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
                 attach_raw_mirror_capture(&data_dir, &mut conv).expect("raw-mirror capture");
                 let marker = illegal.then(|| ExcludedMarker {
                     reason: ExclusionReason::CassRecall,
@@ -35530,6 +35696,7 @@ mod tests {
             "codex",
             &codex_connector,
             &Origin::local(),
+            &IngestIdentity::local(),
             None,
             CaptureSourceKind::Logical,
             conv,
@@ -35584,7 +35751,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         // R1-N5 (任务书 #118b) explicit coverage: this is the real codex
@@ -35639,7 +35806,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), Some(&root), source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         assert_eq!(
@@ -35690,7 +35857,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), Some(&root), source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         assert_eq!(
@@ -35740,7 +35907,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let err = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+        let err = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv)
             .expect_err("a first-parse identity that the reparse doesn't reproduce must be rejected, not silently accepted");
         assert!(
             err.0.contains("reparse identity mismatch"),
@@ -35778,7 +35945,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         assert_eq!(
@@ -35838,7 +36005,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv);
+        let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv);
 
         unsafe {
             match &prior_xdg {
@@ -36101,6 +36268,7 @@ mod tests {
             "opencode",
             &codex_connector,
             &Origin::local(),
+            &IngestIdentity::local(),
             None,
             CaptureSourceKind::Logical,
             logical_conv,
@@ -36117,6 +36285,7 @@ mod tests {
             "codex",
             &codex_connector,
             &Origin::local(),
+            &IngestIdentity::local(),
             None,
             CaptureSourceKind::File(missing),
             failing_conv,
