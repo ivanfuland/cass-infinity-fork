@@ -66,6 +66,7 @@ use crate::storage::sqlite::{
     historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{EmbeddingInput, SemanticIndexer};
+use semantic_progress::{SemanticFinalizeProgressEmitter, SemanticProgressSink};
 
 use crate::search::semantic_manifest::TierKind as SemanticTierKind;
 
@@ -10551,13 +10552,48 @@ pub fn run_index(
         stats.salvage_skipped_by_no_ingest = opts.no_ingest;
     }
 
+    // PR8 C8: a semantic run's last mile has no batch-granular event to post
+    // — `run_semantic_db_vector_catchup` drains holes and then hands the run
+    // back to a tail (lexical checkpoint, analytics rebuild, activation
+    // audit) that used to look completely wedged to `cass status` /
+    // `cass doctor`. Open the sink here and tick through that whole window,
+    // to the end of this function, so the run keeps posting forward progress
+    // (issue #258 reads exactly that evidence for `stalled`).
+    //
+    // Scoped to `--semantic`: a plain `cass index` is unchanged, sink env var
+    // or not. The ticker's thread is owned by `semantic_finalize_progress`
+    // and joined on drop, which is the end of this function — including the
+    // early-return paths above it.
+    let semantic_finalize_progress: Option<SemanticFinalizeProgressEmitter> = if opts.semantic {
+        let interval = SemanticFinalizeProgressEmitter::interval_from_env();
+        tracing::debug!(
+            interval_ms = interval.as_millis() as u64,
+            embedder = %opts.embedder,
+            "starting semantic finalize progress ticker"
+        );
+        Some(SemanticFinalizeProgressEmitter::start(
+            SemanticProgressSink::open_for_embedder(&opts.embedder),
+            Some(Arc::clone(&progress_bump)),
+            interval,
+            "semantic_drain",
+        ))
+    } else {
+        None
+    };
+
     if opts.semantic && targeted_semantic_watch_once {
         tracing::info!(
             embedder = %opts.embedder,
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
+        if let Some(emitter) = semantic_finalize_progress.as_ref() {
+            emitter.set_stage("finalize");
+        }
     } else if opts.semantic {
         let outcome = run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
+        if let Some(emitter) = semantic_finalize_progress.as_ref() {
+            emitter.set_stage("finalize");
+        }
         if let Some(p) = &opts.progress
             && let Ok(mut stats) = p.stats.lock()
         {

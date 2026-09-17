@@ -21,19 +21,29 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 /// Env var that activates the sink and names the output file.
 pub const ENV_PROGRESS_JSONL: &str = "CASS_SEMANTIC_PROGRESS_JSONL";
 
+/// PR8 C8: how often the finalize ticker posts a `finalize_progress`
+/// event while a semantic run is draining holes or in its post-drain
+/// tail. Overridable so tests do not have to wait a minute per tick.
+pub const ENV_FINALIZE_PROGRESS_EVERY_MS: &str = "CASS_SEMANTIC_FINALIZE_PROGRESS_EVERY_MS";
+
+/// Production cadence for the finalize ticker: one event per minute.
+pub const DEFAULT_FINALIZE_PROGRESS_EVERY_MS: u64 = 60_000;
+
 /// Schema version for the JSONL event stream. Bump on any
 /// breaking change to event names or fields.
 pub const PROGRESS_JSONL_SCHEMA: &str = "cass.semantic.progress.v1";
 
-/// The 16 named transition events. Strings deliberately mirror the
+/// The named transition events. Strings deliberately mirror the
 /// `phase` + `sub_phase` columns in each emitted record so a `jq` user
 /// can filter on event name OR phase as they prefer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -76,6 +86,16 @@ pub enum SemanticProgressEvent {
     /// All work finished cleanly (terminal — emitted exactly once per
     /// run, after publish_done or in the no-op path).
     Complete,
+    /// PR8 C8: periodic tick covering the semantic run's drain-and-tail
+    /// window, where the batch-granular events above have nothing left to
+    /// report but the process is still doing real work (lexical
+    /// checkpoint, analytics, activation audit). Carries the elapsed
+    /// seconds and the named stage, and each tick also refreshes the
+    /// index-run lock's forward-progress evidence so an external
+    /// `cass status --json` / `cass doctor` observer does not read a
+    /// working run as `stalled` (cass#258's stall detector is keyed on
+    /// that evidence, and this window used to post none).
+    FinalizeProgress,
 }
 
 impl SemanticProgressEvent {
@@ -100,6 +120,7 @@ impl SemanticProgressEvent {
             Self::Error => "error",
             Self::Cancelled => "cancelled",
             Self::Complete => "complete",
+            Self::FinalizeProgress => "finalize_progress",
         }
     }
 
@@ -119,6 +140,7 @@ impl SemanticProgressEvent {
             Self::Error => "error",
             Self::Cancelled => "cancelled",
             Self::Complete => "complete",
+            Self::FinalizeProgress => "finalize",
         }
     }
 
@@ -138,6 +160,7 @@ impl SemanticProgressEvent {
             | Self::CheckpointSaveDone
             | Self::PublishDone => "done",
             Self::PacketReplayProgress => "progress",
+            Self::FinalizeProgress => "progress",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
             Self::Complete => "complete",
@@ -183,6 +206,17 @@ pub struct SemanticProgressFields {
     /// Free-form error string when the event is `error`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// PR8 C8: the named stage a `finalize_progress` tick is covering
+    /// (e.g. `semantic_drain`, `finalize`). Kept as a short label rather
+    /// than free prose so a consumer can group ticks by stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// PR8 C8: whole seconds elapsed since the ticker started. Redundant
+    /// with the record's `elapsed_ms` for a `finalize_progress` tick, and
+    /// carried anyway because the T6B report asked for a human-scaled
+    /// number next to the stage name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -302,6 +336,19 @@ impl SemanticProgressSink {
         }
     }
 
+    /// Open the sink for a Cass embedder id, labelling the tier the way the
+    /// rest of the semantic stack does (`infinity` is the quality tier,
+    /// `hash` the fast one). Convenience over [`Self::open`] for callers
+    /// that only know the embedder id they just ran with.
+    pub fn open_for_embedder(embedder_id: &str) -> Self {
+        let tier = match embedder_id {
+            "infinity" => "quality",
+            "hash" => "fast",
+            other => other,
+        };
+        Self::open(tier, embedder_id)
+    }
+
     /// Sink that never writes — kept as an explicit factory so callers
     /// can default to a sink without consulting the env var (e.g. tests
     /// that don't care about telemetry).
@@ -401,6 +448,138 @@ impl SemanticProgressSink {
     /// Process-pid for cross-correlation. Stable for the life of the sink.
     pub fn pid(&self) -> u32 {
         current_pid()
+    }
+}
+
+/// PR8 C8: periodic `finalize_progress` ticker for a semantic run's
+/// drain-and-tail window.
+///
+/// Why it exists: every event [`SemanticProgressSink`] knows how to emit is
+/// batch-granular (`embed_batch_*`, `staging_write_*`). Once the last batch
+/// lands, the run still has real work left — the post-drain lexical
+/// checkpoint, analytics rebuild and activation audit — and that window
+/// posted nothing at all. `cass status` / `cass doctor` read the index-run
+/// lock's `last_progress_at_ms` to decide `stalled` (cass#258), so a healthy
+/// run in that window was reported as wedged; the exam hall and the frozen
+/// corpus both hit it (57 min and 14 min respectively).
+///
+/// The ticker therefore does two things on every tick, and both matter:
+///
+/// 1. emits a `finalize_progress` event through the sink (silent when
+///    `CASS_SEMANTIC_PROGRESS_JSONL` is unset — the sink is a no-op);
+/// 2. stores the current wall clock into the shared forward-progress atomic
+///    the index-run lock heartbeat folds into `last_progress_at_ms=`, which
+///    is exactly the evidence `asset_state::maintenance_stall_age_ms`
+///    consumes. No new stall rule is introduced and no existing one is
+///    relaxed for any other window.
+///
+/// Dropping the guard stops the thread and joins it, so the ticker cannot
+/// outlive the run that started it.
+pub struct SemanticFinalizeProgressEmitter {
+    stop: Arc<AtomicBool>,
+    stage: Arc<Mutex<&'static str>>,
+    /// Shared with the ticker thread: `set_stage` posts the new stage's
+    /// first tick from the calling thread, so the writer has to be usable
+    /// from both. `SemanticProgressSink::emit` already serializes on its
+    /// own mutex, so two writers is safe by construction.
+    sink: Arc<SemanticProgressSink>,
+    started: Instant,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SemanticFinalizeProgressEmitter {
+    /// Production cadence, or the test override.
+    pub fn interval_from_env() -> Duration {
+        Duration::from_millis(
+            dotenvy::var(ENV_FINALIZE_PROGRESS_EVERY_MS)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_FINALIZE_PROGRESS_EVERY_MS),
+        )
+    }
+
+    /// Start ticking. `progress_bump` is the index-run lock's
+    /// forward-progress atomic; `None` is legitimate for a caller that has
+    /// no run lock (the events are then the only output).
+    pub fn start(
+        sink: SemanticProgressSink,
+        progress_bump: Option<Arc<AtomicI64>>,
+        interval: Duration,
+        stage: &'static str,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stage_cell = Arc::new(Mutex::new(stage));
+        let started = Instant::now();
+        let sink = Arc::new(sink);
+        let stop_flag = Arc::clone(&stop);
+        let stage_for_thread = Arc::clone(&stage_cell);
+        let sink_for_thread = Arc::clone(&sink);
+        let join = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(interval);
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                let stage_now = *stage_for_thread
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let elapsed = started.elapsed();
+                sink_for_thread.emit(
+                    SemanticProgressEvent::FinalizeProgress,
+                    SemanticProgressFields {
+                        stage: Some(stage_now.to_string()),
+                        elapsed_secs: Some(elapsed.as_secs()),
+                        ..Default::default()
+                    },
+                );
+                if let Some(atomic) = progress_bump.as_ref() {
+                    atomic.store(now_unix_ms(), Ordering::Relaxed);
+                }
+            }
+        });
+        Self {
+            stop,
+            stage: stage_cell,
+            sink,
+            started,
+            join: Some(join),
+        }
+    }
+
+    /// Relabel the window this ticker is covering. Callers switch it as the
+    /// run crosses from hole-draining into the post-drain tail; the label is
+    /// what makes a tick interpretable after the fact. The new stage's first
+    /// tick is posted immediately rather than waiting out an interval, so a
+    /// stage that turns out to be brief still leaves one line saying the run
+    /// reached it.
+    pub fn set_stage(&self, stage: &'static str) {
+        *self
+            .stage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stage;
+        self.sink.emit(
+            SemanticProgressEvent::FinalizeProgress,
+            SemanticProgressFields {
+                stage: Some(stage.to_string()),
+                elapsed_secs: Some(self.started.elapsed().as_secs()),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Seconds since the ticker started.
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
+impl Drop for SemanticFinalizeProgressEmitter {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
     }
 }
 
