@@ -372,6 +372,14 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_ingest: bool,
 
+        /// PR8 C8: state the scan/ingest intent explicitly. Mutually
+        /// exclusive with `--no-ingest` (both together is a usage error).
+        /// A bare `cass index --semantic` still ingests -- the default is
+        /// unchanged -- but it now says so on stderr, so a read-only
+        /// semantic run can never be started by omission.
+        #[arg(long, default_value_t = false)]
+        ingest: bool,
+
         /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
         /// requires the `semantic` build feature, retired in this build --
         /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
@@ -6833,6 +6841,7 @@ async fn execute_cli(
                     data_dir,
                     semantic,
                     no_ingest,
+                    ingest,
                     embedder,
                     idempotency_key,
                     json,
@@ -6840,6 +6849,29 @@ async fn execute_cli(
                     no_progress_events,
                     robot_trace_ingest,
                 } => {
+                    // PR8 C8: resolve the ingest intent before anything runs.
+                    // `--ingest` and `--no-ingest` are opposite instructions,
+                    // so asking for both is a parameter error, not a
+                    // last-one-wins tie-break. The *default* is untouched --
+                    // a bare `cass index` (with or without `--semantic`)
+                    // still ingests; `--semantic` alone just becomes loud
+                    // about it (see `run_index_with_data`).
+                    let ingest_mode = if ingest && no_ingest {
+                        return Err(CliError::usage(
+                            "--ingest cannot be combined with --no-ingest",
+                            Some(
+                                "--ingest explicitly enables the source scan/ingest phase; \
+                                 --no-ingest explicitly disables it"
+                                    .to_string(),
+                            ),
+                        ));
+                    } else if no_ingest {
+                        IngestMode::ExplicitNoIngest
+                    } else if ingest || !semantic {
+                        IngestMode::ExplicitIngest
+                    } else {
+                        IngestMode::Implicit
+                    };
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
                         cli.db.clone(),
@@ -6851,6 +6883,7 @@ async fn execute_cli(
                         data_dir,
                         semantic,
                         no_ingest,
+                        ingest_mode,
                         embedder,
                         progress,
                         structured_format,
@@ -85884,6 +85917,40 @@ fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> 
     })
 }
 
+/// PR8 C8: how this `cass index` run's scan/ingest intent was stated.
+///
+/// The point of naming it is that "the default ingests" is only safe while
+/// it is *visible*: the frozen-corpus build that pulled a live session in
+/// (G589) did so by omitting `--no-ingest`, and nothing said so. The
+/// default itself stays put; a bare `--semantic` run now reports itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestMode {
+    /// `--ingest` was passed (or the run isn't semantic, where the flag
+    /// would have nothing to distinguish).
+    ExplicitIngest,
+    /// `--no-ingest` was passed.
+    ExplicitNoIngest,
+    /// `--semantic` with neither flag: this run ingests because nobody
+    /// said otherwise.
+    Implicit,
+}
+
+impl IngestMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitIngest => "explicit-ingest",
+            Self::ExplicitNoIngest => "explicit-no-ingest",
+            Self::Implicit => "implicit",
+        }
+    }
+}
+
+/// The fixed stderr prefix a bare `cass index --semantic` prints, so an
+/// operator (or a script) can detect the implicit choice without parsing
+/// prose. Emitted in `--json` mode too: stderr is not the JSON stream.
+const IMPLICIT_INGEST_WARNING: &str = "warning: --semantic without --ingest/--no-ingest ingests by \
+     default; pass --no-ingest for a read-only semantic run";
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -85895,6 +85962,7 @@ fn run_index_with_data(
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     no_ingest: bool,
+    ingest_mode: IngestMode,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -86045,6 +86113,15 @@ fn run_index_with_data(
             ));
         }
     }
+    // PR8 C8: a bare `cass index --semantic` still ingests, and now says so.
+    // Fixed prefix + one line on stderr, printed in `--json` mode as well --
+    // the structured payload is on stdout, so this cannot corrupt it, and a
+    // script that reads only stdout still gets a human-visible signal in its
+    // logs. Anything explicit (or a non-semantic run) stays silent.
+    if ingest_mode == IngestMode::Implicit {
+        eprintln!("{IMPLICIT_INGEST_WARNING}");
+    }
+
     let entrypoint = index_entrypoint_diagnostics(
         full,
         force_rebuild,
@@ -86595,6 +86672,14 @@ fn run_index_with_data(
                 serde_json::json!(stats.scan_invocations),
             );
             map.insert("no_ingest".to_string(), serde_json::json!(stats.no_ingest));
+            // PR8 C8: the two booleans above say *what* this run did; this
+            // says whether the caller asked for it. `implicit` is the shape
+            // that silently ingested a live session into the frozen corpus
+            // (G589), so a consumer can now refuse it outright.
+            map.insert(
+                "ingest_mode".to_string(),
+                serde_json::json!(ingest_mode.as_str()),
+            );
             // B05 (任务书 #131): `scan_invocations: 0` + `no_ingest: true` do
             // not by themselves mean "nothing entered the corpus" -- the
             // historical salvage preflight also imports, and this says
@@ -95896,6 +95981,7 @@ fn run_sources_sync(
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // no_ingest
+            IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
             "fastembed".to_string(),
             progress,
             output_format,
@@ -96049,6 +96135,7 @@ fn run_sources_reingest(
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
         false,                  // no_ingest
+        IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
         "fastembed".to_string(),
         progress,
         output_format,
