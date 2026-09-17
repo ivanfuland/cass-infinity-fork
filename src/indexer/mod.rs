@@ -8873,6 +8873,35 @@ fn full_scan_source_ids() -> HashSet<String> {
     }
 }
 
+/// Paths of configured `readonly = true` local scan roots.
+///
+/// `ScanRoot` is a re-exported FAD type with no readonly field, so ingest cannot
+/// be told "do not write here" through it. C5 carries the mark *beside* the
+/// roots instead, in this minimal side channel; C3's `ScanRootMeta` replaces it.
+///
+/// The key is `expand_local_scan_root_path`, the same expansion
+/// [`build_scan_roots`] applies before pushing a local root, so the two join on
+/// an identical `PathBuf` — see `readonly_marks_agree_with_build_scan_roots`.
+pub fn readonly_scan_root_paths() -> HashSet<PathBuf> {
+    // Mirror build_scan_roots and full_scan_source_ids: when the sources config
+    // is short-circuited it must not steer scan behavior either.
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return HashSet::new();
+    }
+    match SourcesConfig::load() {
+        Ok(config) => config
+            .sources
+            .iter()
+            .filter(|source| source.readonly && !source.is_remote())
+            .flat_map(|source| source.paths.iter())
+            .map(|path| expand_local_scan_root_path(path))
+            .collect(),
+        // A config that will not load yields no marks, matching the way
+        // full_scan_source_ids treats the same failure — never an error path.
+        Err(_) => HashSet::new(),
+    }
+}
+
 fn explicit_scan_root_since_ts(
     root: &ScanRoot,
     built_in_local_root: &Path,
@@ -15673,7 +15702,13 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                         path.to_string()
                     };
                     let safe_name = path_to_safe_dirname(&expanded_path);
-                    let mirror_base = data_dir.join("remotes").join(&source.name).join("mirror");
+                    // A source that declares `mirror_dir` mirrors under that
+                    // directory instead of `data_dir/remotes/<name>/mirror`; the
+                    // per-path layout below the root is unchanged, so sync and
+                    // this scan root keep agreeing on where a path landed.
+                    let mirror_base = source.effective_mirror_dir().unwrap_or_else(|| {
+                        data_dir.join("remotes").join(&source.name).join("mirror")
+                    });
                     let mirror_path = mirror_base.join(&safe_name);
 
                     if mirror_path.exists() {
