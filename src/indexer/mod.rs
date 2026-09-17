@@ -16500,30 +16500,24 @@ fn prepare_conversation_for_ingest(
         let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
         let reparsed_conversations =
             connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
-        // R1-N5 safety dependency (R-E-34, control-plane 核实 2026-09-07):
-        // the identity check below is only safe for a genuinely-unchanged
-        // file because of an invariant that lives ELSEWHERE --
-        // `materialize_capture_to_scratch` (via `materialize_sealed_blob`'s
-        // `rebuild_relative_shape(canonical_original_path)`,
-        // `phase3_restore.rs:2164/:2250`) reconstructs the scratch copy's
-        // ancestor directory shape purely from the ORIGINAL file's own real
-        // path (`agent`/`Origin::ClaudeCode` at `:2493` is an inert
-        // placeholder there, documented not to participate in path
-        // reconstruction). Both connectors wired into this crate derive
-        // `external_id` as a pure function of that reconstructed shape --
-        // codex: `source_path.strip_prefix(&sessions_dir)` (pinned
-        // `codex.rs:704-717`); claude_code: `projects_root_for_explicit_
-        // file` (pinned `claude_code.rs:453-458`) -- neither depends on
-        // `ctx.scan_roots`, timestamps, or scan order, so this reparse's id
-        // matches the first parse's id byte-for-byte for either connector.
-        // If shape reconstruction is ever changed to key off anything OTHER
-        // than the original file's own path (e.g. connector/agent kind),
-        // this check will start rejecting every real session of the
-        // affected connector as `CaptureFailed`, with nothing in the error
-        // message pointing back to this dependency -- confirmed NOT
-        // currently the case, but the failure mode is silent and total if
-        // it ever becomes one, hence written down here rather than only at
-        // the definition of `rebuild_relative_shape` itself.
+        // R1-N5 safety dependency (R-E-34, control-plane 核实 2026-09-07;
+        // layout updated by PR8 C4): the identity check below is only safe for
+        // a genuinely-unchanged file because `materialize_capture_to_scratch`
+        // lays the scratch copy out so that the connector root survives. For
+        // claude_code / codex the manifest records `shape_root` (`projects` /
+        // `sessions`) and the path relative to it, and the copy lands at
+        // `<scratch>/<identity_host>/<agent>/<shape_root>/<relative_path>`;
+        // every other connector keeps the baseline full original-path shape.
+        // Both connectors derive `external_id` as a pure function of the path
+        // below the nearest such root -- codex: `sessions_dir_for_explicit_file`
+        // + `strip_prefix` (pinned `codex.rs:95-101`, `:704-717`); claude_code:
+        // `projects_root_for_explicit_file` (pinned `claude_code.rs:143-150`,
+        // `:453-458`) -- neither depends on `ctx.scan_roots`, timestamps, or
+        // scan order, so this reparse's id matches the first parse's id
+        // byte-for-byte. If the layout ever drops the connector root, this
+        // check starts rejecting every real session of the affected connector
+        // as `CaptureFailed`, with nothing in the error message pointing back
+        // to this dependency -- hence written down here.
         let mut reparsed = if reparsed_conversations.len() == 1 {
             let candidate = reparsed_conversations.into_iter().next().expect("len checked above");
             // R1-N5 (任务书 #118b): the single-session branch used to accept
@@ -16548,6 +16542,16 @@ fn prepare_conversation_for_ingest(
                 .find(|c| c.agent_slug == original_agent_slug && c.external_id == original_external_id)
                 .ok_or_else(|| PrepareError("reparse produced no session matching the first parse's agent/external_id".to_string()))?
         };
+        // PR8 C4: the manifest's session key (which picked the materialized
+        // layout above) must also be the first parse's identity. Adds a
+        // rejection only; manifests without a session key pass as before.
+        crate::phase3_restore::ensure_manifest_session_key_matches(
+            data_dir,
+            record,
+            &original_agent_slug,
+            original_external_id.as_deref(),
+        )
+        .map_err(|e| PrepareError(format!("reparse manifest key: {e:#}")))?;
 
         // Provenance from the first parse, not re-derived from the scratch
         // path (Global Constraints/plan Task 2 Interfaces).
@@ -16800,15 +16804,21 @@ fn capture_discovered_source_file_before_parse(
         return;
     }
 
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider,
-        source_id: &source.origin.source_id,
-        origin_kind: source.origin.kind.as_str(),
-        origin_host: source.origin.host.as_deref(),
-        source_path: &source.source_path,
-        db_links: &[],
-    }) {
+    match crate::raw_mirror::capture_source_file_with_identity(
+        crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider,
+            source_id: &source.origin.source_id,
+            origin_kind: source.origin.kind.as_str(),
+            origin_host: source.origin.host.as_deref(),
+            source_path: &source.source_path,
+            db_links: &[],
+        },
+        crate::raw_mirror::RawMirrorSessionIdentity {
+            identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: None,
+        },
+    ) {
         Ok(record) => {
             tracing::debug!(
                 provider,
@@ -16965,15 +16975,21 @@ fn capture_scan_root_file_before_parse(
     ) {
         return;
     }
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider,
-        source_id: &root.origin.source_id,
-        origin_kind: root.origin.kind.as_str(),
-        origin_host: root.origin.host.as_deref(),
-        source_path: &root.path,
-        db_links: &[],
-    }) {
+    match crate::raw_mirror::capture_source_file_with_identity(
+        crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider,
+            source_id: &root.origin.source_id,
+            origin_kind: root.origin.kind.as_str(),
+            origin_host: root.origin.host.as_deref(),
+            source_path: &root.path,
+            db_links: &[],
+        },
+        crate::raw_mirror::RawMirrorSessionIdentity {
+            identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: None,
+        },
+    ) {
         Ok(record) => {
             tracing::debug!(
                 provider,
@@ -17007,15 +17023,21 @@ fn attach_raw_mirror_capture(
 ) -> anyhow::Result<crate::raw_mirror::RawMirrorCaptureRecord> {
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
     let db_link = raw_mirror_db_link_for_conversation(conv);
-    let record = crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider: &conv.agent_slug,
-        source_id: &source_id,
-        origin_kind: &origin_kind,
-        origin_host: origin_host.as_deref(),
-        source_path: &conv.source_path,
-        db_links: std::slice::from_ref(&db_link),
-    })?;
+    let record = crate::raw_mirror::capture_source_file_with_identity(
+        crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider: &conv.agent_slug,
+            source_id: &source_id,
+            origin_kind: &origin_kind,
+            origin_host: origin_host.as_deref(),
+            source_path: &conv.source_path,
+            db_links: std::slice::from_ref(&db_link),
+        },
+        crate::raw_mirror::RawMirrorSessionIdentity {
+            identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: conv.external_id.as_deref(),
+        },
+    )?;
     attach_raw_mirror_metadata(conv, &record);
     tracing::debug!(
         agent = %conv.agent_slug,
