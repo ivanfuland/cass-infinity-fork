@@ -84,6 +84,19 @@ pub struct RawMirrorCaptureInput<'a> {
     pub db_links: &'a [RawMirrorDbLink],
 }
 
+/// PR8 C4: `identity_host` for sessions captured on this machine.
+pub const RAW_MIRROR_LOCAL_IDENTITY_HOST: &str = "local";
+
+/// PR8 C4: the session half of a capture's identity, written into the manifest
+/// next to (not into) the capture identity. `agent` is the capture's
+/// `provider`; `shape_root` / `relative_path` are derived from the source path
+/// by [`crate::phase3_restore::split_connector_shape`].
+#[derive(Debug, Clone, Copy)]
+pub struct RawMirrorSessionIdentity<'a> {
+    pub identity_host: &'a str,
+    pub external_id: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RawMirrorCaptureRecord {
     pub manifest_id: String,
@@ -968,6 +981,20 @@ struct RawMirrorManifestFile {
     original_path: String,
     redacted_original_path: String,
     original_path_blake3: String,
+    // PR8 C4 session key. Empty/`None` values are not serialized, so a
+    // manifest written before these fields existed round-trips to the same
+    // bytes and keeps its self-digest; `DoctorRawMirrorManifestFile` in
+    // `lib.rs` mirrors these five declarations for the same reason.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    identity_host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shape_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relative_path: Option<String>,
     captured_at_ms: i64,
     source_mtime_ms: Option<i64>,
     source_size_bytes: u64,
@@ -978,7 +1005,70 @@ struct RawMirrorManifestFile {
     manifest_blake3: Option<String>,
 }
 
+/// PR8 C4 session key as stored in a manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManifestSessionKey {
+    identity_host: String,
+    agent: String,
+    external_id: Option<String>,
+    shape_root: Option<String>,
+    relative_path: Option<String>,
+}
+
+impl ManifestSessionKey {
+    fn of(manifest: &RawMirrorManifestFile) -> Self {
+        Self {
+            identity_host: manifest.identity_host.clone(),
+            agent: manifest.agent.clone(),
+            external_id: manifest.external_id.clone(),
+            shape_root: manifest.shape_root.clone(),
+            relative_path: manifest.relative_path.clone(),
+        }
+    }
+
+    fn apply_to(&self, manifest: &mut RawMirrorManifestFile) {
+        manifest.identity_host = self.identity_host.clone();
+        manifest.agent = self.agent.clone();
+        manifest.external_id = self.external_id.clone();
+        manifest.shape_root = self.shape_root.clone();
+        manifest.relative_path = self.relative_path.clone();
+    }
+}
+
+/// Captures with `identity_host = "local"` and no known `external_id` (the
+/// pre-parse capture shape). Use [`capture_source_file_with_identity`] when the
+/// session identity is known.
 pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirrorCaptureRecord> {
+    capture_source_file_with_identity(
+        input,
+        RawMirrorSessionIdentity {
+            identity_host: RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: None,
+        },
+    )
+}
+
+pub fn capture_source_file_with_identity(
+    input: RawMirrorCaptureInput<'_>,
+    identity: RawMirrorSessionIdentity<'_>,
+) -> Result<RawMirrorCaptureRecord> {
+    if !crate::phase3_restore::is_valid_identity_host(identity.identity_host) {
+        return Err(anyhow!(
+            "refusing to raw-mirror {} with invalid identity_host {:?} (must match ^[A-Za-z0-9._-]{{1,64}}$)",
+            input.source_path.display(),
+            identity.identity_host
+        ));
+    }
+    let shape = crate::phase3_restore::split_connector_shape(input.provider, input.source_path);
+    let session_key = ManifestSessionKey {
+        identity_host: identity.identity_host.to_string(),
+        agent: input.provider.to_string(),
+        external_id: identity.external_id.map(ToOwned::to_owned),
+        shape_root: shape.as_ref().map(|(root, _)| root.clone()),
+        relative_path: shape
+            .as_ref()
+            .and_then(|(_, relative)| relative.to_str().map(ToOwned::to_owned)),
+    };
     let source_metadata = fs::symlink_metadata(input.source_path)
         .with_context(|| format!("stat raw mirror source {}", input.source_path.display()))?;
     if source_metadata.file_type().is_symlink() {
@@ -1057,6 +1147,11 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
         original_path,
         redacted_original_path: redacted_original_path(input.provider, input.source_path),
         original_path_blake3,
+        identity_host: session_key.identity_host.clone(),
+        agent: session_key.agent.clone(),
+        external_id: session_key.external_id.clone(),
+        shape_root: session_key.shape_root.clone(),
+        relative_path: session_key.relative_path.clone(),
         captured_at_ms,
         source_mtime_ms,
         source_size_bytes: source_metadata.len(),
@@ -1086,6 +1181,12 @@ pub fn capture_source_file(input: RawMirrorCaptureInput<'_>) -> Result<RawMirror
         publish_manifest_bytes_create_new(&root, &manifest_path, &manifest_bytes, &blob_blake3)?;
     let (record_blob_size_bytes, record_captured_at_ms, record_source_mtime_ms) =
         if manifest_already_present {
+            merge_raw_mirror_manifest_session_key(
+                &root,
+                &manifest_path,
+                &session_key,
+                &blob_blake3,
+            )?;
             merge_raw_mirror_manifest_db_links(
                 &root,
                 &manifest_path,
@@ -1404,6 +1505,91 @@ fn merge_raw_mirror_manifest_db_links(
     replace_manifest_bytes(root, manifest_path, &manifest_bytes)
 }
 
+/// The same file captured again (same manifest id) may know more of its session
+/// key than the first capture did: the pre-parse capture has no `external_id`,
+/// the post-parse capture does. Returns the key to write, or `None` when the
+/// manifest already says everything the incoming capture knows.
+///
+/// A manifest written before PR8 (empty `identity_host` and `agent`) adopts the
+/// incoming key wholesale. Otherwise `identity_host`, `agent` and the shape are
+/// fixed by the first capture; disagreement is a hard error rather than a
+/// silent relabel. A second, different `external_id` is an error for shaped
+/// (claude_code / codex, one session per file) manifests and keeps the first
+/// value for the rest, whose files may hold several sessions.
+fn merged_manifest_session_key(
+    existing: &ManifestSessionKey,
+    incoming: &ManifestSessionKey,
+    manifest_path: &Path,
+) -> Result<Option<ManifestSessionKey>> {
+    if existing.identity_host.is_empty() && existing.agent.is_empty() {
+        return Ok(Some(incoming.clone()));
+    }
+    let conflict = |field: &str, left: &dyn std::fmt::Debug, right: &dyn std::fmt::Debug| {
+        anyhow!(
+            "E-MANIFEST-SESSION-KEY-CONFLICT: raw mirror manifest {} records {field}={left:?}, \
+             a new capture of the same file claims {right:?}",
+            manifest_path.display()
+        )
+    };
+    if existing.identity_host != incoming.identity_host {
+        return Err(conflict("identity_host", &existing.identity_host, &incoming.identity_host));
+    }
+    if existing.agent != incoming.agent {
+        return Err(conflict("agent", &existing.agent, &incoming.agent));
+    }
+    if existing.shape_root != incoming.shape_root || existing.relative_path != incoming.relative_path {
+        return Err(conflict(
+            "shape",
+            &(&existing.shape_root, &existing.relative_path),
+            &(&incoming.shape_root, &incoming.relative_path),
+        ));
+    }
+    match (&existing.external_id, &incoming.external_id) {
+        (None, Some(_)) => Ok(Some(incoming.clone())),
+        (Some(left), Some(right)) if left != right && existing.shape_root.is_some() => {
+            Err(conflict("external_id", left, right))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn merge_raw_mirror_manifest_session_key(
+    root: &Path,
+    manifest_path: &Path,
+    incoming: &ManifestSessionKey,
+    expected_blob_blake3: &str,
+) -> Result<()> {
+    let lock = MANIFEST_UPDATE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow!("raw mirror manifest update lock poisoned"))?;
+
+    let mut manifest = read_raw_mirror_manifest(manifest_path)?;
+    if manifest.blob_blake3 != expected_blob_blake3 {
+        return Err(anyhow!(
+            "existing raw mirror manifest {} points at blob {}, expected {}",
+            manifest_path.display(),
+            manifest.blob_blake3,
+            expected_blob_blake3
+        ));
+    }
+    let Some(merged) =
+        merged_manifest_session_key(&ManifestSessionKey::of(&manifest), incoming, manifest_path)?
+    else {
+        return Ok(());
+    };
+
+    ensure_manifest_identity_before_write(&manifest, manifest_path)?;
+    let had_self_digest = manifest.manifest_blake3.is_some();
+    merged.apply_to(&mut manifest);
+    // Same certificate rule as `merge_raw_mirror_manifest_db_links` (R-E-89 ②).
+    if had_self_digest {
+        manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+    }
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    replace_manifest_bytes(root, manifest_path, &manifest_bytes)
+}
+
 fn replace_manifest_bytes(root: &Path, manifest_path: &Path, manifest_bytes: &[u8]) -> Result<()> {
     ensure_private_dir_descendant(
         root,
@@ -1561,13 +1747,33 @@ fn ensure_raw_mirror_root(data_dir: &Path) -> Result<PathBuf> {
 /// to the connector's own file parser. Manifest-relative-path validation is
 /// the same `raw_mirror_manifest_path_from_relative` every other manifest
 /// reader uses -- no second path-safety implementation.
-pub(crate) fn read_capture_for_reparse(data_dir: &Path, record: &RawMirrorCaptureRecord) -> Result<(String, Vec<u8>)> {
+pub(crate) fn read_capture_for_reparse(data_dir: &Path, record: &RawMirrorCaptureRecord) -> Result<RawMirrorCaptureForMaterialize> {
     let root = raw_mirror_root(data_dir);
     let manifest_path = raw_mirror_manifest_path_from_relative(&root, &record.manifest_relative_path)?;
     let manifest = read_raw_mirror_manifest(&manifest_path)?;
     let blob_path = root.join(&record.blob_relative_path);
     let blob = fs::read(&blob_path).with_context(|| format!("read raw mirror blob {}", blob_path.display()))?;
-    Ok((manifest.original_path, blob))
+    Ok(RawMirrorCaptureForMaterialize {
+        original_path: manifest.original_path,
+        identity_host: manifest.identity_host,
+        agent: manifest.agent,
+        external_id: manifest.external_id,
+        shape_root: manifest.shape_root,
+        relative_path: manifest.relative_path,
+        blob,
+    })
+}
+
+/// What materialization reads from a capture: the manifest's shape fields
+/// (PR8 C4, read as recorded, never re-derived) and the blob bytes.
+pub(crate) struct RawMirrorCaptureForMaterialize {
+    pub original_path: String,
+    pub identity_host: String,
+    pub agent: String,
+    pub external_id: Option<String>,
+    pub shape_root: Option<String>,
+    pub relative_path: Option<String>,
+    pub blob: Vec<u8>,
 }
 
 /// PR6 T2b (任务书 #114, R2-B3): force-fsync a session's captured blob and
@@ -2261,6 +2467,14 @@ pub struct RawMirrorManifestView {
     pub origin_host: Option<String>,
     pub original_path: String,
     pub original_path_blake3: String,
+    /// PR8 C4 session key. Empty / `None` on manifests written before PR8.
+    pub identity_host: String,
+    pub agent: String,
+    pub external_id: Option<String>,
+    /// `Some` only for claude_code / codex captures whose path has the
+    /// connector root; materialization then uses the connector-shaped layout.
+    pub shape_root: Option<String>,
+    pub relative_path: Option<String>,
     pub captured_at_ms: i64,
     /// 封存时记录的源文件字节数（`RawMirrorManifestFile.source_size_bytes`）。
     ///
@@ -2375,6 +2589,11 @@ pub fn manifest_views(data_dir: &Path) -> Result<Vec<RawMirrorManifestView>> {
             origin_host: manifest.origin_host.clone(),
             original_path: manifest.original_path.clone(),
             original_path_blake3: manifest.original_path_blake3.clone(),
+            identity_host: manifest.identity_host.clone(),
+            agent: manifest.agent.clone(),
+            external_id: manifest.external_id.clone(),
+            shape_root: manifest.shape_root.clone(),
+            relative_path: manifest.relative_path.clone(),
             captured_at_ms: manifest.captured_at_ms,
             source_size_bytes: manifest.source_size_bytes,
             source_mtime_ms: manifest.source_mtime_ms,

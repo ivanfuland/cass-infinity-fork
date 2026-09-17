@@ -37588,6 +37588,18 @@ struct DoctorRawMirrorManifestFile {
     redacted_original_path: String,
     #[serde(default)]
     original_path_blake3: String,
+    // PR8 C4 session key: same declarations as `raw_mirror::RawMirrorManifestFile`
+    // so doctor's recomputed self-digest covers the same fields.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    identity_host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shape_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relative_path: Option<String>,
     #[serde(default)]
     captured_at_ms: i64,
     #[serde(default)]
@@ -66624,6 +66636,7 @@ paths = ["~/.claude/projects"]
                 verified_at_ms: None,
             },
             manifest_blake3: None,
+            ..Default::default()
         };
         manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
         manifest
