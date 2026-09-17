@@ -17315,6 +17315,78 @@ pub mod persist {
         /// connector's scan must report a skipped session, so callers turn
         /// each of these into a `ScanError`.
         pub skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
+        /// PR8 C8: what happened to every conversation in the batch, as
+        /// `(position in the caller's slice, outcome)`. The aggregate
+        /// counters above cannot answer "what happened to THIS session",
+        /// which is the question the per-session `scan_session` line exists
+        /// to answer. Filled by both persist paths so the common exit can
+        /// emit one line per conversation without knowing which path ran.
+        pub per_conversation: Vec<(usize, ScanSessionOutcome)>,
+    }
+
+    /// PR8 C8: one conversation's ingest result, as reported by the
+    /// `scan_session` line. The four ingest outcomes the T6B ledger asked
+    /// for; nothing else is inferred from them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ScanSessionOutcome {
+        /// The conversation row was created by this batch.
+        Inserted,
+        /// The conversation already existed and this batch appended at least
+        /// one new message to it.
+        Merged,
+        /// The conversation already existed and this batch added nothing --
+        /// a re-scan of an unchanged session.
+        SkippedDuplicate,
+        /// The batch refused this conversation (see `skipped_conversations`);
+        /// the rest of the batch still committed.
+        Error,
+    }
+
+    impl ScanSessionOutcome {
+        pub(super) fn as_str(self) -> &'static str {
+            match self {
+                Self::Inserted => "inserted",
+                Self::Merged => "merged",
+                Self::SkippedDuplicate => "skipped_duplicate",
+                Self::Error => "error",
+            }
+        }
+    }
+
+    /// `conversation_inserted` is true only when this batch created the
+    /// conversation row; the message count separates "appended" from
+    /// "already complete".
+    fn scan_session_outcome(outcome: &crate::storage::sqlite::InsertOutcome) -> ScanSessionOutcome {
+        if outcome.conversation_inserted {
+            ScanSessionOutcome::Inserted
+        } else if outcome.inserted_indices.is_empty() {
+            ScanSessionOutcome::SkippedDuplicate
+        } else {
+            ScanSessionOutcome::Merged
+        }
+    }
+
+    /// PR8 C8: one machine-readable line per conversation the ingest
+    /// touched, on the `cass::scan_session` target. Until now the only
+    /// per-session evidence was aggregate counters, so "which session went
+    /// missing" needed a DB diff. `bytes` is the source file size.
+    fn emit_scan_session(
+        agent_slug: &str,
+        external_id: Option<&str>,
+        source_path: &Path,
+        outcome: ScanSessionOutcome,
+    ) {
+        let bytes = std::fs::metadata(source_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        tracing::info!(
+            target: "cass::scan_session",
+            agent = %agent_slug,
+            external_id = %external_id.unwrap_or_default(),
+            bytes,
+            outcome = outcome.as_str(),
+            "scan_session"
+        );
     }
 
     impl PersistBatchOutcome {
@@ -18193,7 +18265,10 @@ pub mod persist {
 
         let mut batch_outcome = PersistBatchOutcome::default();
 
-        for (_idx, outcome) in ordered {
+        for (idx, outcome) in ordered {
+            batch_outcome
+                .per_conversation
+                .push((idx, scan_session_outcome(&outcome)));
             batch_outcome.record_insert_outcome(&outcome);
             if capture_semantic_delta {
                 let (inputs, max_message_id) =
@@ -18448,7 +18523,40 @@ pub mod persist {
         )
     }
 
+    /// PR8 C8: the exit both persist paths share. The serial path and the
+    /// begin-concurrent path each fill `PersistBatchOutcome::per_conversation`
+    /// in their own shape; emitting here means one `scan_session` line per
+    /// conversation without either path having to know about telemetry.
     fn persist_conversations_batched_inner(
+        storage: &FrankenStorage,
+        convs: &[crate::indexer::exclusion::PreparedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        capture_semantic_delta: bool,
+        raw_mirror_data_dir: Option<&Path>,
+    ) -> Result<PersistBatchOutcome> {
+        let outcome = persist_conversations_batched_inner_impl(
+            storage,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            capture_semantic_delta,
+            raw_mirror_data_dir,
+        )?;
+        for (index, result) in &outcome.per_conversation {
+            if let Some(prepared) = convs.get(*index) {
+                emit_scan_session(
+                    &prepared.conv.agent_slug,
+                    prepared.conv.external_id.as_deref(),
+                    &prepared.conv.source_path,
+                    *result,
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn persist_conversations_batched_inner_impl(
         storage: &FrankenStorage,
         convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
@@ -18616,6 +18724,24 @@ pub mod persist {
         let skipped_positions: std::collections::HashSet<usize> =
             skipped_conversations.iter().map(|skip| skip.index).collect();
         batch_outcome.skipped_conversations = skipped_conversations;
+        // PR8 C8: pair every conversation with its own result. `outcomes`
+        // covers only the conversations the batch accepted (see the
+        // positional contract just above), so walk `convs` and consume
+        // `outcomes` in the same order, marking the skipped ones as errors.
+        {
+            let mut accepted = outcomes.iter();
+            for index in 0..convs.len() {
+                let result = if skipped_positions.contains(&index) {
+                    ScanSessionOutcome::Error
+                } else {
+                    match accepted.next() {
+                        Some(insert) => scan_session_outcome(insert),
+                        None => ScanSessionOutcome::Error,
+                    }
+                };
+                batch_outcome.per_conversation.push((index, result));
+            }
+        }
         record_persisted_raw_mirror_db_links(
             raw_mirror_data_dir,
             convs
