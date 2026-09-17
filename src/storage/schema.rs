@@ -92,7 +92,15 @@ use super::api::{Conn, StorageError, Tx, TxMode, Value, params};
 /// echoes, context-file reads, codex host-shell preambles). Rebuild-only
 /// like every version bump since v5 -- no in-place migration, see
 /// [`ensure`] below.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+/// Version 7 (PR8 C1) adds the multi-host conversation identity:
+/// `conversations.identity_host` (`NOT NULL DEFAULT 'local'`) and the unique
+/// key `idx_conversations_identity(identity_host, agent_id, external_id)`,
+/// which replaces `idx_conversations_provenance(source_id, agent_id,
+/// external_id)`; `source_id` stays as a column with its plain index. The
+/// pre-existing `origin_host` column and its semantics are unchanged. Also
+/// adds the per-root watermark tables `scan_watermarks` and
+/// `scan_file_state`. Rebuild-only, same as v5 and v6.
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
 /// mode) — **must stay byte-for-byte identical** to the matching two lines
@@ -135,6 +143,30 @@ pub(crate) fn recreate_lex_domain_tables(conn: &Conn) -> Result<(), StorageError
 /// byte-for-byte identical to [`V2_LEX_DOMAIN_DDL`] above — a unit test
 /// (`fresh_schema_ddl_tail_matches_v2_lex_domain_migration_ddl`) enforces
 /// this so the two copies cannot silently drift apart.
+///
+/// `messages.id` stays `INTEGER PRIMARY KEY` without `AUTOINCREMENT` (PR8 C1
+/// decision; the question was deferred to PR8 by the PR6 spec
+/// `2026-09-07-pr6-ingest-hygiene-design.md:173` and plan
+/// `2026-09-07-pr6-ingest-hygiene.md:244`, raised by PR6 plan review R2
+/// #1/#2, control-plane ledger G265: "deleting the last row and re-ingesting
+/// reuses the id; real, but not a production path"). The note lives here
+/// because a Rust comment cannot sit inside the raw DDL string. Reasons:
+/// - The only production message-delete path is
+///   `franken_replace_conversation_messages_in_tx` (phase3 restore). It
+///   already allocates new ids above the pre-delete global `MAX(id)`
+///   (`storage::sqlite`, `old_global_max_message_id`), so it never reuses an
+///   id.
+/// - The other delete paths (`purge_agent_archive_data`,
+///   `forget_conversations_by_source_glob`,
+///   `collapse_external_id_prefix_duplicates`) have no production caller in
+///   this crate. The harm path from PR4 R2-01 (a stale snapshot pruning chunks
+///   of a reused id) is closed by PR6 T14, which puts `models backfill` under
+///   the index lock and checks snapshots by `content_hash`.
+/// - PR8 adds no message delete path: a same-identity hit takes the idx-append
+///   merge branch.
+/// Revisit this if a production delete path appears that bypasses the
+/// replace allocator. Schema bumps are rebuild-only, so switching later has
+/// no migration cost.
 const FRESH_SCHEMA_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS _schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')));
 CREATE TABLE IF NOT EXISTS meta ("key" TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -142,8 +174,8 @@ CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UN
 CREATE TABLE IF NOT EXISTS workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, display_name TEXT);
 CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, kind TEXT NOT NULL, host_label TEXT, machine_id TEXT, platform TEXT, config_json TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
 INSERT OR IGNORE INTO sources (id, kind, host_label, created_at, updated_at) VALUES ('local', 'local', NULL, strftime('%s','now')*1000, strftime('%s','now')*1000);
-CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL REFERENCES agents (id), workspace_id INTEGER REFERENCES workspaces (id), source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources (id), external_id TEXT, title TEXT, source_path TEXT NOT NULL, started_at INTEGER, ended_at INTEGER, approx_tokens INTEGER, metadata_json TEXT, origin_host TEXT, metadata_bin BLOB, total_input_tokens INTEGER, total_output_tokens INTEGER, total_cache_read_tokens INTEGER, total_cache_creation_tokens INTEGER, grand_total_tokens INTEGER, estimated_cost_usd REAL, primary_model TEXT, api_call_count INTEGER, tool_call_count INTEGER, user_message_count INTEGER, assistant_message_count INTEGER, last_message_idx INTEGER, last_message_created_at INTEGER);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_provenance ON conversations(source_id, agent_id, external_id);
+CREATE TABLE IF NOT EXISTS conversations (id INTEGER PRIMARY KEY, agent_id INTEGER NOT NULL REFERENCES agents (id), workspace_id INTEGER REFERENCES workspaces (id), source_id TEXT NOT NULL DEFAULT 'local' REFERENCES sources (id), external_id TEXT, title TEXT, source_path TEXT NOT NULL, started_at INTEGER, ended_at INTEGER, approx_tokens INTEGER, metadata_json TEXT, origin_host TEXT, identity_host TEXT NOT NULL DEFAULT 'local', metadata_bin BLOB, total_input_tokens INTEGER, total_output_tokens INTEGER, total_cache_read_tokens INTEGER, total_cache_creation_tokens INTEGER, grand_total_tokens INTEGER, estimated_cost_usd REAL, primary_model TEXT, api_call_count INTEGER, tool_call_count INTEGER, user_message_count INTEGER, assistant_message_count INTEGER, last_message_idx INTEGER, last_message_created_at INTEGER);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_identity ON conversations(identity_host, agent_id, external_id);
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations (id) ON DELETE CASCADE, idx INTEGER NOT NULL, role TEXT NOT NULL, author TEXT, created_at INTEGER, content TEXT NOT NULL, extra_json TEXT, extra_bin BLOB, excluded BLOB, UNIQUE (conversation_id, idx));
 CREATE INDEX IF NOT EXISTS idx_messages_excluded_blob ON messages(json_extract(excluded, '$.raw.blob'));
 CREATE TABLE IF NOT EXISTS snippets (id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL REFERENCES messages (id) ON DELETE CASCADE, file_path TEXT, start_line INTEGER, end_line INTEGER, language TEXT, snippet_text TEXT);
@@ -203,6 +235,8 @@ CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, d
 CREATE TABLE IF NOT EXISTS conversation_tail_state (conversation_id INTEGER PRIMARY KEY, ended_at INTEGER, last_message_idx INTEGER, last_message_created_at INTEGER);
 CREATE TABLE IF NOT EXISTS conversation_external_lookup (lookup_key TEXT PRIMARY KEY, conversation_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS conversation_external_tail_lookup (lookup_key TEXT PRIMARY KEY, conversation_id INTEGER NOT NULL, ended_at INTEGER, last_message_idx INTEGER, last_message_created_at INTEGER);
+CREATE TABLE IF NOT EXISTS scan_watermarks (root_id TEXT NOT NULL, connector TEXT NOT NULL, last_scan_ts INTEGER NOT NULL, PRIMARY KEY (root_id, connector));
+CREATE TABLE IF NOT EXISTS scan_file_state (root_id TEXT NOT NULL, connector TEXT NOT NULL, relative_path TEXT NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL, last_seen_ts INTEGER NOT NULL, PRIMARY KEY (root_id, connector, relative_path));
 CREATE TABLE IF NOT EXISTS operation_commit_receipt (id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, state TEXT NOT NULL, snapshot_root TEXT, committed_at_ms INTEGER NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
@@ -1253,7 +1287,7 @@ mod tests {
         assert!(names.contains(&"agents".to_string()));
         assert!(names.contains(&"conversations".to_string()));
         assert!(names.contains(&"messages".to_string()));
-        assert!(names.contains(&"idx_conversations_provenance".to_string()));
+        assert!(names.contains(&"idx_conversations_identity".to_string()));
         // W2-6 Task戊: fts_messages is retired at version 3 -- a fresh
         // database must never create it (or its FTS5 shadows) again.
         assert!(!names.contains(&"fts_messages".to_string()));
@@ -1667,10 +1701,13 @@ mod tests {
     /// `chunk_staging` table -- `embedding_generations`'s 2 new columns are
     /// not a new statement, just a wider existing one), then down to 67 by
     /// T11 retiring the 4 v4 message-granularity statements (table + 2
-    /// indexes + hole-ledger table). Verified against
+    /// indexes + hole-ledger table), then up to 70 by PR8 C1 (schema 7): +1
+    /// for PR6 T2a's `idx_messages_excluded_blob`, which was never counted
+    /// here, and +2 for `scan_watermarks` and `scan_file_state` (the unique
+    /// conversation index was renamed, not added). Verified against
     /// `FRESH_SCHEMA_DDL.split(';').filter(...).count()` directly (not
     /// hand-counted) each time this constant changed.
-    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 67;
+    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 70;
 
     /// The historical `fts_messages` DDL, byte-for-byte identical to the
     /// statement W2-6 Task戊 removed from [`FRESH_SCHEMA_DDL`]. A real
