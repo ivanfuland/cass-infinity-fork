@@ -7603,7 +7603,7 @@ mod e6_replace_commit_tests {
                 },
                 canonical_path: SHARED_PATH.into(),
             };
-            let got = candidate_versions_from_db(&storage, &identity).unwrap();
+            let got = candidate_versions_from_db(&storage, &identity, None).unwrap();
             assert_eq!(
                 got.len(),
                 1,
@@ -8741,6 +8741,42 @@ fn conversation_ids_for_identity(
     Ok(ids)
 }
 
+/// PR8 C4: DB lookup by session key for connector-shaped manifests (the other
+/// half is [`conversation_ids_for_identity`], unchanged for everything else).
+fn conversation_ids_for_session_key(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity_host: &str,
+    agent: &str,
+    external_id: &str,
+) -> anyhow::Result<Vec<i64>> {
+    use crate::storage::api::Value as ParamValue;
+
+    // `identity_host` 维尚未进 SQL：`conversations.identity_host` 列由 PR8 C1 引入，C1 合入后补 `AND c.identity_host = ?3`。
+    let _ = identity_host;
+    let sql = "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+               WHERE a.slug = ?1 AND c.external_id = ?2 ORDER BY c.id";
+    let params = vec![ParamValue::from(agent), ParamValue::from(external_id)];
+    let ids: Vec<i64> = storage
+        .raw()
+        .query_all_map(sql, &params, |row| row.get_typed(0))?;
+    Ok(ids)
+}
+
+/// PR8 C4: restore's one DB lookup entry -- session key when the manifest has
+/// one, the baseline path identity otherwise.
+fn conversation_ids_for_manifest(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity: &RestoreIdentity,
+    session_key: Option<&MirrorSessionKey>,
+) -> anyhow::Result<Vec<i64>> {
+    match session_key {
+        Some(key) => {
+            conversation_ids_for_session_key(storage, &key.identity_host, &key.agent, &key.external_id)
+        }
+        None => conversation_ids_for_identity(storage, identity),
+    }
+}
+
 pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
@@ -9341,9 +9377,13 @@ fn restore_publish_manifests(
                 // 修前这里只绑 `source_path`：库里另一条同路径、异来源的会话会先被选中，
                 // 于是 manifest 的 backlink 指向一条根本不是它的会话，且指错了不报错。
                 let identity = restore_identity_from_view(view)?;
-                conversation_ids_for_identity(&storage, &identity)?
-                    .into_iter()
-                    .next()
+                conversation_ids_for_manifest(
+                    &storage,
+                    &identity,
+                    manifest_session_key_from_view(view).as_ref(),
+                )?
+                .into_iter()
+                .next()
             }
         };
         let link = crate::raw_mirror::RawMirrorDbLink {
@@ -13955,8 +13995,9 @@ fn normalized_from_db_message(
 fn candidate_versions_from_db(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
+    session_key: Option<&MirrorSessionKey>,
 ) -> anyhow::Result<Vec<CandidateSideVersion>> {
-    let ids = conversation_ids_for_identity(storage, identity)?;
+    let ids = conversation_ids_for_manifest(storage, identity, session_key)?;
     let mut out = Vec::with_capacity(ids.len());
     for conversation_id in ids {
         let messages = storage.fetch_messages(conversation_id)?;
@@ -14227,7 +14268,8 @@ pub(crate) fn plan_mirror_restore(
         };
 
         // ── candidate 侧 ──────────────────────────────────────────────
-        let candidates = candidate_versions_from_db(&storage, &identity)?;
+        let candidates =
+            candidate_versions_from_db(&storage, &identity, manifest_session_key_from_view(head).as_ref())?;
         report.candidate_versions_seen += candidates.len();
         // R-E-68：**零会话投影**降为具名 HOLD，不再打死整轮。判据读的是 `ProjectionFault`
         // 这个具名类别，**不是** `detail` 的错误文案——文案是给人看的、随时会改，拿它做
@@ -14997,7 +15039,7 @@ mod e8_dry_run_planner_tests {
             .insert_conversations_batched(&[(agent_id, workspace_id, &internal)])
             .unwrap();
         let identity = restore_identity_from_view(view).unwrap();
-        let candidates = candidate_versions_from_db(&storage, &identity).unwrap();
+        let candidates = candidate_versions_from_db(&storage, &identity, None).unwrap();
         assert_eq!(candidates.len(), 1, "库里恰有一条对应会话");
 
         // ① 限 scope 相等 —— (A2) 的前提成立。
