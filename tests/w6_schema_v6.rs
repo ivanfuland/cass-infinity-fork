@@ -29,10 +29,10 @@ fn schema_ensure_rejects_v5_database_with_found_5_required_6() {
 
     let err = schema::ensure(&conn).expect_err("ensure must reject a v5 database, not migrate it");
     assert!(
-        matches!(err, StorageError::SchemaRebuildRequired { found: 5, required: 6 }),
-        "expected SchemaRebuildRequired{{found: 5, required: 6}}, got {err:?}"
+        matches!(err, StorageError::SchemaRebuildRequired { found: 5, required: 7 }),
+        "expected SchemaRebuildRequired{{found: 5, required: 7}}, got {err:?}"
     );
-    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 6, "PR6 T2a must bump CURRENT_SCHEMA_VERSION to 6");
+    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 7, "PR8 C1 bumped CURRENT_SCHEMA_VERSION to 7");
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn fresh_v6_database_has_excluded_column_and_expression_index() {
         .raw()
         .query_row_map("PRAGMA user_version;", &[], |row| row.get_typed(0))
         .expect("read user_version");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 
     let cols: Vec<String> = storage
         .raw()
