@@ -3986,7 +3986,7 @@ mod e5_materialization_tests {
                 u64::try_from(mtime).unwrap(),
                 "先证明 mtime 真的被改了 —— 不然这条测试又是个失效探针"
             );
-            match project_from_materialized(&materialized, &input, &test_provenance()).unwrap() {
+            match project_from_materialized(&materialized, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => seen.push(conv.conv),
                 other => panic!("期望 Projected，实得 {other:?}"),
             }
@@ -4082,7 +4082,7 @@ mod e5_materialization_tests {
             ..big
         };
         let kept_when_below = extras_outside_kept(
-            project_from_materialized(&materialized, &below, &test_provenance()).unwrap(),
+            project_from_materialized(&materialized, &below, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap(),
         );
         assert!(
             kept_when_below > 0,
@@ -4093,7 +4093,7 @@ mod e5_materialization_tests {
         // 正向断言：compact 之后那五个「明令不得丢」的键**仍然在场**。
         // 只做反向的「剩下的键 ⊆ 允许集」锁不住基线——少掉一个键照样满足子集关系。
         // 本断言同时是 `COMPACT_INVARIANT_EXTRA_KEYS` 与基线私有常量的同步锁。
-        let above = project_from_materialized(&materialized, &big, &test_provenance()).unwrap();
+        let above = project_from_materialized(&materialized, &big, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap();
         if let SealedProjection::Projected(conv) = &above {
             let present: std::collections::BTreeSet<&str> = conv
                 .conv
@@ -4460,6 +4460,7 @@ mod e5_materialization_tests {
         let prepared = crate::indexer::prepare_conversation_for_restore(
             "codex",
             &franken_agent_detection::types::Origin::local(),
+            &crate::indexer::IngestIdentity::local(),
             None,
             4096,
             &record,
@@ -4579,7 +4580,7 @@ mod e5_materialization_tests {
                 source_size_bytes: sealed,
                 ..input
             };
-            match project_from_materialized(&m, &below, &test_provenance()).unwrap() {
+            match project_from_materialized(&m, &below, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => conv
                     .conv
                     .messages
@@ -5430,7 +5431,7 @@ mod e5_materialization_tests {
                 source_size_bytes: sealed,
                 ..input
             };
-            match project_from_materialized(&materialized, &sized, &test_provenance()).unwrap() {
+            match project_from_materialized(&materialized, &sized, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => {
                     conv.conv.messages.iter().map(|m| m.extra.clone()).collect()
                 }
@@ -5933,7 +5934,7 @@ mod e5_p30_blob_read_tests {
                 source_size_bytes: view.source_size_bytes,
                 blob: &blob,
             };
-            let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+            let projected = match project_sealed_source(&scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
                 Ok(SealedProjection::Projected(conv)) => conv.conv,
                 other => panic!("封存投影未产出会话：{other:?}"),
             };
@@ -6071,7 +6072,7 @@ mod e5_p30_blob_read_tests {
             source_size_bytes: blob.len() as u64,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -11148,7 +11149,7 @@ mod e7_restore_journal_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -14951,7 +14952,7 @@ mod e8_dry_run_planner_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -15021,7 +15022,7 @@ mod e8_dry_run_planner_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+        let projected = match project_sealed_source(&scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => *conv,
             other => panic!("投影未产出会话：{other:?}"),
         };
