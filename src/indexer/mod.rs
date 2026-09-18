@@ -7581,10 +7581,10 @@ fn scan_one_root_for_producer(
                 source_kind,
                 conversation,
             ) {
-                Ok(prepared) => {
-                    batch_sender.push(prepared);
-                    Ok(())
-                }
+                // `push` reports the consumer-disconnected case; returning it
+                // keeps the baseline semantics (a failed send stops this
+                // root's scan and marks the callback fatal).
+                Ok(prepared) => batch_sender.push(prepared),
                 Err(error) => {
                     tracing::warn!(
                         connector = name,
