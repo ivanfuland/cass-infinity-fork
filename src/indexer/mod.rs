@@ -7416,11 +7416,19 @@ fn batch_scan_one_root(
     scan_errors: &mut Vec<String>,
 ) -> (RootScanOutcome, bool) {
     let mut prepare_failed = false;
+    let capture_fallback_roots: Vec<ScanRoot> = conn
+        .detect()
+        .root_paths
+        .iter()
+        .cloned()
+        .map(ScanRoot::local)
+        .collect();
     let (outcome, fatal) = run_local_root_scan(
         conn,
         name,
         data_dir,
         plan,
+        &capture_fallback_roots,
         active_source_filter,
         &mut |root, meta, conversation| {
             let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
@@ -7457,8 +7465,8 @@ fn batch_scan_one_root(
         scan_errors.push(error.to_string());
         return (failed_outcome(outcome), false);
     }
-    if !outcome.succeeded {
-        scan_errors.push(format!("scan failed for {}", plan.root.path.display()));
+    if let Some(error) = outcome.error.clone() {
+        scan_errors.push(error);
     }
     let succeeded = outcome.succeeded && !prepare_failed;
     let outcome = if succeeded {
@@ -7499,7 +7507,10 @@ fn scan_local_roots_for_producer(
             scan_succeeded = false;
             let _ = tx.send(IndexMessage::ScanError {
                 connector_name: name,
-                error: format!("scan failed for {}", plan.root.path.display()),
+                error: outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("scan failed for {}", plan.root.path.display())),
             });
         }
         if !root_succeeded {
@@ -7536,11 +7547,19 @@ fn scan_one_root_for_producer(
         StreamingBatchSender::new(tx, config.flow_limiter.clone(), name, *is_discovered);
     let mut prepare_failed = false;
     let mut flush_failed = false;
+    let capture_fallback_roots: Vec<ScanRoot> = conn
+        .detect()
+        .root_paths
+        .iter()
+        .cloned()
+        .map(ScanRoot::local)
+        .collect();
     let (outcome, fatal) = run_local_root_scan(
         conn,
         name,
         &config.data_dir,
         plan,
+        &capture_fallback_roots,
         config.active_source_filter.as_ref(),
         &mut |root, meta, conversation| {
             if !was_detected && !*is_discovered {
@@ -9314,6 +9333,9 @@ struct RootScanOutcome {
     /// False when this root's scan hit an error: the watermark and the file
     /// states for this `(root_id, connector)` then both stay put.
     succeeded: bool,
+    /// The connector's own error text, surfaced to `scan_errors` exactly as
+    /// the baseline local scan surfaced it.
+    error: Option<String>,
     /// `(relative_path, size, mtime)` of every file this scan covered.
     files: Vec<(String, i64, i64)>,
 }
@@ -9324,6 +9346,7 @@ impl RootScanOutcome {
             connector: connector.to_string(),
             root_id: root_id.to_string(),
             succeeded: false,
+            error: None,
             files: Vec::new(),
         }
     }
@@ -9537,11 +9560,16 @@ fn file_scan_stamp(path: &Path, discovered: &crate::connectors::DiscoveredSource
 /// Returns the outcome plus, separately, a fatal error the *callback* raised
 /// (the streaming producer's consumer-disconnected case, which stops the
 /// producer rather than being recorded as a scan error).
+#[allow(clippy::too_many_arguments)]
 fn run_local_root_scan(
     connector: &(dyn crate::connectors::Connector + Send),
     connector_name: &'static str,
     data_dir: &Path,
     plan: &LocalRootPlan,
+    // Roots the raw-mirror pre-parse capture falls back to when this connector
+    // discovers nothing under `plan.root`: the connector's own detected roots,
+    // exactly as the baseline local scan passed them.
+    capture_fallback_roots: &[ScanRoot],
     active_source_filter: &ActiveSessionSourceFilter,
     on_conversation: &mut dyn FnMut(
         &ScanRoot,
@@ -9602,6 +9630,7 @@ fn run_local_root_scan(
                     connector: connector_name.to_string(),
                     root_id,
                     succeeded: true,
+                    error: None,
                     files: Vec::new(),
                 },
                 None,
@@ -9636,7 +9665,7 @@ fn run_local_root_scan(
         &ctx,
         data_dir,
         connector_name,
-        std::slice::from_ref(&plan.root),
+        capture_fallback_roots,
         ctx.since_ts,
         active_source_filter,
     );
@@ -9668,6 +9697,7 @@ fn run_local_root_scan(
                 connector: connector_name.to_string(),
                 root_id,
                 succeeded: true,
+                error: None,
                 files: scanned_files,
             },
             None,
@@ -9680,7 +9710,13 @@ fn run_local_root_scan(
                 error = %error,
                 "scan root failed"
             );
-            (RootScanOutcome::failed(connector_name, &root_id), fatal)
+            (
+                RootScanOutcome {
+                    error: Some(error.to_string()),
+                    ..RootScanOutcome::failed(connector_name, &root_id)
+                },
+                fatal,
+            )
         }
     }
 }
@@ -38601,15 +38637,30 @@ mod tests {
     }
 
     #[test]
-    fn persist_final_index_run_metadata_updates_last_scan_ts_and_last_indexed_at_together() {
+    /// PR8 C3 (spec 推荐默认 / AC-7): a scan that ran to completion still
+    /// records `last_indexed_at`, and no longer writes the legacy global
+    /// `last_scan_ts` -- schema 7 keeps that value only for older readers
+    /// (`status --json`'s staleness comparison), and progress lives in the
+    /// per-`(root_id, connector)` rows now.
+    fn persist_final_index_run_metadata_writes_last_indexed_at_but_not_the_legacy_scan_ts() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
         persist_final_index_run_metadata(&storage, &db_path, true, 123, 456, false).unwrap();
 
-        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            None,
+            "schema 7 must not write the legacy global scan watermark"
+        );
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
+
+        // A value written by an older binary stays readable and untouched.
+        storage.set_last_scan_ts(99).unwrap();
+        persist_final_index_run_metadata(&storage, &db_path, true, 123, 457, false).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(99));
+        assert_eq!(storage.get_last_indexed_at().unwrap(), Some(457));
     }
 
     #[test]
