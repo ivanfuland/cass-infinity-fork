@@ -16662,7 +16662,9 @@ pub fn build_scan_roots_with_meta(
     if let Some(config) = config
         && !config.sources.is_empty()
     {
-        db_registered_fallback = false;
+        // This branch returns below, so it never reaches the fallback: no
+        // `db_registered_fallback` write is needed here, only in the `Err` arm
+        // above (which does fall through to it).
         for source in &config.sources {
             let origin = Origin {
                 source_id: source.name.clone(),
