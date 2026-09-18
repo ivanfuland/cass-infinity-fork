@@ -135,6 +135,12 @@
         },
         "capture_failed": {
           "type": "null"
+        },
+        "scan_roots_missing": {
+          "type": "null"
+        },
+        "sources_config_error": {
+          "type": "null"
         }
       }
     },
