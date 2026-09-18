@@ -2695,6 +2695,19 @@ fn mirror_session_key(
     })
 }
 
+/// PR8 C3: the ingest identity a restore replays a capture with.
+///
+/// Restore has no `ScanRoot` -- the capture already recorded which machine
+/// produced the session (`identity_host`, C4's manifest column), so the
+/// identity comes from there. A manifest written before that column existed
+/// carries an empty value and falls back to `local`, exactly as PR8 C2's
+/// transitional identity did.
+pub fn restore_identity_from_manifest_view(
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> crate::indexer::IngestIdentity {
+    crate::indexer::IngestIdentity::for_manifest(&view.identity_host)
+}
+
 pub fn manifest_session_key_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> Option<MirrorSessionKey> {
@@ -3007,6 +3020,9 @@ impl SealedMessageProjector<'_> {
         let prepared = crate::indexer::prepare_conversation_for_restore(
             connector_name_for(self.agent),
             &franken_agent_detection::types::Origin::local(),
+            // Digest comparison only: nothing is persisted here, so the
+            // identity never reaches storage (PR8 C3).
+            &crate::indexer::IngestIdentity::local(),
             None,
             self.sealed_source_size_bytes,
             &provenance,
@@ -3066,13 +3082,19 @@ impl MessageSequenceProjector for CandidateComparableProjector<'_> {
 /// 2. **Desktop sidecar 路径门**——§B.0.1 第一行，判据是路径分量，必须先于 parser；
 /// 3. **whole-file 形态分类**——复用 E2 冻结的分类器，零第二定义；
 /// 4. **JSONL 主路径**：pin parser 扫 → 恰好一个会话 → 跑 restore 侧的 ③。
+///
+/// PR8 C3: `identity` is the ingest identity the projected conversations are
+/// persisted under. A runner holding the manifest view passes
+/// [`restore_identity_from_manifest_view`]; a projection with no manifest of
+/// its own (the digest-comparison path) passes `IngestIdentity::local()`.
 pub(crate) fn project_sealed_source(
     scratch_root: &Path,
     input: &SealedSource<'_>,
+    identity: &crate::indexer::IngestIdentity,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
 ) -> Result<SealedProjection, ProjectionFault> {
     let materialized = materialize_sealed_blob(scratch_root, input)?;
-    project_from_materialized(&materialized, input, consumed_manifest)
+    project_from_materialized(&materialized, input, identity, consumed_manifest)
 }
 
 /// [`project_sealed_source`] 的后半段：输入是**已经物化好的**那个文件。
@@ -3084,6 +3106,7 @@ pub(crate) fn project_sealed_source(
 fn project_from_materialized(
     materialized: &Path,
     input: &SealedSource<'_>,
+    identity: &crate::indexer::IngestIdentity,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
 ) -> Result<SealedProjection, ProjectionFault> {
     use crate::phase3_bundle::{HoldReason, WholeFileDisposition, classify_whole_file};
@@ -3149,6 +3172,7 @@ fn project_from_materialized(
     let prepared = crate::indexer::prepare_conversation_for_restore(
         connector_name_for(input.agent),
         &franken_agent_detection::types::Origin::local(),
+        identity,
         None,
         input.source_size_bytes,
         consumed_manifest,
@@ -3848,7 +3872,7 @@ mod e5_materialization_tests {
             source_size_bytes: CLAUDE_JSONL.len() as u64,
             blob: CLAUDE_JSONL,
         };
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Held { reason, .. } => assert_eq!(
                 reason,
                 crate::phase3_bundle::HoldReason::OutOfScopeFormat,
@@ -3865,7 +3889,7 @@ mod e5_materialization_tests {
             "/home/u/.claude/projects/myapp/11111111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => {
                 assert_eq!(conv.conv.messages.len(), 2, "两条消息都要在");
             }
@@ -3882,7 +3906,7 @@ mod e5_materialization_tests {
             "/home/u/Library/Application Support/Claude/claude-code-sessions/11111111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Held { reason, detail } => {
                 assert_eq!(reason, crate::phase3_bundle::HoldReason::OutOfScopeFormat);
                 assert_eq!(detail.as_deref(), Some("claude-desktop-sidecar"));
@@ -3902,12 +3926,14 @@ mod e5_materialization_tests {
         let a = project_sealed_source(
             &scratch("inv-root-a"),
             &claude_source(path, CLAUDE_JSONL),
+            &crate::indexer::IngestIdentity::local(),
             &test_provenance(),
         )
         .unwrap();
         let b = project_sealed_source(
             &scratch("inv-root-b-considerably-longer"),
             &claude_source(path, CLAUDE_JSONL),
+            &crate::indexer::IngestIdentity::local(),
             &test_provenance(),
         )
         .unwrap();
@@ -3960,7 +3986,7 @@ mod e5_materialization_tests {
                 u64::try_from(mtime).unwrap(),
                 "先证明 mtime 真的被改了 —— 不然这条测试又是个失效探针"
             );
-            match project_from_materialized(&materialized, &input, &test_provenance()).unwrap() {
+            match project_from_materialized(&materialized, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => seen.push(conv.conv),
                 other => panic!("期望 Projected，实得 {other:?}"),
             }
@@ -4056,7 +4082,7 @@ mod e5_materialization_tests {
             ..big
         };
         let kept_when_below = extras_outside_kept(
-            project_from_materialized(&materialized, &below, &test_provenance()).unwrap(),
+            project_from_materialized(&materialized, &below, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap(),
         );
         assert!(
             kept_when_below > 0,
@@ -4067,7 +4093,7 @@ mod e5_materialization_tests {
         // 正向断言：compact 之后那五个「明令不得丢」的键**仍然在场**。
         // 只做反向的「剩下的键 ⊆ 允许集」锁不住基线——少掉一个键照样满足子集关系。
         // 本断言同时是 `COMPACT_INVARIANT_EXTRA_KEYS` 与基线私有常量的同步锁。
-        let above = project_from_materialized(&materialized, &big, &test_provenance()).unwrap();
+        let above = project_from_materialized(&materialized, &big, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap();
         if let SealedProjection::Projected(conv) = &above {
             let present: std::collections::BTreeSet<&str> = conv
                 .conv
@@ -4114,7 +4140,7 @@ mod e5_materialization_tests {
             "/home/u/.claude/projects/myapp/cccc1111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        let conv = match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => conv.conv,
             other => panic!("期望 Projected，实得 {other:?}"),
         };
@@ -4434,6 +4460,7 @@ mod e5_materialization_tests {
         let prepared = crate::indexer::prepare_conversation_for_restore(
             "codex",
             &franken_agent_detection::types::Origin::local(),
+            &crate::indexer::IngestIdentity::local(),
             None,
             4096,
             &record,
@@ -4553,7 +4580,7 @@ mod e5_materialization_tests {
                 source_size_bytes: sealed,
                 ..input
             };
-            match project_from_materialized(&m, &below, &test_provenance()).unwrap() {
+            match project_from_materialized(&m, &below, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => conv
                     .conv
                     .messages
@@ -4616,7 +4643,7 @@ mod e5_materialization_tests {
         let root = scratch(tag);
         let bytes = CLAUDE_ALL_BLOCKS.as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -4787,7 +4814,7 @@ mod e5_materialization_tests {
         )
         .as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
-        let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        let conv = match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => conv.conv,
             other => panic!("期望 Projected，实得 {other:?}"),
         };
@@ -4839,7 +4866,7 @@ mod e5_materialization_tests {
             source_size_bytes: bytes.len() as u64,
             blob: bytes,
         };
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -4900,7 +4927,7 @@ mod e5_materialization_tests {
         let root = scratch(tag);
         let bytes = raw.as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -5161,7 +5188,7 @@ mod e5_materialization_tests {
             source_size_bytes: bytes.len() as u64,
             blob: bytes,
         };
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -5404,7 +5431,7 @@ mod e5_materialization_tests {
                 source_size_bytes: sealed,
                 ..input
             };
-            match project_from_materialized(&materialized, &sized, &test_provenance()).unwrap() {
+            match project_from_materialized(&materialized, &sized, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => {
                     conv.conv.messages.iter().map(|m| m.extra.clone()).collect()
                 }
@@ -5907,7 +5934,7 @@ mod e5_p30_blob_read_tests {
                 source_size_bytes: view.source_size_bytes,
                 blob: &blob,
             };
-            let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+            let projected = match project_sealed_source(&scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
                 Ok(SealedProjection::Projected(conv)) => conv.conv,
                 other => panic!("封存投影未产出会话：{other:?}"),
             };
@@ -6045,7 +6072,7 @@ mod e5_p30_blob_read_tests {
             source_size_bytes: blob.len() as u64,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -8850,7 +8877,15 @@ fn restore_project_plan_item(
         source_size_bytes: view.source_size_bytes,
         blob: &blob,
     };
-    match project_sealed_source(&journal.scratch_dir, &sealed, &provenance) {
+    // PR8 C3: the manifest this capture came from records which machine
+    // produced the session, and that is the identity restore persists under.
+    let restore_identity = restore_identity_from_manifest_view(view);
+    match project_sealed_source(
+        &journal.scratch_dir,
+        &sealed,
+        &restore_identity,
+        &provenance,
+    ) {
         Ok(SealedProjection::Projected(prepared)) => {
             // T2b.3 (B段)：恢复链的落库端点，`excluded` marker 必须传到底
             // ——不许再经 `map_to_internal` 的 all-None 包装（会把 marker 吞掉）。
@@ -11114,7 +11149,7 @@ mod e7_restore_journal_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -14917,7 +14952,7 @@ mod e8_dry_run_planner_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -14987,7 +15022,7 @@ mod e8_dry_run_planner_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+        let projected = match project_sealed_source(&scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => *conv,
             other => panic!("投影未产出会话：{other:?}"),
         };
