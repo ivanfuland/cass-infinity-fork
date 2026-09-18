@@ -52,8 +52,9 @@ pub struct ScanRootMeta {
     /// `local`.
     pub origin_host: String,
     /// Configured `readonly = true` local roots (hard constraint 9/10). Carried
-    /// here so ingest reads it from the root metadata instead of C5's
-    /// transitional `readonly_scan_root_paths()` side channel.
+    /// here so ingest reads it from the root metadata instead of the
+    /// transitional side channel C5 used before this table existed (removed in
+    /// PR8 C6 once every reader had moved over).
     pub readonly: bool,
     /// Canonicalized root path, as it went into `root_id`.
     pub canonical_path: PathBuf,

@@ -18063,6 +18063,14 @@ struct StateDbSnapshot {
     /// meta keys and same null-when-never-written semantics as the three above.
     capture_na: Option<u64>,
     capture_failed: Option<u64>,
+    /// PR8 C6 (spec S5 / hard constraint 13): `last_index.scan_roots_missing`
+    /// (JSON array text) and `last_index.sources_config_error` (text, stored
+    /// empty when the run had no error). Both are `None` when the key was
+    /// never written; the config-error read also collapses the writer's empty
+    /// string to `None`, because "" is how that writer spells "no error", not
+    /// a value to render.
+    scan_roots_missing: Option<Vec<String>>,
+    sources_config_error: Option<String>,
 }
 
 fn probe_state_db(
@@ -18182,6 +18190,28 @@ fn probe_state_db_modes(
     )
     .ok()
     .and_then(|s| s.parse::<u64>().ok());
+    // PR8 C6 (spec S5 / hard constraint 13): same `last_index.*` keys, two
+    // different text encodings. The missing-root list is JSON array text and
+    // parses back to a list (`[]` = a run happened and skipped nothing). The
+    // config-error text is stored as "" when the run had no error, so an empty
+    // value is an absence rather than a value -- both "never written" and "no
+    // error" surface as null, exactly like the counters above.
+    snapshot.scan_roots_missing = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.scan_roots_missing'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+    snapshot.sources_config_error = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.sources_config_error'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .filter(|s| !s.is_empty());
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -18887,6 +18917,8 @@ fn state_meta_json_inner(
     let event_align_failed = db_snapshot.event_align_failed;
     let capture_na = db_snapshot.capture_na;
     let capture_failed = db_snapshot.capture_failed;
+    let scan_roots_missing = db_snapshot.scan_roots_missing;
+    let sources_config_error = db_snapshot.sources_config_error;
 
     let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
@@ -19175,6 +19207,13 @@ fn state_meta_json_inner(
             "event_align_failed": event_align_failed,
             "capture_na": capture_na,
             "capture_failed": capture_failed,
+            // PR8 C6 (spec S5 / hard constraint 13): `scan_roots_missing` is
+            // the list of configured roots the last successful run skipped
+            // (`null` when no run has written it, `[]` when a run skipped
+            // nothing); `sources_config_error` is that run's `sources.toml`
+            // load failure, null when there was none.
+            "scan_roots_missing": scan_roots_missing,
+            "sources_config_error": sources_config_error,
         },
         "index": {
             "exists": lexical.exists,
@@ -86697,6 +86736,17 @@ fn run_index_with_data(
                 "salvage_skipped_by_no_ingest".to_string(),
                 serde_json::json!(stats.salvage_skipped_by_no_ingest),
             );
+            // PR8 C6 (spec S5 / hard constraint 13): the configured-source
+            // facts at the payload's top level, next to the `--no-ingest`
+            // fields above (they stay in `indexing_stats` too, single source).
+            map.insert(
+                "scan_roots_missing".to_string(),
+                serde_json::json!(stats.scan_roots_missing),
+            );
+            map.insert(
+                "sources_config_error".to_string(),
+                serde_json::json!(stats.sources_config_error),
+            );
             map.insert(
                 "indexing_stats".to_string(),
                 serde_json::to_value(&*stats).unwrap_or_default(),
@@ -94943,6 +94993,20 @@ struct DiagnosticCheck {
     remediation: Option<String>,
 }
 
+/// PR8 C6 (spec S5 / hard constraint 13): one configured source root and the
+/// `missing` / `empty` / `present` state this machine is in for it.
+///
+/// A source-level list rather than a field on every [`DiagnosticCheck`]: the
+/// state only means anything for a root, and the other checks stay exactly the
+/// JSON shape they had.
+#[derive(serde::Serialize)]
+struct SourceRootState {
+    /// The path the scan would actually use for this entry.
+    path: String,
+    /// `missing` | `empty` | `present`.
+    state: &'static str,
+}
+
 /// Aggregated diagnostics for a single source (P5.6)
 #[derive(serde::Serialize)]
 struct SourceDiagnostics {
@@ -94951,6 +95015,9 @@ struct SourceDiagnostics {
     /// state + likely root cause + safe next command, in the 6.1 schema.
     host_report: crate::fleet_doctor_schema::HostDoctorReport,
     checks: Vec<DiagnosticCheck>,
+    /// PR8 C6 (spec S5): this source's configured roots, in `sources.toml`
+    /// order, each with its `missing` / `empty` / `present` state.
+    roots: Vec<SourceRootState>,
     passed: usize,
     warnings: usize,
     failed: usize,
@@ -95030,13 +95097,43 @@ fn run_sources_doctor(
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
     use colored::Colorize;
 
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::Config.kind_str(),
-        message: format!("Failed to load sources config: {e}"),
-        hint: Some("Run 'cass sources add' to configure a source".into()),
-        retryable: false,
-    })?;
+    let config = match SourcesConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            // PR8 C6 (spec S5 / hard constraint 13): the doctor is the surface
+            // an operator reaches for when a source "is not working", so a
+            // config that will not even load must be visible in this command's
+            // own output as `invalid` plus the reason -- not only as a fatal
+            // error envelope a `--json` caller would have to find on stderr.
+            // The exit code stays 9; the `already_reported` sentinel is what
+            // keeps `main` from printing the same failure a second time.
+            let reason = format!("Failed to load sources config: {e}");
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+            if let Some(fmt) = structured_format {
+                output_structured_value(
+                    serde_json::json!({
+                        "error": reason,
+                        "config_state": "invalid",
+                        "sources": []
+                    }),
+                    fmt,
+                )?;
+            } else {
+                println!("invalid: {reason}");
+            }
+            return Err(CliError::already_reported(
+                9,
+                CliErrorKind::Config.kind_str(),
+                false,
+            ));
+        }
+    };
 
     if config.sources.is_empty() {
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -95081,37 +95178,56 @@ fn run_sources_doctor(
 
     let mut all_diagnostics = Vec::new();
     let mut observations = Vec::new();
+    // PR8 C6: the mirror root a remote source's paths land under is derived
+    // from the data directory, exactly as `build_scan_roots_with_meta` derives
+    // it.
+    let data_dir = default_data_dir();
 
     for source in sources_to_check {
         let source_start = std::time::Instant::now();
         let mut checks = Vec::new();
 
-        // Check 1: SSH connectivity
         let host = source.host.as_deref().unwrap_or("unknown");
-        let ssh_check = check_ssh_connectivity(host);
-        checks.push(ssh_check);
 
-        // Check 2: rsync availability on remote
-        let rsync_check = check_rsync_available(host);
-        checks.push(rsync_check);
+        // Checks 1-3 are about the *other* machine. PR8 C6: a local source has
+        // none of them -- it used to be handed `host = "unknown"` and reported
+        // a failing SSH check for a directory on this very machine.
+        if source.is_remote() {
+            // Check 1: SSH connectivity
+            let ssh_check = check_ssh_connectivity(host);
+            checks.push(ssh_check);
 
-        // Check 3: Remote paths exist
-        for (idx, path) in source.paths.iter().enumerate() {
-            if let Some(message) = source_path_entry_error(idx, path) {
-                checks.push(DiagnosticCheck {
-                    name: format!("Remote Path: paths[{idx}]"),
-                    status: "fail".into(),
-                    message: format!("Invalid source path: {message}"),
-                    remediation: Some("Fix or remove this path in sources.toml".into()),
-                });
-            } else {
-                checks.push(check_remote_path(host, path));
+            // Check 2: rsync availability on remote
+            let rsync_check = check_rsync_available(host);
+            checks.push(rsync_check);
+
+            // Check 3: Remote paths exist
+            for (idx, path) in source.paths.iter().enumerate() {
+                if let Some(message) = source_path_entry_error(idx, path) {
+                    checks.push(DiagnosticCheck {
+                        name: format!("Remote Path: paths[{idx}]"),
+                        status: "fail".into(),
+                        message: format!("Invalid source path: {message}"),
+                        remediation: Some("Fix or remove this path in sources.toml".into()),
+                    });
+                } else {
+                    checks.push(check_remote_path(host, path));
+                }
             }
         }
 
         // Check 4: Local storage writable
         let storage_check = check_local_storage(&source.name);
         checks.push(storage_check);
+
+        // Check 5 (PR8 C6, spec S5): where each configured root actually is on
+        // this machine -- `missing` / `empty` / `present`, for local and remote
+        // sources alike.
+        let roots: Vec<SourceRootState> = source
+            .paths
+            .iter()
+            .map(|path| configured_root_state(source, &data_dir, path))
+            .collect();
 
         // Compute summary
         let passed = checks.iter().filter(|c| c.status == "pass").count();
@@ -95184,6 +95300,7 @@ fn run_sources_doctor(
             source_id: source.name.clone(),
             host_report,
             checks,
+            roots,
             passed,
             warnings,
             failed,
@@ -95236,6 +95353,21 @@ fn run_sources_doctor(
                 println!("    {}", check.message.dimmed());
                 if let Some(ref hint) = check.remediation {
                     println!("    {}: {}", "Hint".cyan(), hint);
+                }
+            }
+
+            // PR8 C6 (spec S5): the per-root states the JSON carries as
+            // `roots[].state`, shown here as the same three words.
+            if !diag.roots.is_empty() {
+                println!();
+                println!("{}", "Roots".normal());
+                for root in &diag.roots {
+                    let label = match root.state {
+                        "present" => root.state.green(),
+                        "empty" => root.state.yellow(),
+                        _ => root.state.red(),
+                    };
+                    println!("  {} {}", label, root.path.dimmed());
                 }
             }
 
@@ -95451,6 +95583,82 @@ fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
             remediation: Some("SSH connectivity may have failed".into()),
         },
     }
+}
+
+/// PR8 C6 (spec S5 / hard constraint 13): the state of one configured source
+/// root on this machine.
+///
+/// The path is derived exactly as the scan derives it -- for a remote source the
+/// same [`crate::indexer::remote_mirror_candidates`] list
+/// `build_scan_roots_with_meta` tries in order, for a local one the same
+/// [`crate::indexer::expand_local_scan_root_path`] -- so the doctor and the scan
+/// cannot disagree about which directory an entry names.
+fn configured_root_state(
+    source: &crate::sources::config::SourceDefinition,
+    data_dir: &Path,
+    path: &str,
+) -> SourceRootState {
+    let candidates: Vec<PathBuf> = if source.is_remote() {
+        crate::indexer::remote_mirror_candidates(source, data_dir, path)
+    } else {
+        vec![crate::indexer::expand_local_scan_root_path(path)]
+    };
+
+    let existing: Vec<&PathBuf> = candidates
+        .iter()
+        .filter(|candidate| candidate.exists())
+        .collect();
+    let Some(root) = existing.first() else {
+        return SourceRootState {
+            path: candidates
+                .first()
+                .map_or_else(|| path.to_string(), |candidate| candidate.display().to_string()),
+            state: "missing",
+        };
+    };
+
+    let state = if existing
+        .iter()
+        .any(|candidate| dir_contains_regular_file(candidate))
+    {
+        "present"
+    } else {
+        "empty"
+    };
+    SourceRootState {
+        path: root.display().to_string(),
+        state,
+    }
+}
+
+/// True when `dir` holds at least one regular file, at any depth.
+///
+/// Symlinks are followed (a root populated by links is still populated), an
+/// unreadable subdirectory is skipped rather than fatal, and the walk is
+/// depth-limited so a symlink loop under a source root cannot hang the doctor.
+fn dir_contains_regular_file(dir: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        const MAX_DEPTH: usize = 64;
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() {
+                return true;
+            }
+            if meta.is_dir() && walk(&entry.path(), depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(dir, 0)
 }
 
 /// Check if local storage directory is writable

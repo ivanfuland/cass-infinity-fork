@@ -11,7 +11,7 @@
 //! the four e2e targets and the `checks.toml [report]` exit code are the AC-6
 //! evidence and live in the task report, not here.
 
-use coding_agent_search::indexer::{IndexOptions, build_scan_roots, readonly_scan_root_paths, run_index};
+use coding_agent_search::indexer::{IndexOptions, build_scan_roots, run_index};
 use coding_agent_search::sources::config::{SourceDefinition, SourcesConfig};
 use coding_agent_search::sources::sync::{SyncEngine, path_to_safe_dirname};
 use coding_agent_search::storage::sqlite::FrankenStorage;
@@ -253,11 +253,14 @@ fn external_mirror_dir_is_authorized_root() {
 
 /// AC-4: a `readonly = true` local root is byte-identical after an index run.
 ///
-/// The mark travels through `readonly_scan_root_paths()`, the minimal side
-/// channel C5 uses because `ScanRoot` is a FAD type with no readonly field;
-/// C3's `ScanRootMeta` replaces it. The file-tree comparison is the actual
-/// claim: ingest must not create a lock, a watermark sidecar or a `.tmp` under
-/// the root.
+/// The mark travels through C3's `ScanRootMeta`, which is also where the
+/// configured `origin_host` reaches ingest (C5's transitional list-of-paths
+/// side channel was removed in PR8 C6, once both facts had a home on the root
+/// metadata). The file-tree comparison is the
+/// actual claim: ingest must not create a lock, a watermark sidecar or a
+/// `.tmp` under the root -- and the identity assertion below is what keeps the
+/// tree comparison from being vacuous, by proving the run really did route
+/// this root's session through that metadata.
 #[test]
 fn readonly_root_untouched() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
@@ -290,12 +293,6 @@ fn readonly_root_untouched() {
     assert!(!before.is_empty(), "the fixture must not be empty");
 
     with_private_env(&config_home, &home, || {
-        assert!(
-            readonly_scan_root_paths().contains(&source_root),
-            "the readonly mark must reach ingest for {:?}",
-            source_root
-        );
-
         let db_path = data_dir.join("agent_search.db");
         run_index(
             IndexOptions {
@@ -324,6 +321,20 @@ fn readonly_root_untouched() {
         assert!(
             ingested > 0,
             "the readonly fixture session must have been ingested (got {ingested})"
+        );
+
+        // ...and it arrived through this root's `ScanRootMeta`: the configured
+        // `origin_host` is what ingest used as the session's identity.
+        let identity: String = conn
+            .query_row(
+                "SELECT identity_host FROM conversations WHERE source_path LIKE ?1",
+                [format!("%{}%", source_root.display())],
+                |row| row.get(0),
+            )
+            .expect("the readonly root's session must be in the corpus");
+        assert_eq!(
+            identity, "fixture-ro",
+            "the configured root's origin_host must reach ingest as the identity"
         );
     });
 

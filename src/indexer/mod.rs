@@ -58,7 +58,7 @@ use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode
 #[cfg(test)]
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
-use crate::sources::config::{Platform, SourcesConfig};
+use crate::sources::config::{Platform, SourceDefinition, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
@@ -991,6 +991,19 @@ pub struct IndexingStats {
     /// `scan_invocations: 0` alone cannot tell "nothing was imported" apart
     /// from "nothing was scanned, but a backup was imported".
     pub salvage_skipped_by_no_ingest: bool,
+    /// PR8 C6 (spec S5 / hard constraint 13): names of the *configured* scan
+    /// roots this run skipped because their path does not exist. The same list
+    /// goes to the `last_index.scan_roots_missing` `meta` key as JSON array
+    /// text, so a later `cass status --json` discloses it without this run's
+    /// stdout.
+    #[serde(default)]
+    pub scan_roots_missing: Vec<String>,
+    /// PR8 C6 (spec S5 / hard constraint 13): the text of the `sources.toml`
+    /// load failure that made this run skip **every** configured source (and
+    /// stop falling back to the DB-registered ones). `None` when the config
+    /// loaded, or when `CASS_IGNORE_SOURCES_CONFIG` short-circuited it.
+    #[serde(default)]
+    pub sources_config_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -6323,19 +6336,30 @@ fn persist_last_index_run_meta_counters(writer: &FrankenStorage) -> Result<()> {
     // R2-N8 (任务书 #129): the two capture-outcome counts land in the same
     // statement (and therefore the same commit) as the three anchor counts.
     let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+    // PR8 C6 (spec S5 / hard constraint 13): the configured-source facts ride
+    // the same statement (and so the same commit) as the five above. Both keys
+    // are always written, like the counters: the missing-root list as JSON
+    // array text (`[]` when nothing was missing) and the load failure as
+    // plain text (empty string when there was none -- `status --json` renders
+    // that empty string back as null).
+    let (scan_roots_missing, sources_config_error) = last_index_configured_source_snapshot();
     writer.raw().execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES \
          ('last_index.codex_host_shell_hits', ?1), \
          ('last_index.codex_idx0_user_total', ?2), \
          ('last_index.event_align_failed', ?3), \
          ('last_index.capture_na', ?4), \
-         ('last_index.capture_failed', ?5)",
+         ('last_index.capture_failed', ?5), \
+         ('last_index.scan_roots_missing', ?6), \
+         ('last_index.sources_config_error', ?7)",
         &crate::storage::api::params![
             codex_host_shell_hits.to_string(),
             codex_idx0_user_total.to_string(),
             event_align_failed.to_string(),
             capture_na.to_string(),
-            capture_failed.to_string()
+            capture_failed.to_string(),
+            serde_json::to_string(&scan_roots_missing).unwrap_or_else(|_| "[]".to_string()),
+            sources_config_error.unwrap_or_default()
         ],
     )?;
     Ok(())
@@ -9254,35 +9278,6 @@ fn full_scan_source_ids() -> HashSet<String> {
     }
 }
 
-/// Paths of configured `readonly = true` local scan roots.
-///
-/// `ScanRoot` is a re-exported FAD type with no readonly field, so ingest cannot
-/// be told "do not write here" through it. C5 carries the mark *beside* the
-/// roots instead, in this minimal side channel; C3's `ScanRootMeta` replaces it.
-///
-/// The key is `expand_local_scan_root_path`, the same expansion
-/// [`build_scan_roots`] applies before pushing a local root, so the two join on
-/// an identical `PathBuf` — see `readonly_marks_agree_with_build_scan_roots`.
-pub fn readonly_scan_root_paths() -> HashSet<PathBuf> {
-    // Mirror build_scan_roots and full_scan_source_ids: when the sources config
-    // is short-circuited it must not steer scan behavior either.
-    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
-        return HashSet::new();
-    }
-    match SourcesConfig::load() {
-        Ok(config) => config
-            .sources
-            .iter()
-            .filter(|source| source.readonly && !source.is_remote())
-            .flat_map(|source| source.paths.iter())
-            .map(|path| expand_local_scan_root_path(path))
-            .collect(),
-        // A config that will not load yields no marks, matching the way
-        // full_scan_source_ids treats the same failure — never an error path.
-        Err(_) => HashSet::new(),
-    }
-}
-
 fn explicit_scan_root_since_ts(
     root: &ScanRoot,
     built_in_local_root: &Path,
@@ -11508,6 +11503,13 @@ pub fn run_index(
         let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
         stats.capture_na = capture_na;
         stats.capture_failed = capture_failed;
+        // PR8 C6 (spec S5 / hard constraint 13): same unconditional disclosure
+        // for the configured-source facts -- a run that skipped a configured
+        // root, or could not read `sources.toml` at all, says so in its own
+        // `--json` report, not only in a log line and a later `status`.
+        let (scan_roots_missing, sources_config_error) = last_index_configured_source_snapshot();
+        stats.scan_roots_missing = scan_roots_missing;
+        stats.sources_config_error = sources_config_error;
     }
 
     if targeted_watch_once_only_run {
@@ -16494,7 +16496,13 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
     let config = match SourcesConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::debug!("sources config load failed: {e}");
+            // PR8 C6 (spec S5): a config that will not load is an operator
+            // error, not a debug detail -- it used to leave every configured
+            // source silently unregistered. The same failure is recorded on
+            // `IndexingStats` by `build_scan_roots_with_meta` (the only writer
+            // of `last_index.sources_config_error`), so this line reports it
+            // without double-counting it.
+            tracing::error!(error = %e, "sources config failed to load");
             return;
         }
     };
@@ -16549,7 +16557,13 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
     }
 }
 
-fn expand_local_scan_root_path(path: &str) -> PathBuf {
+/// Resolve a configured scan-root path the way every consumer of it must:
+/// `~/…` against this user's home, anything else as written.
+///
+/// PR8 C6: `run_sources_doctor` classifies a *local* configured root from this
+/// same expansion, so the doctor and the scan root cannot disagree about which
+/// directory a `sources.toml` entry names.
+pub(crate) fn expand_local_scan_root_path(path: &str) -> PathBuf {
     if let Some(stripped) = path.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
     {
@@ -16622,10 +16636,35 @@ pub fn build_scan_roots_with_meta(
     // For explicit multi-root support, we add the local root.
     roots.push(ScanRoot::local(data_dir.to_path_buf()));
 
-    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_err()
-        && let Ok(config) = SourcesConfig::load()
+    // PR8 C6 (spec S5 / hard constraint 13): the chained `let Ok(config)` this
+    // used to be folded a load *failure* into the same `else` as "no configured
+    // sources", so a broken `sources.toml` produced exactly the roots an empty
+    // one does. The two states are split apart here: a failure is reported and
+    // recorded, and it alone suppresses the DB-registered fallback below.
+    let mut db_registered_fallback = true;
+    let config = if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_err() {
+        match SourcesConfig::load() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "sources config failed to load; configured sources skipped this run"
+                );
+                record_sources_config_error(&e.to_string());
+                db_registered_fallback = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(config) = config
         && !config.sources.is_empty()
     {
+        // This branch returns below, so it never reaches the fallback: no
+        // `db_registered_fallback` write is needed here, only in the `Err` arm
+        // above (which does fall through to it).
         for source in &config.sources {
             let origin = Origin {
                 source_id: source.name.clone(),
@@ -16637,68 +16676,43 @@ pub fn build_scan_roots_with_meta(
 
             for path in &source.paths {
                 if source.is_remote() {
-                    let expanded_path = if path.starts_with("~/") {
-                        path.to_string()
-                    } else if path.starts_with('~') {
-                        path.replacen('~', "~/", 1)
-                    } else {
-                        path.to_string()
-                    };
-                    let safe_name = path_to_safe_dirname(&expanded_path);
-                    // A source that declares `mirror_dir` mirrors under that
-                    // directory instead of `data_dir/remotes/<name>/mirror`; the
-                    // per-path layout below the root is unchanged, so sync and
-                    // this scan root keep agreeing on where a path landed.
-                    let mirror_base = source.effective_mirror_dir().unwrap_or_else(|| {
-                        data_dir.join("remotes").join(&source.name).join("mirror")
-                    });
-                    let mirror_path = mirror_base.join(&safe_name);
-
-                    if mirror_path.exists() {
-                        // SSH mirror roots keep the baseline full-root scan
-                        // (hard constraint 5) but still carry the configured
-                        // `origin_host` as their identity: sessions arriving
-                        // through ivanmac's mirror are ivanmac's.
-                        metas.insert(configured_scan_root_meta(
-                            &source.name,
-                            &source.origin_host,
-                            source.readonly,
-                            false,
-                            &mirror_path,
-                        ));
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
-                        scan_root.workspace_rewrites = workspace_rewrites.clone();
-                        roots.push(scan_root);
+                    // SSH mirror roots keep the baseline full-root scan (hard
+                    // constraint 5) but still carry the configured
+                    // `origin_host` as their identity: sessions arriving
+                    // through ivanmac's mirror are ivanmac's.
+                    //
+                    // PR8 C6: the candidate list is shared with
+                    // `run_sources_doctor`, so this scan root and that doctor
+                    // report cannot drift into two derivations of one layout.
+                    let Some(mirror_path) = remote_mirror_candidates(source, data_dir, path)
+                        .into_iter()
+                        .find(|candidate| candidate.exists())
+                    else {
                         continue;
-                    }
-
-                    if path.starts_with("~/") {
-                        let suffix = path.trim_start_matches("~/");
-                        let safe_suffix = path_to_safe_dirname(suffix);
-                        if let Ok(entries) = std::fs::read_dir(&mirror_base) {
-                            for entry in entries.flatten() {
-                                let name = entry.file_name();
-                                let name_str = name.to_string_lossy();
-                                if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
-                                    metas.insert(configured_scan_root_meta(
-                                        &source.name,
-                                        &source.origin_host,
-                                        source.readonly,
-                                        false,
-                                        &entry.path(),
-                                    ));
-                                    let mut scan_root =
-                                        ScanRoot::remote(entry.path(), origin.clone(), platform);
-                                    scan_root.workspace_rewrites = workspace_rewrites.clone();
-                                    roots.push(scan_root);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    };
+                    metas.insert(configured_scan_root_meta(
+                        &source.name,
+                        &source.origin_host,
+                        source.readonly,
+                        false,
+                        &mirror_path,
+                    ));
+                    let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
+                    scan_root.workspace_rewrites = workspace_rewrites.clone();
+                    roots.push(scan_root);
                 } else {
                     let local_path = expand_local_scan_root_path(path);
                     if !local_path.exists() {
+                        // PR8 C6 (spec S5 / hard constraint 13): a configured
+                        // root that is not there is named, not silently
+                        // dropped -- this `continue` used to be the whole
+                        // visible story of a typo'd path.
+                        tracing::warn!(
+                            source = %source.name,
+                            path = %local_path.display(),
+                            "configured scan root does not exist; skipped"
+                        );
+                        record_scan_root_missing(&source.name);
                         continue;
                     }
                     // A machine-local configured root: its own watermark row
@@ -16722,8 +16736,15 @@ pub fn build_scan_roots_with_meta(
         return (roots, metas);
     }
 
-    // Fallback: remote mirror roots from registered sources
-    if let Ok(sources) = storage.list_sources() {
+    // Fallback: remote mirror roots from registered sources.
+    //
+    // PR8 C6 (hard constraint 13): reached only when the configured sources say
+    // nothing (`Ok` + empty) or the whole config was short-circuited -- never
+    // on a config that failed to load, which is reported instead of being
+    // silently papered over with the DB's older registry.
+    if db_registered_fallback
+        && let Ok(sources) = storage.list_sources()
+    {
         for source in sources {
             // Parse platform from source
             let platform =
@@ -16855,6 +16876,51 @@ pub fn build_scan_roots_with_meta(
     }
 
     (roots, metas)
+}
+
+/// The mirror directories a configured remote `source`'s `path` can live under,
+/// in the order the build tries them: the path's own mirror directory first,
+/// then -- for a `~/`-rooted path -- every sibling directory under the mirror
+/// root whose name ends with the same safe suffix, the layout an older sync
+/// produced before the per-path mirror name was pinned.
+///
+/// PR8 C6: `run_sources_doctor` classifies a remote root's `missing` / `empty`
+/// / `present` state from this same list, so the two surfaces cannot drift into
+/// two derivations of one layout.
+pub(crate) fn remote_mirror_candidates(
+    source: &SourceDefinition,
+    data_dir: &Path,
+    path: &str,
+) -> Vec<PathBuf> {
+    let expanded_path = if path.starts_with("~/") {
+        path.to_string()
+    } else if path.starts_with('~') {
+        path.replacen('~', "~/", 1)
+    } else {
+        path.to_string()
+    };
+    let safe_name = path_to_safe_dirname(&expanded_path);
+    // A source that declares `mirror_dir` mirrors under that directory instead
+    // of `data_dir/remotes/<name>/mirror`; the per-path layout below the root
+    // is unchanged, so sync and this derivation keep agreeing.
+    let mirror_base = source
+        .effective_mirror_dir()
+        .unwrap_or_else(|| data_dir.join("remotes").join(&source.name).join("mirror"));
+
+    let mut candidates = vec![mirror_base.join(&safe_name)];
+    if path.starts_with("~/") {
+        let safe_suffix = path_to_safe_dirname(path.trim_start_matches("~/"));
+        if let Ok(entries) = std::fs::read_dir(&mirror_base) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(&safe_suffix)
+                    && entry.path().is_dir()
+                {
+                    candidates.push(entry.path());
+                }
+            }
+        }
+    }
+    candidates
 }
 
 /// The `ScanRootMeta` for one configured source path (hard constraint 12).
@@ -17222,6 +17288,11 @@ fn refresh_run_counters_in_stats(opts: &IndexOptions) {
         let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
         stats.capture_na = capture_na;
         stats.capture_failed = capture_failed;
+        // PR8 C6: same cycle boundary as the counters above, so a watch cycle
+        // that resolves a missing root stops reporting it.
+        let (scan_roots_missing, sources_config_error) = last_index_configured_source_snapshot();
+        stats.scan_roots_missing = scan_roots_missing;
+        stats.sources_config_error = sources_config_error;
     }
 }
 
@@ -17241,6 +17312,54 @@ pub(crate) fn last_index_capture_counters_snapshot() -> (u64, u64) {
     )
 }
 
+/// PR8 C6 (spec S5 / hard constraint 13): the configured scan roots this run
+/// skipped, and the `sources.toml` load failure that made it skip all of them.
+///
+/// Statics with a `record_*` / snapshot pair and the same
+/// [`reset_last_index_run_counters`] run boundary as `CAPTURE_NA` /
+/// `CAPTURE_FAILED` above, and for the same reason: the meta writer
+/// ([`persist_last_index_run_meta_counters`]) has only a `FrankenStorage` and no
+/// `IndexOptions`, so a run-scoped value has to be reachable from a counter
+/// snapshot. The boundary is what keeps that honest -- without the reset at
+/// `run_index` entry, the next run in the same process would inherit this one's
+/// list.
+static SCAN_ROOTS_MISSING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static SOURCES_CONFIG_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record one configured scan root this run skipped because its path does not
+/// exist -- once per source, alongside the `warn!` that names it.
+fn record_scan_root_missing(name: &str) {
+    let mut missing = SCAN_ROOTS_MISSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !missing.iter().any(|seen| seen == name) {
+        missing.push(name.to_string());
+    }
+}
+
+/// Record that `sources.toml` failed to load for this run, so neither the run's
+/// own `--json` report nor `status --json` has to re-derive it.
+fn record_sources_config_error(error: &str) {
+    *SOURCES_CONFIG_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+}
+
+/// This run's configured-source observability facts (PR8 C6): the names of the
+/// configured roots that were missing, and the config load failure if there was
+/// one.
+pub(crate) fn last_index_configured_source_snapshot() -> (Vec<String>, Option<String>) {
+    let missing = SCAN_ROOTS_MISSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let error = SOURCES_CONFIG_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (missing, error)
+}
+
 /// Reset all three run-level counters. Call at `run_index` entry and at the
 /// start of each watch cycle -- "each cycle = one run" per mission #116⑥.
 pub(crate) fn reset_last_index_run_counters() {
@@ -17249,6 +17368,15 @@ pub(crate) fn reset_last_index_run_counters() {
     EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
     CAPTURE_NA.store(0, std::sync::atomic::Ordering::Relaxed);
     CAPTURE_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // PR8 C6: the configured-source facts are per-run too, so they share this
+    // boundary rather than accumulating across a watch process' cycles.
+    SCAN_ROOTS_MISSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    *SOURCES_CONFIG_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     // R2-N7 (任务书 #129): the per-session detail list is the counter's
     // detail side, so it shares the counter's run boundary.
     EVENT_ALIGN_FAILURES
