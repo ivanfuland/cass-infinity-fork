@@ -25,6 +25,9 @@
     "data_dir": {
       "type": "string"
     },
+    "index_run_lock_path": {
+      "type": "string"
+    },
     "index": {
       "type": "object",
       "properties": {
@@ -131,6 +134,12 @@
           "type": "null"
         },
         "capture_failed": {
+          "type": "null"
+        },
+        "scan_roots_missing": {
+          "type": "null"
+        },
+        "sources_config_error": {
           "type": "null"
         }
       }

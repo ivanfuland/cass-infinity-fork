@@ -1750,7 +1750,8 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                           candidate_only_excluded_row=None,
                           fragmented_extra_text_blocks=False,
                           duplicate_source_row=False, null_raw_event_key=False,
-                          sibling_tool_use_result=None, tool_use_result_shape=None):
+                          sibling_tool_use_result=None, tool_use_result_shape=None,
+                          same_event_extra_leak=False, mixed_array_tool_use_result=None):
     candidate = os.path.join(root, "candidate.db")
     reference = os.path.join(root, "reference.db")
     manifest_path = os.path.join(root, "manifest.json")
@@ -1763,6 +1764,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
         fragmented_array_tool_use_result
         or foreign_array_tool_use_result_cleared
         or fragmented_extra_text_blocks
+        or mixed_array_tool_use_result is not None
     )
     body_text = (
         _VERIFY_FRAGMENT_BODY if fragmented
@@ -1811,6 +1813,7 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
     # cover, so that position has to be a covered one).
     needs_second_pair = (
         excludable_sibling_leak
+        or same_event_extra_leak
         or unexcludable_sibling_leak
         or excludable_extra_leak
         or unexcludable_extra_leak
@@ -2161,6 +2164,44 @@ def _write_verify_fixture(root, *, sibling_leak=False, non_target_cleared=False,
                 "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
                 "VALUES (1, 2, 'user', ?, ?)",
                 ["assistant commentary, must stay", msgpack.packb(sibling_extra, use_bin_type=True)],
+            )
+        if mixed_array_tool_use_result is not None:
+            # R10-B2 (PR8 C7): a joined array whose elements do NOT all
+            # contribute to the join. `overclear` is what the pre-fix Rust wrote
+            # -- every element's `text` replaced, including the `image`
+            # element's, which `_extract_content_part` does not render -- and
+            # must fail. `contributing` is the correct result, with R10-N5's
+            # bare-string element replaced whole, and must pass.
+            if mixed_array_tool_use_result == "overclear":
+                candidate_extra["toolUseResult"] = (
+                    [{"type": "text", "text": redacted}, {"type": "image", "text": redacted},
+                     {"type": "text", "text": redacted}]
+                    if with_excluded
+                    else [{"type": "text", "text": "secret A"}, {"type": "image", "text": "caption kept"},
+                          {"type": "text", "text": "secret B"}]
+                )
+            else:
+                candidate_extra["toolUseResult"] = (
+                    [redacted, {"type": "image", "text": "caption kept"}, {"type": "text", "text": redacted}]
+                    if with_excluded
+                    else ["secret A", {"type": "image", "text": "caption kept"},
+                          {"type": "text", "text": "secret B"}]
+                )
+            conn.execute(
+                "UPDATE messages SET extra_bin = ? WHERE conversation_id = 1 AND idx = 1",
+                [msgpack.packb(candidate_extra, use_bin_type=True)],
+            )
+        if same_event_extra_leak:
+            # R10-B1 (PR8 C7): a row projected from the EXCLUDED event itself
+            # (its extra carries `uuid: u2`, the marker's `raw.event_key`) that
+            # still holds the body, identical on both sides. Its own position
+            # (idx=2, the second Read's call) is one the rules do not cover, and
+            # the extra limb used to excuse it on that ground -- but a copy in
+            # the excluded event's own sibling is the exclusion's to clear.
+            conn.execute(
+                "INSERT INTO messages(conversation_id, idx, role, content, extra_bin) "
+                "VALUES (1, 2, 'user', ?, ?)",
+                ["a later turn", msgpack.packb(_verify_extra(body_text), use_bin_type=True)],
             )
         if leak_multiline_body or short_body:
             # B08: the body survives verbatim in a later row's extra,
@@ -2748,6 +2789,18 @@ def verify_selftest_cases():
         # cover is the leak this limb exists for, and keeps failing.
         ("V36 a body in a covered row's extra is still a failure", False,
          "still carries the body in extra_bin"),
+        # R10-B1 (PR8 C7): a sibling row of the EXCLUDED event still carrying
+        # the body in its extra is a leak whatever its own position is.
+        ("V_R10_B1 a same-event sibling row still carrying the body in its extra is a failure", False,
+         "still carries the body in extra_bin"),
+        # R10-B2 (PR8 C7): only the elements that contribute to the join are
+        # the owned copy; clearing a non-rendered element's `text` is an
+        # over-clear...
+        ("V_R10_B2 clearing a non-contributing element of a joined array toolUseResult is a failure", False,
+         "redacted a field this exclusion does not own"),
+        # ...and clearing exactly the contributing ones, a bare string whole
+        # (R10-N5), is the legitimate result.
+        ("V_R10_B2b clearing only the contributing elements of a joined array toolUseResult passes", True, ""),
     ]
 
 
@@ -2802,6 +2855,9 @@ def _run_verify_selftest(paths_cfg):
             33: {"unexcludable_sibling_leak": True},
             34: {"unexcludable_extra_leak": True},
             35: {"excludable_extra_leak": True},
+            36: {"same_event_extra_leak": True},
+            37: {"mixed_array_tool_use_result": "overclear"},
+            38: {"mixed_array_tool_use_result": "contributing"},
         }.get(index, {})
         with tempfile.TemporaryDirectory() as root:
             ok, why = _verify_case(root, paths_cfg, expect_ok, want_substring, want_report, **flags)
@@ -4558,9 +4614,28 @@ def _allowed_extra_paths(entry, ref_row, ref_extra):
             # array is the body's copy and every element is a target.
             joined = _flatten_content(items)
             if joined and any(joined == body for body in bodies):
-                for index in range(len(items)):
-                    allowed.add(f"toolUseResult[{index}].text")
+                # R10-B2 (PR8 C7): only the elements the join is made of. An
+                # element `_extract_content_part` does not render from its
+                # `text` (an `image` carrying one, a `tool_use`) is not part of
+                # the copy; a bare string (R10-N5) is replaced whole.
+                for index, item in enumerate(items):
+                    path = _joined_part_path(index, item)
+                    if path is not None:
+                        allowed.add(path)
     return allowed
+
+
+def _joined_part_path(index, item):
+    """The rewritable path of a `toolUseResult` array element that
+    contributes its own text to `_flatten_content`'s join -- mirrors
+    `exclusion.rs::strip_claude_array_tool_use_result`."""
+    if isinstance(item, str):
+        return f"toolUseResult[{index}]" if item else None
+    if isinstance(item, dict) and item.get("type") in (None, "text", "input_text", "output_text"):
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            return f"toolUseResult[{index}].text"
+    return None
 
 
 def _extra_event_key(extra):
@@ -5259,7 +5334,12 @@ def _verify_once(candidate, manifest_path, reference, mirror_root, sample_rebuil
                         if len(body_retained_unexcludable_samples) < 20:
                             body_retained_unexcludable_samples.append([label, sib["idx"]])
                 if extra_hit:
-                    if state != "not_excludable" and state != "not_locatable":
+                    # R10-B1 (PR8 C7): a row carrying the EXCLUDED event's own
+                    # identity is a projection of that event, so the copy is the
+                    # exclusion's to clear whatever this row's own position is.
+                    marker_event_key = ((marker or {}).get("raw") or {}).get("event_key")
+                    same_event = isinstance(marker_event_key, str) and _extra_event_key(sib_extra) == marker_event_key
+                    if same_event or (state != "not_excludable" and state != "not_locatable"):
                         failures.append(
                             (label, f"session row idx={sib['idx']} still carries the body in extra_bin")
                         )

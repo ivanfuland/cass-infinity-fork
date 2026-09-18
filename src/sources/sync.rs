@@ -884,12 +884,45 @@ impl SyncEngine {
         self
     }
 
-    /// Get the local mirror directory for a source.
-    pub fn mirror_dir(&self, source_name: &str) -> PathBuf {
-        self.local_store
-            .join("remotes")
-            .join(source_name)
-            .join("mirror")
+    /// Get the mirror root for a source.
+    ///
+    /// A source that declares `mirror_dir` mirrors there instead of under
+    /// `data_dir/remotes/<name>/mirror`; a source that does not keeps the
+    /// baseline layout exactly (PR8 hard constraint 11).
+    pub fn mirror_dir(&self, source: &SourceDefinition) -> PathBuf {
+        source.effective_mirror_dir().unwrap_or_else(|| {
+            self.local_store
+                .join("remotes")
+                .join(&source.name)
+                .join("mirror")
+        })
+    }
+
+    /// The directory writes are authorized against by [`prepare_local_sync_root`].
+    ///
+    /// For a source without `mirror_dir` this is `local_store`, so every
+    /// component from the data dir down to the mirror is symlink-checked exactly
+    /// as before. A source with an explicit `mirror_dir` is authorized against
+    /// that directory itself — the containment predicate is unchanged, only the
+    /// root it is applied to, which is what lets an external mirror root (a NAS
+    /// mount, say) be written without widening the check.
+    fn sync_authorization_root(&self, source: &SourceDefinition) -> PathBuf {
+        source
+            .effective_mirror_dir()
+            .unwrap_or_else(|| self.local_store.clone())
+    }
+
+    /// Authorize and create the mirror root this source syncs into, returning it.
+    ///
+    /// Split out of [`SyncEngine::sync_source`] so the authorization decision is
+    /// reachable without an SSH connection: it is the part PR8 changed, and it
+    /// is the part a caller (or a test) can verify on its own.
+    pub fn prepare_mirror_root(&self, source: &SourceDefinition) -> Result<PathBuf, SyncError> {
+        let mirror_dir = self.mirror_dir(source);
+        let auth_root = self.sync_authorization_root(source);
+        prepare_local_sync_root(&auth_root, &mirror_dir)
+            .map_err(|e| SyncError::CreateDirFailed(std::io::Error::other(e)))?;
+        Ok(mirror_dir)
     }
 
     /// Get the remote home directory by SSH-ing to the host and printing `$HOME`.
@@ -1048,9 +1081,7 @@ impl SyncEngine {
         let overall_start = Instant::now();
 
         // Create the mirror directory
-        let mirror_dir = self.mirror_dir(&source.name);
-        prepare_local_sync_root(&self.local_store, &mirror_dir)
-            .map_err(|e| SyncError::CreateDirFailed(std::io::Error::other(e)))?;
+        let mirror_dir = self.prepare_mirror_root(source)?;
 
         // Pre-fetch remote home directory if any paths use tilde (avoids multiple SSH calls)
         let remote_home = if source.paths.iter().enumerate().any(|(index, path)| {
@@ -3925,8 +3956,37 @@ Total transferred file size: 1,234 bytes
     #[test]
     fn test_sync_engine_mirror_dir() {
         let engine = SyncEngine::new(Path::new("/data/cass"));
-        let mirror = engine.mirror_dir("laptop");
+        let source = SourceDefinition::ssh("laptop", "user@laptop.local");
+        let mirror = engine.mirror_dir(&source);
         assert_eq!(mirror, PathBuf::from("/data/cass/remotes/laptop/mirror"));
+    }
+
+    #[test]
+    fn test_sync_engine_mirror_dir_honors_configured_mirror_dir() {
+        let engine = SyncEngine::new(Path::new("/data/cass"));
+        let mut source = SourceDefinition::ssh("laptop", "user@laptop.local");
+        source.mirror_dir = Some(PathBuf::from("/mnt/nas/laptop-mirror"));
+
+        assert_eq!(
+            engine.mirror_dir(&source),
+            PathBuf::from("/mnt/nas/laptop-mirror")
+        );
+        assert_eq!(
+            engine.sync_authorization_root(&source),
+            PathBuf::from("/mnt/nas/laptop-mirror"),
+            "an external mirror root authorizes against itself"
+        );
+    }
+
+    #[test]
+    fn test_sync_authorization_root_defaults_to_local_store() {
+        let engine = SyncEngine::new(Path::new("/data/cass"));
+        let source = SourceDefinition::ssh("laptop", "user@laptop.local");
+        assert_eq!(
+            engine.sync_authorization_root(&source),
+            PathBuf::from("/data/cass"),
+            "without mirror_dir the baseline root is preserved"
+        );
     }
 
     #[test]

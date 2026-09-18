@@ -159,6 +159,7 @@ fn sources_list_with_sources() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -441,6 +442,7 @@ fn sources_list_verbose() {
         r#"
 [[sources]]
 name = "workstation"
+origin_host = "workstation"
 type = "ssh"
 host = "dev@work.example.com"
 paths = ["~/.claude/projects", "~/.codex/sessions"]
@@ -511,6 +513,7 @@ fn sources_list_json() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -593,6 +596,8 @@ fn sources_add_no_test() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "myserver",
             "user@myserver.local",
             "--name",
             "myserver",
@@ -662,6 +667,8 @@ fn sources_add_explicit_paths() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "devbox",
             "admin@devbox",
             "--name",
             "devbox",
@@ -722,6 +729,8 @@ fn sources_add_no_paths_error() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "server",
             "user@server.local",
             "--name",
             "server",
@@ -767,6 +776,7 @@ fn sources_add_duplicate_error() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -783,6 +793,8 @@ paths = ["~/.claude/projects"]
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "laptop",
             "other@other.local",
             "--name",
             "laptop",
@@ -836,6 +848,8 @@ fn sources_add_reserved_local_name_error() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "local",
             "user@other.local",
             "--name",
             "local",
@@ -886,6 +900,7 @@ fn sources_add_duplicate_error_case_insensitive() {
         r#"
 [[sources]]
 name = "Laptop"
+origin_host = "Laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -906,6 +921,8 @@ paths = ["~/.claude/projects"]
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "laptop",
             "other@other.local",
             "--name",
             "laptop",
@@ -967,6 +984,8 @@ fn sources_add_invalid_url() {
             "sources",
             "add",
             "laptop.local",
+            "--origin-host",
+            "laptop",
             "--preset",
             "linux-defaults",
             "--no-test",
@@ -1015,6 +1034,8 @@ fn sources_add_auto_name() {
             "sources",
             "add",
             "user@devlaptop.home.lan",
+            "--origin-host",
+            "devlaptop",
             "--preset",
             "linux-defaults",
             "--no-test",
@@ -1071,6 +1092,8 @@ fn sources_add_auto_name_disambiguates_reserved_local() {
             "sources",
             "add",
             "user@local",
+            "--origin-host",
+            "local",
             "--preset",
             "linux-defaults",
             "--no-test",
@@ -1132,12 +1155,14 @@ fn sources_remove_basic() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 
 [[sources]]
 name = "workstation"
+origin_host = "workstation"
 type = "ssh"
 host = "dev@work.local"
 paths = ["~/.claude/projects"]
@@ -1200,6 +1225,7 @@ fn sources_remove_nonexistent() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -1264,6 +1290,7 @@ fn sources_remove_with_purge() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -1364,6 +1391,7 @@ fn sources_remove_with_purge_case_insensitive_uses_stored_name() {
         r#"
 [[sources]]
 name = "Laptop"
+origin_host = "Laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -1444,6 +1472,7 @@ fn sources_remove_prompt_uses_stored_name_case_insensitive() {
         r#"
 [[sources]]
 name = "Laptop"
+origin_host = "Laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -1574,6 +1603,7 @@ fn sources_doctor_json() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -1663,12 +1693,14 @@ fn sources_doctor_single_source() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 
 [[sources]]
 name = "workstation"
+origin_host = "workstation"
 type = "ssh"
 host = "dev@work.local"
 paths = ["~/.claude/projects"]
@@ -1740,6 +1772,7 @@ fn sources_doctor_health_unreachable_is_mutation_free_and_safe() {
         r#"
 [[sources]]
 name = "retired-laptop"
+origin_host = "retired-laptop"
 type = "ssh"
 host = "user@retired-laptop.invalid"
 paths = ["~/.claude/projects"]
@@ -1842,6 +1875,7 @@ fn sources_doctor_unreachable_omits_unprobed_remote_binary_8_7() {
         r#"
 [[sources]]
 name = "retired-laptop"
+origin_host = "retired-laptop"
 type = "ssh"
 host = "user@retired-laptop.invalid"
 paths = ["~/.claude/projects"]
@@ -1972,6 +2006,7 @@ fn sources_sync_dry_run() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2043,12 +2078,14 @@ fn sources_sync_single_source() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
 
 [[sources]]
 name = "workstation"
+origin_host = "workstation"
 type = "ssh"
 host = "dev@work.local"
 paths = ["~/.claude/projects"]
@@ -2120,6 +2157,7 @@ fn sources_sync_json() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2269,6 +2307,8 @@ fn sources_workflow_add_list_remove() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "server",
             "user@server.example",
             "--name",
             "server",
@@ -2369,6 +2409,8 @@ fn sources_multiple_add_list() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "laptop",
             "user@laptop.local",
             "--name",
             "laptop",
@@ -2387,6 +2429,8 @@ fn sources_multiple_add_list() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "workstation",
             "dev@workstation.office",
             "--name",
             "workstation",
@@ -2449,6 +2493,7 @@ fn mappings_list_empty() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2511,6 +2556,7 @@ fn mappings_list_with_mappings() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2577,6 +2623,7 @@ fn mappings_list_json() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2645,6 +2692,7 @@ fn mappings_list_nonexistent_source() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2705,6 +2753,7 @@ fn mappings_add_basic() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2769,6 +2818,7 @@ fn mappings_add_with_agents() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2838,6 +2888,7 @@ fn mappings_add_multiple() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2919,6 +2970,7 @@ fn mappings_add_nonexistent_source() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -2988,6 +3040,7 @@ fn mappings_remove_by_index() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -3062,6 +3115,7 @@ fn mappings_remove_invalid_index() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -3126,6 +3180,7 @@ fn mappings_remove_from_empty() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -3186,6 +3241,7 @@ fn mappings_test_match() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -3254,6 +3310,7 @@ fn mappings_test_no_match() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -3329,6 +3386,7 @@ fn mappings_test_with_agent() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]
@@ -3415,6 +3473,7 @@ fn mappings_workflow_complete() {
         r#"
 [[sources]]
 name = "laptop"
+origin_host = "laptop"
 type = "ssh"
 host = "user@laptop.local"
 paths = ["~/.claude/projects"]

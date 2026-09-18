@@ -144,7 +144,8 @@ fn schema_ensure_fresh_on_empty_v0() {
     // PR6 T2a (任务书 #113) bumped CURRENT_SCHEMA_VERSION 5 -> 6
     // (`messages.excluded` JSONB); this file's own name/purpose (asserting
     // the v5 chunk-domain DDL shape) is unaffected, only the literal here.
-    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 6);
+    // PR8 C1 bumped it again 6 -> 7 (`conversations.identity_host`).
+    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 7);
 }
 
 // =============================================================================

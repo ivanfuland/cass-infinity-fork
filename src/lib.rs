@@ -372,6 +372,14 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         no_ingest: bool,
 
+        /// PR8 C8: state the scan/ingest intent explicitly. Mutually
+        /// exclusive with `--no-ingest` (both together is a usage error).
+        /// A bare `cass index --semantic` still ingests -- the default is
+        /// unchanged -- but it now says so on stderr, so a read-only
+        /// semantic run can never be started by omission.
+        #[arg(long, default_value_t = false)]
+        ingest: bool,
+
         /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
         /// requires the `semantic` build feature, retired in this build --
         /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
@@ -2144,6 +2152,13 @@ pub enum SourcesCommand {
         /// Skip connectivity test
         #[arg(long)]
         no_test: bool,
+        /// The machine these sessions were produced on (e.g. "ivanmac").
+        /// Required: it becomes `conversations.identity_host` for rows ingested
+        /// from this source, so two machines that happen to share an absolute
+        /// session path stay two conversations. Never derived from `url` or
+        /// `--name`; must match ^[A-Za-z0-9._-]{1,64}$.
+        #[arg(long = "origin-host", value_name = "HOST")]
+        origin_host: String,
     },
     /// Remove a configured source
     Remove {
@@ -6833,6 +6848,7 @@ async fn execute_cli(
                     data_dir,
                     semantic,
                     no_ingest,
+                    ingest,
                     embedder,
                     idempotency_key,
                     json,
@@ -6840,6 +6856,29 @@ async fn execute_cli(
                     no_progress_events,
                     robot_trace_ingest,
                 } => {
+                    // PR8 C8: resolve the ingest intent before anything runs.
+                    // `--ingest` and `--no-ingest` are opposite instructions,
+                    // so asking for both is a parameter error, not a
+                    // last-one-wins tie-break. The *default* is untouched --
+                    // a bare `cass index` (with or without `--semantic`)
+                    // still ingests; `--semantic` alone just becomes loud
+                    // about it (see `run_index_with_data`).
+                    let ingest_mode = if ingest && no_ingest {
+                        return Err(CliError::usage(
+                            "--ingest cannot be combined with --no-ingest",
+                            Some(
+                                "--ingest explicitly enables the source scan/ingest phase; \
+                                 --no-ingest explicitly disables it"
+                                    .to_string(),
+                            ),
+                        ));
+                    } else if no_ingest {
+                        IngestMode::ExplicitNoIngest
+                    } else if ingest || !semantic {
+                        IngestMode::ExplicitIngest
+                    } else {
+                        IngestMode::Implicit
+                    };
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
                         cli.db.clone(),
@@ -6851,6 +6890,7 @@ async fn execute_cli(
                         data_dir,
                         semantic,
                         no_ingest,
+                        ingest_mode,
                         embedder,
                         progress,
                         structured_format,
@@ -18023,6 +18063,14 @@ struct StateDbSnapshot {
     /// meta keys and same null-when-never-written semantics as the three above.
     capture_na: Option<u64>,
     capture_failed: Option<u64>,
+    /// PR8 C6 (spec S5 / hard constraint 13): `last_index.scan_roots_missing`
+    /// (JSON array text) and `last_index.sources_config_error` (text, stored
+    /// empty when the run had no error). Both are `None` when the key was
+    /// never written; the config-error read also collapses the writer's empty
+    /// string to `None`, because "" is how that writer spells "no error", not
+    /// a value to render.
+    scan_roots_missing: Option<Vec<String>>,
+    sources_config_error: Option<String>,
 }
 
 fn probe_state_db(
@@ -18142,6 +18190,28 @@ fn probe_state_db_modes(
     )
     .ok()
     .and_then(|s| s.parse::<u64>().ok());
+    // PR8 C6 (spec S5 / hard constraint 13): same `last_index.*` keys, two
+    // different text encodings. The missing-root list is JSON array text and
+    // parses back to a list (`[]` = a run happened and skipped nothing). The
+    // config-error text is stored as "" when the run had no error, so an empty
+    // value is an absence rather than a value -- both "never written" and "no
+    // error" surface as null, exactly like the counters above.
+    snapshot.scan_roots_missing = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.scan_roots_missing'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+    snapshot.sources_config_error = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_index.sources_config_error'",
+        &[],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .filter(|s| !s.is_empty());
     if include_counts && !watermarks_only {
         snapshot.conversation_count = franken_query_row_map_retry(
             &conn,
@@ -18847,6 +18917,8 @@ fn state_meta_json_inner(
     let event_align_failed = db_snapshot.event_align_failed;
     let capture_na = db_snapshot.capture_na;
     let capture_failed = db_snapshot.capture_failed;
+    let scan_roots_missing = db_snapshot.scan_roots_missing;
+    let sources_config_error = db_snapshot.sources_config_error;
 
     let index_path = crate::indexer::expected_index_dir(data_dir);
     // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain (db_path);
@@ -19135,6 +19207,13 @@ fn state_meta_json_inner(
             "event_align_failed": event_align_failed,
             "capture_na": capture_na,
             "capture_failed": capture_failed,
+            // PR8 C6 (spec S5 / hard constraint 13): `scan_roots_missing` is
+            // the list of configured roots the last successful run skipped
+            // (`null` when no run has written it, `[]` when a run skipped
+            // nothing); `sources_config_error` is that run's `sources.toml`
+            // load failure, null when there was none.
+            "scan_roots_missing": scan_roots_missing,
+            "sources_config_error": sources_config_error,
         },
         "index": {
             "exists": lexical.exists,
@@ -37588,6 +37667,18 @@ struct DoctorRawMirrorManifestFile {
     redacted_original_path: String,
     #[serde(default)]
     original_path_blake3: String,
+    // PR8 C4 session key: same declarations as `raw_mirror::RawMirrorManifestFile`
+    // so doctor's recomputed self-digest covers the same fields.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    identity_host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shape_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relative_path: Option<String>,
     #[serde(default)]
     captured_at_ms: i64,
     #[serde(default)]
@@ -65269,6 +65360,7 @@ mod doctor_asset_taxonomy_tests {
 name = "laptop"
 type = "ssh"
 host = "user@host"
+origin_host = "laptop"
 paths = [" ~/.claude/projects"]
 "#,
         )
@@ -65297,6 +65389,7 @@ paths = [" ~/.claude/projects"]
 name = "laptop"
 type = "ssh"
 host = "user@host"
+origin_host = "laptop"
 paths = ["~/.claude/projects"]
 "#,
         )
@@ -66624,6 +66717,7 @@ paths = ["~/.claude/projects"]
                 verified_at_ms: None,
             },
             manifest_blake3: None,
+            ..Default::default()
         };
         manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
         manifest
@@ -70965,6 +71059,13 @@ fn run_status(
             "explanation": explanation,
             "warnings": warnings,
             "data_dir": data_dir.display().to_string(),
+            // C9 (T6B): same fact as `index --json`'s `index_run_lock_path`, on
+            // the read-only surface. It is current configuration, not a result
+            // of the last index run, so it belongs at the top level next to
+            // `data_dir` rather than inside the `last_index` block.
+            "index_run_lock_path": crate::search::asset_state::index_run_lock_path(&data_dir)
+                .display()
+                .to_string(),
             "index": state.get("index").cloned().unwrap_or(serde_json::Value::Null),
             // T2b.3 (B段, mission #116⑦): `run_status` builds this payload by
             // selectively copying named keys out of `state` (`state_meta_json_
@@ -85864,6 +85965,40 @@ fn semantic_activation_suffix(stats: &indexer::IndexingStats) -> Option<String> 
     })
 }
 
+/// PR8 C8: how this `cass index` run's scan/ingest intent was stated.
+///
+/// The point of naming it is that "the default ingests" is only safe while
+/// it is *visible*: the frozen-corpus build that pulled a live session in
+/// (G589) did so by omitting `--no-ingest`, and nothing said so. The
+/// default itself stays put; a bare `--semantic` run now reports itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestMode {
+    /// `--ingest` was passed (or the run isn't semantic, where the flag
+    /// would have nothing to distinguish).
+    ExplicitIngest,
+    /// `--no-ingest` was passed.
+    ExplicitNoIngest,
+    /// `--semantic` with neither flag: this run ingests because nobody
+    /// said otherwise.
+    Implicit,
+}
+
+impl IngestMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitIngest => "explicit-ingest",
+            Self::ExplicitNoIngest => "explicit-no-ingest",
+            Self::Implicit => "implicit",
+        }
+    }
+}
+
+/// The fixed stderr prefix a bare `cass index --semantic` prints, so an
+/// operator (or a script) can detect the implicit choice without parsing
+/// prose. Emitted in `--json` mode too: stderr is not the JSON stream.
+const IMPLICIT_INGEST_WARNING: &str = "warning: --semantic without --ingest/--no-ingest ingests by \
+     default; pass --no-ingest for a read-only semantic run";
+
 #[allow(clippy::too_many_arguments)]
 fn run_index_with_data(
     db_override: Option<PathBuf>,
@@ -85875,6 +86010,7 @@ fn run_index_with_data(
     data_dir_override: Option<PathBuf>,
     semantic: bool,
     no_ingest: bool,
+    ingest_mode: IngestMode,
     embedder: String,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
@@ -86025,6 +86161,15 @@ fn run_index_with_data(
             ));
         }
     }
+    // PR8 C8: a bare `cass index --semantic` still ingests, and now says so.
+    // Fixed prefix + one line on stderr, printed in `--json` mode as well --
+    // the structured payload is on stdout, so this cannot corrupt it, and a
+    // script that reads only stdout still gets a human-visible signal in its
+    // logs. Anything explicit (or a non-semantic run) stays silent.
+    if ingest_mode == IngestMode::Implicit {
+        eprintln!("{IMPLICIT_INGEST_WARNING}");
+    }
+
     let entrypoint = index_entrypoint_diagnostics(
         full,
         force_rebuild,
@@ -86539,6 +86684,14 @@ fn run_index_with_data(
             "force_rebuild": force_rebuild,
             "entrypoint": entrypoint,
             "data_dir": data_dir.display().to_string(),
+            // C9 (T6B): the run lock this binary itself takes, published so an
+            // external controller can watch the same file without re-deriving
+            // the name from source or from the wrapper scripts' own flock.
+            // Single source of truth: `search::asset_state::index_run_lock_path`
+            // (the same function `acquire_index_run_lock` opens).
+            "index_run_lock_path": crate::search::asset_state::index_run_lock_path(&data_dir)
+                .display()
+                .to_string(),
             "db_path": db_path.display().to_string(),
             "conversations": conversations,
             "messages": messages,
@@ -86567,6 +86720,14 @@ fn run_index_with_data(
                 serde_json::json!(stats.scan_invocations),
             );
             map.insert("no_ingest".to_string(), serde_json::json!(stats.no_ingest));
+            // PR8 C8: the two booleans above say *what* this run did; this
+            // says whether the caller asked for it. `implicit` is the shape
+            // that silently ingested a live session into the frozen corpus
+            // (G589), so a consumer can now refuse it outright.
+            map.insert(
+                "ingest_mode".to_string(),
+                serde_json::json!(ingest_mode.as_str()),
+            );
             // B05 (任务书 #131): `scan_invocations: 0` + `no_ingest: true` do
             // not by themselves mean "nothing entered the corpus" -- the
             // historical salvage preflight also imports, and this says
@@ -86574,6 +86735,17 @@ fn run_index_with_data(
             map.insert(
                 "salvage_skipped_by_no_ingest".to_string(),
                 serde_json::json!(stats.salvage_skipped_by_no_ingest),
+            );
+            // PR8 C6 (spec S5 / hard constraint 13): the configured-source
+            // facts at the payload's top level, next to the `--no-ingest`
+            // fields above (they stay in `indexing_stats` too, single source).
+            map.insert(
+                "scan_roots_missing".to_string(),
+                serde_json::json!(stats.scan_roots_missing),
+            );
+            map.insert(
+                "sources_config_error".to_string(),
+                serde_json::json!(stats.sources_config_error),
             );
             map.insert(
                 "indexing_stats".to_string(),
@@ -94007,7 +94179,8 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
             preset,
             paths,
             no_test,
-        } => run_sources_add(&url, name, preset, paths, no_test),
+            origin_host,
+        } => run_sources_add(&url, name, preset, paths, no_test, origin_host),
         SourcesCommand::Remove { name, purge, yes } => run_sources_remove(&name, purge, yes),
         SourcesCommand::Doctor { source, json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
@@ -94443,9 +94616,30 @@ fn run_sources_add(
     preset: Option<String>,
     paths_arg: Vec<String>,
     no_test: bool,
+    origin_host: String,
 ) -> CliResult<()> {
-    use crate::sources::config::{Platform, SourceDefinition, SourcesConfig, get_preset_paths};
+    use crate::sources::config::{
+        Platform, SourceDefinition, SourcesConfig, get_preset_paths, is_valid_origin_host,
+    };
     use crate::sources::provenance::SourceKind;
+
+    // Reject a malformed origin_host here, with the CLI's own error shape,
+    // rather than letting `add_source` surface it as a generic validation
+    // failure. The rule is the same predicate the config loader applies.
+    if !is_valid_origin_host(&origin_host) {
+        return Err(CliError {
+            code: 10,
+            kind: CliErrorKind::Config.kind_str(),
+            message: format!(
+                "Invalid --origin-host '{origin_host}': must match ^[A-Za-z0-9._-]{{1,64}}$"
+            ),
+            hint: Some(
+                "Pass the machine these sessions were produced on, e.g. --origin-host ivanmac"
+                    .into(),
+            ),
+            retryable: false,
+        });
+    }
 
     // Parse URL to extract host
     let (host, source_id) = parse_source_url(url, name.as_deref())?;
@@ -94516,6 +94710,7 @@ fn run_sources_add(
         host: Some(host.clone()),
         paths: paths.clone(),
         platform,
+        origin_host,
         ..Default::default()
     };
 
@@ -94798,6 +94993,20 @@ struct DiagnosticCheck {
     remediation: Option<String>,
 }
 
+/// PR8 C6 (spec S5 / hard constraint 13): one configured source root and the
+/// `missing` / `empty` / `present` state this machine is in for it.
+///
+/// A source-level list rather than a field on every [`DiagnosticCheck`]: the
+/// state only means anything for a root, and the other checks stay exactly the
+/// JSON shape they had.
+#[derive(serde::Serialize)]
+struct SourceRootState {
+    /// The path the scan would actually use for this entry.
+    path: String,
+    /// `missing` | `empty` | `present`.
+    state: &'static str,
+}
+
 /// Aggregated diagnostics for a single source (P5.6)
 #[derive(serde::Serialize)]
 struct SourceDiagnostics {
@@ -94806,6 +95015,9 @@ struct SourceDiagnostics {
     /// state + likely root cause + safe next command, in the 6.1 schema.
     host_report: crate::fleet_doctor_schema::HostDoctorReport,
     checks: Vec<DiagnosticCheck>,
+    /// PR8 C6 (spec S5): this source's configured roots, in `sources.toml`
+    /// order, each with its `missing` / `empty` / `present` state.
+    roots: Vec<SourceRootState>,
     passed: usize,
     warnings: usize,
     failed: usize,
@@ -94885,13 +95097,43 @@ fn run_sources_doctor(
     use crate::sources::config::{SourcesConfig, source_names_equal, source_path_entry_error};
     use colored::Colorize;
 
-    let config = SourcesConfig::load().map_err(|e| CliError {
-        code: 9,
-        kind: CliErrorKind::Config.kind_str(),
-        message: format!("Failed to load sources config: {e}"),
-        hint: Some("Run 'cass sources add' to configure a source".into()),
-        retryable: false,
-    })?;
+    let config = match SourcesConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            // PR8 C6 (spec S5 / hard constraint 13): the doctor is the surface
+            // an operator reaches for when a source "is not working", so a
+            // config that will not even load must be visible in this command's
+            // own output as `invalid` plus the reason -- not only as a fatal
+            // error envelope a `--json` caller would have to find on stderr.
+            // The exit code stays 9; the `already_reported` sentinel is what
+            // keeps `main` from printing the same failure a second time.
+            let reason = format!("Failed to load sources config: {e}");
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+            if let Some(fmt) = structured_format {
+                output_structured_value(
+                    serde_json::json!({
+                        "error": reason,
+                        "config_state": "invalid",
+                        "sources": []
+                    }),
+                    fmt,
+                )?;
+            } else {
+                println!("invalid: {reason}");
+            }
+            return Err(CliError::already_reported(
+                9,
+                CliErrorKind::Config.kind_str(),
+                false,
+            ));
+        }
+    };
 
     if config.sources.is_empty() {
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -94936,37 +95178,56 @@ fn run_sources_doctor(
 
     let mut all_diagnostics = Vec::new();
     let mut observations = Vec::new();
+    // PR8 C6: the mirror root a remote source's paths land under is derived
+    // from the data directory, exactly as `build_scan_roots_with_meta` derives
+    // it.
+    let data_dir = default_data_dir();
 
     for source in sources_to_check {
         let source_start = std::time::Instant::now();
         let mut checks = Vec::new();
 
-        // Check 1: SSH connectivity
         let host = source.host.as_deref().unwrap_or("unknown");
-        let ssh_check = check_ssh_connectivity(host);
-        checks.push(ssh_check);
 
-        // Check 2: rsync availability on remote
-        let rsync_check = check_rsync_available(host);
-        checks.push(rsync_check);
+        // Checks 1-3 are about the *other* machine. PR8 C6: a local source has
+        // none of them -- it used to be handed `host = "unknown"` and reported
+        // a failing SSH check for a directory on this very machine.
+        if source.is_remote() {
+            // Check 1: SSH connectivity
+            let ssh_check = check_ssh_connectivity(host);
+            checks.push(ssh_check);
 
-        // Check 3: Remote paths exist
-        for (idx, path) in source.paths.iter().enumerate() {
-            if let Some(message) = source_path_entry_error(idx, path) {
-                checks.push(DiagnosticCheck {
-                    name: format!("Remote Path: paths[{idx}]"),
-                    status: "fail".into(),
-                    message: format!("Invalid source path: {message}"),
-                    remediation: Some("Fix or remove this path in sources.toml".into()),
-                });
-            } else {
-                checks.push(check_remote_path(host, path));
+            // Check 2: rsync availability on remote
+            let rsync_check = check_rsync_available(host);
+            checks.push(rsync_check);
+
+            // Check 3: Remote paths exist
+            for (idx, path) in source.paths.iter().enumerate() {
+                if let Some(message) = source_path_entry_error(idx, path) {
+                    checks.push(DiagnosticCheck {
+                        name: format!("Remote Path: paths[{idx}]"),
+                        status: "fail".into(),
+                        message: format!("Invalid source path: {message}"),
+                        remediation: Some("Fix or remove this path in sources.toml".into()),
+                    });
+                } else {
+                    checks.push(check_remote_path(host, path));
+                }
             }
         }
 
         // Check 4: Local storage writable
         let storage_check = check_local_storage(&source.name);
         checks.push(storage_check);
+
+        // Check 5 (PR8 C6, spec S5): where each configured root actually is on
+        // this machine -- `missing` / `empty` / `present`, for local and remote
+        // sources alike.
+        let roots: Vec<SourceRootState> = source
+            .paths
+            .iter()
+            .map(|path| configured_root_state(source, &data_dir, path))
+            .collect();
 
         // Compute summary
         let passed = checks.iter().filter(|c| c.status == "pass").count();
@@ -95039,6 +95300,7 @@ fn run_sources_doctor(
             source_id: source.name.clone(),
             host_report,
             checks,
+            roots,
             passed,
             warnings,
             failed,
@@ -95091,6 +95353,21 @@ fn run_sources_doctor(
                 println!("    {}", check.message.dimmed());
                 if let Some(ref hint) = check.remediation {
                     println!("    {}: {}", "Hint".cyan(), hint);
+                }
+            }
+
+            // PR8 C6 (spec S5): the per-root states the JSON carries as
+            // `roots[].state`, shown here as the same three words.
+            if !diag.roots.is_empty() {
+                println!();
+                println!("{}", "Roots".normal());
+                for root in &diag.roots {
+                    let label = match root.state {
+                        "present" => root.state.green(),
+                        "empty" => root.state.yellow(),
+                        _ => root.state.red(),
+                    };
+                    println!("  {} {}", label, root.path.dimmed());
                 }
             }
 
@@ -95306,6 +95583,82 @@ fn check_remote_path(host: &str, path: &str) -> DiagnosticCheck {
             remediation: Some("SSH connectivity may have failed".into()),
         },
     }
+}
+
+/// PR8 C6 (spec S5 / hard constraint 13): the state of one configured source
+/// root on this machine.
+///
+/// The path is derived exactly as the scan derives it -- for a remote source the
+/// same [`crate::indexer::remote_mirror_candidates`] list
+/// `build_scan_roots_with_meta` tries in order, for a local one the same
+/// [`crate::indexer::expand_local_scan_root_path`] -- so the doctor and the scan
+/// cannot disagree about which directory an entry names.
+fn configured_root_state(
+    source: &crate::sources::config::SourceDefinition,
+    data_dir: &Path,
+    path: &str,
+) -> SourceRootState {
+    let candidates: Vec<PathBuf> = if source.is_remote() {
+        crate::indexer::remote_mirror_candidates(source, data_dir, path)
+    } else {
+        vec![crate::indexer::expand_local_scan_root_path(path)]
+    };
+
+    let existing: Vec<&PathBuf> = candidates
+        .iter()
+        .filter(|candidate| candidate.exists())
+        .collect();
+    let Some(root) = existing.first() else {
+        return SourceRootState {
+            path: candidates
+                .first()
+                .map_or_else(|| path.to_string(), |candidate| candidate.display().to_string()),
+            state: "missing",
+        };
+    };
+
+    let state = if existing
+        .iter()
+        .any(|candidate| dir_contains_regular_file(candidate))
+    {
+        "present"
+    } else {
+        "empty"
+    };
+    SourceRootState {
+        path: root.display().to_string(),
+        state,
+    }
+}
+
+/// True when `dir` holds at least one regular file, at any depth.
+///
+/// Symlinks are followed (a root populated by links is still populated), an
+/// unreadable subdirectory is skipped rather than fatal, and the walk is
+/// depth-limited so a symlink loop under a source root cannot hang the doctor.
+fn dir_contains_regular_file(dir: &Path) -> bool {
+    fn walk(dir: &Path, depth: usize) -> bool {
+        const MAX_DEPTH: usize = 64;
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() {
+                return true;
+            }
+            if meta.is_dir() && walk(&entry.path(), depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(dir, 0)
 }
 
 /// Check if local storage directory is writable
@@ -95868,6 +96221,7 @@ fn run_sources_sync(
             Some(data_dir), // data_dir
             false,          // semantic
             false,          // no_ingest
+            IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
             "fastembed".to_string(),
             progress,
             output_format,
@@ -96021,6 +96375,7 @@ fn run_sources_reingest(
         Some(data_dir.clone()), // data_dir (existing mirror root is discovered here)
         false,                  // semantic
         false,                  // no_ingest
+        IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
         "fastembed".to_string(),
         progress,
         output_format,

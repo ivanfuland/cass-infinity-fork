@@ -20,6 +20,7 @@
 //! name = "laptop"
 //! type = "ssh"
 //! host = "user@laptop.local"
+//! origin_host = "laptop"
 //! paths = ["~/.claude/projects", "~/.cursor"]
 //! ```
 //!

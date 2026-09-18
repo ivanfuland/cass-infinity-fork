@@ -8,6 +8,7 @@ pub mod quarantine;
 pub mod quarantine_retry;
 pub mod redact_secrets;
 pub mod refresh_ledger;
+pub mod scan_root_meta;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
@@ -57,7 +58,7 @@ use crate::search::asset_state::{SearchMaintenanceJobKind, SearchMaintenanceMode
 #[cfg(test)]
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_USER};
 
-use crate::sources::config::{Platform, SourcesConfig};
+use crate::sources::config::{Platform, SourceDefinition, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
@@ -66,6 +67,7 @@ use crate::storage::sqlite::{
     historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{EmbeddingInput, SemanticIndexer};
+use semantic_progress::{SemanticFinalizeProgressEmitter, SemanticProgressSink};
 
 use crate::search::semantic_manifest::TierKind as SemanticTierKind;
 
@@ -989,6 +991,19 @@ pub struct IndexingStats {
     /// `scan_invocations: 0` alone cannot tell "nothing was imported" apart
     /// from "nothing was scanned, but a backup was imported".
     pub salvage_skipped_by_no_ingest: bool,
+    /// PR8 C6 (spec S5 / hard constraint 13): names of the *configured* scan
+    /// roots this run skipped because their path does not exist. The same list
+    /// goes to the `last_index.scan_roots_missing` `meta` key as JSON array
+    /// text, so a later `cass status --json` discloses it without this run's
+    /// stdout.
+    #[serde(default)]
+    pub scan_roots_missing: Vec<String>,
+    /// PR8 C6 (spec S5 / hard constraint 13): the text of the `sources.toml`
+    /// load failure that made this run skip **every** configured source (and
+    /// stop falling back to the DB-registered ones). `None` when the config
+    /// loaded, or when `CASS_IGNORE_SOURCES_CONFIG` short-circuited it.
+    #[serde(default)]
+    pub sources_config_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1029,6 +1044,10 @@ struct NonWatchIngestOutcome {
     /// unusable excluded fingerprint). Carried up so the consumer reports
     /// them as scan errors for their connector.
     skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
+    /// PR8 C3: what each watermarks-enabled root covered this run. Persisted
+    /// at the run's finalize, together with the connector-level watermark, so
+    /// a run that defers conversations does not advance any of them.
+    root_outcomes: Vec<RootScanOutcome>,
 }
 
 impl NonWatchIngestOutcome {
@@ -1052,6 +1071,11 @@ impl NonWatchIngestOutcome {
                 let mut skipped = self.skipped_conversations;
                 skipped.extend(other.skipped_conversations);
                 skipped
+            },
+            root_outcomes: {
+                let mut outcomes = self.root_outcomes;
+                outcomes.extend(other.root_outcomes);
+                outcomes
             },
         }
     }
@@ -2020,10 +2044,7 @@ pub(crate) enum LexicalPopulationStrategy {
 /// inside cass itself.
 const DEFAULT_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR_MAX_DB_BYTES: u64 =
     100 * 1024 * 1024 * 1024;
-const DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFERRED_LARGE_INCREMENTAL_LEXICAL_REPAIR_REASON: &str = "large_populated_incremental_index_defers_authoritative_lexical_repair_until_explicit_full_or_force_rebuild";
-const BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON: &str =
-    "large_populated_incremental_index_bootstraps_missing_scan_watermark";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DeferredIncrementalCanonicalLexicalRepair {
@@ -2111,17 +2132,6 @@ fn force_incremental_authoritative_lexical_repair_enabled() -> bool {
     dotenvy_truthy("CASS_INCREMENTAL_AUTHORITATIVE_LEXICAL_REPAIR")
 }
 
-fn incremental_missing_watermark_full_scan_max_db_bytes() -> u64 {
-    dotenvy::var("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES)
-}
-
-fn force_incremental_missing_watermark_full_scan_enabled() -> bool {
-    dotenvy_truthy("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN")
-}
-
 fn is_plain_populated_incremental_index_run(
     opts: &IndexOptions,
     canonical_conversations: usize,
@@ -2141,47 +2151,6 @@ fn db_size_bytes_for_incremental_lexical_repair_policy(db_path: &Path) -> u64 {
     std::fs::metadata(db_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BootstrappedIncrementalScanWatermark {
-    canonical_conversations: usize,
-    db_size_bytes: u64,
-    max_automatic_full_scan_db_size_bytes: u64,
-    reason: &'static str,
-}
-
-fn should_bootstrap_missing_incremental_scan_watermark(
-    opts: &IndexOptions,
-    canonical_storage_rebuilt: bool,
-    canonical_conversations: usize,
-    needs_rebuild: bool,
-    retry_stale_index_ingest_quarantine: bool,
-    last_scan_ts: Option<i64>,
-) -> Option<BootstrappedIncrementalScanWatermark> {
-    if canonical_storage_rebuilt
-        || needs_rebuild
-        || retry_stale_index_ingest_quarantine
-        || last_scan_ts.is_some()
-        || !is_plain_populated_incremental_index_run(opts, canonical_conversations)
-        || force_incremental_missing_watermark_full_scan_enabled()
-    {
-        return None;
-    }
-
-    let db_size_bytes = db_size_bytes_for_incremental_lexical_repair_policy(&opts.db_path);
-    let max_automatic_full_scan_db_size_bytes =
-        incremental_missing_watermark_full_scan_max_db_bytes();
-    if db_size_bytes <= max_automatic_full_scan_db_size_bytes {
-        return None;
-    }
-
-    Some(BootstrappedIncrementalScanWatermark {
-        canonical_conversations,
-        db_size_bytes,
-        max_automatic_full_scan_db_size_bytes,
-        reason: BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON,
-    })
 }
 
 fn should_defer_incremental_authoritative_lexical_repair(
@@ -4541,7 +4510,7 @@ pub(crate) fn acquire_index_run_lock(
     // sync_capture_durable, DB commit) can happen.
     crate::raw_mirror::create_dir_all_durable(data_dir)
         .with_context(|| format!("creating cass data directory {}", data_dir.display()))?;
-    let lock_path = data_dir.join("index-run.lock");
+    let lock_path = crate::search::asset_state::index_run_lock_path(data_dir);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -6332,8 +6301,16 @@ fn persist_final_index_run_metadata(
                         // between them leave `last_indexed_at` advanced while the
                         // counters (or vice versa) still reflect the previous run.
                         let tx = writer.raw().transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
+                        // PR8 C3 (AC-7): schema 7 stops writing the legacy
+                        // global `last_scan_ts`. The value stays readable (the
+                        // `status --json` staleness comparison and pre-PR8
+                        // databases still use it), but this run's scan progress
+                        // is recorded per `(root_id, connector)` now.
                         if performed_scan {
-                            writer.set_last_scan_ts(scan_start_ts)?;
+                            tracing::debug!(
+                                scan_start_ts,
+                                "scan completed; per-root watermarks are persisted separately"
+                            );
                         }
                         writer.set_last_indexed_at(now_ms)?;
                         if write_last_index_run_counters {
@@ -6359,19 +6336,30 @@ fn persist_last_index_run_meta_counters(writer: &FrankenStorage) -> Result<()> {
     // R2-N8 (任务书 #129): the two capture-outcome counts land in the same
     // statement (and therefore the same commit) as the three anchor counts.
     let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
+    // PR8 C6 (spec S5 / hard constraint 13): the configured-source facts ride
+    // the same statement (and so the same commit) as the five above. Both keys
+    // are always written, like the counters: the missing-root list as JSON
+    // array text (`[]` when nothing was missing) and the load failure as
+    // plain text (empty string when there was none -- `status --json` renders
+    // that empty string back as null).
+    let (scan_roots_missing, sources_config_error) = last_index_configured_source_snapshot();
     writer.raw().execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES \
          ('last_index.codex_host_shell_hits', ?1), \
          ('last_index.codex_idx0_user_total', ?2), \
          ('last_index.event_align_failed', ?3), \
          ('last_index.capture_na', ?4), \
-         ('last_index.capture_failed', ?5)",
+         ('last_index.capture_failed', ?5), \
+         ('last_index.scan_roots_missing', ?6), \
+         ('last_index.sources_config_error', ?7)",
         &crate::storage::api::params![
             codex_host_shell_hits.to_string(),
             codex_idx0_user_total.to_string(),
             event_align_failed.to_string(),
             capture_na.to_string(),
-            capture_failed.to_string()
+            capture_failed.to_string(),
+            serde_json::to_string(&scan_roots_missing).unwrap_or_else(|_| "[]".to_string()),
+            sources_config_error.unwrap_or_default()
         ],
     )?;
     Ok(())
@@ -6865,6 +6853,10 @@ pub(crate) enum IndexMessage {
         is_discovered: bool,
         /// Whether every scan scope for this connector completed without error
         scan_succeeded: bool,
+        /// PR8 C3: what each watermarks-enabled root of this connector
+        /// covered, for the consumer to persist (`scan_watermarks` +
+        /// `scan_file_state`).
+        root_outcomes: Vec<RootScanOutcome>,
     },
 }
 
@@ -7408,6 +7400,286 @@ struct StreamingProducerConfig {
     full_scan_source_ids: Arc<HashSet<String>>,
     progress: Option<Arc<IndexingProgress>>,
     active_source_filter: Arc<ActiveSessionSourceFilter>,
+    /// PR8 C3: per-connector root plans -- the connector's own home roots plus
+    /// every configured root that has its own watermark row (empty for every
+    /// connector outside claude_code / codex, which keep the baseline
+    /// `local_default` scan).
+    local_root_plans: Arc<HashMap<&'static str, ConnectorRootPlans>>,
+    /// PR8 C3: the metadata every scan root (configured + home) is looked up
+    /// in for its `identity_host` / `root_id`.
+    scan_roots_meta: Arc<scan_root_meta::ScanRootMetaIndex>,
+}
+
+/// PR8 C3: one connector's watermarks-enabled roots, split by where they come
+/// from. Home roots are scanned as the connector's local sources; configured
+/// roots are scanned in the additional-roots pass.
+#[derive(Debug, Clone, Default)]
+struct ConnectorRootPlans {
+    home: Vec<LocalRootPlan>,
+    configured: HashMap<PathBuf, LocalRootPlan>,
+}
+
+impl ConnectorRootPlans {
+    /// The plan for one configured root, keyed by its canonical path.
+    fn configured_for(&self, root: &ScanRoot) -> Option<&LocalRootPlan> {
+        self.configured
+            .get(&scan_root_meta::canonicalize_root_path(&root.path))
+    }
+}
+
+/// The batch path's per-root scan: the same rules as the streaming producer's
+/// [`scan_one_root_for_producer`], but conversations are collected into the
+/// connector's pending batch instead of being streamed.
+fn batch_scan_one_root(
+    conn: &(dyn Connector + Send),
+    name: &'static str,
+    data_dir: &Path,
+    plan: &LocalRootPlan,
+    active_source_filter: &ActiveSessionSourceFilter,
+    convs: &mut Vec<crate::indexer::exclusion::PreparedConversation>,
+    scan_errors: &mut Vec<String>,
+) -> (RootScanOutcome, bool) {
+    let mut prepare_failed = false;
+    let capture_fallback_roots: Vec<ScanRoot> = conn
+        .detect()
+        .root_paths
+        .iter()
+        .cloned()
+        .map(ScanRoot::local)
+        .collect();
+    let (outcome, fatal) = run_local_root_scan(
+        conn,
+        name,
+        data_dir,
+        plan,
+        &capture_fallback_roots,
+        active_source_filter,
+        &mut |root, meta, conversation| {
+            let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
+            let identity = IngestIdentity::for_meta(meta);
+            match prepare_conversation_for_ingest(
+                data_dir,
+                name,
+                conn,
+                &root.origin,
+                &identity,
+                None,
+                source_kind,
+                conversation,
+            ) {
+                Ok(prepared) => {
+                    convs.push(prepared);
+                    Ok(())
+                }
+                Err(error) => {
+                    prepare_failed = true;
+                    scan_errors.push(error.to_string());
+                    tracing::warn!(
+                        connector = name,
+                        error = %error,
+                        "prepare_conversation_for_ingest failed; skipping session"
+                    );
+                    Ok(())
+                }
+            }
+        },
+    );
+
+    if let Some(error) = fatal {
+        scan_errors.push(error.to_string());
+        return (failed_outcome(outcome), false);
+    }
+    if let Some(error) = outcome.error.clone() {
+        scan_errors.push(error);
+    }
+    let succeeded = outcome.succeeded && !prepare_failed;
+    let outcome = if succeeded {
+        outcome
+    } else {
+        failed_outcome(outcome)
+    };
+    (outcome, succeeded)
+}
+
+/// The producer-side loop over one connector's watermarks-enabled home roots.
+///
+/// Returns the per-root outcomes, whether every root scanned cleanly, and
+/// whether the consumer went away (which stops the producer).
+fn scan_local_roots_for_producer(
+    conn: &(dyn Connector + Send),
+    name: &'static str,
+    config: &StreamingProducerConfig,
+    plans: &[LocalRootPlan],
+    tx: &Sender<IndexMessage>,
+) -> (Vec<RootScanOutcome>, bool, bool) {
+    let mut outcomes = Vec::new();
+    let mut scan_succeeded = true;
+    let mut disconnected = false;
+    let mut is_discovered = true;
+
+    for plan in plans {
+        let (outcome, root_succeeded, root_disconnected) = scan_one_root_for_producer(
+            conn,
+            name,
+            config,
+            plan,
+            tx,
+            false,
+            &mut is_discovered,
+        );
+        if !outcome.succeeded {
+            scan_succeeded = false;
+            let _ = tx.send(IndexMessage::ScanError {
+                connector_name: name,
+                error: outcome
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("scan failed for {}", plan.root.path.display())),
+            });
+        }
+        if !root_succeeded {
+            scan_succeeded = false;
+        }
+        outcomes.push(outcome);
+        if root_disconnected {
+            disconnected = true;
+            break;
+        }
+    }
+
+    (outcomes, scan_succeeded, disconnected)
+}
+
+/// Scan one watermarks-enabled root for the streaming producer.
+///
+/// Returns the outcome, whether the root's scan and flush were clean, and
+/// whether the consumer went away.
+#[allow(clippy::too_many_arguments)]
+fn scan_one_root_for_producer(
+    conn: &(dyn Connector + Send),
+    name: &'static str,
+    config: &StreamingProducerConfig,
+    plan: &LocalRootPlan,
+    tx: &Sender<IndexMessage>,
+    was_detected: bool,
+    is_discovered: &mut bool,
+) -> (RootScanOutcome, bool, bool) {
+    let mut scan_succeeded = true;
+    let mut disconnected = false;
+
+    let mut batch_sender =
+        StreamingBatchSender::new(tx, config.flow_limiter.clone(), name, *is_discovered);
+    let mut prepare_failed = false;
+    let mut flush_failed = false;
+    let capture_fallback_roots: Vec<ScanRoot> = conn
+        .detect()
+        .root_paths
+        .iter()
+        .cloned()
+        .map(ScanRoot::local)
+        .collect();
+    let (outcome, fatal) = run_local_root_scan(
+        conn,
+        name,
+        &config.data_dir,
+        plan,
+        &capture_fallback_roots,
+        config.active_source_filter.as_ref(),
+        &mut |root, meta, conversation| {
+            if !was_detected && !*is_discovered {
+                if let Some(p) = &config.progress {
+                    p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                }
+                *is_discovered = true;
+                batch_sender.mark_next_batch_discovered();
+            }
+            let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
+            let identity = IngestIdentity::for_meta(meta);
+            match prepare_conversation_for_ingest(
+                &config.data_dir,
+                name,
+                conn,
+                &root.origin,
+                &identity,
+                None,
+                source_kind,
+                conversation,
+            ) {
+                // `push` reports the consumer-disconnected case; returning it
+                // keeps the baseline semantics (a failed send stops this
+                // root's scan and marks the callback fatal).
+                Ok(prepared) => batch_sender.push(prepared),
+                Err(error) => {
+                    tracing::warn!(
+                        connector = name,
+                        error = %error,
+                        "prepare_conversation_for_ingest failed; skipping session"
+                    );
+                    prepare_failed = true;
+                    if tx
+                        .send(IndexMessage::ScanError {
+                            connector_name: name,
+                            error: format!("prepare_conversation_for_ingest failed: {error}"),
+                        })
+                        .is_err()
+                    {
+                        return Err(anyhow::Error::new(StreamingConsumerDisconnected {
+                            connector_name: name,
+                        }));
+                    }
+                    Ok(())
+                }
+            }
+        },
+    );
+
+    if let Err(error) = batch_sender.flush() {
+        if is_streaming_consumer_disconnected(&error) {
+            tracing::info!(
+                connector = name,
+                "streaming consumer disconnected; stopping producer"
+            );
+            disconnected = true;
+        } else {
+            flush_failed = true;
+            tracing::warn!(connector = name, "local flush failed: {}", error);
+            let _ = tx.send(IndexMessage::ScanError {
+                connector_name: name,
+                error: format!("local flush failed: {error}"),
+            });
+        }
+    }
+
+    if prepare_failed || flush_failed || !outcome.succeeded {
+        scan_succeeded = false;
+    }
+    let mut outcome = outcome;
+    if !scan_succeeded {
+        // A root whose scan (or one of its sessions' prepare) failed must not
+        // advance its watermark or rewrite its file state (hard constraint 5).
+        outcome.succeeded = false;
+        outcome.files.clear();
+    }
+
+    match fatal {
+        Some(error) if is_streaming_consumer_disconnected(&error) => {
+            tracing::info!(
+                connector = name,
+                "streaming consumer disconnected; stopping producer"
+            );
+            disconnected = true;
+        }
+        Some(error) => {
+            scan_succeeded = false;
+            let _ = tx.send(IndexMessage::ScanError {
+                connector_name: name,
+                error: error.to_string(),
+            });
+        }
+        None => {}
+    }
+
+    (outcome, scan_succeeded, disconnected)
 }
 
 /// Spawn a producer thread that scans a connector and sends batches through the channel.
@@ -7429,8 +7701,28 @@ fn spawn_connector_producer(
         let was_detected = detect.detected;
         let mut is_discovered = false;
         let mut scan_succeeded = true;
+        let mut root_outcomes: Vec<RootScanOutcome> = Vec::new();
+        let mut consumer_disconnected = false;
 
-        if detect.detected {
+        let local_plans: Vec<LocalRootPlan> = config
+            .local_root_plans
+            .get(name)
+            .map(|plans| plans.home.clone())
+            .unwrap_or_default();
+
+        if detect.detected && !local_plans.is_empty() {
+            // Update discovered agents count immediately when detected
+            if let Some(p) = &config.progress {
+                p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+            }
+            is_discovered = true;
+
+            let (outcomes, roots_succeeded, disconnected) =
+                scan_local_roots_for_producer(conn.as_ref(), name, &config, &local_plans, &tx);
+            root_outcomes.extend(outcomes);
+            scan_succeeded = roots_succeeded;
+            consumer_disconnected = disconnected;
+        } else if detect.detected {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
@@ -7479,7 +7771,7 @@ fn spawn_connector_producer(
                     return Ok(());
                 }
                 let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
-                match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conversation) {
+                match prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &local_origin, &IngestIdentity::local(), None, source_kind, conversation) {
                     Ok(prepared) => batch_sender.push(prepared),
                     Err(error) => {
                         // R1-B1 (任务书 #118a): a prepare failure must be a
@@ -7555,6 +7847,34 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
+            // PR8 C3: a configured *local* root with its own watermark row
+            // takes the same per-root path as a home root; a root the contract
+            // exempts (ssh mirror, `full_scan` source) has no plan here and
+            // keeps the baseline full-root scan below.
+            if let Some(plan) = config
+                .local_root_plans
+                .get(name)
+                .and_then(|plans| plans.configured_for(root))
+            {
+                let (outcome, root_succeeded, root_disconnected) = scan_one_root_for_producer(
+                    conn.as_ref(),
+                    name,
+                    &config,
+                    plan,
+                    &tx,
+                    was_detected,
+                    &mut is_discovered,
+                );
+                root_outcomes.push(outcome);
+                if !root_succeeded {
+                    scan_succeeded = false;
+                }
+                if root_disconnected {
+                    consumer_disconnected = true;
+                    break;
+                }
+                continue;
+            }
             let local_since_ts = config
                 .local_since_ts_by_connector
                 .get(name)
@@ -7605,7 +7925,7 @@ fn spawn_connector_producer(
                 }
                 let source_kind = capture_source_kind_for(name, conversation.source_path.clone());
                 let prepared =
-                    prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conversation);
+                    prepare_conversation_for_ingest(&config.data_dir, name, conn.as_ref(), &root.origin, &ingest_identity_for_root(root, &config.scan_roots_meta), Some(root), source_kind, conversation);
 
                 if !was_detected && !is_discovered {
                     if let Some(p) = &config.progress {
@@ -7711,12 +8031,24 @@ fn spawn_connector_producer(
             "streaming_scan_complete"
         );
 
-        // Signal completion with timing
+        if consumer_disconnected {
+            tracing::info!(
+                connector = name,
+                "not reporting scan completion: the streaming consumer is gone"
+            );
+            return;
+        }
+
+        // Signal completion with timing. PR8 C3 carries this connector's
+        // per-root outcomes along: the consumer owns the database handle, so
+        // the watermark and file-state rows are written on its side once the
+        // run's own status is known.
         let _ = tx.send(IndexMessage::Done {
             connector_name: name,
             scan_ms,
             is_discovered,
             scan_succeeded,
+            root_outcomes,
         });
     })
 }
@@ -8066,8 +8398,10 @@ fn run_streaming_consumer(
                 scan_ms,
                 is_discovered,
                 scan_succeeded,
+                root_outcomes,
             }) => {
                 active_producers -= 1;
+                ingest_outcome.root_outcomes.extend(root_outcomes);
                 let effective_scan_succeeded =
                     scan_succeeded && !failed_scan_connectors.contains(connector_name);
 
@@ -8188,6 +8522,7 @@ fn run_streaming_index(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    scan_roots_meta: Arc<scan_root_meta::ScanRootMetaIndex>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
@@ -8200,6 +8535,7 @@ fn run_streaming_index(
         lexical_strategy,
         additional_scan_roots,
         configured_connector_factories(),
+        &scan_roots_meta,
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
@@ -8259,6 +8595,7 @@ fn run_streaming_index_with_connector_factories(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
+    scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
@@ -8317,6 +8654,13 @@ fn run_streaming_index_with_connector_factories(
             &connector_factories,
         )?),
         full_scan_source_ids: Arc::new(full_scan_source_ids()),
+        local_root_plans: Arc::new(build_connector_root_plans(
+            storage,
+            &connector_factories,
+            &additional_scan_roots,
+            scan_roots_meta,
+        )?),
+        scan_roots_meta: Arc::new(scan_roots_meta.clone()),
         progress: opts.progress.clone(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::with_shared_skips(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -8414,6 +8758,7 @@ fn run_batch_index(
     since_ts: Option<i64>,
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
+    scan_roots_meta: Arc<scan_root_meta::ScanRootMetaIndex>,
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
@@ -8426,6 +8771,7 @@ fn run_batch_index(
         lexical_strategy,
         additional_scan_roots,
         configured_connector_factories(),
+        &scan_roots_meta,
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
@@ -8442,7 +8788,8 @@ fn run_batch_index_with_connector_factories(
     lexical_strategy: LexicalPopulationStrategy,
     additional_scan_roots: Vec<ScanRoot>,
     connector_factories: Vec<(&'static str, ConnectorFactory)>,
-    scan_start_ts: i64,
+    scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
+    _scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
 ) -> Result<NonWatchIngestOutcome> {
@@ -8472,6 +8819,8 @@ fn run_batch_index_with_connector_factories(
         is_discovered: bool,
         scan_succeeded: bool,
         scan_error: Option<String>,
+        /// PR8 C3: this connector's per-root outcomes, persisted at finalize.
+        root_outcomes: Vec<RootScanOutcome>,
     }
 
     let progress_ref = opts.progress.as_ref();
@@ -8486,6 +8835,12 @@ fn run_batch_index_with_connector_factories(
         &connector_factories,
     )?);
     let full_scan_source_ids = full_scan_source_ids();
+    let root_plans_by_connector = build_connector_root_plans(
+        storage,
+        &connector_factories,
+        &additional_scan_roots,
+        scan_roots_meta,
+    )?;
 
     // Keep scan completion state with each connector so watermarks are only
     // advanced for connectors whose full scan scope completed successfully.
@@ -8500,8 +8855,35 @@ fn run_batch_index_with_connector_factories(
                 let mut is_discovered = false;
                 let mut scan_succeeded = true;
                 let mut scan_errors = Vec::new();
+                let mut root_outcomes: Vec<RootScanOutcome> = Vec::new();
+                let empty_plans = ConnectorRootPlans::default();
+                let plans = root_plans_by_connector.get(name).unwrap_or(&empty_plans);
 
-                if detect.detected {
+                if detect.detected && !plans.home.is_empty() {
+                    // Update discovered agents count immediately when detected
+                    // This gives fast UI feedback during the discovery phase
+                    // Note: AtomicUsize has no contention, only the mutex was problematic
+                    if let Some(p) = progress_ref {
+                        p.discovered_agents.fetch_add(1, Ordering::Relaxed);
+                    }
+                    is_discovered = true;
+
+                    for plan in &plans.home {
+                        let (outcome, root_succeeded) = batch_scan_one_root(
+                            conn.as_ref(),
+                            name,
+                            &data_dir,
+                            plan,
+                            active_source_filter.as_ref(),
+                            &mut convs,
+                            &mut scan_errors,
+                        );
+                        if !root_succeeded {
+                            scan_succeeded = false;
+                        }
+                        root_outcomes.push(outcome);
+                    }
+                } else if detect.detected {
                     // Update discovered agents count immediately when detected
                     // This gives fast UI feedback during the discovery phase
                     // Note: AtomicUsize has no contention, only the mutex was problematic
@@ -8547,7 +8929,7 @@ fn run_batch_index_with_connector_factories(
                             });
                             for conv in local_convs {
                                 let source_kind = capture_source_kind_for(name, conv.source_path.clone());
-                                match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, None, source_kind, conv) {
+                                match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &local_origin, &IngestIdentity::local(), None, source_kind, conv) {
                                     Ok(prepared) => convs.push(prepared),
                                     Err(error) => {
                                         scan_succeeded = false;
@@ -8569,6 +8951,26 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
+                        // PR8 C3: a configured local root with its own
+                        // watermark row takes the per-root path; exempt roots
+                        // (ssh mirror, `full_scan` source) fall through to the
+                        // baseline full-root scan.
+                        if let Some(plan) = plans.configured_for(root) {
+                            let (outcome, root_succeeded) = batch_scan_one_root(
+                                conn.as_ref(),
+                                name,
+                                &data_dir,
+                                plan,
+                                active_source_filter.as_ref(),
+                                &mut convs,
+                                &mut scan_errors,
+                            );
+                            if !root_succeeded {
+                                scan_succeeded = false;
+                            }
+                            root_outcomes.push(outcome);
+                            continue;
+                        }
                         let local_since_ts = local_since_ts_by_connector
                             .get(name)
                             .copied()
@@ -8610,7 +9012,7 @@ fn run_batch_index_with_connector_factories(
                                 });
                                 for conv in remote_convs {
                                     let source_kind = capture_source_kind_for(name, conv.source_path.clone());
-                                    match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, Some(root), source_kind, conv) {
+                                    match prepare_conversation_for_ingest(&data_dir, name, conn.as_ref(), &root.origin, &ingest_identity_for_root(root, scan_roots_meta), Some(root), source_kind, conv) {
                                         Ok(prepared) => convs.push(prepared),
                                         Err(error) => {
                                             scan_succeeded = false;
@@ -8650,7 +9052,8 @@ fn run_batch_index_with_connector_factories(
                     p.current.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if convs.is_empty() && !is_discovered && scan_succeeded {
+                if convs.is_empty() && !is_discovered && scan_succeeded && root_outcomes.is_empty()
+                {
                     return None;
                 }
 
@@ -8668,6 +9071,7 @@ fn run_batch_index_with_connector_factories(
                     is_discovered,
                     scan_succeeded,
                     scan_error,
+                    root_outcomes,
                 })
             })
             .collect();
@@ -8734,6 +9138,11 @@ fn run_batch_index_with_connector_factories(
     let mut ingest_outcome = NonWatchIngestOutcome::default();
     let preserve_scan_watermark =
         scan_watermark_preservation_active(active_session_source_skips) || scan_had_errors;
+    // PR8 C3: per-root outcomes are collected before the batches are consumed.
+    let root_scan_outcomes: Vec<RootScanOutcome> = pending_batches
+        .iter()
+        .flat_map(|pending| pending.root_outcomes.iter().cloned())
+        .collect();
     for pending in pending_batches {
         let batch_outcome = ingest_non_watch_batch_with_oom_split(
             storage,
@@ -8745,23 +9154,18 @@ fn run_batch_index_with_connector_factories(
             progress_bump,
         )?;
         ingest_outcome = ingest_outcome.accumulate(batch_outcome);
-        // Periodically persist scan_start_ts so that if the process is killed,
-        // the next run does a delta scan instead of a full rescan (infinite-OOM-loop fix).
-        if !preserve_scan_watermark && last_scan_ts_save.elapsed() >= Duration::from_secs(10) {
-            if let Err(e) = persist::with_ephemeral_writer(
-                storage,
-                false,
-                "updating batch incremental last_scan_ts",
-                |writer| writer.set_last_scan_ts(scan_start_ts),
-            ) {
-                tracing::warn!("batch incremental last_scan_ts save failed: {}", e);
+        // PR8 C3 (spec 推荐默认 / AC-7): schema 7 no longer writes the legacy
+        // global `last_scan_ts`. It stays readable for `status --json`'s
+        // staleness comparison and for older binaries, and every scan now
+        // advances a per-(root, connector) watermark instead. The periodic
+        // crash-safety write that used to land here therefore has nothing left
+        // to write: the per-root rows are persisted once, at finalize.
+        if last_scan_ts_save.elapsed() >= Duration::from_secs(10) {
+            if preserve_scan_watermark {
+                tracing::debug!(
+                    "batch scan watermarks stay where they are because scan exclusions or active source skips are active"
+                );
             }
-            last_scan_ts_save = std::time::Instant::now();
-        } else if preserve_scan_watermark && last_scan_ts_save.elapsed() >= Duration::from_secs(10)
-        {
-            tracing::debug!(
-                "preserving batch incremental last_scan_ts because scan exclusions or active source skips are active"
-            );
             last_scan_ts_save = std::time::Instant::now();
         }
         tracing::info!(
@@ -8770,6 +9174,7 @@ fn run_batch_index_with_connector_factories(
             "batch_ingest"
         );
     }
+    ingest_outcome.root_outcomes.extend(root_scan_outcomes);
     let index_ms = index_start.elapsed().as_millis() as u64;
 
     // Populate structured stats for JSON output (T7.4)
@@ -8894,6 +9299,480 @@ fn explicit_scan_root_since_ts(
     } else {
         None
     }
+}
+
+/// PR8 C3 (spec hard constraints 5 and 6): one watermarks-enabled local scan
+/// root, with the watermark and per-file state read for it *before* the scan
+/// starts.
+///
+/// The plan is built on the thread that has the database handle; the scan
+/// itself then needs no database access, only the filesystem comparison below.
+#[derive(Debug, Clone)]
+struct LocalRootPlan {
+    root: ScanRoot,
+    meta: scan_root_meta::ScanRootMeta,
+    /// `None` = no `(root_id, connector)` row, so the whole root is scanned.
+    /// There is deliberately no bootstrap to "now" (spec hard constraint 5).
+    watermark: Option<i64>,
+    /// `relative_path -> (size, mtime)` last recorded for this
+    /// `(root_id, connector)`.
+    file_states: HashMap<String, (i64, i64)>,
+}
+
+/// What one root's scan reported back. Persisted only once the whole run's
+/// status is known (see [`persist_root_scan_outcomes`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RootScanOutcome {
+    connector: String,
+    root_id: String,
+    /// False when this root's scan hit an error: the watermark and the file
+    /// states for this `(root_id, connector)` then both stay put.
+    succeeded: bool,
+    /// The connector's own error text, surfaced to `scan_errors` exactly as
+    /// the baseline local scan surfaced it.
+    error: Option<String>,
+    /// `(relative_path, size, mtime)` of every file this scan covered.
+    files: Vec<(String, i64, i64)>,
+}
+
+impl RootScanOutcome {
+    fn failed(connector: &str, root_id: &str) -> Self {
+        Self {
+            connector: connector.to_string(),
+            root_id: root_id.to_string(),
+            succeeded: false,
+            error: None,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// Keep the connector/root identity, drop the claim of a clean scan: a root
+/// whose scan (or one of its sessions' prepare) failed must not advance its
+/// watermark or rewrite its file state (hard constraint 5).
+fn failed_outcome(outcome: RootScanOutcome) -> RootScanOutcome {
+    RootScanOutcome {
+        succeeded: false,
+        files: Vec::new(),
+        ..outcome
+    }
+}
+
+/// The home roots of one connector, with their watermark and file state.
+///
+/// Only claude_code and codex have home roots (hard constraint 5's scope);
+/// every other connector returns an empty plan set and keeps the baseline
+/// connector-level watermark through `ScanContext::local_default`.
+fn local_root_plans(
+    connector: &str,
+    storage: &FrankenStorage,
+) -> Result<Vec<LocalRootPlan>> {
+    let mut plans = Vec::new();
+    for path in scan_root_meta::home_scan_roots(connector) {
+        if !path.exists() {
+            continue;
+        }
+        let canonical_path = scan_root_meta::canonicalize_root_path(&path);
+        let root_id = scan_root_meta::home_root_id(connector, &canonical_path);
+        let watermark = storage.get_scan_watermark(&root_id, connector)?;
+        let file_states = storage.scan_file_states_for_root_connector(&root_id, connector)?;
+        plans.push(LocalRootPlan {
+            root: ScanRoot::local(canonical_path.clone()),
+            meta: scan_root_meta::ScanRootMeta {
+                root_id,
+                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+                readonly: false,
+                canonical_path,
+                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+                watermarks_enabled: true,
+            },
+            watermark,
+            file_states,
+        });
+    }
+    Ok(plans)
+}
+
+/// The plan for one configured root, when the contract gives it watermarks
+/// (`watermarks_enabled`: a local configured root of a source that did not opt
+/// into full scans). Mirror roots and `full_scan` sources return `None` and
+/// keep `explicit_scan_root_since_ts`'s full-root scan.
+fn configured_local_root_plan(
+    connector: &str,
+    storage: &FrankenStorage,
+    root: &ScanRoot,
+    meta: &scan_root_meta::ScanRootMeta,
+) -> Result<LocalRootPlan> {
+    let watermark = storage.get_scan_watermark(&meta.root_id, connector)?;
+    let file_states = storage.scan_file_states_for_root_connector(&meta.root_id, connector)?;
+    Ok(LocalRootPlan {
+        root: root.clone(),
+        meta: meta.clone(),
+        watermark,
+        file_states,
+    })
+}
+
+/// Build every connector's root plans once, before the scan loops start: the
+/// streaming producers own no database handle, and the batch scan runs inside
+/// rayon.
+fn build_connector_root_plans(
+    storage: &FrankenStorage,
+    connector_factories: &[(&'static str, ConnectorFactory)],
+    additional_scan_roots: &[ScanRoot],
+    scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
+) -> Result<HashMap<&'static str, ConnectorRootPlans>> {
+    let mut plans_by_connector = HashMap::new();
+
+    for (name, _) in connector_factories {
+        let mut plans = ConnectorRootPlans {
+            home: local_root_plans(name, storage)?,
+            configured: HashMap::new(),
+        };
+        for root in additional_scan_roots {
+            let Some(meta) = scan_roots_meta.get_by_path(&root.path) else {
+                continue;
+            };
+            if !meta.watermarks_enabled {
+                continue;
+            }
+            let plan = configured_local_root_plan(name, storage, root, meta)?;
+            plans
+                .configured
+                .insert(scan_root_meta::canonicalize_root_path(&root.path), plan);
+        }
+        plans_by_connector.insert(*name, plans);
+    }
+
+    Ok(plans_by_connector)
+}
+
+/// Every `root_id` this run is allowed to reset: the home roots of the
+/// connectors that have them, plus every watermarks-enabled configured root.
+fn scanned_root_ids(
+    additional_scan_roots: &[ScanRoot],
+    scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
+) -> Vec<String> {
+    let mut root_ids = Vec::new();
+
+    for connector in scan_root_meta::CONNECTORS_WITH_HOME_ROOTS {
+        for path in scan_root_meta::home_scan_roots(connector) {
+            if !path.exists() {
+                continue;
+            }
+            let canonical_path = scan_root_meta::canonicalize_root_path(&path);
+            root_ids.push(scan_root_meta::home_root_id(connector, &canonical_path));
+        }
+    }
+
+    for root in additional_scan_roots {
+        if let Some(meta) = scan_roots_meta.get_by_path(&root.path)
+            && meta.watermarks_enabled
+        {
+            root_ids.push(meta.root_id.clone());
+        }
+    }
+
+    root_ids.sort();
+    root_ids.dedup();
+    root_ids
+}
+
+/// `cass index --full` (and a forced rebuild) resets the watermarks of the
+/// roots this run scans, so every file under them is read again. Other roots'
+/// rows -- another `paths` entry, a second home -- are left untouched, which is
+/// the difference between a per-root watermark and the old single global one.
+fn clear_watermarks_for_scanned_roots(
+    storage: &FrankenStorage,
+    additional_scan_roots: &[ScanRoot],
+    scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
+) -> Result<()> {
+    let root_ids = scanned_root_ids(additional_scan_roots, scan_roots_meta);
+    if root_ids.is_empty() {
+        return Ok(());
+    }
+
+    persist::with_ephemeral_writer(
+        storage,
+        false,
+        "clearing scan watermarks for a full scan",
+        |writer| {
+            for root_id in &root_ids {
+                writer.clear_scan_watermarks_for_root(root_id)?;
+                writer.clear_scan_file_state_for_root(root_id)?;
+            }
+            Ok(())
+        },
+    )?;
+    tracing::info!(
+        roots = root_ids.len(),
+        "cleared per-root scan watermarks for a full scan"
+    );
+    Ok(())
+}
+
+/// `path` relative to `root`, as the `scan_file_state` key spelling. `None`
+/// when the file is not under the root, which would otherwise make two roots
+/// share a key.
+fn relative_path_within(root: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().to_string())
+}
+
+fn file_scan_stamp(path: &Path, discovered: &crate::connectors::DiscoveredSourceFile) -> (i64, i64) {
+    if let (Some(size), Some(mtime)) = (discovered.size_bytes, discovered.modified_at_ms) {
+        return (i64::try_from(size).unwrap_or(i64::MAX), mtime);
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| {
+                    modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                })
+                .unwrap_or(0);
+            (size, mtime)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// Scan one watermarks-enabled root and report what it covered.
+///
+/// Full scan (no watermark row) hands the connector the root itself with
+/// `since_ts = None`. Otherwise each file with `mtime > watermark`, a `size`
+/// that differs from what `scan_file_state` recorded, or no record at all, is
+/// handed over as an explicit single-file root with `since_ts = Some(0)` --
+/// `0` because the connector's own inner mtime filter would otherwise drop a
+/// file whose size changed while its mtime did not (hard constraint 6).
+///
+/// Returns the outcome plus, separately, a fatal error the *callback* raised
+/// (the streaming producer's consumer-disconnected case, which stops the
+/// producer rather than being recorded as a scan error).
+#[allow(clippy::too_many_arguments)]
+fn run_local_root_scan(
+    connector: &(dyn crate::connectors::Connector + Send),
+    connector_name: &'static str,
+    data_dir: &Path,
+    plan: &LocalRootPlan,
+    // Roots the raw-mirror pre-parse capture falls back to when this connector
+    // discovers nothing under `plan.root`: the connector's own detected roots,
+    // exactly as the baseline local scan passed them.
+    capture_fallback_roots: &[ScanRoot],
+    active_source_filter: &ActiveSessionSourceFilter,
+    on_conversation: &mut dyn FnMut(
+        &ScanRoot,
+        &scan_root_meta::ScanRootMeta,
+        NormalizedConversation,
+    ) -> Result<()>,
+) -> (RootScanOutcome, Option<anyhow::Error>) {
+    let root_id = plan.meta.root_id.clone();
+    let discovery_ctx = crate::connectors::ScanContext::with_roots(
+        data_dir.to_path_buf(),
+        vec![plan.root.clone()],
+        None,
+    );
+    let discovered = match connector.discover_source_files(&discovery_ctx) {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            tracing::warn!(
+                connector = connector_name,
+                root = %plan.root.path.display(),
+                error = %error,
+                "scan root discovery failed"
+            );
+            return (RootScanOutcome::failed(connector_name, &root_id), None);
+        }
+    };
+
+    // Everything the connector would read under this root, with the size and
+    // mtime the comparison below runs on.
+    let candidates: Vec<(String, i64, i64, PathBuf)> = discovered
+        .iter()
+        .filter_map(|discovered_file| {
+            let relative = relative_path_within(
+                &plan.meta.canonical_path,
+                &discovered_file.source_path,
+            )?;
+            let (size, mtime) = file_scan_stamp(&discovered_file.source_path, discovered_file);
+            Some((relative, size, mtime, discovered_file.source_path.clone()))
+        })
+        .collect();
+
+    let (ctx, scanned_files) = if let Some(watermark) = plan.watermark {
+        let changed: Vec<(String, i64, i64, PathBuf)> = candidates
+            .iter()
+            .filter(|(relative, size, mtime, _)| {
+                *mtime > watermark
+                    || plan
+                        .file_states
+                        .get(relative)
+                        .is_none_or(|(recorded_size, _)| recorded_size != size)
+            })
+            .cloned()
+            .collect();
+        if changed.is_empty() {
+            // Nothing changed: the watermark still moves forward (this root
+            // and connector scanned cleanly), and no file state needs rewriting.
+            return (
+                RootScanOutcome {
+                    connector: connector_name.to_string(),
+                    root_id,
+                    succeeded: true,
+                    error: None,
+                    files: Vec::new(),
+                },
+                None,
+            );
+        }
+        let scanned: Vec<(String, i64, i64)> = changed
+            .iter()
+            .map(|(relative, size, mtime, _)| (relative.clone(), *size, *mtime))
+            .collect();
+        let file_roots: Vec<ScanRoot> = changed
+            .iter()
+            .map(|(_, _, _, path)| plan.root.with_path(path.clone()))
+            .collect();
+        (
+            crate::connectors::ScanContext::with_roots(
+                plan.root.path.clone(),
+                file_roots,
+                Some(0),
+            ),
+            scanned,
+        )
+    } else {
+        let scanned: Vec<(String, i64, i64)> = candidates
+            .iter()
+            .map(|(relative, size, mtime, _)| (relative.clone(), *size, *mtime))
+            .collect();
+        (discovery_ctx.clone(), scanned)
+    };
+
+    capture_connector_sources_before_parse(
+        connector,
+        &ctx,
+        data_dir,
+        connector_name,
+        capture_fallback_roots,
+        ctx.since_ts,
+        active_source_filter,
+    );
+    record_scan_invocation();
+
+    let mut fatal: Option<anyhow::Error> = None;
+    let scan_result = connector.scan_with_callback(&ctx, &mut |conversation| {
+        if should_skip_active_session_source(
+            active_source_filter,
+            connector_name,
+            &plan.root.origin.source_id,
+            &conversation.source_path,
+        ) {
+            return Ok(());
+        }
+        if should_skip_subagent_source(&conversation.source_path) {
+            return Ok(());
+        }
+        if let Err(error) = on_conversation(&plan.root, &plan.meta, conversation) {
+            fatal = Some(error);
+            return Err(anyhow::anyhow!("scan root callback failed"));
+        }
+        Ok(())
+    });
+
+    match scan_result {
+        Ok(()) if fatal.is_none() => (
+            RootScanOutcome {
+                connector: connector_name.to_string(),
+                root_id,
+                succeeded: true,
+                error: None,
+                files: scanned_files,
+            },
+            None,
+        ),
+        Ok(()) => (RootScanOutcome::failed(connector_name, &root_id), fatal),
+        Err(error) => {
+            tracing::warn!(
+                connector = connector_name,
+                root = %plan.root.path.display(),
+                error = %error,
+                "scan root failed"
+            );
+            (
+                RootScanOutcome {
+                    error: Some(error.to_string()),
+                    ..RootScanOutcome::failed(connector_name, &root_id)
+                },
+                fatal,
+            )
+        }
+    }
+}
+
+/// Persist the per-root watermarks and file states for this run.
+///
+/// Gated exactly like the connector-level watermark: nothing is written when
+/// the run deferred conversations, when source exclusions or active-session
+/// skips are in force, or when a root's own scan failed -- for a failing root
+/// *both* its watermark and its file states stay where they were (hard
+/// constraint 5).
+fn persist_root_scan_outcomes(
+    storage: &FrankenStorage,
+    outcomes: &[RootScanOutcome],
+    skips: &Mutex<ActiveSessionSourceSkips>,
+    performed_scan: bool,
+    scan_deferred_conversations: usize,
+    scan_start_ts: i64,
+) -> Result<()> {
+    if !performed_scan || scan_deferred_conversations != 0 || outcomes.is_empty() {
+        return Ok(());
+    }
+
+    for outcome in outcomes {
+        if !outcome.succeeded {
+            continue;
+        }
+        let Some(watermark_ts) =
+            effective_connector_scan_watermark_ts(skips, &outcome.connector, scan_start_ts)
+        else {
+            continue;
+        };
+        if let Err(error) = persist::with_ephemeral_writer(
+            storage,
+            false,
+            "updating per-root scan watermarks",
+            |writer| {
+                writer.set_scan_watermark(&outcome.root_id, &outcome.connector, watermark_ts)?;
+                for (relative_path, size, mtime) in &outcome.files {
+                    writer.upsert_scan_file_state(
+                        &outcome.root_id,
+                        &outcome.connector,
+                        relative_path,
+                        *size,
+                        *mtime,
+                        watermark_ts,
+                    )?;
+                }
+                Ok(())
+            },
+        ) {
+            tracing::warn!(
+                connector = %outcome.connector,
+                root_id = %outcome.root_id,
+                error = %error,
+                "per-root scan watermark update failed"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Restore scan watermarks through a DEDICATED short-lived writer connection
@@ -9621,6 +10500,9 @@ pub fn run_index(
     let mut scanned_connectors = BTreeSet::new();
     let mut scan_had_errors = false;
     let mut scan_deferred_conversations = 0usize;
+    // PR8 C3: every watermarks-enabled root this run scanned, with what it
+    // covered. Persisted at finalize (see `persist_root_scan_outcomes`).
+    let mut root_scan_outcomes: Vec<RootScanOutcome> = Vec::new();
     // Pre-run watermark snapshot: streaming connector watermarks and the
     // 10s-periodic global saves are written BEFORE ingest knows whether any
     // conversation gets #298-deferred. If this run defers anything, every
@@ -10191,47 +11073,44 @@ pub fn run_index(
                     );
                 }
 
-                // Get last scan timestamp for incremental indexing.
-                // If full rebuild or force_rebuild, scan everything (since_ts = None).
-                // Otherwise, only scan files modified since last successful scan.
-                let last_scan_ts = storage.get_last_scan_ts().unwrap_or(None);
-                let bootstrap_missing_scan_watermark =
-                    should_bootstrap_missing_incremental_scan_watermark(
-                        &opts,
-                        canonical_storage_rebuilt,
-                        canonical_sessions_before_salvage,
-                        needs_rebuild,
-                        stale_index_ingest_quarantine_retry.is_some(),
-                        last_scan_ts,
-                    );
-                let since_ts = if let Some(bootstrap) = &bootstrap_missing_scan_watermark {
-                    tracing::warn!(
-                        db_path = %opts.db_path.display(),
-                        canonical_conversations = bootstrap.canonical_conversations,
-                        db_size_bytes = bootstrap.db_size_bytes,
-                        max_automatic_full_scan_db_size_bytes =
-                            bootstrap.max_automatic_full_scan_db_size_bytes,
-                        reason = bootstrap.reason,
-                        "bootstrapping missing incremental scan watermark on a large populated archive; use --full or CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN=1 for deliberate historical backfill"
-                    );
-                    Some(scan_start_ts.saturating_sub(1).max(0))
-                } else {
-                    non_watch_scan_since_ts(
-                        opts.full,
-                        needs_rebuild,
-                        stale_index_ingest_quarantine_retry.is_some(),
-                        last_scan_ts,
-                    )
-                };
+                // PR8 C3 (spec hard constraint 5): the legacy global
+                // `last_scan_ts` no longer decides the incremental cutoff and
+                // the missing-watermark bootstrap is gone. Every
+                // watermarks-enabled root reads its own
+                // `(root_id, connector)` row, and "no row" means "scan the
+                // whole root" -- never "start from now". `since_ts` survives
+                // only as the fallback for connectors the contract leaves on
+                // the connector-level watermark (everything outside
+                // claude_code / codex), which still come from the connector
+                // rows via `connector_local_scan_since_ts_map`.
+                let since_ts = non_watch_scan_since_ts(
+                    opts.full,
+                    needs_rebuild,
+                    stale_index_ingest_quarantine_retry.is_some(),
+                    None,
+                );
 
                 if since_ts.is_some() {
-                    tracing::info!(since_ts = ?since_ts, "incremental_scan: using last_scan_ts");
+                    tracing::info!(since_ts = ?since_ts, "incremental_scan: full rebuild requested");
                 } else {
-                    tracing::info!("full_scan: no last_scan_ts or rebuild requested");
+                    tracing::info!("scan: per-root watermarks decide the cutoff");
                 }
 
-                let additional_scan_roots =
-                    additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+                let (additional_scan_roots, scan_roots_meta) =
+                    additional_scan_roots_with_meta(&storage, &opts.data_dir);
+                let scan_roots_meta = Arc::new(scan_roots_meta);
+
+                // `cass index --full` clears the watermarks of the roots this
+                // run will scan (hard constraint 5: "只把当前扫描根的全部行置
+                // 零"), so the whole root is re-read while a fake home's or a
+                // second path's rows stay exactly where they were.
+                if opts.full || opts.force_rebuild || needs_rebuild {
+                    clear_watermarks_for_scanned_roots(
+                        &storage,
+                        &additional_scan_roots,
+                        &scan_roots_meta,
+                    )?;
+                }
 
                 preflight_phase!("watch_startup:scan_entry");
                 complete_preflight_phase!();
@@ -10243,6 +11122,7 @@ pub fn run_index(
                         since_ts,
                         lexical_strategy,
                         additional_scan_roots.clone(),
+                        Arc::clone(&scan_roots_meta),
                         scan_start_ts,
                         Some(&progress_bump),
                         &active_session_source_skips,
@@ -10261,6 +11141,7 @@ pub fn run_index(
                     scan_had_errors |= scan_outcome.scan_had_errors;
                     scan_deferred_conversations = scan_deferred_conversations
                         .saturating_add(scan_outcome.deferred_conversations);
+                    root_scan_outcomes.extend(scan_outcome.root_outcomes);
                 } else {
                     tracing::info!(
                         "using batch indexing (streaming disabled via CASS_STREAMING_INDEX=0)"
@@ -10271,6 +11152,7 @@ pub fn run_index(
                         since_ts,
                         lexical_strategy,
                         additional_scan_roots.clone(),
+                        Arc::clone(&scan_roots_meta),
                         scan_start_ts,
                         Some(&progress_bump),
                         &active_session_source_skips,
@@ -10283,6 +11165,7 @@ pub fn run_index(
                     scan_had_errors |= scan_outcome.scan_had_errors;
                     scan_deferred_conversations = scan_deferred_conversations
                         .saturating_add(scan_outcome.deferred_conversations);
+                    root_scan_outcomes.extend(scan_outcome.root_outcomes);
                 }
                 performed_scan = true;
                 stale_index_ingest_quarantine_retry_attempted =
@@ -10551,13 +11434,48 @@ pub fn run_index(
         stats.salvage_skipped_by_no_ingest = opts.no_ingest;
     }
 
+    // PR8 C8: a semantic run's last mile has no batch-granular event to post
+    // — `run_semantic_db_vector_catchup` drains holes and then hands the run
+    // back to a tail (lexical checkpoint, analytics rebuild, activation
+    // audit) that used to look completely wedged to `cass status` /
+    // `cass doctor`. Open the sink here and tick through that whole window,
+    // to the end of this function, so the run keeps posting forward progress
+    // (issue #258 reads exactly that evidence for `stalled`).
+    //
+    // Scoped to `--semantic`: a plain `cass index` is unchanged, sink env var
+    // or not. The ticker's thread is owned by `semantic_finalize_progress`
+    // and joined on drop, which is the end of this function — including the
+    // early-return paths above it.
+    let semantic_finalize_progress: Option<SemanticFinalizeProgressEmitter> = if opts.semantic {
+        let interval = SemanticFinalizeProgressEmitter::interval_from_env();
+        tracing::debug!(
+            interval_ms = interval.as_millis() as u64,
+            embedder = %opts.embedder,
+            "starting semantic finalize progress ticker"
+        );
+        Some(SemanticFinalizeProgressEmitter::start(
+            SemanticProgressSink::open_for_embedder(&opts.embedder),
+            Some(Arc::clone(&progress_bump)),
+            interval,
+            "semantic_drain",
+        ))
+    } else {
+        None
+    };
+
     if opts.semantic && targeted_semantic_watch_once {
         tracing::info!(
             embedder = %opts.embedder,
             "deferring broad semantic indexing until targeted watch-once ingest completes"
         );
+        if let Some(emitter) = semantic_finalize_progress.as_ref() {
+            emitter.set_stage("finalize");
+        }
     } else if opts.semantic {
         let outcome = run_semantic_db_vector_catchup(&opts, "cass index --semantic")?;
+        if let Some(emitter) = semantic_finalize_progress.as_ref() {
+            emitter.set_stage("finalize");
+        }
         if let Some(p) = &opts.progress
             && let Ok(mut stats) = p.stats.lock()
         {
@@ -10585,6 +11503,13 @@ pub fn run_index(
         let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
         stats.capture_na = capture_na;
         stats.capture_failed = capture_failed;
+        // PR8 C6 (spec S5 / hard constraint 13): same unconditional disclosure
+        // for the configured-source facts -- a run that skipped a configured
+        // root, or could not read `sources.toml` at all, says so in its own
+        // `--json` report, not only in a log line and a later `status`.
+        let (scan_roots_missing, sources_config_error) = last_index_configured_source_snapshot();
+        stats.scan_roots_missing = scan_roots_missing;
+        stats.sources_config_error = sources_config_error;
     }
 
     if targeted_watch_once_only_run {
@@ -10616,12 +11541,12 @@ pub fn run_index(
         if performed_scan && preserve_scan_watermark {
             tracing::info!(
                 db_path = %opts.db_path.display(),
-                "preserving final last_scan_ts because scan exclusions or active source skips are active"
+                "preserving this run's scan watermarks because scan exclusions or active source skips are active"
             );
         } else if performed_scan && scan_had_errors {
             tracing::warn!(
                 db_path = %opts.db_path.display(),
-                "preserving final global last_scan_ts because one or more connector scans failed; successful connector-specific watermarks will still be updated"
+                "preserving failed connectors' watermarks because one or more connector scans failed; successful connector-specific watermarks will still be updated"
             );
         }
         persist_final_index_run_metadata(
@@ -10639,6 +11564,16 @@ pub fn run_index(
                 &connector_watermarks_to_persist,
             )?;
         }
+        // PR8 C3: per-root watermarks and per-file state, written under the
+        // same conditions as the connector-level rows above.
+        persist_root_scan_outcomes(
+            &storage,
+            &root_scan_outcomes,
+            &active_session_source_skips,
+            performed_scan,
+            scan_deferred_conversations,
+            scan_start_ts,
+        )?;
     }
     // Watermark state is now final for this run (advanced for clean runs,
     // restored/preserved for deferred ones): the early-exit guard has nothing
@@ -12351,6 +13286,7 @@ fn ingest_batch_detailed(
             inserted_conversations: batch_outcome.inserted_conversations,
             inserted_messages: batch_outcome.inserted_messages,
         },
+        root_outcomes: Vec::new(),
         quarantined_conversations: 0,
         deferred_conversations: 0,
         lexical_update_deferred: batch_outcome.lexical_update_deferred,
@@ -14752,9 +15688,18 @@ fn reindex_paths_with_semantic_delta(
         // Provenance injection, path rewriting, capture + exclusion judgment.
         let mut prepared_convs: Vec<crate::indexer::exclusion::PreparedConversation> =
             Vec::with_capacity(convs.len());
+        // PR8 C3: the watched root's identity comes from its `ScanRootMeta`
+        // exactly as it does on the streaming and batch paths -- a watch pass
+        // must not stamp a different `identity_host` on the same session.
+        let watch_root_identity = storage
+            .lock()
+            .map(|guard| {
+                identity_for_watch_root(&guard, &opts.data_dir, kind.slug(), &root)
+            })
+            .unwrap_or_else(|_| IngestIdentity::local());
         for conv in convs {
             let source_kind = capture_source_kind_for(kind.slug(), conv.source_path.clone());
-            match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, Some(&root), source_kind, conv) {
+            match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, &watch_root_identity, Some(&root), source_kind, conv) {
                 Ok(prepared) => prepared_convs.push(prepared),
                 Err(error) => {
                     // R1-B1 (任务书 #118a): a prepare failure must poison
@@ -15551,7 +16496,13 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
     let config = match SourcesConfig::load() {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::debug!("sources config load failed: {e}");
+            // PR8 C6 (spec S5): a config that will not load is an operator
+            // error, not a debug detail -- it used to leave every configured
+            // source silently unregistered. The same failure is recorded on
+            // `IndexingStats` by `build_scan_roots_with_meta` (the only writer
+            // of `last_index.sources_config_error`), so this line reports it
+            // without double-counting it.
+            tracing::error!(error = %e, "sources config failed to load");
             return;
         }
     };
@@ -15606,7 +16557,13 @@ fn sync_sources_config_to_db(storage: &FrankenStorage) {
     }
 }
 
-fn expand_local_scan_root_path(path: &str) -> PathBuf {
+/// Resolve a configured scan-root path the way every consumer of it must:
+/// `~/…` against this user's home, anything else as written.
+///
+/// PR8 C6: `run_sources_doctor` classifies a *local* configured root from this
+/// same expansion, so the doctor and the scan root cannot disagree about which
+/// directory a `sources.toml` entry names.
+pub(crate) fn expand_local_scan_root_path(path: &str) -> PathBuf {
     if let Some(stripped) = path.strip_prefix("~/")
         && let Some(home) = dirs::home_dir()
     {
@@ -15634,15 +16591,44 @@ fn additional_scan_roots_for_scan_or_watch(
     // Source-config syncing and scan-root discovery can be expensive on large
     // machines with many historical bundles and configured mirrors. Defer that
     // work until a source scan or watch session actually needs it.
+    additional_scan_roots_with_meta(storage, data_dir).0
+}
+
+/// [`additional_scan_roots_for_scan_or_watch`] plus the `ScanRootMeta` of the
+/// roots it kept, for the callers that ingest and therefore need each root's
+/// `identity_host` / `root_id` (PR8 C3).
+fn additional_scan_roots_with_meta(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+) -> (Vec<ScanRoot>, scan_root_meta::ScanRootMetaIndex) {
     sync_sources_config_to_db(storage);
-    build_scan_roots(storage, data_dir)
+    let (roots, metas) = build_scan_roots_with_meta(storage, data_dir);
+    let filtered: Vec<ScanRoot> = roots
         .into_iter()
         .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == data_dir))
-        .collect()
+        .collect();
+    (filtered, metas)
 }
 
 pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRoot> {
+    build_scan_roots_with_meta(storage, data_dir).0
+}
+
+/// PR8 C3 (spec hard constraint 12): the same roots as [`build_scan_roots`],
+/// plus the [`scan_root_meta::ScanRootMeta`] that names each one.
+///
+/// `ScanRootMeta` is keyed by `(source_name, canonical_path)` and carries
+/// `root_id` / `origin_host` / `readonly` / `watermarks_enabled`; ingest reads
+/// `identity_host` and the watermark key from it, because the `ScanRoot` type
+/// itself is a re-exported `franken_agent_detection` type that PR8 does not
+/// modify. The plain [`build_scan_roots`] entry point stays for callers that
+/// only need the roots.
+pub fn build_scan_roots_with_meta(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+) -> (Vec<ScanRoot>, scan_root_meta::ScanRootMetaIndex) {
     let mut roots = Vec::new();
+    let mut metas = scan_root_meta::ScanRootMetaIndex::new();
 
     // Add local default root with local provenance
     // We create a single "local" root that encompasses all local paths.
@@ -15650,10 +16636,35 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
     // For explicit multi-root support, we add the local root.
     roots.push(ScanRoot::local(data_dir.to_path_buf()));
 
-    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_err()
-        && let Ok(config) = SourcesConfig::load()
+    // PR8 C6 (spec S5 / hard constraint 13): the chained `let Ok(config)` this
+    // used to be folded a load *failure* into the same `else` as "no configured
+    // sources", so a broken `sources.toml` produced exactly the roots an empty
+    // one does. The two states are split apart here: a failure is reported and
+    // recorded, and it alone suppresses the DB-registered fallback below.
+    let mut db_registered_fallback = true;
+    let config = if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_err() {
+        match SourcesConfig::load() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "sources config failed to load; configured sources skipped this run"
+                );
+                record_sources_config_error(&e.to_string());
+                db_registered_fallback = false;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(config) = config
         && !config.sources.is_empty()
     {
+        // This branch returns below, so it never reaches the fallback: no
+        // `db_registered_fallback` write is needed here, only in the `Err` arm
+        // above (which does fall through to it).
         for source in &config.sources {
             let origin = Origin {
                 source_id: source.name.clone(),
@@ -15665,46 +16676,55 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
 
             for path in &source.paths {
                 if source.is_remote() {
-                    let expanded_path = if path.starts_with("~/") {
-                        path.to_string()
-                    } else if path.starts_with('~') {
-                        path.replacen('~', "~/", 1)
-                    } else {
-                        path.to_string()
-                    };
-                    let safe_name = path_to_safe_dirname(&expanded_path);
-                    let mirror_base = data_dir.join("remotes").join(&source.name).join("mirror");
-                    let mirror_path = mirror_base.join(&safe_name);
-
-                    if mirror_path.exists() {
-                        let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
-                        scan_root.workspace_rewrites = workspace_rewrites.clone();
-                        roots.push(scan_root);
+                    // SSH mirror roots keep the baseline full-root scan (hard
+                    // constraint 5) but still carry the configured
+                    // `origin_host` as their identity: sessions arriving
+                    // through ivanmac's mirror are ivanmac's.
+                    //
+                    // PR8 C6: the candidate list is shared with
+                    // `run_sources_doctor`, so this scan root and that doctor
+                    // report cannot drift into two derivations of one layout.
+                    let Some(mirror_path) = remote_mirror_candidates(source, data_dir, path)
+                        .into_iter()
+                        .find(|candidate| candidate.exists())
+                    else {
                         continue;
-                    }
-
-                    if path.starts_with("~/") {
-                        let suffix = path.trim_start_matches("~/");
-                        let safe_suffix = path_to_safe_dirname(suffix);
-                        if let Ok(entries) = std::fs::read_dir(&mirror_base) {
-                            for entry in entries.flatten() {
-                                let name = entry.file_name();
-                                let name_str = name.to_string_lossy();
-                                if name_str.ends_with(&safe_suffix) && entry.path().is_dir() {
-                                    let mut scan_root =
-                                        ScanRoot::remote(entry.path(), origin.clone(), platform);
-                                    scan_root.workspace_rewrites = workspace_rewrites.clone();
-                                    roots.push(scan_root);
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                    };
+                    metas.insert(configured_scan_root_meta(
+                        &source.name,
+                        &source.origin_host,
+                        source.readonly,
+                        false,
+                        &mirror_path,
+                    ));
+                    let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
+                    scan_root.workspace_rewrites = workspace_rewrites.clone();
+                    roots.push(scan_root);
                 } else {
                     let local_path = expand_local_scan_root_path(path);
                     if !local_path.exists() {
+                        // PR8 C6 (spec S5 / hard constraint 13): a configured
+                        // root that is not there is named, not silently
+                        // dropped -- this `continue` used to be the whole
+                        // visible story of a typo'd path.
+                        tracing::warn!(
+                            source = %source.name,
+                            path = %local_path.display(),
+                            "configured scan root does not exist; skipped"
+                        );
+                        record_scan_root_missing(&source.name);
                         continue;
                     }
+                    // A machine-local configured root: its own watermark row
+                    // unless the source opted into full scans, and the
+                    // configured `origin_host` as its identity.
+                    metas.insert(configured_scan_root_meta(
+                        &source.name,
+                        &source.origin_host,
+                        source.readonly,
+                        !source.full_scan,
+                        &local_path,
+                    ));
                     let mut scan_root = ScanRoot::local(local_path);
                     scan_root.origin = origin.clone();
                     scan_root.platform = platform;
@@ -15713,11 +16733,18 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                 }
             }
         }
-        return roots;
+        return (roots, metas);
     }
 
-    // Fallback: remote mirror roots from registered sources
-    if let Ok(sources) = storage.list_sources() {
+    // Fallback: remote mirror roots from registered sources.
+    //
+    // PR8 C6 (hard constraint 13): reached only when the configured sources say
+    // nothing (`Ok` + empty) or the whole config was short-circuited -- never
+    // on a config that failed to load, which is reported instead of being
+    // silently papered over with the DB's older registry.
+    if db_registered_fallback
+        && let Ok(sources) = storage.list_sources()
+    {
         for source in sources {
             // Parse platform from source
             let platform =
@@ -15804,6 +16831,16 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                             kind: source.kind,
                             host: source.host_label.clone(),
                         };
+                        // DB-registered fallback roots carry no config fields:
+                        // identity stays `local` and they keep the baseline
+                        // scan scope (no per-root watermark).
+                        metas.insert(configured_scan_root_meta(
+                            &source.id,
+                            "local",
+                            false,
+                            false,
+                            &local_path,
+                        ));
                         let mut scan_root = ScanRoot::local(local_path);
                         scan_root.origin = origin;
                         scan_root.platform = platform;
@@ -15823,6 +16860,13 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
                     kind: source.kind,
                     host: source.host_label.clone(),
                 };
+                metas.insert(configured_scan_root_meta(
+                    &source.id,
+                    "local",
+                    false,
+                    false,
+                    &mirror_path,
+                ));
                 let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
                 scan_root.workspace_rewrites = workspace_rewrites;
 
@@ -15831,7 +16875,190 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
         }
     }
 
-    roots
+    (roots, metas)
+}
+
+/// The mirror directories a configured remote `source`'s `path` can live under,
+/// in the order the build tries them: the path's own mirror directory first,
+/// then -- for a `~/`-rooted path -- every sibling directory under the mirror
+/// root whose name ends with the same safe suffix, the layout an older sync
+/// produced before the per-path mirror name was pinned.
+///
+/// PR8 C6: `run_sources_doctor` classifies a remote root's `missing` / `empty`
+/// / `present` state from this same list, so the two surfaces cannot drift into
+/// two derivations of one layout.
+pub(crate) fn remote_mirror_candidates(
+    source: &SourceDefinition,
+    data_dir: &Path,
+    path: &str,
+) -> Vec<PathBuf> {
+    let expanded_path = if path.starts_with("~/") {
+        path.to_string()
+    } else if path.starts_with('~') {
+        path.replacen('~', "~/", 1)
+    } else {
+        path.to_string()
+    };
+    let safe_name = path_to_safe_dirname(&expanded_path);
+    // A source that declares `mirror_dir` mirrors under that directory instead
+    // of `data_dir/remotes/<name>/mirror`; the per-path layout below the root
+    // is unchanged, so sync and this derivation keep agreeing.
+    let mirror_base = source
+        .effective_mirror_dir()
+        .unwrap_or_else(|| data_dir.join("remotes").join(&source.name).join("mirror"));
+
+    let mut candidates = vec![mirror_base.join(&safe_name)];
+    if path.starts_with("~/") {
+        let safe_suffix = path_to_safe_dirname(path.trim_start_matches("~/"));
+        if let Ok(entries) = std::fs::read_dir(&mirror_base) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(&safe_suffix)
+                    && entry.path().is_dir()
+                {
+                    candidates.push(entry.path());
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// The `ScanRootMeta` for one configured source path (hard constraint 12).
+/// `root_id` is derived from the *canonical* path, so the same spelling under
+/// two homes -- or a fake `HOME` and the real one -- never shares a row.
+fn configured_scan_root_meta(
+    source_name: &str,
+    origin_host: &str,
+    readonly: bool,
+    watermarks_enabled: bool,
+    root_path: &Path,
+) -> scan_root_meta::ScanRootMeta {
+    let canonical_path = scan_root_meta::canonicalize_root_path(root_path);
+    scan_root_meta::ScanRootMeta {
+        root_id: scan_root_meta::config_root_id(source_name, &canonical_path),
+        origin_host: origin_host.to_string(),
+        readonly,
+        canonical_path,
+        source_name: source_name.to_string(),
+        watermarks_enabled,
+    }
+}
+
+/// PR8 C2 (spec S1 / hard constraint 2): the machine a scanned session came
+/// from, plus the scan root it arrived through.
+///
+/// This is the **single** place C2 turns a scan root into an ingest identity, and
+/// it is deliberately transitional: C2 runs against `ScanRoot`s that carry no
+/// `ScanRootMeta` yet (C3 adds it), so every root resolves to `local`/`local`
+/// here. The only non-`local` values that reach storage in this task are the ones
+/// `tests/w8_identity_merge.rs` puts on the conversation metadata directly. C3
+/// replaces this function's body with a `ScanRootMeta` lookup and changes nothing
+/// else on this path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestIdentity {
+    pub identity_host: String,
+    pub root_id: String,
+}
+
+impl IngestIdentity {
+    /// The identity of every root C2 can see: local ingest, restore of a
+    /// pre-PR8 capture, and any caller that has no root metadata at all.
+    pub fn local() -> Self {
+        Self {
+            identity_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+            root_id: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+        }
+    }
+
+    /// PR8 C3: restore replays a capture that already recorded which machine
+    /// produced the session, so its identity comes from the manifest rather
+    /// than from a scan root (a pre-PR8 manifest records nothing and falls
+    /// back to `local` -- the caller passes `local` for that case).
+    #[must_use]
+    pub fn for_manifest(identity_host: &str) -> Self {
+        let identity_host = if identity_host.trim().is_empty() {
+            crate::storage::sqlite::DEFAULT_IDENTITY_HOST
+        } else {
+            identity_host
+        };
+        Self {
+            identity_host: identity_host.to_string(),
+            root_id: scan_root_meta::restore_root_id(identity_host),
+        }
+    }
+}
+
+impl IngestIdentity {
+    /// The identity carried by one root's [`scan_root_meta::ScanRootMeta`]
+    /// (`origin_host` + `root_id`).
+    #[must_use]
+    pub fn for_meta(meta: &scan_root_meta::ScanRootMeta) -> Self {
+        Self {
+            identity_host: meta.origin_host.clone(),
+            root_id: meta.root_id.clone(),
+        }
+    }
+}
+
+/// The metadata of one connector's home roots, as `ScanRootMeta`s.
+fn home_root_metas(connector: &str) -> Vec<scan_root_meta::ScanRootMeta> {
+    let mut metas = Vec::new();
+    for path in scan_root_meta::home_scan_roots(connector) {
+        if !path.exists() {
+            continue;
+        }
+        let canonical_path = scan_root_meta::canonicalize_root_path(&path);
+        metas.push(scan_root_meta::ScanRootMeta {
+            root_id: scan_root_meta::home_root_id(connector, &canonical_path),
+            origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+            readonly: false,
+            canonical_path,
+            source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+            watermarks_enabled: true,
+        });
+    }
+    metas
+}
+
+/// The ingest identity of a watched root (the watch/targeted-reindex path).
+///
+/// That path holds no `ScanRootMetaIndex` -- it is handed a `(kind, root)`
+/// pair per batch -- so the index is rebuilt for this one lookup from the same
+/// sources config and home root resolution the scan paths use.
+fn identity_for_watch_root(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    connector: &str,
+    root: &ScanRoot,
+) -> IngestIdentity {
+    let (_, mut metas) = build_scan_roots_with_meta(storage, data_dir);
+    for meta in home_root_metas(connector) {
+        metas.insert(meta);
+    }
+    ingest_identity_for_root(root, &metas)
+}
+
+/// PR8 C3 (spec hard constraint 12): the ingest identity of a scan root, read
+/// from the `ScanRootMeta` `build_scan_roots_with_meta` built for it.
+///
+/// A root with no meta -- a connector outside claude_code / codex, or the
+/// built-in `data_dir` root -- keeps the transitional `local`/`local`, with a
+/// warning: silently inventing an identity is how two machines' identically
+/// pathed sessions end up merged.
+pub fn ingest_identity_for_root(
+    root: &ScanRoot,
+    metas: &scan_root_meta::ScanRootMetaIndex,
+) -> IngestIdentity {
+    match metas.get_by_path(&root.path) {
+        Some(meta) => IngestIdentity::for_meta(meta),
+        None => {
+            tracing::warn!(
+                root = %root.path.display(),
+                "scan root has no ScanRootMeta; using the transitional local identity"
+            );
+            IngestIdentity::local()
+        }
+    }
 }
 
 /// Inject provenance metadata into a conversation from a scan root's origin.
@@ -15840,7 +17067,19 @@ pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRo
 /// so that persistence can extract and store the source_id.
 ///
 /// Part of P2.2 - provenance injection.
-fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
+///
+/// PR8 C2 adds `cass.identity` alongside it -- the `identity_host` that becomes
+/// part of the conversation dedup key, and the `root_id` that names the scan root
+/// in `merge_conflicts` entries. It is written here, in the same single place
+/// everything else about a conversation's provenance is written, and read back by
+/// `storage::sqlite` (`conversation_identity_host` / `conversation_root_id`). The
+/// whole `cass.identity` object is replaced on every call, exactly like
+/// `cass.origin`, so connector-authored metadata can never spoof it.
+fn inject_provenance(
+    conv: &mut NormalizedConversation,
+    origin: &Origin,
+    identity: &IngestIdentity,
+) {
     // Ensure metadata is an object
     if !conv.metadata.is_object() {
         conv.metadata = serde_json::json!({});
@@ -15855,6 +17094,13 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
             *cass = serde_json::json!({});
         }
         if let Some(cass_obj) = cass.as_object_mut() {
+            cass_obj.insert(
+                "identity".to_string(),
+                serde_json::json!({
+                    "identity_host": identity.identity_host,
+                    "root_id": identity.root_id
+                }),
+            );
             cass_obj.insert(
                 "origin".to_string(),
                 serde_json::json!({
@@ -16042,6 +17288,11 @@ fn refresh_run_counters_in_stats(opts: &IndexOptions) {
         let (capture_na, capture_failed) = last_index_capture_counters_snapshot();
         stats.capture_na = capture_na;
         stats.capture_failed = capture_failed;
+        // PR8 C6: same cycle boundary as the counters above, so a watch cycle
+        // that resolves a missing root stops reporting it.
+        let (scan_roots_missing, sources_config_error) = last_index_configured_source_snapshot();
+        stats.scan_roots_missing = scan_roots_missing;
+        stats.sources_config_error = sources_config_error;
     }
 }
 
@@ -16061,6 +17312,54 @@ pub(crate) fn last_index_capture_counters_snapshot() -> (u64, u64) {
     )
 }
 
+/// PR8 C6 (spec S5 / hard constraint 13): the configured scan roots this run
+/// skipped, and the `sources.toml` load failure that made it skip all of them.
+///
+/// Statics with a `record_*` / snapshot pair and the same
+/// [`reset_last_index_run_counters`] run boundary as `CAPTURE_NA` /
+/// `CAPTURE_FAILED` above, and for the same reason: the meta writer
+/// ([`persist_last_index_run_meta_counters`]) has only a `FrankenStorage` and no
+/// `IndexOptions`, so a run-scoped value has to be reachable from a counter
+/// snapshot. The boundary is what keeps that honest -- without the reset at
+/// `run_index` entry, the next run in the same process would inherit this one's
+/// list.
+static SCAN_ROOTS_MISSING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static SOURCES_CONFIG_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record one configured scan root this run skipped because its path does not
+/// exist -- once per source, alongside the `warn!` that names it.
+fn record_scan_root_missing(name: &str) {
+    let mut missing = SCAN_ROOTS_MISSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !missing.iter().any(|seen| seen == name) {
+        missing.push(name.to_string());
+    }
+}
+
+/// Record that `sources.toml` failed to load for this run, so neither the run's
+/// own `--json` report nor `status --json` has to re-derive it.
+fn record_sources_config_error(error: &str) {
+    *SOURCES_CONFIG_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+}
+
+/// This run's configured-source observability facts (PR8 C6): the names of the
+/// configured roots that were missing, and the config load failure if there was
+/// one.
+pub(crate) fn last_index_configured_source_snapshot() -> (Vec<String>, Option<String>) {
+    let missing = SCAN_ROOTS_MISSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let error = SOURCES_CONFIG_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (missing, error)
+}
+
 /// Reset all three run-level counters. Call at `run_index` entry and at the
 /// start of each watch cycle -- "each cycle = one run" per mission #116⑥.
 pub(crate) fn reset_last_index_run_counters() {
@@ -16069,6 +17368,15 @@ pub(crate) fn reset_last_index_run_counters() {
     EVENT_ALIGN_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
     CAPTURE_NA.store(0, std::sync::atomic::Ordering::Relaxed);
     CAPTURE_FAILED.store(0, std::sync::atomic::Ordering::Relaxed);
+    // PR8 C6: the configured-source facts are per-run too, so they share this
+    // boundary rather than accumulating across a watch process' cycles.
+    SCAN_ROOTS_MISSING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+    *SOURCES_CONFIG_ERROR
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     // R2-N7 (任务书 #129): the per-session detail list is the counter's
     // detail side, so it shares the counter's run boundary.
     EVENT_ALIGN_FAILURES
@@ -16422,13 +17730,14 @@ fn prepare_conversation_for_ingest(
     connector_name: &str,
     connector: &(dyn crate::connectors::Connector + Send),
     origin: &Origin,
+    identity: &IngestIdentity,
     workspace_rewrite_root: Option<&ScanRoot>,
     source_kind: CaptureSourceKind,
     mut conv: NormalizedConversation,
 ) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
     use crate::indexer::exclusion::{PrepareError, PreparedConversation};
 
-    inject_provenance(&mut conv, origin);
+    inject_provenance(&mut conv, origin, identity);
     canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(&mut conv, root);
@@ -16500,30 +17809,24 @@ fn prepare_conversation_for_ingest(
         let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
         let reparsed_conversations =
             connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
-        // R1-N5 safety dependency (R-E-34, control-plane 核实 2026-09-07):
-        // the identity check below is only safe for a genuinely-unchanged
-        // file because of an invariant that lives ELSEWHERE --
-        // `materialize_capture_to_scratch` (via `materialize_sealed_blob`'s
-        // `rebuild_relative_shape(canonical_original_path)`,
-        // `phase3_restore.rs:2164/:2250`) reconstructs the scratch copy's
-        // ancestor directory shape purely from the ORIGINAL file's own real
-        // path (`agent`/`Origin::ClaudeCode` at `:2493` is an inert
-        // placeholder there, documented not to participate in path
-        // reconstruction). Both connectors wired into this crate derive
-        // `external_id` as a pure function of that reconstructed shape --
-        // codex: `source_path.strip_prefix(&sessions_dir)` (pinned
-        // `codex.rs:704-717`); claude_code: `projects_root_for_explicit_
-        // file` (pinned `claude_code.rs:453-458`) -- neither depends on
-        // `ctx.scan_roots`, timestamps, or scan order, so this reparse's id
-        // matches the first parse's id byte-for-byte for either connector.
-        // If shape reconstruction is ever changed to key off anything OTHER
-        // than the original file's own path (e.g. connector/agent kind),
-        // this check will start rejecting every real session of the
-        // affected connector as `CaptureFailed`, with nothing in the error
-        // message pointing back to this dependency -- confirmed NOT
-        // currently the case, but the failure mode is silent and total if
-        // it ever becomes one, hence written down here rather than only at
-        // the definition of `rebuild_relative_shape` itself.
+        // R1-N5 safety dependency (R-E-34, control-plane 核实 2026-09-07;
+        // layout updated by PR8 C4): the identity check below is only safe for
+        // a genuinely-unchanged file because `materialize_capture_to_scratch`
+        // lays the scratch copy out so that the connector root survives. For
+        // claude_code / codex the manifest records `shape_root` (`projects` /
+        // `sessions`) and the path relative to it, and the copy lands at
+        // `<scratch>/<identity_host>/<agent>/<shape_root>/<relative_path>`;
+        // every other connector keeps the baseline full original-path shape.
+        // Both connectors derive `external_id` as a pure function of the path
+        // below the nearest such root -- codex: `sessions_dir_for_explicit_file`
+        // + `strip_prefix` (pinned `codex.rs:95-101`, `:704-717`); claude_code:
+        // `projects_root_for_explicit_file` (pinned `claude_code.rs:143-150`,
+        // `:453-458`) -- neither depends on `ctx.scan_roots`, timestamps, or
+        // scan order, so this reparse's id matches the first parse's id
+        // byte-for-byte. If the layout ever drops the connector root, this
+        // check starts rejecting every real session of the affected connector
+        // as `CaptureFailed`, with nothing in the error message pointing back
+        // to this dependency -- hence written down here.
         let mut reparsed = if reparsed_conversations.len() == 1 {
             let candidate = reparsed_conversations.into_iter().next().expect("len checked above");
             // R1-N5 (任务书 #118b): the single-session branch used to accept
@@ -16548,6 +17851,16 @@ fn prepare_conversation_for_ingest(
                 .find(|c| c.agent_slug == original_agent_slug && c.external_id == original_external_id)
                 .ok_or_else(|| PrepareError("reparse produced no session matching the first parse's agent/external_id".to_string()))?
         };
+        // PR8 C4: the manifest's session key (which picked the materialized
+        // layout above) must also be the first parse's identity. Adds a
+        // rejection only; manifests without a session key pass as before.
+        crate::phase3_restore::ensure_manifest_session_key_matches(
+            data_dir,
+            record,
+            &original_agent_slug,
+            original_external_id.as_deref(),
+        )
+        .map_err(|e| PrepareError(format!("reparse manifest key: {e:#}")))?;
 
         // Provenance from the first parse, not re-derived from the scratch
         // path (Global Constraints/plan Task 2 Interfaces).
@@ -16556,7 +17869,9 @@ fn prepare_conversation_for_ingest(
         // parse's FINAL value, not whatever the connector derived scanning
         // the scratch copy.
         reparsed.workspace = original_workspace.clone();
-        inject_provenance(&mut reparsed, origin);
+        // Same identity as the first parse: the reparse of a captured copy is
+        // the same session from the same root, never a second identity.
+        inject_provenance(&mut reparsed, origin, identity);
         canonicalize_claude_external_id(connector_name, &mut reparsed);
         // R2-N2 (任务书 #119c): carry the first parse's rewrite provenance
         // forward directly -- do NOT call `apply_workspace_rewrite` again
@@ -16668,6 +17983,7 @@ fn prepare_conversation_for_ingest(
 pub(crate) fn prepare_conversation_for_restore(
     connector_name: &str,
     origin: &Origin,
+    identity: &IngestIdentity,
     workspace_rewrite_root: Option<&ScanRoot>,
     sealed_source_size_bytes: u64,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
@@ -16676,7 +17992,13 @@ pub(crate) fn prepare_conversation_for_restore(
 ) -> Result<crate::indexer::exclusion::PreparedConversation, crate::indexer::exclusion::PrepareError> {
     use crate::indexer::exclusion::PrepareError;
 
-    inject_provenance(&mut conv, origin);
+    // PR8 C3: restore replays a capture that already recorded which machine
+    // produced the session, so its identity comes from the manifest rather
+    // than from a scan root: `IngestIdentity::for_manifest` on the consumed
+    // manifest's `identity_host` (C4's column), falling back to `local` for a
+    // manifest written before that column existed. The caller passes it in --
+    // a projection with no manifest of its own passes `local`.
+    inject_provenance(&mut conv, origin, identity);
     canonicalize_claude_external_id(connector_name, &mut conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(&mut conv, root);
@@ -16800,15 +18122,21 @@ fn capture_discovered_source_file_before_parse(
         return;
     }
 
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider,
-        source_id: &source.origin.source_id,
-        origin_kind: source.origin.kind.as_str(),
-        origin_host: source.origin.host.as_deref(),
-        source_path: &source.source_path,
-        db_links: &[],
-    }) {
+    match crate::raw_mirror::capture_source_file_with_identity(
+        crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider,
+            source_id: &source.origin.source_id,
+            origin_kind: source.origin.kind.as_str(),
+            origin_host: source.origin.host.as_deref(),
+            source_path: &source.source_path,
+            db_links: &[],
+        },
+        crate::raw_mirror::RawMirrorSessionIdentity {
+            identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: None,
+        },
+    ) {
         Ok(record) => {
             tracing::debug!(
                 provider,
@@ -16965,15 +18293,21 @@ fn capture_scan_root_file_before_parse(
     ) {
         return;
     }
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider,
-        source_id: &root.origin.source_id,
-        origin_kind: root.origin.kind.as_str(),
-        origin_host: root.origin.host.as_deref(),
-        source_path: &root.path,
-        db_links: &[],
-    }) {
+    match crate::raw_mirror::capture_source_file_with_identity(
+        crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider,
+            source_id: &root.origin.source_id,
+            origin_kind: root.origin.kind.as_str(),
+            origin_host: root.origin.host.as_deref(),
+            source_path: &root.path,
+            db_links: &[],
+        },
+        crate::raw_mirror::RawMirrorSessionIdentity {
+            identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: None,
+        },
+    ) {
         Ok(record) => {
             tracing::debug!(
                 provider,
@@ -17007,15 +18341,21 @@ fn attach_raw_mirror_capture(
 ) -> anyhow::Result<crate::raw_mirror::RawMirrorCaptureRecord> {
     let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
     let db_link = raw_mirror_db_link_for_conversation(conv);
-    let record = crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider: &conv.agent_slug,
-        source_id: &source_id,
-        origin_kind: &origin_kind,
-        origin_host: origin_host.as_deref(),
-        source_path: &conv.source_path,
-        db_links: std::slice::from_ref(&db_link),
-    })?;
+    let record = crate::raw_mirror::capture_source_file_with_identity(
+        crate::raw_mirror::RawMirrorCaptureInput {
+            data_dir,
+            provider: &conv.agent_slug,
+            source_id: &source_id,
+            origin_kind: &origin_kind,
+            origin_host: origin_host.as_deref(),
+            source_path: &conv.source_path,
+            db_links: std::slice::from_ref(&db_link),
+        },
+        crate::raw_mirror::RawMirrorSessionIdentity {
+            identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+            external_id: conv.external_id.as_deref(),
+        },
+    )?;
     attach_raw_mirror_metadata(conv, &record);
     tracing::debug!(
         agent = %conv.agent_slug,
@@ -17293,6 +18633,78 @@ pub mod persist {
         /// connector's scan must report a skipped session, so callers turn
         /// each of these into a `ScanError`.
         pub skipped_conversations: Vec<crate::storage::sqlite::BatchSkippedConversation>,
+        /// PR8 C8: what happened to every conversation in the batch, as
+        /// `(position in the caller's slice, outcome)`. The aggregate
+        /// counters above cannot answer "what happened to THIS session",
+        /// which is the question the per-session `scan_session` line exists
+        /// to answer. Filled by both persist paths so the common exit can
+        /// emit one line per conversation without knowing which path ran.
+        pub per_conversation: Vec<(usize, ScanSessionOutcome)>,
+    }
+
+    /// PR8 C8: one conversation's ingest result, as reported by the
+    /// `scan_session` line. The four ingest outcomes the T6B ledger asked
+    /// for; nothing else is inferred from them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ScanSessionOutcome {
+        /// The conversation row was created by this batch.
+        Inserted,
+        /// The conversation already existed and this batch appended at least
+        /// one new message to it.
+        Merged,
+        /// The conversation already existed and this batch added nothing --
+        /// a re-scan of an unchanged session.
+        SkippedDuplicate,
+        /// The batch refused this conversation (see `skipped_conversations`);
+        /// the rest of the batch still committed.
+        Error,
+    }
+
+    impl ScanSessionOutcome {
+        pub(super) fn as_str(self) -> &'static str {
+            match self {
+                Self::Inserted => "inserted",
+                Self::Merged => "merged",
+                Self::SkippedDuplicate => "skipped_duplicate",
+                Self::Error => "error",
+            }
+        }
+    }
+
+    /// `conversation_inserted` is true only when this batch created the
+    /// conversation row; the message count separates "appended" from
+    /// "already complete".
+    fn scan_session_outcome(outcome: &crate::storage::sqlite::InsertOutcome) -> ScanSessionOutcome {
+        if outcome.conversation_inserted {
+            ScanSessionOutcome::Inserted
+        } else if outcome.inserted_indices.is_empty() {
+            ScanSessionOutcome::SkippedDuplicate
+        } else {
+            ScanSessionOutcome::Merged
+        }
+    }
+
+    /// PR8 C8: one machine-readable line per conversation the ingest
+    /// touched, on the `cass::scan_session` target. Until now the only
+    /// per-session evidence was aggregate counters, so "which session went
+    /// missing" needed a DB diff. `bytes` is the source file size.
+    fn emit_scan_session(
+        agent_slug: &str,
+        external_id: Option<&str>,
+        source_path: &Path,
+        outcome: ScanSessionOutcome,
+    ) {
+        let bytes = std::fs::metadata(source_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        tracing::info!(
+            target: "cass::scan_session",
+            agent = %agent_slug,
+            external_id = %external_id.unwrap_or_default(),
+            bytes,
+            outcome = outcome.as_str(),
+            "scan_session"
+        );
     }
 
     impl PersistBatchOutcome {
@@ -18006,11 +19418,17 @@ pub mod persist {
     ) -> bool {
         let mut seen = HashSet::new();
         for conv in convs {
-            let (source_id, _) = extract_provenance(&conv.metadata);
+            // PR8 C2: this pre-check decides whether a batch needs the serial
+            // fallback, so it must use the same key dimension the storage layer
+            // deduplicates on. Two roots of the same host produce one key (and
+            // fall back); the same external_id on two hosts produces two, and
+            // must not be mistaken for a duplicate.
+            let identity_host =
+                crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata);
             let key = if let Some(external_id) = conv.external_id.as_deref() {
                 (
                     conv.agent_slug.clone(),
-                    source_id,
+                    identity_host,
                     Some(external_id.to_owned()),
                     None,
                     conv.started_at,
@@ -18018,7 +19436,7 @@ pub mod persist {
             } else {
                 (
                     conv.agent_slug.clone(),
-                    source_id,
+                    identity_host,
                     None,
                     Some(conv.source_path.to_string_lossy().to_string()),
                     None,
@@ -18171,7 +19589,10 @@ pub mod persist {
 
         let mut batch_outcome = PersistBatchOutcome::default();
 
-        for (_idx, outcome) in ordered {
+        for (idx, outcome) in ordered {
+            batch_outcome
+                .per_conversation
+                .push((idx, scan_session_outcome(&outcome)));
             batch_outcome.record_insert_outcome(&outcome);
             if capture_semantic_delta {
                 let (inputs, max_message_id) =
@@ -18392,6 +19813,44 @@ pub mod persist {
         )
     }
 
+    /// PR8 C2 test seam: persist already-scanned conversations through the real
+    /// dispatcher and report `(inserted_conversations, inserted_messages)`.
+    ///
+    /// [`persist_conversations_batched_inner`] is the single decision point for
+    /// the serial vs begin-concurrent write paths, and spec hard constraint 2
+    /// requires **both** of them to write `identity_host`. It is `pub(super)` and
+    /// takes `pub(crate)` types, so a black-box integration test cannot reach it
+    /// directly -- this follows the existing `set_prepare_fault_hook` precedent of
+    /// a `#[doc(hidden)] pub` seam. It adds no behavior of its own: same
+    /// dispatcher, same feature set, and the `CASS_INDEXER_BEGIN_CONCURRENT`
+    /// read happens inside `persist_conversations_batched_inner` as usual.
+    #[doc(hidden)]
+    pub fn persist_normalized_conversations_for_tests(
+        storage: &FrankenStorage,
+        data_dir: &Path,
+        convs: Vec<NormalizedConversation>,
+    ) -> Result<(usize, usize)> {
+        let prepared: Vec<crate::indexer::exclusion::PreparedConversation> = convs
+            .into_iter()
+            .map(|conv| {
+                let excluded = vec![None; conv.messages.len()];
+                crate::indexer::exclusion::PreparedConversation { conv, excluded }
+            })
+            .collect();
+        let outcome = persist_conversations_batched_inner(
+            storage,
+            &prepared,
+            LexicalPopulationStrategy::IncrementalInline,
+            false,
+            false,
+            Some(data_dir),
+        )?;
+        Ok((
+            outcome.inserted_conversations,
+            outcome.inserted_messages,
+        ))
+    }
+
     pub(super) fn persist_conversations_batched_with_raw_mirror_links(
         storage: &FrankenStorage,
         data_dir: &Path,
@@ -18426,7 +19885,40 @@ pub mod persist {
         )
     }
 
+    /// PR8 C8: the exit both persist paths share. The serial path and the
+    /// begin-concurrent path each fill `PersistBatchOutcome::per_conversation`
+    /// in their own shape; emitting here means one `scan_session` line per
+    /// conversation without either path having to know about telemetry.
     fn persist_conversations_batched_inner(
+        storage: &FrankenStorage,
+        convs: &[crate::indexer::exclusion::PreparedConversation],
+        lexical_strategy: LexicalPopulationStrategy,
+        defer_checkpoints: bool,
+        capture_semantic_delta: bool,
+        raw_mirror_data_dir: Option<&Path>,
+    ) -> Result<PersistBatchOutcome> {
+        let outcome = persist_conversations_batched_inner_impl(
+            storage,
+            convs,
+            lexical_strategy,
+            defer_checkpoints,
+            capture_semantic_delta,
+            raw_mirror_data_dir,
+        )?;
+        for (index, result) in &outcome.per_conversation {
+            if let Some(prepared) = convs.get(*index) {
+                emit_scan_session(
+                    &prepared.conv.agent_slug,
+                    prepared.conv.external_id.as_deref(),
+                    &prepared.conv.source_path,
+                    *result,
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn persist_conversations_batched_inner_impl(
         storage: &FrankenStorage,
         convs: &[crate::indexer::exclusion::PreparedConversation],
         lexical_strategy: LexicalPopulationStrategy,
@@ -18594,6 +20086,24 @@ pub mod persist {
         let skipped_positions: std::collections::HashSet<usize> =
             skipped_conversations.iter().map(|skip| skip.index).collect();
         batch_outcome.skipped_conversations = skipped_conversations;
+        // PR8 C8: pair every conversation with its own result. `outcomes`
+        // covers only the conversations the batch accepted (see the
+        // positional contract just above), so walk `convs` and consume
+        // `outcomes` in the same order, marking the skipped ones as errors.
+        {
+            let mut accepted = outcomes.iter();
+            for index in 0..convs.len() {
+                let result = if skipped_positions.contains(&index) {
+                    ScanSessionOutcome::Error
+                } else {
+                    match accepted.next() {
+                        Some(insert) => scan_session_outcome(insert),
+                        None => ScanSessionOutcome::Error,
+                    }
+                };
+                batch_outcome.per_conversation.push((index, result));
+            }
+        }
         record_persisted_raw_mirror_db_links(
             raw_mirror_data_dir,
             convs
@@ -20155,140 +21665,6 @@ pub mod persist {
             );
         }
 
-        #[test]
-        #[serial]
-        fn large_missing_incremental_scan_watermark_bootstraps_by_default() {
-            let _max_guard = set_env(
-                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
-                "8",
-            );
-            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("agent_search.db");
-            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
-            let opts =
-                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
-
-            let bootstrap = crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                &opts, false, 42, false, false, None,
-            )
-            .expect("large populated incremental run should bootstrap missing scan watermark");
-
-            assert_eq!(bootstrap.canonical_conversations, 42);
-            assert_eq!(bootstrap.db_size_bytes, 16);
-            assert_eq!(bootstrap.max_automatic_full_scan_db_size_bytes, 8);
-            assert_eq!(
-                bootstrap.reason,
-                crate::indexer::BOOTSTRAP_LARGE_INCREMENTAL_MISSING_WATERMARK_REASON
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn existing_or_small_missing_incremental_scan_watermark_keeps_full_scan_behavior() {
-            let _max_guard = set_env(
-                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
-                "1024",
-            );
-            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("agent_search.db");
-            std::fs::write(&db_path, b"tiny").unwrap();
-            let opts =
-                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
-
-            assert_eq!(
-                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                    &opts, false, 42, false, false, None,
-                ),
-                None
-            );
-            assert_eq!(
-                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                    &opts,
-                    false,
-                    42,
-                    false,
-                    false,
-                    Some(1_700_000_000_000),
-                ),
-                None
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn explicit_missing_watermark_full_scan_override_keeps_historical_rescan() {
-            let _max_guard = set_env(
-                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
-                "1",
-            );
-            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "1");
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("agent_search.db");
-            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
-            let opts =
-                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
-
-            assert_eq!(
-                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                    &opts, false, 42, false, false, None,
-                ),
-                None
-            );
-        }
-
-        #[test]
-        #[serial]
-        fn non_plain_missing_watermark_modes_keep_historical_scan_behavior() {
-            let _max_guard = set_env(
-                "CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN_MAX_DB_BYTES",
-                "1",
-            );
-            let _force_guard = set_env("CASS_INCREMENTAL_MISSING_WATERMARK_FULL_SCAN", "0");
-            let dir = tempfile::TempDir::new().unwrap();
-            let db_path = dir.path().join("agent_search.db");
-            std::fs::write(&db_path, b"0123456789abcdef").unwrap();
-            let base =
-                incremental_repair_policy_test_options(dir.path().to_path_buf(), db_path.clone());
-
-            let mut full = base.clone();
-            full.full = true;
-            assert_eq!(
-                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                    &full, false, 42, false, false, None,
-                ),
-                None
-            );
-
-            let mut force_rebuild = base.clone();
-            force_rebuild.force_rebuild = true;
-            assert_eq!(
-                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                    &force_rebuild,
-                    false,
-                    42,
-                    false,
-                    false,
-                    None,
-                ),
-                None
-            );
-
-            let mut watch_once = base;
-            watch_once.watch_once_paths = Some(vec![dir.path().join("session.jsonl")]);
-            assert_eq!(
-                crate::indexer::should_bootstrap_missing_incremental_scan_watermark(
-                    &watch_once,
-                    false,
-                    42,
-                    false,
-                    false,
-                    None,
-                ),
-                None
-            );
-        }
 
         #[test]
         fn deferred_incremental_authoritative_lexical_repair_is_reported_in_progress_stats() {
@@ -21960,7 +23336,7 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        inject_provenance(&mut conv, &Origin::local());
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
 
         attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
@@ -22679,7 +24055,7 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        inject_provenance(&mut conv, &Origin::local());
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
         attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
 
         let manifest_root = data_dir.join("raw-mirror/v1/manifests");
@@ -22735,7 +24111,7 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        inject_provenance(&mut conv, &Origin::local());
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
         attach_raw_mirror_capture(&data_dir, &mut conv).expect("capture should succeed");
         let manifest_relative = conv.metadata["cass"]["raw_mirror"]["manifest_relative_path"]
             .as_str()
@@ -22821,6 +24197,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
             vec![("codex", failing_explicit_file_root_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -26042,6 +27419,7 @@ mod tests {
             scan_ms: 1,
             is_discovered,
             scan_succeeded: true,
+            root_outcomes: Vec::new(),
         })
         .expect("done message should send");
     }
@@ -27330,6 +28708,7 @@ mod tests {
             scan_ms: 42,
             is_discovered: true,
             scan_succeeded: true,
+            root_outcomes: Vec::new(),
         })
         .unwrap();
         drop(tx);
@@ -27382,6 +28761,7 @@ mod tests {
             scan_ms: 42,
             is_discovered: true,
             scan_succeeded: false,
+            root_outcomes: Vec::new(),
         })
         .map_err(|_| anyhow::anyhow!("done message should send"))?;
         drop(tx);
@@ -27439,6 +28819,7 @@ mod tests {
             scan_ms: 42,
             is_discovered: true,
             scan_succeeded: true,
+            root_outcomes: Vec::new(),
         })
         .map_err(|_| anyhow::anyhow!("done message should send"))?;
         drop(tx);
@@ -29727,6 +31108,8 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 full_scan_source_ids: Arc::new(HashSet::new()),
+                local_root_plans: Arc::new(HashMap::new()),
+                scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -29807,6 +31190,7 @@ mod tests {
                 Some(Platform::Linux),
             )],
             vec![("claude", watermark_sensitive_remote_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -29886,6 +31270,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             vec![configured_local_scan_root(local_root_path)],
             vec![("claude", watermark_sensitive_remote_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -29930,6 +31315,7 @@ mod tests {
             LexicalPopulationStrategy::IncrementalInline,
             Vec::new(),
             vec![("claude", panic_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -29996,6 +31382,7 @@ mod tests {
                 Some(Platform::Linux),
             )],
             vec![("claude", watermark_sensitive_remote_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -30076,6 +31463,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             vec![configured_local_scan_root(local_root_path)],
             vec![("claude", watermark_sensitive_remote_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -30128,6 +31516,7 @@ mod tests {
                 LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
                 Vec::new(),
                 vec![("codex", failing_explicit_file_root_connector_factory)],
+                &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
                 FrankenStorage::now_millis(),
                 None,
                 &SharedActiveSessionSourceSkips::default(),
@@ -30209,6 +31598,7 @@ mod tests {
             LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
             Vec::new(),
             vec![("codex", deferred_batch_connector_factory)],
+            &crate::indexer::scan_root_meta::ScanRootMetaIndex::new(),
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
@@ -30286,6 +31676,8 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 full_scan_source_ids: Arc::new(HashSet::new()),
+                local_root_plans: Arc::new(HashMap::new()),
+                scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -30355,6 +31747,8 @@ mod tests {
                 since_ts: None,
                 local_since_ts_by_connector: Arc::new(HashMap::new()),
                 full_scan_source_ids: Arc::new(HashSet::new()),
+                local_root_plans: Arc::new(HashMap::new()),
+                scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -34872,12 +36266,87 @@ mod tests {
         assert!(conv.metadata.get("cass").is_none());
 
         let origin = Origin::local();
-        inject_provenance(&mut conv, &origin);
+        inject_provenance(&mut conv, &origin, &IngestIdentity::local());
 
         let cass = conv.metadata.get("cass").expect("cass field should exist");
         let origin_obj = cass.get("origin").expect("origin should exist");
         assert_eq!(origin_obj.get("source_id").unwrap().as_str(), Some("local"));
         assert_eq!(origin_obj.get("kind").unwrap().as_str(), Some("local"));
+
+        // PR8 C2: the identity carrier rides alongside, and the storage layer
+        // reads it back to the same value (single definition of the shape).
+        let identity_obj = cass.get("identity").expect("cass.identity should exist");
+        assert_eq!(identity_obj.get("identity_host").unwrap().as_str(), Some("local"));
+        assert_eq!(identity_obj.get("root_id").unwrap().as_str(), Some("local"));
+        assert_eq!(
+            crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata),
+            "local"
+        );
+    }
+
+    /// PR8 C2: the transitional identity hook is the single place C3 will edit,
+    /// so pin its C2 contract -- every root resolves to `local`/`local`, and a
+    /// `ScanRoot` is genuinely not consulted yet.
+    #[test]
+    fn ingest_identity_for_root_falls_back_to_local_without_meta() {
+        let root = ScanRoot::local(std::path::PathBuf::from("/some/scan/root"));
+        let identity = ingest_identity_for_root(&root, &scan_root_meta::ScanRootMetaIndex::new());
+        assert_eq!(identity.identity_host, "local");
+        assert_eq!(identity.root_id, "local");
+
+        // PR8 C3: with a `ScanRootMeta` for the root, the identity is the
+        // root's -- `origin_host` from the source config (or `local` for a
+        // home root) and the derived `root_id`.
+        let mut metas = scan_root_meta::ScanRootMetaIndex::new();
+        metas.insert(scan_root_meta::ScanRootMeta {
+            root_id: "cfg:ivanmac:0123456789abcdef".to_string(),
+            origin_host: "ivanmac".to_string(),
+            readonly: false,
+            canonical_path: std::path::PathBuf::from("/some/scan/root"),
+            source_name: "ivanmac".to_string(),
+            watermarks_enabled: true,
+        });
+        let identity = ingest_identity_for_root(&root, &metas);
+        assert_eq!(identity.identity_host, "ivanmac");
+        assert_eq!(identity.root_id, "cfg:ivanmac:0123456789abcdef");
+
+        // The carrier path storage actually reads is what `inject_provenance`
+        // writes, so a round trip through both must agree.
+        let mut conv = norm_conv(Some("identity-roundtrip"), vec![norm_msg(0, 10)]);
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity {
+            identity_host: "ivanmac".to_string(),
+            root_id: "root-ivanmac".to_string(),
+        });
+        assert_eq!(
+            crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata),
+            "ivanmac"
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/identity/root_id").and_then(serde_json::Value::as_str),
+            Some("root-ivanmac")
+        );
+    }
+
+    /// PR8 C2: `cass.identity` is *replaced*, never merged, so connector-authored
+    /// metadata cannot spoof the identity a conversation is deduplicated under.
+    #[test]
+    fn inject_provenance_overwrites_a_connector_authored_identity() {
+        let mut conv = norm_conv(Some("spoofed-identity"), vec![norm_msg(0, 10)]);
+        conv.metadata = serde_json::json!({
+            "cass": {"identity": {"identity_host": "ivanmac", "root_id": "spoofed"}}
+        });
+
+        inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
+
+        assert_eq!(
+            crate::storage::sqlite::conversation_identity_host_from_metadata(&conv.metadata),
+            "local",
+            "a connector-supplied identity must be overwritten, not honored"
+        );
+        assert_eq!(
+            conv.metadata.pointer("/cass/identity/root_id").and_then(serde_json::Value::as_str),
+            Some("local")
+        );
     }
 
     #[test]
@@ -34885,7 +36354,7 @@ mod tests {
         let mut conv = norm_conv(Some("test"), vec![norm_msg(0, 100)]);
 
         let origin = Origin::remote_with_host("laptop", "user@laptop.local");
-        inject_provenance(&mut conv, &origin);
+        inject_provenance(&mut conv, &origin, &IngestIdentity::local());
 
         let cass = conv.metadata.get("cass").expect("cass field should exist");
         let origin_obj = cass.get("origin").expect("origin should exist");
@@ -34909,7 +36378,7 @@ mod tests {
         });
 
         let origin = Origin::remote_with_host("laptop", "user@laptop.local");
-        inject_provenance(&mut conv, &origin);
+        inject_provenance(&mut conv, &origin, &IngestIdentity::local());
 
         assert_eq!(
             conv.metadata.pointer("/other"),
@@ -35266,6 +36735,7 @@ mod tests {
                 "codex",
                 &connector,
                 &Origin::local(),
+                &IngestIdentity::local(),
                 None,
                 CaptureSourceKind::File(source_path.to_path_buf()),
                 conv,
@@ -35357,7 +36827,7 @@ mod tests {
                 let mut conv = norm_conv(Some(&format!("r3-n5-{label}")), vec![norm_msg(0, 1_000)]);
                 conv.agent_slug = "codex".to_string();
                 conv.source_path = source_path;
-                inject_provenance(&mut conv, &Origin::local());
+                inject_provenance(&mut conv, &Origin::local(), &IngestIdentity::local());
                 attach_raw_mirror_capture(&data_dir, &mut conv).expect("raw-mirror capture");
                 let marker = illegal.then(|| ExcludedMarker {
                     reason: ExclusionReason::CassRecall,
@@ -35508,6 +36978,7 @@ mod tests {
             "codex",
             &codex_connector,
             &Origin::local(),
+            &IngestIdentity::local(),
             None,
             CaptureSourceKind::Logical,
             conv,
@@ -35562,7 +37033,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         // R1-N5 (任务书 #118b) explicit coverage: this is the real codex
@@ -35617,7 +37088,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), Some(&root), source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         assert_eq!(
@@ -35668,7 +37139,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), Some(&root), source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), Some(&root), source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         assert_eq!(
@@ -35718,7 +37189,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let err = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+        let err = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv)
             .expect_err("a first-parse identity that the reparse doesn't reproduce must be rejected, not silently accepted");
         assert!(
             err.0.contains("reparse identity mismatch"),
@@ -35756,7 +37227,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv)
+        let prepared = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv)
             .expect("prepare should succeed against a real, parseable codex fixture");
 
         assert_eq!(
@@ -35816,7 +37287,7 @@ mod tests {
 
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
-        let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), None, source_kind, conv);
+        let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv);
 
         unsafe {
             match &prior_xdg {
@@ -36079,6 +37550,7 @@ mod tests {
             "opencode",
             &codex_connector,
             &Origin::local(),
+            &IngestIdentity::local(),
             None,
             CaptureSourceKind::Logical,
             logical_conv,
@@ -36095,6 +37567,7 @@ mod tests {
             "codex",
             &codex_connector,
             &Origin::local(),
+            &IngestIdentity::local(),
             None,
             CaptureSourceKind::File(missing),
             failing_conv,
@@ -37292,15 +38765,30 @@ mod tests {
     }
 
     #[test]
-    fn persist_final_index_run_metadata_updates_last_scan_ts_and_last_indexed_at_together() {
+    /// PR8 C3 (spec 推荐默认 / AC-7): a scan that ran to completion still
+    /// records `last_indexed_at`, and no longer writes the legacy global
+    /// `last_scan_ts` -- schema 7 keeps that value only for older readers
+    /// (`status --json`'s staleness comparison), and progress lives in the
+    /// per-`(root_id, connector)` rows now.
+    fn persist_final_index_run_metadata_writes_last_indexed_at_but_not_the_legacy_scan_ts() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("agent_search.db");
         let storage = FrankenStorage::open(&db_path).unwrap();
 
         persist_final_index_run_metadata(&storage, &db_path, true, 123, 456, false).unwrap();
 
-        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(123));
+        assert_eq!(
+            storage.get_last_scan_ts().unwrap(),
+            None,
+            "schema 7 must not write the legacy global scan watermark"
+        );
         assert_eq!(storage.get_last_indexed_at().unwrap(), Some(456));
+
+        // A value written by an older binary stays readable and untouched.
+        storage.set_last_scan_ts(99).unwrap();
+        persist_final_index_run_metadata(&storage, &db_path, true, 123, 457, false).unwrap();
+        assert_eq!(storage.get_last_scan_ts().unwrap(), Some(99));
+        assert_eq!(storage.get_last_indexed_at().unwrap(), Some(457));
     }
 
     #[test]

@@ -958,7 +958,7 @@ mod tests {
         let mut f = std::fs::File::create(&ok_path).expect("create ok");
         writeln!(
             f,
-            "[[sources]]\nname = \"laptop\"\ntype = \"ssh\"\nhost = \"me@laptop\"\npaths = [\"~/.claude/projects\"]"
+            "[[sources]]\nname = \"laptop\"\ntype = \"ssh\"\nhost = \"me@laptop\"\norigin_host = \"laptop\"\npaths = [\"~/.claude/projects\"]"
         )
         .expect("write ok");
         drop(f);

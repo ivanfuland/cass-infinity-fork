@@ -354,7 +354,7 @@ fn remote_source_is_named_but_not_contacted_without_live() {
     let config_dir = home.path().join("xdg-config").join("cass");
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     let sources_toml = config_dir.join("sources.toml");
-    let toml = "[[sources]]\nname = \"deferred-host\"\ntype = \"ssh\"\nhost = \"nobody@deferred.invalid\"\npaths = [\"~/.claude/projects\"]\n";
+    let toml = "[[sources]]\nname = \"deferred-host\"\ntype = \"ssh\"\nhost = \"nobody@deferred.invalid\"\norigin_host = \"deferred-host\"\npaths = [\"~/.claude/projects\"]\n";
     std::fs::write(&sources_toml, toml).expect("write sources.toml");
     let before = std::fs::read(&sources_toml).expect("read sources.toml before");
 

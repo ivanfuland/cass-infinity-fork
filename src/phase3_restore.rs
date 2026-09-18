@@ -2204,6 +2204,86 @@ fn rebuild_relative_shape(canonical_original_path: &str) -> Result<PathBuf, Proj
 /// 2. **落盘后**回读 `metadata().len()` 再比一次 —— 防的是短写（`ENOSPC`、被截断）。
 ///    只比入参不比产物，等于把「写成功了」当成「写全了」，正是七类矩阵 E-1
 ///    「短读 / 部分读当完整」的写侧同构。
+/// PR8 C4：`identity_host` 的合法取值 `^[A-Za-z0-9._-]{1,64}$`（spec 硬约束 8）。
+pub fn is_valid_identity_host(identity_host: &str) -> bool {
+    is_safe_shape_component(identity_host)
+}
+
+fn is_safe_shape_component(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && value != "."
+        && value != ".."
+}
+
+/// PR8 C4：把 claude_code / codex 的原始路径拆成 `(连接器根目录名, 相对该根的部分)`。
+///
+/// 两家从显式文件往上找**最近的**同名祖先当 `external_id` 的根（FAD pin
+/// `claude_code.rs::projects_root_for_explicit_file` 找 `projects`、
+/// `codex.rs::sessions_dir_for_explicit_file` 找 `sessions`），`external_id` 是相对该根的
+/// 路径形状。物化时只要保留 `<根名>/<相对部分>`，reparse 出的 `external_id` 就不变。
+/// 这里取同一个「最近祖先」，文件自身不算祖先。与 [`rebuild_relative_shape`] 不同，本函数
+/// 只做词法拆分、不拒 `..`——拒绝在 [`mirror_shape_relative_path`] 做，capture 记下原样。
+///
+/// 其它 agent、找不到根、或相对部分不是 UTF-8 时返回 `None`（走基线原路径形状）。
+pub fn split_connector_shape(agent: &str, original_path: &Path) -> Option<(String, PathBuf)> {
+    let root_name = match agent {
+        "claude_code" => "projects",
+        "codex" => "sessions",
+        _ => return None,
+    };
+    let components: Vec<Component<'_>> = original_path.components().collect();
+    let file_index = components.len().checked_sub(1)?;
+    let root_index = components[..file_index].iter().rposition(|component| {
+        matches!(component, Component::Normal(name) if *name == std::ffi::OsStr::new(root_name))
+    })?;
+    let relative: PathBuf = components[root_index + 1..].iter().collect();
+    relative.to_str()?;
+    Some((root_name.to_string(), relative))
+}
+
+/// PR8 C4：新布局下物化文件相对 dest 的路径 `<identity_host>/<agent>/<shape_root>/<relative_path>`。
+///
+/// 路径编码必须落在 dest 之内（spec 硬约束 8）：前三段各是一个合法分量，`relative_path`
+/// 只许有普通分量（拒 `..`、绝对前缀、空）。manifest 可能被改过，所以物化时每次都判，
+/// 不信 capture 时写进去的值。
+pub fn mirror_shape_relative_path(
+    identity_host: &str,
+    agent: &str,
+    shape_root: &str,
+    relative_path: &str,
+) -> Result<PathBuf, ProjectionFault> {
+    let unsafe_shape = |detail: String| ProjectionFault::UnsafeOriginalPath {
+        detail: format!("E-MIRROR-SHAPE-ESCAPE: {detail}"),
+    };
+    if !is_valid_identity_host(identity_host) {
+        return Err(unsafe_shape(format!(
+            "identity_host {identity_host:?} does not match ^[A-Za-z0-9._-]{{1,64}}$"
+        )));
+    }
+    for (field, value) in [("agent", agent), ("shape_root", shape_root)] {
+        if !is_safe_shape_component(value) {
+            return Err(unsafe_shape(format!("{field} {value:?} is not a single safe component")));
+        }
+    }
+    let relative = Path::new(relative_path);
+    if relative_path.is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(unsafe_shape(format!(
+            "relative_path {relative_path:?} must be non-empty and contain only normal components"
+        )));
+    }
+    Ok(Path::new(identity_host)
+        .join(agent)
+        .join(shape_root)
+        .join(relative))
+}
+
 /// R-E-84 (c) 的写后前缀断言，**单独一个函数**是为了能被直接进入。
 ///
 /// 这一格只有在 (a) 漏判时才会被走到（(a) 逐分量拒 symlink，正常形态到不了这里），
@@ -2244,6 +2324,15 @@ fn hard_link_count(_meta: &std::fs::Metadata) -> u64 {
     1
 }
 
+/// 物化目标已存在时怎么办。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingTargetPolicy {
+    /// 基线：截断重写（scratch 根每次新建或按 slot 复用）。
+    Overwrite,
+    /// PR8 C4 dest 物化：同 blob 跳过，不同 blob 报错、一个字节不动。
+    SkipIdenticalRefuseDifferent,
+}
+
 fn materialize_sealed_blob(
     scratch_root: &Path,
     input: &SealedSource<'_>,
@@ -2256,6 +2345,28 @@ fn materialize_sealed_blob(
         });
     }
     let relative = rebuild_relative_shape(input.canonical_original_path)?;
+    materialize_blob_at_relative(
+        scratch_root,
+        &relative,
+        input.blob,
+        input.source_size_bytes,
+        ExistingTargetPolicy::Overwrite,
+    )
+    .map(|(path, _skipped)| path)
+}
+
+/// [`materialize_sealed_blob`] 的落盘部分，按调用方给定的相对形状写。返回
+/// `(物化后的绝对路径, 是否因同 blob 已存在而跳过)`。
+///
+/// 逐分量 symlink / 非常规文件 / 硬链接预检与写后前缀断言对两种形状、两种策略**完全相同**；
+/// 已存在目标的策略判定排在预检之后，所以跳过分支同样拿不到 symlink 或硬链接目标。
+fn materialize_blob_at_relative(
+    scratch_root: &Path,
+    relative: &Path,
+    blob: &[u8],
+    source_size_bytes: u64,
+    existing_target: ExistingTargetPolicy,
+) -> Result<(PathBuf, bool), ProjectionFault> {
 
     // ── R-E-84 (a)：逐分量拒 symlink ────────────────────────────────────
     //
@@ -2348,7 +2459,33 @@ fn materialize_sealed_blob(
         }
     }
 
-    let target = canonical_root.join(&relative);
+    let target = canonical_root.join(relative);
+    if existing_target == ExistingTargetPolicy::SkipIdenticalRefuseDifferent
+        && std::fs::symlink_metadata(&target).is_ok()
+    {
+        // 上面的逐分量预检已经拒掉了 symlink、非常规文件与硬链接目标，走到这里的是
+        // 一个根内的普通文件。
+        let existing = std::fs::read(&target).map_err(|err| ProjectionFault::Materialize {
+            detail: format!("read existing {}: {err}", target.display()),
+        })?;
+        if blake3::hash(&existing) != blake3::hash(blob) {
+            return Err(ProjectionFault::Materialize {
+                detail: format!(
+                    "E-MIRROR-TARGET-CONFLICT: {} already holds different bytes (blake3 {}, \
+                     this capture is {}) — refusing to overwrite it",
+                    target.display(),
+                    blake3::hash(&existing).to_hex(),
+                    blake3::hash(blob).to_hex()
+                ),
+            });
+        }
+        let canonical_target =
+            std::fs::canonicalize(&target).map_err(|err| ProjectionFault::Materialize {
+                detail: format!("canonicalize existing {}: {err}", target.display()),
+            })?;
+        assert_materialized_inside_root(&canonical_root, &canonical_target)?;
+        return Ok((canonical_target, true));
+    }
     if let Some(parent) = target.parent() {
         create_private_dir_all(parent).map_err(|err| ProjectionFault::Materialize {
             detail: format!("create_dir_all {}: {err}", parent.display()),
@@ -2375,7 +2512,7 @@ fn materialize_sealed_blob(
         }
     }
 
-    write_private_scratch_file(&target, input.blob).map_err(|err| {
+    write_private_scratch_file(&target, blob).map_err(|err| {
         ProjectionFault::Materialize {
             detail: format!("write {}: {err}", target.display()),
         }
@@ -2397,13 +2534,13 @@ fn materialize_sealed_blob(
             detail: format!("stat back {}: {err}", canonical_target.display()),
         })?
         .len();
-    if written != input.source_size_bytes {
+    if written != source_size_bytes {
         return Err(ProjectionFault::SealedSizeMismatch {
-            manifest: input.source_size_bytes,
+            manifest: source_size_bytes,
             blob: written,
         });
     }
-    Ok(canonical_target)
+    Ok((canonical_target, false))
 }
 
 /// 一次封存投影的处置。
@@ -2474,6 +2611,143 @@ const fn connector_name_for(agent: Origin) -> &'static str {
     }
 }
 
+/// PR8 C4: result of [`materialize_capture_to_dest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorMaterializeOutcome {
+    /// The file was written at this path.
+    Written(PathBuf),
+    /// A file with the same bytes was already at this path; nothing written.
+    SkippedIdentical(PathBuf),
+}
+
+/// PR8 C4: materialize one capture under `dest`, laid out from its manifest.
+///
+/// A manifest with `shape_root` + `relative_path` (claude_code / codex) lands at
+/// `<dest>/<identity_host>/<agent>/<shape_root>/<relative_path>`, so two hosts
+/// sharing an `external_id` never share a path and the connector derives the
+/// same `external_id` from it. Any other manifest keeps the baseline
+/// original-path shape. The layout is read from the manifest, never re-derived
+/// here. An existing target with the same bytes is skipped, different bytes are
+/// refused untouched, and symlinked / hard-linked targets or ancestors are
+/// refused by the shared [`materialize_sealed_blob`] checks.
+pub fn materialize_capture_to_dest(
+    data_dir: &Path,
+    record: &crate::raw_mirror::RawMirrorCaptureRecord,
+    dest: &Path,
+) -> anyhow::Result<MirrorMaterializeOutcome> {
+    let capture = crate::raw_mirror::read_capture_for_reparse(data_dir, record)?;
+    let relative = match (&capture.shape_root, &capture.relative_path) {
+        (Some(shape_root), Some(relative_path)) => mirror_shape_relative_path(
+            &capture.identity_host,
+            &capture.agent,
+            shape_root,
+            relative_path,
+        ),
+        (None, None) => rebuild_relative_shape(&capture.original_path),
+        _ => Err(ProjectionFault::UnsafeOriginalPath {
+            detail: format!(
+                "E-MIRROR-SHAPE-ESCAPE: manifest {} records only one of shape_root / relative_path",
+                record.manifest_relative_path
+            ),
+        }),
+    }
+    .map_err(|fault| anyhow::anyhow!("{fault}"))?;
+    let (path, skipped) = materialize_blob_at_relative(
+        dest,
+        &relative,
+        &capture.blob,
+        capture.blob.len() as u64,
+        ExistingTargetPolicy::SkipIdenticalRefuseDifferent,
+    )
+    .map_err(|fault| anyhow::anyhow!("{fault}"))?;
+    Ok(if skipped {
+        MirrorMaterializeOutcome::SkippedIdentical(path)
+    } else {
+        MirrorMaterializeOutcome::Written(path)
+    })
+}
+
+/// PR8 C4: the session key a manifest carries for connector-shaped captures,
+/// `(identity_host, agent, external_id)`. `None` for everything else (other
+/// connectors, captures made before the key existed, or no `external_id`
+/// yet), which keeps the baseline path-based lookups.
+///
+/// Shared by restore's DB lookup ([`conversation_ids_for_session_key`]) and
+/// the indexer's reparse check ([`ensure_manifest_session_key_matches`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorSessionKey {
+    pub identity_host: String,
+    pub agent: String,
+    pub external_id: String,
+}
+
+fn mirror_session_key(
+    identity_host: &str,
+    agent: &str,
+    external_id: Option<&str>,
+    shape_root: Option<&str>,
+) -> Option<MirrorSessionKey> {
+    shape_root?;
+    Some(MirrorSessionKey {
+        identity_host: identity_host.to_string(),
+        agent: agent.to_string(),
+        external_id: external_id?.to_string(),
+    })
+}
+
+/// PR8 C3: the ingest identity a restore replays a capture with.
+///
+/// Restore has no `ScanRoot` -- the capture already recorded which machine
+/// produced the session (`identity_host`, C4's manifest column), so the
+/// identity comes from there. A manifest written before that column existed
+/// carries an empty value and falls back to `local`, exactly as PR8 C2's
+/// transitional identity did.
+pub fn restore_identity_from_manifest_view(
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> crate::indexer::IngestIdentity {
+    crate::indexer::IngestIdentity::for_manifest(&view.identity_host)
+}
+
+pub fn manifest_session_key_from_view(
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> Option<MirrorSessionKey> {
+    mirror_session_key(
+        &view.identity_host,
+        &view.agent,
+        view.external_id.as_deref(),
+        view.shape_root.as_deref(),
+    )
+}
+
+/// PR8 C4: the indexer's reparse-side check that the capture's manifest key is
+/// the first parse's `(agent, external_id)`. Only adds a rejection: a manifest
+/// without a session key passes, exactly as before.
+pub fn ensure_manifest_session_key_matches(
+    data_dir: &Path,
+    record: &crate::raw_mirror::RawMirrorCaptureRecord,
+    agent: &str,
+    external_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let capture = crate::raw_mirror::read_capture_for_reparse(data_dir, record)?;
+    let Some(key) = mirror_session_key(
+        &capture.identity_host,
+        &capture.agent,
+        capture.external_id.as_deref(),
+        capture.shape_root.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    if key.agent != agent || Some(key.external_id.as_str()) != external_id {
+        anyhow::bail!(
+            "manifest session key mismatch for {}: manifest records agent={:?} external_id={:?}, first parse was agent={agent:?} external_id={external_id:?}",
+            record.manifest_relative_path,
+            key.agent,
+            key.external_id
+        );
+    }
+    Ok(())
+}
+
 /// PR6 T2b (任务书 #114): materialize a just-captured raw-mirror blob back
 /// into its ancestor directory shape under `scratch`, so a connector's own
 /// file parser (which detects file type by extension/filename and derives
@@ -2491,19 +2765,18 @@ const fn connector_name_for(agent: Origin) -> &'static str {
 /// connector registry, not via this file's `Origin`-keyed
 /// [`scan_materialized_file`]) -- `Origin::ClaudeCode` is passed as an inert
 /// placeholder.
+///
+/// PR8 C4: the layout now comes from [`materialize_capture_to_dest`] -- the
+/// connector-shaped layout when the manifest has one, the baseline
+/// original-path shape otherwise; `scratch` is always a fresh directory.
 pub(crate) fn materialize_capture_to_scratch(
     data_dir: &Path,
     record: &crate::raw_mirror::RawMirrorCaptureRecord,
     scratch: &Path,
 ) -> anyhow::Result<PathBuf> {
-    let (canonical_original_path, blob) = crate::raw_mirror::read_capture_for_reparse(data_dir, record)?;
-    let input = SealedSource {
-        agent: Origin::ClaudeCode,
-        canonical_original_path: &canonical_original_path,
-        source_size_bytes: blob.len() as u64,
-        blob: &blob,
-    };
-    materialize_sealed_blob(scratch, &input).map_err(|fault| anyhow::anyhow!("{fault}"))
+    Ok(match materialize_capture_to_dest(data_dir, record, scratch)? {
+        MirrorMaterializeOutcome::Written(path) | MirrorMaterializeOutcome::SkippedIdentical(path) => path,
+    })
 }
 
 /// 拿 pin parser 扫**恰好一个已物化的文件**。
@@ -2747,6 +3020,9 @@ impl SealedMessageProjector<'_> {
         let prepared = crate::indexer::prepare_conversation_for_restore(
             connector_name_for(self.agent),
             &franken_agent_detection::types::Origin::local(),
+            // Digest comparison only: nothing is persisted here, so the
+            // identity never reaches storage (PR8 C3).
+            &crate::indexer::IngestIdentity::local(),
             None,
             self.sealed_source_size_bytes,
             &provenance,
@@ -2806,13 +3082,19 @@ impl MessageSequenceProjector for CandidateComparableProjector<'_> {
 /// 2. **Desktop sidecar 路径门**——§B.0.1 第一行，判据是路径分量，必须先于 parser；
 /// 3. **whole-file 形态分类**——复用 E2 冻结的分类器，零第二定义；
 /// 4. **JSONL 主路径**：pin parser 扫 → 恰好一个会话 → 跑 restore 侧的 ③。
+///
+/// PR8 C3: `identity` is the ingest identity the projected conversations are
+/// persisted under. A runner holding the manifest view passes
+/// [`restore_identity_from_manifest_view`]; a projection with no manifest of
+/// its own (the digest-comparison path) passes `IngestIdentity::local()`.
 pub(crate) fn project_sealed_source(
     scratch_root: &Path,
     input: &SealedSource<'_>,
+    identity: &crate::indexer::IngestIdentity,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
 ) -> Result<SealedProjection, ProjectionFault> {
     let materialized = materialize_sealed_blob(scratch_root, input)?;
-    project_from_materialized(&materialized, input, consumed_manifest)
+    project_from_materialized(&materialized, input, identity, consumed_manifest)
 }
 
 /// [`project_sealed_source`] 的后半段：输入是**已经物化好的**那个文件。
@@ -2824,6 +3106,7 @@ pub(crate) fn project_sealed_source(
 fn project_from_materialized(
     materialized: &Path,
     input: &SealedSource<'_>,
+    identity: &crate::indexer::IngestIdentity,
     consumed_manifest: &crate::raw_mirror::RawMirrorCaptureRecord,
 ) -> Result<SealedProjection, ProjectionFault> {
     use crate::phase3_bundle::{HoldReason, WholeFileDisposition, classify_whole_file};
@@ -2889,6 +3172,7 @@ fn project_from_materialized(
     let prepared = crate::indexer::prepare_conversation_for_restore(
         connector_name_for(input.agent),
         &franken_agent_detection::types::Origin::local(),
+        identity,
         None,
         input.source_size_bytes,
         consumed_manifest,
@@ -3555,6 +3839,11 @@ mod e5_materialization_tests {
             origin_host: None,
             original_path: "/home/u/.claude/projects/myapp/x.jsonl".to_owned(),
             original_path_blake3: "ffff0000".repeat(8),
+            identity_host: String::new(),
+            agent: String::new(),
+            external_id: None,
+            shape_root: None,
+            relative_path: None,
             captured_at_ms: 1_766_000_000_111,
             source_size_bytes: CLAUDE_JSONL.len() as u64,
             source_mtime_ms: Some(1_755_000_000_222),
@@ -3583,7 +3872,7 @@ mod e5_materialization_tests {
             source_size_bytes: CLAUDE_JSONL.len() as u64,
             blob: CLAUDE_JSONL,
         };
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Held { reason, .. } => assert_eq!(
                 reason,
                 crate::phase3_bundle::HoldReason::OutOfScopeFormat,
@@ -3600,7 +3889,7 @@ mod e5_materialization_tests {
             "/home/u/.claude/projects/myapp/11111111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => {
                 assert_eq!(conv.conv.messages.len(), 2, "两条消息都要在");
             }
@@ -3617,7 +3906,7 @@ mod e5_materialization_tests {
             "/home/u/Library/Application Support/Claude/claude-code-sessions/11111111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Held { reason, detail } => {
                 assert_eq!(reason, crate::phase3_bundle::HoldReason::OutOfScopeFormat);
                 assert_eq!(detail.as_deref(), Some("claude-desktop-sidecar"));
@@ -3637,12 +3926,14 @@ mod e5_materialization_tests {
         let a = project_sealed_source(
             &scratch("inv-root-a"),
             &claude_source(path, CLAUDE_JSONL),
+            &crate::indexer::IngestIdentity::local(),
             &test_provenance(),
         )
         .unwrap();
         let b = project_sealed_source(
             &scratch("inv-root-b-considerably-longer"),
             &claude_source(path, CLAUDE_JSONL),
+            &crate::indexer::IngestIdentity::local(),
             &test_provenance(),
         )
         .unwrap();
@@ -3695,7 +3986,7 @@ mod e5_materialization_tests {
                 u64::try_from(mtime).unwrap(),
                 "先证明 mtime 真的被改了 —— 不然这条测试又是个失效探针"
             );
-            match project_from_materialized(&materialized, &input, &test_provenance()).unwrap() {
+            match project_from_materialized(&materialized, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => seen.push(conv.conv),
                 other => panic!("期望 Projected，实得 {other:?}"),
             }
@@ -3791,7 +4082,7 @@ mod e5_materialization_tests {
             ..big
         };
         let kept_when_below = extras_outside_kept(
-            project_from_materialized(&materialized, &below, &test_provenance()).unwrap(),
+            project_from_materialized(&materialized, &below, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap(),
         );
         assert!(
             kept_when_below > 0,
@@ -3802,7 +4093,7 @@ mod e5_materialization_tests {
         // 正向断言：compact 之后那五个「明令不得丢」的键**仍然在场**。
         // 只做反向的「剩下的键 ⊆ 允许集」锁不住基线——少掉一个键照样满足子集关系。
         // 本断言同时是 `COMPACT_INVARIANT_EXTRA_KEYS` 与基线私有常量的同步锁。
-        let above = project_from_materialized(&materialized, &big, &test_provenance()).unwrap();
+        let above = project_from_materialized(&materialized, &big, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap();
         if let SealedProjection::Projected(conv) = &above {
             let present: std::collections::BTreeSet<&str> = conv
                 .conv
@@ -3849,7 +4140,7 @@ mod e5_materialization_tests {
             "/home/u/.claude/projects/myapp/cccc1111-2222-3333-4444-555555555555.jsonl",
             CLAUDE_JSONL,
         );
-        let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        let conv = match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => conv.conv,
             other => panic!("期望 Projected，实得 {other:?}"),
         };
@@ -4169,6 +4460,7 @@ mod e5_materialization_tests {
         let prepared = crate::indexer::prepare_conversation_for_restore(
             "codex",
             &franken_agent_detection::types::Origin::local(),
+            &crate::indexer::IngestIdentity::local(),
             None,
             4096,
             &record,
@@ -4288,7 +4580,7 @@ mod e5_materialization_tests {
                 source_size_bytes: sealed,
                 ..input
             };
-            match project_from_materialized(&m, &below, &test_provenance()).unwrap() {
+            match project_from_materialized(&m, &below, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => conv
                     .conv
                     .messages
@@ -4351,7 +4643,7 @@ mod e5_materialization_tests {
         let root = scratch(tag);
         let bytes = CLAUDE_ALL_BLOCKS.as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -4522,7 +4814,7 @@ mod e5_materialization_tests {
         )
         .as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
-        let conv = match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        let conv = match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => conv.conv,
             other => panic!("期望 Projected，实得 {other:?}"),
         };
@@ -4574,7 +4866,7 @@ mod e5_materialization_tests {
             source_size_bytes: bytes.len() as u64,
             blob: bytes,
         };
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -4635,7 +4927,7 @@ mod e5_materialization_tests {
         let root = scratch(tag);
         let bytes = raw.as_bytes();
         let input = claude_source(CLAUDE_PATH, bytes);
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -4896,7 +5188,7 @@ mod e5_materialization_tests {
             source_size_bytes: bytes.len() as u64,
             blob: bytes,
         };
-        match project_sealed_source(&root, &input, &test_provenance()).unwrap() {
+        match project_sealed_source(&root, &input, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
             SealedProjection::Projected(conv) => Box::new(conv.conv),
             other => panic!("期望 Projected，实得 {other:?}"),
         }
@@ -5139,7 +5431,7 @@ mod e5_materialization_tests {
                 source_size_bytes: sealed,
                 ..input
             };
-            match project_from_materialized(&materialized, &sized, &test_provenance()).unwrap() {
+            match project_from_materialized(&materialized, &sized, &crate::indexer::IngestIdentity::local(), &test_provenance()).unwrap() {
                 SealedProjection::Projected(conv) => {
                     conv.conv.messages.iter().map(|m| m.extra.clone()).collect()
                 }
@@ -5642,7 +5934,7 @@ mod e5_p30_blob_read_tests {
                 source_size_bytes: view.source_size_bytes,
                 blob: &blob,
             };
-            let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+            let projected = match project_sealed_source(&scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
                 Ok(SealedProjection::Projected(conv)) => conv.conv,
                 other => panic!("封存投影未产出会话：{other:?}"),
             };
@@ -5780,7 +6072,7 @@ mod e5_p30_blob_read_tests {
             source_size_bytes: blob.len() as u64,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -7338,7 +7630,7 @@ mod e6_replace_commit_tests {
                 },
                 canonical_path: SHARED_PATH.into(),
             };
-            let got = candidate_versions_from_db(&storage, &identity).unwrap();
+            let got = candidate_versions_from_db(&storage, &identity, None).unwrap();
             assert_eq!(
                 got.len(),
                 1,
@@ -8476,6 +8768,45 @@ fn conversation_ids_for_identity(
     Ok(ids)
 }
 
+/// PR8 C4: DB lookup by session key for connector-shaped manifests (the other
+/// half is [`conversation_ids_for_identity`], unchanged for everything else).
+fn conversation_ids_for_session_key(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity_host: &str,
+    agent: &str,
+    external_id: &str,
+) -> anyhow::Result<Vec<i64>> {
+    use crate::storage::api::Value as ParamValue;
+
+    // PR8 C1 introduced `conversations.identity_host`; the session key binds all three dimensions.
+    let sql = "SELECT c.id FROM conversations c JOIN agents a ON a.id = c.agent_id \
+               WHERE a.slug = ?1 AND c.external_id = ?2 AND c.identity_host = ?3 ORDER BY c.id";
+    let params = vec![
+        ParamValue::from(agent),
+        ParamValue::from(external_id),
+        ParamValue::from(identity_host),
+    ];
+    let ids: Vec<i64> = storage
+        .raw()
+        .query_all_map(sql, &params, |row| row.get_typed(0))?;
+    Ok(ids)
+}
+
+/// PR8 C4: restore's one DB lookup entry -- session key when the manifest has
+/// one, the baseline path identity otherwise.
+fn conversation_ids_for_manifest(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity: &RestoreIdentity,
+    session_key: Option<&MirrorSessionKey>,
+) -> anyhow::Result<Vec<i64>> {
+    match session_key {
+        Some(key) => {
+            conversation_ids_for_session_key(storage, &key.identity_host, &key.agent, &key.external_id)
+        }
+        None => conversation_ids_for_identity(storage, identity),
+    }
+}
+
 pub(crate) fn restore_identity_from_view(
     view: &crate::raw_mirror::RawMirrorManifestView,
 ) -> anyhow::Result<RestoreIdentity> {
@@ -8546,7 +8877,15 @@ fn restore_project_plan_item(
         source_size_bytes: view.source_size_bytes,
         blob: &blob,
     };
-    match project_sealed_source(&journal.scratch_dir, &sealed, &provenance) {
+    // PR8 C3: the manifest this capture came from records which machine
+    // produced the session, and that is the identity restore persists under.
+    let restore_identity = restore_identity_from_manifest_view(view);
+    match project_sealed_source(
+        &journal.scratch_dir,
+        &sealed,
+        &restore_identity,
+        &provenance,
+    ) {
         Ok(SealedProjection::Projected(prepared)) => {
             // T2b.3 (B段)：恢复链的落库端点，`excluded` marker 必须传到底
             // ——不许再经 `map_to_internal` 的 all-None 包装（会把 marker 吞掉）。
@@ -9076,9 +9415,13 @@ fn restore_publish_manifests(
                 // 修前这里只绑 `source_path`：库里另一条同路径、异来源的会话会先被选中，
                 // 于是 manifest 的 backlink 指向一条根本不是它的会话，且指错了不报错。
                 let identity = restore_identity_from_view(view)?;
-                conversation_ids_for_identity(&storage, &identity)?
-                    .into_iter()
-                    .next()
+                conversation_ids_for_manifest(
+                    &storage,
+                    &identity,
+                    manifest_session_key_from_view(view).as_ref(),
+                )?
+                .into_iter()
+                .next()
             }
         };
         let link = crate::raw_mirror::RawMirrorDbLink {
@@ -10806,7 +11149,7 @@ mod e7_restore_journal_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -13690,8 +14033,9 @@ fn normalized_from_db_message(
 fn candidate_versions_from_db(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
+    session_key: Option<&MirrorSessionKey>,
 ) -> anyhow::Result<Vec<CandidateSideVersion>> {
-    let ids = conversation_ids_for_identity(storage, identity)?;
+    let ids = conversation_ids_for_manifest(storage, identity, session_key)?;
     let mut out = Vec::with_capacity(ids.len());
     for conversation_id in ids {
         let messages = storage.fetch_messages(conversation_id)?;
@@ -13962,7 +14306,8 @@ pub(crate) fn plan_mirror_restore(
         };
 
         // ── candidate 侧 ──────────────────────────────────────────────
-        let candidates = candidate_versions_from_db(&storage, &identity)?;
+        let candidates =
+            candidate_versions_from_db(&storage, &identity, manifest_session_key_from_view(head).as_ref())?;
         report.candidate_versions_seen += candidates.len();
         // R-E-68：**零会话投影**降为具名 HOLD，不再打死整轮。判据读的是 `ProjectionFault`
         // 这个具名类别，**不是** `detail` 的错误文案——文案是给人看的、随时会改，拿它做
@@ -14607,7 +14952,7 @@ mod e8_dry_run_planner_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        match project_sealed_source(scratch, &sealed, &provenance) {
+        match project_sealed_source(scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => {
                 crate::indexer::persist::map_to_internal(&conv.conv)
             }
@@ -14677,7 +15022,7 @@ mod e8_dry_run_planner_tests {
             source_size_bytes: view.source_size_bytes,
             blob: &blob,
         };
-        let projected = match project_sealed_source(&scratch, &sealed, &provenance) {
+        let projected = match project_sealed_source(&scratch, &sealed, &crate::indexer::IngestIdentity::local(), &provenance) {
             Ok(SealedProjection::Projected(conv)) => *conv,
             other => panic!("投影未产出会话：{other:?}"),
         };
@@ -14732,7 +15077,7 @@ mod e8_dry_run_planner_tests {
             .insert_conversations_batched(&[(agent_id, workspace_id, &internal)])
             .unwrap();
         let identity = restore_identity_from_view(view).unwrap();
-        let candidates = candidate_versions_from_db(&storage, &identity).unwrap();
+        let candidates = candidate_versions_from_db(&storage, &identity, None).unwrap();
         assert_eq!(candidates.len(), 1, "库里恰有一条对应会话");
 
         // ① 限 scope 相等 —— (A2) 的前提成立。

@@ -764,6 +764,7 @@ fn sources_doctor_recovery_surface_is_in_parity() -> Result<(), String> {
         "name = \"parity-host\"\n",
         "type = \"ssh\"\n",
         "host = \"nobody@parity.invalid\"\n",
+        "origin_host = \"parity-host\"\n",
         "paths = [\"~/.claude/projects\"]\n",
     );
     std::fs::write(&sources_toml, toml).map_err(|e| format!("write sources.toml: {e}"))?;

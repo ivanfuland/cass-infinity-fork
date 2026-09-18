@@ -54,8 +54,10 @@ struct Cli {
     exempt_null_rewrites: Option<PathBuf>,
 }
 
-// R1-B4 (exec92): must match `idx_conversations_provenance`'s real unique
-// key -- (agent_slug, external_id) alone collapses two sessions from
+// R1-B4 (exec92): keyed like the schema-6 unique key `(source_id, agent_id,
+// external_id)`. Schema 7 (PR8 C1) changed the unique key to
+// `(identity_host, agent_id, external_id)`; this diff key still uses
+// `source_id`. (agent_slug, external_id) alone collapses two sessions from
 // different sources (a real, reachable shape once a corpus has more than
 // one `sources` row) into a single map entry, so an entire missing session
 // can go undetected whenever the surviving source happens to share the
@@ -575,7 +577,7 @@ mod tests {
         let writer = FrankenStorage::open_writer(&old).unwrap();
         writer
             .raw()
-            .execute_batch("DROP INDEX IF EXISTS idx_conversations_provenance;")
+            .execute_batch("DROP INDEX IF EXISTS idx_conversations_identity;")
             .unwrap();
         writer
             .raw()
@@ -736,8 +738,8 @@ mod tests {
 
     /// R1-B4 (exec92): two sessions from *different* sources sharing the
     /// same `(agent_slug, external_id)` are a real, distinct-identity shape
-    /// (`idx_conversations_provenance`'s actual unique key adds
-    /// `source_id`) -- the old `(agent_slug, external_id)`-only key
+    /// (the schema-6 unique key added `source_id`; schema 7's unique key is
+    /// `(identity_host, agent_id, external_id)`) -- the old `(agent_slug, external_id)`-only key
     /// collapsed both into one `HashMap` entry, so deleting one of them
     /// from `--new` went entirely undetected (whichever side survived the
     /// collision "matched" the deleted one).

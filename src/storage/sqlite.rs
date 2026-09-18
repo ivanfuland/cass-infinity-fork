@@ -399,6 +399,28 @@ fn doctor_mutation_lock_error_is_active(err: &std::io::Error) -> bool {
     }
 }
 
+/// PR8 C8: did taking the doctor mutation lock fail because the path cannot
+/// be written, as opposed to another holder keeping it busy?
+///
+/// `acquire_doctor_mutation_db_open_guard` has exactly two write-side steps
+/// before it ever tries the advisory lock -- `fs::create_dir_all` on the
+/// lock's parent and a `create(true).write(true)` open of the lock file
+/// itself -- so an EACCES/EROFS from either is what a read-only directory
+/// produces. `ReadOnlyFilesystem` covers the mount case; `PermissionDenied`
+/// covers the mode/ownership case. The two are kept apart from
+/// [`doctor_mutation_lock_error_is_active`]'s `WouldBlock`, which means
+/// "someone else holds it", not "this path is not writable".
+fn doctor_lock_failure_is_write_permission(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+            )
+        })
+    })
+}
+
 fn acquire_doctor_mutation_db_open_guard(
     db_path: &Path,
     timeout: Duration,
@@ -2756,7 +2778,36 @@ impl FrankenStorage {
     /// not enter the archive while `cass doctor --fix` owns the repair lock.
     pub fn open_readonly_with_doctor_lock_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let path_str = path.to_string_lossy().to_string();
-        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout)?;
+        let _doctor_guard = acquire_doctor_mutation_db_open_guard(path, timeout).map_err(|err| {
+            // PR8 C8: `acquire_doctor_mutation_db_open_guard` opens (and
+            // creates) `<db_dir>/doctor/locks/doctor-repair.lock` with
+            // `read(true).write(true).create(true)`. A read-only database
+            // *directory* -- or a read-only mount -- therefore fails here
+            // before SQLite is ever asked to open anything, and the bare io
+            // error reads like a corrupt or busy database rather than "this
+            // open needs a writable sidecar". Name it, with a fixed code, so
+            // doctor output, logs and CI can tell the two apart.
+            if doctor_lock_failure_is_write_permission(&err) {
+                tracing::error!(
+                    code = "E-READONLY-LOCK-WRITE",
+                    db_path = %path.display(),
+                    error = %err,
+                    "read-only open needs a writable doctor mutation lock"
+                );
+                anyhow!(
+                    "E-READONLY-LOCK-WRITE: opening {} read-only requires a writable doctor \
+                     mutation lock at {} (the lock file is created and opened for writing before \
+                     the database itself is touched, so a read-only directory or mount cannot \
+                     host a read-only open); underlying failure: {err:#}",
+                    path.display(),
+                    doctor_mutation_lock_path_for_db_open(path)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unresolved>".to_string()),
+                )
+            } else {
+                err
+            }
+        })?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening the legacy embedded engine db readonly at {}", path.display()))?;
         let storage = Self::new(conn, path.to_path_buf());
@@ -4242,33 +4293,92 @@ impl InsertConversationTreePerfProfile {
     }
 }
 
+/// PR8 C2 (spec hard constraint 2): the conversation dedup key is
+/// `(identity_host, agent_id, external_id)`. `identity_host` names the machine
+/// the session was produced on; `source_id` is demoted to a plain first-ingest
+/// attribute and no longer takes part in dedup. The `SourcePath` variant (no
+/// `external_id`) keys on the same identity dimension, so a session that only
+/// exists at a path is still host-scoped.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PendingConversationKey {
     External {
-        source_id: String,
+        identity_host: String,
         agent_id: i64,
         external_id: String,
     },
     SourcePath {
-        source_id: String,
+        identity_host: String,
         agent_id: i64,
         source_path: String,
         started_at: Option<i64>,
     },
 }
 
-fn conversation_external_lookup_key(source_id: &str, agent_id: i64, external_id: &str) -> String {
+/// Path inside a conversation's logical metadata where C2 carries the ingest
+/// identity. It sits next to the pre-existing `cass.origin` provenance
+/// (`source_id` / `kind` / `host`), which is what `extract_provenance` already
+/// reads, and it is written in exactly one place on the ingest side
+/// (`indexer::inject_provenance`).
+///
+/// Why metadata rather than a struct field: `Conversation` lives in
+/// `src/model/types.rs` and `NormalizedConversation` is the pinned upstream FAD
+/// type -- C2's `allowed_paths` cover neither, so the value has to travel on a
+/// field both of them already have. Metadata also survives the rayon
+/// `map_to_internal` hop and the begin-concurrent `WriterHandle` thread hop
+/// without any extra plumbing, which a thread-local carrier would not.
+const IDENTITY_HOST_METADATA_POINTER: &str = "/cass/identity/identity_host";
+const IDENTITY_ROOT_ID_METADATA_POINTER: &str = "/cass/identity/root_id";
+
+/// The value used when a conversation carries no identity carrier: local
+/// ingest, restore of a pre-PR8 capture, and every caller that predates C2.
+pub(crate) const DEFAULT_IDENTITY_HOST: &str = "local";
+
+/// Read the identity dimension straight off a conversation's logical metadata.
+/// `pub(crate)` because the ingest side needs the same answer for its duplicate
+/// pre-check (`indexer::duplicate_conversation_keys_present`) -- one definition,
+/// one place the carrier shape can drift.
+pub(crate) fn conversation_identity_host_from_metadata(metadata: &serde_json::Value) -> String {
+    metadata
+        .pointer(IDENTITY_HOST_METADATA_POINTER)
+        .and_then(serde_json::Value::as_str)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(DEFAULT_IDENTITY_HOST)
+        .to_string()
+}
+
+fn conversation_identity_host(conv: &Conversation) -> String {
+    conversation_identity_host_from_metadata(&conv.metadata_json)
+}
+
+/// The scan root the conversation arrived through, recorded alongside
+/// `identity_host` and used by the `merge_conflicts` entries (spec hard
+/// constraint 3). C2's transitional `ingest_identity_for_root` returns `local`
+/// for both; C3 starts supplying real `root_id`s.
+fn conversation_root_id(conv: &Conversation) -> String {
+    conv.metadata_json
+        .pointer(IDENTITY_ROOT_ID_METADATA_POINTER)
+        .and_then(serde_json::Value::as_str)
+        .filter(|root_id| !root_id.is_empty())
+        .unwrap_or(DEFAULT_IDENTITY_HOST)
+        .to_string()
+}
+
+fn conversation_external_lookup_key(
+    identity_host: &str,
+    agent_id: i64,
+    external_id: &str,
+) -> String {
     format!(
-        "{}:{source_id}:{agent_id}:{}:{external_id}",
-        source_id.chars().count(),
+        "{}:{identity_host}:{agent_id}:{}:{external_id}",
+        identity_host.chars().count(),
         external_id.chars().count()
     )
 }
 
 fn conversation_external_lookup_key_for_conv(agent_id: i64, conv: &Conversation) -> Option<String> {
-    conv.external_id
-        .as_deref()
-        .map(|external_id| conversation_external_lookup_key(&conv.source_id, agent_id, external_id))
+    conv.external_id.as_deref().map(|external_id| {
+        conversation_external_lookup_key(&conversation_identity_host(conv), agent_id, external_id)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -4302,6 +4412,18 @@ struct ExistingConversationNewMessages<'a> {
     new_chars: i64,
     idx_collision_count: usize,
     first_collision_idx: Option<i64>,
+}
+
+/// One dropped variant of a same-`idx` message, recorded under
+/// `metadata.merge_conflicts` exactly as `{idx, root_id, content_hash, seen_at}`
+/// (spec hard constraint 3). Dedup key is `(idx, content_hash)`, so replaying
+/// the identical conflict through another pass adds nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeConflictEntry {
+    idx: i64,
+    root_id: String,
+    content_hash: String,
+    seen_at: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4492,7 +4614,7 @@ fn collect_new_messages_for_existing_conversation<'a>(
     for msg in &conv.messages {
         let incoming_fingerprint = message_merge_fingerprint(msg)?;
         if let Some(existing_fingerprint) = existing_messages.get(&msg.idx) {
-            if existing_fingerprint != &incoming_fingerprint {
+                    if existing_fingerprint != &incoming_fingerprint {
                 idx_collision_count = idx_collision_count.saturating_add(1);
                 first_collision_idx.get_or_insert(msg.idx);
             }
@@ -4522,6 +4644,177 @@ fn collect_new_messages_for_existing_conversation<'a>(
         idx_collision_count,
         first_collision_idx,
     })
+}
+
+/// PR8 C2 (hard constraint 3): the same-`idx`, different-`content_hash`
+/// collisions between an incoming conversation and the row it is merging into,
+/// read from the **stored** bodies.
+///
+/// Why this cannot ride along on the merge's own message lookup:
+/// [`franken_existing_message_lookup`] records an index it already has with the
+/// **incoming** fingerprint as a deliberate cheap presence marker ("normal
+/// reprocessing does not need to read stored content"), so comparing the two
+/// maps inside the merge loop compares the incoming conversation with itself
+/// and can never see a divergence. Stored content is what distinguishes the two
+/// variants, and this is the only place that reads it.
+///
+/// Two cheap gates keep the added read off the hot path, so a routine re-scan of
+/// an unchanged corpus pays nothing for it:
+///
+/// 1. The caller already knows the row is being merged into; nothing runs for a
+///    brand-new conversation.
+/// 2. The range is capped at the row's own highest index -- a message whose
+///    `idx` is above it cannot already exist -- and if the whole incoming range
+///    sits above that cap (the ordinary append-only tail advance) this returns
+///    without issuing a query at all.
+///
+/// What remains is bounded by `sqlite_autoindex_messages_1`, the same index the
+/// merge lookup uses.
+fn franken_detect_merge_conflicts_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+) -> Result<Vec<MergeConflictEntry>> {
+    let (Some(min_idx), Some(max_idx)) = (
+        conv.messages.iter().map(|msg| msg.idx).min(),
+        conv.messages.iter().map(|msg| msg.idx).max(),
+    ) else {
+        return Ok(Vec::new());
+    };
+    let existing_max_idx = franken_cached_existing_conversation_tail_metadata(tx, conversation_id)?
+        .last_message_idx
+        .unwrap_or(max_idx);
+    let upper_idx = max_idx.min(existing_max_idx);
+    if upper_idx < min_idx {
+        return Ok(Vec::new());
+    }
+
+    let stored_rows: Vec<(i64, String, Option<String>)> = tx.query_all_map(
+        "SELECT idx, content, json(excluded)
+         FROM messages INDEXED BY sqlite_autoindex_messages_1
+         WHERE conversation_id = ?1
+           AND idx >= ?2
+           AND idx <= ?3",
+        fparams![conversation_id, min_idx, upper_idx],
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+    )?;
+    if stored_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stored_hashes: HashMap<i64, [u8; 32]> = HashMap::with_capacity(stored_rows.len());
+    for (idx, content, excluded) in stored_rows {
+        let excluded_marker = excluded
+            .as_deref()
+            .map(crate::indexer::exclusion::ExcludedMarker::from_json_str)
+            .transpose()?;
+        stored_hashes.insert(idx, fingerprint_hash_for(&content, excluded_marker.as_ref())?);
+    }
+
+    let root_id = conversation_root_id(conv);
+    let seen_at = FrankenStorage::now_millis();
+    let mut conflicts = Vec::new();
+    for msg in &conv.messages {
+        let Some(stored_hash) = stored_hashes.get(&msg.idx) else {
+            continue;
+        };
+        let incoming_hash = fingerprint_hash(msg)?;
+        // Only a *content* difference is a conflict (spec hard constraint 3).
+        // A message whose role/author/timestamp drifted but whose body is
+        // byte-identical is still handled by the merge's existing idx-collision
+        // counters; it is not a conflict to record here.
+        if stored_hash == &incoming_hash {
+            continue;
+        }
+        conflicts.push(MergeConflictEntry {
+            idx: msg.idx,
+            root_id: root_id.clone(),
+            content_hash: hex::encode(incoming_hash),
+            seen_at,
+        });
+    }
+    Ok(conflicts)
+}
+
+/// PR8 C2 (hard constraint 3): append the run's dropped variants to the
+/// conversation's logical metadata under `merge_conflicts`.
+///
+/// The read and the write both go through the production format bridge --
+/// `franken_read_metadata_compat` in, `franken_metadata_insert_payload` out --
+/// so the **first-ingested** value of every other metadata field is carried
+/// through untouched (the row's stored metadata is the source of truth here,
+/// never the incoming conversation's). Existing entries are preserved and
+/// deduplicated on `(idx, content_hash)` so replaying the same conflict is a
+/// no-op.
+fn franken_record_merge_conflicts_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+) -> Result<()> {
+    let conflicts = franken_detect_merge_conflicts_in_tx(tx, conversation_id, conv)?;
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    let conflicts = &conflicts;
+
+    let mut metadata = tx
+        .query_row_map(
+            "SELECT metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| Ok(franken_read_metadata_compat(row, 0, 1)),
+        )
+        .optional()?
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    if !metadata.is_object() {
+        metadata = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let Some(object) = metadata.as_object_mut() else {
+        return Ok(());
+    };
+    let recorded = object
+        .entry("merge_conflicts".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if !recorded.is_array() {
+        *recorded = serde_json::Value::Array(Vec::new());
+    }
+    let Some(recorded) = recorded.as_array_mut() else {
+        return Ok(());
+    };
+
+    let mut appended = false;
+    for conflict in conflicts {
+        let already_recorded = recorded.iter().any(|entry| {
+            entry.get("idx").and_then(serde_json::Value::as_i64) == Some(conflict.idx)
+                && entry.get("content_hash").and_then(serde_json::Value::as_str)
+                    == Some(conflict.content_hash.as_str())
+        });
+        if already_recorded {
+            continue;
+        }
+        recorded.push(serde_json::json!({
+            "idx": conflict.idx,
+            "root_id": conflict.root_id,
+            "content_hash": conflict.content_hash,
+            "seen_at": conflict.seen_at,
+        }));
+        appended = true;
+    }
+    if !appended {
+        return Ok(());
+    }
+
+    let (metadata_json_str, metadata_bin) = franken_metadata_insert_payload(&metadata)?;
+    let metadata_bin_bytes = metadata_bin.as_deref();
+    tx.execute(
+        "UPDATE conversations SET metadata_json = ?1, metadata_bin = ?2 WHERE id = ?3",
+        fparams![
+            metadata_json_str.as_deref(),
+            metadata_bin_bytes,
+            conversation_id
+        ],
+    )?;
+    Ok(())
 }
 
 fn franken_existing_conversation_append_tail_state(
@@ -4648,12 +4941,12 @@ fn franken_find_existing_conversation_with_tail_by_key(
     conv: Option<&Conversation>,
 ) -> Result<Option<ExistingConversationWithTail>> {
     if let PendingConversationKey::External {
-        source_id,
+        identity_host,
         agent_id,
         external_id,
     } = key
     {
-        let lookup_key = conversation_external_lookup_key(source_id, *agent_id, external_id);
+        let lookup_key = conversation_external_lookup_key(identity_host, *agent_id, external_id);
         if let Some(existing) = franken_find_external_conversation_tail_lookup(tx, &lookup_key)? {
             return Ok(Some(existing));
         }
@@ -5179,15 +5472,16 @@ fn timestamps_within_tolerance(left: Option<i64>, right: Option<i64>, tolerance_
 }
 
 fn conversation_merge_key(agent_id: i64, conv: &Conversation) -> PendingConversationKey {
+    let identity_host = conversation_identity_host(conv);
     if let Some(external_id) = conv.external_id.clone() {
         PendingConversationKey::External {
-            source_id: conv.source_id.clone(),
+            identity_host,
             agent_id,
             external_id,
         }
     } else {
         PendingConversationKey::SourcePath {
-            source_id: conv.source_id.clone(),
+            identity_host,
             agent_id,
             source_path: path_to_string(&conv.source_path),
             started_at: conversation_effective_started_at(conv),
@@ -5398,6 +5692,33 @@ impl FrankenStorage {
         Ok(id)
     }
 
+    /// PR8 C2 test seam: one conversation's **logical** metadata, decoded the
+    /// same way every production reader decodes it
+    /// ([`franken_read_metadata_compat`]: `metadata_bin` msgpack first, then the
+    /// `metadata_json` text column).
+    ///
+    /// Why this exists rather than the test reading a column directly: the C2
+    /// `merge_conflicts` record is written through
+    /// `franken_metadata_insert_payload`, which stores any non-empty object as
+    /// msgpack in `metadata_bin` and leaves `metadata_json` NULL -- and an
+    /// integration test crate cannot decode msgpack (no `rmp-serde`
+    /// dev-dependency). This mirrors the existing `set_prepare_fault_hook`
+    /// precedent of a `#[doc(hidden)] pub` seam that lets a black-box test reach
+    /// a fact the production code owns.
+    #[doc(hidden)]
+    pub fn conversation_metadata_for_tests(
+        &self,
+        conversation_id: i64,
+    ) -> Result<serde_json::Value> {
+        self.conn
+            .query_row_map(
+                "SELECT metadata_json, metadata_bin FROM conversations WHERE id = ?1",
+                fparams![conversation_id],
+                |row| Ok(franken_read_metadata_compat(row, 0, 1)),
+            )
+            .with_context(|| format!("reading logical metadata for conversation {conversation_id}"))
+    }
+
     /// Get current time as milliseconds since epoch.
     pub fn now_millis() -> i64 {
         SystemTime::now()
@@ -5503,6 +5824,115 @@ impl FrankenStorage {
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES(?1, ?2)",
             fparams![key.as_str(), ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// PR8 C3 (spec hard constraint 4/5): read this `(root_id, connector)`
+    /// scan watermark. `None` means "no row" and therefore "scan the whole
+    /// root" -- there is deliberately no bootstrap to the current time.
+    pub fn get_scan_watermark(&self, root_id: &str, connector: &str) -> Result<Option<i64>> {
+        let result: Result<i64, _> = self.conn.query_row_map(
+            "SELECT last_scan_ts FROM scan_watermarks WHERE root_id = ?1 AND connector = ?2",
+            fparams![root_id, connector],
+            |row| row.get_typed(0),
+        );
+        match result.optional() {
+            Ok(ts) => Ok(ts),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write this `(root_id, connector)` scan watermark. Callers only reach
+    /// here for a root whose scan completed without error (hard constraint 5).
+    pub fn set_scan_watermark(&self, root_id: &str, connector: &str, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_watermarks(root_id, connector, last_scan_ts)
+             VALUES(?1, ?2, ?3)",
+            fparams![root_id, connector, ts],
+        )?;
+        Ok(())
+    }
+
+    /// `cass index --full` for one root: drop that root's watermark row only.
+    /// A fake home's `--full` must not touch the real home's row (hard
+    /// constraint 5: "`--full` 只把当前扫描根的全部行置零").
+    pub fn clear_scan_watermarks_for_root(&self, root_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM scan_watermarks WHERE root_id = ?1",
+            fparams![root_id],
+        )?;
+        Ok(())
+    }
+
+    /// Drop one root's per-file state, the companion of
+    /// [`Self::clear_scan_watermarks_for_root`] on a `--full` scan. Rows of
+    /// other roots and other connectors are untouched.
+    pub fn clear_scan_file_state_for_root(&self, root_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM scan_file_state WHERE root_id = ?1",
+            fparams![root_id],
+        )?;
+        Ok(())
+    }
+
+    /// One file's recorded `(size, mtime, last_seen_ts)` for this
+    /// `(root_id, connector)`. Keyed with the connector on purpose: one
+    /// connector's successful scan must not erase another connector's pending
+    /// re-read of the same file (spec R3-B2).
+    pub fn get_scan_file_state(
+        &self,
+        root_id: &str,
+        connector: &str,
+        relative_path: &str,
+    ) -> Result<Option<(i64, i64, i64)>> {
+        let result: Result<(i64, i64, i64), _> = self.conn.query_row_map(
+            "SELECT size, mtime, last_seen_ts FROM scan_file_state
+             WHERE root_id = ?1 AND connector = ?2 AND relative_path = ?3",
+            fparams![root_id, connector, relative_path],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        );
+        match result.optional() {
+            Ok(state) => Ok(state),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Every recorded `relative_path -> (size, mtime)` for one
+    /// `(root_id, connector)`, read once per scan instead of per file.
+    pub fn scan_file_states_for_root_connector(
+        &self,
+        root_id: &str,
+        connector: &str,
+    ) -> Result<HashMap<String, (i64, i64)>> {
+        let rows: Vec<(String, i64, i64)> = self.conn.query_all_map(
+            "SELECT relative_path, size, mtime FROM scan_file_state
+             WHERE root_id = ?1 AND connector = ?2",
+            fparams![root_id, connector],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)),
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, size, mtime)| (path, (size, mtime)))
+            .collect())
+    }
+
+    /// Record that this `(root_id, connector)` scan saw `relative_path` with
+    /// the given size/mtime. Written only for roots whose scan had no error.
+    pub fn upsert_scan_file_state(
+        &self,
+        root_id: &str,
+        connector: &str,
+        relative_path: &str,
+        size: i64,
+        mtime: i64,
+        last_seen_ts: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scan_file_state
+             (root_id, connector, relative_path, size, mtime, last_seen_ts)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            fparams![root_id, connector, relative_path, size, mtime, last_seen_ts],
         )?;
         Ok(())
     }
@@ -8187,6 +8617,7 @@ impl FrankenStorage {
                             &mut existing_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx",
                         )?;
+                        franken_record_merge_conflicts_in_tx(tx, existing_id, conv)?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let mut inserted_indices = Vec::new();
@@ -8552,6 +8983,7 @@ impl FrankenStorage {
             )?
         };
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
+        franken_record_merge_conflicts_in_tx(&tx, existing_id, conv)?;
 
         let mut inserted_indices = Vec::new();
         let (inserted_last_idx, inserted_last_created_at) =
@@ -8703,6 +9135,7 @@ impl FrankenStorage {
                 "skipping replay-equivalent recovered message with shifted idx",
             )?
         };
+        franken_record_merge_conflicts_in_tx(tx, conversation_id, conv)?;
 
         let mut inserted_indices = Vec::new();
         let mut inserted_message_ids = Vec::new();
@@ -9392,6 +9825,7 @@ impl FrankenStorage {
                             &mut pending_message_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx during batched merge",
                         )?;
+                        franken_record_merge_conflicts_in_tx(tx, existing_id, conv)?;
                         let (inserted_last_idx, inserted_last_created_at) =
                             borrowed_messages_tail_state(&new_messages);
                         let inserted_append_messages =
@@ -9496,7 +9930,8 @@ impl FrankenStorage {
                                     &mut pending_message_replay_fingerprints,
                                     "skipping replay-equivalent recovered message with shifted idx after duplicate conversation recovery",
                                 )?;
-                                let (inserted_last_idx, inserted_last_created_at) =
+                                franken_record_merge_conflicts_in_tx(tx, existing_id, conv)?;
+                                        let (inserted_last_idx, inserted_last_created_at) =
                                     borrowed_messages_tail_state(&new_messages);
                                 let inserted_append_messages =
                                     franken_append_insert_new_messages(tx, existing_id, &new_messages)?;
@@ -10221,12 +10656,12 @@ fn franken_insert_external_conversation_tail_lookup_key(
 
 fn franken_insert_external_conversation_tail_lookup(
     tx: &FrankenTransaction<'_>,
-    source_id: &str,
+    identity_host: &str,
     agent_id: i64,
     external_id: &str,
     existing: ExistingConversationWithTail,
 ) -> Result<()> {
-    let lookup_key = conversation_external_lookup_key(source_id, agent_id, external_id);
+    let lookup_key = conversation_external_lookup_key(identity_host, agent_id, external_id);
     let ended_at = existing.tail_state.and_then(|state| state.ended_at);
     let last_message_idx = existing.tail_state.map(|state| state.last_message_idx);
     let last_message_created_at = existing
@@ -10369,11 +10804,11 @@ fn franken_find_existing_conversation_by_key_impl(
 ) -> Result<Option<i64>> {
     match key {
         PendingConversationKey::External {
-            source_id,
+            identity_host,
             agent_id,
             external_id,
         } => {
-            let lookup_key = conversation_external_lookup_key(source_id, *agent_id, external_id);
+            let lookup_key = conversation_external_lookup_key(identity_host, *agent_id, external_id);
             if let Some(existing_id) = franken_find_external_conversation_lookup(tx, &lookup_key)? {
                 return Ok(Some(existing_id));
             }
@@ -10381,12 +10816,16 @@ fn franken_find_existing_conversation_by_key_impl(
                 return Ok(None);
             }
 
+            // PR8 C2: the fallback scan resolves by the same identity key the
+            // unique index enforces (`idx_conversations_identity`), so a row
+            // written by another root of the *same host* is found here; a row
+            // of another host is deliberately not.
             let existing_id = tx
                 .query_row_map(
                     "SELECT id
                  FROM conversations
-                 WHERE source_id = ?1 AND agent_id = ?2 AND external_id = ?3",
-                    fparams![source_id.as_str(), *agent_id, external_id.as_str()],
+                 WHERE identity_host = ?1 AND agent_id = ?2 AND external_id = ?3",
+                    fparams![identity_host.as_str(), *agent_id, external_id.as_str()],
                     |row| row.get_typed(0),
                 )
                 .optional()?;
@@ -10406,7 +10845,7 @@ fn franken_find_existing_conversation_by_key_impl(
             }
         }
         PendingConversationKey::SourcePath {
-            source_id,
+            identity_host,
             agent_id,
             source_path,
             started_at,
@@ -10415,7 +10854,7 @@ fn franken_find_existing_conversation_by_key_impl(
                 .query_row_map(
                     "SELECT c.id
                      FROM conversations c
-                     WHERE c.source_id = ?1
+                     WHERE c.identity_host = ?1
                        AND c.agent_id = ?2
                        AND c.source_path = ?3
                        AND ((
@@ -10437,7 +10876,7 @@ fn franken_find_existing_conversation_by_key_impl(
                      ORDER BY c.id
                      LIMIT 1",
                     fparams![
-                        source_id.as_str(),
+                        identity_host.as_str(),
                         *agent_id,
                         source_path.as_str(),
                         *started_at
@@ -10469,11 +10908,11 @@ fn franken_find_existing_conversation_by_key_impl(
                             AND created_at IS NOT NULL)
                      ) AS effective_started_at
                  FROM conversations c
-                 WHERE c.source_id = ?1
+                 WHERE c.identity_host = ?1
                    AND c.agent_id = ?2
                    AND c.source_path = ?3
                  ORDER BY c.id",
-                fparams![source_id.as_str(), *agent_id, source_path.as_str()],
+                fparams![identity_host.as_str(), *agent_id, source_path.as_str()],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )?;
 
@@ -10613,12 +11052,16 @@ fn franken_insert_conversation(
     let (last_message_idx, last_message_created_at) = conversation_tail_state(conv);
     let metadata_bin_bytes = metadata_bin.as_deref();
 
+    // PR8 C2 (hard constraint 2): the identity dimension is written explicitly
+    // on both insert paths rather than left to the column default, so the row
+    // and the dedup key lookup are built from the same value.
+    let identity_host = conversation_identity_host(conv);
     match tx.execute(
         "INSERT INTO conversations(
             agent_id, workspace_id, source_id, external_id, title, source_path,
             started_at, ended_at, approx_tokens, metadata_json, origin_host, metadata_bin,
-            last_message_idx, last_message_created_at
-        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            last_message_idx, last_message_created_at, identity_host
+        ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         fparams![
             agent_id,
             workspace_id,
@@ -10633,7 +11076,8 @@ fn franken_insert_conversation(
             conv.origin_host.as_deref(),
             metadata_bin_bytes,
             last_message_idx,
-            last_message_created_at
+            last_message_created_at,
+            identity_host.as_str()
         ],
     ) {
         Ok(_) => {
@@ -10648,7 +11092,7 @@ fn franken_insert_conversation(
             if let Some(external_id) = conv.external_id.as_deref() {
                 franken_insert_external_conversation_tail_lookup(
                     tx,
-                    conv.source_id.as_str(),
+                    identity_host.as_str(),
                     agent_id,
                     external_id,
                     ExistingConversationWithTail {
@@ -10663,7 +11107,7 @@ fn franken_insert_conversation(
             }
             Ok(Some(conv_id))
         }
-        Err(StorageError::Constraint { .. }) => {
+        Err(StorageError::Constraint { detail }) if is_unique_conflict_detail(&detail) => {
             tracing::debug!(
                 source_id = %conv.source_id,
                 agent_id,
@@ -10675,6 +11119,27 @@ fn franken_insert_conversation(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// PR8 C2 (hard constraint 2): only UNIQUE / PRIMARY KEY violations mean
+/// "another writer owns this identity key" and may be reported as `Ok(None)`
+/// for the caller's duplicate recovery. NOT NULL, CHECK and FOREIGN KEY
+/// failures are real defects (a malformed row, a missing parent) and must reach
+/// the caller as errors instead of being laundered into the duplicate path,
+/// where the follow-up lookup would replace the true cause with the misleading
+/// "duplicate conflict but existing row was not found".
+///
+/// `StorageError::Constraint` keeps only SQLite's message text -- the extended
+/// result code is dropped by `map_sqlite_failure` before the variant is built,
+/// and that mapper lives outside this task's `allowed_paths` -- so the message
+/// prefix is the discriminator available here. SQLite emits
+/// `UNIQUE constraint failed: <table>.<cols>` for both SQLITE_CONSTRAINT_UNIQUE
+/// and (for non-rowid primary keys) SQLITE_CONSTRAINT_PRIMARYKEY; the rowid
+/// alias case reports `PRIMARY KEY must be unique`. Everything else has its own
+/// prefix (`NOT NULL constraint failed`, `CHECK constraint failed`,
+/// `FOREIGN KEY constraint failed`).
+fn is_unique_conflict_detail(detail: &str) -> bool {
+    detail.starts_with("UNIQUE constraint failed") || detail.starts_with("PRIMARY KEY must be unique")
 }
 
 type MetadataInsertPayload<'a> = (Option<Cow<'a, str>>, Option<Vec<u8>>);
@@ -18218,7 +18683,19 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn rebuild_analytics_repopulates_from_messages() {
+        // 与 `analytics_ingest_populates_metrics_and_rollups`（本文件上方）同一个
+        // 机制：本用例经 `insert_conversations_batched` 间接读**进程级**开关
+        // `DEFAULT_DEFER_ANALYTICS_UPDATES`，而 `run_index()` 一进门就把它翻成
+        // 「延后」，本文件里读该开关的用例也各自 push 自己的值。没有 `#[serial]`
+        // 时它与那些用例并发跑到一起，`orig_mm`（下方 `assert_eq!(orig_mm, 3)`）
+        // 会读到 0。PR6 期间本用例并行 flake 两棒两现（STATUS [cass-54]）。
+        //
+        // 修法按任务书优先序 ①：入组既有 `#[serial]`，不改产品语义、不改断言口径。
+        // 这里不额外加 `default_defer_analytics_updates_guard(false)` 钉死 —— 上方
+        // 用例的 M1 实验已实测：持有者栈语义下「后 push 者生效」，钉死比并发用例
+        // 的 guard 来得晚，钉了也不保护（8/8 仍红）。
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
 
@@ -18712,7 +19189,7 @@ mod tests {
             .unwrap();
         let external_id = initial.external_id.as_deref().unwrap();
         let lookup_key =
-            conversation_external_lookup_key(&initial.source_id, agent_id, external_id);
+            conversation_external_lookup_key(&conversation_identity_host(&initial), agent_id, external_id);
         let lookup_id: i64 = storage
             .conn
             .query_row_map(

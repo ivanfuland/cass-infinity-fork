@@ -275,6 +275,7 @@ fn create_ssh_sources_config(
 name = "{source_name}"
 type = "ssh"
 host = "{host}"
+origin_host = "{source_name}"
 port = {port}
 identity_file = "{identity_file}"
 paths = [{paths_toml}]
@@ -820,6 +821,7 @@ fn ssh_sources_path_rewriting() {
 name = "path-mapping-test"
 type = "ssh"
 host = "{host}"
+origin_host = "path-mapping-test"
 port = {port}
 identity_file = "{identity}"
 paths = ["/root/.claude/projects"]
@@ -1132,6 +1134,7 @@ fn ssh_sources_mappings_list() {
 name = "mapping-test"
 type = "ssh"
 host = "{host}"
+origin_host = "mapping-test"
 port = {port}
 identity_file = "{identity}"
 paths = ["/root/.claude/projects"]
@@ -1233,6 +1236,8 @@ fn ssh_sources_full_e2e_flow() {
         .args([
             "sources",
             "add",
+            "--origin-host",
+            "e2e-docker",
             &format!("root@localhost:{}", server.port()),
             "--name",
             "e2e-docker",
