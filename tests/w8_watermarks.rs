@@ -484,7 +484,13 @@ fn size_change_forces_reread() {
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"appended turn\"}}\n",
         );
         std::fs::write(&first_file, content).expect("rewrite fixture");
-        set_mtime(&first_file, original_mtime);
+        // Older than the root's watermark, so only the size comparison and the
+        // `since_ts = 0` bypass can bring it back into the scan.
+        assert!(
+            original_mtime < SystemTime::now(),
+            "the fixture mtime must be in the past"
+        );
+        set_mtime(&first_file, SystemTime::now() - Duration::from_secs(3_600));
         let rewritten_size = std::fs::metadata(&first_file)
             .expect("rewritten fixture metadata")
             .len();
@@ -704,6 +710,10 @@ fn mirror_and_full_scan_roots_ignore_watermark() {
         assert!(
             watermarks(&fixture.db_path(), "cfg:backup:").is_empty(),
             "a full_scan source must not keep per-root watermarks"
+        );
+        assert!(
+            watermarks(&fixture.db_path(), "cfg:ivanmac:").is_empty(),
+            "an ssh mirror root must not keep per-root watermarks either"
         );
     });
 }
