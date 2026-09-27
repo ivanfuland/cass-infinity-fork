@@ -581,6 +581,15 @@ fn preflight_schema(db_path: &Path) -> Option<SyncError> {
 /// purpose-built probe, whose own doc comment already calls a missing
 /// identity a precondition failure — makes "Infinity is unreachable" a
 /// typed exit 2 by construction.
+///
+/// Infinity *is* the semantic backend in this fork — the fsvi/ONNX tier was
+/// retired in W3-5 (`src/indexer/mod.rs`'s `#[cfg(not(feature =
+/// "infinity"))]` arm says the same thing to `run_index`). The two arms below
+/// are therefore the same precondition reached two ways, not a degraded
+/// fallback: a build without the feature has no probe to run, so it fails
+/// here, before the mirror stage and before the index, rather than compiling
+/// the call away or letting the round report success.
+#[cfg(feature = "infinity")]
 fn preflight_semantic() -> Option<SyncError> {
     let config = crate::search::infinity::InfinityConfig::from_env();
     match crate::search::infinity::probe_served_embed_identity(&config) {
@@ -593,6 +602,25 @@ fn preflight_semantic() -> Option<SyncError> {
             ),
         }),
     }
+}
+
+/// The same precondition for a build compiled without the `infinity` feature.
+///
+/// There is nothing to probe and no semantic tier this build could activate,
+/// so `cass sync` — which requires semantic readiness — cannot start a round
+/// at all. Same kind and same exit code as an unreachable Infinity; the
+/// fixed message points at the build rather than at a server, because
+/// retrying the network cannot fix it.
+#[cfg(not(feature = "infinity"))]
+fn preflight_semantic() -> Option<SyncError> {
+    Some(SyncError {
+        kind: CliErrorKind::SemanticUnavailable.kind_str(),
+        message: "this build has no semantic backend: it was compiled without the \
+                  `infinity` feature, and the fsvi/ONNX semantic tier was retired in \
+                  W3-5; rebuild with --no-default-features --features \
+                  qr,encryption,infinity to run `cass sync`"
+            .to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
