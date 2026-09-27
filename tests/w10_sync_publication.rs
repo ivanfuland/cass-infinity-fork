@@ -61,11 +61,16 @@ const PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 /// One generated assistant turn of the payload, in bytes.
 ///
 /// Turns are made large rather than numerous on purpose: a few hundred fat
-/// turns fill the same 4 MiB as tens of thousands of thin ones, and they keep
-/// the conversation far below the ingest path's per-conversation message
-/// ceiling — which is a separate behaviour, not something this task may
-/// assert around. With a small turn count the archive's message count is the
-/// connector's own count, so the end-to-end assertion below can be exact.
+/// turns fill the same 4 MiB as tens of thousands of thin ones, so a run scans
+/// and ingests a small conversation instead of a huge one.
+///
+/// It does not make the archive's message-row count agree with the
+/// connector's. For this payload the connector reports 258 messages while the
+/// archive written by the same run holds 132 rows; the difference is not
+/// localized here, is not caused by this task's change, and is outside its
+/// scope. The end-to-end test below therefore pins the archive's
+/// *conversation* count exactly and its message count only as non-zero, rather
+/// than comparing two instruments whose disagreement nobody has explained.
 const TURN_LINE_BYTES: usize = 16 * 1024;
 
 /// KiB/s, the control-plane baseline's throttle. `rsync --bwlimit` is in
@@ -300,8 +305,11 @@ impl Mirror {
     }
 }
 
-/// Every regular file under `root`, with its size. Symlinks are not followed;
-/// the transfer preserves links rather than creating them here.
+/// Every regular file under `root`, with its size.
+///
+/// Symlinks are neither followed nor reported. `DirEntry::metadata` follows
+/// them, so the kind comes from `file_type` — which describes the entry itself
+/// — and a symlink falls through both arms below.
 fn regular_files_under(root: &Path) -> BTreeMap<PathBuf, u64> {
     let mut out = BTreeMap::new();
     let mut stack = vec![root.to_path_buf()];
@@ -310,10 +318,13 @@ fn regular_files_under(root: &Path) -> BTreeMap<PathBuf, u64> {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
                 stack.push(entry.path());
-            } else if meta.is_file() {
+            } else if file_type.is_file() {
+                let Ok(meta) = entry.metadata() else { continue };
                 out.insert(entry.path(), meta.len());
             }
         }
@@ -362,6 +373,49 @@ fn snapshot(mirror: &Mirror) -> Files {
     regular_files_under(&mirror.scan_root)
 }
 
+/// The one file this transfer is growing, named from what the snapshot shows
+/// against the one taken before the transfer started: a file that was not
+/// there, or one whose size has moved, and that carries payload.
+///
+/// This is the transfer's *real* parked temp file — `rsync` writes it beside
+/// the destination and renames it into place only on completion — so a caller
+/// can hand the live window to the connector instead of inventing a file whose
+/// name merely looks like one.
+fn growing_file(now: &Files, before: &Files) -> Option<(PathBuf, u64)> {
+    let mut grown = now
+        .iter()
+        .filter(|(path, size)| **size > 0 && before.get(*path) != Some(*size))
+        .map(|(path, size)| (path.clone(), *size));
+    let first = grown.next();
+    assert!(
+        grown.next().is_none(),
+        "one transfer grows one file; more than one means the snapshot is not what it claims"
+    );
+    first
+}
+
+/// [`growing_file`], for a caller that has already waited for it to exist.
+fn require_growing_file(now: &Files, before: &Files) -> (PathBuf, u64) {
+    growing_file(now, before).unwrap_or_else(|| {
+        panic!(
+            "the transfer must be growing a file by now, but the mirror root holds: {}",
+            describe_files_of(now)
+        )
+    })
+}
+
+/// [`describe_files`] for a snapshot whose root is not at hand.
+fn describe_files_of(files: &Files) -> String {
+    if files.is_empty() {
+        return "(no files)".to_string();
+    }
+    files
+        .iter()
+        .map(|(path, size)| format!("{} ({size} bytes)", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Wait until *this* transfer has written payload, so the interrupt lands
 /// inside the transfer rather than before it.
 ///
@@ -382,10 +436,7 @@ fn wait_for_bytes_in_flight(
     let deadline = Instant::now() + WAIT_LIMIT;
     loop {
         let now = snapshot(mirror);
-        let progressed = now
-            .iter()
-            .any(|(path, size)| *size > 0 && before.get(path) != Some(size));
-        if progressed {
+        if growing_file(&now, before).is_some() {
             return now;
         }
         if let Some(status) = child.try_wait().expect("poll the transfer") {
@@ -537,11 +588,22 @@ fn interrupted_first_transfer_publishes_no_target_file() {
 
     let (mut child, log) = start_throttled_transfer(&mirror, "interrupted");
     let in_flight = wait_for_bytes_in_flight(&mirror, &before, &mut child, &log);
+    let (parked, parked_len) = require_growing_file(&in_flight, &before);
+    assert_ne!(
+        parked,
+        mirror.target(),
+        "the transfer must be writing to its parked temp file, not to the session's real name, \
+         when it is interrupted"
+    );
     assert!(
-        !in_flight.contains_key(&mirror.target()),
-        "the transfer must be writing to its parked temp file, not to the session's real \
-         name, when it is interrupted: {}",
-        describe_files(&mirror.scan_root, &in_flight)
+        !mirror.target().exists(),
+        "the session's real name must not exist while the transfer is running: {}",
+        mirror.target().display()
+    );
+    assert!(
+        parked_len > 0,
+        "the fragment must carry payload before it is interrupted: {}",
+        parked.display()
     );
     interrupt_and_settle(&mut child, &log);
 
@@ -573,10 +635,15 @@ fn interrupted_overwrite_preserves_the_previous_complete_file() {
 
     let (mut child, log) = start_throttled_transfer(&mirror, "interrupted-overwrite");
     let in_flight = wait_for_bytes_in_flight(&mirror, &before, &mut child, &log);
-    assert!(
-        in_flight.keys().any(|path| path != &target),
-        "the transfer must have a parked temp file in flight when it is interrupted: {}",
-        describe_files(&mirror.scan_root, &in_flight)
+    let (parked, _) = require_growing_file(&in_flight, &before);
+    assert_ne!(
+        parked, target,
+        "the transfer must be overwriting through a parked temp file, not in place"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read the published session mid-transfer"),
+        published,
+        "the previous complete file must still be its own bytes while the overwrite runs"
     );
     interrupt_and_settle(&mut child, &log);
 
@@ -601,8 +668,13 @@ fn interrupted_overwrite_preserves_the_previous_complete_file() {
     );
 }
 
-/// P2: on the next index the connector sees nothing at all — neither the
-/// session's real name nor `rsync`'s parked temp fragment counts as a session.
+/// P2 (live window and after): the connector sees no session, neither in
+/// `rsync`'s parked temp fragment while the transfer is still running nor at
+/// the session's real name once it has been interrupted.
+///
+/// The window half is taken against the fragment the transfer is really
+/// writing — named from the in-flight snapshot — not against a file this test
+/// wrote to look like one.
 #[test]
 fn interrupted_transfer_is_invisible_to_the_connector() {
     let mirror = Mirror::new("laptop", "~/.codex");
@@ -611,7 +683,70 @@ fn interrupted_transfer_is_invisible_to_the_connector() {
     let before = snapshot(&mirror);
 
     let (mut child, log) = start_throttled_transfer(&mirror, "interrupted-discovery");
-    wait_for_bytes_in_flight(&mirror, &before, &mut child, &log);
+    let in_flight = wait_for_bytes_in_flight(&mirror, &before, &mut child, &log);
+    let (parked, parked_len) = require_growing_file(&in_flight, &before);
+    assert_eq!(
+        parked.parent(),
+        mirror.target().parent(),
+        "rsync parks its temp file beside the destination, so the fragment under test has to be \
+         in the destination's own directory: {}",
+        parked.display()
+    );
+    assert_ne!(
+        parked,
+        mirror.target(),
+        "the growing file must be the parked temp, not the session's real name"
+    );
+    assert!(
+        !mirror.target().exists(),
+        "the session's real name must not exist while its transfer is still running: {}",
+        mirror.target().display()
+    );
+
+    // Why the fragment is harmless, stated over the fragment itself rather
+    // than assumed: rsync parks it as `.<destination name>.XXXXXX`, and the
+    // codex connector's rollout rule needs a name that *starts* with
+    // `rollout-`. The observed name is in the message either way.
+    let parked_name = parked
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("the parked fragment has no name: {}", parked.display()));
+    let target_name = mirror
+        .target()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the session's real name is not empty")
+        .to_string();
+    assert!(
+        parked_name.starts_with(&format!(".{target_name}.")),
+        "rsync's parked temp file is `.{target_name}.XXXXXX`; observed `{parked_name}` \
+         ({parked_len} bytes)"
+    );
+    assert!(
+        !parked_name.starts_with("rollout-"),
+        "the connector's rollout rule cannot match `{parked_name}`, which is why the live \
+         fragment is invisible while a truncated file at `{target_name}` would not be"
+    );
+
+    // The live window, handed to the connector that the indexer itself uses.
+    let discovered_mid_transfer = discovered_paths(&mirror);
+    assert!(
+        !discovered_mid_transfer.contains(&parked),
+        "the connector must not treat rsync's parked temp fragment as a session, but it \
+         discovered {discovered_mid_transfer:?} including {} ({parked_len} bytes)",
+        parked.display()
+    );
+    assert!(
+        discovered_mid_transfer.is_empty(),
+        "mid-transfer the mirror root holds only the parked fragment, so the connector must \
+         discover nothing, found {discovered_mid_transfer:?}"
+    );
+    assert_eq!(
+        parsed_counts(&mirror),
+        (0, 0),
+        "the connector must not present a half-transferred session as a complete one"
+    );
+
     interrupt_and_settle(&mut child, &log);
 
     let discovered = discovered_paths(&mirror);
@@ -628,20 +763,6 @@ fn interrupted_transfer_is_invisible_to_the_connector() {
         (0, 0),
         "the connector must parse no conversation out of an interrupted mirror root"
     );
-
-    // The instrument itself: the parked temp name is not a shape the codex
-    // connector matches, which is why the fragment above is harmless while a
-    // truncated file at the real name would not be.
-    let parked = mirror
-        .scan_root
-        .join("sessions/2025/11/25/.rollout-test.jsonl.aB3xYz");
-    std::fs::write(&parked, b"{\"type\":\"session_meta\"}\n").expect("write a parked fragment");
-    assert!(
-        discovered_paths(&mirror).is_empty(),
-        "a parked rsync temp file must not be discovered as a session: {}",
-        parked.display()
-    );
-    std::fs::remove_file(&parked).expect("remove the parked fragment");
 }
 
 /// P2 (second half) and P4: retrying the same transfer after the interruption
@@ -655,7 +776,13 @@ fn retry_after_interruption_publishes_a_complete_discoverable_session() {
     let before = snapshot(&mirror);
 
     let (mut child, log) = start_throttled_transfer(&mirror, "interrupted-then-retried");
-    wait_for_bytes_in_flight(&mirror, &before, &mut child, &log);
+    let in_flight = wait_for_bytes_in_flight(&mirror, &before, &mut child, &log);
+    let (parked, _) = require_growing_file(&in_flight, &before);
+    assert_ne!(
+        parked,
+        mirror.target(),
+        "the retried transfer must also park its fragment beside the destination"
+    );
     interrupt_and_settle(&mut child, &log);
     assert!(
         regular_files_under(&mirror.scan_root).is_empty(),
