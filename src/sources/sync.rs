@@ -888,14 +888,10 @@ impl SyncEngine {
     ///
     /// A source that declares `mirror_dir` mirrors there instead of under
     /// `data_dir/remotes/<name>/mirror`; a source that does not keeps the
-    /// baseline layout exactly (PR8 hard constraint 11).
+    /// baseline layout exactly (PR8 hard constraint 11). The derivation is
+    /// shared with the index side through [`mirror_root_for`].
     pub fn mirror_dir(&self, source: &SourceDefinition) -> PathBuf {
-        source.effective_mirror_dir().unwrap_or_else(|| {
-            self.local_store
-                .join("remotes")
-                .join(&source.name)
-                .join("mirror")
-        })
+        mirror_root_for(source, &self.local_store)
     }
 
     /// The directory writes are authorized against by [`prepare_local_sync_root`].
@@ -1182,7 +1178,7 @@ impl SyncEngine {
     ) -> PathSyncResult {
         let start = Instant::now();
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = mirror_path_under(dest_dir, remote_path);
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1207,10 +1203,10 @@ impl SyncEngine {
             );
         }
 
-        // Convert remote path to safe local directory name
-        // Use raw remote_path for stability (independent of home expansion success)
-        let safe_name = path_to_safe_dirname(remote_path);
-        let local_path = dest_dir.join(&safe_name);
+        // Name the mirror directory from the raw remote_path (independent of
+        // home expansion success), through the one function the index side
+        // also uses to find it.
+        let local_path = mirror_path_under(dest_dir, remote_path);
 
         // Create local directory without following any pre-existing mirror symlink.
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
@@ -1398,7 +1394,7 @@ impl SyncEngine {
         let start = Instant::now();
 
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = mirror_path_under(dest_dir, remote_path);
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1413,8 +1409,7 @@ impl SyncEngine {
         }
 
         let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
-        let safe_name = path_to_safe_dirname(remote_path);
-        let local_path = dest_dir.join(&safe_name);
+        let local_path = mirror_path_under(dest_dir, remote_path);
 
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
             return PathSyncResult {
@@ -1570,7 +1565,7 @@ impl SyncEngine {
         let start = Instant::now();
 
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = mirror_path_under(dest_dir, remote_path);
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1585,8 +1580,7 @@ impl SyncEngine {
         }
 
         let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
-        let safe_name = path_to_safe_dirname(remote_path);
-        let local_path = dest_dir.join(&safe_name);
+        let local_path = mirror_path_under(dest_dir, remote_path);
 
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
             return PathSyncResult {
@@ -1906,7 +1900,7 @@ impl SyncEngine {
     ) -> PathSyncResult {
         let start = Instant::now();
         if remote_path.starts_with('~') && remote_home.is_none() {
-            let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+            let local_path = mirror_path_under(dest_dir, remote_path);
             return PathSyncResult {
                 remote_path: remote_path.to_string(),
                 local_path,
@@ -1920,8 +1914,10 @@ impl SyncEngine {
             };
         }
         let expanded_path = Self::expand_tilde_with_home(remote_path, remote_home);
-        // Use raw remote_path for stability (independent of home expansion success)
-        let local_path = dest_dir.join(path_to_safe_dirname(remote_path));
+        // Name the mirror directory from the raw remote_path (independent of
+        // home expansion success), through the one function the index side
+        // also uses to find it.
+        let local_path = mirror_path_under(dest_dir, remote_path);
 
         // Create local directory without following any pre-existing mirror symlink.
         if let Err(e) = prepare_local_sync_container(dest_dir, &local_path) {
@@ -2534,6 +2530,32 @@ fn expand_tilde_local(path: &str) -> String {
         return home.display().to_string();
     }
     path.to_string()
+}
+
+/// The mirror root a source's per-path directories live under: the explicit
+/// `mirror_dir` when the source declares one, `data_dir/remotes/<name>/mirror`
+/// otherwise (PR8 hard constraint 11).
+pub fn mirror_root_for(source: &SourceDefinition, data_dir: &Path) -> PathBuf {
+    source
+        .effective_mirror_dir()
+        .unwrap_or_else(|| data_dir.join("remotes").join(&source.name).join("mirror"))
+}
+
+/// The directory one **raw** remote path mirrors into under `mirror_root`.
+///
+/// The name comes from the configured spelling, never from the home-expanded
+/// path, and the configured spelling is the whole input: `~` and `~/` may mean
+/// the same place on the remote, but they are two different strings and so two
+/// different directory names here (`root_<h("~")>` vs `root_<h("~/")>`). The
+/// sync writer and the index-side candidate search both route through this one
+/// function, which is the whole reason a transfer can no longer succeed into a
+/// directory the index does not look at.
+///
+/// `mirror_root_for` supplies the root for both sides; together the two are
+/// "source definition + data dir + raw remote path -> primary mirror
+/// directory".
+pub fn mirror_path_under(mirror_root: &Path, remote_path: &str) -> PathBuf {
+    mirror_root.join(path_to_safe_dirname(remote_path))
 }
 
 /// Convert a remote path to a safe directory name.
