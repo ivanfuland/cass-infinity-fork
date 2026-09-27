@@ -343,6 +343,25 @@ fn source_root_prefix() -> String {
     format!("cfg:{SOURCE_NAME}:")
 }
 
+/// One line per observation, `w10_mirror_select`'s convention: what a pass did
+/// to the two tables and to the archive is then reproducible from
+/// `cargo test -- --nocapture` instead of only asserted. Restricted to the two
+/// connectors the claims are about — the other ~20 connectors in this root
+/// write their own rows on every run and would bury them.
+fn observe(label: &str, db_path: &Path, streaming: bool, parsed: Option<u64>) -> String {
+    let watermarks = root_rows(db_path, ROOT_WATERMARK_ROWS, &source_root_prefix());
+    let states = root_rows(db_path, ROOT_FILE_STATE_ROWS, &source_root_prefix());
+    let mut keep = rows_of(&watermarks, "claude");
+    keep.extend(rows_of(&watermarks, IDLE_CONNECTOR));
+    let mut state_keep = rows_of(&states, "claude");
+    state_keep.extend(rows_of(&states, IDLE_CONNECTOR));
+    format!(
+        "[{label} streaming={streaming}] parsed_this_run={parsed:?} \
+         conversations={} watermarks={keep:?} file_state={state_keep:?}",
+        db_scalar(db_path, CONVERSATIONS),
+    )
+}
+
 /// One `(size, mtime, last_seen_ts)` record for `(connector, relative_path)`,
 /// or `None` when the root holds no such row. The record is what the next run's
 /// comparison runs on, so it is the end-to-end evidence that a pass read — or
@@ -498,11 +517,16 @@ fn deleted_mirror_file_loses_its_state_and_reappears_as_new() {
         let seeded_watermarks =
             root_rows(&env.db_path(), ROOT_WATERMARK_ROWS, &source_root_prefix());
         let seeded_states = root_rows(&env.db_path(), ROOT_FILE_STATE_ROWS, &source_root_prefix());
+        println!(
+            "[mirror root {root_id}] {}",
+            observe("pass1+seed", &env.db_path(), streaming, Some(parsed_first))
+        );
 
         // The far machine deletes one session.
         std::fs::remove_file(&alpha).expect("delete the mirrored session");
 
         let second = env.index_ok();
+        println!("{}", observe("pass2", &env.db_path(), streaming, Some(0)));
         assert_eq!(
             db_scalar(&env.db_path(), CONVERSATIONS),
             conversations,
@@ -552,6 +576,15 @@ fn deleted_mirror_file_loses_its_state_and_reappears_as_new() {
         );
 
         let third = env.index_ok();
+        println!(
+            "{}",
+            observe(
+                "pass3",
+                &env.db_path(),
+                streaming,
+                Some(parsed_this_run(&third))
+            )
+        );
         assert_eq!(
             parsed_this_run(&third),
             1,
@@ -622,8 +655,17 @@ fn failed_watermark_write_rolls_back_both_tables_and_the_rerun_commits() {
             SystemTime::now() - Duration::from_secs(7_200),
         );
 
+        println!(
+            "[mirror root {root_id}] {}",
+            observe("pre-failure+seed", &env.db_path(), streaming, None)
+        );
+
         install_watermark_failure(&env.db_path(), &root_id);
         let (code, stdout, stderr) = env.index_raw();
+        println!(
+            "{} (exit code {code})",
+            observe("after-failed-run", &env.db_path(), streaming, None)
+        );
         assert_ne!(
             code, 0,
             "a storage failure while committing the root must fail `cass index`, \
@@ -664,6 +706,15 @@ fn failed_watermark_write_rolls_back_both_tables_and_the_rerun_commits() {
         // Recovery: the same scan, without the fault, commits.
         drop_watermark_failure(&env.db_path());
         let recovered = env.index_ok();
+        println!(
+            "{}",
+            observe(
+                "after-recovery",
+                &env.db_path(),
+                streaming,
+                Some(parsed_this_run(&recovered))
+            )
+        );
         assert!(
             parsed_this_run(&recovered) >= 1,
             "the file the failed run could not commit must come back on the rerun: {recovered}"
