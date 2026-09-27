@@ -5937,6 +5937,86 @@ impl FrankenStorage {
         Ok(())
     }
 
+    /// PR10 task 04 (spec hard constraint 11): commit one **mirror root**'s
+    /// clean enumeration in a single transaction.
+    ///
+    /// Three writes, in this order, every one of them scoped to
+    /// `(root_id, connector)`: drop the recorded paths this enumeration did
+    /// not find, upsert the files this run parsed, and advance the root's
+    /// watermark. The watermark goes last because it is the run's "everything
+    /// under this root has been seen" claim; a failure before it rolls the
+    /// whole transaction back, so the next run re-enumerates and re-parses
+    /// instead of skipping files it never read.
+    ///
+    /// `discovered_paths` (the whole enumeration) and `changed_files` (the
+    /// subset handed to the connector) answer different questions and both are
+    /// needed: a recorded path missing from the enumeration is a file that
+    /// disappeared from the mirror and loses its row, while a path merely
+    /// handed over is a state to write.
+    ///
+    /// The deletes are issued one path at a time on purpose: a single
+    /// `NOT IN (...)` would be a statement whose parameter count grows with the
+    /// size of the root. This is a mirror-root-only entry point -- callers
+    /// that want the baseline per-root behaviour keep
+    /// [`Self::set_scan_watermark`] + [`Self::upsert_scan_file_state`].
+    pub fn commit_mirror_root_scan_state(
+        &self,
+        root_id: &str,
+        connector: &str,
+        discovered_paths: &[String],
+        changed_files: &[(String, i64, i64)],
+        watermark_ts: i64,
+    ) -> Result<()> {
+        self.conn.with_tx_no_replay(
+            TxMode::Immediate,
+            |tx| -> Result<(), StorageError> {
+                (|| -> Result<()> {
+                    let recorded: Vec<String> = tx.query_all_map(
+                        "SELECT relative_path FROM scan_file_state
+                         WHERE root_id = ?1 AND connector = ?2",
+                        fparams![root_id, connector],
+                        |row| row.get_typed(0),
+                    )?;
+                    let discovered: HashSet<&str> =
+                        discovered_paths.iter().map(String::as_str).collect();
+                    for relative_path in &recorded {
+                        if discovered.contains(relative_path.as_str()) {
+                            continue;
+                        }
+                        tx.execute(
+                            "DELETE FROM scan_file_state
+                             WHERE root_id = ?1 AND connector = ?2 AND relative_path = ?3",
+                            fparams![root_id, connector, relative_path.as_str()],
+                        )?;
+                    }
+                    for (relative_path, size, mtime) in changed_files {
+                        tx.execute(
+                            "INSERT OR REPLACE INTO scan_file_state
+                             (root_id, connector, relative_path, size, mtime, last_seen_ts)
+                             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                            fparams![
+                                root_id,
+                                connector,
+                                relative_path.as_str(),
+                                *size,
+                                *mtime,
+                                watermark_ts
+                            ],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT OR REPLACE INTO scan_watermarks(root_id, connector, last_scan_ts)
+                         VALUES(?1, ?2, ?3)",
+                        fparams![root_id, connector, watermark_ts],
+                    )?;
+                    Ok(())
+                })()
+                .map_err(anyhow_error_into_storage_error)
+            },
+        )?;
+        Ok(())
+    }
+
     /// Snapshot every scan watermark (global `last_scan_ts` + all per-connector
     /// rows) as raw meta rows, so a run that deferred conversations can restore
     /// them verbatim instead of advancing past unindexed sources.

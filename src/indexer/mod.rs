@@ -9349,10 +9349,21 @@ struct RootScanOutcome {
     /// that exist" -- `succeeded` is what separates a genuinely empty
     /// enumeration from an unread one.
     discovered_paths: Vec<String>,
+    /// PR10 task 04 (spec hard constraint 11): this root is an explicitly
+    /// configured SSH mirror root, so its clean scan commits through the
+    /// transactional path -- absent paths dropped, changed files written and
+    /// the watermark advanced together, with a failure reaching the caller
+    /// instead of being logged and swallowed.
+    ///
+    /// Carried on the outcome because the persist stage runs long after the
+    /// root's plan is out of scope. It is `false` for every other root kind
+    /// (home roots, machine-local configured roots, the DB-registered
+    /// fallback), which keep the baseline write-it-and-warn path.
+    mirror_root: bool,
 }
 
 impl RootScanOutcome {
-    fn failed(connector: &str, root_id: &str) -> Self {
+    fn failed(connector: &str, root_id: &str, mirror_root: bool) -> Self {
         Self {
             connector: connector.to_string(),
             root_id: root_id.to_string(),
@@ -9360,16 +9371,22 @@ impl RootScanOutcome {
             error: None,
             files: Vec::new(),
             discovered_paths: Vec::new(),
+            mirror_root,
         }
     }
 
     /// A root that failed for a reason the run should carry, not just a
     /// false `succeeded`: the caller sees the failure and this root's
     /// watermark and file states both stay where they were.
-    fn failed_with_error(connector: &str, root_id: &str, error: impl Into<String>) -> Self {
+    fn failed_with_error(
+        connector: &str,
+        root_id: &str,
+        mirror_root: bool,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             error: Some(error.into()),
-            ..Self::failed(connector, root_id)
+            ..Self::failed(connector, root_id, mirror_root)
         }
     }
 }
@@ -9647,7 +9664,10 @@ fn run_local_root_scan(
                 error = %error,
                 "scan root discovery failed"
             );
-            return (RootScanOutcome::failed(connector_name, &root_id), None);
+            return (
+                RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
+                None,
+            );
         }
     };
 
@@ -9676,6 +9696,7 @@ fn run_local_root_scan(
                 RootScanOutcome::failed_with_error(
                     connector_name,
                     &root_id,
+                    plan.meta.mirror_root,
                     format!(
                         "discovered source {} is not under scan root {}",
                         discovered_file.source_path.display(),
@@ -9724,6 +9745,7 @@ fn run_local_root_scan(
                     error: None,
                     files: Vec::new(),
                     discovered_paths,
+                    mirror_root: plan.meta.mirror_root,
                 },
                 None,
             );
@@ -9792,10 +9814,14 @@ fn run_local_root_scan(
                 error: None,
                 files: scanned_files,
                 discovered_paths,
+                mirror_root: plan.meta.mirror_root,
             },
             None,
         ),
-        Ok(()) => (RootScanOutcome::failed(connector_name, &root_id), fatal),
+        Ok(()) => (
+            RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
+            fatal,
+        ),
         Err(error) => {
             tracing::warn!(
                 connector = connector_name,
@@ -9806,7 +9832,7 @@ fn run_local_root_scan(
             (
                 RootScanOutcome {
                     error: Some(error.to_string()),
-                    ..RootScanOutcome::failed(connector_name, &root_id)
+                    ..RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root)
                 },
                 fatal,
             )
@@ -9821,6 +9847,12 @@ fn run_local_root_scan(
 /// skips are in force, or when a root's own scan failed -- for a failing root
 /// *both* its watermark and its file states stay where they were (hard
 /// constraint 5).
+///
+/// An explicit SSH mirror root (PR10 task 04) takes the transactional branch
+/// inside the loop: its absent-path deletes, changed-file writes and watermark
+/// all commit together and a failure propagates to the caller. Every other
+/// root keeps the baseline per-row writes and their warning-only error
+/// handling.
 fn persist_root_scan_outcomes(
     storage: &FrankenStorage,
     outcomes: &[RootScanOutcome],
@@ -9842,6 +9874,33 @@ fn persist_root_scan_outcomes(
         else {
             continue;
         };
+        if outcome.mirror_root {
+            // PR10 task 04 (spec hard constraint 11): an explicit SSH mirror
+            // root commits its whole enumeration as one transaction, and a
+            // failure there is this run's failure. The two things the old
+            // branch below cannot do are the reason it is a separate path:
+            // clearing the state of paths that disappeared from the mirror
+            // (without touching another connector's rows for the same root),
+            // and refusing to report a clean run when that write did not land.
+            // A warning-only success here would advance nothing today and
+            // silently re-read nothing tomorrow -- the failure has to reach
+            // `cass index`'s exit code.
+            persist::with_ephemeral_writer(
+                storage,
+                false,
+                "committing a mirror root's scan state",
+                |writer| {
+                    writer.commit_mirror_root_scan_state(
+                        &outcome.root_id,
+                        &outcome.connector,
+                        &outcome.discovered_paths,
+                        &outcome.files,
+                        watermark_ts,
+                    )
+                },
+            )?;
+            continue;
+        }
         if let Err(error) = persist::with_ephemeral_writer(
             storage,
             false,
