@@ -647,11 +647,22 @@ fn new_root_never_bootstraps() {
     });
 }
 
-/// AC-6: ssh mirror roots and `full_scan` sources keep scanning the whole root,
-/// so a file whose mtime predates the watermark is still ingested.
+/// AC-6: an ssh mirror root keeps its own per-root watermark and per-file state
+/// and still ingests a file whose mtime predates the watermark, while a
+/// `full_scan` source keeps scanning the whole root on every run and keeps no
+/// per-root watermark at all.
+///
+/// PR10 task 03 split this case, which was
+/// `mirror_and_full_scan_roots_ignore_watermark` through PR8. Both halves used
+/// to be read in full on every run. The mirror half changed with PR10 hard
+/// constraint 9, because a mirrored file carries the *far* machine's mtime, so
+/// the watermark is not a sound cutoff for it and the recorded per-file state
+/// decides instead (spec AC-7: the same case with a same-size, earlier-mtime
+/// rewrite belongs to `w10_mirror_select`). The `full_scan` half is unchanged
+/// on purpose: that source asked for a whole-root scan, and it still gets one.
 #[test]
 #[serial]
-fn mirror_and_full_scan_roots_ignore_watermark() {
+fn mirror_root_tracks_state_while_full_scan_ignores_watermark() {
     for_each_scan_path(|_streaming| {
         let fixture = Fixture::new("mirror-full-scan");
         let mirror_base = fixture.root.join("mirror-base");
@@ -685,7 +696,16 @@ fn mirror_and_full_scan_roots_ignore_watermark() {
         fixture.index(false, None, None);
         assert!(
             conversation_count(&fixture.db_path()) > before_count,
-            "a mirror root must be scanned in full on every run (before {before_count})"
+            "a file new to the mirror must be ingested even though its mtime predates the \
+             root's watermark (before {before_count})"
+        );
+        assert!(
+            !watermarks(&fixture.db_path(), "cfg:ivanmac:").is_empty(),
+            "an ssh mirror root must keep its own per-root watermark"
+        );
+        assert!(
+            !file_states(&fixture.db_path(), "cfg:ivanmac:").is_empty(),
+            "an ssh mirror root must record the per-file state its next run compares against"
         );
 
         // A `full_scan` local source behaves the same way.
@@ -712,8 +732,9 @@ fn mirror_and_full_scan_roots_ignore_watermark() {
             "a full_scan source must not keep per-root watermarks"
         );
         assert!(
-            watermarks(&fixture.db_path(), "cfg:ivanmac:").is_empty(),
-            "an ssh mirror root must not keep per-root watermarks either"
+            !watermarks(&fixture.db_path(), "cfg:ivanmac:").is_empty(),
+            "the incremental mirror root is the contrast: it keeps its own watermark \
+             while the full_scan source keeps none"
         );
     });
 }
