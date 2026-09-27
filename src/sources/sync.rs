@@ -142,6 +142,26 @@ fn remote_spec_for_rsync(host: &str, remote_path: &str) -> String {
     format!("{host}:{remote_path}")
 }
 
+/// The transfer flags every rsync transport in this module passes.
+///
+/// Both the GNU and the WSL transport consume this one list, so a flag cannot
+/// end up on one and not the other.
+///
+/// The list deliberately leaves out `--partial`. With it, an interrupted
+/// transfer keeps its partial data by renaming the in-progress temp file onto
+/// the destination — which publishes a truncated file under the session's real
+/// name, and a mirror root is a scan root, so the next index reads that stub
+/// as a session. Without it rsync parks the partial data in a temp file beside
+/// the destination and leaves the destination itself alone until the transfer
+/// completes, so an interrupted overwrite leaves the previous complete file
+/// byte for byte.
+///
+/// That behaviour is pinned by `tests/w10_sync_publication.rs`, which
+/// interrupts a throttled transfer of this exact flag vector and then asks the
+/// connector what it can see.
+#[doc(hidden)]
+pub const RSYNC_TRANSFER_FLAGS: [&str; 4] = ["-avz", "--links", "--safe-links", "--stats"];
+
 fn run_rsync_command(
     timeout_str: &str,
     ssh_opts: &str,
@@ -150,7 +170,7 @@ fn run_rsync_command(
     arg_protection: RsyncArgProtection,
 ) -> std::io::Result<std::process::Output> {
     let mut cmd = Command::new("rsync");
-    cmd.args(["-avz", "--links", "--safe-links", "--stats", "--partial"]);
+    cmd.args(RSYNC_TRANSFER_FLAGS);
     if let Some(flag) = arg_protection.flag() {
         cmd.arg(flag);
     }
@@ -1446,14 +1466,8 @@ impl SyncEngine {
         let timeout_str = self.transfer_timeout.to_string();
 
         let mut cmd = Command::new("wsl");
-        cmd.args([
-            "rsync",
-            "-avz",
-            "--links",
-            "--safe-links",
-            "--stats",
-            "--partial",
-        ]);
+        cmd.args(["rsync"]);
+        cmd.args(RSYNC_TRANSFER_FLAGS);
         // WSL rsync is the real rsync (not openrsync), so --protect-args is safe.
         cmd.arg("--protect-args");
         cmd.args([
