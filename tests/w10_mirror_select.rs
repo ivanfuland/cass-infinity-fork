@@ -27,7 +27,9 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use coding_agent_search::sources::config::SourceDefinition;
+use coding_agent_search::sources::provenance::Source;
 use coding_agent_search::sources::sync::{SyncEngine, mirror_path_under, path_to_safe_dirname};
+use coding_agent_search::storage::api::Value;
 use coding_agent_search::storage::sqlite::FrankenStorage;
 
 /// The in-tree claude_code fixture: 1 conversation / 2 messages, so a pass
@@ -41,6 +43,12 @@ const CLAUDE_FIXTURE: &str = "claude_code_real/projects/-test-project/agent-test
 const REMOTE_PATH: &str = "~/.claude/projects";
 
 const SOURCE_NAME: &str = "laptop";
+
+/// The id of the source registered in the database for the fallback case. It is
+/// deliberately *not* [`SOURCE_NAME`]: the fallback is keyed off the DB row's
+/// id, and reusing the configured name would make the two derivations look
+/// alike in the assertions.
+const FALLBACK_SOURCE_ID: &str = "db-registered-laptop";
 
 /// The two spells a same-size rewrite swaps between: the fixture's own word
 /// and a replacement of the same length.
@@ -264,14 +272,27 @@ fn table_rows(db_path: &Path, sql: &str) -> Vec<String> {
         .unwrap_or_else(|e| panic!("query {sql:?}: {e}"))
 }
 
+/// [`table_rows`] with a `root_id` prefix bound to `?1`.
+fn root_rows(db_path: &Path, sql: &str, root_prefix: &str) -> Vec<String> {
+    let storage = FrankenStorage::open_readonly(db_path).expect("open corpus read-only");
+    storage
+        .raw()
+        .query_all_map(sql, &[Value::from(format!("{root_prefix}%"))], |row| {
+            row.get_typed::<String>(0)
+        })
+        .unwrap_or_else(|e| panic!("query {sql:?}: {e}"))
+}
+
 const CONVERSATIONS: &str = "SELECT COUNT(*) FROM conversations";
 const MESSAGES: &str = "SELECT COUNT(*) FROM messages";
 
-/// The `cfg:laptop:...` root's own watermark and file-state rows.
-const MIRROR_WATERMARK_ROWS: &str = "SELECT root_id || '|' || connector || '|' || last_scan_ts \
-     FROM scan_watermarks WHERE root_id LIKE 'cfg:laptop:%' ORDER BY root_id, connector";
-const MIRROR_FILE_STATE_ROWS: &str = "SELECT root_id || '|' || connector || '|' || relative_path \
-     || '|' || size || '|' || mtime FROM scan_file_state WHERE root_id LIKE 'cfg:laptop:%' \
+/// One root's own watermark and file-state rows. Both are read by `root_id`
+/// prefix so the same projection can ask about the incremental mirror root and
+/// about the root kinds that must not have rows at all.
+const ROOT_WATERMARK_ROWS: &str = "SELECT root_id || '|' || connector || '|' || last_scan_ts \
+     FROM scan_watermarks WHERE root_id LIKE ?1 ORDER BY root_id, connector";
+const ROOT_FILE_STATE_ROWS: &str = "SELECT root_id || '|' || connector || '|' || relative_path \
+     || '|' || size || '|' || mtime FROM scan_file_state WHERE root_id LIKE ?1 \
      ORDER BY root_id, connector, relative_path";
 
 /// The `relative_path` the tests put the in-tree fixture at, inside the mirror
@@ -298,15 +319,54 @@ fn fs_stamp(path: &Path) -> (i64, i64) {
 /// the thing the next run's comparison runs on, so it is the end-to-end
 /// evidence that a pass actually read that file.
 fn recorded_mtime(db_path: &Path, relative: &str) -> Option<i64> {
-    table_rows(db_path, MIRROR_FILE_STATE_ROWS)
-        .into_iter()
-        .find_map(|row| {
-            let fields: Vec<&str> = row.split('|').collect();
-            if fields.get(2) != Some(&relative) {
-                return None;
-            }
-            fields.get(4)?.parse::<i64>().ok()
-        })
+    root_rows(
+        db_path,
+        ROOT_FILE_STATE_ROWS,
+        &format!("cfg:{SOURCE_NAME}:"),
+    )
+    .into_iter()
+    .find_map(|row| {
+        let fields: Vec<&str> = row.split('|').collect();
+        if fields.get(2) != Some(&relative) {
+            return None;
+        }
+        fields.get(4)?.parse::<i64>().ok()
+    })
+}
+
+/// The mirror directory the **DB-registered fallback** in
+/// `build_scan_roots_with_meta` derives for a remote source with no
+/// `config_json.paths`: `<data_dir>/remotes/<id>/mirror` (`src/indexer/mod.rs`,
+/// the "Remote mirror directory" arm of the fallback).
+///
+/// Derived here rather than through `SyncEngine::prepare_mirror_root`: that
+/// writer is the *explicit-config* path and would be circular evidence for a
+/// case whose whole subject is that the fallback finds the directory by itself.
+fn fallback_mirror_dir(data_dir: &Path, source_id: &str) -> PathBuf {
+    data_dir.join("remotes").join(source_id).join("mirror")
+}
+
+/// Register one remote source in `data_dir`'s archive the way the registry
+/// holds it once the first ingest has run.
+///
+/// Deliberately **no `config_json`**, and that is a finding rather than a
+/// shortcut. With `config_json.paths` present the first pass derives
+/// `<mirror>/<safe dirname>` and the second derives `<mirror>`: ingesting a
+/// session whose `source_id` is new upserts a placeholder `Source` with
+/// `config_json: None` (`src/storage/sqlite.rs`, the `known_sources` arm), and
+/// `upsert_source`'s `ON CONFLICT ... DO UPDATE SET config_json =
+/// excluded.config_json` lets that NULL overwrite the registered paths. The
+/// root changes between passes, claude's `external_id_root` changes with it,
+/// and the second pass dies on `E-MANIFEST-SESSION-KEY-CONFLICT` from
+/// `raw_mirror`'s session-key merge. Reported to the control plane; fixing it
+/// would change product scan rules, which this task does not own.
+fn register_fallback_source(data_dir: &Path, source_id: &str) {
+    let db_path = data_dir.join("agent_search.db");
+    let storage = FrankenStorage::open(&db_path).expect("open the archive to register a source");
+    storage
+        .upsert_source(&Source::remote(source_id, source_id))
+        .expect("register the remote source");
+    storage.close().expect("close the archive");
 }
 
 // ---------------------------------------------------------------------------
@@ -338,8 +398,16 @@ fn unchanged_mirror_second_pass_parses_nothing() {
         );
         assert!(messages > 0, "the mirrored session must bring messages");
 
-        let watermarks = table_rows(&env.db_path(), MIRROR_WATERMARK_ROWS);
-        let states = table_rows(&env.db_path(), MIRROR_FILE_STATE_ROWS);
+        let watermarks = root_rows(
+            &env.db_path(),
+            ROOT_WATERMARK_ROWS,
+            &format!("cfg:{SOURCE_NAME}:"),
+        );
+        let states = root_rows(
+            &env.db_path(),
+            ROOT_FILE_STATE_ROWS,
+            &format!("cfg:{SOURCE_NAME}:"),
+        );
         assert!(
             !watermarks.is_empty(),
             "an explicit ssh mirror root must keep a per-root watermark, got none"
@@ -366,7 +434,11 @@ fn unchanged_mirror_second_pass_parses_nothing() {
             "a no-op pass must not add a message"
         );
         assert_eq!(
-            table_rows(&env.db_path(), MIRROR_FILE_STATE_ROWS),
+            root_rows(
+                &env.db_path(),
+                ROOT_FILE_STATE_ROWS,
+                &format!("cfg:{SOURCE_NAME}:")
+            ),
             states,
             "a clean pass with nothing to re-read must not rewrite the file state"
         );
@@ -509,7 +581,12 @@ fn full_scan_mirror_still_reads_the_whole_root_every_run() {
             "the first pass must read the mirror: {first}"
         );
         assert!(
-            table_rows(&env.db_path(), MIRROR_WATERMARK_ROWS).is_empty(),
+            root_rows(
+                &env.db_path(),
+                ROOT_WATERMARK_ROWS,
+                &format!("cfg:{SOURCE_NAME}:")
+            )
+            .is_empty(),
             "a full_scan source must not keep a per-root watermark"
         );
 
@@ -521,8 +598,107 @@ fn full_scan_mirror_still_reads_the_whole_root_every_run() {
             "a full_scan source re-reads every file on every run: {second}"
         );
         assert!(
-            table_rows(&env.db_path(), MIRROR_WATERMARK_ROWS).is_empty(),
+            root_rows(
+                &env.db_path(),
+                ROOT_WATERMARK_ROWS,
+                &format!("cfg:{SOURCE_NAME}:")
+            )
+            .is_empty(),
             "a full_scan source must not start keeping watermarks either"
+        );
+    });
+}
+
+/// The DB-registered mirror fallback keeps the baseline full-root scan and
+/// keeps **no** per-root watermark or file state at all: its root carries no
+/// `ScanRootMeta`, so `build_connector_root_plans` never builds a plan for it
+/// and the comparison this task changed is never reached. Hard constraint 9
+/// leaves that path alone on purpose — a source has to be configured in
+/// `sources.toml` to get the incremental treatment.
+///
+/// The evidence is the passes themselves, not the absence of rows: an
+/// unchanged second run still hands the file over, which is what a full-root
+/// scan looks like from the outside. See [`register_fallback_source`] for why
+/// the registry row carries no `config_json.paths`.
+#[test]
+fn db_registered_mirror_fallback_still_full_scans_and_keeps_no_watermark() {
+    for_each_scan_path(|streaming| {
+        let env = Env::new(streaming);
+        // No `sources.toml` at all: `SourcesConfig::load` sees an empty config
+        // and the builder falls through to the registry in the archive.
+        register_fallback_source(&env.data_dir, FALLBACK_SOURCE_ID);
+
+        let mirror = fallback_mirror_dir(&env.data_dir, FALLBACK_SOURCE_ID);
+        write_claude_session(&mirror, SESSION_RELATIVE);
+
+        let first = env.index_ok();
+        let parsed_first = parsed_this_run(&first);
+        assert!(
+            parsed_first >= 1,
+            "the fallback root must be scanned from its own mirror directory: {first}"
+        );
+        let conversations = db_scalar(&env.db_path(), CONVERSATIONS);
+        let messages = db_scalar(&env.db_path(), MESSAGES);
+        assert_eq!(
+            conversations, 1,
+            "the fallback mirror's session must be ingested exactly once: {first}"
+        );
+
+        let root_prefix = format!("cfg:{FALLBACK_SOURCE_ID}:");
+        let first_watermarks = root_rows(&env.db_path(), ROOT_WATERMARK_ROWS, &root_prefix);
+        let first_states = root_rows(&env.db_path(), ROOT_FILE_STATE_ROWS, &root_prefix);
+        println!(
+            "db-fallback pass 1 (streaming={streaming}): parsed_this_run={parsed_first} \
+             conversations={conversations} messages={messages} \
+             watermark_rows={first_watermarks:?} file_state_rows={first_states:?}"
+        );
+        assert!(
+            first_watermarks.is_empty(),
+            "a DB-registered fallback root must not keep a per-root watermark"
+        );
+        assert!(
+            first_states.is_empty(),
+            "a DB-registered fallback root must not record per-file state either"
+        );
+
+        // Nothing changed on disk: an incremental root would hand nothing over.
+        let second = env.index_ok();
+        let second_watermarks = root_rows(&env.db_path(), ROOT_WATERMARK_ROWS, &root_prefix);
+        let second_states = root_rows(&env.db_path(), ROOT_FILE_STATE_ROWS, &root_prefix);
+        println!(
+            "db-fallback pass 2 (streaming={streaming}): parsed_this_run={} \
+             conversations={} messages={} watermark_rows={second_watermarks:?} \
+             file_state_rows={second_states:?}",
+            parsed_this_run(&second),
+            db_scalar(&env.db_path(), CONVERSATIONS),
+            db_scalar(&env.db_path(), MESSAGES),
+        );
+        assert!(
+            parsed_this_run(&second) > 0,
+            "the fallback is re-read in full on every run, not skipped: {second}"
+        );
+        assert_eq!(
+            parsed_this_run(&second),
+            parsed_first,
+            "the whole root is read again, so the same files come back: {second}"
+        );
+        assert_eq!(
+            db_scalar(&env.db_path(), CONVERSATIONS),
+            conversations,
+            "re-reading must not duplicate a session: {second}"
+        );
+        assert_eq!(
+            db_scalar(&env.db_path(), MESSAGES),
+            messages,
+            "re-reading must not duplicate a message: {second}"
+        );
+        assert!(
+            second_watermarks.is_empty(),
+            "a second full scan must not start keeping watermarks either"
+        );
+        assert!(
+            second_states.is_empty(),
+            "a second full scan must not start recording per-file state either"
         );
     });
 }
@@ -531,43 +707,66 @@ fn full_scan_mirror_still_reads_the_whole_root_every_run() {
 // S3 — the path spellings keep the state the comparison depends on
 // ---------------------------------------------------------------------------
 
-/// A relative `--data-dir` and a symlink to the same tree each keep a non-empty
-/// file state on the first pass, and each still re-reads a late file with an
-/// old mtime afterwards. The failure this rules out is a pass that reports
-/// success while the watermark moved and no file state was written — the shape
-/// that silently drops every later file.
+/// The `--data-dir` spellings this platform can exercise, as
+/// `(spelling the CLI receives, the child's working directory, the tree it
+/// resolves to)`.
+///
+/// The **relative** spelling runs on every platform and carries the claim by
+/// itself: a pass through a spelled data dir still leaves the file state the
+/// next pass compares against.
+///
+/// The **symlink** spelling is Unix-only. On Windows a directory symlink needs
+/// a privilege (or developer mode) the CI runner is not guaranteed to have, and
+/// `std::os::unix` does not exist there at all — so on Windows this case
+/// contributes the relative spelling and nothing else, rather than failing to
+/// build or skipping the target.
+fn data_dir_spellings(env: &Env) -> Vec<(PathBuf, PathBuf, PathBuf)> {
+    let relative = PathBuf::from("relative-data");
+    let absolute = env.root().join(&relative);
+    std::fs::create_dir_all(&absolute).expect("create relative data dir");
+
+    #[cfg(unix)]
+    let symlinked = {
+        let link = env.root().join("data-link");
+        std::os::unix::fs::symlink(&env.data_dir, &link).expect("create data dir symlink");
+        vec![(link, env.root().to_path_buf(), env.data_dir.clone())]
+    };
+    #[cfg(not(unix))]
+    let symlinked: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+
+    // Built without a `mut` binding: on Windows `symlinked` is the empty
+    // vector above, and a `mut` that no platform mutates would itself be the
+    // warning this split exists to avoid.
+    std::iter::once((relative, env.root().to_path_buf(), absolute))
+        .chain(symlinked)
+        .collect()
+}
+
+/// A relative `--data-dir` — and, where the platform has one, a symlink to the
+/// same tree — keeps a non-empty file state on the first pass, and still
+/// re-reads a late file with an old mtime afterwards. The failure this rules
+/// out is a pass that reports success while the watermark moved and no file
+/// state was written — the shape that silently drops every later file.
 #[test]
 fn relative_and_symlinked_data_dirs_keep_the_incremental_state() {
     for_each_scan_path(|streaming| {
         let env = Env::new(streaming);
         env.write_sources_config(false);
 
-        let relative = PathBuf::from("relative-data");
-        let absolute = env.root().join(&relative);
-        std::fs::create_dir_all(&absolute).expect("create relative data dir");
-        let link = env.root().join("data-link");
-        std::os::unix::fs::symlink(&env.data_dir, &link).expect("create data dir symlink");
-
-        // (spelling the CLI receives, the child's working directory, the tree
-        // that spelling resolves to). Each spelling owns a *different* data
-        // dir, so the two iterations cannot observe each other.
-        let spellings = [
-            (relative.clone(), absolute.clone()),
-            (link.clone(), env.data_dir.clone()),
-        ];
-
-        for (as_seen_by_cli, real) in spellings {
+        // Each spelling owns a *different* data dir, so the iterations cannot
+        // observe each other.
+        for (as_seen_by_cli, cwd, real) in data_dir_spellings(&env) {
             let db = real.join("agent_search.db");
             let mirror = env.prepare_mirror(&real);
             write_claude_session(&mirror, SESSION_RELATIVE);
 
-            let first = env.index_ok_in(&as_seen_by_cli, Some(env.root()));
+            let first = env.index_ok_in(&as_seen_by_cli, Some(&cwd));
             let parsed_first = parsed_this_run(&first);
             assert!(
                 parsed_first >= 1,
                 "the first pass through {as_seen_by_cli:?} must read the mirror: {first}"
             );
-            let states = table_rows(&db, MIRROR_FILE_STATE_ROWS);
+            let states = root_rows(&db, ROOT_FILE_STATE_ROWS, &format!("cfg:{SOURCE_NAME}:"));
             assert!(
                 !states.is_empty(),
                 "a successful pass that advanced a watermark must leave file state behind, \
@@ -587,7 +786,7 @@ fn relative_and_symlinked_data_dirs_keep_the_incremental_state() {
             write_claude_session(&mirror, "projects/-pr10/agent-late.jsonl");
             set_mtime(&late, SystemTime::now() - Duration::from_secs(10_800));
 
-            let second = env.index_ok_in(&as_seen_by_cli, Some(env.root()));
+            let second = env.index_ok_in(&as_seen_by_cli, Some(&cwd));
             assert_eq!(
                 parsed_this_run(&second),
                 parsed_first,
