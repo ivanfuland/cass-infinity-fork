@@ -60,7 +60,7 @@ use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_U
 
 use crate::sources::config::{Platform, SourceDefinition, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
-use crate::sources::sync::path_to_safe_dirname;
+use crate::sources::sync::{mirror_path_under, mirror_root_for, path_to_safe_dirname};
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, HistoricalSalvageOutcome,
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
@@ -5638,7 +5638,8 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
         return Ok(false);
     }
 
-    let additional_scan_roots = additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir);
+    let additional_scan_roots =
+        additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir)?;
     let watch_roots = build_watch_roots(additional_scan_roots);
     if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
         return Ok(false);
@@ -11097,7 +11098,7 @@ pub fn run_index(
                 }
 
                 let (additional_scan_roots, scan_roots_meta) =
-                    additional_scan_roots_with_meta(&storage, &opts.data_dir);
+                    additional_scan_roots_with_meta(&storage, &opts.data_dir)?;
                 let scan_roots_meta = Arc::new(scan_roots_meta);
 
                 // `cass index --full` clears the watermarks of the roots this
@@ -11664,7 +11665,7 @@ pub fn run_index(
             anyhow::bail!(message);
         }
         let additional_scan_roots =
-            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)?;
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
         let watch_once_mode = opts
             .watch_once_paths
@@ -16587,27 +16588,31 @@ pub(crate) fn expand_local_scan_root_path(path: &str) -> PathBuf {
 fn additional_scan_roots_for_scan_or_watch(
     storage: &FrankenStorage,
     data_dir: &Path,
-) -> Vec<ScanRoot> {
+) -> anyhow::Result<Vec<ScanRoot>> {
     // Source-config syncing and scan-root discovery can be expensive on large
     // machines with many historical bundles and configured mirrors. Defer that
     // work until a source scan or watch session actually needs it.
-    additional_scan_roots_with_meta(storage, data_dir).0
+    Ok(additional_scan_roots_with_meta(storage, data_dir)?.0)
 }
 
 /// [`additional_scan_roots_for_scan_or_watch`] plus the `ScanRootMeta` of the
 /// roots it kept, for the callers that ingest and therefore need each root's
 /// `identity_host` / `root_id` (PR8 C3).
+///
+/// Fallible because a configured remote path with two mirror layouts is a
+/// refusal, not a default (PR10 hard constraint 10).
 fn additional_scan_roots_with_meta(
     storage: &FrankenStorage,
     data_dir: &Path,
-) -> (Vec<ScanRoot>, scan_root_meta::ScanRootMetaIndex) {
+) -> anyhow::Result<(Vec<ScanRoot>, scan_root_meta::ScanRootMetaIndex)> {
+    ensure_configured_mirror_roots_unambiguous(data_dir)?;
     sync_sources_config_to_db(storage);
     let (roots, metas) = build_scan_roots_with_meta(storage, data_dir);
     let filtered: Vec<ScanRoot> = roots
         .into_iter()
         .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == data_dir))
         .collect();
-    (filtered, metas)
+    Ok((filtered, metas))
 }
 
 pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRoot> {
@@ -16684,11 +16689,30 @@ pub fn build_scan_roots_with_meta(
                     // PR8 C6: the candidate list is shared with
                     // `run_sources_doctor`, so this scan root and that doctor
                     // report cannot drift into two derivations of one layout.
-                    let Some(mirror_path) = remote_mirror_candidates(source, data_dir, path)
-                        .into_iter()
-                        .find(|candidate| candidate.exists())
-                    else {
-                        continue;
+                    //
+                    // PR10 task 01: the resolution is a choice among that list
+                    // -- primary first, the legacy layout only when the primary
+                    // is absent, and nothing at all when two different trees
+                    // exist (`ensure_configured_mirror_roots_unambiguous` fails
+                    // the run before this point; skipping here keeps this
+                    // builder from picking one on the surfaces that only read
+                    // roots). The path handed to the connector *and* to the
+                    // metadata is the canonical one, so the tree that is
+                    // scanned and the base a relative path is computed against
+                    // are the same directory.
+                    let mirror_path = match choose_configured_mirror_root(source, data_dir, path) {
+                        MirrorRootChoice::One(mirror_path) => mirror_path,
+                        MirrorRootChoice::Absent => continue,
+                        MirrorRootChoice::Ambiguous(roots) => {
+                            tracing::error!(
+                                source = %source.name,
+                                path = %path,
+                                roots = ?roots,
+                                "configured remote path has more than one mirror directory; \
+                                 refusing to index either"
+                            );
+                            continue;
+                        }
                     };
                     metas.insert(configured_scan_root_meta(
                         &source.name,
@@ -16878,11 +16902,29 @@ pub fn build_scan_roots_with_meta(
     (roots, metas)
 }
 
+/// The `~/`-normalized spelling of a remote path: what this derivation used to
+/// name the mirror directory after, before the raw spelling became the rule.
+fn tilde_normalized_path(path: &str) -> String {
+    if path.starts_with("~/") {
+        path.to_string()
+    } else if path.starts_with('~') {
+        path.replacen('~', "~/", 1)
+    } else {
+        path.to_string()
+    }
+}
+
 /// The mirror directories a configured remote `source`'s `path` can live under,
 /// in the order the build tries them: the path's own mirror directory first,
-/// then -- for a `~/`-rooted path -- every sibling directory under the mirror
-/// root whose name ends with the same safe suffix, the layout an older sync
-/// produced before the per-path mirror name was pinned.
+/// then the two layouts older versions produced -- the `~/`-normalized name,
+/// and every sibling directory under the mirror root whose name ends with the
+/// same safe suffix.
+///
+/// The first entry is [`crate::sources::sync::mirror_path_under`] applied to
+/// the **raw** configured path, the same rule the sync writer names the
+/// directory with; that is what keeps a bare `~` out of two directories. The
+/// rest are read-only compatibility: `~` and `~/x` were both normalized to
+/// `~/...` here, so a mirror written under that name has to stay findable.
 ///
 /// PR8 C6: `run_sources_doctor` classifies a remote root's `missing` / `empty`
 /// / `present` state from this same list, so the two surfaces cannot drift into
@@ -16892,28 +16934,24 @@ pub(crate) fn remote_mirror_candidates(
     data_dir: &Path,
     path: &str,
 ) -> Vec<PathBuf> {
-    let expanded_path = if path.starts_with("~/") {
-        path.to_string()
-    } else if path.starts_with('~') {
-        path.replacen('~', "~/", 1)
-    } else {
-        path.to_string()
-    };
-    let safe_name = path_to_safe_dirname(&expanded_path);
     // A source that declares `mirror_dir` mirrors under that directory instead
     // of `data_dir/remotes/<name>/mirror`; the per-path layout below the root
     // is unchanged, so sync and this derivation keep agreeing.
-    let mirror_base = source
-        .effective_mirror_dir()
-        .unwrap_or_else(|| data_dir.join("remotes").join(&source.name).join("mirror"));
+    let mirror_root = mirror_root_for(source, data_dir);
 
-    let mut candidates = vec![mirror_base.join(&safe_name)];
+    let primary = mirror_path_under(&mirror_root, path);
+    let legacy = mirror_path_under(&mirror_root, &tilde_normalized_path(path));
+    let mut candidates = vec![primary.clone()];
+    if legacy != primary {
+        candidates.push(legacy);
+    }
     if path.starts_with("~/") {
         let safe_suffix = path_to_safe_dirname(path.trim_start_matches("~/"));
-        if let Ok(entries) = std::fs::read_dir(&mirror_base) {
+        if let Ok(entries) = std::fs::read_dir(&mirror_root) {
             for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().ends_with(&safe_suffix)
                     && entry.path().is_dir()
+                    && !candidates.contains(&entry.path())
                 {
                     candidates.push(entry.path());
                 }
@@ -16921,6 +16959,87 @@ pub(crate) fn remote_mirror_candidates(
         }
     }
     candidates
+}
+
+/// What a configured remote path's mirror directory resolves to on this
+/// machine, before the root is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MirrorRootChoice {
+    /// No mirror layout for this path exists here yet.
+    Absent,
+    /// The one directory this path's mirror lives in, canonicalized.
+    One(PathBuf),
+    /// Two or more layouts exist and they are not the same directory.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// Resolve one configured remote path to the single mirror directory it lives
+/// in: the primary layout when it exists, otherwise the legacy layout an older
+/// sync produced, and a refusal to choose when both exist as different trees
+/// (hard constraint 10).
+///
+/// The comparison is on canonical paths, so a legacy sibling that is a symlink
+/// to the primary is one directory, not two.
+fn choose_configured_mirror_root(
+    source: &SourceDefinition,
+    data_dir: &Path,
+    path: &str,
+) -> MirrorRootChoice {
+    let mut existing: Vec<PathBuf> = Vec::new();
+    for candidate in remote_mirror_candidates(source, data_dir, path) {
+        if !candidate.exists() {
+            continue;
+        }
+        let canonical = scan_root_meta::canonicalize_root_path(&candidate);
+        if !existing.contains(&canonical) {
+            existing.push(canonical);
+        }
+    }
+    match existing.len() {
+        0 => MirrorRootChoice::Absent,
+        1 => MirrorRootChoice::One(existing.remove(0)),
+        _ => MirrorRootChoice::Ambiguous(existing),
+    }
+}
+
+/// Hard constraint 10: two mirror layouts for one configured remote path that
+/// resolve to different directories is an operator error, and the run must say
+/// so instead of indexing one of them.
+///
+/// This runs before the roots are built so the failure is the run's own, not a
+/// root that quietly went missing; the builder keeps its own refusal (it logs
+/// and skips) for the surfaces that only read roots.
+fn ensure_configured_mirror_roots_unambiguous(data_dir: &Path) -> anyhow::Result<()> {
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return Ok(());
+    }
+    // A config that will not load has its own reporting (`sources_config_error`)
+    // and its own exit code; this check only rules on the ones that parsed.
+    let Ok(config) = SourcesConfig::load() else {
+        return Ok(());
+    };
+    for source in &config.sources {
+        if !source.is_remote() {
+            continue;
+        }
+        for path in &source.paths {
+            if let MirrorRootChoice::Ambiguous(roots) =
+                choose_configured_mirror_root(source, data_dir, path)
+            {
+                let roots: Vec<String> = roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect();
+                anyhow::bail!(
+                    "mirror-root-ambiguous: source '{}' path '{}' has more than one mirror directory: {}",
+                    source.name,
+                    path,
+                    roots.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `ScanRootMeta` for one configured source path (hard constraint 12).
