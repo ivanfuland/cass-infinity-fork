@@ -61,9 +61,28 @@ pub struct ScanRootMeta {
     /// Source name for configured roots, [`HOME_SOURCE_NAME`] for home roots.
     pub source_name: String,
     /// Whether `(root_id, connector)` watermarks apply to this root: local
-    /// configured roots and home roots yes, ssh mirror roots and `full_scan`
-    /// sources no (hard constraint 5).
+    /// configured roots and home roots yes, ssh mirror roots whose source did
+    /// not opt into `full_scan` yes, `full_scan` sources no (hard constraints
+    /// 5 and 9).
     pub watermarks_enabled: bool,
+    /// PR10 task 03: true only for a root built from an explicitly configured
+    /// `sources.toml` entry of `type = "ssh"` -- a **mirror** of another
+    /// machine's tree rather than this machine's own history. Only that one
+    /// branch in [`crate::indexer::build_scan_roots_with_meta`] sets it; home
+    /// roots, local configured roots and every DB-registered fallback root
+    /// leave it false.
+    ///
+    /// It decides what "this file changed" means once the root has a watermark
+    /// (see `run_local_root_scan`). Local history is append-only, so a root
+    /// watermark is a sound cutoff for it: a file recorded at a *later* mtime
+    /// than the watermark is history this root already read. A mirror is a
+    /// copy that can hand over a file whose mtime predates any watermark at
+    /// any transfer, so only this root's recorded per-file state can decide.
+    ///
+    /// Read only where a [`Self::watermarks_enabled`] root has a
+    /// `LocalRootPlan`: a `full_scan` mirror keeps the baseline full-root scan
+    /// and never consults it.
+    pub mirror_root: bool,
 }
 
 impl ScanRootMeta {
@@ -278,6 +297,7 @@ mod tests {
             canonical_path: canonical.clone(),
             source_name: "laptop".to_string(),
             watermarks_enabled: true,
+            mirror_root: false,
         };
 
         let mut index = ScanRootMetaIndex::new();
@@ -305,6 +325,7 @@ mod tests {
             canonical_path: cfg.clone(),
             source_name: "laptop".to_string(),
             watermarks_enabled: true,
+            mirror_root: false,
         });
         let mut homes = ScanRootMetaIndex::new();
         homes.insert(ScanRootMeta {
@@ -314,6 +335,7 @@ mod tests {
             canonical_path: home.clone(),
             source_name: HOME_SOURCE_NAME.to_string(),
             watermarks_enabled: true,
+            mirror_root: false,
         });
 
         configured.merge(&homes);
