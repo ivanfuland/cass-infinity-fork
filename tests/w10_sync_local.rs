@@ -713,6 +713,21 @@ fn sync_without_the_infinity_feature_fails_the_same_precondition() {
         serde_json::json!("semantic-unavailable"),
         "the report must name the missing semantic backend: {report}"
     );
+    // `semantic-unavailable` is shared with "Infinity is configured but
+    // unreachable", so the kind alone cannot tell the two apart. Pin the
+    // build-specific wording: a binary compiled without the feature has no
+    // probe to fail, and must not describe one as unreachable.
+    let message = report["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the report must carry a string error message: {report}"));
+    assert!(
+        message.contains("compiled without the `infinity` feature"),
+        "the message must name the missing build feature, not a network problem: {message}"
+    );
+    assert!(
+        !message.contains("did not answer the embed-identity probe"),
+        "a build with no probe must not report one as unreachable: {message}"
+    );
     assert_eq!(
         report["mirror"]["attempted"],
         serde_json::json!(false),
