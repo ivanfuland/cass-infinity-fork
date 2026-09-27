@@ -733,6 +733,184 @@ paths = ["~/.codex/sessions"]
 }
 
 #[test]
+fn sync_with_only_a_local_source_is_a_complete_round() {
+    // S1: a `type = "local"` entry is a local root for the indexer, not a
+    // pending mirror. Counting it as one would fail a healthy round with
+    // `mirror_failed` / exit 3 even though there is nothing to pull.
+    let fixture = Fixture::new();
+    let stub = StubInfinity::start();
+    fixture.seed_session("rollout-local.jsonl", "w10-local-src");
+
+    let local_root = fixture.tmp.path().join("local-root");
+    std::fs::create_dir_all(&local_root).expect("create local source root");
+    fixture.write_sources_config(&format!(
+        r#"
+[[sources]]
+name = "bench-local"
+type = "local"
+origin_host = "bench-local"
+paths = ["{}"]
+"#,
+        local_root.display()
+    ));
+
+    let output = fixture.sync_json(&stub.base_url, &[]);
+    let report = report_of(&output);
+    assert_eq!(
+        report["exit_code"],
+        serde_json::json!(EXIT_READY),
+        "a local-only config is a complete round: {report} stderr={}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        report["mirror"]["sources"],
+        serde_json::json!([]),
+        "a local source is not a mirror to pull: {report}"
+    );
+    assert_eq!(
+        report["partial_reasons"],
+        serde_json::json!([]),
+        "a local-only config must not be reported partial: {report}"
+    );
+    assert_eq!(
+        report["complete"],
+        serde_json::json!(true),
+        "a local-only config must be complete: {report}"
+    );
+    assert_eq!(
+        db_scalar(&fixture.db_path(), "SELECT COUNT(*) FROM conversations"),
+        1,
+        "the seeded local session must still be ingested"
+    );
+}
+
+#[test]
+fn sync_refuses_the_ignore_sources_config_escape_hatch() {
+    // S2: with `CASS_IGNORE_SOURCES_CONFIG` set, `run_index` skips
+    // `sources.toml` entirely. Accepting it here would let a normal sync
+    // report success without ever validating the configured sources, so the
+    // normal path refuses outright.
+    //
+    // The fixture config is deliberately *valid* (a local source): a corrupt
+    // one would be refused by the ordinary load-failure branch and the test
+    // would no longer prove the escape hatch itself is what got rejected.
+    let fixture = Fixture::new();
+    let stub = StubInfinity::start();
+    fixture.seed_session("rollout-ignore.jsonl", "w10-ignore");
+
+    let local_root = fixture.tmp.path().join("local-root");
+    std::fs::create_dir_all(&local_root).expect("create local source root");
+    fixture.write_sources_config(&format!(
+        r#"
+[[sources]]
+name = "bench-local"
+type = "local"
+origin_host = "bench-local"
+paths = ["{}"]
+"#,
+        local_root.display()
+    ));
+
+    let mut cmd = fixture.command();
+    cmd.env("CASS_INFINITY_URL", &stub.base_url);
+    cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    cmd.args(["sync", "--json", "--data-dir"]);
+    cmd.arg(fixture.data_dir());
+    let output = cmd
+        .output()
+        .expect("spawn cass sync with the escape hatch set");
+    let report = report_of(&output);
+    assert_eq!(
+        report["exit_code"],
+        serde_json::json!(EXIT_PRECONDITION),
+        "the escape hatch must not buy a normal sync a clean exit: {report}"
+    );
+    assert_eq!(
+        report["error"]["kind"],
+        serde_json::json!("config"),
+        "the refusal must name the config: {report}"
+    );
+    assert_eq!(
+        report["index"]["started"],
+        serde_json::json!(false),
+        "nothing may be indexed behind a refused config: {report}"
+    );
+    assert!(
+        !fixture.db_path().exists(),
+        "the refusal must happen before the database is created"
+    );
+}
+
+#[test]
+fn sync_no_ingest_still_runs_with_the_ignore_sources_config_set() {
+    // S2, second half: `--no-ingest` neither mirrors nor scans, so it never
+    // reads the config and the escape hatch is irrelevant to it. The corpus
+    // is built first -- the drain's activation audit legitimately refuses a
+    // generation with zero chunk rows, so an empty database is not a
+    // meaningful fixture for the hole-draining path.
+    let fixture = Fixture::new();
+    let stub = StubInfinity::start();
+    fixture.seed_session("rollout-ignore-ro.jsonl", "w10-ignore-ro");
+
+    let warmup = fixture.sync_json(&stub.base_url, &[]);
+    assert_eq!(
+        warmup.status.code(),
+        Some(EXIT_READY),
+        "warmup sync must succeed: {}",
+        stderr_of(&warmup)
+    );
+    let sessions_before = db_scalar(&fixture.db_path(), "SELECT COUNT(*) FROM conversations");
+    assert!(
+        sessions_before > 0,
+        "the warmup must ingest the seeded session"
+    );
+
+    let local_root = fixture.tmp.path().join("local-root");
+    std::fs::create_dir_all(&local_root).expect("create local source root");
+    fixture.write_sources_config(&format!(
+        r#"
+[[sources]]
+name = "bench-local"
+type = "local"
+origin_host = "bench-local"
+paths = ["{}"]
+"#,
+        local_root.display()
+    ));
+
+    fixture.seed_session("rollout-ignore-ro2.jsonl", "w10-ignore-ro2");
+
+    let mut cmd = fixture.command();
+    cmd.env("CASS_INFINITY_URL", &stub.base_url);
+    cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
+    cmd.args(["sync", "--json", "--no-ingest", "--data-dir"]);
+    cmd.arg(fixture.data_dir());
+    let output = cmd.output().expect("spawn cass sync --no-ingest");
+    let report = report_of(&output);
+    assert_eq!(
+        report["exit_code"],
+        serde_json::json!(EXIT_READY),
+        "--no-ingest must still run its hole-draining path: {report} stderr={}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        report["index"]["stats"]["scan_invocations"],
+        serde_json::json!(0),
+        "--no-ingest must not scan: {report}"
+    );
+    assert_eq!(
+        report["mirror"]["skip_reason"],
+        serde_json::json!("no-ingest"),
+        "the mirror stage must be reported as skipped: {report}"
+    );
+    assert_eq!(
+        db_scalar(&fixture.db_path(), "SELECT COUNT(*) FROM conversations"),
+        sessions_before,
+        "--no-ingest must not ingest the newly seeded session"
+    );
+}
+
+#[test]
 fn sync_unidentified_index_failure_exits_1() {
     let fixture = Fixture::new();
     let stub = StubInfinity::start();
@@ -796,7 +974,8 @@ fn semantic_activation_decides_exit_3() {
     // prunes, so `holes_after == 0` -- and therefore `activated == true` --
     // on every run that returns Ok. The classification is still this task's
     // product behaviour, so it is pinned directly here.
-    let (code, reasons, error) = classify_index_outcome(IndexOutcome::Completed(false), false);
+    let (code, reasons, error) =
+        classify_index_outcome(IndexOutcome::Completed(false), false, None);
     assert_eq!(
         code, EXIT_PARTIAL,
         "an unactivated semantic domain is partial"
@@ -808,7 +987,7 @@ fn semantic_activation_decides_exit_3() {
     );
 
     // Both partial causes at once are preserved (hard constraint 5/6).
-    let (code, reasons, _) = classify_index_outcome(IndexOutcome::Completed(false), true);
+    let (code, reasons, _) = classify_index_outcome(IndexOutcome::Completed(false), true, None);
     assert_eq!(code, EXIT_PARTIAL);
     assert_eq!(
         reasons,
@@ -816,28 +995,71 @@ fn semantic_activation_decides_exit_3() {
     );
 
     // Ready: only when nothing is partial.
-    let (code, reasons, error) = classify_index_outcome(IndexOutcome::Completed(true), false);
+    let (code, reasons, error) = classify_index_outcome(IndexOutcome::Completed(true), false, None);
     assert_eq!(code, EXIT_READY);
     assert!(reasons.is_empty());
     assert!(error.is_none());
 
     // Ready locally, but the remote half did not run.
-    let (code, reasons, error) = classify_index_outcome(IndexOutcome::Completed(true), true);
+    let (code, reasons, error) = classify_index_outcome(IndexOutcome::Completed(true), true, None);
     assert_eq!(code, EXIT_PARTIAL);
     assert_eq!(reasons, vec![REASON_MIRROR_FAILED]);
     assert_eq!(error.expect("partial carries a reason").kind, "source");
 
     // An index that published no semantic fact must not report success.
     let (code, _, error) =
-        classify_index_outcome(IndexOutcome::CompletedWithoutSemanticFact, false);
+        classify_index_outcome(IndexOutcome::CompletedWithoutSemanticFact, false, None);
     assert_eq!(code, EXIT_INTERNAL);
     assert_eq!(error.expect("failure carries a reason").kind, "index");
 
     // A real index error is an internal failure whether or not the mirror ran.
     let (code, reasons, error) =
-        classify_index_outcome(IndexOutcome::Failed("boom".to_string()), false);
+        classify_index_outcome(IndexOutcome::Failed("boom".to_string()), false, None);
     assert_eq!(code, EXIT_INTERNAL);
     assert!(reasons.is_empty());
+    assert_eq!(error.expect("failure carries a reason").kind, "index");
+}
+
+#[test]
+fn a_late_sources_config_error_fails_closed() {
+    // N1: the preflight accepted `sources.toml`, but the index run reports
+    // that it could not load it (the file changed under the round). The
+    // mirror set this report describes is then not the one the round indexed
+    // against, so neither `complete` nor exit 0 is available -- and that must
+    // hold even when everything else looks perfect.
+    let detail = "Failed to parse config file: expected `=`";
+    for (label, outcome) in [
+        ("a clean run", IndexOutcome::Completed(true)),
+        ("a partial run", IndexOutcome::Completed(false)),
+        (
+            "a run with no semantic fact",
+            IndexOutcome::CompletedWithoutSemanticFact,
+        ),
+    ] {
+        let (code, _, error) = classify_index_outcome(outcome, false, Some(detail));
+        assert_eq!(
+            code, EXIT_INTERNAL,
+            "{label} must fail closed on a late config error"
+        );
+        let error = error.expect("a failed round carries a reason");
+        assert_eq!(
+            error.kind, "config",
+            "{label} must name the config, not the index"
+        );
+        assert!(
+            error.message.contains(detail),
+            "{label} must keep the indexer's config error text: {error:?}"
+        );
+    }
+
+    // A failed index is reported as a failed index, not relabelled as a
+    // config error -- the run already has a more specific reason.
+    let (code, _, error) = classify_index_outcome(
+        IndexOutcome::Failed("boom".to_string()),
+        false,
+        Some(detail),
+    );
+    assert_eq!(code, EXIT_INTERNAL);
     assert_eq!(error.expect("failure carries a reason").kind, "index");
 }
 

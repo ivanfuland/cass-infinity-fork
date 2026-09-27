@@ -26,6 +26,11 @@
 //!   does not load, and an unreachable Infinity are each probed *before* the
 //!   index starts, so they classify as exit 2 by construction instead of by
 //!   pattern-matching an `anyhow` string after the fact.
+//! - **The config is read once.** The validated `SourcesConfig` from the
+//!   preflight is the only one this round has; the mirror stage reads it and
+//!   the post-index check verifies the indexer saw a working config too, so a
+//!   round whose config stopped loading mid-flight fails closed instead of
+//!   reporting success.
 //! - **stdout carries exactly one JSON object.** The report is printed first
 //!   and the process is then ended with `CliError::already_reported`, which
 //!   makes the top-level handler exit with the report's own code without
@@ -78,8 +83,12 @@ const MIRROR_NOT_IMPLEMENTED: &str = "the `sync` mirror stage is not implemented
      sources.toml declares this source but nothing was pulled from it \
      (task 06 delivers the mirror stage)";
 
-/// One `cass sync` round, as it appears on stdout and (one compact line per
-/// round) in `<data_dir>/logs/sync-runs.jsonl`.
+/// One `cass sync` round, as it appears on stdout.
+///
+/// The `<data_dir>/logs/sync-runs.jsonl` trace is **not** written here: its
+/// per-stage timings and file semantics belong with the complete mirror
+/// result in task 06, and a half-specified line format would be a contract
+/// nobody agreed to.
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncReport {
     pub schema: &'static str,
@@ -165,7 +174,7 @@ pub fn run_sync(
     structured: bool,
 ) -> Result<(), CliError> {
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
-    let report = execute(db_override, data_dir.clone(), no_ingest, no_mirror);
+    let report = execute(db_override, data_dir, no_ingest, no_mirror);
 
     let line = match serde_json::to_string(&report) {
         Ok(line) => line,
@@ -185,7 +194,6 @@ pub fn run_sync(
             })
             .to_string();
             println!("{fallback}");
-            append_run_log(&data_dir, &fallback);
             return Err(CliError::already_reported(
                 EXIT_INTERNAL,
                 CliErrorKind::EncodeJson.kind_str(),
@@ -199,9 +207,6 @@ pub fn run_sync(
     } else {
         print_human_summary(&report);
     }
-    // The line on disk is the same bytes stdout carried, so a later reader
-    // can diff a round against what the caller actually saw.
-    append_run_log(&data_dir, &line);
 
     if report.exit_code == EXIT_READY {
         Ok(())
@@ -211,48 +216,6 @@ pub fn run_sync(
             .as_ref()
             .map_or(CliErrorKind::Unknown.kind_str(), |e| e.kind);
         Err(CliError::already_reported(report.exit_code, kind, false))
-    }
-}
-
-/// Append one round to `<data_dir>/logs/sync-runs.jsonl`.
-///
-/// This is a trace, not a completion proof: a SIGKILLed round simply has no
-/// final line, and the absence of a line must never be read as "nothing was
-/// ingested". A failure to write warns on stderr and is otherwise ignored —
-/// the round's exit code belongs to the index, not to the log.
-fn append_run_log(data_dir: &Path, line: &str) {
-    let logs_dir = data_dir.join("logs");
-    if let Err(err) = std::fs::create_dir_all(&logs_dir) {
-        eprintln!(
-            "warning: could not create {} for the sync run log: {err}",
-            logs_dir.display()
-        );
-        return;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&logs_dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let path = logs_dir.join("sync-runs.jsonl");
-    let opened = {
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).append(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options.open(&path)
-    };
-    match opened {
-        Ok(mut file) => {
-            use std::io::Write as _;
-            if let Err(err) = writeln!(file, "{line}") {
-                eprintln!("warning: could not append to {}: {err}", path.display());
-            }
-        }
-        Err(err) => eprintln!("warning: could not open {}: {err}", path.display()),
     }
 }
 
@@ -296,9 +259,21 @@ fn execute(
     // Order: config, schema, Infinity. All three are "the run could not
     // meaningfully start" checks, so the report can say `index.started =
     // false` truthfully for each of them.
-    if let Some(err) = preflight_config(no_ingest) {
-        return finish(report, EXIT_PRECONDITION, Some(err));
-    }
+    //
+    // The config is loaded here and nowhere else: the same validated value
+    // decides the mirror set below and is the thing the post-index check
+    // compares against, so a second `SourcesConfig::load()` that swallows
+    // its own error can never contradict this one. `--no-ingest` never reads
+    // the file at all, which is why the load sits behind that check rather
+    // than inside the loader.
+    let config = if no_ingest {
+        None
+    } else {
+        match preflight_config() {
+            Ok(config) => Some(config),
+            Err(err) => return finish(report, EXIT_PRECONDITION, Some(err)),
+        }
+    };
     if let Some(err) = preflight_schema(&db_path) {
         return finish(report, EXIT_PRECONDITION, Some(err));
     }
@@ -309,20 +284,23 @@ fn execute(
     // ---- mirror ---------------------------------------------------------
     //
     // This build performs no remote transfer; task 06 wires
-    // `SyncEngine::sync_source` in here. A config that declares sources is
-    // reported source-by-source as not synced -- never as success, and never
-    // as a reason to skip the local index below (hard constraint 2).
+    // `SyncEngine::sync_source` in here. A *remote* source the round did not
+    // sync is reported as such -- never as success, and never as a reason to
+    // skip the local index below (hard constraint 2).
+    //
+    // Only remote sources count. A `type = "local"` entry is a local root for
+    // the indexer, not something to pull; treating it as a pending mirror
+    // would fail a perfectly healthy round (spec axis S1).
     //
     // Note the exit code: the local half of the round still runs and can
     // still succeed, so this is a *partial* round (3), not an internal
     // failure (1). A caller that reads 0 here would believe its configured
     // mirrors are in sync when none of them was contacted.
-    let configured_sources = if no_ingest || no_mirror {
-        Vec::new()
-    } else {
-        configured_source_names()
+    let unsynced_remotes: Vec<String> = match (&config, no_mirror) {
+        (Some(config), false) => config.remote_source_names(),
+        _ => Vec::new(),
     };
-    for name in configured_sources {
+    for name in unsynced_remotes {
         report.mirror.sources.push(MirrorSourceResult {
             name,
             status: MIRROR_STATUS_FAILED,
@@ -352,6 +330,12 @@ fn execute(
     let index_outcome = run_index(opts, None);
     let stats = progress.stats.lock().ok().map(|s| s.clone());
     report.semantic_activated = stats.as_ref().and_then(|s| s.semantic_activated);
+    // The indexer's own view of the sources config. The preflight above
+    // already accepted this file, so a non-empty value here means the config
+    // stopped loading *during* the round -- the mirror set this report
+    // describes is then no longer the one the round actually indexed
+    // against, and the round must not be reported complete (N1).
+    let late_config_error = stats.as_ref().and_then(|s| s.sources_config_error.clone());
     report.index.stats = stats;
 
     let outcome = match index_outcome {
@@ -361,7 +345,8 @@ fn execute(
         },
         Err(err) => IndexOutcome::Failed(format!("{err:#}")),
     };
-    let (exit_code, partial_reasons, error) = classify_index_outcome(outcome, mirror_failed);
+    let (exit_code, partial_reasons, error) =
+        classify_index_outcome(outcome, mirror_failed, late_config_error.as_deref());
     report.partial_reasons = partial_reasons;
     finish(report, exit_code, error)
 }
@@ -389,13 +374,19 @@ pub enum IndexOutcome {
 pub fn classify_index_outcome(
     outcome: IndexOutcome,
     mirror_failed: bool,
+    sources_config_error: Option<&str>,
 ) -> (i32, Vec<&'static str>, Option<SyncError>) {
     let mut reasons: Vec<&'static str> = Vec::new();
     if mirror_failed {
         reasons.push(REASON_MIRROR_FAILED);
     }
-    match outcome {
-        IndexOutcome::Failed(message) => (
+    // The table is matched on `(outcome, late config error)`. Reading it that
+    // way keeps the config arm and the semantic arm from having to repeat
+    // each other: `Failed` wins because a failed run has no facts to trust,
+    // and a late config error wins over both success and partial because the
+    // round indexed against a file this report cannot vouch for (N1).
+    match (outcome, sources_config_error) {
+        (IndexOutcome::Failed(message), _) => (
             EXIT_INTERNAL,
             reasons,
             Some(SyncError {
@@ -403,7 +394,18 @@ pub fn classify_index_outcome(
                 message: format!("index run failed: {message}"),
             }),
         ),
-        IndexOutcome::Completed(true) => {
+        (_, Some(detail)) => (
+            EXIT_INTERNAL,
+            reasons,
+            Some(SyncError {
+                kind: CliErrorKind::Config.kind_str(),
+                message: format!(
+                    "sources.toml loaded for the preflight but the index run reported a \
+                     config error, so this round cannot be reported complete: {detail}"
+                ),
+            }),
+        ),
+        (IndexOutcome::Completed(true), None) => {
             if mirror_failed {
                 // Lexical + semantic are ready; only the remote half of the
                 // round is not. That is exactly the "partial" reading of
@@ -420,7 +422,7 @@ pub fn classify_index_outcome(
                 (EXIT_READY, reasons, None)
             }
         }
-        IndexOutcome::Completed(false) => {
+        (IndexOutcome::Completed(false), None) => {
             reasons.push(REASON_SEMANTIC_NOT_READY);
             let kind = if mirror_failed {
                 CliErrorKind::Source.kind_str()
@@ -441,7 +443,7 @@ pub fn classify_index_outcome(
         }
         // Hard constraint 5: a run that requested semantic indexing but
         // published no `semantic_activated` fact must not report success.
-        IndexOutcome::CompletedWithoutSemanticFact => (
+        (IndexOutcome::CompletedWithoutSemanticFact, None) => (
             EXIT_INTERNAL,
             reasons,
             Some(SyncError {
@@ -477,42 +479,61 @@ fn mirror_skip_reason(no_ingest: bool, no_mirror: bool) -> Option<&'static str> 
 // Preflight probes
 // ---------------------------------------------------------------------------
 
-/// Load and validate `sources.toml`, unless this run has no use for it.
+/// The `sources.toml` fact this round carries past the preflight.
+///
+/// Exactly one load happens per round, and the validated value is the one the
+/// mirror stage reads. Loading again later (and swallowing that error) would
+/// let the report describe a different config than the round indexed against
+/// (N1), so there is deliberately no second read anywhere in this module.
+struct LoadedConfig {
+    config: SourcesConfig,
+}
+
+impl LoadedConfig {
+    /// Names of the **remote** sources the round would have pulled.
+    ///
+    /// A `type = "local"` entry is a local root for the indexer, not a
+    /// pending mirror; counting it here would fail a healthy round (S1).
+    fn remote_source_names(&self) -> Vec<String> {
+        self.config
+            .sources
+            .iter()
+            .filter(|source| source.is_remote())
+            .map(|source| source.name.clone())
+            .collect()
+    }
+}
+
+/// Load and validate `sources.toml` for the normal (ingesting) path.
 ///
 /// A missing file is a legitimate empty config. An existing file that fails
 /// to read, parse, or validate is exit 2 — the alternative (index only HOME
 /// and call it a success) is exactly the silent-partial-result the spec
 /// forbids.
 ///
-/// `--no-ingest` skips this entirely: that mode neither mirrors nor scans,
-/// so a corrupt config must not be able to stop it.
-///
-/// `CASS_IGNORE_SOURCES_CONFIG` is honoured for the same reason `run_index`
-/// honours it — it is the operator's explicit "pretend there is no config"
-/// switch, and sync must not be stricter than `index` about the same file.
-fn preflight_config(no_ingest: bool) -> Option<SyncError> {
-    if no_ingest || dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
-        return None;
+/// `CASS_IGNORE_SOURCES_CONFIG` is **refused** rather than honoured: the
+/// indexer skips the config under that variable, so accepting it here would
+/// let a corrupt `sources.toml` produce a "complete" round that never looked
+/// at it (S2). `--no-ingest` is the supported way to run without the config,
+/// and it never reaches this function.
+fn preflight_config() -> Result<LoadedConfig, SyncError> {
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return Err(SyncError {
+            kind: CliErrorKind::Config.kind_str(),
+            message: "CASS_IGNORE_SOURCES_CONFIG is set, so the indexer would skip \
+                      sources.toml entirely; a normal `cass sync` refuses to report \
+                      success without validating the configured sources. Unset it, or \
+                      use `--no-ingest` for the read-only hole-draining path."
+                .to_string(),
+        });
     }
     match SourcesConfig::load() {
-        Ok(_) => None,
-        Err(err) => Some(SyncError {
+        Ok(config) => Ok(LoadedConfig { config }),
+        Err(err) => Err(SyncError {
             kind: CliErrorKind::Config.kind_str(),
             message: format!("sources.toml exists but did not load: {err}"),
         }),
     }
-}
-
-/// Names of the sources the config declares, or an empty list when it
-/// cannot be read (a bad config has already failed the preflight above by
-/// then) or when the operator asked for the config to be ignored.
-fn configured_source_names() -> Vec<String> {
-    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
-        return Vec::new();
-    }
-    SourcesConfig::load()
-        .map(|c| c.sources.into_iter().map(|s| s.name).collect())
-        .unwrap_or_default()
 }
 
 /// Reject a database whose `user_version` this binary cannot open in place.
