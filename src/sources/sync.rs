@@ -2544,10 +2544,12 @@ pub fn mirror_root_for(source: &SourceDefinition, data_dir: &Path) -> PathBuf {
 /// The directory one **raw** remote path mirrors into under `mirror_root`.
 ///
 /// The name comes from the configured spelling, never from the home-expanded
-/// path: `~` and `~/` are the same directory on the remote, so they have to be
-/// the same directory here too. The sync writer and the index-side candidate
-/// search both route through this one function, which is the whole reason a
-/// transfer can no longer succeed into a directory the index does not look at.
+/// path, and the configured spelling is the whole input: `~` and `~/` may mean
+/// the same place on the remote, but they are two different strings and so two
+/// different directory names here (`root_<h("~")>` vs `root_<h("~/")>`). The
+/// sync writer and the index-side candidate search both route through this one
+/// function, which is the whole reason a transfer can no longer succeed into a
+/// directory the index does not look at.
 ///
 /// `mirror_root_for` supplies the root for both sides; together the two are
 /// "source definition + data dir + raw remote path -> primary mirror

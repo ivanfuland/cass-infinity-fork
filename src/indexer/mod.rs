@@ -9346,6 +9346,16 @@ impl RootScanOutcome {
             files: Vec::new(),
         }
     }
+
+    /// A root that failed for a reason the run should carry, not just a
+    /// false `succeeded`: the caller sees the failure and this root's
+    /// watermark and file states both stay where they were.
+    fn failed_with_error(connector: &str, root_id: &str, error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            ..Self::failed(connector, root_id)
+        }
+    }
 }
 
 /// Keep the connector/root identity, drop the claim of a clean scan: a root
@@ -9594,17 +9604,41 @@ fn run_local_root_scan(
 
     // Everything the connector would read under this root, with the size and
     // mtime the comparison below runs on.
-    let candidates: Vec<(String, i64, i64, PathBuf)> = discovered
-        .iter()
-        .filter_map(|discovered_file| {
-            let relative = relative_path_within(
-                &plan.meta.canonical_path,
-                &discovered_file.source_path,
-            )?;
-            let (size, mtime) = file_scan_stamp(&discovered_file.source_path, discovered_file);
-            Some((relative, size, mtime, discovered_file.source_path.clone()))
-        })
-        .collect();
+    //
+    // PR10 hard constraint 10: a discovered file that does not resolve inside
+    // this root fails the whole root. Dropping it (the `filter_map` this used
+    // to be) left the remaining candidates looking like a complete, clean
+    // enumeration -- with no candidate at all the root reported success with
+    // an empty file list, which is exactly what advances a watermark past
+    // files that were never seen. The root keeps its identity and its state
+    // stays where it was.
+    let mut candidates: Vec<(String, i64, i64, PathBuf)> = Vec::with_capacity(discovered.len());
+    for discovered_file in &discovered {
+        let Some(relative) =
+            relative_path_within(&plan.meta.canonical_path, &discovered_file.source_path)
+        else {
+            tracing::warn!(
+                connector = connector_name,
+                root = %plan.meta.canonical_path.display(),
+                path = %discovered_file.source_path.display(),
+                "discovered source is outside its scan root; failing the root instead of dropping it"
+            );
+            return (
+                RootScanOutcome::failed_with_error(
+                    connector_name,
+                    &root_id,
+                    format!(
+                        "discovered source {} is not under scan root {}",
+                        discovered_file.source_path.display(),
+                        plan.meta.canonical_path.display()
+                    ),
+                ),
+                None,
+            );
+        };
+        let (size, mtime) = file_scan_stamp(&discovered_file.source_path, discovered_file);
+        candidates.push((relative, size, mtime, discovered_file.source_path.clone()));
+    }
 
     let (ctx, scanned_files) = if let Some(watermark) = plan.watermark {
         let changed: Vec<(String, i64, i64, PathBuf)> = candidates
@@ -23637,6 +23671,127 @@ mod tests {
     ) -> crate::connectors::DiscoveredSourceFile {
         crate::connectors::DiscoveredSourceFile::new("synthetic", root, source_path, role, true)
             .with_fs_metadata()
+    }
+
+    /// Discovers exactly the files it was handed and parses none of them, so a
+    /// test can ask what the root scan does with the *file list* alone: every
+    /// other way this scan can fail would fail under both the old and the new
+    /// implementation and prove nothing.
+    struct SilentDiscoveryConnector {
+        sources: Vec<crate::connectors::DiscoveredSourceFile>,
+    }
+
+    impl Connector for SilentDiscoveryConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult::not_found()
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn discover_source_files(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<crate::connectors::DiscoveredSourceFile>> {
+            Ok(self.sources.clone())
+        }
+    }
+
+    /// PR10 hard constraint 10: a discovered file that does not resolve inside
+    /// the root fails that root.
+    ///
+    /// The `filter_map` this replaced dropped such a file, so a root whose only
+    /// candidate was outside it reported `succeeded: true` with an empty file
+    /// list — the exact shape `persist_root_scan_outcomes` treats as a clean
+    /// enumeration and advances the watermark for.
+    #[test]
+    fn local_root_scan_fails_when_a_discovered_file_is_outside_the_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let inside = provider_root.join("inside.jsonl");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&inside, b"{\"inside\":true}\n").expect("write inside");
+        std::fs::write(&outside, b"{\"outside\":true}\n").expect("write outside");
+
+        let root = ScanRoot::local(provider_root.clone());
+        let canonical_path = scan_root_meta::canonicalize_root_path(&provider_root);
+        let root_id = scan_root_meta::home_root_id("claude", &canonical_path);
+        let plan = LocalRootPlan {
+            root: root.clone(),
+            meta: scan_root_meta::ScanRootMeta {
+                root_id: root_id.clone(),
+                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+                readonly: false,
+                canonical_path,
+                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+                watermarks_enabled: true,
+            },
+            // No watermark, so the whole root is enumerated and the changed-file
+            // criterion plays no part here.
+            watermark: None,
+            file_states: std::collections::HashMap::new(),
+        };
+        let connector = SilentDiscoveryConnector {
+            sources: vec![
+                discovered_test_source(
+                    &root,
+                    inside,
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+                discovered_test_source(
+                    &root,
+                    outside,
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+            ],
+        };
+        let active_filter = ActiveSessionSourceFilter::default();
+        let mut parsed: Vec<std::path::PathBuf> = Vec::new();
+        let (outcome, fatal) = run_local_root_scan(
+            &connector,
+            "claude",
+            &data_dir,
+            &plan,
+            &[],
+            &active_filter,
+            &mut |_root, _meta, conversation| {
+                parsed.push(conversation.source_path.clone());
+                Ok(())
+            },
+        );
+
+        assert!(
+            fatal.is_none(),
+            "an unmappable file is a root failure, not a fatal scan error: {fatal:?}"
+        );
+        assert!(
+            !outcome.succeeded,
+            "a discovered file outside the root must fail the root"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty()),
+            "the failure must carry a reason, got {:?}",
+            outcome.error
+        );
+        assert!(
+            outcome.files.is_empty(),
+            "a failed root must record no file state, got {:?}",
+            outcome.files
+        );
+        assert_eq!(outcome.root_id, root_id, "the root keeps its identity");
+        assert!(
+            parsed.is_empty(),
+            "no file may be parsed once one is known to be unmappable, got {parsed:?}"
+        );
     }
 
     fn raw_mirror_manifest_values(data_dir: &Path) -> Vec<serde_json::Value> {
