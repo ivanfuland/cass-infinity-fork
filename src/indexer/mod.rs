@@ -7358,6 +7358,36 @@ fn effective_connector_scan_watermark_ts(
     })
 }
 
+/// PR10 task 04: whether an active-session source skip must hold back this
+/// connector's **mirror-root** commit for this run.
+///
+/// The bounded watermark [`effective_connector_scan_watermark_ts`] returns for
+/// a *known* skipped mtime is the right answer for a local root, whose next
+/// scan is a `mtime > watermark` comparison: the watermark stops just short of
+/// the source that may still be growing. A mirror root does not compare
+/// against the watermark at all — its recorded per-file state decides — so a
+/// bounded watermark buys nothing there, while the absent-path cleanup would
+/// drop the state of a file this run deliberately did not read (and, for the
+/// ssh case, an explicit mirror file's `source_id` is not `LOCAL_SOURCE_ID`, so
+/// the skip can only be read from the run's own record). The next run would
+/// then treat that file as new: a re-read rather than a loss, but still not a
+/// complete enumeration, and hard constraint 11 says an incomplete scan must
+/// not touch this root's state.
+///
+/// Scoped to mirror roots on purpose: every other root keeps the baseline
+/// bounded-watermark behaviour.
+fn mirror_root_commit_held_by_active_skips(
+    skips: &Mutex<ActiveSessionSourceSkips>,
+    connector: &str,
+) -> bool {
+    let state = lock_active_session_source_skips(skips);
+    let holds = |name: &str| {
+        state.unknown_mtime_connectors.contains(name)
+            || state.min_mtime_by_connector.contains_key(name)
+    };
+    holds(ACTIVE_SOURCE_SKIP_ALL_CONNECTORS) || holds(connector)
+}
+
 fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
@@ -9875,6 +9905,15 @@ fn persist_root_scan_outcomes(
             continue;
         };
         if outcome.mirror_root {
+            if mirror_root_commit_held_by_active_skips(skips, &outcome.connector) {
+                tracing::info!(
+                    connector = %outcome.connector,
+                    root_id = %outcome.root_id,
+                    "holding back a mirror root's scan state because an active source was \
+                     skipped this run"
+                );
+                continue;
+            }
             // PR10 task 04 (spec hard constraint 11): an explicit SSH mirror
             // root commits its whole enumeration as one transaction, and a
             // failure there is this run's failure. The two things the old
@@ -24181,6 +24220,238 @@ mod tests {
             vec!["late.jsonl", "regressed.jsonl", "unchanged.jsonl"],
             "the watermark still moves for a clean enumeration with no work to do"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR10 task 04 / spec hard constraint 11: an incomplete scan of a mirror
+    // root must not touch its state.
+    //
+    // These three cases take `persist_root_scan_outcomes` as the narrowest
+    // seam -- the same function the run calls at finalize -- instead of driving
+    // a whole `cass index` whose scan errors, deferred conversations and active
+    // sources are hard to stage on purpose. The fixture is deliberately one a
+    // *complete* run would change: a `(root_id, connector)` that already holds
+    // a watermark and the state of a path that has left the mirror, plus a new
+    // path this run parsed. So "nothing moved" is a claim with something to be
+    // wrong about, and the control case below proves the seam really does move
+    // it.
+    // -----------------------------------------------------------------------
+
+    /// The fixture every case above shares: one mirror root's
+    /// `(root_id, connector)`, its prior watermark and per-file state, and the
+    /// scan this run reports.
+    const SKIP_CASE_CONNECTOR: &str = "claude";
+    const SKIP_CASE_ROOT_ID: &str = "cfg:laptop:/mirror/provider-root";
+    const SKIP_CASE_WATERMARK: i64 = 1_700_000_000_000;
+    const SKIP_CASE_MTIME: i64 = 1_699_000_000_000;
+    const SKIP_CASE_SCAN_START_TS: i64 = 1_700_000_100_000;
+    /// Recorded by the previous run and **not** in this run's enumeration: the
+    /// path a commit that got past the gates would delete.
+    const SKIP_CASE_ABSENT_PATH: &str = "projects/-p/agent-gone.jsonl";
+    /// Parsed by this run and not yet recorded: the path such a commit would
+    /// upsert.
+    const SKIP_CASE_NEW_PATH: &str = "projects/-p/agent-new.jsonl";
+
+    struct MirrorCommitCase {
+        before_watermarks: Vec<String>,
+        after_watermarks: Vec<String>,
+        before_states: Vec<String>,
+        after_states: Vec<String>,
+    }
+
+    fn mirror_root_state_rows(
+        storage: &FrankenStorage,
+        root_id: &str,
+        connector: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let watermarks = storage
+            .raw()
+            .query_all_map(
+                "SELECT root_id || '|' || connector || '|' || last_scan_ts FROM scan_watermarks
+                 WHERE root_id = ?1 AND connector = ?2 ORDER BY root_id, connector",
+                &[ParamValue::from(root_id), ParamValue::from(connector)],
+                |row| row.get_typed(0),
+            )
+            .expect("watermark rows");
+        let states = storage
+            .raw()
+            .query_all_map(
+                "SELECT root_id || '|' || connector || '|' || relative_path || '|' || size
+                 || '|' || mtime || '|' || last_seen_ts FROM scan_file_state
+                 WHERE root_id = ?1 AND connector = ?2 ORDER BY root_id, connector, relative_path",
+                &[ParamValue::from(root_id), ParamValue::from(connector)],
+                |row| row.get_typed(0),
+            )
+            .expect("file state rows");
+        (watermarks, states)
+    }
+
+    /// Run one gate case: seed the root's prior state, hand
+    /// `persist_root_scan_outcomes` the outcome this case is about, and report
+    /// both tables on either side.
+    fn mirror_commit_case(
+        skips: &Mutex<ActiveSessionSourceSkips>,
+        scan_deferred_conversations: usize,
+        succeeded: bool,
+    ) -> MirrorCommitCase {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        storage
+            .set_scan_watermark(SKIP_CASE_ROOT_ID, SKIP_CASE_CONNECTOR, SKIP_CASE_WATERMARK)
+            .expect("seed the watermark");
+        storage
+            .upsert_scan_file_state(
+                SKIP_CASE_ROOT_ID,
+                SKIP_CASE_CONNECTOR,
+                SKIP_CASE_ABSENT_PATH,
+                941,
+                SKIP_CASE_MTIME,
+                SKIP_CASE_WATERMARK,
+            )
+            .expect("seed the absent path's state");
+
+        let (before_watermarks, before_states) =
+            mirror_root_state_rows(&storage, SKIP_CASE_ROOT_ID, SKIP_CASE_CONNECTOR);
+
+        // A failed enumeration carries no file list at all (`failed_outcome`) --
+        // which is exactly why the `succeeded` gate has to be the thing that
+        // stops it, rather than the emptiness of its lists.
+        let outcome = RootScanOutcome {
+            connector: SKIP_CASE_CONNECTOR.to_string(),
+            root_id: SKIP_CASE_ROOT_ID.to_string(),
+            succeeded,
+            error: (!succeeded).then(|| "scan failed".to_string()),
+            files: if succeeded {
+                vec![(SKIP_CASE_NEW_PATH.to_string(), 700, SKIP_CASE_MTIME)]
+            } else {
+                Vec::new()
+            },
+            discovered_paths: if succeeded {
+                vec![SKIP_CASE_NEW_PATH.to_string()]
+            } else {
+                Vec::new()
+            },
+            mirror_root: true,
+        };
+
+        persist_root_scan_outcomes(
+            &storage,
+            &[outcome],
+            skips,
+            true,
+            scan_deferred_conversations,
+            SKIP_CASE_SCAN_START_TS,
+        )
+        .expect("persisting a mirror root's outcome");
+
+        let (after_watermarks, after_states) =
+            mirror_root_state_rows(&storage, SKIP_CASE_ROOT_ID, SKIP_CASE_CONNECTOR);
+        storage.close().expect("close db");
+        MirrorCommitCase {
+            before_watermarks,
+            after_watermarks,
+            before_states,
+            after_states,
+        }
+    }
+
+    fn assert_mirror_root_untouched(case: &MirrorCommitCase, why: &str) {
+        assert!(
+            case.after_watermarks == case.before_watermarks
+                && case.after_states == case.before_states,
+            "{why}: an incomplete scan must not delete, upsert or advance this root's \
+             state\n--- before watermarks ---\n{:?}\n--- after watermarks ---\n{:?}\n\
+             --- before states ---\n{:?}\n--- after states ---\n{:?}",
+            case.before_watermarks,
+            case.after_watermarks,
+            case.before_states,
+            case.after_states
+        );
+    }
+
+    /// The seam these cases rest on: with no gate in force, the very same
+    /// fixture *does* move -- the absent path's row goes, the new path's row
+    /// lands and the watermark advances. Without this, "nothing moved" above
+    /// would also hold for a function that never writes anything.
+    #[test]
+    #[serial]
+    fn mirror_root_commit_moves_state_when_no_gate_applies() {
+        let skips = Mutex::new(ActiveSessionSourceSkips::default());
+        let case = mirror_commit_case(&skips, 0, true);
+
+        assert_ne!(
+            case.after_states, case.before_states,
+            "a complete scan of a mirror root must commit its state"
+        );
+        assert!(
+            case.after_states
+                .iter()
+                .any(|row| row.contains(SKIP_CASE_NEW_PATH)),
+            "the file this run parsed must be recorded, got {:?}",
+            case.after_states
+        );
+        assert!(
+            !case
+                .after_states
+                .iter()
+                .any(|row| row.contains(SKIP_CASE_ABSENT_PATH)),
+            "the path the enumeration no longer sees must lose its row, got {:?}",
+            case.after_states
+        );
+        assert_ne!(
+            case.after_watermarks, case.before_watermarks,
+            "a complete scan advances the root's watermark"
+        );
+    }
+
+    /// A connector whose scan failed leaves both tables alone: `succeeded` is
+    /// the gate, and a failed outcome carries empty lists that would otherwise
+    /// read as "everything under this root is gone".
+    #[test]
+    #[serial]
+    fn failed_mirror_scan_does_not_touch_the_root_state() {
+        let skips = Mutex::new(ActiveSessionSourceSkips::default());
+        let case = mirror_commit_case(&skips, 0, false);
+        assert_mirror_root_untouched(&case, "a failed mirror-root scan");
+    }
+
+    /// Deferred conversations mean this run did not commit everything it read,
+    /// so the root's state must stay where it was.
+    #[test]
+    #[serial]
+    fn deferred_conversations_do_not_touch_a_mirror_root_state() {
+        let skips = Mutex::new(ActiveSessionSourceSkips::default());
+        let case = mirror_commit_case(&skips, 1, true);
+        assert_mirror_root_untouched(&case, "a run that deferred a conversation");
+    }
+
+    /// An **active** session source skipped for this connector: the file may
+    /// still be growing, so this run's enumeration is not complete and the
+    /// absent-path cleanup must not run. The recorded mtime is deliberately
+    /// *known* -- `effective_connector_scan_watermark_ts` returns a bounded
+    /// `Some` for that case, so the existing gate does not stop it and only the
+    /// mirror-root hold does. The `*` (unattributed) spelling is covered too,
+    /// because a skip nobody could attribute bounds every connector.
+    #[test]
+    #[serial]
+    fn active_source_skip_holds_back_a_mirror_root_commit() {
+        for skipped_for in [SKIP_CASE_CONNECTOR, ACTIVE_SOURCE_SKIP_ALL_CONNECTORS] {
+            let skips = Mutex::new(ActiveSessionSourceSkips::default());
+            note_active_session_source_skip(&skips, skipped_for, Some(SKIP_CASE_MTIME));
+            let case = mirror_commit_case(&skips, 0, true);
+            assert_mirror_root_untouched(
+                &case,
+                &format!("an active source skipped for {skipped_for}"),
+            );
+
+            let state = lock_active_session_source_skips(&skips);
+            assert!(
+                state.min_mtime_by_connector.contains_key(skipped_for),
+                "the fixture must record a *known* skipped mtime, or the existing \
+                 bounded-watermark gate would be doing this instead"
+            );
+        }
     }
 
     /// PASS_TO_PASS: a local root keeps the watermark cutoff. Its history is

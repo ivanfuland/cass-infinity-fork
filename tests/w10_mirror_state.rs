@@ -61,6 +61,13 @@ const REMOTE_PATH: &str = "~/.claude/projects";
 
 const SOURCE_NAME: &str = "laptop";
 
+/// The prefix every root id of this configured source carries
+/// (`cfg:<source name>:<canonical path>`). Used as a **constant** in the
+/// induced-failure trigger, which is why the run reads the concrete id back
+/// from the database and asserts it starts with this — the trigger must name
+/// this root, not a string this test assembled.
+const ROOT_ID_PREFIX: &str = "cfg:laptop:";
+
 /// The connector kept out of the scan by `disabled_agents`. Its rows are seeded
 /// by hand, which makes "verbatim unchanged" a statement about the product's
 /// SQL scoping and nothing else.
@@ -434,20 +441,29 @@ fn seed_idle_connector_state(db_path: &Path, root_id: &str) {
     storage.close().expect("close the archive");
 }
 
-/// Install the deterministic last-write failure: the watermark insert of this
-/// root's own transaction raises, after the absent-path deletes and the
-/// changed-file upserts have already run inside it.
+/// Install the deterministic last-write failure: the watermark insert of the
+/// `claude` transaction for this mirror root raises, after the absent-path
+/// deletes and the changed-file upserts have already run inside it.
 ///
 /// The same shape as the in-crate `n4_atomicity_guard` (`src/indexer/mod.rs`):
 /// a `BEFORE INSERT ... RAISE(FAIL)`. Nothing in the product knows about it —
 /// the task deliberately does not add a fault-injection switch.
-fn install_watermark_failure(db_path: &Path, root_id: &str) {
+///
+/// The condition names both the root *and* the connector, and it does so with
+/// constants rather than the runtime `root_id`: this root is scanned by every
+/// enabled connector, each of which commits a transaction of its own, so a
+/// trigger keyed on `root_id` alone could fire inside another connector's
+/// empty-enumeration commit. The failing run would then be failing somewhere
+/// other than the transaction this test is about, and the rollback assertions
+/// could hold for the wrong reason. [`ROOT_ID_PREFIX`] is asserted against the
+/// root id read back from the database for exactly that reason.
+fn install_watermark_failure(db_path: &Path) {
     let storage = FrankenStorage::open(db_path).expect("open the archive to install the trigger");
     storage
         .raw()
         .execute_batch(&format!(
             "CREATE TRIGGER {INDUCED_FAILURE_TRIGGER} BEFORE INSERT ON scan_watermarks \
-             WHEN NEW.root_id = '{root_id}' \
+             WHEN NEW.root_id LIKE '{ROOT_ID_PREFIX}%' AND NEW.connector = 'claude' \
              BEGIN SELECT RAISE(FAIL, '{INDUCED_FAILURE_TEXT}'); END;"
         ))
         .expect("install the induced-failure trigger");
@@ -640,6 +656,10 @@ fn failed_watermark_write_rolls_back_both_tables_and_the_rerun_commits() {
         assert!(before_alpha.is_some() && before_beta.is_some());
 
         let root_id = mirror_root_id(&env.db_path());
+        assert!(
+            root_id.starts_with(ROOT_ID_PREFIX),
+            "the induced-failure trigger's constant root pattern must name this root, got {root_id}"
+        );
         seed_idle_connector_state(&env.db_path(), &root_id);
         let seeded_watermarks =
             root_rows(&env.db_path(), ROOT_WATERMARK_ROWS, &source_root_prefix());
@@ -660,7 +680,7 @@ fn failed_watermark_write_rolls_back_both_tables_and_the_rerun_commits() {
             observe("pre-failure+seed", &env.db_path(), streaming, None)
         );
 
-        install_watermark_failure(&env.db_path(), &root_id);
+        install_watermark_failure(&env.db_path());
         let (code, stdout, stderr) = env.index_raw();
         println!(
             "{} (exit code {code})",
@@ -676,14 +696,26 @@ fn failed_watermark_write_rolls_back_both_tables_and_the_rerun_commits() {
             "the failure must be the induced watermark write (proving the commit path \
              really ran), got\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
         );
+        // Scoped to the two connectors the claim is about, and deliberately so:
+        // the trigger names `claude`, so the other ~20 enabled connectors of
+        // this root each commit their own — complete, empty-enumeration —
+        // transaction, and which of them landed before `claude`'s failure
+        // depends on the order the scan producers finished in. Their rows
+        // moving is not this test's subject; `claude`'s rolling back is.
         assert_eq!(
-            root_rows(&env.db_path(), ROOT_WATERMARK_ROWS, &source_root_prefix()),
-            seeded_watermarks,
-            "a failed commit must leave the watermark where it was"
+            rows_of(
+                &root_rows(&env.db_path(), ROOT_WATERMARK_ROWS, &source_root_prefix()),
+                "claude"
+            ),
+            rows_of(&seeded_watermarks, "claude"),
+            "a failed commit must leave this root's watermark where it was"
         );
         assert_eq!(
-            root_rows(&env.db_path(), ROOT_FILE_STATE_ROWS, &source_root_prefix()),
-            seeded_states,
+            rows_of(
+                &root_rows(&env.db_path(), ROOT_FILE_STATE_ROWS, &source_root_prefix()),
+                "claude"
+            ),
+            rows_of(&seeded_states, "claude"),
             "a failed commit must roll the absent-path deletes and the file-state upserts \
              back too, not leave them half-applied"
         );
