@@ -55,7 +55,9 @@ use crate::CliError;
 use crate::indexer::{IndexOptions, IndexRunLockBusy, IndexingProgress, IndexingStats, run_index};
 use crate::model::cli_error_kind::ErrorKind as CliErrorKind;
 use crate::sources::config::{SourceDefinition, SourcesConfig};
-use crate::sources::sync::{SyncEngine, mirror_path_under};
+// Aliased: this module's own report type is `SyncReport` too, and the two are
+// different objects — one describes the round, the other one source's transfer.
+use crate::sources::sync::{SyncEngine, SyncReport as TransferReport, mirror_path_under};
 use crate::storage::api::Conn;
 use crate::storage::schema::{CURRENT_SCHEMA_VERSION, read_user_version};
 
@@ -87,11 +89,11 @@ const MIRROR_SKIPPED_NO_INGEST: &str = "no-ingest";
 const MIRROR_SKIPPED_BY_FLAG: &str = "no-mirror";
 
 /// Per-source status: every configured path of the source transferred.
-const MIRROR_STATUS_SUCCESS: &str = "success";
+pub const MIRROR_STATUS_SUCCESS: &str = "success";
 /// Per-source status: some paths transferred and some did not.
-const MIRROR_STATUS_PARTIAL: &str = "partial";
+pub const MIRROR_STATUS_PARTIAL: &str = "partial";
 /// Per-source status: no path transferred, or the transfer could not start.
-const MIRROR_STATUS_FAILED: &str = "failed";
+pub const MIRROR_STATUS_FAILED: &str = "failed";
 
 /// `error.message` when the local half of the round is ready but the remote
 /// half is not.
@@ -239,10 +241,16 @@ pub fn run_sync(
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
     let mut report = execute(db_override, data_dir.clone(), no_ingest, no_mirror);
 
-    // The fourth stage is the emission of this very object: building the
-    // report is inside every stage that got here, so its window is the
-    // serialize-and-hand-off step. Closing it *before* serializing is what
-    // keeps the printed line and the logged line the same bytes.
+    // The fourth stage, and what its window can honestly be.
+    //
+    // `finished_at` has to be inside the object it stamps, so the window can
+    // only close *before* the line is serialized — it therefore covers the
+    // round's own bookkeeping up to the moment the report is sealed, and it
+    // does **not** cover the real output cost: the serialization, the log
+    // append and the write to stdout all happen after both stamps and are not
+    // measured by anything. Reading this stage as "how long the report took to
+    // emit" would be wrong; it is a marker for "the round stopped working
+    // here", which is what the log line needs to be ordered.
     report.stages.push(SyncStage {
         name: STAGE_REPORT,
         started_at: Some(Utc::now_stamp()),
@@ -434,6 +442,11 @@ fn execute(
     let mirror = closed_stage(STAGE_MIRROR, mirror_started, mirror_status);
 
     // ---- index (exactly once) -------------------------------------------
+    //
+    // The only `run_index` call in this module, and nothing above can reach it
+    // conditionally: no source count, no transfer count and no mirror failure
+    // feeds a branch around it. The mirror result decides the *exit code*, not
+    // whether the local half runs (hard constraint 2).
     let index_started = Utc::now_stamp();
     let progress = Arc::new(IndexingProgress::default());
     let opts = IndexOptions {
@@ -718,6 +731,37 @@ fn preflight_failed(started_at: String) -> Vec<SyncStage> {
 // Mirror stage
 // ---------------------------------------------------------------------------
 
+/// Decide one source's status from what the transport reported.
+///
+/// Hard constraint 4 pins this shape and both halves of it are load-bearing:
+/// `SyncReport::all_succeeded` **and** every `PathSyncResult::success` are
+/// read, and neither may relax the other. So a report that says it succeeded
+/// while carrying a failed path is not `success`, and a report that says it
+/// failed while every path succeeded is not `success` either — the two signals
+/// disagreeing is precisely the case a single-signal reading would get wrong,
+/// in whichever direction the transport happens to be wrong.
+///
+/// No successful path at all is `failed`; some but not all is `partial`. The
+/// empty-path report is the vacuous case of "every path succeeded", and only
+/// `all_succeeded` can contradict it then — a source whose `sync_source`
+/// returns `Ok` with no paths is not reachable today (`NoPaths` is an `Err`),
+/// so this is a floor rather than a live path.
+///
+/// Narrow and pure on purpose: the control plane's reverse mutation removes
+/// one signal or the other, and each of those must turn a test of *this*
+/// function red. A CLI fixture cannot do that — its two signals agree.
+pub fn mirror_source_status(report: &TransferReport) -> &'static str {
+    let all_paths_succeeded = report.path_results.iter().all(|path| path.success);
+    let any_path_succeeded = report.path_results.iter().any(|path| path.success);
+    if report.all_succeeded && all_paths_succeeded {
+        MIRROR_STATUS_SUCCESS
+    } else if any_path_succeeded {
+        MIRROR_STATUS_PARTIAL
+    } else {
+        MIRROR_STATUS_FAILED
+    }
+}
+
 /// Mirror one configured remote source, and check what its report claims.
 ///
 /// Returns the report entry plus any internal-consistency complaints about the
@@ -776,15 +820,7 @@ fn mirror_one_source(
                 })
                 .collect();
 
-            let all_paths_succeeded = paths.iter().all(|path| path.success);
-            let any_path_succeeded = paths.iter().any(|path| path.success);
-            let status = if report.all_succeeded && all_paths_succeeded {
-                MIRROR_STATUS_SUCCESS
-            } else if any_path_succeeded {
-                MIRROR_STATUS_PARTIAL
-            } else {
-                MIRROR_STATUS_FAILED
-            };
+            let status = mirror_source_status(&report);
             let error = (status != MIRROR_STATUS_SUCCESS).then(|| summarize_path_failures(&paths));
             (
                 MirrorSourceResult {
@@ -1053,10 +1089,21 @@ impl Utc {
 /// private (0600) on Unix; the platform-specific calls are `#[cfg]`-gated so a
 /// Windows build still compiles.
 ///
+/// Concurrent rounds are expected (hard constraint 13 puts no lock between the
+/// mirror and the index, and nothing serializes two `cass sync` processes), so
+/// the whole record is built first and appended under a short-lived exclusive
+/// lock on this file. Both halves matter and the body below says why.
+///
 /// Timing is not part of this function's contract — the caller writes the log
 /// *before* printing, and a failure to write is the caller's to report as a
 /// warning. Nothing here can change the round's exit code.
-fn append_run_log(data_dir: &Path, line: &str) -> std::io::Result<()> {
+///
+/// `pub` for the same reason the other narrow functions in this module are:
+/// the concurrency contract above is a claim about this function, and the only
+/// honest way to test it is to call it — a CLI round cannot hold the lock at a
+/// chosen moment.
+pub fn append_run_log(data_dir: &Path, line: &str) -> std::io::Result<()> {
+    use fs2::FileExt;
     use std::io::Write;
 
     let dir = data_dir.join("logs");
@@ -1085,9 +1132,32 @@ fn append_run_log(data_dir: &Path, line: &str) -> std::io::Result<()> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
 
-    file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
-    file.flush()
+    // One record, one `write_all` — never the JSON and then the newline as two
+    // calls. Two calls interleave under `O_APPEND` (`{a}{b}\n\n`); the sibling
+    // writer `src/doctor_runs.rs::append_action` documents and fixed exactly
+    // that shape (its Pass-11 note), and this follows it.
+    let mut record = String::with_capacity(line.len() + 1);
+    record.push_str(line);
+    record.push('\n');
+
+    // A single `write_all` is not enough here, and the difference from
+    // `append_action` is the record size. That one is bounded well under
+    // PIPE_BUF, which is what makes one `write` all-or-nothing on Linux; a
+    // `cass.sync.v1` report grows with the number of configured sources and
+    // has no such bound, and above PIPE_BUF the kernel is free to split the
+    // write and another appender can land inside the split. So the append
+    // takes a short-lived exclusive lock on the log file itself and releases
+    // it as soon as the record is in — it does not wrap the mirror stage, the
+    // index or anything else in the round.
+    FileExt::lock_exclusive(&file)?;
+    let written = file
+        .write_all(record.as_bytes())
+        .and_then(|()| file.flush());
+    // Released explicitly rather than left to `drop`, so that the next round's
+    // writer is unblocked even when this one failed, and so the release is a
+    // fact this function reports rather than a side effect nobody sees.
+    let released = FileExt::unlock(&file);
+    written.and(released)
 }
 
 /// A round identifier: UTC stamp plus pid, so two runs that start in the

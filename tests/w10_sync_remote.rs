@@ -35,15 +35,39 @@
 //!    the binary (the drain's post-loop invariant bails a run that leaves a
 //!    hole), so it is pinned at the function level rather than claimed as an
 //!    end-to-end result.
+//! 7. `the_source_status_reads_both_transfer_signals` — the per-path criterion
+//!    on the two inputs where the transport's two signals *disagree*. A real
+//!    `sync_source` never produces them, so no CLI fixture can pin this, and a
+//!    mutation that drops either signal has to turn it red.
+//! 8. `the_log_writer_serializes_concurrent_appends_of_long_records` and
+//!    `a_held_log_lock_makes_the_next_writer_wait` — the log's concurrency
+//!    contract, called directly: many writers of 48 KiB records come out one
+//!    intact line each, and a writer that arrives while the lock is held
+//!    demonstrably waits (it is still one record after five seconds) and lands
+//!    once the lock is released.
+//! 9. `concurrent_rounds_append_one_intact_line_each` — the same contract
+//!    across four real `cass sync` processes appending at once.
 //!
-//! The shell fixtures are `#[cfg(unix)]`; a non-Unix build still compiles this
-//! file and still runs the table case in (6). The rest of the file — the
-//! fixture struct, the stand-in transports and the JSON helpers — is then
-//! genuinely unused there rather than merely unreferenced, so the dead-code
-//! and unused-import warnings are allowed away for exactly that configuration
-//! and for no other.
+//! What a build configuration can run, and why the gate is
+//! `all(unix, feature = "infinity")` rather than just `unix`:
+//!
+//! * The eight cross-thread/cross-process cases that drive the real binary
+//!   (`cass sync`, the stand-in `ssh`/`rsync` on a private `PATH`) expect the
+//!   round to get past the semantic precondition — which a build without the
+//!   `infinity` feature can never do (it exits 2 by construction, see
+//!   `src/sync.rs::preflight_semantic`). Leaving them Unix-only made them
+//!   *run* under `--features qr,encryption` and fail; that was a test gap, not
+//!   a product one.
+//! * The log-writer cases, the status case and the decision-table case call
+//!   only feature-independent functions, so they run in every configuration,
+//!   Windows and no-Infinity included.
+//!
+//! The dead-code and unused-import allowance therefore covers exactly the two
+//! configurations where the fixture is genuinely unreachable —
+//! `not(all(unix, feature = "infinity"))` — and no other, so the full build
+//! still reports an unused item if one appears.
 
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+#![cfg_attr(not(all(unix, feature = "infinity")), allow(dead_code, unused_imports))]
 
 mod util;
 
@@ -56,9 +80,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use coding_agent_search::sources::sync::{
+    PathSyncResult, SyncMethod, SyncReport as TransferReport,
+};
 use coding_agent_search::sync::{
-    EXIT_INTERNAL, EXIT_PARTIAL, EXIT_PRECONDITION, EXIT_READY, IndexOutcome, REASON_MIRROR_FAILED,
-    REASON_SEMANTIC_NOT_READY, classify_round_outcome,
+    EXIT_INTERNAL, EXIT_PARTIAL, EXIT_PRECONDITION, EXIT_READY, IndexOutcome, MIRROR_STATUS_FAILED,
+    MIRROR_STATUS_PARTIAL, MIRROR_STATUS_SUCCESS, REASON_MIRROR_FAILED, REASON_SEMANTIC_NOT_READY,
+    append_run_log, classify_round_outcome, mirror_source_status,
 };
 use tempfile::TempDir;
 use util::seed_codex_session;
@@ -529,7 +557,7 @@ fn db_scalar(db_path: &Path, sql: &str) -> i64 {
         .unwrap_or_else(|e| panic!("query {sql:?}: {e}"))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -559,7 +587,7 @@ origin_host = "cass-bad"
 paths = ["~/.claude/projects"]
 "#;
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn remote_sources_mirror_then_index_once() {
     let fixture = Fixture::new();
@@ -659,6 +687,18 @@ fn remote_sources_mirror_then_index_once() {
         serde_json::json!(true),
         "a failed mirror half must not skip the local index: {report}"
     );
+    // This round's own statistics, not the archive's: `run_index` resets the
+    // scan counter as it enters, so a non-zero value here can only come from
+    // the run this report describes. That is the observable half of "the
+    // mirror's result did not replace the index" — the other half is the
+    // single `run_index` call site, which no fixture can see.
+    assert!(
+        report["index"]["stats"]["scan_invocations"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "the round's own index must really have scanned its roots: {report}"
+    );
     assert_eq!(
         report["semantic_activated"],
         serde_json::json!(true),
@@ -684,7 +724,7 @@ fn remote_sources_mirror_then_index_once() {
 // M2 — zero transfer, no sources, and a lying "Ok"
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn zero_transfer_and_no_sources_still_ingest() {
     let stub = StubInfinity::start();
@@ -823,7 +863,7 @@ paths = ["{REMOTE_PATH}", "~/.codex/sessions"]
 // M2 — a transfer that claims success without materialising its root
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn a_successful_transfer_without_its_root_is_exit_1() {
     let fixture = Fixture::new();
@@ -878,7 +918,7 @@ paths = ["{REMOTE_PATH}"]
 // M3 — the lock is a typed precondition, and it never wraps the mirror
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn a_held_index_lock_is_exit_2() {
     use fs2::FileExt;
@@ -967,7 +1007,7 @@ paths = ["{REMOTE_PATH}"]
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn an_unreachable_infinity_is_exit_2() {
     let fixture = Fixture::new();
@@ -1006,7 +1046,7 @@ fn an_unreachable_infinity_is_exit_2() {
 // M3 — the run log
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn the_run_log_matches_stdout_byte_for_byte() {
     let fixture = Fixture::new();
@@ -1084,7 +1124,7 @@ fn the_run_log_matches_stdout_byte_for_byte() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "infinity"))]
 #[test]
 fn a_log_that_cannot_be_written_only_warns() {
     let fixture = Fixture::new();
@@ -1196,4 +1236,349 @@ fn the_round_decision_table_keeps_both_partial_reasons() {
     assert_eq!(code, EXIT_READY);
     assert!(reasons.is_empty());
     assert!(error.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The per-path criterion, pinned on inputs whose two signals disagree
+// ---------------------------------------------------------------------------
+
+/// One `PathSyncResult` with the fields the status decision reads.
+fn path_result(remote_path: &str, success: bool) -> PathSyncResult {
+    PathSyncResult {
+        remote_path: remote_path.to_string(),
+        success,
+        error: (!success).then(|| "transfer failed".to_string()),
+        ..Default::default()
+    }
+}
+
+fn transfer_report(all_succeeded: bool, paths: &[(&str, bool)]) -> TransferReport {
+    let mut report = TransferReport::new("cass-fixture", SyncMethod::Rsync);
+    report.all_succeeded = all_succeeded;
+    for (remote_path, success) in paths {
+        report.path_results.push(path_result(remote_path, *success));
+    }
+    report
+}
+
+#[test]
+fn the_source_status_reads_both_transfer_signals() {
+    // Two signals decide one status, and the interesting cases are the ones
+    // where they disagree — a transport can be wrong in either direction, and
+    // each direction is only caught by reading the *other* signal. The CLI
+    // fixtures cannot reach these: a real `sync_source` keeps the two
+    // consistent, so both of the cases below are unreachable end to end. A
+    // reverse mutation that drops `all_succeeded` or drops the per-path
+    // comparison therefore has to turn this test red; that is its whole point.
+    assert_eq!(
+        mirror_source_status(&transfer_report(true, &[("~/.claude/projects", false)])),
+        MIRROR_STATUS_FAILED,
+        "a report claiming success while its only path failed is not success"
+    );
+    assert_eq!(
+        mirror_source_status(&transfer_report(
+            true,
+            &[("~/.claude/projects", true), ("~/.codex/sessions", false)]
+        )),
+        MIRROR_STATUS_PARTIAL,
+        "a report claiming success with a failed path among successful ones is not success"
+    );
+    assert_eq!(
+        mirror_source_status(&transfer_report(
+            false,
+            &[("~/.claude/projects", true), ("~/.codex/sessions", true)]
+        )),
+        MIRROR_STATUS_PARTIAL,
+        "a report claiming failure while every path succeeded is not success either"
+    );
+
+    // The agreeing cases, so the assertions above are not satisfied by a
+    // function that simply never returns success.
+    assert_eq!(
+        mirror_source_status(&transfer_report(
+            true,
+            &[("~/.claude/projects", true), ("~/.codex/sessions", true)]
+        )),
+        MIRROR_STATUS_SUCCESS,
+        "both signals agreeing on a clean transfer is the one success"
+    );
+    assert_eq!(
+        mirror_source_status(&transfer_report(
+            false,
+            &[("~/.claude/projects", false), ("~/.codex/sessions", false)]
+        )),
+        MIRROR_STATUS_FAILED,
+        "both signals agreeing on a failed transfer is failure"
+    );
+    // The vacuous case: "every path succeeded" is true of no paths, so only
+    // the report's own flag can speak. Not reachable through `sync_source`
+    // (an empty path list is an `Err`), pinned so the floor is explicit.
+    assert_eq!(
+        mirror_source_status(&transfer_report(true, &[])),
+        MIRROR_STATUS_SUCCESS,
+        "an empty path list leaves only the report's own flag"
+    );
+    assert_eq!(
+        mirror_source_status(&transfer_report(false, &[])),
+        MIRROR_STATUS_FAILED,
+        "an empty path list with a failed report is failure"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The round log's concurrency contract
+// ---------------------------------------------------------------------------
+
+/// A record far past PIPE_BUF — the size at which one `write` stops being
+/// all-or-nothing on Linux and the lock stops being optional. A real report
+/// reaches this size once enough sources are configured.
+fn long_record(run_id: &str) -> String {
+    serde_json::json!({
+        "schema": SCHEMA,
+        "run_id": run_id,
+        "padding": "x".repeat(48 * 1024),
+    })
+    .to_string()
+}
+
+fn log_lines(data_dir: &Path) -> Vec<String> {
+    let path = data_dir.join("logs").join("sync-runs.jsonl");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines().map(str::to_string).collect()
+}
+
+#[test]
+fn the_log_writer_serializes_concurrent_appends_of_long_records() {
+    // Writers that each open the file themselves — separate open file
+    // descriptions, which is what makes `flock` contend. Long records, many
+    // rounds: without the lock two of these interleave into one unparseable
+    // line, and the assertions below read the file back rather than trusting
+    // that it happened.
+    use std::thread;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().to_path_buf();
+    let writers = 4;
+    let rounds = 24;
+
+    let handles: Vec<_> = (0..writers)
+        .map(|writer| {
+            let data_dir = data_dir.clone();
+            thread::spawn(move || {
+                for round in 0..rounds {
+                    let run_id = format!("sync-w{writer}-r{round}");
+                    append_run_log(&data_dir, &long_record(&run_id))
+                        .unwrap_or_else(|e| panic!("append {run_id}: {e}"));
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("writer thread");
+    }
+
+    let lines = log_lines(&data_dir);
+    assert_eq!(
+        lines.len(),
+        writers * rounds,
+        "one record is one line, whatever the writers did"
+    );
+    let mut seen: Vec<String> = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        let parsed: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|e| {
+            panic!("line {index} is not one JSON object ({e}): {:.120}…", line)
+        });
+        assert_eq!(parsed["schema"], serde_json::json!(SCHEMA));
+        seen.push(
+            parsed["run_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("line {index} lost its run_id"))
+                .to_string(),
+        );
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        writers * rounds,
+        "every round's record must survive intact and exactly once"
+    );
+}
+
+#[test]
+fn a_held_log_lock_makes_the_next_writer_wait() {
+    // The decidable half: while this thread holds the lock, a writer already
+    // trying to append must not land. A writer that skipped the lock would
+    // write within milliseconds, so "the file is still one record after five
+    // seconds" is a real signal rather than a lucky pass — and the second half
+    // (release, then the record appears) proves the same writer was waiting on
+    // the lock rather than stuck somewhere else.
+    use fs2::FileExt;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().expect("tempdir");
+    let data_dir = tmp.path().to_path_buf();
+    append_run_log(&data_dir, "{\"first\":true}").expect("first record");
+
+    let log_path = data_dir.join("logs").join("sync-runs.jsonl");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(&log_path)
+        .expect("open the log for locking");
+    FileExt::lock_exclusive(&held).expect("take the log lock");
+
+    let waiting = {
+        let data_dir = data_dir.clone();
+        thread::spawn(move || append_run_log(&data_dir, &long_record("sync-waiting")))
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        assert_eq!(
+            log_lines(&data_dir).len(),
+            1,
+            "a writer appended while the log lock was held by someone else"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    FileExt::unlock(&held).expect("release the log lock");
+    waiting
+        .join()
+        .expect("the waiting writer thread")
+        .expect("the waiting writer's append");
+
+    let lines = log_lines(&data_dir);
+    assert_eq!(
+        lines.len(),
+        2,
+        "the record the other writer was waiting to append must be there"
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&lines[1]).expect("the waited-for record is one JSON object");
+    assert_eq!(parsed["run_id"], serde_json::json!("sync-waiting"));
+}
+
+/// A config with `count` failing remote sources, so one round's report is a few
+/// kilobytes — the size at which the append stops being a single atomic write.
+fn many_failing_sources(count: usize) -> String {
+    let mut body = String::new();
+    for index in 0..count {
+        body.push_str(&format!(
+            "\n[[sources]]\nname = \"cass-bad-{index}\"\ntype = \"ssh\"\n\
+             host = \"{BAD_SOURCE}@fixture.invalid\"\norigin_host = \"cass-bad-{index}\"\n\
+             paths = [\"{REMOTE_PATH}\"]\n"
+        ));
+    }
+    body
+}
+
+#[cfg(all(unix, feature = "infinity"))]
+#[test]
+fn concurrent_rounds_append_one_intact_line_each() {
+    // The cross-process half of the log contract: four separate `cass sync`
+    // processes appending to one file at once. The index lock is held by this
+    // test for the whole run, so every round takes the same short path (mirror,
+    // then exit 2 at the lock) and their appends land close together — which is
+    // the window the single locked `write_all` exists for. Each round's report
+    // is a few kilobytes, well past the size at which one `write` is
+    // all-or-nothing.
+    use fs2::FileExt;
+    use std::process::Child;
+
+    let fixture = Fixture::new();
+    let stub = StubInfinity::start();
+    fixture.seed_session("rollout-concurrent.jsonl", "w10-concurrent");
+    fixture.write_sources_config(&many_failing_sources(10));
+
+    std::fs::create_dir_all(fixture.data_dir()).expect("create data dir");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(fixture.data_dir().join("index-run.lock"))
+        .expect("open the index-run lock");
+    FileExt::lock_exclusive(&held).expect("hold the index lock for the whole test");
+
+    let rounds = 4_usize;
+    let children: Vec<Child> = (0..rounds)
+        .map(|_| {
+            let mut cmd = fixture.command();
+            cmd.env("CASS_INFINITY_URL", &stub.base_url);
+            cmd.args(["sync", "--json", "--data-dir"]);
+            cmd.arg(fixture.data_dir());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd.spawn().expect("spawn cass sync")
+        })
+        .collect();
+    let outputs: Vec<Output> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("wait for cass sync"))
+        .collect();
+    FileExt::unlock(&held).expect("release the index lock");
+
+    let mut stdout_run_ids: Vec<String> = Vec::with_capacity(rounds);
+    for output in &outputs {
+        let payload = report_of(output);
+        assert_eq!(
+            payload["exit_code"],
+            serde_json::json!(EXIT_PRECONDITION),
+            "every round contended on the same index lock: {payload}"
+        );
+        assert_eq!(
+            payload["error"]["kind"],
+            serde_json::json!("index-busy"),
+            "the loser of the lock must name the busy lock: {payload}"
+        );
+        stdout_run_ids.push(
+            payload["run_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the report must carry its run_id: {payload}"))
+                .to_string(),
+        );
+    }
+
+    let lines = log_lines(&fixture.data_dir());
+    assert_eq!(
+        lines.len(),
+        rounds,
+        "four concurrent rounds must leave exactly four lines: {}",
+        lines.len()
+    );
+    let mut logged_run_ids: Vec<String> = Vec::with_capacity(rounds);
+    for (index, line) in lines.iter().enumerate() {
+        assert!(
+            line.len() > 1024,
+            "the fixtures are meant to produce records past a single atomic write, \
+             got {} bytes on line {index}",
+            line.len()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line {index} is not one JSON object ({e}): {line:.200}"));
+        let run_id = parsed["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("line {index} lost its run_id"))
+            .to_string();
+        // The line-by-line judgement, printed rather than only asserted: the
+        // report carries it as the raw evidence for this case, and a reader
+        // can compare it against the four rounds that ran.
+        println!(
+            "[concurrent round log] line {index}: {} bytes, one JSON object, run_id={run_id}",
+            line.len()
+        );
+        logged_run_ids.push(run_id);
+    }
+    logged_run_ids.sort();
+    stdout_run_ids.sort();
+    println!("[concurrent round log] logged run_ids: {logged_run_ids:?}");
+    println!("[concurrent round log] stdout run_ids: {stdout_run_ids:?}");
+    assert_eq!(
+        logged_run_ids, stdout_run_ids,
+        "the logged rounds must be exactly the rounds that ran, one line each"
+    );
 }
