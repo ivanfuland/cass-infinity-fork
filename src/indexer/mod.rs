@@ -4498,6 +4498,36 @@ impl LexicalRebuildState {
     }
 }
 
+/// The narrow fact "`<data_dir>/index-run.lock` is held by another process".
+///
+/// `cass sync` has to classify a contended lock as exit 2 (PR10 spec hard
+/// constraint 6), and the spec forbids reaching that by pattern-matching an
+/// `anyhow` message. So the busy branch returns this type instead of a bare
+/// string, and the caller downcasts. Its `Display` is byte-for-byte the
+/// sentence the string error used to carry, so nothing an operator reads
+/// changes — only what a caller can *identify*.
+///
+/// It is a separate type rather than a variant of an existing error enum
+/// because `acquire_index_run_lock` is the only producer and the only fact it
+/// carries is which lock was busy.
+#[derive(Debug)]
+pub struct IndexRunLockBusy {
+    /// The lock file that was already held. Reported, never re-derived.
+    pub lock_path: PathBuf,
+}
+
+impl std::fmt::Display for IndexRunLockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another cass index process already holds {}",
+            self.lock_path.display()
+        )
+    }
+}
+
+impl std::error::Error for IndexRunLockBusy {}
+
 pub(crate) fn acquire_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -4521,10 +4551,9 @@ pub(crate) fn acquire_index_run_lock(
 
     if let Err(err) = file.try_lock_exclusive() {
         if err.kind() == std::io::ErrorKind::WouldBlock {
-            anyhow::bail!(
-                "another cass index process already holds {}",
-                lock_path.display()
-            );
+            return Err(anyhow::Error::new(IndexRunLockBusy {
+                lock_path: lock_path.clone(),
+            }));
         }
         return Err(err)
             .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
