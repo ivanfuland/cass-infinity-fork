@@ -60,7 +60,7 @@ use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_TOOL, ROLE_U
 
 use crate::sources::config::{Platform, SourceDefinition, SourcesConfig};
 use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
-use crate::sources::sync::path_to_safe_dirname;
+use crate::sources::sync::{mirror_path_under, mirror_root_for, path_to_safe_dirname};
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, HistoricalSalvageOutcome,
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
@@ -4498,6 +4498,36 @@ impl LexicalRebuildState {
     }
 }
 
+/// The narrow fact "`<data_dir>/index-run.lock` is held by another process".
+///
+/// `cass sync` has to classify a contended lock as exit 2 (PR10 spec hard
+/// constraint 6), and the spec forbids reaching that by pattern-matching an
+/// `anyhow` message. So the busy branch returns this type instead of a bare
+/// string, and the caller downcasts. Its `Display` is byte-for-byte the
+/// sentence the string error used to carry, so nothing an operator reads
+/// changes — only what a caller can *identify*.
+///
+/// It is a separate type rather than a variant of an existing error enum
+/// because `acquire_index_run_lock` is the only producer and the only fact it
+/// carries is which lock was busy.
+#[derive(Debug)]
+pub struct IndexRunLockBusy {
+    /// The lock file that was already held. Reported, never re-derived.
+    pub lock_path: PathBuf,
+}
+
+impl std::fmt::Display for IndexRunLockBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "another cass index process already holds {}",
+            self.lock_path.display()
+        )
+    }
+}
+
+impl std::error::Error for IndexRunLockBusy {}
+
 pub(crate) fn acquire_index_run_lock(
     data_dir: &Path,
     db_path: &Path,
@@ -4521,10 +4551,9 @@ pub(crate) fn acquire_index_run_lock(
 
     if let Err(err) = file.try_lock_exclusive() {
         if err.kind() == std::io::ErrorKind::WouldBlock {
-            anyhow::bail!(
-                "another cass index process already holds {}",
-                lock_path.display()
-            );
+            return Err(anyhow::Error::new(IndexRunLockBusy {
+                lock_path: lock_path.clone(),
+            }));
         }
         return Err(err)
             .with_context(|| format!("acquiring index-run lock {}", lock_path.display()));
@@ -5638,7 +5667,8 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
         return Ok(false);
     }
 
-    let additional_scan_roots = additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir);
+    let additional_scan_roots =
+        additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir)?;
     let watch_roots = build_watch_roots(additional_scan_roots);
     if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
         return Ok(false);
@@ -7357,6 +7387,36 @@ fn effective_connector_scan_watermark_ts(
     })
 }
 
+/// PR10 task 04: whether an active-session source skip must hold back this
+/// connector's **mirror-root** commit for this run.
+///
+/// The bounded watermark [`effective_connector_scan_watermark_ts`] returns for
+/// a *known* skipped mtime is the right answer for a local root, whose next
+/// scan is a `mtime > watermark` comparison: the watermark stops just short of
+/// the source that may still be growing. A mirror root does not compare
+/// against the watermark at all — its recorded per-file state decides — so a
+/// bounded watermark buys nothing there, while the absent-path cleanup would
+/// drop the state of a file this run deliberately did not read (and, for the
+/// ssh case, an explicit mirror file's `source_id` is not `LOCAL_SOURCE_ID`, so
+/// the skip can only be read from the run's own record). The next run would
+/// then treat that file as new: a re-read rather than a loss, but still not a
+/// complete enumeration, and hard constraint 11 says an incomplete scan must
+/// not touch this root's state.
+///
+/// Scoped to mirror roots on purpose: every other root keeps the baseline
+/// bounded-watermark behaviour.
+fn mirror_root_commit_held_by_active_skips(
+    skips: &Mutex<ActiveSessionSourceSkips>,
+    connector: &str,
+) -> bool {
+    let state = lock_active_session_source_skips(skips);
+    let holds = |name: &str| {
+        state.unknown_mtime_connectors.contains(name)
+            || state.min_mtime_by_connector.contains_key(name)
+    };
+    holds(ACTIVE_SOURCE_SKIP_ALL_CONNECTORS) || holds(connector)
+}
+
 fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
@@ -7847,10 +7907,11 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
-            // PR8 C3: a configured *local* root with its own watermark row
-            // takes the same per-root path as a home root; a root the contract
-            // exempts (ssh mirror, `full_scan` source) has no plan here and
-            // keeps the baseline full-root scan below.
+            // PR8 C3: a configured root with its own watermark row (a local
+            // one, or -- PR10 hard constraint 9 -- an ssh mirror root whose
+            // source did not opt into `full_scan`) takes the same per-root path
+            // as a home root; a root the contract exempts (`full_scan` source)
+            // has no plan here and keeps the baseline full-root scan below.
             if let Some(plan) = config
                 .local_root_plans
                 .get(name)
@@ -8951,10 +9012,11 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
-                        // PR8 C3: a configured local root with its own
-                        // watermark row takes the per-root path; exempt roots
-                        // (ssh mirror, `full_scan` source) fall through to the
-                        // baseline full-root scan.
+                        // PR8 C3: a configured root with its own watermark row
+                        // (local, or an ssh mirror root per PR10 hard
+                        // constraint 9) takes the per-root path; exempt roots
+                        // (`full_scan` source) fall through to the baseline
+                        // full-root scan.
                         if let Some(plan) = plans.configured_for(root) {
                             let (outcome, root_succeeded) = batch_scan_one_root(
                                 conn.as_ref(),
@@ -9287,7 +9349,8 @@ fn explicit_scan_root_since_ts(
     // full_scan sources bypass the incremental watermark so third-party-transported
     // cross-machine history (files carrying an origin mtime older than the connector
     // watermark) is still promoted to canonical. Canonical dedupe protects repeats —
-    // the same guarantee configured remote mirror roots already rely on.
+    // the same guarantee the roots that stay on a full-root scan after PR10 rely on
+    // (a `full_scan` source, and the DB-registered mirror fallback below).
     if full_scan_source_ids.contains(&root.origin.source_id) {
         return None;
     }
@@ -9333,16 +9396,56 @@ struct RootScanOutcome {
     error: Option<String>,
     /// `(relative_path, size, mtime)` of every file this scan covered.
     files: Vec<(String, i64, i64)>,
+    /// PR10 task 03 (spec hard constraint 11): the root-relative paths of
+    /// **every** file the enumeration covered, sorted and deduped, whether or
+    /// not the comparison below handed it to the connector.
+    ///
+    /// `files` answers "what did this run parse"; this answers "what is under
+    /// this root at all". Task 04 consumes it to clear the recorded state of
+    /// paths that disappeared from a root, which is why a clean scan with no
+    /// changes still carries it. Every failure path clears it: an enumeration
+    /// that did not complete must never be read as "these are all the files
+    /// that exist" -- `succeeded` is what separates a genuinely empty
+    /// enumeration from an unread one.
+    discovered_paths: Vec<String>,
+    /// PR10 task 04 (spec hard constraint 11): this root is an explicitly
+    /// configured SSH mirror root, so its clean scan commits through the
+    /// transactional path -- absent paths dropped, changed files written and
+    /// the watermark advanced together, with a failure reaching the caller
+    /// instead of being logged and swallowed.
+    ///
+    /// Carried on the outcome because the persist stage runs long after the
+    /// root's plan is out of scope. It is `false` for every other root kind
+    /// (home roots, machine-local configured roots, the DB-registered
+    /// fallback), which keep the baseline write-it-and-warn path.
+    mirror_root: bool,
 }
 
 impl RootScanOutcome {
-    fn failed(connector: &str, root_id: &str) -> Self {
+    fn failed(connector: &str, root_id: &str, mirror_root: bool) -> Self {
         Self {
             connector: connector.to_string(),
             root_id: root_id.to_string(),
             succeeded: false,
             error: None,
             files: Vec::new(),
+            discovered_paths: Vec::new(),
+            mirror_root,
+        }
+    }
+
+    /// A root that failed for a reason the run should carry, not just a
+    /// false `succeeded`: the caller sees the failure and this root's
+    /// watermark and file states both stay where they were.
+    fn failed_with_error(
+        connector: &str,
+        root_id: &str,
+        mirror_root: bool,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            error: Some(error.into()),
+            ..Self::failed(connector, root_id, mirror_root)
         }
     }
 }
@@ -9354,6 +9457,7 @@ fn failed_outcome(outcome: RootScanOutcome) -> RootScanOutcome {
     RootScanOutcome {
         succeeded: false,
         files: Vec::new(),
+        discovered_paths: Vec::new(),
         ..outcome
     }
 }
@@ -9385,6 +9489,7 @@ fn local_root_plans(
                 canonical_path,
                 source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
                 watermarks_enabled: true,
+                mirror_root: false,
             },
             watermark,
             file_states,
@@ -9394,9 +9499,10 @@ fn local_root_plans(
 }
 
 /// The plan for one configured root, when the contract gives it watermarks
-/// (`watermarks_enabled`: a local configured root of a source that did not opt
-/// into full scans). Mirror roots and `full_scan` sources return `None` and
-/// keep `explicit_scan_root_since_ts`'s full-root scan.
+/// (`watermarks_enabled`: a configured root of a source that did not opt into
+/// full scans -- a local one, or an ssh mirror root per PR10 hard constraint
+/// 9). `full_scan` sources return `None` and keep
+/// `explicit_scan_root_since_ts`'s full-root scan.
 fn configured_local_root_plan(
     connector: &str,
     storage: &FrankenStorage,
@@ -9543,14 +9649,44 @@ fn file_scan_stamp(path: &Path, discovered: &crate::connectors::DiscoveredSource
     }
 }
 
+/// The relative paths of every file an enumeration covered, sorted and
+/// deduped: the "what is under this root" fact task 04 consumes, as opposed to
+/// `RootScanOutcome::files`' "what this run parsed".
+fn sorted_discovered_paths(candidates: &[(String, i64, i64, PathBuf)]) -> Vec<String> {
+    let mut paths: Vec<String> = candidates
+        .iter()
+        .map(|(relative, _, _, _)| relative.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// Scan one watermarks-enabled root and report what it covered.
 ///
 /// Full scan (no watermark row) hands the connector the root itself with
-/// `since_ts = None`. Otherwise each file with `mtime > watermark`, a `size`
-/// that differs from what `scan_file_state` recorded, or no record at all, is
-/// handed over as an explicit single-file root with `since_ts = Some(0)` --
-/// `0` because the connector's own inner mtime filter would otherwise drop a
-/// file whose size changed while its mtime did not (hard constraint 6).
+/// `since_ts = None`. Otherwise each *changed* file is handed over as an
+/// explicit single-file root with `since_ts = Some(0)` -- `0` because the
+/// connector's own inner mtime filter would otherwise drop a file whose size
+/// changed while its mtime did not (hard constraint 6).
+///
+/// "Changed" depends on what the root *is* (PR10 task 03, spec hard
+/// constraint 9), which is the one place [`scan_root_meta::ScanRootMeta::mirror_root`]
+/// is read:
+///
+/// - a **local** root holds this machine's own append-only history, so the
+///   root watermark is a sound cutoff: `mtime > watermark`, a `size` that
+///   differs from what `scan_file_state` recorded, or no record at all;
+/// - a **mirror** root holds a copy of another machine's tree, which can
+///   deliver a file whose mtime predates any watermark on any transfer, so
+///   the watermark is not a cutoff at all: no record, a recorded `size` that
+///   differs, or a recorded `mtime` that differs. A file replaced in place by
+///   an older copy counts, and so does a newly mirrored file that was written
+///   on the far machine long ago. Content is never hashed (spec
+///   "镜像文件状态边界").
+///
+/// Both modes record the same two collections: `files` is what was handed
+/// over, `discovered_paths` is the whole enumeration.
 ///
 /// Returns the outcome plus, separately, a fatal error the *callback* raised
 /// (the streaming producer's consumer-disconnected case, which stops the
@@ -9587,33 +9723,73 @@ fn run_local_root_scan(
                 error = %error,
                 "scan root discovery failed"
             );
-            return (RootScanOutcome::failed(connector_name, &root_id), None);
+            return (
+                RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
+                None,
+            );
         }
     };
 
     // Everything the connector would read under this root, with the size and
     // mtime the comparison below runs on.
-    let candidates: Vec<(String, i64, i64, PathBuf)> = discovered
-        .iter()
-        .filter_map(|discovered_file| {
-            let relative = relative_path_within(
-                &plan.meta.canonical_path,
-                &discovered_file.source_path,
-            )?;
-            let (size, mtime) = file_scan_stamp(&discovered_file.source_path, discovered_file);
-            Some((relative, size, mtime, discovered_file.source_path.clone()))
-        })
-        .collect();
+    //
+    // PR10 hard constraint 10: a discovered file that does not resolve inside
+    // this root fails the whole root. Dropping it (the `filter_map` this used
+    // to be) left the remaining candidates looking like a complete, clean
+    // enumeration -- with no candidate at all the root reported success with
+    // an empty file list, which is exactly what advances a watermark past
+    // files that were never seen. The root keeps its identity and its state
+    // stays where it was.
+    let mut candidates: Vec<(String, i64, i64, PathBuf)> = Vec::with_capacity(discovered.len());
+    for discovered_file in &discovered {
+        let Some(relative) =
+            relative_path_within(&plan.meta.canonical_path, &discovered_file.source_path)
+        else {
+            tracing::warn!(
+                connector = connector_name,
+                root = %plan.meta.canonical_path.display(),
+                path = %discovered_file.source_path.display(),
+                "discovered source is outside its scan root; failing the root instead of dropping it"
+            );
+            return (
+                RootScanOutcome::failed_with_error(
+                    connector_name,
+                    &root_id,
+                    plan.meta.mirror_root,
+                    format!(
+                        "discovered source {} is not under scan root {}",
+                        discovered_file.source_path.display(),
+                        plan.meta.canonical_path.display()
+                    ),
+                ),
+                None,
+            );
+        };
+        let (size, mtime) = file_scan_stamp(&discovered_file.source_path, discovered_file);
+        candidates.push((relative, size, mtime, discovered_file.source_path.clone()));
+    }
+
+    // The enumeration on its own, taken before the comparison below decides
+    // what to hand over: a clean scan with nothing to re-read still has to
+    // report what it saw (spec hard constraint 11).
+    let discovered_paths = sorted_discovered_paths(&candidates);
 
     let (ctx, scanned_files) = if let Some(watermark) = plan.watermark {
         let changed: Vec<(String, i64, i64, PathBuf)> = candidates
             .iter()
             .filter(|(relative, size, mtime, _)| {
-                *mtime > watermark
-                    || plan
-                        .file_states
-                        .get(relative)
-                        .is_none_or(|(recorded_size, _)| recorded_size != size)
+                match plan.file_states.get(relative) {
+                    // No record for this path at this root: it has never been
+                    // read here, whatever its mtime says.
+                    None => true,
+                    Some((recorded_size, recorded_mtime)) => {
+                        if plan.meta.mirror_root {
+                            recorded_size != size || recorded_mtime != mtime
+                        } else {
+                            *mtime > watermark || recorded_size != size
+                        }
+                    }
+                }
             })
             .cloned()
             .collect();
@@ -9627,6 +9803,8 @@ fn run_local_root_scan(
                     succeeded: true,
                     error: None,
                     files: Vec::new(),
+                    discovered_paths,
+                    mirror_root: plan.meta.mirror_root,
                 },
                 None,
             );
@@ -9694,10 +9872,15 @@ fn run_local_root_scan(
                 succeeded: true,
                 error: None,
                 files: scanned_files,
+                discovered_paths,
+                mirror_root: plan.meta.mirror_root,
             },
             None,
         ),
-        Ok(()) => (RootScanOutcome::failed(connector_name, &root_id), fatal),
+        Ok(()) => (
+            RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
+            fatal,
+        ),
         Err(error) => {
             tracing::warn!(
                 connector = connector_name,
@@ -9708,7 +9891,7 @@ fn run_local_root_scan(
             (
                 RootScanOutcome {
                     error: Some(error.to_string()),
-                    ..RootScanOutcome::failed(connector_name, &root_id)
+                    ..RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root)
                 },
                 fatal,
             )
@@ -9723,6 +9906,12 @@ fn run_local_root_scan(
 /// skips are in force, or when a root's own scan failed -- for a failing root
 /// *both* its watermark and its file states stay where they were (hard
 /// constraint 5).
+///
+/// An explicit SSH mirror root (PR10 task 04) takes the transactional branch
+/// inside the loop: its absent-path deletes, changed-file writes and watermark
+/// all commit together and a failure propagates to the caller. Every other
+/// root keeps the baseline per-row writes and their warning-only error
+/// handling.
 fn persist_root_scan_outcomes(
     storage: &FrankenStorage,
     outcomes: &[RootScanOutcome],
@@ -9744,6 +9933,42 @@ fn persist_root_scan_outcomes(
         else {
             continue;
         };
+        if outcome.mirror_root {
+            if mirror_root_commit_held_by_active_skips(skips, &outcome.connector) {
+                tracing::info!(
+                    connector = %outcome.connector,
+                    root_id = %outcome.root_id,
+                    "holding back a mirror root's scan state because an active source was \
+                     skipped this run"
+                );
+                continue;
+            }
+            // PR10 task 04 (spec hard constraint 11): an explicit SSH mirror
+            // root commits its whole enumeration as one transaction, and a
+            // failure there is this run's failure. The two things the old
+            // branch below cannot do are the reason it is a separate path:
+            // clearing the state of paths that disappeared from the mirror
+            // (without touching another connector's rows for the same root),
+            // and refusing to report a clean run when that write did not land.
+            // A warning-only success here would advance nothing today and
+            // silently re-read nothing tomorrow -- the failure has to reach
+            // `cass index`'s exit code.
+            persist::with_ephemeral_writer(
+                storage,
+                false,
+                "committing a mirror root's scan state",
+                |writer| {
+                    writer.commit_mirror_root_scan_state(
+                        &outcome.root_id,
+                        &outcome.connector,
+                        &outcome.discovered_paths,
+                        &outcome.files,
+                        watermark_ts,
+                    )
+                },
+            )?;
+            continue;
+        }
         if let Err(error) = persist::with_ephemeral_writer(
             storage,
             false,
@@ -11097,7 +11322,7 @@ pub fn run_index(
                 }
 
                 let (additional_scan_roots, scan_roots_meta) =
-                    additional_scan_roots_with_meta(&storage, &opts.data_dir);
+                    additional_scan_roots_with_meta(&storage, &opts.data_dir)?;
                 let scan_roots_meta = Arc::new(scan_roots_meta);
 
                 // `cass index --full` clears the watermarks of the roots this
@@ -11664,7 +11889,7 @@ pub fn run_index(
             anyhow::bail!(message);
         }
         let additional_scan_roots =
-            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir);
+            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)?;
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
         let watch_once_mode = opts
             .watch_once_paths
@@ -16587,27 +16812,31 @@ pub(crate) fn expand_local_scan_root_path(path: &str) -> PathBuf {
 fn additional_scan_roots_for_scan_or_watch(
     storage: &FrankenStorage,
     data_dir: &Path,
-) -> Vec<ScanRoot> {
+) -> anyhow::Result<Vec<ScanRoot>> {
     // Source-config syncing and scan-root discovery can be expensive on large
     // machines with many historical bundles and configured mirrors. Defer that
     // work until a source scan or watch session actually needs it.
-    additional_scan_roots_with_meta(storage, data_dir).0
+    Ok(additional_scan_roots_with_meta(storage, data_dir)?.0)
 }
 
 /// [`additional_scan_roots_for_scan_or_watch`] plus the `ScanRootMeta` of the
 /// roots it kept, for the callers that ingest and therefore need each root's
 /// `identity_host` / `root_id` (PR8 C3).
+///
+/// Fallible because a configured remote path with two mirror layouts is a
+/// refusal, not a default (PR10 hard constraint 10).
 fn additional_scan_roots_with_meta(
     storage: &FrankenStorage,
     data_dir: &Path,
-) -> (Vec<ScanRoot>, scan_root_meta::ScanRootMetaIndex) {
+) -> anyhow::Result<(Vec<ScanRoot>, scan_root_meta::ScanRootMetaIndex)> {
+    ensure_configured_mirror_roots_unambiguous(data_dir)?;
     sync_sources_config_to_db(storage);
     let (roots, metas) = build_scan_roots_with_meta(storage, data_dir);
     let filtered: Vec<ScanRoot> = roots
         .into_iter()
         .filter(|root| !(root.origin.source_id == LOCAL_SOURCE_ID && root.path == data_dir))
         .collect();
-    (filtered, metas)
+    Ok((filtered, metas))
 }
 
 pub fn build_scan_roots(storage: &FrankenStorage, data_dir: &Path) -> Vec<ScanRoot> {
@@ -16676,25 +16905,54 @@ pub fn build_scan_roots_with_meta(
 
             for path in &source.paths {
                 if source.is_remote() {
-                    // SSH mirror roots keep the baseline full-root scan (hard
-                    // constraint 5) but still carry the configured
-                    // `origin_host` as their identity: sessions arriving
-                    // through ivanmac's mirror are ivanmac's.
+                    // PR10 task 03 / hard constraint 9: an explicitly
+                    // configured ssh mirror root takes the per-root watermark
+                    // and file state unless its source opted into `full_scan`
+                    // (hard constraint 5). The mirror still carries the
+                    // configured `origin_host` as its identity: sessions
+                    // arriving through ivanmac's mirror are ivanmac's.
+                    //
+                    // `mirror_root` is set here and nowhere else: the mirror's
+                    // file comparison cannot use the watermark as a cutoff,
+                    // because a transfer can deliver a file whose mtime
+                    // predates it. The DB-registered fallback below passes
+                    // `false` and keeps the baseline full-root scan -- it has
+                    // no `full_scan` field to consult.
                     //
                     // PR8 C6: the candidate list is shared with
                     // `run_sources_doctor`, so this scan root and that doctor
                     // report cannot drift into two derivations of one layout.
-                    let Some(mirror_path) = remote_mirror_candidates(source, data_dir, path)
-                        .into_iter()
-                        .find(|candidate| candidate.exists())
-                    else {
-                        continue;
+                    //
+                    // PR10 task 01: the resolution is a choice among that list
+                    // -- primary first, the legacy layout only when the primary
+                    // is absent, and nothing at all when two different trees
+                    // exist (`ensure_configured_mirror_roots_unambiguous` fails
+                    // the run before this point; skipping here keeps this
+                    // builder from picking one on the surfaces that only read
+                    // roots). The path handed to the connector *and* to the
+                    // metadata is the canonical one, so the tree that is
+                    // scanned and the base a relative path is computed against
+                    // are the same directory.
+                    let mirror_path = match choose_configured_mirror_root(source, data_dir, path) {
+                        MirrorRootChoice::One(mirror_path) => mirror_path,
+                        MirrorRootChoice::Absent => continue,
+                        MirrorRootChoice::Ambiguous(roots) => {
+                            tracing::error!(
+                                source = %source.name,
+                                path = %path,
+                                roots = ?roots,
+                                "configured remote path has more than one mirror directory; \
+                                 refusing to index either"
+                            );
+                            continue;
+                        }
                     };
                     metas.insert(configured_scan_root_meta(
                         &source.name,
                         &source.origin_host,
                         source.readonly,
-                        false,
+                        !source.full_scan,
+                        true,
                         &mirror_path,
                     ));
                     let mut scan_root = ScanRoot::remote(mirror_path, origin.clone(), platform);
@@ -16723,6 +16981,7 @@ pub fn build_scan_roots_with_meta(
                         &source.origin_host,
                         source.readonly,
                         !source.full_scan,
+                        false,
                         &local_path,
                     ));
                     let mut scan_root = ScanRoot::local(local_path);
@@ -16833,10 +17092,12 @@ pub fn build_scan_roots_with_meta(
                         };
                         // DB-registered fallback roots carry no config fields:
                         // identity stays `local` and they keep the baseline
-                        // scan scope (no per-root watermark).
+                        // scan scope (no per-root watermark, no mirror
+                        // comparison -- there is no `full_scan` to consult).
                         metas.insert(configured_scan_root_meta(
                             &source.id,
                             "local",
+                            false,
                             false,
                             false,
                             &local_path,
@@ -16865,6 +17126,7 @@ pub fn build_scan_roots_with_meta(
                     "local",
                     false,
                     false,
+                    false,
                     &mirror_path,
                 ));
                 let mut scan_root = ScanRoot::remote(mirror_path, origin, platform);
@@ -16878,11 +17140,29 @@ pub fn build_scan_roots_with_meta(
     (roots, metas)
 }
 
+/// The `~/`-normalized spelling of a remote path: what this derivation used to
+/// name the mirror directory after, before the raw spelling became the rule.
+fn tilde_normalized_path(path: &str) -> String {
+    if path.starts_with("~/") {
+        path.to_string()
+    } else if path.starts_with('~') {
+        path.replacen('~', "~/", 1)
+    } else {
+        path.to_string()
+    }
+}
+
 /// The mirror directories a configured remote `source`'s `path` can live under,
 /// in the order the build tries them: the path's own mirror directory first,
-/// then -- for a `~/`-rooted path -- every sibling directory under the mirror
-/// root whose name ends with the same safe suffix, the layout an older sync
-/// produced before the per-path mirror name was pinned.
+/// then the two layouts older versions produced -- the `~/`-normalized name,
+/// and every sibling directory under the mirror root whose name ends with the
+/// same safe suffix.
+///
+/// The first entry is [`crate::sources::sync::mirror_path_under`] applied to
+/// the **raw** configured path, the same rule the sync writer names the
+/// directory with; that is what keeps a bare `~` out of two directories. The
+/// rest are read-only compatibility: `~` and `~/x` were both normalized to
+/// `~/...` here, so a mirror written under that name has to stay findable.
 ///
 /// PR8 C6: `run_sources_doctor` classifies a remote root's `missing` / `empty`
 /// / `present` state from this same list, so the two surfaces cannot drift into
@@ -16892,28 +17172,24 @@ pub(crate) fn remote_mirror_candidates(
     data_dir: &Path,
     path: &str,
 ) -> Vec<PathBuf> {
-    let expanded_path = if path.starts_with("~/") {
-        path.to_string()
-    } else if path.starts_with('~') {
-        path.replacen('~', "~/", 1)
-    } else {
-        path.to_string()
-    };
-    let safe_name = path_to_safe_dirname(&expanded_path);
     // A source that declares `mirror_dir` mirrors under that directory instead
     // of `data_dir/remotes/<name>/mirror`; the per-path layout below the root
     // is unchanged, so sync and this derivation keep agreeing.
-    let mirror_base = source
-        .effective_mirror_dir()
-        .unwrap_or_else(|| data_dir.join("remotes").join(&source.name).join("mirror"));
+    let mirror_root = mirror_root_for(source, data_dir);
 
-    let mut candidates = vec![mirror_base.join(&safe_name)];
+    let primary = mirror_path_under(&mirror_root, path);
+    let legacy = mirror_path_under(&mirror_root, &tilde_normalized_path(path));
+    let mut candidates = vec![primary.clone()];
+    if legacy != primary {
+        candidates.push(legacy);
+    }
     if path.starts_with("~/") {
         let safe_suffix = path_to_safe_dirname(path.trim_start_matches("~/"));
-        if let Ok(entries) = std::fs::read_dir(&mirror_base) {
+        if let Ok(entries) = std::fs::read_dir(&mirror_root) {
             for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().ends_with(&safe_suffix)
                     && entry.path().is_dir()
+                    && !candidates.contains(&entry.path())
                 {
                     candidates.push(entry.path());
                 }
@@ -16921,6 +17197,87 @@ pub(crate) fn remote_mirror_candidates(
         }
     }
     candidates
+}
+
+/// What a configured remote path's mirror directory resolves to on this
+/// machine, before the root is built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MirrorRootChoice {
+    /// No mirror layout for this path exists here yet.
+    Absent,
+    /// The one directory this path's mirror lives in, canonicalized.
+    One(PathBuf),
+    /// Two or more layouts exist and they are not the same directory.
+    Ambiguous(Vec<PathBuf>),
+}
+
+/// Resolve one configured remote path to the single mirror directory it lives
+/// in: the primary layout when it exists, otherwise the legacy layout an older
+/// sync produced, and a refusal to choose when both exist as different trees
+/// (hard constraint 10).
+///
+/// The comparison is on canonical paths, so a legacy sibling that is a symlink
+/// to the primary is one directory, not two.
+fn choose_configured_mirror_root(
+    source: &SourceDefinition,
+    data_dir: &Path,
+    path: &str,
+) -> MirrorRootChoice {
+    let mut existing: Vec<PathBuf> = Vec::new();
+    for candidate in remote_mirror_candidates(source, data_dir, path) {
+        if !candidate.exists() {
+            continue;
+        }
+        let canonical = scan_root_meta::canonicalize_root_path(&candidate);
+        if !existing.contains(&canonical) {
+            existing.push(canonical);
+        }
+    }
+    match existing.len() {
+        0 => MirrorRootChoice::Absent,
+        1 => MirrorRootChoice::One(existing.remove(0)),
+        _ => MirrorRootChoice::Ambiguous(existing),
+    }
+}
+
+/// Hard constraint 10: two mirror layouts for one configured remote path that
+/// resolve to different directories is an operator error, and the run must say
+/// so instead of indexing one of them.
+///
+/// This runs before the roots are built so the failure is the run's own, not a
+/// root that quietly went missing; the builder keeps its own refusal (it logs
+/// and skips) for the surfaces that only read roots.
+fn ensure_configured_mirror_roots_unambiguous(data_dir: &Path) -> anyhow::Result<()> {
+    if dotenvy::var("CASS_IGNORE_SOURCES_CONFIG").is_ok() {
+        return Ok(());
+    }
+    // A config that will not load has its own reporting (`sources_config_error`)
+    // and its own exit code; this check only rules on the ones that parsed.
+    let Ok(config) = SourcesConfig::load() else {
+        return Ok(());
+    };
+    for source in &config.sources {
+        if !source.is_remote() {
+            continue;
+        }
+        for path in &source.paths {
+            if let MirrorRootChoice::Ambiguous(roots) =
+                choose_configured_mirror_root(source, data_dir, path)
+            {
+                let roots: Vec<String> = roots
+                    .iter()
+                    .map(|root| root.display().to_string())
+                    .collect();
+                anyhow::bail!(
+                    "mirror-root-ambiguous: source '{}' path '{}' has more than one mirror directory: {}",
+                    source.name,
+                    path,
+                    roots.join(", ")
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `ScanRootMeta` for one configured source path (hard constraint 12).
@@ -16931,6 +17288,7 @@ fn configured_scan_root_meta(
     origin_host: &str,
     readonly: bool,
     watermarks_enabled: bool,
+    mirror_root: bool,
     root_path: &Path,
 ) -> scan_root_meta::ScanRootMeta {
     let canonical_path = scan_root_meta::canonicalize_root_path(root_path);
@@ -16941,6 +17299,7 @@ fn configured_scan_root_meta(
         canonical_path,
         source_name: source_name.to_string(),
         watermarks_enabled,
+        mirror_root,
     }
 }
 
@@ -17015,6 +17374,7 @@ fn home_root_metas(connector: &str) -> Vec<scan_root_meta::ScanRootMeta> {
             canonical_path,
             source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
             watermarks_enabled: true,
+            mirror_root: false,
         });
     }
     metas
@@ -23518,6 +23878,682 @@ mod tests {
     ) -> crate::connectors::DiscoveredSourceFile {
         crate::connectors::DiscoveredSourceFile::new("synthetic", root, source_path, role, true)
             .with_fs_metadata()
+    }
+
+    /// Discovers exactly the files it was handed and parses none of them, so a
+    /// test can ask what the root scan does with the *file list* alone: every
+    /// other way this scan can fail would fail under both the old and the new
+    /// implementation and prove nothing.
+    struct SilentDiscoveryConnector {
+        sources: Vec<crate::connectors::DiscoveredSourceFile>,
+    }
+
+    impl Connector for SilentDiscoveryConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult::not_found()
+        }
+
+        fn scan(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(Vec::new())
+        }
+
+        fn discover_source_files(
+            &self,
+            _ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<crate::connectors::DiscoveredSourceFile>> {
+            Ok(self.sources.clone())
+        }
+    }
+
+    /// PR10 hard constraint 10: a discovered file that does not resolve inside
+    /// the root fails that root.
+    ///
+    /// The `filter_map` this replaced dropped such a file, so a root whose only
+    /// candidate was outside it reported `succeeded: true` with an empty file
+    /// list — the exact shape `persist_root_scan_outcomes` treats as a clean
+    /// enumeration and advances the watermark for.
+    #[test]
+    fn local_root_scan_fails_when_a_discovered_file_is_outside_the_root() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let inside = provider_root.join("inside.jsonl");
+        let outside = temp.path().join("outside.jsonl");
+        std::fs::write(&inside, b"{\"inside\":true}\n").expect("write inside");
+        std::fs::write(&outside, b"{\"outside\":true}\n").expect("write outside");
+
+        let root = ScanRoot::local(provider_root.clone());
+        let canonical_path = scan_root_meta::canonicalize_root_path(&provider_root);
+        let root_id = scan_root_meta::home_root_id("claude", &canonical_path);
+        let plan = LocalRootPlan {
+            root: root.clone(),
+            meta: scan_root_meta::ScanRootMeta {
+                root_id: root_id.clone(),
+                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+                readonly: false,
+                canonical_path,
+                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+                watermarks_enabled: true,
+                mirror_root: false,
+            },
+            // No watermark, so the whole root is enumerated and the changed-file
+            // criterion plays no part here.
+            watermark: None,
+            file_states: std::collections::HashMap::new(),
+        };
+        let connector = SilentDiscoveryConnector {
+            sources: vec![
+                discovered_test_source(
+                    &root,
+                    inside,
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+                discovered_test_source(
+                    &root,
+                    outside,
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                ),
+            ],
+        };
+        let active_filter = ActiveSessionSourceFilter::default();
+        let mut parsed: Vec<std::path::PathBuf> = Vec::new();
+        let (outcome, fatal) = run_local_root_scan(
+            &connector,
+            "claude",
+            &data_dir,
+            &plan,
+            &[],
+            &active_filter,
+            &mut |_root, _meta, conversation| {
+                parsed.push(conversation.source_path.clone());
+                Ok(())
+            },
+        );
+
+        assert!(
+            fatal.is_none(),
+            "an unmappable file is a root failure, not a fatal scan error: {fatal:?}"
+        );
+        assert!(
+            !outcome.succeeded,
+            "a discovered file outside the root must fail the root"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty()),
+            "the failure must carry a reason, got {:?}",
+            outcome.error
+        );
+        assert!(
+            outcome.files.is_empty(),
+            "a failed root must record no file state, got {:?}",
+            outcome.files
+        );
+        assert_eq!(outcome.root_id, root_id, "the root keeps its identity");
+        assert!(
+            parsed.is_empty(),
+            "no file may be parsed once one is known to be unmappable, got {parsed:?}"
+        );
+        assert!(
+            outcome.discovered_paths.is_empty(),
+            "a failed enumeration must clear the discovered set rather than look \
+             like a clean scan of an empty root, got {:?}",
+            outcome.discovered_paths
+        );
+    }
+
+    /// `(size, mtime_ms)` of a file on disk, the same pair `file_scan_stamp`
+    /// reads, so a test can hand `scan_file_state` exactly what a previous run
+    /// would have recorded.
+    fn fs_stamp(path: &Path) -> (i64, i64) {
+        let metadata = std::fs::metadata(path).expect("fixture metadata");
+        let mtime = metadata
+            .modified()
+            .expect("fixture mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime after epoch")
+            .as_millis();
+        (
+            i64::try_from(metadata.len()).expect("fixture size"),
+            i64::try_from(mtime).expect("fixture mtime ms"),
+        )
+    }
+
+    /// A `ScanRootMeta`-carrying plan for `root`, with the root kind task 03
+    /// added and the watermark / recorded per-file state a previous run would
+    /// have left behind.
+    fn plan_with_recorded_state(
+        root: &ScanRoot,
+        mirror_root: bool,
+        watermark: Option<i64>,
+        recorded: &[(&str, i64, i64)],
+    ) -> LocalRootPlan {
+        let canonical_path = scan_root_meta::canonicalize_root_path(&root.path);
+        let (source_name, origin_host) = if mirror_root {
+            ("ivanmac", "ivanmac")
+        } else {
+            (
+                scan_root_meta::HOME_SOURCE_NAME,
+                crate::storage::sqlite::DEFAULT_IDENTITY_HOST,
+            )
+        };
+        LocalRootPlan {
+            root: root.clone(),
+            meta: scan_root_meta::ScanRootMeta {
+                root_id: scan_root_meta::config_root_id(source_name, &canonical_path),
+                origin_host: origin_host.to_string(),
+                readonly: false,
+                canonical_path,
+                source_name: source_name.to_string(),
+                watermarks_enabled: true,
+                mirror_root,
+            },
+            watermark,
+            file_states: recorded
+                .iter()
+                .map(|(relative, size, mtime)| ((*relative).to_string(), (*size, *mtime)))
+                .collect(),
+        }
+    }
+
+    /// The three files the selection tests run against, written under a fresh
+    /// root, plus the provider root itself.
+    ///
+    /// - `unchanged.jsonl`: recorded exactly as it is now.
+    /// - `regressed.jsonl`: same size as its record, mtime moved *backwards*
+    ///   two hours -- the mirror case (a transfer replacing a file with an
+    ///   older copy) and the case a watermark comparison cannot see.
+    /// - `late.jsonl`: no record at all, and an mtime two hours old -- a file
+    ///   the far machine wrote long ago and that only arrived now.
+    fn selection_fixture(temp: &TempDir) -> (PathBuf, PathBuf) {
+        let provider_root = temp.path().join("provider-root");
+        std::fs::create_dir_all(&provider_root).expect("provider root");
+        let now = SystemTime::now();
+        for name in ["unchanged.jsonl", "regressed.jsonl", "late.jsonl"] {
+            std::fs::write(
+                provider_root.join(name),
+                format!("{{\"file\":\"{name}\"}}\n"),
+            )
+            .expect("write fixture");
+        }
+        for name in ["regressed.jsonl", "late.jsonl"] {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(provider_root.join(name))
+                .expect("open fixture for mtime");
+            file.set_modified(now - Duration::from_secs(7_200))
+                .expect("set fixture mtime");
+        }
+        let data_dir = temp.path().join("cass-data");
+        (provider_root, data_dir)
+    }
+
+    /// A watermark above every file in the selection fixture, so the *only*
+    /// thing that can bring a file back is the recorded per-file state. That is
+    /// what separates the two rules: with the watermark out of the way, a local
+    /// root keeps everything it has a matching-size record for, while a mirror
+    /// root still re-reads the one whose mtime moved.
+    fn watermark_above_everything(provider_root: &Path) -> i64 {
+        ["unchanged.jsonl", "regressed.jsonl", "late.jsonl"]
+            .iter()
+            .map(|name| fs_stamp(&provider_root.join(name)).1)
+            .max()
+            .expect("the fixture is not empty")
+            + 60_000
+    }
+
+    /// Run one root scan over the three fixture files, silently: the connector
+    /// discovers them and parses none, so `RootScanOutcome::files` is exactly
+    /// the set the comparison handed over.
+    fn scan_selection_fixture(plan: &LocalRootPlan, data_dir: &Path) -> RootScanOutcome {
+        let discovered: Vec<crate::connectors::DiscoveredSourceFile> = plan
+            .file_states
+            .keys()
+            .map(|relative| plan.root.path.join(relative))
+            .chain(
+                ["unchanged.jsonl", "regressed.jsonl", "late.jsonl"]
+                    .iter()
+                    .map(|name| plan.root.path.join(name)),
+            )
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|path| {
+                discovered_test_source(
+                    &plan.root,
+                    path,
+                    crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                )
+            })
+            .collect();
+        let connector = SilentDiscoveryConnector {
+            sources: discovered,
+        };
+        let active_filter = ActiveSessionSourceFilter::default();
+        let (outcome, fatal) = run_local_root_scan(
+            &connector,
+            "claude",
+            data_dir,
+            plan,
+            &[],
+            &active_filter,
+            &mut |_root, _meta, _conversation| Ok(()),
+        );
+        assert!(
+            fatal.is_none(),
+            "the silent connector never fails: {fatal:?}"
+        );
+        outcome
+    }
+
+    /// PR10 task 03 (spec hard constraint 9): a mirror root whose watermark is
+    /// already ahead of every file still re-reads a file whose recorded size or
+    /// mtime differs, and still sees a file it has no record for.
+    #[test]
+    fn mirror_root_selects_by_recorded_state_not_by_watermark() {
+        let temp = TempDir::new().expect("tempdir");
+        let (provider_root, data_dir) = selection_fixture(&temp);
+        let root = ScanRoot::remote(
+            provider_root.clone(),
+            Origin {
+                source_id: "ivanmac".to_string(),
+                kind: SourceKind::Ssh,
+                host: Some("ivanmac".to_string()),
+            },
+            None,
+        );
+
+        let unchanged = fs_stamp(&provider_root.join("unchanged.jsonl"));
+        // What a previous run recorded for `regressed.jsonl`: its mtime as it
+        // was *before* it was replaced by the older copy.
+        let regressed_now = fs_stamp(&provider_root.join("regressed.jsonl"));
+        let recorded_regressed_mtime = regressed_now.1 + 7_200_000;
+
+        let plan = plan_with_recorded_state(
+            &root,
+            true,
+            Some(watermark_above_everything(&provider_root)),
+            &[
+                ("unchanged.jsonl", unchanged.0, unchanged.1),
+                ("regressed.jsonl", regressed_now.0, recorded_regressed_mtime),
+            ],
+        );
+        let outcome = scan_selection_fixture(&plan, &data_dir);
+
+        assert!(outcome.succeeded, "the scan itself must be clean");
+        let selected: Vec<&str> = outcome
+            .files
+            .iter()
+            .map(|(relative, _, _)| relative.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["late.jsonl", "regressed.jsonl"],
+            "a mirror re-reads what its records say changed, whatever the watermark says"
+        );
+        assert_eq!(
+            outcome.discovered_paths,
+            vec!["late.jsonl", "regressed.jsonl", "unchanged.jsonl"],
+            "the enumeration is independent of what was handed over"
+        );
+    }
+
+    /// The ticket's zero-change pass: nothing is handed to the connector, but
+    /// the whole enumeration still comes back -- this is what task 04 consumes,
+    /// and "the database did not grow" is not a substitute for it.
+    #[test]
+    fn mirror_root_zero_change_still_reports_the_whole_enumeration() {
+        let temp = TempDir::new().expect("tempdir");
+        let (provider_root, data_dir) = selection_fixture(&temp);
+        let root = ScanRoot::remote(
+            provider_root.clone(),
+            Origin {
+                source_id: "ivanmac".to_string(),
+                kind: SourceKind::Ssh,
+                host: Some("ivanmac".to_string()),
+            },
+            None,
+        );
+
+        let recorded: Vec<(&str, i64, i64)> = ["unchanged.jsonl", "regressed.jsonl", "late.jsonl"]
+            .iter()
+            .map(|name| {
+                let (size, mtime) = fs_stamp(&provider_root.join(name));
+                (*name, size, mtime)
+            })
+            .collect();
+        let plan = plan_with_recorded_state(
+            &root,
+            true,
+            Some(watermark_above_everything(&provider_root)),
+            &recorded,
+        );
+        let outcome = scan_selection_fixture(&plan, &data_dir);
+
+        assert!(
+            outcome.succeeded,
+            "a clean scan with no changes still succeeds"
+        );
+        assert!(
+            outcome.files.is_empty(),
+            "nothing changed, so nothing may be handed over, got {:?}",
+            outcome.files
+        );
+        assert_eq!(
+            outcome.discovered_paths,
+            vec!["late.jsonl", "regressed.jsonl", "unchanged.jsonl"],
+            "the watermark still moves for a clean enumeration with no work to do"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR10 task 04 / spec hard constraint 11: an incomplete scan of a mirror
+    // root must not touch its state.
+    //
+    // These three cases take `persist_root_scan_outcomes` as the narrowest
+    // seam -- the same function the run calls at finalize -- instead of driving
+    // a whole `cass index` whose scan errors, deferred conversations and active
+    // sources are hard to stage on purpose. The fixture is deliberately one a
+    // *complete* run would change: a `(root_id, connector)` that already holds
+    // a watermark and the state of a path that has left the mirror, plus a new
+    // path this run parsed. So "nothing moved" is a claim with something to be
+    // wrong about, and the control case below proves the seam really does move
+    // it.
+    // -----------------------------------------------------------------------
+
+    /// The fixture every case above shares: one mirror root's
+    /// `(root_id, connector)`, its prior watermark and per-file state, and the
+    /// scan this run reports.
+    const SKIP_CASE_CONNECTOR: &str = "claude";
+    const SKIP_CASE_ROOT_ID: &str = "cfg:laptop:/mirror/provider-root";
+    const SKIP_CASE_WATERMARK: i64 = 1_700_000_000_000;
+    const SKIP_CASE_MTIME: i64 = 1_699_000_000_000;
+    const SKIP_CASE_SCAN_START_TS: i64 = 1_700_000_100_000;
+    /// Recorded by the previous run and **not** in this run's enumeration: the
+    /// path a commit that got past the gates would delete.
+    const SKIP_CASE_ABSENT_PATH: &str = "projects/-p/agent-gone.jsonl";
+    /// Parsed by this run and not yet recorded: the path such a commit would
+    /// upsert.
+    const SKIP_CASE_NEW_PATH: &str = "projects/-p/agent-new.jsonl";
+
+    struct MirrorCommitCase {
+        before_watermarks: Vec<String>,
+        after_watermarks: Vec<String>,
+        before_states: Vec<String>,
+        after_states: Vec<String>,
+    }
+
+    fn mirror_root_state_rows(
+        storage: &FrankenStorage,
+        root_id: &str,
+        connector: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let watermarks = storage
+            .raw()
+            .query_all_map(
+                "SELECT root_id || '|' || connector || '|' || last_scan_ts FROM scan_watermarks
+                 WHERE root_id = ?1 AND connector = ?2 ORDER BY root_id, connector",
+                &[ParamValue::from(root_id), ParamValue::from(connector)],
+                |row| row.get_typed(0),
+            )
+            .expect("watermark rows");
+        let states = storage
+            .raw()
+            .query_all_map(
+                "SELECT root_id || '|' || connector || '|' || relative_path || '|' || size
+                 || '|' || mtime || '|' || last_seen_ts FROM scan_file_state
+                 WHERE root_id = ?1 AND connector = ?2 ORDER BY root_id, connector, relative_path",
+                &[ParamValue::from(root_id), ParamValue::from(connector)],
+                |row| row.get_typed(0),
+            )
+            .expect("file state rows");
+        (watermarks, states)
+    }
+
+    /// Run one gate case: seed the root's prior state, hand
+    /// `persist_root_scan_outcomes` the outcome this case is about, and report
+    /// both tables on either side.
+    fn mirror_commit_case(
+        skips: &Mutex<ActiveSessionSourceSkips>,
+        scan_deferred_conversations: usize,
+        succeeded: bool,
+    ) -> MirrorCommitCase {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open db");
+        storage
+            .set_scan_watermark(SKIP_CASE_ROOT_ID, SKIP_CASE_CONNECTOR, SKIP_CASE_WATERMARK)
+            .expect("seed the watermark");
+        storage
+            .upsert_scan_file_state(
+                SKIP_CASE_ROOT_ID,
+                SKIP_CASE_CONNECTOR,
+                SKIP_CASE_ABSENT_PATH,
+                941,
+                SKIP_CASE_MTIME,
+                SKIP_CASE_WATERMARK,
+            )
+            .expect("seed the absent path's state");
+
+        let (before_watermarks, before_states) =
+            mirror_root_state_rows(&storage, SKIP_CASE_ROOT_ID, SKIP_CASE_CONNECTOR);
+
+        // A failed enumeration carries no file list at all (`failed_outcome`) --
+        // which is exactly why the `succeeded` gate has to be the thing that
+        // stops it, rather than the emptiness of its lists.
+        let outcome = RootScanOutcome {
+            connector: SKIP_CASE_CONNECTOR.to_string(),
+            root_id: SKIP_CASE_ROOT_ID.to_string(),
+            succeeded,
+            error: (!succeeded).then(|| "scan failed".to_string()),
+            files: if succeeded {
+                vec![(SKIP_CASE_NEW_PATH.to_string(), 700, SKIP_CASE_MTIME)]
+            } else {
+                Vec::new()
+            },
+            discovered_paths: if succeeded {
+                vec![SKIP_CASE_NEW_PATH.to_string()]
+            } else {
+                Vec::new()
+            },
+            mirror_root: true,
+        };
+
+        persist_root_scan_outcomes(
+            &storage,
+            &[outcome],
+            skips,
+            true,
+            scan_deferred_conversations,
+            SKIP_CASE_SCAN_START_TS,
+        )
+        .expect("persisting a mirror root's outcome");
+
+        let (after_watermarks, after_states) =
+            mirror_root_state_rows(&storage, SKIP_CASE_ROOT_ID, SKIP_CASE_CONNECTOR);
+        storage.close().expect("close db");
+        MirrorCommitCase {
+            before_watermarks,
+            after_watermarks,
+            before_states,
+            after_states,
+        }
+    }
+
+    fn assert_mirror_root_untouched(case: &MirrorCommitCase, why: &str) {
+        assert!(
+            case.after_watermarks == case.before_watermarks
+                && case.after_states == case.before_states,
+            "{why}: an incomplete scan must not delete, upsert or advance this root's \
+             state\n--- before watermarks ---\n{:?}\n--- after watermarks ---\n{:?}\n\
+             --- before states ---\n{:?}\n--- after states ---\n{:?}",
+            case.before_watermarks,
+            case.after_watermarks,
+            case.before_states,
+            case.after_states
+        );
+    }
+
+    /// The seam these cases rest on: with no gate in force, the very same
+    /// fixture *does* move -- the absent path's row goes, the new path's row
+    /// lands and the watermark advances. Without this, "nothing moved" above
+    /// would also hold for a function that never writes anything.
+    #[test]
+    #[serial]
+    fn mirror_root_commit_moves_state_when_no_gate_applies() {
+        let skips = Mutex::new(ActiveSessionSourceSkips::default());
+        let case = mirror_commit_case(&skips, 0, true);
+
+        assert_ne!(
+            case.after_states, case.before_states,
+            "a complete scan of a mirror root must commit its state"
+        );
+        assert!(
+            case.after_states
+                .iter()
+                .any(|row| row.contains(SKIP_CASE_NEW_PATH)),
+            "the file this run parsed must be recorded, got {:?}",
+            case.after_states
+        );
+        assert!(
+            !case
+                .after_states
+                .iter()
+                .any(|row| row.contains(SKIP_CASE_ABSENT_PATH)),
+            "the path the enumeration no longer sees must lose its row, got {:?}",
+            case.after_states
+        );
+        assert_ne!(
+            case.after_watermarks, case.before_watermarks,
+            "a complete scan advances the root's watermark"
+        );
+    }
+
+    /// A connector whose scan failed leaves both tables alone: `succeeded` is
+    /// the gate, and a failed outcome carries empty lists that would otherwise
+    /// read as "everything under this root is gone".
+    #[test]
+    #[serial]
+    fn failed_mirror_scan_does_not_touch_the_root_state() {
+        let skips = Mutex::new(ActiveSessionSourceSkips::default());
+        let case = mirror_commit_case(&skips, 0, false);
+        assert_mirror_root_untouched(&case, "a failed mirror-root scan");
+    }
+
+    /// Deferred conversations mean this run did not commit everything it read,
+    /// so the root's state must stay where it was.
+    #[test]
+    #[serial]
+    fn deferred_conversations_do_not_touch_a_mirror_root_state() {
+        let skips = Mutex::new(ActiveSessionSourceSkips::default());
+        let case = mirror_commit_case(&skips, 1, true);
+        assert_mirror_root_untouched(&case, "a run that deferred a conversation");
+    }
+
+    /// An **active** session source skipped for this connector: the file may
+    /// still be growing, so this run's enumeration is not complete and the
+    /// absent-path cleanup must not run. The recorded mtime is deliberately
+    /// *known* -- `effective_connector_scan_watermark_ts` returns a bounded
+    /// `Some` for that case, so the existing gate does not stop it and only the
+    /// mirror-root hold does. The `*` (unattributed) spelling is covered too,
+    /// because a skip nobody could attribute bounds every connector.
+    #[test]
+    #[serial]
+    fn active_source_skip_holds_back_a_mirror_root_commit() {
+        for skipped_for in [SKIP_CASE_CONNECTOR, ACTIVE_SOURCE_SKIP_ALL_CONNECTORS] {
+            let skips = Mutex::new(ActiveSessionSourceSkips::default());
+            note_active_session_source_skip(&skips, skipped_for, Some(SKIP_CASE_MTIME));
+            let case = mirror_commit_case(&skips, 0, true);
+            assert_mirror_root_untouched(
+                &case,
+                &format!("an active source skipped for {skipped_for}"),
+            );
+
+            let state = lock_active_session_source_skips(&skips);
+            assert!(
+                state.min_mtime_by_connector.contains_key(skipped_for),
+                "the fixture must record a *known* skipped mtime, or the existing \
+                 bounded-watermark gate would be doing this instead"
+            );
+        }
+    }
+
+    /// PASS_TO_PASS: a local root keeps the watermark cutoff. Its history is
+    /// append-only, so a file recorded at an mtime *past* the watermark is
+    /// history this root already read -- even though its mtime moved backwards
+    /// relative to the record.
+    #[test]
+    fn local_root_keeps_the_watermark_cutoff() {
+        let temp = TempDir::new().expect("tempdir");
+        let (provider_root, data_dir) = selection_fixture(&temp);
+        let root = ScanRoot::local(provider_root.clone());
+
+        let unchanged = fs_stamp(&provider_root.join("unchanged.jsonl"));
+        let regressed_now = fs_stamp(&provider_root.join("regressed.jsonl"));
+        let plan = plan_with_recorded_state(
+            &root,
+            false,
+            Some(watermark_above_everything(&provider_root)),
+            &[
+                ("unchanged.jsonl", unchanged.0, unchanged.1),
+                (
+                    "regressed.jsonl",
+                    regressed_now.0,
+                    regressed_now.1 + 7_200_000,
+                ),
+            ],
+        );
+        let outcome = scan_selection_fixture(&plan, &data_dir);
+
+        assert!(outcome.succeeded, "the scan itself must be clean");
+        let selected: Vec<&str> = outcome
+            .files
+            .iter()
+            .map(|(relative, _, _)| relative.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["late.jsonl"],
+            "only the never-recorded file is new to a local root; a matching-size \
+             record under the watermark stays read"
+        );
+        assert_eq!(
+            outcome.discovered_paths,
+            vec!["late.jsonl", "regressed.jsonl", "unchanged.jsonl"],
+            "the enumeration is reported for a local root too"
+        );
+    }
+
+    /// The no-watermark path is the first pass of every root: everything is
+    /// handed over and everything is enumerated.
+    #[test]
+    fn root_without_a_watermark_reports_every_file_twice_over() {
+        let temp = TempDir::new().expect("tempdir");
+        let (provider_root, data_dir) = selection_fixture(&temp);
+        let root = ScanRoot::local(provider_root.clone());
+        let plan = plan_with_recorded_state(&root, false, None, &[]);
+        let outcome = scan_selection_fixture(&plan, &data_dir);
+
+        assert!(outcome.succeeded, "the scan itself must be clean");
+        let selected: Vec<&str> = outcome
+            .files
+            .iter()
+            .map(|(relative, _, _)| relative.as_str())
+            .collect();
+        assert_eq!(
+            selected,
+            vec!["late.jsonl", "regressed.jsonl", "unchanged.jsonl"],
+            "a root with no watermark row is read in full"
+        );
+        assert_eq!(
+            outcome.discovered_paths, selected,
+            "with no watermark the two collections coincide"
+        );
     }
 
     fn raw_mirror_manifest_values(data_dir: &Path) -> Vec<serde_json::Value> {
@@ -36305,6 +37341,7 @@ mod tests {
             canonical_path: std::path::PathBuf::from("/some/scan/root"),
             source_name: "ivanmac".to_string(),
             watermarks_enabled: true,
+            mirror_root: false,
         });
         let identity = ingest_identity_for_root(&root, &metas);
         assert_eq!(identity.identity_host, "ivanmac");

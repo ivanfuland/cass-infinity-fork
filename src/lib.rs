@@ -66,6 +66,7 @@ pub mod storage;
 pub mod subsystem_coverage_matrix;
 pub mod swarm_replay_fixture;
 pub mod swarm_status;
+pub mod sync;
 pub mod top_session_summary;
 pub mod topology_budget;
 pub mod tui_asciicast;
@@ -415,6 +416,31 @@ pub enum Commands {
         /// Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection.
         #[arg(long, default_value_t = false)]
         robot_trace_ingest: bool,
+    },
+    /// One incremental sync round: pull configured mirrors, ingest local
+    /// sessions, drain the semantic domain, report once as JSON.
+    ///
+    /// This is the entry point an hourly caller uses INSTEAD of `index`; it
+    /// always runs semantic indexing and never takes `--full` (a full
+    /// re-ingest stays a separate, isolated rebuild).
+    Sync {
+        /// Output as JSON (for automation)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Override data dir (mirror + db + logs). Defaults to platform data dir.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Do not pull mirrors and do not scan local roots -- only drain the
+        /// derived semantic holes. Implies `--no-mirror` and reads no
+        /// `sources.toml`.
+        #[arg(long, default_value_t = false)]
+        no_ingest: bool,
+
+        /// Skip the remote mirror stage but still ingest local sessions.
+        #[arg(long, default_value_t = false)]
+        no_mirror: bool,
     },
     /// Generate shell completions to stdout
     Completions {
@@ -3388,7 +3414,9 @@ mod mirror_subcommand_recovery_regression_tests {
 
     #[test]
     fn mirror_subcommands_with_json_are_not_rewritten_to_search() {
-        for sub in ["mirror-relink", "mirror-restore"] {
+        // `sync` joined this list in PR10 task 05 after the identical
+        // symptom: `cass sync --json --data-dir <dir>` ran a *search*.
+        for sub in ["mirror-relink", "mirror-restore", "sync"] {
             let mut rest = vec![
                 sub.to_string(),
                 "--data-dir".to_string(),
@@ -3427,10 +3455,10 @@ mod mirror_subcommand_recovery_regression_tests {
         );
     }
 
-    /// 两个子命令都必须在 canonical 命令表里 —— **不靠模糊匹配**。
+    /// 子命令都必须在 canonical 命令表里 —— **不靠模糊匹配**。
     #[test]
     fn both_mirror_subcommands_are_canonical() {
-        for sub in ["mirror-relink", "mirror-restore"] {
+        for sub in ["mirror-relink", "mirror-restore", "sync"] {
             assert!(
                 CANONICAL_TOP_LEVEL_COMMANDS.contains(&sub),
                 "{sub} 必须显式在 CANONICAL_TOP_LEVEL_COMMANDS 内（裁定 R-E-63）"
@@ -6123,6 +6151,12 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "expand",
     "resume",
     "index",
+    // PR10 task 05: `sync` is a real subcommand. Without this entry,
+    // `cass sync --json …` is rewritten into `search sync …` by the
+    // implicit-query recovery layer and reports a missing-index error
+    // instead of ever reaching the sync handler (the same failure
+    // `mirror-restore` had, see 裁定 R-E-63 below).
+    "sync",
     "capabilities",
     "triage",
     "support-bundle",
@@ -6815,6 +6849,7 @@ async fn execute_cli(
             }
         }
         Commands::Index { .. }
+        | Commands::Sync { .. }
         | Commands::Search { .. }
         | Commands::Pack { .. }
         | Commands::Stats { .. }
@@ -6899,6 +6934,20 @@ async fn execute_cli(
                         no_progress_events,
                         robot_trace_ingest,
                     )?;
+                }
+                // PR10 task 05: the local half of `cass sync`. The handler
+                // prints the one report object and then ends the process
+                // with that report's own exit code; it is deliberately not
+                // routed through `run_index_with_data`, which prints its own
+                // stdout and re-reads the sources config.
+                Commands::Sync {
+                    json,
+                    data_dir,
+                    no_ingest,
+                    no_mirror,
+                } => {
+                    let structured = resolve_subcommand_structured_format(cli, json).is_some();
+                    sync::run_sync(cli.db.clone(), data_dir, no_ingest, no_mirror, structured)?;
                 }
                 Commands::Search {
                     query,
@@ -20762,6 +20811,7 @@ fn describe_command(cli: &Cli) -> String {
     match &cli.command {
         Some(Commands::Tui { .. }) => "tui".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
+        Some(Commands::Sync { .. }) => "sync".to_string(),
         Some(Commands::Search { .. }) => "search".to_string(),
         Some(Commands::Pack { .. }) => "pack".to_string(),
         Some(Commands::MirrorRelink { .. }) => "mirror-relink".to_string(),
@@ -21048,6 +21098,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         } => resolve_subcommand_structured_format(cli, *json).is_some() || *robot_meta,
         Commands::Pack { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Index { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Sync { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Onboarding { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
