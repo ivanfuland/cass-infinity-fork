@@ -2179,12 +2179,19 @@ struct SemanticCandidateSearchRequest {
 /// T9 (plan v5.1): chunk-domain candidate-search mode a caller can observe
 /// via `CandidateMeta.mode` -- whether the KNN window alone satisfied
 /// `fetch_limit`, or a second, budgeted exact scan had to run.
+///
+/// PR9 task 06 adds `Exact`: when `fetch_limit` already exceeds what one
+/// `vec0` KNN pass can return (`SQLITE_VEC_KNN_K_MAX`) *and* the active
+/// generation holds more chunk rows than that ceiling, round 1 is skipped
+/// outright and every candidate comes from the budgeted exact scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CandidateMode {
     #[serde(rename = "knn")]
     Knn,
     #[serde(rename = "knn+exact")]
     KnnExact,
+    #[serde(rename = "exact")]
+    Exact,
 }
 
 /// T9 (plan v5.1): observability/diagnostics envelope for one chunk-domain
@@ -2193,10 +2200,11 @@ pub enum CandidateMode {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateMeta {
     pub mode: CandidateMode,
-    /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`).
+    /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`), or
+    /// `0` on the `Exact` mode, where `vec0` was never called at all.
     pub k: usize,
     /// Raw `vec0` KNN row count, before the message-id fold or any
-    /// relational filter.
+    /// relational filter (`0` whenever no KNN round ran -- see `mode`).
     pub first_round_rows: usize,
     /// Final unique-message count in the returned candidate set (after
     /// folding, filtering, and -- if it ran -- the exact-scan round).
@@ -3849,27 +3857,52 @@ impl SearchClient {
             }
 
             let row_count_usize = usize::try_from(row_count).unwrap_or(usize::MAX);
-            let k = fetch_limit
-                .saturating_mul(OVERFETCH_FACTOR)
-                .min(row_count_usize)
-                .min(SQLITE_VEC_KNN_K_MAX)
-                .max(1);
+
+            // PR9 task 06: when the caller asks for more messages than a
+            // single `vec0` KNN pass can return (`fetch_limit >
+            // SQLITE_VEC_KNN_K_MAX`) *and* this generation really holds
+            // more chunk rows than that ceiling, round 1's window is
+            // capped below `fetch_limit` by construction -- it can only
+            // ever produce a strict subset of what the exact scan below
+            // reads anyway, so running it is pure waste. Skip `vec0`
+            // entirely and scan the authoritative float rows directly.
+            // `k` and `first_round_rows` both report `0` so a caller can
+            // tell "vec0 was never called" apart from "vec0 was called and
+            // returned nothing"; the scan keeps the round-2 fallback's
+            // distance, filter and `EXACT_SCAN_ROW_BUDGET` semantics.
+            let direct_exact =
+                fetch_limit > SQLITE_VEC_KNN_K_MAX && row_count_usize > SQLITE_VEC_KNN_K_MAX;
+
+            let k = if direct_exact {
+                0
+            } else {
+                fetch_limit
+                    .saturating_mul(OVERFETCH_FACTOR)
+                    .min(row_count_usize)
+                    .min(SQLITE_VEC_KNN_K_MAX)
+                    .max(1)
+            };
 
             let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
             let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
             // Round 1: raw vec0 KNN over chunk_id rowids, ORDER BY distance
             // (ascending -- closest first). `first_round_rows` is this
             // row count exactly as returned, before any JOIN/fold/filter.
-            let raw_knn: Vec<(i64, f64)> = tx.query_all_map(
-                &format!(
-                    "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
-                ),
-                &crate::storage::api::params![blob, k_i64],
-                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
-            )?;
+            // Never runs on the direct-exact path (see above).
+            let raw_knn: Vec<(i64, f64)> = if direct_exact {
+                Vec::new()
+            } else {
+                tx.query_all_map(
+                    &format!(
+                        "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+                    ),
+                    &crate::storage::api::params![blob, k_i64],
+                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
+                )?
+            };
             let first_round_rows = raw_knn.len();
 
-            if raw_knn.is_empty() {
+            if raw_knn.is_empty() && !direct_exact {
                 return Ok((
                     Vec::new(),
                     CandidateMeta {
@@ -3949,15 +3982,22 @@ impl SearchClient {
             // table), same as the retired v4 path.
             let candidate_message_ids: Vec<i64> = folded.iter().map(|f| f.message_id).collect();
             let round1_folded_before_filter = folded.len();
-            let (sql, params) = Self::build_db_vector_domain_filter_sql(
-                &candidate_message_ids,
-                filters,
-                effective_roles.as_ref(),
-            );
-            let passing_ids: std::collections::HashSet<i64> =
-                tx.query_all_map(&sql, &params, |row| row.get_typed(0))?.into_iter().collect();
-            let mut filtered: Vec<ChunkFoldedCandidate> =
-                folded.into_iter().filter(|f| passing_ids.contains(&f.message_id)).collect();
+            let mut filtered: Vec<ChunkFoldedCandidate> = if candidate_message_ids.is_empty() {
+                // Nothing was folded -- either the direct-exact path never
+                // called `vec0` at all, or every KNN chunk failed its
+                // provenance lookup. Either way an id-keyed filter has no
+                // input to run against.
+                Vec::new()
+            } else {
+                let (sql, params) = Self::build_db_vector_domain_filter_sql(
+                    &candidate_message_ids,
+                    filters,
+                    effective_roles.as_ref(),
+                );
+                let passing_ids: std::collections::HashSet<i64> =
+                    tx.query_all_map(&sql, &params, |row| row.get_typed(0))?.into_iter().collect();
+                folded.into_iter().filter(|f| passing_ids.contains(&f.message_id)).collect()
+            };
 
             let round1_unique_messages = filtered.len();
             // Plan v5.1: "窗满 ⟺ first_round_rows == min(k, 该代际 vec0 总行数)".
@@ -3982,12 +4022,23 @@ impl SearchClient {
             let corpus_exhausted_without_filter_loss = first_round_rows == row_count_usize
                 && round1_unique_messages == round1_folded_before_filter;
 
-            let mut mode = CandidateMode::Knn;
+            // Direct-exact never ran round 1, so its exact scan is
+            // unconditional; otherwise the scan runs only when round 1's
+            // saturated window still fell short of `fetch_limit` after the
+            // relational filter (see the long note above).
+            let exact_scan_needed = direct_exact
+                || (window_full
+                    && round1_unique_messages < fetch_limit
+                    && !corpus_exhausted_without_filter_loss);
+
+            let mut mode = if direct_exact { CandidateMode::Exact } else { CandidateMode::Knn };
             let mut incomplete = false;
             let mut reason: Option<String> = None;
 
-            if window_full && round1_unique_messages < fetch_limit && !corpus_exhausted_without_filter_loss {
-                mode = CandidateMode::KnnExact;
+            if exact_scan_needed {
+                if !direct_exact {
+                    mode = CandidateMode::KnnExact;
+                }
                 let still_needed = fetch_limit - round1_unique_messages;
                 let budget = effective_exact_scan_row_budget();
                 let (sql, params) =
@@ -17468,7 +17519,13 @@ mod tests {
     /// budget must cut a scan short (not error) once more filter-passing
     /// rows exist than the budget allows, reporting the result as
     /// incomplete rather than silently truncating without a signal.
+    ///
+    /// `#[serial]`: shares the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
+    /// atomic with `pr9_direct_exact_budget_marks_incomplete`, so the two
+    /// must not interleave (the first to finish would otherwise reset the
+    /// budget mid-scan for the other).
     #[test]
+    #[serial_test::serial]
     fn semantic_exact_scan_row_budget_marks_incomplete() {
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
@@ -18329,11 +18386,23 @@ mod tests {
         // (4,200 docs, dim=4) precisely so this exact-scan round is cheap,
         // matching its own doc comment ("only the k-value itself is under
         // test here, not ... realistic-scale latency").
+        // PR9 task 06 changed which mode this scenario reports, not what it
+        // returns: `fetch_limit` (80,016) exceeds `SQLITE_VEC_KNN_K_MAX`
+        // *and* the generation holds more rows than that ceiling (4,200),
+        // so the KNN round can only ever return 4,096 of the 80,016
+        // requested -- strictly less than the exact scan reads anyway.
+        // The whole `vec0` round is now skipped, and the exact scan is the
+        // only source of candidates, which is what `Exact` says. Before
+        // this change the same input ran the KNN round first (4,096 rows),
+        // then the exact scan for the remaining 104 -- same 4,200 results,
+        // same scores, same order, one wasted 4,096-row KNN pass.
         assert_eq!(
             meta.mode,
-            CandidateMode::KnnExact,
-            "the k-max clamp leaves the corpus (4,200) short of fetch_limit(80,016), driving the exact-scan round"
+            CandidateMode::Exact,
+            "fetch_limit > SQLITE_VEC_KNN_K_MAX on a >4096-row generation must skip vec0 entirely"
         );
+        assert_eq!(meta.k, 0, "the direct-exact path never calls vec0, so no k was ever passed to it");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran, so it returned no rows");
         assert!(
             !meta.incomplete,
             "4,200 docs is nowhere near EXACT_SCAN_ROW_BUDGET -- the exact scan completes comfortably"
@@ -18342,6 +18411,288 @@ mod tests {
             results.len(),
             TOTAL_DOCS as usize,
             "an unfiltered corpus smaller than fetch_limit must come back in full, not clamped to k-max(4096)"
+        );
+    }
+
+    /// PR9 task 06: when `fetch_limit` is already past what a single `vec0`
+    /// KNN pass can return (`SQLITE_VEC_KNN_K_MAX` = 4,096) *and* the
+    /// active generation holds more chunk rows than that ceiling, round 1
+    /// is skipped outright (`mode=exact`, `k=0`, `first_round_rows=0`) and
+    /// the whole candidate set comes from the budgeted exact scan. Both an
+    /// unfiltered query and a highly selective one must return exactly the
+    /// message ids, float scores and order the authoritative cosine
+    /// distance implies -- the expectation is derived here, never read
+    /// back out of a production path, and no KNN round is retained to
+    /// fake the skip.
+    ///
+    /// The corpus mirrors the sibling k-max test's 4,200-doc, dim=4 shape
+    /// (same "keep fixture setup fast, only the branch is under test"
+    /// argument), with the first `TARGET_DOCS` docs placed in
+    /// `/ws/target`. Doc `i` holds `[cos θ, sin θ, 0, 0]` for
+    /// `θ = i * THETA_STEP` against a `[1, 0, 0, 0]` query, so its true
+    /// similarity is `cos θ`. `THETA_STEP` is chosen so every `θ` stays
+    /// well below π: cosine is then strictly decreasing over the whole
+    /// fixture, which makes "score desc, message_id asc" exactly "index
+    /// asc" with no tie or precision ambiguity.
+    ///
+    /// `#[serial]`: `#[serial]` only excludes *other* `#[serial]` tests, so
+    /// without this the test below -- which shrinks the process-global
+    /// `EXACT_SCAN_ROW_BUDGET_OVERRIDE` to 10 for the duration of its own
+    /// scan -- can run concurrently with this one and flip these
+    /// `incomplete` assertions. Observed for real on this branch's first
+    /// default-parallel run (`focused-2`: 1 passed, 1 failed at the
+    /// `nowhere near EXACT_SCAN_ROW_BUDGET` assertion).
+    #[test]
+    #[serial_test::serial]
+    fn pr9_direct_exact_when_fetch_exceeds_vec0_limit() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const TOTAL_DOCS: i64 = 4_200;
+        const TARGET_DOCS: i64 = 50;
+        const BASE_ID: i64 = 4_000_000;
+        // Mirrors exec60's observed derived-k crash value for `--limit
+        // 5000` in hybrid mode -- the same number the sibling k-max test
+        // uses -- and is comfortably past SQLITE_VEC_KNN_K_MAX.
+        const FETCH_LIMIT: usize = 80_016;
+        // Exactly at the ceiling, not past it: the branch's other side.
+        const K_MAX_FETCH_LIMIT: usize = 4_096;
+        const THETA_STEP: f32 = 0.0005;
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = BASE_ID + i;
+                let workspace_id = if i < TARGET_DOCS { target_ws } else { other_ws };
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(workspace_id),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + i],
+                )?;
+                let theta = (i as f32) * THETA_STEP;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
+
+        let roles = HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]);
+        // `(message_id, authoritative cosine similarity)` for doc indices
+        // `idxs`, already in "score desc, message_id asc" order because
+        // THETA_STEP keeps cosine strictly decreasing over the fixture.
+        let expected = |idxs: std::ops::Range<i64>| -> Vec<(u64, f32)> {
+            idxs.map(|i| ((BASE_ID + i) as u64, ((i as f32) * THETA_STEP).cos())).collect()
+        };
+        let assert_matches_authoritative_float = |results: &[crate::search::vector_index::VectorSearchResult],
+                                                  want: &[(u64, f32)],
+                                                  label: &str| {
+            let got: Vec<(u64, f32)> = results.iter().map(|r| (r.message_id, r.score)).collect();
+            assert_eq!(got.len(), want.len(), "{label}: wrong result count");
+            for (rank, ((got_id, got_score), (want_id, want_score))) in
+                got.iter().zip(want.iter()).enumerate()
+            {
+                assert_eq!(got_id, want_id, "{label}: rank {rank} has the wrong message id");
+                assert!(
+                    (got_score - want_score).abs() < 1e-6,
+                    "{label}: rank {rank} (id {got_id}) scored {got_score}, authoritative cosine is {want_score}"
+                );
+            }
+        };
+
+        // Case 1: unfiltered, fetch_limit past the ceiling -> direct exact.
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&roles),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Exact,
+            "fetch_limit(80,016) > SQLITE_VEC_KNN_K_MAX and 4,200 rows > it too -- vec0 must be skipped"
+        );
+        assert_eq!(meta.k, 0, "no k was ever passed to vec0 on the direct-exact path");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
+        assert!(!meta.incomplete, "4,200 rows is nowhere near EXACT_SCAN_ROW_BUDGET");
+        assert_eq!(meta.unique_messages, TOTAL_DOCS as usize);
+        // The *wire* value 08/09 consume through `_meta.candidates.mode`,
+        // not merely the Rust variant name.
+        let meta_json = serde_json::to_value(&meta).expect("CandidateMeta must serialize");
+        assert_eq!(
+            meta_json.get("mode").and_then(serde_json::Value::as_str),
+            Some("exact"),
+            "the direct-exact branch must be observable as mode=\"exact\" to callers"
+        );
+        assert_matches_authoritative_float(&results, &expected(0..TOTAL_DOCS), "unfiltered direct-exact");
+
+        // Case 2: highly selective workspace filter, same oversized
+        // fetch_limit -> still direct exact, but only the /ws/target docs.
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&roles),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(meta.mode, CandidateMode::Exact, "the oversized fetch_limit decides the branch, filter or not");
+        assert_eq!(meta.k, 0, "no k was ever passed to vec0 on the direct-exact path");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
+        assert!(!meta.incomplete, "50 matching rows is nowhere near EXACT_SCAN_ROW_BUDGET");
+        assert_eq!(meta.unique_messages, TARGET_DOCS as usize);
+        assert_matches_authoritative_float(&results, &expected(0..TARGET_DOCS), "filtered direct-exact");
+
+        // Case 3: the other side of the threshold. `fetch_limit` equal to
+        // SQLITE_VEC_KNN_K_MAX is *not* past it, so the existing KNN path
+        // must still run unchanged: k = min(4096 * 4, 4,200, 4,096) =
+        // 4,096, and the 4,096 nearest docs (== the lowest indices, since
+        // distance ascends with θ) come back.
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&roles),
+            K_MAX_FETCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Knn,
+            "fetch_limit == SQLITE_VEC_KNN_K_MAX is not past it -- the KNN-only path must stay in place"
+        );
+        assert_eq!(meta.k, K_MAX_FETCH_LIMIT, "k = min(4096 * 4, 4200, 4096)");
+        assert_eq!(meta.first_round_rows, K_MAX_FETCH_LIMIT, "vec0 returned its full, saturated window");
+        assert!(!meta.incomplete, "round 1 alone met fetch_limit, so no exact scan ran");
+        assert_matches_authoritative_float(
+            &results,
+            &expected(0..K_MAX_FETCH_LIMIT as i64),
+            "k-ceiling boundary",
+        );
+    }
+
+    /// PR9 task 06: the direct-exact path must honour the *same* row-budget
+    /// contract the round-2 fallback does. A scan that runs past
+    /// `EXACT_SCAN_ROW_BUDGET` reports `incomplete=true` with
+    /// `reason=exact_scan_row_budget` -- it must neither error, nor
+    /// silently truncate without a signal, nor (the failure this
+    /// explicitly pins) collapse into a *successful* empty result.
+    ///
+    /// `#[serial]`: this test and `semantic_exact_scan_row_budget_marks_incomplete`
+    /// both drive the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
+    /// atomic, so they must never interleave -- the second one to finish
+    /// would otherwise reset the budget out from under the first.
+    #[test]
+    #[serial_test::serial]
+    fn pr9_direct_exact_budget_marks_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const TOTAL_DOCS: i64 = 4_200;
+        const BASE_ID: i64 = 4_100_000;
+        const FETCH_LIMIT: usize = 80_016;
+        const BUDGET: usize = 10;
+
+        struct ResetBudgetOnDrop;
+        impl Drop for ResetBudgetOnDrop {
+            fn drop(&mut self) {
+                reset_exact_scan_row_budget_for_test();
+            }
+        }
+        let _reset_guard = ResetBudgetOnDrop;
+        set_exact_scan_row_budget_for_test(BUDGET);
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = BASE_ID + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, 'local', 't', ?3)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + i],
+                )?;
+                let theta = (i as f32) * 0.0005;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
+
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+                crate::search::vector_index::ROLE_TOOL,
+            ])),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+
+        assert_eq!(meta.mode, CandidateMode::Exact, "the injected budget must be hit on the direct-exact path");
+        assert_eq!(meta.k, 0, "no k was ever passed to vec0 on the direct-exact path");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
+        assert!(meta.incomplete, "the scan reads 4,200 rows against an injected budget of {BUDGET}");
+        assert_eq!(meta.reason.as_deref(), Some("exact_scan_row_budget"));
+        assert_eq!(
+            meta.unique_messages, BUDGET,
+            "exactly `budget` rows make it into the result before the sentinel fires"
+        );
+        assert_eq!(
+            results.len(),
+            BUDGET,
+            "a budget breach must be reported as incomplete, never as a successful empty result"
         );
     }
 
@@ -18456,7 +18807,22 @@ mod tests {
         // occur in this design at all; what's left worth asserting is the
         // same completeness/identity claim the old assertions made, via the
         // new meta fields.
-        assert_eq!(meta.mode, CandidateMode::KnnExact, "the selective workspace filter must drive the exact-scan round");
+        // PR9 task 06: this fixture is 5,000 rows and `FETCH_LIMIT` is
+        // `usize::MAX - 1`, so it now satisfies the direct-exact
+        // precondition (`fetch_limit > 4096 && rows > 4096`) and vec0 is
+        // skipped outright -- the answer is still exactly the 10
+        // `/ws/target` docs, from the same exact scan, with `k=0`. The
+        // no-abort property this test exists for is unaffected: the exact
+        // scan never sizes an allocation from `fetch_limit` (it folds into
+        // a `HashMap` bounded by the streamed rows, then `Vec::truncate`s
+        // to `still_needed`, a no-op when that exceeds the row count).
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Exact,
+            "fetch_limit > SQLITE_VEC_KNN_K_MAX on a >4096-row generation must skip vec0 entirely"
+        );
+        assert_eq!(meta.k, 0, "the direct-exact path never calls vec0");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
         assert!(
             !meta.incomplete,
             "all 10 /ws/target docs are found well within EXACT_SCAN_ROW_BUDGET -- nothing was truncated by the budget"
