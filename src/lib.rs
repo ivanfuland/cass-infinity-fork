@@ -24175,30 +24175,46 @@ fn run_cli_search(
             rerank_ms,
             rerank_applied,
             semantic_opts.rerank,
+            // PR9 task 08: the one production sink -- same stdout the seven
+            // former inline `std::io::stdout()` sites wrote to.
+            &mut std::io::stdout(),
         )?;
-    } else if display_result.hits.is_empty() {
-        eprintln!("No results found.");
-    } else if let Some(display) = display_format {
-        // Human-readable display formats
-        output_display_results(&display_result.hits, display, wrap, query, highlight)?;
     } else {
-        // Default plain text output
-        for hit in &display_result.hits {
-            println!("----------------------------------------------------------------");
-            println!(
-                "Score: {:.2} | Agent: {} | WS: {}",
-                hit.score, hit.agent, hit.workspace
-            );
-            println!("Path: {}", hit.source_path);
-            let snippet = hit.snippet.replace('\n', " ");
-            let snippet = if highlight {
-                highlight_matches(&snippet, query, "**", "**")
-            } else {
-                snippet
-            };
-            println!("Snippet: {}", apply_wrap(&snippet, wrap));
+        // PR9 task 08: the plain-text surface of the same fact JSON/JSONL
+        // carry as `search_precision` -- printed once, ahead of any hit line,
+        // and only when a chunk-domain candidate search actually ran (a
+        // lexical-only or degraded result prints nothing rather than an
+        // `exact` claim about distances it never computed). Covers all three
+        // human sub-branches below, including the empty-result one, so the
+        // line is not silently dropped when the semantic leg returned no
+        // candidates.
+        if let Some(precision) = display_result.search_precision() {
+            println!("Search precision: {precision}");
         }
-        println!("----------------------------------------------------------------");
+        if display_result.hits.is_empty() {
+            eprintln!("No results found.");
+        } else if let Some(display) = display_format {
+            // Human-readable display formats
+            output_display_results(&display_result.hits, display, wrap, query, highlight)?;
+        } else {
+            // Default plain text output
+            for hit in &display_result.hits {
+                println!("----------------------------------------------------------------");
+                println!(
+                    "Score: {:.2} | Agent: {} | WS: {}",
+                    hit.score, hit.agent, hit.workspace
+                );
+                println!("Path: {}", hit.source_path);
+                let snippet = hit.snippet.replace('\n', " ");
+                let snippet = if highlight {
+                    highlight_matches(&snippet, query, "**", "**")
+                } else {
+                    snippet
+                };
+                println!("Snippet: {}", apply_wrap(&snippet, wrap));
+            }
+            println!("----------------------------------------------------------------");
+        }
     }
 
     // Bead v6vuz: in human (non-robot) search mode, surface the same bounded
@@ -26253,6 +26269,29 @@ fn trust_value_for_hit(
     serde_json::to_value(assess_trust(&signals)).unwrap_or(serde_json::Value::Null)
 }
 
+/// PR9 task 08: the two robot-output fields projected from
+/// `SearchResult.candidates`, derived in exactly one place.
+///
+/// Both JSON fast paths, the plain JSON payload, the JSONL `_meta` header and
+/// the human text renderer read this projection, so no two surfaces of one
+/// search can report different precision. Both fields are `None` for a
+/// lexical-only result or a hybrid one whose semantic leg degraded to
+/// lexical: those never looked at a vector, and calling them `exact` would be
+/// a claim about distances that were never computed.
+struct SearchPrecisionProjection<'a> {
+    search_precision: Option<&'static str>,
+    candidates: Option<&'a crate::search::query::CandidateMeta>,
+}
+
+fn search_precision_projection(
+    result: &crate::search::query::SearchResult,
+) -> SearchPrecisionProjection<'_> {
+    SearchPrecisionProjection {
+        search_precision: result.search_precision(),
+        candidates: result.candidates.as_ref(),
+    }
+}
+
 /// Output search results in robot-friendly format
 #[allow(clippy::too_many_arguments, unused_variables)]
 fn output_robot_results(
@@ -26305,6 +26344,15 @@ fn output_robot_results(
     // JSON/JSONL top-level fields this gates must appear whenever the
     // caller asked for `--rerank`, not only when it succeeded.
     rerank_requested: bool,
+    // PR9 task 08: the sink every robot format writes to. This was
+    // `std::io::stdout()` at each of the seven write sites, which made the
+    // payload-construction code unreachable from a test -- and the reason a
+    // `search_precision`/`candidates` field could be added to the struct and
+    // to the slow `_meta` path while both default JSON fast paths and the
+    // JSONL header silently bypassed it is that no test could construct a
+    // `SearchResult` and read back what the real serializer emitted. The one
+    // production caller passes stdout; unit tests pass a `Vec<u8>`.
+    out: &mut dyn std::io::Write,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
@@ -26317,9 +26365,23 @@ fn output_robot_results(
             .iter()
             .map(|hit| hit.source_path.as_str())
             .collect();
+        let mut out = BufWriter::new(&mut *out);
         for path in paths {
-            println!("{path}");
+            writeln!(&mut out, "{path}").map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::EncodeJson.kind_str(),
+                message: format!("failed to write session path: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
         }
+        out.flush().map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::EncodeJson.kind_str(),
+            message: format!("failed to flush session paths: {e}"),
+            hint: None,
+            retryable: false,
+        })?;
         return Ok(());
     }
 
@@ -26441,8 +26503,18 @@ fn output_robot_results(
             request_id: Option<String>,
             cursor: Option<String>,
             hits_clamped: bool,
+            // PR9 task 08: both fields are derived by the one projection the
+            // slow JSON path, the JSONL `_meta` header and the human text
+            // renderer also read, so all five output surfaces agree by
+            // construction. Absent (not `null`) when no chunk-domain
+            // semantic candidate search ran.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            search_precision: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            candidates: Option<&'a crate::search::query::CandidateMeta>,
         }
 
+        let search_precision = search_precision_projection(result);
         let payload = FastSummaryJsonPayload {
             query,
             limit,
@@ -26454,9 +26526,10 @@ fn output_robot_results(
             request_id,
             cursor: input_cursor,
             hits_clamped: false,
+            search_precision: search_precision.search_precision,
+            candidates: search_precision.candidates,
         };
-        let stdout = std::io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
+        let mut out = BufWriter::new(&mut *out);
         serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
             code: 9,
             kind: CliErrorKind::EncodeJson.kind_str(),
@@ -26603,8 +26676,15 @@ fn output_robot_results(
             request_id: Option<String>,
             cursor: Option<String>,
             hits_clamped: bool,
+            // PR9 task 08 -- see `FastSummaryJsonPayload` above for why these
+            // two fields are here and why they are omitted when `None`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            search_precision: Option<&'static str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            candidates: Option<&'a crate::search::query::CandidateMeta>,
         }
 
+        let search_precision = search_precision_projection(result);
         let payload = FastJsonPayload {
             query,
             limit,
@@ -26616,9 +26696,10 @@ fn output_robot_results(
             request_id,
             cursor: input_cursor,
             hits_clamped: false,
+            search_precision: search_precision.search_precision,
+            candidates: search_precision.candidates,
         };
-        let stdout = std::io::stdout();
-        let mut out = BufWriter::new(stdout.lock());
+        let mut out = BufWriter::new(&mut *out);
         serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
             code: 9,
             kind: CliErrorKind::EncodeJson.kind_str(),
@@ -26868,6 +26949,24 @@ fn output_robot_results(
                 "hits_clamped": hits_clamped,
             });
 
+            // PR9 task 08: the same two fields the fast paths carry, from the
+            // same projection -- unconditional on `--robot-meta`, because a
+            // caller that never asks for `_meta` is exactly the caller that
+            // had no way to see whether its candidates were approximated.
+            // Absent (not `null`) when no chunk-domain candidate search ran.
+            {
+                let projection = search_precision_projection(result);
+                if let Some(precision) = projection.search_precision
+                    && let serde_json::Value::Object(map) = &mut payload
+                {
+                    map.insert("search_precision".to_string(), serde_json::json!(precision));
+                    map.insert(
+                        "candidates".to_string(),
+                        serde_json::to_value(projection.candidates).unwrap_or_default(),
+                    );
+                }
+            }
+
             // R2-B5: unconditional (not gated on `--robot-meta`/`include_meta`
             // the way `rerank_applied` alone still is inside the `_meta`
             // block below) whenever `--rerank` was requested -- a caller
@@ -27014,8 +27113,7 @@ fn output_robot_results(
                 }
             }
 
-            let stdout = std::io::stdout();
-            let mut out = BufWriter::new(stdout.lock());
+            let mut out = BufWriter::new(&mut *out);
             serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
@@ -27039,8 +27137,7 @@ fn output_robot_results(
             })?;
         }
         RobotFormat::Jsonl => {
-            let stdout = std::io::stdout();
-            let mut out = BufWriter::new(stdout.lock());
+            let mut out = BufWriter::new(&mut *out);
 
             // JSONL: one object per line, optional _meta header. R2-B5:
             // `rerank_requested` added to the trigger list -- without
@@ -27049,11 +27146,23 @@ fn output_robot_results(
             // `rerank_requested`/`rerank_applied` (inserted below,
             // unconditional on `include_meta` like the `RobotFormat::Json`
             // case above) would have had nowhere to land.
+            //
+            // PR9 task 08: `result.candidates.is_some()` joins that list for
+            // the same class of reason one format over -- the `_meta` header
+            // is the only place a JSONL consumer can see candidate
+            // diagnostics, so a semantic search that never passes
+            // `--robot-meta` previously had no way to learn its precision at
+            // all. The per-hit lines below are untouched. Deliberately not
+            // added to `jsonl_meta_emitted` earlier in this function: that
+            // boolean only feeds `tokens_estimated`, and widening it would
+            // change an existing field's value for runs that used to report
+            // `null`.
             if include_meta
                 || agg_json.is_some()
                 || !result.suggestions.is_empty()
                 || explanation.is_some()
                 || rerank_requested
+                || result.candidates.is_some()
             {
                 let mut meta = serde_json::json!({
                     "_meta": {
@@ -27072,6 +27181,14 @@ fn output_robot_results(
                         // identical addition above for why these two fields
                         // had no emission path before this fix.
                         "candidates": result.candidates,
+                        // PR9 task 08: JSONL has no payload top level, so the
+                        // header line it already owns is where this contract
+                        // lives for this format. Kept to the `_meta` envelope's
+                        // fixed shape: `null` exactly when `candidates` is
+                        // `null`, meaning "no chunk-domain candidate search
+                        // ran" -- never an `exact` claim about distances that
+                        // were never computed.
+                        "search_precision": result.search_precision(),
                         "semantic_degraded": result.semantic_degraded,
                         "semantic_refinement": search_mode_meta.semantic_refinement(),
                         "refinement_level": search_mode_meta.realized_refinement(),
@@ -27339,14 +27456,28 @@ fn output_robot_results(
                 }
             }
 
-            let out = serde_json::to_string(&payload).map_err(|e| CliError {
+            let encoded = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
                 message: format!("failed to encode json: {e}"),
                 hint: None,
                 retryable: false,
             })?;
-            println!("{out}");
+            let mut out = BufWriter::new(&mut *out);
+            writeln!(&mut out, "{encoded}").map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::EncodeJson.kind_str(),
+                message: format!("failed to write compact json output: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
+            out.flush().map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::EncodeJson.kind_str(),
+                message: format!("failed to flush compact json output: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
         }
         RobotFormat::Toon => {
             // TOON: Token-Optimized Object Notation
@@ -27475,7 +27606,21 @@ fn output_robot_results(
             // Preserve the existing "compact JSON" behavior by first ensuring the payload is
             // valid JSON (serde_json::to_string above). We don't need the string itself here.
             drop(json_str);
-            print!("{toon_str}");
+            let mut out = BufWriter::new(&mut *out);
+            write!(&mut out, "{toon_str}").map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::EncodeJson.kind_str(),
+                message: format!("failed to write toon output: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
+            out.flush().map_err(|e| CliError {
+                code: 9,
+                kind: CliErrorKind::EncodeJson.kind_str(),
+                message: format!("failed to flush toon output: {e}"),
+                hint: None,
+                retryable: false,
+            })?;
         }
         RobotFormat::Sessions => {
             unreachable!("RobotFormat::Sessions is handled above to avoid building hit payloads");
@@ -27483,6 +27628,296 @@ fn output_robot_results(
     }
 
     Ok(())
+}
+
+/// PR9 task 08: drives the real `output_robot_results` with a constructed
+/// `SearchResult` and reads back the exact bytes each default surface emits.
+///
+/// This is the only way to reach the `approximate: true` half of the output
+/// contract before PR9 task 09 lands the int8 coarse screen: the shipped
+/// float paths cannot produce an approximate candidate set, and no env var,
+/// CLI flag or fixture is allowed to fake one. The sink parameter (rather
+/// than `std::io::stdout()` inside the function) is what makes the two JSON
+/// fast paths and the JSONL header observable here at all -- the same three
+/// surfaces that silently dropped candidate diagnostics before this task.
+#[cfg(test)]
+mod pr9_candidate_meta_output_tests {
+    use super::{
+        Aggregations, FieldBudgets, RobotFormat, SearchModeMeta, output_robot_results,
+    };
+    use crate::search::query::{
+        CacheStats, CandidateMeta, CandidateMode, MatchType, SearchHit, SearchMode, SearchResult,
+    };
+    use serde_json::Value;
+
+    fn test_hit() -> SearchHit {
+        SearchHit {
+            title: "Title".to_string(),
+            snippet: "Snippet".to_string(),
+            content: "Content".to_string(),
+            content_hash: 0,
+            conversation_id: None,
+            score: 1.25,
+            source_path: "/tmp/session.jsonl".to_string(),
+            agent: "codex".to_string(),
+            workspace: "/tmp".to_string(),
+            workspace_original: None,
+            created_at: Some(1_733_000_000_000),
+            line_number: Some(1),
+            match_type: MatchType::Exact,
+            source_id: "local".to_string(),
+            origin_kind: "local".to_string(),
+            origin_host: None,
+            message_id: Some(42),
+            winning_chunk_idx: Some(3),
+            winning_chunk_span: None,
+            winning_chunk_hash: None,
+        }
+    }
+
+    fn result_with(candidates: Option<CandidateMeta>) -> SearchResult {
+        SearchResult {
+            hits: vec![test_hit()],
+            wildcard_fallback: false,
+            cache_stats: CacheStats::default(),
+            suggestions: Vec::new(),
+            total_count: None,
+            candidates,
+            semantic_degraded: false,
+        }
+    }
+
+    /// The real float path: PR9 task 06's direct exact scan.
+    fn exact_candidates() -> CandidateMeta {
+        CandidateMeta::exact_float_path(CandidateMode::Exact, 0, 0, 1, false, None)
+    }
+
+    /// The shape PR9 task 09 will construct on its int8 coarse-screen path.
+    fn approximate_candidates() -> CandidateMeta {
+        CandidateMeta {
+            mode: CandidateMode::Knn,
+            k: 4096,
+            first_round_rows: 4096,
+            unique_messages: 200,
+            incomplete: false,
+            reason: None,
+            approximate: true,
+            requested_coarse_k: Some(6432),
+            effective_coarse_k: Some(4096),
+            coarse_cap_hit: Some(true),
+            corpus_limited: Some(false),
+        }
+    }
+
+    /// `--fields source_path,line_number,agent,title,score` (the summary fast path).
+    fn summary_fields() -> Option<Vec<String>> {
+        Some(vec![
+            "source_path".to_string(),
+            "line_number".to_string(),
+            "agent".to_string(),
+            "title".to_string(),
+            "score".to_string(),
+        ])
+    }
+
+    fn render(
+        format: RobotFormat,
+        include_meta: bool,
+        fields: &Option<Vec<String>>,
+        result: &SearchResult,
+    ) -> String {
+        let mut sink: Vec<u8> = Vec::new();
+        output_robot_results(
+            "hello",
+            8,
+            8,
+            0,
+            result,
+            format,
+            include_meta,
+            1,
+            fields,
+            FieldBudgets { snippet: None, content: None, title: None, fallback: None },
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &Aggregations::default(),
+            1,
+            None,
+            false,
+            None,
+            SearchModeMeta::new(SearchMode::Hybrid, false),
+            1,
+            0,
+            false,
+            false,
+            &mut sink,
+        )
+        .expect("render robot output");
+        String::from_utf8(sink).expect("utf-8 robot output")
+    }
+
+    fn render_json(include_meta: bool) -> Value {
+        let out = render(RobotFormat::Json, include_meta, &None, &result_with(Some(exact_candidates())));
+        serde_json::from_str(&out).expect("default JSON payload parses")
+    }
+
+    fn render_json_approximate() -> Value {
+        let out = render(
+            RobotFormat::Json,
+            false,
+            &None,
+            &result_with(Some(approximate_candidates())),
+        );
+        serde_json::from_str(&out).expect("default JSON payload parses")
+    }
+
+    fn render_json_summary(result: &SearchResult) -> Value {
+        let out = render(RobotFormat::Json, false, &summary_fields(), result);
+        serde_json::from_str(&out).expect("summary JSON payload parses")
+    }
+
+    fn render_jsonl_first_line(result: &SearchResult, include_meta: bool) -> String {
+        let out = render(RobotFormat::Jsonl, include_meta, &None, result);
+        out.lines().next().expect("jsonl has a first line").to_string()
+    }
+
+    #[test]
+    fn pr9_candidate_meta_default_json_fast_path_carries_exact_precision() {
+        let value = render_json(false);
+        assert_eq!(value["count"], serde_json::json!(1));
+        assert_eq!(value["search_precision"], serde_json::json!("exact"));
+        assert_eq!(value["candidates"]["mode"], serde_json::json!("exact"));
+        assert_eq!(value["candidates"]["approximate"], serde_json::json!(false));
+        for key in ["requested_coarse_k", "effective_coarse_k", "coarse_cap_hit", "corpus_limited"] {
+            assert!(
+                value["candidates"].get(key).is_none(),
+                "{key} must stay absent on the float path, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_summary_json_fast_path_carries_exact_precision() {
+        let value = render_json_summary(&result_with(Some(exact_candidates())));
+        assert_eq!(value["search_precision"], serde_json::json!("exact"));
+        assert_eq!(value["candidates"]["approximate"], serde_json::json!(false));
+        assert_eq!(value["hits"][0]["source_path"], serde_json::json!("/tmp/session.jsonl"));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_plain_json_with_robot_meta_carries_both_views() {
+        let value = render_json(true);
+        assert_eq!(value["search_precision"], serde_json::json!("exact"));
+        assert_eq!(value["candidates"]["mode"], serde_json::json!("exact"));
+        // The pre-existing `_meta.candidates` diagnostic keeps its place.
+        assert_eq!(value["_meta"]["candidates"]["mode"], serde_json::json!("exact"));
+        assert_eq!(value["_meta"]["candidates"]["approximate"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_approximate_default_json_is_visible_without_robot_meta() {
+        let value = render_json_approximate();
+        assert_eq!(value["search_precision"], serde_json::json!("approximate"));
+        assert_eq!(value["candidates"]["approximate"], serde_json::json!(true));
+        assert_eq!(value["candidates"]["requested_coarse_k"], serde_json::json!(6432));
+        assert_eq!(value["candidates"]["effective_coarse_k"], serde_json::json!(4096));
+        assert_eq!(value["candidates"]["coarse_cap_hit"], serde_json::json!(true));
+        assert_eq!(value["candidates"]["corpus_limited"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_approximate_summary_json_is_visible_without_robot_meta() {
+        let value = render_json_summary(&result_with(Some(approximate_candidates())));
+        assert_eq!(value["search_precision"], serde_json::json!("approximate"));
+        assert_eq!(value["candidates"]["effective_coarse_k"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_approximate_jsonl_header_is_visible_without_robot_meta() {
+        let result = result_with(Some(approximate_candidates()));
+        let header: Value =
+            serde_json::from_str(&render_jsonl_first_line(&result, false)).expect("jsonl header parses");
+        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("approximate"));
+        assert_eq!(header["_meta"]["candidates"]["approximate"], serde_json::json!(true));
+        assert_eq!(header["_meta"]["candidates"]["requested_coarse_k"], serde_json::json!(6432));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_exact_jsonl_header_precision_without_robot_meta() {
+        // The float path proves the header trigger itself: `result.candidates`
+        // being `Some` is now enough, with no `--robot-meta` and no
+        // aggregation/suggestion/explanation/rerank in play.
+        let result = result_with(Some(exact_candidates()));
+        let out = render(RobotFormat::Jsonl, false, &None, &result);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "one header line plus one hit line, got {out}");
+        let header: Value = serde_json::from_str(lines[0]).expect("jsonl header parses");
+        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("exact"));
+        assert_eq!(header["_meta"]["candidates"]["mode"], serde_json::json!("exact"));
+        let hit: Value = serde_json::from_str(lines[1]).expect("jsonl hit parses");
+        assert_eq!(hit["source_path"], serde_json::json!("/tmp/session.jsonl"));
+        assert!(hit.get("_meta").is_none(), "the per-hit line must not become a meta line");
+    }
+
+    /// PR9 task 09 re-runs the same three-format acceptance on its real int8
+    /// path, so the samples it compares against have to be exact bytes rather
+    /// than a paraphrase in a report. This test both re-asserts the three
+    /// surfaces and prints them between sentinels for `--nocapture` capture.
+    #[test]
+    fn pr9_candidate_meta_downstream_samples_round_trip() {
+        let result = result_with(Some(approximate_candidates()));
+        let json_full = render(RobotFormat::Json, false, &None, &result);
+        let json_summary = render(RobotFormat::Json, false, &summary_fields(), &result);
+        let jsonl = render(RobotFormat::Jsonl, false, &None, &result);
+
+        let parsed: Value = serde_json::from_str(&json_full).expect("default JSON parses");
+        assert_eq!(parsed["search_precision"], serde_json::json!("approximate"));
+        let parsed: Value = serde_json::from_str(&json_summary).expect("summary JSON parses");
+        assert_eq!(parsed["search_precision"], serde_json::json!("approximate"));
+        let header: Value =
+            serde_json::from_str(jsonl.lines().next().expect("jsonl first line"))
+                .expect("jsonl header parses");
+        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("approximate"));
+
+        for (label, body) in [
+            ("json_full", json_full.as_str()),
+            ("json_summary", json_summary.as_str()),
+            ("jsonl", jsonl.as_str()),
+        ] {
+            println!("PR9-TASK08-SAMPLE-BEGIN {label}");
+            print!("{body}");
+            if !body.ends_with('\n') {
+                println!();
+            }
+            println!("PR9-TASK08-SAMPLE-END {label}");
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_lexical_result_claims_no_precision() {
+        let lexical = result_with(None);
+        let json = render(RobotFormat::Json, false, &None, &lexical);
+        let value: Value = serde_json::from_str(&json).expect("lexical JSON payload parses");
+        assert!(value.get("search_precision").is_none(), "got {value}");
+        assert!(value.get("candidates").is_none(), "got {value}");
+        let meta_json = render(RobotFormat::Json, true, &None, &lexical);
+        let value: Value = serde_json::from_str(&meta_json).expect("lexical robot-meta payload parses");
+        assert!(value["_meta"]["candidates"].is_null());
+        // No header at all, so the only line keeps its per-hit shape.
+        let jsonl = render(RobotFormat::Jsonl, false, &None, &lexical);
+        let first: Value = serde_json::from_str(jsonl.lines().next().expect("first line"))
+            .expect("lexical jsonl line parses");
+        assert!(first.get("_meta").is_none(), "got {first}");
+        assert_eq!(first["source_path"], serde_json::json!("/tmp/session.jsonl"));
+    }
 }
 
 #[cfg(test)]

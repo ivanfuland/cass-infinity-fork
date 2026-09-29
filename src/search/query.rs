@@ -2224,15 +2224,121 @@ pub struct CandidateMeta {
     pub unique_messages: usize,
     /// `true` iff a triggered exact-scan round hit `EXACT_SCAN_ROW_BUDGET`
     /// before it could confirm it had found every filter-passing message.
+    ///
+    /// Independent of `approximate`: this reports a scan that stopped early,
+    /// never a distance that was approximated. Neither field is derived from
+    /// the other.
     pub incomplete: bool,
     pub reason: Option<String>,
+    /// PR9 task 08: `true` iff the returned candidate set was produced by a
+    /// distance-approximating coarse screen instead of exact float
+    /// distances -- i.e. the caller can no longer assume the top-k order is
+    /// the true float order.
+    ///
+    /// Every path in this file computes exact float distances (the `vec0`
+    /// KNN round and the direct exact scan both compare the stored `f32`
+    /// vectors), so every construction site sets `false`. PR9 task 09 is
+    /// what introduces the real int8 coarse screen and flips it to `true`
+    /// on exactly the path that produces approximate candidates; until then
+    /// a `true` here would be a claim nothing in the build can back.
+    pub approximate: bool,
+    /// PR9 task 08: `k` requested for the coarse screen before any cap was
+    /// applied, for the approximate path task 09 adds.
+    ///
+    /// `None` on every exact/float path -- absence means "no coarse screen
+    /// ran here", which must never be read back as a measured `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_coarse_k: Option<usize>,
+    /// PR9 task 08: the `k` the coarse screen actually ran with after the
+    /// 4096 `SQLITE_VEC_KNN_K_MAX` cap and the corpus size were applied.
+    /// `None` on every exact/float path (see `requested_coarse_k`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_coarse_k: Option<usize>,
+    /// PR9 task 08: `true` iff `effective_coarse_k` was reduced by the 4096
+    /// cap rather than by the corpus. `None` when no coarse screen ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coarse_cap_hit: Option<bool>,
+    /// PR9 task 08: `true` iff the coarse screen could not have returned
+    /// more than the active generation holds -- the corpus, not the cap,
+    /// bounded it. `None` when no coarse screen ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_limited: Option<bool>,
 }
 
+/// PR9 task 08: the two fixed wire values of the `search_precision` output
+/// field. A single spelling used by the JSON payload, both JSON fast paths,
+/// the JSONL `_meta` header and the human text renderer, so a consumer can
+/// match on the literal rather than on a per-surface string.
+const SEARCH_PRECISION_EXACT: &str = "exact";
+const SEARCH_PRECISION_APPROXIMATE: &str = "approximate";
+
 impl CandidateMeta {
+    /// PR9 task 08: complete a candidate meta whose candidates were scored by
+    /// exact float distances.
+    ///
+    /// Every construction site in this file goes through here, which is what
+    /// makes "which paths claim approximation" a one-line answer: none of
+    /// them do, and only PR9 task 09's int8 coarse screen will set
+    /// `approximate: true` / the four coarse-screen facts, on its own path.
+    /// Crate-visible so the output-layer test can drive the real serializer
+    /// with the same float-path meta the search layer really produces.
+    pub(crate) fn exact_float_path(
+        mode: CandidateMode,
+        k: usize,
+        first_round_rows: usize,
+        unique_messages: usize,
+        incomplete: bool,
+        reason: Option<String>,
+    ) -> Self {
+        CandidateMeta {
+            mode,
+            k,
+            first_round_rows,
+            unique_messages,
+            incomplete,
+            reason,
+            approximate: false,
+            requested_coarse_k: None,
+            effective_coarse_k: None,
+            coarse_cap_hit: None,
+            corpus_limited: None,
+        }
+    }
+
     /// Degenerate zero-candidate meta for an empty/zero-limit query that
     /// never reaches `search_db_vector_domain` at all.
     fn empty() -> Self {
-        CandidateMeta { mode: CandidateMode::Knn, k: 0, first_round_rows: 0, unique_messages: 0, incomplete: false, reason: None }
+        Self::exact_float_path(CandidateMode::Knn, 0, 0, 0, false, None)
+    }
+
+    /// PR9 task 08: the wire value a consumer reads in `search_precision`.
+    ///
+    /// `approximate` alone decides it. `incomplete` deliberately does not:
+    /// a scan that stopped at `EXACT_SCAN_ROW_BUDGET` still compares exact
+    /// float distances, so it is not an approximation and mapping it to
+    /// `approximate` would be a false claim about the distances.
+    pub fn search_precision(&self) -> &'static str {
+        if self.approximate {
+            SEARCH_PRECISION_APPROXIMATE
+        } else {
+            SEARCH_PRECISION_EXACT
+        }
+    }
+}
+
+impl SearchResult {
+    /// PR9 task 08: the single derivation every robot/human output surface
+    /// uses for `search_precision`.
+    ///
+    /// `Some` only when a chunk-domain semantic candidate search actually
+    /// ran. A lexical-only result, or a hybrid one whose semantic leg
+    /// degraded to lexical, carries `candidates: None`; those report `None`
+    /// here rather than inventing an `exact` claim about a search that never
+    /// looked at a vector at all.
+    pub fn search_precision(&self) -> Option<&'static str> {
+        self.candidates
+            .as_ref()
+            .map(CandidateMeta::search_precision)
     }
 }
 
@@ -3854,14 +3960,7 @@ impl SearchClient {
                 // Genuinely empty archive (w3-d7①): not an error.
                 return Ok((
                     Vec::new(),
-                    CandidateMeta {
-                        mode: CandidateMode::Knn,
-                        k: 0,
-                        first_round_rows: 0,
-                        unique_messages: 0,
-                        incomplete: false,
-                        reason: None,
-                    },
+                    CandidateMeta::exact_float_path(CandidateMode::Knn, 0, 0, 0, false, None),
                 ));
             }
 
@@ -3934,14 +4033,7 @@ impl SearchClient {
             if raw_knn.is_empty() && !direct_exact {
                 return Ok((
                     Vec::new(),
-                    CandidateMeta {
-                        mode: CandidateMode::Knn,
-                        k,
-                        first_round_rows: 0,
-                        unique_messages: 0,
-                        incomplete: false,
-                        reason: None,
-                    },
+                    CandidateMeta::exact_float_path(CandidateMode::Knn, k, 0, 0, false, None),
                 ));
             }
 
@@ -4160,7 +4252,14 @@ impl SearchClient {
 
             Ok((
                 results,
-                CandidateMeta { mode, k, first_round_rows, unique_messages, incomplete, reason },
+                CandidateMeta::exact_float_path(
+                    mode,
+                    k,
+                    first_round_rows,
+                    unique_messages,
+                    incomplete,
+                    reason,
+                ),
             ))
         })
         .map_err(|err: crate::storage::api::StorageError| anyhow!(err.to_string()))
@@ -19749,6 +19848,160 @@ mod tests {
             sha_before,
             pr9_file_sha256(&old),
             "a refused writable open must leave the archive byte-identical"
+        );
+    }
+}
+
+/// PR9 task 08: pins the two things the new `search_precision` output
+/// contract rests on -- that `approximate` is the only input to the wire
+/// value (never `incomplete`), and that the four coarse-screen facts are
+/// absent rather than zero-valued when no coarse screen ran, so PR9 task 09
+/// can fill them in without any consumer having to re-read "0" as "unknown".
+#[cfg(test)]
+mod pr9_candidate_meta_tests {
+    use super::*;
+
+    fn float_meta() -> CandidateMeta {
+        CandidateMeta::exact_float_path(CandidateMode::KnnExact, 12, 9, 7, false, None)
+    }
+
+    /// The one construction PR9 task 09 adds: a quantized coarse screen with
+    /// all four facts measured.
+    fn approximate_meta() -> CandidateMeta {
+        CandidateMeta {
+            mode: CandidateMode::Knn,
+            k: 4096,
+            first_round_rows: 4096,
+            unique_messages: 200,
+            incomplete: false,
+            reason: None,
+            approximate: true,
+            requested_coarse_k: Some(6432),
+            effective_coarse_k: Some(4096),
+            coarse_cap_hit: Some(true),
+            corpus_limited: Some(false),
+        }
+    }
+
+    fn result_with(candidates: Option<CandidateMeta>) -> SearchResult {
+        SearchResult {
+            hits: Vec::new(),
+            wildcard_fallback: false,
+            cache_stats: CacheStats::default(),
+            suggestions: Vec::new(),
+            total_count: None,
+            candidates,
+            semantic_degraded: false,
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_float_paths_never_claim_approximation() {
+        let meta = float_meta();
+        assert!(!meta.approximate);
+        assert_eq!(meta.search_precision(), "exact");
+        assert_eq!(meta.requested_coarse_k, None);
+        assert_eq!(meta.effective_coarse_k, None);
+        assert_eq!(meta.coarse_cap_hit, None);
+        assert_eq!(meta.corpus_limited, None);
+    }
+
+    #[test]
+    fn pr9_candidate_meta_empty_and_knn_metas_report_exact() {
+        for meta in [
+            CandidateMeta::empty(),
+            CandidateMeta::exact_float_path(CandidateMode::Knn, 4, 0, 0, false, None),
+            CandidateMeta::exact_float_path(
+                CandidateMode::Exact,
+                0,
+                0,
+                3,
+                false,
+                None,
+            ),
+        ] {
+            assert!(!meta.approximate);
+            assert_eq!(meta.search_precision(), "exact");
+            assert_eq!(meta.requested_coarse_k, None);
+            assert_eq!(meta.effective_coarse_k, None);
+            assert_eq!(meta.coarse_cap_hit, None);
+            assert_eq!(meta.corpus_limited, None);
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_approximate_meta_reports_approximate() {
+        let meta = approximate_meta();
+        assert!(meta.approximate);
+        assert_eq!(meta.search_precision(), "approximate");
+    }
+
+    #[test]
+    fn pr9_candidate_meta_incomplete_does_not_imply_approximate() {
+        // A budget-stopped exact scan is still an exact-distance scan: the
+        // two fields answer different questions and must not be conflated.
+        let meta = CandidateMeta::exact_float_path(
+            CandidateMode::Exact,
+            0,
+            0,
+            5,
+            true,
+            Some("exact_scan_row_budget".to_string()),
+        );
+        assert!(meta.incomplete);
+        assert_eq!(meta.search_precision(), "exact");
+    }
+
+    #[test]
+    fn pr9_candidate_meta_absent_coarse_facts_stay_absent_in_json() {
+        let value = serde_json::to_value(float_meta()).expect("serialize candidate meta");
+        assert_eq!(value["approximate"], serde_json::json!(false));
+        // Old fields and their wire names are unchanged.
+        assert_eq!(value["mode"], serde_json::json!("knn+exact"));
+        assert_eq!(value["k"], serde_json::json!(12));
+        assert_eq!(value["first_round_rows"], serde_json::json!(9));
+        assert_eq!(value["unique_messages"], serde_json::json!(7));
+        assert_eq!(value["incomplete"], serde_json::json!(false));
+        assert_eq!(value["reason"], serde_json::Value::Null);
+        // A missing measurement must not be readable as a measured zero.
+        for key in [
+            "requested_coarse_k",
+            "effective_coarse_k",
+            "coarse_cap_hit",
+            "corpus_limited",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "{key} must be absent when no coarse screen ran, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_set_coarse_facts_serialize_with_their_values() {
+        let value = serde_json::to_value(approximate_meta()).expect("serialize candidate meta");
+        assert_eq!(value["approximate"], serde_json::json!(true));
+        assert_eq!(value["mode"], serde_json::json!("knn"));
+        assert_eq!(value["requested_coarse_k"], serde_json::json!(6432));
+        assert_eq!(value["effective_coarse_k"], serde_json::json!(4096));
+        assert_eq!(value["coarse_cap_hit"], serde_json::json!(true));
+        assert_eq!(value["corpus_limited"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_search_result_without_candidates_claims_nothing() {
+        assert_eq!(result_with(None).search_precision(), None);
+    }
+
+    #[test]
+    fn pr9_candidate_meta_search_result_projects_its_candidate_meta() {
+        assert_eq!(
+            result_with(Some(float_meta())).search_precision(),
+            Some("exact")
+        );
+        assert_eq!(
+            result_with(Some(approximate_meta())).search_precision(),
+            Some("approximate")
         );
     }
 }
