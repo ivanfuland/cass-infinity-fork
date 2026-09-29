@@ -14,12 +14,17 @@
 //! (`ROW_NUMBER() OVER (ORDER BY chunk_id) - 1) % stride = 0`, so the
 //! sample spans the whole table rather than clustering at one end); run
 //! each of the 64 vectors through a `k=40` `vec0` KNN scan, 3 times over a
-//! freshly-reopened read-only connection each rep ("cold": no warm
+//! freshly-reopened read-only connection each rep ("new connection": no warm
 //! statement/page cache carried from a prior rep) and 3 times over one
-//! connection kept open across all three reps ("hot": statement cache and
-//! OS page cache both warm from the immediately preceding rep) -- 6 * 64 =
-//! 384 individual per-query timings total, pooled into one latency
-//! distribution.
+//! connection kept open across all three reps ("reused connection":
+//! statement cache and OS page cache both warm from the immediately
+//! preceding rep) -- 6 * 64 = 384 individual per-query timings total.
+//!
+//! PR9 task 01: the probe additionally reports what the merged block alone
+//! cannot -- the identity and order of the 64 sampled query chunks, every
+//! individual timing paired with the query it belongs to, and the same
+//! summary block computed per phase. The merged `p50/p95/mean/max` block is
+//! retained unchanged and is exactly reproducible from `timings`.
 //!
 //! Usage: `CASS_DATA_DIR=<dir containing agent_search.db> cargo run
 //! --release --no-default-features --features qr,encryption,infinity
@@ -43,6 +48,13 @@ const COLD_REPS: usize = 3;
 const HOT_REPS: usize = 3;
 const MAX_LATENCY_GATE: Duration = Duration::from_secs(2);
 
+/// Label for the freshly-reopened-connection phase, and the JSON field name
+/// carrying its summary.
+const PHASE_NEW_CONNECTION: &str = "new_connection";
+/// Label for the single-reused-connection phase, and the JSON field name
+/// carrying its summary.
+const PHASE_REUSED_CONNECTION: &str = "reused_connection";
+
 #[derive(Parser, Debug)]
 #[command(name = "w4_ku2_probe")]
 struct Cli {
@@ -60,6 +72,46 @@ struct Ku2Report {
     mean_ms: f64,
     max_ms: f64,
     passed: bool,
+    /// The `chunk_id` of each sampled query vector, in the order the probe
+    /// queries them. Length equals the number of distinct query vectors
+    /// (64 when the active generation has at least `SAMPLE_COUNT * stride`
+    /// rows to sample).
+    query_chunk_ids: Vec<i64>,
+    /// Summary over the `COLD_REPS` sweeps that each used a freshly-reopened
+    /// read-only connection.
+    new_connection: PhaseStats,
+    /// Summary over the `HOT_REPS` sweeps that shared one open connection.
+    reused_connection: PhaseStats,
+    /// Every individual KNN timing, in execution order, carrying the query
+    /// it belongs to and the chunk ids it returned.
+    timings: Vec<QueryTiming>,
+}
+
+/// The original merged summary shape, computed over one phase's samples.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+struct PhaseStats {
+    samples: usize,
+    p50_ms: f64,
+    p95_ms: f64,
+    mean_ms: f64,
+    max_ms: f64,
+}
+
+/// One `k=40` KNN scan of one sampled query vector.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+struct QueryTiming {
+    /// One of `PHASE_NEW_CONNECTION` / `PHASE_REUSED_CONNECTION`.
+    phase: &'static str,
+    /// 0-based rep index within its phase.
+    repetition: usize,
+    /// 0-based index into `query_chunk_ids` -- the query this sample belongs to.
+    sample_index: usize,
+    /// `query_chunk_ids[sample_index]`, repeated so a single timing row is
+    /// self-describing.
+    chunk_id: i64,
+    elapsed_ms: f64,
+    /// The chunk ids the scan returned, in distance order.
+    top_chunk_ids: Vec<i64>,
 }
 
 fn active_generation(storage: &FrankenStorage) -> anyhow::Result<(i64, i64)> {
@@ -71,7 +123,7 @@ fn active_generation(storage: &FrankenStorage) -> anyhow::Result<(i64, i64)> {
     Ok(row)
 }
 
-fn sample_stride_vectors(storage: &FrankenStorage, generation_id: i64, sample_count: i64) -> anyhow::Result<Vec<Vec<f32>>> {
+fn sample_stride_vectors(storage: &FrankenStorage, generation_id: i64, sample_count: i64) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
     let total: i64 = storage.raw().query_row_map(
         "SELECT COUNT(*) FROM message_chunks WHERE generation_id = ?1",
         &[coding_agent_search::storage::api::Value::from(generation_id)],
@@ -80,29 +132,44 @@ fn sample_stride_vectors(storage: &FrankenStorage, generation_id: i64, sample_co
     anyhow::ensure!(total > 0, "active generation {generation_id} has zero message_chunks rows to sample");
 
     let stride = (total / sample_count).max(1);
-    let blobs: Vec<Vec<u8>> = storage.raw().query_all_map(
+    let rows: Vec<(i64, Vec<u8>)> = storage.raw().query_all_map(
         "WITH ranked AS ( \
-             SELECT embedding, ROW_NUMBER() OVER (ORDER BY chunk_id) - 1 AS rn \
+             SELECT chunk_id, embedding, ROW_NUMBER() OVER (ORDER BY chunk_id) - 1 AS rn \
              FROM message_chunks WHERE generation_id = ?1 \
          ) \
-         SELECT embedding FROM ranked WHERE rn % ?2 = 0 ORDER BY rn LIMIT ?3",
+         SELECT chunk_id, embedding FROM ranked WHERE rn % ?2 = 0 ORDER BY rn LIMIT ?3",
         &[
             coding_agent_search::storage::api::Value::from(generation_id),
             coding_agent_search::storage::api::Value::from(stride),
             coding_agent_search::storage::api::Value::from(sample_count),
         ],
-        |row| row.get_typed(0),
+        |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
     )?;
-    anyhow::ensure!(!blobs.is_empty(), "stride sampling produced zero vectors (total={total}, stride={stride})");
+    anyhow::ensure!(!rows.is_empty(), "stride sampling produced zero vectors (total={total}, stride={stride})");
 
-    blobs.iter().map(|b| le_blob_to_f32_vector(b).map_err(anyhow::Error::from)).collect()
+    rows.into_iter().map(|(chunk_id, blob)| Ok((chunk_id, le_blob_to_f32_vector(&blob)?))).collect()
 }
 
-fn timed_knn_sweep(storage: &FrankenStorage, generation_id: i64, queries: &[Vec<f32>], out: &mut Vec<Duration>) -> anyhow::Result<()> {
-    for q in queries {
+fn timed_knn_sweep(
+    storage: &FrankenStorage,
+    generation_id: i64,
+    queries: &[(i64, Vec<f32>)],
+    phase: &'static str,
+    repetition: usize,
+    out: &mut Vec<QueryTiming>,
+) -> anyhow::Result<()> {
+    for (sample_index, (chunk_id, vector)) in queries.iter().enumerate() {
         let t0 = Instant::now();
-        vec0_knn(storage.raw(), generation_id, q, K)?;
-        out.push(t0.elapsed());
+        let hits = vec0_knn(storage.raw(), generation_id, vector, K)?;
+        let elapsed = t0.elapsed();
+        out.push(QueryTiming {
+            phase,
+            repetition,
+            sample_index,
+            chunk_id: *chunk_id,
+            elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+            top_chunk_ids: hits.into_iter().map(|(id, _)| id).collect(),
+        });
     }
     Ok(())
 }
@@ -115,38 +182,55 @@ fn percentile_ms(sorted_ms: &[f64], p: f64) -> f64 {
     sorted_ms[rank - 1]
 }
 
+/// The original merged summary, computed over an arbitrary set of timings --
+/// used once for the whole run and once per phase.
+fn summarize_ms(timings: impl Iterator<Item = f64>) -> (usize, f64, f64, f64, f64) {
+    let mut ms: Vec<f64> = timings.collect();
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean_ms = ms.iter().sum::<f64>() / ms.len() as f64;
+    let max_ms = *ms.last().unwrap();
+    (ms.len(), percentile_ms(&ms, 0.50), percentile_ms(&ms, 0.95), mean_ms, max_ms)
+}
+
+fn phase_stats(timings: &[QueryTiming], phase: &str) -> PhaseStats {
+    let (samples, p50_ms, p95_ms, mean_ms, max_ms) =
+        summarize_ms(timings.iter().filter(|t| t.phase == phase).map(|t| t.elapsed_ms));
+    PhaseStats { samples, p50_ms, p95_ms, mean_ms, max_ms }
+}
+
 fn run_probe(db_path: &Path) -> anyhow::Result<Ku2Report> {
     let storage = FrankenStorage::open_readonly(db_path)?;
     let (generation_id, _dim) = active_generation(&storage)?;
     let queries = sample_stride_vectors(&storage, generation_id, SAMPLE_COUNT)?;
 
-    let mut timings: Vec<Duration> = Vec::with_capacity((COLD_REPS + HOT_REPS) * queries.len());
+    let mut timings: Vec<QueryTiming> = Vec::with_capacity((COLD_REPS + HOT_REPS) * queries.len());
 
-    for _ in 0..COLD_REPS {
+    for repetition in 0..COLD_REPS {
         let cold_storage = FrankenStorage::open_readonly(db_path)?;
-        timed_knn_sweep(&cold_storage, generation_id, &queries, &mut timings)?;
+        timed_knn_sweep(&cold_storage, generation_id, &queries, PHASE_NEW_CONNECTION, repetition, &mut timings)?;
     }
 
     let hot_storage = FrankenStorage::open_readonly(db_path)?;
-    for _ in 0..HOT_REPS {
-        timed_knn_sweep(&hot_storage, generation_id, &queries, &mut timings)?;
+    for repetition in 0..HOT_REPS {
+        timed_knn_sweep(&hot_storage, generation_id, &queries, PHASE_REUSED_CONNECTION, repetition, &mut timings)?;
     }
 
-    let mut ms: Vec<f64> = timings.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
-    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean_ms = ms.iter().sum::<f64>() / ms.len() as f64;
-    let max_ms = *ms.last().unwrap();
-    let passed = timings.iter().all(|d| *d <= MAX_LATENCY_GATE);
+    let (samples, p50_ms, p95_ms, mean_ms, max_ms) = summarize_ms(timings.iter().map(|t| t.elapsed_ms));
+    let passed = timings.iter().all(|t| t.elapsed_ms <= MAX_LATENCY_GATE.as_secs_f64() * 1000.0);
 
     Ok(Ku2Report {
-        samples: ms.len(),
+        samples,
         k: K,
         generation_id,
-        p50_ms: percentile_ms(&ms, 0.50),
-        p95_ms: percentile_ms(&ms, 0.95),
+        p50_ms,
+        p95_ms,
         mean_ms,
         max_ms,
         passed,
+        query_chunk_ids: queries.iter().map(|(chunk_id, _)| *chunk_id).collect(),
+        new_connection: phase_stats(&timings, PHASE_NEW_CONNECTION),
+        reused_connection: phase_stats(&timings, PHASE_REUSED_CONNECTION),
+        timings,
     })
 }
 
@@ -267,6 +351,42 @@ mod tests {
         assert!(report.max_ms < 2000.0);
         assert!(report.p50_ms <= report.p95_ms);
         assert!(report.p95_ms <= report.max_ms);
+
+        // PR9 task 01: the added observation fields must be self-consistent,
+        // and the merged block must be reproducible from `timings` alone.
+        assert_eq!(report.query_chunk_ids.len(), SAMPLE_COUNT as usize);
+        let mut distinct = report.query_chunk_ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), SAMPLE_COUNT as usize, "the 64 sampled query chunk ids must be pairwise distinct");
+        assert_eq!(report.timings.len(), report.samples);
+        for t in &report.timings {
+            assert!(report.query_chunk_ids[t.sample_index] == t.chunk_id, "each timing must name its own query");
+            assert_eq!(t.top_chunk_ids.len(), K);
+        }
+        assert_eq!(report.new_connection.samples, 64 * COLD_REPS);
+        assert_eq!(report.reused_connection.samples, 64 * HOT_REPS);
+        assert_eq!(report.new_connection.samples + report.reused_connection.samples, report.samples);
+        assert_eq!(
+            report.timings.iter().filter(|t| t.phase == PHASE_NEW_CONNECTION).count(),
+            report.new_connection.samples
+        );
+        assert_eq!(
+            report.timings.iter().filter(|t| t.phase == PHASE_REUSED_CONNECTION).count(),
+            report.reused_connection.samples
+        );
+        let (n, p50, p95, mean, max) = summarize_ms(report.timings.iter().map(|t| t.elapsed_ms));
+        assert_eq!((n, p50, p95, mean, max), (report.samples, report.p50_ms, report.p95_ms, report.mean_ms, report.max_ms));
+        assert_eq!(phase_stats(&report.timings, PHASE_NEW_CONNECTION), report.new_connection);
+        assert_eq!(phase_stats(&report.timings, PHASE_REUSED_CONNECTION), report.reused_connection);
+
+        // PR9 task 01 evidence: emit the verified report so an independent
+        // script can recompute the merged block from `timings` outside the
+        // crate. Captured with `--nocapture`; a normal test run captures and
+        // discards it. No file, no environment switch.
+        println!("W4_KU2_PROBE_REPORT_JSON_BEGIN");
+        println!("{}", serde_json::to_string(&report).expect("Ku2Report must serialize"));
+        println!("W4_KU2_PROBE_REPORT_JSON_END");
     }
 
     #[test]
