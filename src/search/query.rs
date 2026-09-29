@@ -327,9 +327,22 @@ impl std::ops::Deref for SendConnection {
     }
 }
 
+/// Open the search client's raw read-only hydration connection.
+///
+/// PR9 task 07: this is the second read-only search entry -- it opens the
+/// archive directly through
+/// [`crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout`]
+/// and so does not inherit [`crate::storage::sqlite::FrankenStorage::open_readonly`]'s
+/// guard. The schema-version check therefore has to be repeated here, in the
+/// same order: read-only connection open, then version, then (only if the
+/// schema is current) the PRAGMAs and the hand-off to callers that run vector
+/// SQL. A rejected archive keeps the same "rebuild / use a matching binary"
+/// story as the shared entry, instead of surfacing later as a `vec0`
+/// int8/float type error from `search_db_vector_domain`.
 fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<Connection> {
     let conn =
         crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, timeout)?;
+    crate::storage::sqlite::ensure_readonly_schema_current(&conn)?;
     conn.execute("PRAGMA query_only = 1;", &[])
         .with_context(|| "setting search hydration query_only")?;
     conn.execute("PRAGMA busy_timeout = 5000;", &[])
@@ -3143,6 +3156,22 @@ impl SearchClient {
                     *guard = Some(SendConnection(conn));
                 }
                 Err(err) => {
+                    // PR9 task 07: a schema-guard rejection is not a "no sqlite
+                    // backend" condition. The archive exists and is readable --
+                    // it is just not a schema this binary may read, and there is
+                    // no lexical or vector answer to be had from it. Degrading
+                    // to `None` here would resurface downstream as
+                    // `lex_domain_rebuild_state=absent -- run \`cass index
+                    // --full\``, which is the wrong remediation for a schema
+                    // mismatch and is exactly the misreport the guard exists to
+                    // prevent. Every other open failure (missing file, bad page
+                    // store, lock, I/O) keeps the debug-log + degrade-to-`None`
+                    // behaviour below.
+                    if let Some(rejection) =
+                        crate::storage::sqlite::readonly_schema_guard_rejection(&err)
+                    {
+                        return Err(anyhow!(rejection));
+                    }
                     tracing::debug!(
                         error = %err,
                         path = %path.display(),
@@ -19352,5 +19381,387 @@ mod tests {
             after[0].score
         );
         assert_ne!(gen_a, gen_b);
+    }
+
+    // =========================================================================
+    // PR9 task 07: read-only search checks the schema version before it runs
+    // any vector SQL.
+    //
+    // Two read-only entries can be followed by vector SQL:
+    //   1. `FrankenStorage::open_readonly*` (`src/storage/sqlite.rs`) -- the
+    //      shared read-only entry.
+    //   2. `open_search_hydration_sqlite` (this file) -- the search client's
+    //      raw hydration connection, which opens the archive directly and so
+    //      does not inherit (1)'s guard.
+    //
+    // Every negative fixture below carries a *broken* `vec0` table on top of
+    // its foreign `user_version`, so "the schema error came first" is
+    // falsifiable: if the guard were absent, or ordered after the vector SQL,
+    // the reported error would be the vector domain's, not the guard's. The
+    // same broken vector layer at schema 7 is asserted separately to really
+    // produce a vector-SQL error, which is what makes that falsification
+    // meaningful rather than assumed.
+    // =========================================================================
+
+    /// The schema version this binary speaks -- the guard's `required` value.
+    /// Spelled out here (rather than importing the constant into this module)
+    /// so the tests state the number they expect independently of the
+    /// production path they exercise.
+    const PR9_CURRENT_SCHEMA_VERSION: i64 = crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+    fn pr9_file_sha256(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).expect("read fixture db for hashing");
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Build one schema-`PR9_CURRENT_SCHEMA_VERSION` fixture holding two messages
+    /// (7001, 7002) with one chunk each in an active, dim-2 generation, plus
+    /// that generation's `vec0` table. Closed on return, so the copy below
+    /// starts from a checkpointed file with no WAL sidecar in play.
+    fn pr9_build_schema_guard_fixture(base: &Path) {
+        let storage = FrankenStorage::open(base).expect("build the schema-7 guard fixture");
+        for message_id in [7001_i64, 7002] {
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: None,
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+        }
+        seed_active_generation_with_multi_chunk_vectors(
+            &storage,
+            2,
+            &[
+                (7001, 7001, 0, vec![1.0_f32, 0.0_f32]),
+                (7002, 7002, 0, vec![0.0_f32, 1.0_f32]),
+            ],
+        );
+        storage.close().expect("close the guard fixture");
+    }
+
+    /// Copy `base` to `dst`, then -- through one real writable connection --
+    /// optionally break the fixture's `vec0` table and write `user_version`.
+    ///
+    /// The "broken" variant redeclares the generation's `vec0` table as
+    /// `float[3]` while the stored float rows stay dim-2, so a dim-2 KNN query
+    /// is a genuine vector-SQL width mismatch rather than a missing table: the
+    /// error a caller would see if the guard did not fire first.
+    fn pr9_make_variant(base: &Path, dst: &Path, user_version: i64, break_vector_layer: bool) {
+        std::fs::copy(base, dst).expect("copy the guard fixture");
+        let conn = crate::storage::api::Conn::open_writable(dst, Profile::Production)
+            .expect("open the fixture copy writable");
+        if break_vector_layer {
+            let generation_id: i64 = conn
+                .query_row_map(
+                    "SELECT id FROM embedding_generations WHERE is_active = 1",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .expect("read the active generation id from the fixture copy");
+            let table = format!("vec_index_gen_{generation_id}");
+            conn.execute_batch(&format!(
+                "DROP TABLE {table}; \
+                 CREATE VIRTUAL TABLE {table} USING vec0(embedding float[3]);"
+            ))
+            .expect("break the fixture's vec0 table");
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {user_version};"))
+            .expect("write user_version on the fixture copy");
+        conn.close_with_checkpoint().expect("checkpoint and close the fixture copy");
+
+        // Evidence hook, off by default so the suite stays hermetic: with
+        // `PR9_TASK07_ARTIFACT_DIR` set, the finished fixture is also written
+        // there (and never cleaned up), so the claimed `user_version` of each
+        // fixture can be re-read independently -- `sqlite3 -readonly <file>
+        // 'PRAGMA user_version'` -- instead of taking this test's own word for
+        // it. See the PR9 task-07 report for the recorded values.
+        if let Some(dir) = std::env::var_os("PR9_TASK07_ARTIFACT_DIR") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).expect("create the PR9 task-07 artifact dir");
+            let name = dst.file_name().expect("fixture copies always have a file name");
+            std::fs::copy(dst, dir.join(name)).expect("publish the fixture copy as evidence");
+        }
+    }
+
+    /// Independent read of the value the guard is supposed to compare against,
+    /// through a read-only connection the fixture never went through.
+    fn pr9_read_user_version_readonly(path: &Path) -> i64 {
+        let conn = crate::storage::api::Conn::open_read(path)
+            .expect("read-only open for the independent user_version check");
+        crate::storage::schema::read_user_version(&conn).expect("read user_version")
+    }
+
+    #[test]
+    fn pr9_readonly_schema_mismatch_precedes_vector_sql() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("pr9-base.db");
+        pr9_build_schema_guard_fixture(&base);
+
+        let v7_ok = dir.path().join("pr9-v7-ok.db");
+        let v7_broken = dir.path().join("pr9-v7-broken.db");
+        let v6_broken = dir.path().join("pr9-v6-broken.db");
+        let v8_broken = dir.path().join("pr9-v8-broken.db");
+        pr9_make_variant(&base, &v7_ok, PR9_CURRENT_SCHEMA_VERSION, false);
+        pr9_make_variant(&base, &v7_broken, PR9_CURRENT_SCHEMA_VERSION, true);
+        pr9_make_variant(&base, &v6_broken, PR9_CURRENT_SCHEMA_VERSION - 1, true);
+        pr9_make_variant(&base, &v8_broken, PR9_CURRENT_SCHEMA_VERSION + 1, true);
+
+        // Inputs, read back independently rather than trusted from the writer.
+        assert_eq!(pr9_read_user_version_readonly(&v7_ok), PR9_CURRENT_SCHEMA_VERSION);
+        assert_eq!(pr9_read_user_version_readonly(&v7_broken), PR9_CURRENT_SCHEMA_VERSION);
+        assert_eq!(pr9_read_user_version_readonly(&v6_broken), PR9_CURRENT_SCHEMA_VERSION - 1);
+        assert_eq!(pr9_read_user_version_readonly(&v8_broken), PR9_CURRENT_SCHEMA_VERSION + 1);
+
+        let shas_before: Vec<String> = [&v7_ok, &v7_broken, &v6_broken, &v8_broken]
+            .iter()
+            .map(|p| pr9_file_sha256(p.as_path()))
+            .collect();
+        // Evidence, not assertions: `-- --nocapture` prints the exact fixture
+        // digests and the exact rejection texts this run produced, so the
+        // report can quote the run rather than paraphrase the source.
+        for (path, sha) in [&v7_ok, &v7_broken, &v6_broken, &v8_broken]
+            .iter()
+            .zip(shas_before.iter())
+        {
+            println!(
+                "PR9-07 fixture {} user_version={} sha256={sha}",
+                path.display(),
+                pr9_read_user_version_readonly(path.as_path())
+            );
+        }
+
+        // ---- Entry 1: `FrankenStorage::open_readonly` --------------------
+        //
+        // Schema 7 opens and completes a real read.
+        {
+            let storage = FrankenStorage::open_readonly(&v7_ok)
+                .expect("schema-7 read-only open must succeed");
+            let generations: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT count(*) FROM embedding_generations WHERE is_active = 1",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .expect("narrow real read through the read-only handle");
+            assert_eq!(generations, 1, "the schema-7 fixture must expose its active generation");
+        }
+        // Schema 6 and 8 are refused, with the real numbers in the message.
+        // `FrankenStorage` is not `Debug`, so the refusal is destructured
+        // rather than `expect_err`-ed.
+        let old_err = match FrankenStorage::open_readonly(&v6_broken) {
+            Ok(_) => panic!("entry 1 must refuse a schema-6 archive"),
+            Err(err) => err,
+        };
+        let old_msg = format!("{old_err:#}");
+        println!("PR9-07 entry1 schema-6 rejection: {old_msg}");
+        assert!(
+            old_msg.contains("version 6") && old_msg.contains("version 7"),
+            "entry 1's schema-6 rejection must name found/required, got: {old_msg}"
+        );
+        assert!(
+            old_msg.contains("rebuild"),
+            "entry 1's schema-6 rejection must carry the rebuild story, got: {old_msg}"
+        );
+        assert!(
+            !old_msg.contains("vector") && !old_msg.contains("vec0"),
+            "entry 1 must reject a schema-6 archive before any vector-layer error, got: {old_msg}"
+        );
+
+        let new_err = match FrankenStorage::open_readonly(&v8_broken) {
+            Ok(_) => panic!("entry 1 must refuse a schema-8 archive"),
+            Err(err) => err,
+        };
+        let new_msg = format!("{new_err:#}");
+        println!("PR9-07 entry1 schema-8 rejection: {new_msg}");
+        assert!(
+            new_msg.contains("version 8") && new_msg.contains("version 7"),
+            "entry 1's schema-8 rejection must name found/required, got: {new_msg}"
+        );
+        assert!(
+            new_msg.contains("newer than"),
+            "entry 1's schema-8 rejection must say the archive is newer than the binary, got: {new_msg}"
+        );
+        assert!(
+            !new_msg.contains("vector") && !new_msg.contains("vec0"),
+            "entry 1 must reject a schema-8 archive before any vector-layer error, got: {new_msg}"
+        );
+
+        // ---- Entry 2: `open_search_hydration_sqlite` ---------------------
+        //
+        // Schema 7 opens and runs the narrowest real vector search through it.
+        {
+            let conn = open_search_hydration_sqlite(&v7_ok, Duration::from_secs(5))
+                .expect("schema-7 hydration open must succeed");
+            let (results, _meta) = SearchClient::search_db_vector_domain(
+                &conn,
+                &[1.0, 0.0],
+                &SearchFilters::default(),
+                None,
+                5,
+            )
+            .expect("the narrowest real vector search over the schema-7 fixture");
+            // Both fixture chunks are inside the KNN window (k = min(5*4, 2)),
+            // so both messages come back, ordered `score desc, message_id asc`:
+            // 7001's `[1,0]` against the `[1,0]` query first, 7002's orthogonal
+            // `[0,1]` second.
+            let got: Vec<(u64, f32)> = results
+                .iter()
+                .map(|r| (r.message_id, r.score))
+                .collect();
+            assert_eq!(got.len(), 2, "expected both fixture messages, got {got:?}");
+            assert_eq!(got[0].0, 7001, "the near-exact chunk must rank first, got {got:?}");
+            assert!(
+                got[0].1 > 0.9,
+                "expected the near-exact chunk's score above 0.9, got {got:?}"
+            );
+            assert_eq!(got[1].0, 7002, "the orthogonal chunk must rank second, got {got:?}");
+        }
+        for (path, found, required) in [
+            (&v6_broken, PR9_CURRENT_SCHEMA_VERSION - 1, PR9_CURRENT_SCHEMA_VERSION),
+            (&v8_broken, PR9_CURRENT_SCHEMA_VERSION + 1, PR9_CURRENT_SCHEMA_VERSION),
+        ] {
+            let err = open_search_hydration_sqlite(path, Duration::from_secs(5)).expect_err(
+                "entry 2 must refuse a non-current archive before handing out a connection",
+            );
+            let msg = format!("{err:#}");
+            println!("PR9-07 entry2 user_version={found} rejection: {msg}");
+            assert!(
+                msg.contains(&format!("version {found}")) && msg.contains(&format!("version {required}")),
+                "entry 2 must name found/required for user_version={found}, got: {msg}"
+            );
+            assert!(
+                !msg.contains("vector") && !msg.contains("vec0"),
+                "entry 2 must reject user_version={found} before any vector-layer error, got: {msg}"
+            );
+        }
+
+        // ---- The falsifier: the broken vector layer really does error -----
+        //
+        // Same broken `vec0` table, same query, but at the schema this binary
+        // accepts -- so the guard cannot be masking a fixture that was simply
+        // unable to reach vector SQL at all.
+        {
+            let conn = open_search_hydration_sqlite(&v7_broken, Duration::from_secs(5))
+                .expect("schema 7 with a broken vec0 table still opens");
+            let err = SearchClient::search_db_vector_domain(
+                &conn,
+                &[1.0, 0.0],
+                &SearchFilters::default(),
+                None,
+                5,
+            )
+            .expect_err(
+                "a dim-3 vec0 table under dim-2 float rows must fail the KNN query -- if this \
+                 passes, the negative fixtures above prove nothing about ordering",
+            );
+            let msg = format!("{err:#}");
+            println!("PR9-07 broken-vec0-at-schema-7 vector-layer error: {msg}");
+            assert!(
+                !msg.contains("schema version"),
+                "the vector-layer error must not be the schema guard's, got: {msg}"
+            );
+        }
+
+        // ---- Neither entry may have written a byte -----------------------
+        let shas_after: Vec<String> = [&v7_ok, &v7_broken, &v6_broken, &v8_broken]
+            .iter()
+            .map(|p| pr9_file_sha256(p.as_path()))
+            .collect();
+        assert_eq!(
+            shas_before, shas_after,
+            "the read-only guard must leave every fixture byte-identical"
+        );
+    }
+
+    /// PR9 task 07: the guard's rejection has to reach the search surface as
+    /// itself. The client's lazy open used to swallow every open failure into a
+    /// debug log, which turned a schema mismatch into
+    /// `lex_domain_rebuild_state=absent -- run \`cass index --full\`` -- the
+    /// wrong remediation, and exactly what the guard exists to prevent.
+    #[test]
+    fn pr9_readonly_schema_guard_reaches_the_search_surface() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("pr9-base.db");
+        pr9_build_schema_guard_fixture(&base);
+        let old = dir.path().join("pr9-old.db");
+        pr9_make_variant(&base, &old, PR9_CURRENT_SCHEMA_VERSION - 1, false);
+        let sha_before = pr9_file_sha256(&old);
+
+        let index_path = dir.path().join("index");
+        let client = SearchClient::open(&index_path, Some(&old))
+            .expect("constructing the search client must not need the schema")
+            .expect("the fixture database exists, so a client is constructed");
+
+        let err = client
+            .lex_domain_rebuild_marker_state_for_search()
+            .expect_err("a schema-6 archive must not report a lexical marker state");
+        let msg = format!("{err:#}");
+        println!("PR9-07 search-surface rejection: {msg}");
+        assert!(
+            msg.contains(&format!("version {}", PR9_CURRENT_SCHEMA_VERSION - 1))
+                && msg.contains(&format!("version {}", PR9_CURRENT_SCHEMA_VERSION)),
+            "the search surface must report the schema guard's found/required, got: {msg}"
+        );
+        assert!(
+            !msg.contains("lex_domain_rebuild_state"),
+            "the search surface must not misreport a schema mismatch as a missing lexical \
+             index, got: {msg}"
+        );
+        assert_eq!(
+            sha_before,
+            pr9_file_sha256(&old),
+            "reaching the search surface must not modify the archive"
+        );
+    }
+
+    /// PR9 task 07 (AC2): the new read-only guard must not change what the
+    /// *writable* entry does with an old archive -- same rejection class, and
+    /// no watermark, DDL or byte-level repair on the way out.
+    #[test]
+    fn pr9_readonly_schema_guard_leaves_writable_rejection_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("pr9-base.db");
+        pr9_build_schema_guard_fixture(&base);
+        let old = dir.path().join("pr9-old.db");
+        pr9_make_variant(&base, &old, PR9_CURRENT_SCHEMA_VERSION - 1, false);
+        let sha_before = pr9_file_sha256(&old);
+
+        let err = match FrankenStorage::open(&old) {
+            Ok(_) => panic!("the writable entry must keep refusing a schema-6 archive"),
+            Err(err) => err,
+        };
+        let typed = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StorageError>())
+            .expect("the writable refusal must stay a typed StorageError");
+        assert!(
+            matches!(
+                typed,
+                StorageError::SchemaRebuildRequired { found, required }
+                    if *found == PR9_CURRENT_SCHEMA_VERSION - 1 && *required == PR9_CURRENT_SCHEMA_VERSION
+            ),
+            "the writable entry must keep its SchemaRebuildRequired{{found,required}} class, got: {typed:?}"
+        );
+
+        assert_eq!(
+            pr9_read_user_version_readonly(&old),
+            PR9_CURRENT_SCHEMA_VERSION - 1,
+            "a refused writable open must not migrate the archive"
+        );
+        assert_eq!(
+            sha_before,
+            pr9_file_sha256(&old),
+            "a refused writable open must leave the archive byte-identical"
+        );
     }
 }

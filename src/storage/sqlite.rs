@@ -627,6 +627,102 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     }
 }
 
+/// PR9 task 07: the read-only schema guard's rejection for a database whose
+/// `user_version` is *newer* than the version this binary was built for.
+///
+/// A dedicated type rather than a bare `StorageError::Other`, so a consumer
+/// (`search::query`'s lazy hydration open, which must decide whether an open
+/// failure is the guard speaking or an ordinary "no sqlite backend" condition)
+/// can recognise it by downcast instead of by matching error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadonlySchemaNewerThanBinary {
+    pub(crate) found: i64,
+    pub(crate) required: i64,
+}
+
+impl std::fmt::Display for ReadonlySchemaNewerThanBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "database schema version {} is newer than version {} this binary supports; \
+             use a binary that matches the archive (or rebuild the archive from the raw \
+             corpus with this one)",
+            self.found, self.required
+        )
+    }
+}
+
+impl std::error::Error for ReadonlySchemaNewerThanBinary {}
+
+/// PR9 task 07: read-only schema-version guard.
+///
+/// Every read-only entry that can be followed by vector SQL must call this
+/// once the connection is open and before any vector SQL runs. The writable
+/// side already refuses a non-current `user_version` through
+/// [`crate::storage::schema::ensure`] (rebuild-only: no in-place migration);
+/// this is the read-only counterpart. Without it, a schema-mismatched archive
+/// that reaches a `vec0`/int8 query is reported as a vector type error rather
+/// than as "this database needs a rebuild or a matching binary".
+///
+/// It only *reads* `PRAGMA user_version` and classifies. It never calls
+/// `ensure`, never runs DDL or a migration, never writes a watermark or any
+/// other row, and leaves the database file byte-identical.
+///
+/// - `found == CURRENT_SCHEMA_VERSION` -> `Ok`.
+/// - `found < CURRENT_SCHEMA_VERSION` (including `0`) -> the same typed
+///   `StorageError::SchemaRebuildRequired { found, required }` the writable
+///   path raises, so both sides tell the caller one story.
+/// - `found > CURRENT_SCHEMA_VERSION` -> [`ReadonlySchemaNewerThanBinary`]:
+///   the archive was written by a newer binary and must be read by a matching
+///   one (or rebuilt from the raw corpus), not opened by this build.
+///
+/// Both rejection messages carry the real `found` and `required` numbers at
+/// their top level, so a caller that only renders `{}` still reports them.
+///
+/// `pub(crate)`: `search::query`'s raw hydration connection bypasses
+/// [`FrankenStorage::open_readonly`] entirely and needs the same check.
+pub(crate) fn ensure_readonly_schema_current(conn: &FrankenConnection) -> Result<()> {
+    let found = crate::storage::schema::read_user_version(conn)
+        .context("reading PRAGMA user_version for the read-only schema guard")?;
+
+    if found == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    if found < CURRENT_SCHEMA_VERSION {
+        return Err(anyhow::Error::new(StorageError::SchemaRebuildRequired {
+            found,
+            required: CURRENT_SCHEMA_VERSION,
+        }));
+    }
+
+    Err(anyhow::Error::new(ReadonlySchemaNewerThanBinary {
+        found,
+        required: CURRENT_SCHEMA_VERSION,
+    }))
+}
+
+/// PR9 task 07: recognise the read-only schema guard's own rejection anywhere
+/// in an error chain, returning its message.
+///
+/// `None` means "this failure is not the guard speaking" -- every other
+/// read-only open failure (missing file, unreadable page store, lock, I/O)
+/// keeps whatever handling its caller already had.
+pub(crate) fn readonly_schema_guard_rejection(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|cause| {
+        if cause.downcast_ref::<ReadonlySchemaNewerThanBinary>().is_some()
+            || matches!(
+                cause.downcast_ref::<StorageError>(),
+                Some(StorageError::SchemaRebuildRequired { .. })
+            )
+        {
+            Some(cause.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     path: &Path,
     timeout: Duration,
@@ -2810,6 +2906,12 @@ impl FrankenStorage {
         })?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening the legacy embedded engine db readonly at {}", path.display()))?;
+        // PR9 task 07: version check goes here -- after the read-only connection
+        // exists, before `Self::new` and therefore before any caller can run
+        // vector SQL through this handle. Rebuild-only on both sides: an old
+        // archive is refused with `SchemaRebuildRequired`, a newer one with
+        // `ReadonlySchemaNewerThanBinary`, and neither path touches the file.
+        ensure_readonly_schema_current(&conn)?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
