@@ -23033,28 +23033,152 @@ mod tests {
         );
     }
 
+    /// SHA-256 of a file's bytes, for the "a refused read-only open must not
+    /// touch the archive" assertion below.
+    fn pr9_task07_file_sha256(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).expect("read the archive for hashing");
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// PR9 task 07: `tests/fixtures/search_demo_data/agent_search.db` is a
+    /// **schema-1** archive, and the read-only schema guard accepts only
+    /// `CURRENT_SCHEMA_VERSION`. That refusal is the intended contract
+    /// (rebuild-only: an old archive is rebuilt from the raw corpus, not
+    /// converted in place), so what this case pins is now the refusal itself:
+    /// the real `found`/`required` pair, and an archive left byte-identical.
+    ///
+    /// The subject this test used to carry -- "listing lexical rebuild
+    /// footprints still works when a current-schema archive has no tail-cache
+    /// rows" -- is preserved on a real schema-7 fixture by
+    /// `list_conversation_footprints_for_lexical_rebuild_tolerates_missing_tail_state_readonly`
+    /// below. Relabelling this historical archive's `user_version` to make it
+    /// look current would have destroyed the record of what it actually is.
     #[test]
-    fn list_conversation_footprints_for_lexical_rebuild_tolerates_legacy_search_demo_fixture() {
+    fn list_conversation_footprints_for_lexical_rebuild_legacy_search_demo_fixture_is_refused_readonly() {
         let fixture_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("search_demo_data")
             .join("agent_search.db");
-        let storage = FrankenStorage::open_readonly(&fixture_db).unwrap();
+
+        // Read the input value independently of the code under test, rather
+        // than taking the guard's own `found` on trust.
+        let probe = FrankenConnection::open_read(&fixture_db)
+            .expect("open the demo archive for an independent user_version read");
+        let found = crate::storage::schema::read_user_version(&probe)
+            .expect("read the demo archive's user_version");
+        drop(probe);
+        assert_eq!(found, 1, "the checked-in demo archive is a schema-1 database");
+
+        let sha_before = pr9_task07_file_sha256(&fixture_db);
+
+        let err = match FrankenStorage::open_readonly(&fixture_db) {
+            Ok(_) => panic!(
+                "a schema-1 archive must be refused by the read-only schema guard, not opened"
+            ),
+            Err(err) => err,
+        };
+        let typed = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StorageError>())
+            .expect("the refusal must stay a typed StorageError");
+        assert!(
+            matches!(
+                typed,
+                StorageError::SchemaRebuildRequired { found, required }
+                    if *found == 1 && *required == CURRENT_SCHEMA_VERSION
+            ),
+            "expected SchemaRebuildRequired{{found: 1, required: {CURRENT_SCHEMA_VERSION}}}, got: {typed:?}"
+        );
+
+        assert_eq!(
+            sha_before,
+            pr9_task07_file_sha256(&fixture_db),
+            "a refused read-only open must leave the archive byte-identical"
+        );
+    }
+
+    /// PR9 task 07: the read-only half of the subject the legacy
+    /// `search_demo_data` case used to carry -- listing lexical rebuild
+    /// footprints through the handle self-heal actually uses, on an archive
+    /// whose tail-cache table is gone, so counts have to come from `messages`.
+    /// (The writable-handle half already lives in
+    /// `list_conversation_footprints_for_lexical_rebuild_tolerates_missing_tail_state_table`.)
+    #[test]
+    fn list_conversation_footprints_for_lexical_rebuild_tolerates_missing_tail_state_readonly() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let conversation_id = {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conversation_id = storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some("footprint-no-tail-state-readonly".to_string()),
+                        title: Some("footprint-no-tail-state-readonly".to_string()),
+                        source_path: PathBuf::from("/tmp/footprint-no-tail-state-readonly.jsonl"),
+                        started_at: Some(1_700_000_000_000),
+                        ended_at: Some(1_700_000_000_100),
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages: vec![Message {
+                            excluded: None,
+                            id: None,
+                            idx: 10,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_010),
+                            content: "current schema without a tail cache".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        }],
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap()
+                .conversation_id;
+            storage
+                .conn
+                .execute("DROP TABLE conversation_tail_state", fparams![])
+                .unwrap();
+            conversation_id
+        };
+
+        let storage = SqliteStorage::open_readonly(&db_path)
+            .expect("a current-schema archive must still open read-only");
 
         let footprints = storage
             .list_conversation_footprints_for_lexical_rebuild()
             .unwrap();
 
-        assert!(
-            !footprints.is_empty(),
-            "search self-heal should be able to plan a lexical rebuild from the legacy search demo fixture"
-        );
-        assert!(
-            footprints
-                .iter()
-                .all(|footprint| footprint.message_count > 0),
-            "legacy fixture conversations should derive message counts from messages when tail caches are absent"
+        assert_eq!(
+            footprints,
+            vec![LexicalRebuildConversationFootprintRow {
+                conversation_id,
+                message_count: 11,
+                message_bytes: 11 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+            }],
+            "read-only lexical self-heal must tolerate a missing tail cache on a current-schema \
+             archive and derive counts from messages"
         );
     }
 

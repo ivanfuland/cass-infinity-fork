@@ -19477,19 +19477,6 @@ mod tests {
         conn.execute_batch(&format!("PRAGMA user_version = {user_version};"))
             .expect("write user_version on the fixture copy");
         conn.close_with_checkpoint().expect("checkpoint and close the fixture copy");
-
-        // Evidence hook, off by default so the suite stays hermetic: with
-        // `PR9_TASK07_ARTIFACT_DIR` set, the finished fixture is also written
-        // there (and never cleaned up), so the claimed `user_version` of each
-        // fixture can be re-read independently -- `sqlite3 -readonly <file>
-        // 'PRAGMA user_version'` -- instead of taking this test's own word for
-        // it. See the PR9 task-07 report for the recorded values.
-        if let Some(dir) = std::env::var_os("PR9_TASK07_ARTIFACT_DIR") {
-            let dir = PathBuf::from(dir);
-            std::fs::create_dir_all(&dir).expect("create the PR9 task-07 artifact dir");
-            let name = dst.file_name().expect("fixture copies always have a file name");
-            std::fs::copy(dst, dir.join(name)).expect("publish the fixture copy as evidence");
-        }
     }
 
     /// Independent read of the value the guard is supposed to compare against,
