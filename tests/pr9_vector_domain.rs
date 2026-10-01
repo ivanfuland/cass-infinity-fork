@@ -83,6 +83,25 @@ fn pr9_delete_failure_after_first_row_restores_all_mirrors_and_authority() {
 }
 
 #[test]
+fn pr9_missing_int8_row_cannot_be_silently_healed_by_a_delete() {
+    let (_dir,storage,generation)=archive();
+    let conn=storage.raw();
+    let id=insert(conn,generation).unwrap();
+    let shard=vector_domain::int8_table_name(generation,(id%8) as usize).unwrap();
+    conn.execute(&format!("DELETE FROM {shard} WHERE rowid=?1"),&[Value::from(id)]).unwrap();
+    let before=revision(conn,generation);
+    let result=conn.with_tx_no_replay(TxMode::Immediate,|tx| {
+        tx.execute("DELETE FROM message_chunks WHERE chunk_id=?1",&[Value::from(id)])?;
+        vector_domain::delete_vec0_rows_in_tx(tx,generation,&[id])?;
+        Ok(())
+    });
+    assert!(result.is_err(),"missing shard identity must abort the entire authoritative delete");
+    assert_eq!(count(conn,"message_chunks"),1);
+    assert_eq!(count(conn,&format!("vec_index_gen_{generation}")),1);
+    assert_eq!(revision(conn,generation),before);
+}
+
+#[test]
 fn pr9_rebuild_failure_restores_the_previous_committed_layout() {
     let (_dir,storage,generation)=archive();
     let conn=storage.raw();

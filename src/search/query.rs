@@ -18426,6 +18426,43 @@ mod tests {
     }
 
     #[test]
+    fn pr9_fast_rejects_an_orphan_candidate_even_when_shard_count_matches() {
+        let (_dir, storage, generation, client) = pr9_fast_fixture();
+        let shard = format!("vec_index_gen_{generation}_int8_shard_1");
+        let blob: Vec<u8> = storage.raw().query_row_map(
+            &format!("SELECT embedding FROM {shard} WHERE rowid=1"),
+            &[], |row| row.get_typed(0),
+        ).unwrap();
+        storage.raw().execute(
+            &format!("INSERT INTO {shard}(rowid,embedding) VALUES(9,vec_int8(?1))"),
+            &crate::storage::api::params![blob],
+        ).unwrap();
+        storage.raw().execute(
+            &format!("DELETE FROM {shard} WHERE rowid=1"), &[],
+        ).unwrap();
+        let error = client.search_vector_candidates(
+            &[0.5;4], &SearchFilters::default(), None, 10,
+        ).unwrap_err();
+        assert!(error.to_string().contains("candidate has no authoritative row"), "{error:#}");
+    }
+
+    #[test]
+    fn pr9_fast_propagates_a_worker_table_error_without_exact_fallback() {
+        let (dir, _storage, generation, client) = pr9_fast_fixture();
+        let path = dir.path().join("cass.db");
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let writer = FrankenStorage::open(&path).unwrap();
+            writer.raw().execute_batch(&format!(
+                "DROP TABLE vec_index_gen_{generation}_int8_shard_7"
+            )).unwrap();
+        })));
+        let error = client.search_vector_candidates(
+            &[0.5;4], &SearchFilters::default(), None, 10,
+        ).unwrap_err();
+        assert!(error.to_string().contains("no such table"), "{error:#}");
+    }
+
+    #[test]
     fn pr9_fast_wal_insert_between_main_and_worker_snapshots_uses_main_exact() {
         let (dir, _storage, generation, client)=pr9_fast_fixture();
         let path=dir.path().join("cass.db");

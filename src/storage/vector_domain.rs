@@ -539,8 +539,15 @@ pub fn delete_vec0_rows_in_tx(
     for chunk_id in chunk_ids {
         if *chunk_id < 0 { return Err(reject("negative chunk ID cannot route to an int8 shard")); }
         let shard = int8_table_name(generation_id, (*chunk_id % INT8_SHARDS as i64) as usize)?;
-        tx.execute(&format!("DELETE FROM {shard} WHERE rowid=?1"), &params![*chunk_id])?;
-        deleted += tx.execute(&delete_sql, &params![*chunk_id])? as u64;
+        let quantized = tx.execute(&format!("DELETE FROM {shard} WHERE rowid=?1"), &params![*chunk_id])?;
+        if quantized != 1 {
+            return Err(reject(format!("vector mirror damaged: chunk_id={chunk_id} missing from its int8 shard")));
+        }
+        let float = tx.execute(&delete_sql, &params![*chunk_id])?;
+        if float != 1 {
+            return Err(reject(format!("vector mirror damaged: chunk_id={chunk_id} missing from the float mirror")));
+        }
+        deleted += 1;
     }
     if !chunk_ids.is_empty() { bump_revision(tx, generation_id)?; }
     Ok(deleted)

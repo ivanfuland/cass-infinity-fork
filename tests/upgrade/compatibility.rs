@@ -105,11 +105,11 @@ fn test_open_rejects_pre_rusqlite_archive_instead_of_converting_it() {
     };
     let rendered = format!("{err:#}");
     assert!(
-        rendered.contains("user_version=0 but is not empty"),
+        rendered.contains("schema version 0 predates version 8's rebuild-only shape"),
         "expected schema::ensure's pre-rusqlite-archive rejection, got: {rendered}"
     );
     assert!(
-        rendered.contains("rebuild the archive instead of trying to convert this file"),
+        rendered.contains("full re-ingest required"),
         "expected the rebuild-not-convert guidance, got: {rendered}"
     );
 }
