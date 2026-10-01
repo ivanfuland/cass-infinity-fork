@@ -2913,6 +2913,40 @@ mod chunk_catchup_v5_tests {
     }
 
     #[test]
+    fn audit_3_and_10_reject_an_int8_row_with_the_right_id_but_wrong_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id, _) = clean_two_message_generation(&storage);
+        let message_id: i64 = storage.raw().query_row_map(
+            "SELECT message_id FROM message_chunks WHERE chunk_id=?1",
+            &params![chunk_id], |row| row.get_typed(0),
+        ).unwrap();
+        let clean = run_activation_audit(&storage, generation_id, 10, Some(message_id), Some(&mock_embed), 10, 1).unwrap();
+        assert!(clean.passed, "fixture must start clean: {clean:?}");
+
+        let shard = vector_domain::int8_table_name(generation_id, (chunk_id % 8) as usize).unwrap();
+        let mut bytes: Vec<u8> = storage.raw().query_row_map(
+            &format!("SELECT embedding FROM {shard} WHERE rowid=?1"),
+            &params![chunk_id], |row| row.get_typed(0),
+        ).unwrap();
+        bytes[0] ^= 1;
+        storage.raw().with_tx_no_replay(TxMode::Immediate, |tx| {
+            tx.execute(&format!("DELETE FROM {shard} WHERE rowid=?1"), &params![chunk_id])?;
+            tx.execute(
+                &format!("INSERT INTO {shard}(rowid,embedding) VALUES(?1,vec_int8(?2))"),
+                &params![chunk_id, bytes.clone()],
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id), Some(&mock_embed), 10, 1).unwrap();
+        assert!(!report.passed, "wrong int8 bytes must refuse activation: {report:?}");
+        assert!(report.failure_reasons.iter().any(|r| r.contains("③ int8 self-row verification failed") && r.contains(&chunk_id.to_string())), "③ must catch the corrupt anchor: {report:?}");
+        assert!(report.failure_reasons.iter().any(|r| r.contains("⑩ ownership check failed") && r.contains("int8 mirror")), "⑩ must independently catch the corrupt sample: {report:?}");
+        assert!(!report.failure_reasons.iter().any(|r| r.contains("③ vec0 self-row verification failed")), "float mirror remained intact: {report:?}");
+    }
+
+    #[test]
     fn audit_4_bidirectional_anti_join_by_chunk() {
         let dir = tempfile::TempDir::new().unwrap();
         let storage = open_storage(&dir.path().join("db.sqlite"));

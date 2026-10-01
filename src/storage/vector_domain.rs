@@ -709,6 +709,22 @@ mod tests {
     }
 
     #[test]
+    fn int8_only_generation_is_still_discovered_for_cleanup() {
+        let (_dir, conn) = scratch_conn();
+        let generation_id = create_generation(&conn, 4);
+        create_vec0_table_for_generation(&conn, generation_id, 4).unwrap();
+        conn.execute_batch(&format!("DROP TABLE vec_index_gen_{generation_id}")).unwrap();
+
+        assert_eq!(list_vec0_generation_ids(&conn).unwrap(), vec![generation_id]);
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+            assert_eq!(list_vec0_generation_ids_in_tx(tx)?, vec![generation_id]);
+            drop_vec0_table_for_generation_in_tx(tx, generation_id)
+        }).unwrap();
+        assert!(enumerate_vec0_tables_for_generation(&conn, generation_id).unwrap().is_empty());
+        assert!(list_vec0_generation_ids(&conn).unwrap().is_empty());
+    }
+
+    #[test]
     fn drop_vec0_table_on_a_never_created_generation_is_a_harmless_no_op() {
         let (_dir, conn) = scratch_conn();
         // No create_vec0_table_for_generation call at all -- a generation

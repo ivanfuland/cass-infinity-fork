@@ -3909,6 +3909,19 @@ impl SearchClient {
         rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     }
 
+    fn float_vec0_knn_in_tx(
+        tx: &crate::storage::api::Tx<'_>,
+        table: &str,
+        query_blob: &[u8],
+        k: i64,
+    ) -> Result<Vec<(i64, f64)>, StorageError> {
+        tx.query_all_map(
+            &format!("SELECT rowid, distance FROM {table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"),
+            &crate::storage::api::params![query_blob.to_vec(), k],
+            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
+        )
+    }
+
     /// T9 (plan v5.1) chunk-domain KNN + MaxSim fold + budgeted exact-scan
     /// candidate search. Reads the active generation's `message_chunks` /
     /// `vec_index_gen_<id>` (rowid = `chunk_id` for a v5 chunk-domain
@@ -4049,10 +4062,10 @@ impl SearchClient {
             // tell "vec0 was never called" apart from "vec0 was called and
             // returned nothing"; the scan keeps the round-2 fallback's
             // distance, filter and `EXACT_SCAN_ROW_BUDGET` semantics.
-            let mut direct_exact =
+            let direct_exact =
                 fetch_limit > SQLITE_VEC_KNN_K_MAX && row_count_usize > SQLITE_VEC_KNN_K_MAX;
 
-            let mut k = if direct_exact {
+            let k = if direct_exact {
                 0
             } else {
                 fetch_limit
@@ -4098,20 +4111,12 @@ impl SearchClient {
                         rows
                     }
                     Int8Candidates::SnapshotMismatch => {
-                        direct_exact = true;
-                        k = 0;
                         coarse_skip_reason = Some("snapshot_mismatch".into());
-                        Vec::new()
+                        Self::float_vec0_knn_in_tx(tx, &vec0_table, &blob, k_i64)?
                     }
                 }
             } else {
-                tx.query_all_map(
-                    &format!(
-                        "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
-                    ),
-                    &crate::storage::api::params![blob, k_i64],
-                    |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
-                )?
+                Self::float_vec0_knn_in_tx(tx, &vec0_table, &blob, k_i64)?
             };
             let first_round_rows = raw_knn.len();
 
@@ -18503,8 +18508,9 @@ mod tests {
         let (hits,meta)=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap();
         assert_eq!(hits.iter().map(|h|h.message_id).collect::<Vec<_>>(),vec![1,2,3,4]);
         assert_eq!(meta.coarse_skip_reason.as_deref(),Some("snapshot_mismatch"));
-        assert_eq!(meta.mode,CandidateMode::Exact);
-        assert_eq!(meta.k,0);
+        assert_eq!(meta.mode,CandidateMode::Knn);
+        assert_eq!(meta.k,4);
+        assert_eq!(meta.first_round_rows,4);
         assert!(!meta.approximate);
     }
 
@@ -18524,6 +18530,9 @@ mod tests {
         assert!(hits.iter().any(|h|h.message_id==1));
         assert_eq!(hits.len(),4);
         assert_eq!(meta.coarse_skip_reason.as_deref(),Some("snapshot_mismatch"));
+        assert_eq!(meta.mode,CandidateMode::Knn);
+        assert_eq!(meta.k,4);
+        assert_eq!(meta.first_round_rows,4);
         assert!(!meta.approximate);
     }
 
@@ -18544,6 +18553,9 @@ mod tests {
         let (hits,meta)=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap();
         assert_eq!(hits.len(),4);
         assert_eq!(meta.coarse_skip_reason.as_deref(),Some("snapshot_mismatch"));
+        assert_eq!(meta.mode,CandidateMode::Knn);
+        assert_eq!(meta.k,4);
+        assert_eq!(meta.first_round_rows,4);
         assert!(!meta.approximate);
     }
 
@@ -19151,6 +19163,29 @@ mod tests {
             &expected(0..K_MAX_FETCH_LIMIT as i64),
             "k-ceiling boundary",
         );
+
+        // A concurrent writer can invalidate the eight worker snapshots.
+        // The same main read snapshot must then use the ordinary float vec0
+        // window, not turn a small request into an entire-authority scan.
+        let db_path = dir.path().join("cass.db");
+        let fast_client = SearchClient::open(&dir.path().join("fast-index"), Some(&db_path))
+            .unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let writer = FrankenStorage::open(&db_path).unwrap();
+            writer.raw().execute(
+                "UPDATE message_chunks SET created_at=created_at WHERE chunk_id=1", &[],
+            ).unwrap();
+        })));
+        let (fast_hits, fast_meta) = fast_client.search_vector_candidates(
+            &[1.0, 0.0, 0.0, 0.0], &SearchFilters::default(), Some(&roles), 5,
+        ).unwrap();
+        assert_eq!(fast_meta.coarse_skip_reason.as_deref(), Some("snapshot_mismatch"));
+        assert_eq!(fast_meta.mode, CandidateMode::Knn, "snapshot mismatch must reuse float vec0 KNN");
+        assert_eq!(fast_meta.k, 20);
+        assert_eq!(fast_meta.first_round_rows, 20);
+        assert!(!fast_meta.approximate);
+        assert!(!fast_meta.incomplete);
+        assert_eq!(fast_hits[0].message_id, BASE_ID as u64);
     }
 
     /// PR9 task 06: the direct-exact path must honour the *same* row-budget
