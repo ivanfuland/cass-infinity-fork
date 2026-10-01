@@ -27706,6 +27706,10 @@ mod pr9_candidate_meta_output_tests {
             effective_coarse_k: Some(4096),
             coarse_cap_hit: Some(true),
             corpus_limited: Some(false),
+            coarse_shard_count: None,
+            coarse_rows_collected: None,
+            float_rescore_rows: None,
+            coarse_skip_reason: None,
         }
     }
 

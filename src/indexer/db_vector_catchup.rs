@@ -1069,6 +1069,11 @@ pub fn run_activation_audit(
     // see [`vec0_row_embedding_blob`]'s doc comment for why KNN alone
     // cannot be trusted to catch the anchor's own vec0 row having drifted.
     if let Some(anchor_blob) = anchor_embedding_blob.as_ref() {
+        match vector_domain::int8_row_matches(conn, generation_id, anchor_chunk_id, anchor_blob) {
+            Ok(true) => {}
+            Ok(false) => failures.push(format!("③ int8 self-row verification failed: chunk_id={anchor_chunk_id}")),
+            Err(e) => failures.push(format!("③ int8 self-row verification errored: {e}")),
+        }
         match vec0_row_embedding_blob(conn, generation_id, anchor_chunk_id) {
             Ok(Some(vec0_blob)) if &vec0_blob == anchor_blob => {}
             Ok(Some(_)) => failures.push(format!(
@@ -1147,6 +1152,12 @@ pub fn run_activation_audit(
              {vec0_chunks_missing_from_message_chunks} vec0 row(s) missing from message_chunks \
              (vec0 has {vec0_row_count} row(s), message_chunks has {chunk_count})"
         ));
+    }
+
+    match vector_domain::audit_int8_mirror_identity(conn, generation_id, dim) {
+        Ok(audit) if audit.rows == chunk_count && audit.missing == 0 && audit.extra == 0 && audit.wrong_shard == 0 && audit.duplicates == 0 => {}
+        Ok(audit) => failures.push(format!("⑦ int8 mirror identity mismatch: {audit:?}, authoritative rows={chunk_count}")),
+        Err(e) => failures.push(format!("⑦ int8 mirror identity audit errored: {e}")),
     }
 
     // ⑧⑨: one pass over expected-vs-stored, keyed by (message_id, chunk_idx)
@@ -1280,6 +1291,9 @@ pub fn run_activation_audit(
                         Some(vec0_blob) if vec0_blob == stored_blob => {}
                         Some(_) => bail!("vec0 row for chunk_id={chunk_id} does not byte-match message_chunks.embedding (direct point read)"),
                         None => bail!("vec0 row for chunk_id={chunk_id} is missing (direct point read)"),
+                    }
+                    if !vector_domain::int8_row_matches(conn, generation_id, *chunk_id, &stored_blob)? {
+                        bail!("int8 mirror for chunk_id={chunk_id} does not match authoritative quantization");
                     }
                     let hits = vector_domain::vec0_knn(conn, generation_id, &stored_vec, 1)?;
                     let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
@@ -2200,7 +2214,10 @@ mod chunk_catchup_v5_tests {
                 let mut hasher = DefaultHasher::new();
                 text.hash(&mut hasher);
                 i.hash(&mut hasher);
-                1.0 + (hasher.finish() % 1000) as f32 / 1000.0
+                // Power-of-two scaling preserves the cosine direction and
+                // keeps this synthetic embedder inside the unit quantizer's
+                // component range; the old 1..2 fixture was not valid int8 input.
+                (1.0 + (hasher.finish() % 1000) as f32 / 1000.0) * 0.5
             })
             .collect()
     }
@@ -2872,8 +2889,11 @@ mod chunk_catchup_v5_tests {
         storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
-                vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &[chunk_id_a])?;
-                vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &[(chunk_id_a, corrupted_blob.as_slice())])?;
+                // This specific negative fixture corrupts only the float
+                // mirror, so its direct float-byte check remains necessary.
+                // The normal primitive now correctly maintains both mirrors.
+                tx.execute(&format!("DELETE FROM vec_index_gen_{generation_id} WHERE rowid=?1"), &params![chunk_id_a])?;
+                tx.execute(&format!("INSERT INTO vec_index_gen_{generation_id}(rowid,embedding) VALUES(?1,?2)"), &params![chunk_id_a, corrupted_blob.clone()])?;
                 Ok(())
             })
             .unwrap();
