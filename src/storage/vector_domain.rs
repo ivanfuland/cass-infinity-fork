@@ -219,7 +219,7 @@ pub fn parallel_int8_candidates(
 pub fn audit_int8_mirror_identity(conn: &Conn, generation_id: i64, dim: i64) -> Result<Int8MirrorAudit, StorageError> {
     check_int8_layout(conn, generation_id, dim)?;
     let mut audit = Int8MirrorAudit::default();
-    let mut union = Vec::with_capacity(INT8_SHARDS);
+    let mut shard_selects = Vec::with_capacity(INT8_SHARDS);
     for shard in 0..INT8_SHARDS {
         let table = int8_table_name(generation_id, shard)?;
         let count: i64 = conn.query_row_map(&format!("SELECT count(*) FROM {table}"), &[], |row| row.get_typed(0))?;
@@ -236,10 +236,10 @@ pub fn audit_int8_mirror_identity(conn: &Conn, generation_id: i64, dim: i64) -> 
             &format!("SELECT count(*) FROM {table} WHERE rowid%8 != ?1"),
             &params![shard as i64], |row| row.get_typed(0),
         )?;
-        union.push(format!("SELECT rowid AS chunk_id FROM {table}"));
+        shard_selects.push(format!("SELECT rowid AS chunk_id FROM {table}"));
     }
     audit.duplicates = conn.query_row_map(
-        &format!("SELECT coalesce(sum(n-1),0) FROM (SELECT count(*) AS n FROM ({}) GROUP BY chunk_id HAVING count(*)>1)", union.join(" UNION ALL ")),
+        &format!("SELECT coalesce(sum(n-1),0) FROM (SELECT count(*) AS n FROM ({}) GROUP BY chunk_id HAVING count(*)>1)", shard_selects.join(" UNION ALL ")),
         &[], |row| row.get_typed(0),
     )?;
     Ok(audit)

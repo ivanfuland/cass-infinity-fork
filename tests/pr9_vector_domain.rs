@@ -235,6 +235,17 @@ fn resource_rebuild(rows: usize) {
         assert_eq!(meta.first_round_rows,0,"large window must not run int8 KNN");
         assert_eq!(meta.coarse_skip_reason.as_deref(),Some("large_window"));
         assert!(!meta.approximate);
+        let shard=vector_domain::int8_table_name(generation,7).unwrap();
+        conn.execute_batch(&format!("DROP TABLE {shard}")).unwrap();
+        let (direct_hits,direct_meta)=client.search_vector_candidates(
+            &vector,&coding_agent_search::search::query::SearchFilters::default(),None,requested,
+        ).expect("large-window direct exact must not inspect a missing int8 shard");
+        assert_eq!(direct_hits.len(),hits.len());
+        assert_eq!(direct_hits[0].message_id,hits[0].message_id);
+        assert_eq!(direct_hits[0].score,hits[0].score);
+        assert_eq!(direct_meta.first_round_rows,0);
+        assert_eq!(direct_meta.coarse_skip_reason.as_deref(),Some("large_window"));
+        assert!(!direct_meta.approximate);
     } else {
         assert_eq!(meta.first_round_rows,rows);
         assert_eq!(meta.corpus_limited,Some(true));

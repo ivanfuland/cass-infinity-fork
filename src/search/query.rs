@@ -3905,6 +3905,10 @@ impl SearchClient {
         1.0 - (dot / (norm_a * norm_b))
     }
 
+    fn sort_rescored_chunk_rows(rows: &mut [(i64, f64)]) {
+        rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    }
+
     /// T9 (plan v5.1) chunk-domain KNN + MaxSim fold + budgeted exact-scan
     /// candidate search. Reads the active generation's `message_chunks` /
     /// `vec_index_gen_<id>` (rowid = `chunk_id` for a v5 chunk-domain
@@ -4067,7 +4071,7 @@ impl SearchClient {
             let fast_requested = strategy == VectorSearchMode::Fast;
             let mut coarse_ran = false;
             let mut coarse_skip_reason = if fast_requested && direct_exact { Some("large_window".to_string()) } else { None };
-            if fast_requested {
+            if fast_requested && !direct_exact {
                 crate::storage::vector_domain::check_int8_layout(conn, generation_id, dim)?;
             }
             let mut raw_knn: Vec<(i64, f64)> = if direct_exact {
@@ -4136,7 +4140,7 @@ impl SearchClient {
                 for (id, distance) in &mut raw_knn {
                     *distance = *distances.get(id).ok_or_else(|| StorageError::Other { code: None, detail: "vector mirror damaged: int8 candidate has no authoritative row".into() })?;
                 }
-                raw_knn.sort_by(|a,b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                Self::sort_rescored_chunk_rows(&mut raw_knn);
             }
 
             if raw_knn.is_empty() && !direct_exact {
@@ -18380,6 +18384,24 @@ mod tests {
         let (hits,meta)=client.search_vector_candidates(&[1.0,0.0,0.0,0.0],&SearchFilters::default(),None,1).unwrap();
         assert_eq!(hits[0].chunk_idx,0);
         assert_eq!(meta.float_rescore_rows,Some(2));
+    }
+
+    #[test]
+    fn pr9_fast_rescored_order_ignores_shuffled_shard_arrival() {
+        let original: Vec<(i64, f64)> = (1..=8)
+            .map(|id| (id, if id <= 4 { 0.1 } else { 0.2 }))
+            .collect();
+        for seed in 0_u64..32 {
+            let mut shuffled = original.clone();
+            let mut state = seed + 1;
+            for i in (1..shuffled.len()).rev() {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let j = (state % (i as u64 + 1)) as usize;
+                shuffled.swap(i, j);
+            }
+            SearchClient::sort_rescored_chunk_rows(&mut shuffled);
+            assert_eq!(shuffled.iter().map(|(id, _)| *id).collect::<Vec<_>>(), (1_i64..=8).collect::<Vec<_>>());
+        }
     }
 
     #[cfg(unix)]

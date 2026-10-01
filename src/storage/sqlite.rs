@@ -3098,6 +3098,13 @@ impl FrankenStorage {
                     self.conn
                         .execute_batch(batch.sql)
                         .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
+                    if batch.name == "vector_domain" {
+                        for ddl in crate::storage::schema::VECTOR_DOMAIN_TRIGGER_DDL {
+                            self.conn
+                                .execute_batch(ddl)
+                                .context("repairing schema-8 vector-domain triggers")?;
+                        }
+                    }
                 }
 
                 // R1-B2: `CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex` above
@@ -3744,11 +3751,11 @@ CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, d
 // chunk domain as the sole vector schema and rewrote this repair batch to
 // match: `embedding_generations` (current six-identity-field shape) plus
 // the three chunk-domain tables (`message_chunks`/`chunk_holes`/
-// `chunk_staging`), matching `FRESH_SCHEMA_DDL`'s current shape exactly --
-// this self-heal path now recreates the same five-table batch a fresh
-// build produces, not a frozen historical subset of it.
+// `chunk_staging`). PR9 keeps the schema-8 revision column in this repair
+// batch and reuses schema.rs's idempotent trigger DDL in the same transaction.
+// This self-heal path must never freeze an older vector-domain shape.
 const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER, vector_revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(vector_revision) = 'integer' AND vector_revision >= 0));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS message_chunks (chunk_id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, UNIQUE(generation_id, message_id, chunk_idx));
 CREATE INDEX IF NOT EXISTS idx_message_chunks_generation ON message_chunks(generation_id);
@@ -27295,6 +27302,59 @@ mod tests {
                 crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1, b"test-fingerprint", 1_000)
             })
             .expect("the repaired embedding_generations table must accept a real write");
+
+        let revision_column_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM pragma_table_info('embedding_generations') WHERE name='vector_revision'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(revision_column_count, 1, "schema-8 repair must restore vector_revision");
+        let revision_trigger_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN \
+                 ('vector_chunks_insert_revision','vector_chunks_delete_revision','vector_chunks_update_revision')",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(revision_trigger_count, 3, "schema-8 repair must restore all chunk revision triggers");
+        crate::storage::vector_domain::create_vec0_table_for_generation(repaired.raw(), gen_a, 1024)
+            .expect("repaired vector generation must accept mirror creation with a revision bump");
+        repaired.raw().execute_batch(
+            "INSERT INTO agents(id,slug,name,kind,created_at,updated_at) VALUES(1,'fixture','fixture','cli',0,0);
+             INSERT INTO conversations(id,agent_id,title,source_path) VALUES(1,1,'fixture','/fixture/session.jsonl');
+             INSERT INTO messages(id,conversation_id,idx,role,content) VALUES(1,1,0,'user','fixture');",
+        ).unwrap();
+        let mut vector = vec![0.0_f32; 1024];
+        vector[0] = 1.0;
+        let blob = crate::storage::schema::f32_vector_to_le_blob(&vector);
+        let revision_before: i64 = repaired.raw().query_row_map(
+            "SELECT vector_revision FROM embedding_generations WHERE id=?1",
+            &fparams![gen_a],
+            |row| row.get_typed(0),
+        ).unwrap();
+        repaired.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            let chunk_id = crate::storage::schema::insert_chunk_row_in_tx(tx, &crate::storage::schema::ChunkRow {
+                generation_id: gen_a, message_id: 1, conversation_id: 1, chunk_idx: 0,
+                byte_start: 0, byte_end: 7, content_hash: "fixture".into(),
+                embedding: vector.clone(), norm: 1.0, created_at_ms: 1_000,
+            })?;
+            crate::storage::vector_domain::insert_vec0_rows_in_tx(tx, gen_a, &[(chunk_id, blob.as_slice())])?;
+            Ok(())
+        }).expect("repaired vector domain must accept an authoritative chunk and both mirrors in one transaction");
+        let revision_after: i64 = repaired.raw().query_row_map(
+            "SELECT vector_revision FROM embedding_generations WHERE id=?1",
+            &fparams![gen_a],
+            |row| row.get_typed(0),
+        ).unwrap();
+        assert!(revision_after > revision_before, "repaired chunk write must advance vector_revision");
+        let mirrors = crate::storage::vector_domain::audit_int8_mirror_identity(repaired.raw(), gen_a, 1024).unwrap();
+        assert_eq!(mirrors.rows, 1);
+        assert_eq!((mirrors.missing, mirrors.extra, mirrors.wrong_shard, mirrors.duplicates), (0, 0, 0, 0));
 
         // R2-N1: the repair batch's own `idx_embedding_generations_single_active`
         // unique partial index -- previously missing entirely (silently

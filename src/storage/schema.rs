@@ -258,19 +258,19 @@ INSERT INTO meta(key,value) VALUES('vector_domain_instance_id',lower(hex(randomb
 // Whole CREATE TRIGGER statements live separately: each contains its own
 // semicolons, while the interrupted-DDL test deliberately splits the ordinary
 // fresh schema into statements and tests every transaction rollback boundary.
-const VECTOR_DOMAIN_TRIGGER_DDL: [&str; 6] = [
-    r#"CREATE TRIGGER vector_instance_no_replace BEFORE INSERT ON meta
+pub(crate) const VECTOR_DOMAIN_TRIGGER_DDL: [&str; 6] = [
+    r#"CREATE TRIGGER IF NOT EXISTS vector_instance_no_replace BEFORE INSERT ON meta
 WHEN NEW.key = 'vector_domain_instance_id' AND EXISTS(SELECT 1 FROM meta WHERE key = NEW.key)
 BEGIN SELECT RAISE(ABORT,'vector domain instance identity is immutable'); END;"#,
-    r#"CREATE TRIGGER vector_instance_no_update BEFORE UPDATE ON meta WHEN OLD.key = 'vector_domain_instance_id'
+    r#"CREATE TRIGGER IF NOT EXISTS vector_instance_no_update BEFORE UPDATE ON meta WHEN OLD.key = 'vector_domain_instance_id'
 BEGIN SELECT RAISE(ABORT,'vector domain instance identity is immutable'); END;"#,
-    r#"CREATE TRIGGER vector_instance_no_delete BEFORE DELETE ON meta WHEN OLD.key = 'vector_domain_instance_id'
+    r#"CREATE TRIGGER IF NOT EXISTS vector_instance_no_delete BEFORE DELETE ON meta WHEN OLD.key = 'vector_domain_instance_id'
 BEGIN SELECT RAISE(ABORT,'vector domain instance identity is immutable'); END;"#,
-    r#"CREATE TRIGGER vector_chunks_insert_revision AFTER INSERT ON message_chunks
+    r#"CREATE TRIGGER IF NOT EXISTS vector_chunks_insert_revision AFTER INSERT ON message_chunks
 BEGIN UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = NEW.generation_id; END;"#,
-    r#"CREATE TRIGGER vector_chunks_delete_revision AFTER DELETE ON message_chunks
+    r#"CREATE TRIGGER IF NOT EXISTS vector_chunks_delete_revision AFTER DELETE ON message_chunks
 BEGIN UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = OLD.generation_id; END;"#,
-    r#"CREATE TRIGGER vector_chunks_update_revision AFTER UPDATE ON message_chunks
+    r#"CREATE TRIGGER IF NOT EXISTS vector_chunks_update_revision AFTER UPDATE ON message_chunks
 BEGIN
 UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = OLD.generation_id;
 UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = NEW.generation_id AND NEW.generation_id != OLD.generation_id;
