@@ -691,6 +691,17 @@
           ]
         },
         {
+          "name": "vector-search-mode",
+          "description": "Vector candidate strategy for the semantic/hybrid vector leg. 'exact' (default) keeps the existing unquantized float vec0 KNN; 'fast' forms candidates from the eight int8 shards and rescores every candidate on the authoritative float vectors. Independent of --mode: rejected together with --mode lexical, which has no vector leg",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "exact",
+            "fast"
+          ]
+        },
+        {
           "name": "approximate",
           "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
           "arg_type": "flag",

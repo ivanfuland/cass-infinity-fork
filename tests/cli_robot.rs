@@ -471,6 +471,23 @@ fn capabilities_are_self_describing_for_agents() {
         "capabilities should expose search positional query argument"
     );
 
+    // PR9 task 09a: the vector candidate strategy is a closed enum on the
+    // search command, independent of `--mode`. The advertised set has to stay
+    // exactly `exact|fast`; an extra value would be a contract change for the
+    // downstream consumers of this table, not an implementation detail.
+    let vector_search_mode = search_args
+        .iter()
+        .find(|arg| arg["name"] == "vector-search-mode")
+        .expect("capabilities should expose search --vector-search-mode");
+    assert_eq!(vector_search_mode["arg_type"], "option");
+    assert_eq!(vector_search_mode["value_type"], "enum");
+    assert_eq!(vector_search_mode["required"], false);
+    assert_eq!(
+        vector_search_mode["enum_values"],
+        serde_json::json!(["exact", "fast"]),
+        "the vector search mode enum must be exactly exact|fast"
+    );
+
     let exit_codes = json["exit_codes"].as_array().expect("exit_codes array");
     assert!(
         exit_codes.iter().any(|code| code["code"] == "2"

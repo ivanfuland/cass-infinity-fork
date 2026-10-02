@@ -557,6 +557,13 @@ pub enum Commands {
         /// Search mode: hybrid-preferred (default), lexical, or semantic
         #[arg(long, value_enum)]
         mode: Option<crate::search::query::SearchMode>,
+        /// Vector candidate strategy for the semantic/hybrid vector leg.
+        /// 'exact' (default) keeps the existing unquantized float vec0 KNN;
+        /// 'fast' forms candidates from the eight int8 shards and rescores
+        /// every candidate on the authoritative float vectors. Independent of
+        /// --mode: rejected together with --mode lexical, which has no vector leg.
+        #[arg(long, value_enum)]
+        vector_search_mode: Option<crate::search::query::VectorSearchMode>,
 
         // ==========================================================================
         // Model / Reranker / Daemon flags (bd-3bbv)
@@ -6979,6 +6986,7 @@ async fn execute_cli(
                     source,
                     sessions_from,
                     mode,
+                    vector_search_mode,
                     model,
                     rerank,
                     reranker,
@@ -7032,6 +7040,24 @@ async fn execute_cli(
                     let (eff_timeout, eff_limit, eff_mode) =
                         resolve_search_defaults(timeout, limit, mode)?;
 
+                    // PR9 09a: `--vector-search-mode` is an independent
+                    // dimension from `--mode`, but lexical search has no
+                    // vector leg at all -- silently accepting the flag there
+                    // would report a vector mode that never ran. Checked
+                    // against the *effective* mode (flag > env > config >
+                    // default) and before the database is opened.
+                    if vector_search_mode.is_some()
+                        && matches!(eff_mode, Some(crate::search::query::SearchMode::Lexical))
+                    {
+                        return Err(CliError::usage(
+                            "--vector-search-mode cannot be combined with lexical search",
+                            Some(
+                                "Vector search modes apply to --mode semantic, --mode hybrid, or the default hybrid-preferred mode. Lexical (BM25) search has no vector candidate leg; drop --vector-search-mode or switch --mode."
+                                    .to_string(),
+                            ),
+                        ));
+                    }
+
                     run_cli_search(
                         &query,
                         &agent,
@@ -7069,6 +7095,7 @@ async fn execute_cli(
                         source,
                         sessions_from,
                         eff_mode,
+                        vector_search_mode,
                         semantic_opts,
                     )?;
                 }
@@ -23117,6 +23144,7 @@ fn run_cli_search(
     source: Option<String>,
     sessions_from: Option<String>,
     mode: Option<crate::search::query::SearchMode>,
+    vector_search_mode: Option<crate::search::query::VectorSearchMode>,
     semantic_opts: SemanticSearchOptions,
 ) -> CliResult<()> {
     #[cfg(feature = "infinity")]
@@ -23358,6 +23386,11 @@ fn run_cli_search(
             retryable: true,
         }
     })?;
+
+    // PR9 09a: the CLI flag is `Option<..>` so "absent" stays distinguishable
+    // from "explicitly exact"; both run exact, but only an explicit value can
+    // conflict with lexical mode (rejected by the caller before we get here).
+    let client = client.with_vector_search_mode(vector_search_mode.unwrap_or_default());
 
     if !client.has_lexical_index() {
         eprintln!(
