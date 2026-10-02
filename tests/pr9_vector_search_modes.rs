@@ -246,6 +246,21 @@ impl Fixture {
     }
 }
 
+/// Which searchable state the fixture's active generation is left in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixtureState {
+    /// Active and certified: the ordinary searchable shape.
+    Active,
+    /// A generation exists but none is active — what a running backfill
+    /// looks like, and what `probe_db_vector_domain_availability` reports as
+    /// `IndexBuilding`.
+    Building,
+    /// Active and certified, but one int8 shard has been dropped: a
+    /// structurally broken mirror that must fail loudly rather than quietly
+    /// degrading to the exact path.
+    MissingInt8Shard,
+}
+
 /// The delta that moves a stored vector off the query *within its int8 cell*.
 ///
 /// `vec_quantize_int8(..., 'unit')` scales by the largest magnitude component
@@ -282,7 +297,7 @@ fn distractor_with_same_int8_code(storage: &FrankenStorage, query: &[f32]) -> Ve
     candidate
 }
 
-fn build_fixture(rows: usize) -> Fixture {
+fn build_fixture(rows: usize, state: FixtureState) -> Fixture {
     let dir = tempfile::tempdir().expect("fixture tempdir");
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -390,17 +405,28 @@ fn build_fixture(rows: usize) -> Fixture {
             &[Value::from(format!("completed:{rows}:{rows}"))],
         )
         .expect("set lex domain marker");
-        conn.execute(
-            "UPDATE embedding_generations SET is_active=1, audit_status='passed' WHERE id=?1",
-            &[Value::from(generation)],
-        )
-        .expect("activate generation");
+        if state != FixtureState::Building {
+            conn.execute(
+                "UPDATE embedding_generations SET is_active=1, audit_status='passed' WHERE id=?1",
+                &[Value::from(generation)],
+            )
+            .expect("activate generation");
+        }
+        if state == FixtureState::MissingInt8Shard {
+            let shard = vector_domain::int8_table_name(generation, 3).expect("shard name");
+            conn.execute_batch(&format!("DROP TABLE {shard}"))
+                .expect("drop one int8 shard");
+        }
 
         // Recompute the real eight-shard pool the fast path will collect, and
         // hand the float-top slot to a chunk the screen cannot reach. This is
         // the fixture's whole point: `exact` must return that chunk and `fast`
         // must not, which only happens if `fast` really runs the screen.
-        if rows > 0 {
+        //
+        // Only the two full-width corpora need it; a corpus the pool covers
+        // entirely has nothing outside it, and the deliberately broken states
+        // cannot run the pool query at all.
+        if rows > 8 * PER_SHARD_K {
             let query_code =
                 vector_domain::quantize_unit_int8(conn, &query).expect("quantize query");
             let mut selected: HashSet<i64> = HashSet::new();
@@ -492,16 +518,22 @@ fn build_fixture(rows: usize) -> Fixture {
 }
 
 /// 804 chunks over eight shards, 256 of them inside the `--limit 1` coarse pool.
-static SMALL: Lazy<Fixture> = Lazy::new(|| build_fixture(804));
+static SMALL: Lazy<Fixture> = Lazy::new(|| build_fixture(804, FixtureState::Active));
 
 /// The large-window fixture is its own corpus: `--limit 1025` asks for
 /// `(1025 + 1) * 4 = 4104` candidates, which is above both the vec0 `k` ceiling
 /// and this generation's row count, so the direct-exact window applies.
-static LARGE: Lazy<Fixture> = Lazy::new(|| build_fixture(4204));
+static LARGE: Lazy<Fixture> = Lazy::new(|| build_fixture(4204, FixtureState::Active));
 
 /// An active generation that holds nothing — the "empty active generation"
 /// boundary, which must stay a normal empty result and not an error.
-static EMPTY: Lazy<Fixture> = Lazy::new(|| build_fixture(0));
+static EMPTY: Lazy<Fixture> = Lazy::new(|| build_fixture(0, FixtureState::Active));
+
+/// One generation, none active: the state a backfill reports while it runs.
+static BUILDING: Lazy<Fixture> = Lazy::new(|| build_fixture(256, FixtureState::Building));
+
+/// Active and certified, but shard 3 of the int8 mirror is gone.
+static SHARDLESS: Lazy<Fixture> = Lazy::new(|| build_fixture(256, FixtureState::MissingInt8Shard));
 
 // ---------------------------------------------------------------------------
 // CLI helpers
@@ -782,7 +814,10 @@ fn fast_reports_a_filtering_shortfall_instead_of_hiding_it() {
         serde_json::json!("knn+exact"),
         "the bounded float fallback must be visible in the candidate meta"
     );
-    assert_eq!(filtered["candidates"]["approximate"], serde_json::json!(true));
+    assert_eq!(
+        filtered["candidates"]["approximate"],
+        serde_json::json!(true)
+    );
 
     // A filter the pool can satisfy stays on the plain coarse path.
     let satisfiable = semantic_search(
@@ -952,6 +987,133 @@ fn fast_keeps_the_exact_float_path_above_the_large_window_boundary() {
         default_json["hits"], fast["hits"],
         "the requested mode must not change which rows the float path returns"
     );
+
+    // The fallback has to be visible in every real output surface, not only
+    // the JSON payload the test can parse most easily.
+    let jsonl_run = cass(
+        &[
+            "search",
+            QUERY,
+            "--mode",
+            "semantic",
+            "--model",
+            "bge-m3",
+            "--limit",
+            "1025",
+            "--robot-format",
+            "jsonl",
+            "--vector-search-mode",
+            "fast",
+        ],
+        LARGE.data_dir(),
+    );
+    assert!(
+        jsonl_run.status.success(),
+        "large-window jsonl fast must succeed"
+    );
+    let jsonl = String::from_utf8_lossy(&jsonl_run.stdout);
+    let header: serde_json::Value =
+        serde_json::from_str(jsonl.lines().next().expect("jsonl header"))
+            .expect("jsonl header json");
+    assert_eq!(
+        header["_meta"]["search_precision"],
+        serde_json::json!("exact")
+    );
+    assert_eq!(
+        header["_meta"]["candidates"]["approximate"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        header["_meta"]["candidates"]["coarse_skip_reason"],
+        serde_json::json!("large_window")
+    );
+
+    let text_run = cass(
+        &[
+            "search",
+            QUERY,
+            "--mode",
+            "semantic",
+            "--model",
+            "bge-m3",
+            "--limit",
+            "1025",
+            "--vector-search-mode",
+            "fast",
+        ],
+        LARGE.data_dir(),
+    );
+    assert!(
+        text_run.status.success(),
+        "large-window text fast must succeed"
+    );
+    let text = String::from_utf8_lossy(&text_run.stdout);
+    assert!(
+        text.contains("Search precision: exact"),
+        "the text renderer must report the realized float path, not the requested fast one"
+    );
+    assert!(
+        !text.contains("Search precision: approximate"),
+        "the large-window run must not claim the quantized path"
+    );
+}
+
+#[test]
+fn fast_fails_loudly_while_a_generation_is_building_or_a_shard_is_missing() {
+    // A generation exists but none is active: the semantic context cannot be
+    // built at all, so the CLI must refuse rather than quietly fall back to
+    // lexical or to the float path and report hits as if the screen had run.
+    let building = semantic_search(&BUILDING, 5, &["--vector-search-mode", "fast"]);
+    assert_eq!(
+        building.status.code(),
+        Some(15),
+        "a building generation is a semantic-unavailable refusal, got stdout={} stderr={}",
+        String::from_utf8_lossy(&building.stdout),
+        stderr_text(&building)
+    );
+    assert!(
+        stderr_text(&building).contains("building index"),
+        "the refusal must say the index is still building: {}",
+        stderr_text(&building)
+    );
+    assert!(
+        building.stdout.is_empty(),
+        "a refused search must not print hits: {}",
+        String::from_utf8_lossy(&building.stdout)
+    );
+
+    // Active and certified, but the int8 mirror is structurally incomplete.
+    // `fast` needs that mirror, so the query has to fail loudly instead of
+    // silently serving the exact result under an approximate request.
+    let shardless = semantic_search(&SHARDLESS, 5, &["--vector-search-mode", "fast"]);
+    assert_eq!(
+        shardless.status.code(),
+        Some(9),
+        "a missing int8 shard must surface as a search failure, got stdout={} stderr={}",
+        String::from_utf8_lossy(&shardless.stdout),
+        stderr_text(&shardless)
+    );
+    assert!(
+        stderr_text(&shardless).contains("missing int8 mirror"),
+        "the failure must name the missing mirror: {}",
+        stderr_text(&shardless)
+    );
+    assert!(
+        shardless.stdout.is_empty(),
+        "a failed search must not print hits: {}",
+        String::from_utf8_lossy(&shardless.stdout)
+    );
+
+    // The same library is still searchable on the exact path: the damage is
+    // in the int8 mirror the fast screen needs, not in the authoritative rows.
+    let exact = semantic_search(&SHARDLESS, 5, &["--vector-search-mode", "exact"]);
+    assert_eq!(
+        exact.status.code(),
+        Some(0),
+        "exact must keep working on an incomplete int8 mirror: {}",
+        stderr_text(&exact)
+    );
+    assert!(stdout_json(&exact)["count"].as_u64().unwrap_or(0) > 0);
 }
 
 #[test]
