@@ -18320,6 +18320,40 @@ mod tests {
     }
 
     #[test]
+    fn pr9_fast_huge_fetch_saturates_the_coarse_request_without_wrapping() {
+        let (_dir, _storage, _generation, client) = pr9_fast_fixture();
+        let (hits, meta) = client.search_vector_candidates(
+            &[0.5;4], &SearchFilters::default(), None, usize::MAX,
+        ).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(meta.requested_coarse_k, Some(usize::MAX));
+        assert_eq!(meta.effective_coarse_k, Some(4));
+        assert_eq!(meta.coarse_cap_hit, Some(false));
+        assert_eq!(meta.corpus_limited, Some(true));
+        assert!(meta.approximate);
+    }
+
+    #[test]
+    fn pr9_fast_empty_active_generation_has_no_coarse_claim() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        seed_active_generation_with_chunk_vectors(&storage, 2, &[]);
+        let client = SearchClient::open(&dir.path().join("index"), Some(&path))
+            .unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        let (hits, meta) = client.search_vector_candidates(
+            &[1.0, 0.0], &SearchFilters::default(), None, 10,
+        ).unwrap();
+        assert!(hits.is_empty());
+        assert!(!meta.approximate);
+        assert_eq!(meta.first_round_rows, 0);
+        assert_eq!(meta.coarse_shard_count, None);
+        assert_eq!(meta.coarse_rows_collected, None);
+        assert_eq!(meta.float_rescore_rows, None);
+        assert_eq!(meta.coarse_skip_reason, None);
+    }
+
+    #[test]
     fn pr9_fast_all_shards_are_float_scored_and_filters_preserve_identity() {
         let (_dir, storage, _generation, client) = pr9_fast_fixture();
         let query = [0.5, 0.5, 0.5, 0.5];
