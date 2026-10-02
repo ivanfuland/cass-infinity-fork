@@ -27334,7 +27334,7 @@ mod tests {
         let blob = crate::storage::schema::f32_vector_to_le_blob(&vector);
         let revision_before: i64 = repaired.raw().query_row_map(
             "SELECT vector_revision FROM embedding_generations WHERE id=?1",
-            &fparams![gen_a],
+            fparams![gen_a],
             |row| row.get_typed(0),
         ).unwrap();
         repaired.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
@@ -27348,7 +27348,7 @@ mod tests {
         }).expect("repaired vector domain must accept an authoritative chunk and both mirrors in one transaction");
         let revision_after: i64 = repaired.raw().query_row_map(
             "SELECT vector_revision FROM embedding_generations WHERE id=?1",
-            &fparams![gen_a],
+            fparams![gen_a],
             |row| row.get_typed(0),
         ).unwrap();
         assert!(revision_after > revision_before, "repaired chunk write must advance vector_revision");
