@@ -18354,6 +18354,48 @@ mod tests {
     }
 
     #[test]
+    fn pr9_fast_filter_loss_uses_budgeted_float_fallback() {
+        const N: i64 = 200;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        let mut vectors = Vec::new();
+        for id in 1..=N {
+            seed_db3_message(&storage, &Db3SeedMessage {
+                agent_slug: if id == N { "codex" } else { "claude" },
+                workspace_path: None, source_id: "local", role: "user",
+                created_at: 100, message_id: id, conversation_id: id,
+            });
+            let vector = if id == N { vec![1.0, 0.5, 0.0, 0.0] } else { vec![1.0, 0.0, 0.0, 0.0] };
+            vectors.push((id, id, vector));
+        }
+        seed_active_generation_with_chunk_vectors(&storage, 4, &vectors);
+        let filters = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            ..Default::default()
+        };
+        let (exact, _) = SearchClient::search_db_vector_domain(
+            storage.raw(), &[1.0, 0.0, 0.0, 0.0], &filters, None, 3,
+        ).unwrap();
+        let client = SearchClient::open(&dir.path().join("index"), Some(&path))
+            .unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        let (fast, meta) = client.search_vector_candidates(
+            &[1.0, 0.0, 0.0, 0.0], &filters, None, 3,
+        ).unwrap();
+
+        assert_eq!(exact.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), vec![N as u64]);
+        assert_eq!(fast.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), vec![N as u64]);
+        assert_eq!(meta.mode, CandidateMode::KnnExact);
+        assert_eq!(meta.k, 12);
+        assert_eq!(meta.first_round_rows, 96);
+        assert_eq!(meta.coarse_rows_collected, Some(96));
+        assert_eq!(meta.float_rescore_rows, Some(96));
+        assert_eq!(meta.corpus_limited, Some(false));
+        assert!(meta.approximate);
+        assert!(!meta.incomplete);
+    }
+
+    #[test]
     fn pr9_fast_all_shards_are_float_scored_and_filters_preserve_identity() {
         let (_dir, storage, _generation, client) = pr9_fast_fixture();
         let query = [0.5, 0.5, 0.5, 0.5];
