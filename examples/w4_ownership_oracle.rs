@@ -28,6 +28,14 @@
 //!     restated here on purpose).
 //!   - vec0: `message_chunks.embedding` vs the `vec0` mirror's raw BLOB for
 //!     the same `chunk_id` (`rowid`) -- must be byte-identical.
+//!   - int8 (PR9 task 10 AC2): `message_chunks.embedding` re-quantized with
+//!     the locked unit quantizer vs the raw BLOB in the int8 shard that
+//!     `chunk_id % 8` routes to -- must be byte-identical, and the row must
+//!     be present at all. Missing row and wrong bytes both count into the
+//!     single `int8_mismatch` counter. The reference is the *stored*
+//!     authoritative float BLOB, never this file's re-embedded
+//!     approximation, and the pre-existing span/cosine/`vec0` judgments and
+//!     their thresholds are untouched by it.
 //!
 //! T11.8: this file was rewritten end-to-end to fix four harness defects a
 //! real 105-minute `--full` deadlock against a ~2M-chunk generation exposed
@@ -79,9 +87,10 @@
 //! Usage: `cargo run --release --no-default-features --features
 //! qr,encryption,infinity --example w4_ownership_oracle -- --db <path>
 //! (--full | --sample <N> --seed <S>) --infinity <url> --json <out>`. Exit
-//! codes: 0 `span_failed == 0 && cosine_failed == 0 && vec0_mismatch == 0`;
-//! 1 any of those is nonzero; 2 precondition error (db missing, no active
-//! generation, zero chunks, Infinity unreachable, or the
+//! codes: 0 `span_failed == 0 && cosine_failed == 0 && vec0_mismatch == 0
+//! && int8_mismatch == 0`; 1 any of those is nonzero; 2 precondition error
+//! (db missing, no active generation, zero chunks, Infinity unreachable, an
+//! authoritative float row that cannot be quantized at all, or the
 //! `ownership_oracle.py` subprocess failed to start/speak its protocol, or
 //! stalled/exited before finishing this run's verdicts).
 //!
@@ -119,6 +128,7 @@ use coding_agent_search::search::eligibility::normalized_for_chunks;
 use coding_agent_search::storage::api::Value;
 use coding_agent_search::storage::schema::le_blob_to_f32_vector;
 use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::vector_domain::{INT8_SHARDS, int8_table_name, quantize_unit_int8};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
@@ -196,6 +206,10 @@ struct OwnershipReport {
     span_failed: usize,
     cosine_failed: usize,
     vec0_mismatch: usize,
+    /// PR9 task 10 AC2: chunks whose int8 shard row is missing or whose
+    /// stored int8 bytes differ from the locked quantization of the
+    /// authoritative float BLOB. Both sub-cases share this one counter.
+    int8_mismatch: usize,
     min_cosine: Option<f32>,
     seed: Option<u64>,
     batches: usize,
@@ -215,7 +229,7 @@ struct OwnershipReport {
 }
 impl OwnershipReport {
     fn passed(&self) -> bool {
-        self.span_failed == 0 && self.cosine_failed == 0 && self.vec0_mismatch == 0
+        self.span_failed == 0 && self.cosine_failed == 0 && self.vec0_mismatch == 0 && self.int8_mismatch == 0
     }
 }
 
@@ -315,6 +329,36 @@ fn fetch_vec0_batch(storage: &FrankenStorage, generation_id: i64, chunk_ids: &[i
     Ok(rows.into_iter().collect())
 }
 
+/// PR9 task 10 AC2: batch point-read of exactly one page's `chunk_id`s out
+/// of the eight int8 shards, routed by `chunk_id % 8` (the same routing the
+/// product writes with). One bounded `IN (...)` statement per shard, so no
+/// page's lookup can grow past [`PAGE_ROWS`] bound variables; a chunk whose
+/// row is absent simply does not appear in the returned map, which the
+/// caller counts as `int8_mismatch`.
+fn fetch_int8_batch(storage: &FrankenStorage, generation_id: i64, chunk_ids: &[i64]) -> anyhow::Result<HashMap<i64, Vec<u8>>> {
+    if chunk_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut by_shard: Vec<Vec<i64>> = vec![Vec::new(); INT8_SHARDS];
+    for id in chunk_ids {
+        anyhow::ensure!(*id >= 0, "negative chunk id {id} cannot route to an int8 shard");
+        by_shard[(*id % INT8_SHARDS as i64) as usize].push(*id);
+    }
+    let mut out = HashMap::with_capacity(chunk_ids.len());
+    for (shard, ids) in by_shard.iter().enumerate() {
+        if ids.is_empty() {
+            continue;
+        }
+        let table = int8_table_name(generation_id, shard)?;
+        let placeholders = in_clause_placeholders(ids.len());
+        let sql = format!("SELECT rowid, embedding FROM {table} WHERE rowid IN ({placeholders})");
+        let params: Vec<Value> = ids.iter().map(|id| Value::from(*id)).collect();
+        let rows: Vec<(i64, Vec<u8>)> = storage.raw().query_all_map(&sql, &params, |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))?;
+        out.extend(rows);
+    }
+    Ok(out)
+}
+
 #[derive(serde::Deserialize, Clone)]
 struct OracleVerdict {
     correlation_id: Option<i64>,
@@ -346,6 +390,7 @@ struct DumpTracker {
     span_dumped: usize,
     cosine_dumped: usize,
     vec0_dumped: usize,
+    int8_dumped: usize,
 }
 
 /// One `--dump-failures` row: a chunk that tripped span, cosine, and/or
@@ -367,6 +412,7 @@ struct FailureRecord {
     span_failed: bool,
     cosine_failed: bool,
     vec0_mismatch: bool,
+    int8_mismatch: bool,
 }
 
 /// The persistent `ownership_oracle.py` subprocess for one `run()` call:
@@ -557,6 +603,7 @@ fn flush_embed_pending(
                         span_failed: false,
                         cosine_failed: true,
                         vec0_mismatch: false,
+                        int8_mismatch: false,
                     },
                 );
                 dump.cosine_dumped += 1;
@@ -585,6 +632,7 @@ fn compute_report(
     let mut span_failed = 0usize;
     let mut cosine_failed = 0usize;
     let mut vec0_mismatch = 0usize;
+    let mut int8_mismatch = 0usize;
     let mut min_cosine: Option<f32> = None;
     let mut batches = 0usize;
     let mut partial = false;
@@ -692,6 +740,10 @@ fn compute_report(
         // vec0 batch fetch for exactly this page's chunk_ids.
         let chunk_ids: Vec<i64> = page.iter().map(|c| c.chunk_id).collect();
         let vec0_by_id = fetch_vec0_batch(storage, generation_id, &chunk_ids)?;
+        // PR9 task 10 AC2: the int8 half of the mirror, read independently
+        // (this file's own shard-routed point reads), never through the
+        // product's own audit helper.
+        let int8_by_id = fetch_int8_batch(storage, generation_id, &chunk_ids)?;
 
         // Pass B: span + vec0 verdicts, and batched re-embedding
         // (`pending_embed` flushed every `EMBED_BATCH` chunks, and once
@@ -719,10 +771,24 @@ fn compute_report(
                 vec0_mismatch += 1;
             }
 
+            // PR9 task 10 AC2: the int8 shard row for `chunk_id % 8` must
+            // hold exactly the locked quantization of the STORED
+            // authoritative float BLOB -- never this file's re-embedded
+            // approximation, which is only compared (via cosine) further
+            // down. A missing row and a byte difference are the same
+            // failure from the mirror's point of view.
+            let authoritative = le_blob_to_f32_vector(&c.embedding)?;
+            let expected_int8 = quantize_unit_int8(storage.raw(), &authoritative)?;
+            let int8_ok = matches!(int8_by_id.get(&c.chunk_id), Some(blob) if *blob == expected_int8);
+            if !int8_ok {
+                int8_mismatch += 1;
+            }
+
             if let Some(dump) = dump.as_mut() {
                 let want_span = !span_ok && dump.span_dumped < DUMP_FAILURES_CAP;
                 let want_vec0 = !vec0_ok && dump.vec0_dumped < DUMP_FAILURES_CAP;
-                if want_span || want_vec0 {
+                let want_int8 = !int8_ok && dump.int8_dumped < DUMP_FAILURES_CAP;
+                if want_span || want_vec0 || want_int8 {
                     let entry = dump.records.entry(c.chunk_id).or_insert_with(|| FailureRecord {
                         chunk_id: c.chunk_id,
                         message_id: c.message_id,
@@ -737,6 +803,7 @@ fn compute_report(
                         span_failed: false,
                         cosine_failed: false,
                         vec0_mismatch: false,
+                        int8_mismatch: false,
                     });
                     if want_span {
                         entry.span_failed = true;
@@ -745,6 +812,10 @@ fn compute_report(
                     if want_vec0 {
                         entry.vec0_mismatch = true;
                         dump.vec0_dumped += 1;
+                    }
+                    if want_int8 {
+                        entry.int8_mismatch = true;
+                        dump.int8_dumped += 1;
                     }
                 }
             }
@@ -813,6 +884,7 @@ fn compute_report(
         span_failed,
         cosine_failed,
         vec0_mismatch,
+        int8_mismatch,
         min_cosine,
         seed,
         batches,
@@ -1680,6 +1752,7 @@ mod tests {
         assert_eq!(report.span_failed, 0);
         assert_eq!(report.cosine_failed, 0);
         assert_eq!(report.vec0_mismatch, 0);
+        assert_eq!(report.int8_mismatch, 0, "a freshly rebuilt int8 mirror must be byte-identical to the locked quantization");
         assert!(report.min_cosine.unwrap() > 0.999);
     }
 
@@ -1734,6 +1807,87 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(code, 1, "{message}");
         assert_eq!(report.unwrap().vec0_mismatch, 1);
+    }
+
+    /// PR9 task 10 AC2, first half of the mirror's new judgment: one int8
+    /// byte changed in the shard `chunk_id % 8` routes to. The float mirror
+    /// and the authoritative row are both left alone, so only the new
+    /// counter may move.
+    #[test]
+    fn int8_wrong_byte_is_detected() {
+        let (_dir, path, gen_id, ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let table = int8_table_name(gen_id, (ids[0] % INT8_SHARDS as i64) as usize).unwrap();
+        let mut tampered: Vec<u8> = storage
+            .raw()
+            .query_row_map(&format!("SELECT embedding FROM {table} WHERE rowid = ?1"), &[Value::from(ids[0])], |row| row.get_typed(0))
+            .unwrap();
+        tampered[0] ^= 0x01;
+        // Rewrite through the same delete+insert shape the vector domain
+        // itself writes with: an int8 `vec0` column takes a
+        // `vec_int8`-tagged blob, and that tagged value is not accepted as
+        // the right-hand side of an UPDATE on the column.
+        storage.raw().execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), &[Value::from(ids[0])]).unwrap();
+        storage
+            .raw()
+            .execute(&format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, vec_int8(?2))"), &[Value::from(ids[0]), Value::from(tampered)])
+            .unwrap();
+        drop(storage);
+        let (addr, stop) = start_mock_infinity();
+        let (code, report, message) = run(&path, true, None, None, &format!("http://{addr}"), None, None);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(code, 1, "a single wrong int8 byte must fail the run: {message}");
+        let report = report.unwrap();
+        assert_eq!(report.int8_mismatch, 1);
+        assert_eq!(report.vec0_mismatch, 0, "the float mirror is untouched by an int8-only tamper");
+        assert_eq!(report.span_failed, 0);
+        assert_eq!(report.cosine_failed, 0);
+    }
+
+    /// PR9 task 10 AC2, second half: the int8 row is gone entirely. Same
+    /// counter as a wrong byte, by design -- both mean "this chunk's int8
+    /// mirror does not hold its authoritative quantization".
+    #[test]
+    fn int8_missing_row_is_detected() {
+        let (_dir, path, gen_id, ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let table = int8_table_name(gen_id, (ids[0] % INT8_SHARDS as i64) as usize).unwrap();
+        storage.raw().execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), &[Value::from(ids[0])]).unwrap();
+        drop(storage);
+        let (addr, stop) = start_mock_infinity();
+        let (code, report, message) = run(&path, true, None, None, &format!("http://{addr}"), None, None);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(code, 1, "a missing int8 row must fail the run: {message}");
+        let report = report.unwrap();
+        assert_eq!(report.int8_mismatch, 1);
+        assert_eq!(report.vec0_mismatch, 0, "the float mirror still holds its row");
+    }
+
+    /// PR9 task 10 AC2: moving a chunk's int8 row into a different shard.
+    /// The routed shard is now missing the row, which is exactly the
+    /// `missing` half of the counter -- an equal total row count across the
+    /// eight shards cannot mask it.
+    #[test]
+    fn int8_row_in_the_wrong_shard_is_detected() {
+        let (_dir, path, gen_id, ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let correct = int8_table_name(gen_id, (ids[0] % INT8_SHARDS as i64) as usize).unwrap();
+        let other = int8_table_name(gen_id, ((ids[0] + 1) % INT8_SHARDS as i64) as usize).unwrap();
+        let stored: Vec<u8> = storage
+            .raw()
+            .query_row_map(&format!("SELECT embedding FROM {correct} WHERE rowid = ?1"), &[Value::from(ids[0])], |row| row.get_typed(0))
+            .unwrap();
+        storage.raw().execute(&format!("DELETE FROM {correct} WHERE rowid = ?1"), &[Value::from(ids[0])]).unwrap();
+        storage
+            .raw()
+            .execute(&format!("INSERT INTO {other}(rowid, embedding) VALUES (?1, vec_int8(?2))"), &[Value::from(ids[0]), Value::from(stored)])
+            .unwrap();
+        drop(storage);
+        let (addr, stop) = start_mock_infinity();
+        let (code, report, message) = run(&path, true, None, None, &format!("http://{addr}"), None, None);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(code, 1, "a chunk whose int8 row sits in the wrong shard must fail the run: {message}");
+        assert_eq!(report.unwrap().int8_mismatch, 1);
     }
 
     #[test]
@@ -1812,6 +1966,7 @@ mod tests {
         assert_eq!(report.span_failed, 0);
         assert_eq!(report.cosine_failed, 0);
         assert_eq!(report.vec0_mismatch, 0);
+        assert_eq!(report.int8_mismatch, 0);
         assert!(report.batches >= 2, "a {chunk_count}-chunk generation must span more than one {PAGE_ROWS}-row page");
     }
 

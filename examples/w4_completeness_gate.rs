@@ -12,6 +12,21 @@
 //! [`vector_domain::count_vec0_chunks_set_mismatch_for_generation`] (must be
 //! `(0, 0)`).
 //!
+//! PR9 task 10 AC2: the semantic side also compares the active generation's
+//! authoritative chunk ids against the eight int8 shards, as a set of
+//! `(physical shard, chunk_id)` pairs -- `int8_missing` counts authoritative
+//! chunks whose `chunk_id % 8` shard does not hold their row, and
+//! `int8_extra` counts rows physically sitting in a shard that either are
+//! not routed there (`rowid % 8` differs from that shard) or have no
+//! authoritative row at all. Because the pair carries the *physical* shard
+//! index, a chunk moved into another shard and the same chunk duplicated
+//! across two shards both surface -- neither can be hidden behind an equal
+//! total row count. This is computed from raw SQL in this file; the
+//! product's own `audit_int8_mirror_identity` is not consulted for it.
+//! Only the layout's existence/type/dimension is taken from the product
+//! (`check_int8_layout`), the same structural precondition the product's
+//! own fast path runs.
+//!
 //! Lexical: `lex_docs.doc_id` vs [`eligibility::lexical_eligible`]'s
 //! derived id set; for ids present on both sides, the five projected
 //! columns (`content`/`title`/`agent`/`workspace`/`source_path`, computed
@@ -40,8 +55,10 @@
 //! qr,encryption,infinity --example w4_completeness_gate -- --db <path>
 //! --json <out>`. No stdout progress protocol -- `--json` is written once,
 //! at the end. Exit codes: 0 both domains complete; 1 either domain has a
-//! nonzero finding; 2 precondition error (db missing, or no active
-//! generation to scope the semantic comparison to).
+//! nonzero finding (a missing/damaged int8 shard layout is a precondition
+//! error, not a finding -- the layout is structure, not data); 2
+//! precondition error (db missing, no active generation to scope the
+//! semantic comparison to, or an incomplete/invalid int8 shard layout).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -52,7 +69,7 @@ use coding_agent_search::search::chunking::canonical_role;
 use coding_agent_search::search::eligibility::{for_each_expected_chunk, lexical_eligible, normalized_for_chunks};
 use coding_agent_search::storage::api::Value;
 use coding_agent_search::storage::sqlite::FrankenStorage;
-use coding_agent_search::storage::vector_domain::count_vec0_chunks_set_mismatch_for_generation;
+use coding_agent_search::storage::vector_domain::{INT8_SHARDS, check_int8_layout, count_vec0_chunks_set_mismatch_for_generation, int8_table_name};
 use serde::Serialize;
 
 #[derive(Parser, Debug)]
@@ -73,6 +90,14 @@ struct SemanticReport {
     conv_mismatch: i64,
     holes: i64,
     vec0_mismatch: (i64, i64),
+    /// PR9 task 10 AC2: authoritative chunks whose routed int8 shard
+    /// (`chunk_id % 8`) does not hold their row, summed over the eight
+    /// shards.
+    int8_missing: i64,
+    /// PR9 task 10 AC2: rows physically present in a shard that either are
+    /// not routed there (`rowid % 8 != shard`) or have no authoritative row
+    /// in the active generation, summed over the eight shards.
+    int8_extra: i64,
 }
 impl SemanticReport {
     fn passed(&self) -> bool {
@@ -83,6 +108,8 @@ impl SemanticReport {
             && self.conv_mismatch == 0
             && self.holes == 0
             && self.vec0_mismatch == (0, 0)
+            && self.int8_missing == 0
+            && self.int8_extra == 0
     }
 }
 
@@ -125,11 +152,54 @@ impl CompletenessReport {
     }
 }
 
-fn active_generation_id(storage: &FrankenStorage) -> anyhow::Result<i64> {
-    let id = storage
+fn active_generation(storage: &FrankenStorage) -> anyhow::Result<(i64, i64)> {
+    let row = storage
         .raw()
-        .query_row_map("SELECT id FROM embedding_generations WHERE is_active = 1", &[], |row| row.get_typed(0))?;
-    Ok(id)
+        .query_row_map("SELECT id, dim FROM embedding_generations WHERE is_active = 1", &[], |row| {
+            Ok((row.get_typed::<i64>(0)?, row.get_typed::<i64>(1)?))
+        })?;
+    Ok(row)
+}
+
+/// PR9 task 10 AC2: the eight-shard int8 set comparison, computed directly
+/// from SQL here -- the product's `audit_int8_mirror_identity` is not the
+/// judge. The comparison pairs each row with the shard it *physically*
+/// sits in, so:
+///
+/// * `missing` -- an authoritative chunk whose `chunk_id % 8` shard does
+///   not hold its row.
+/// * `extra` -- a row in shard `s` whose id is either not routed to `s`
+///   (`rowid % 8 != s`) or has no authoritative row at all.
+///
+/// A chunk moved to another shard therefore scores `missing = 1` *and*
+/// `extra = 1`, and duplicating a chunk into a second shard scores
+/// `extra = 1` while `missing` stays `0`; neither case can be hidden by an
+/// unchanged aggregate row count across the eight shards.
+fn count_int8_set_mismatch(storage: &FrankenStorage, generation_id: i64) -> anyhow::Result<(i64, i64)> {
+    let mut missing = 0i64;
+    let mut extra = 0i64;
+    for shard in 0..INT8_SHARDS {
+        let table = int8_table_name(generation_id, shard)?;
+        let shard_missing: i64 = storage.raw().query_row_map(
+            &format!(
+                "SELECT COUNT(*) FROM message_chunks mc WHERE mc.generation_id = ?1 AND mc.chunk_id % {INT8_SHARDS} = ?2 \
+                 AND NOT EXISTS(SELECT 1 FROM {table} v WHERE v.rowid = mc.chunk_id)"
+            ),
+            &[Value::from(generation_id), Value::from(shard as i64)],
+            |row| row.get_typed(0),
+        )?;
+        let shard_extra: i64 = storage.raw().query_row_map(
+            &format!(
+                "SELECT COUNT(*) FROM {table} v WHERE v.rowid % {INT8_SHARDS} != ?1 \
+                 OR NOT EXISTS(SELECT 1 FROM message_chunks mc WHERE mc.generation_id = ?2 AND mc.chunk_id = v.rowid)"
+            ),
+            &[Value::from(shard as i64), Value::from(generation_id)],
+            |row| row.get_typed(0),
+        )?;
+        missing += shard_missing;
+        extra += shard_extra;
+    }
+    Ok((missing, extra))
 }
 
 #[derive(Clone, PartialEq)]
@@ -140,7 +210,7 @@ struct ActualChunk {
     content_hash: String,
 }
 
-fn compute_semantic_report(storage: &FrankenStorage, generation_id: i64) -> anyhow::Result<SemanticReport> {
+fn compute_semantic_report(storage: &FrankenStorage, generation_id: i64, dim: i64) -> anyhow::Result<SemanticReport> {
     let mut expected: HashMap<(i64, u32), coding_agent_search::search::eligibility::ExpectedChunk> = HashMap::new();
     for_each_expected_chunk(storage, 5_000, |chunk| {
         expected.insert((chunk.message_id, chunk.chunk_idx), chunk);
@@ -197,7 +267,14 @@ fn compute_semantic_report(storage: &FrankenStorage, generation_id: i64) -> anyh
 
     let vec0_mismatch = count_vec0_chunks_set_mismatch_for_generation(storage.raw(), generation_id)?;
 
-    Ok(SemanticReport { missing, extra, hash_mismatch, span_mismatch, conv_mismatch, holes, vec0_mismatch })
+    // PR9 task 10 AC2: the eight int8 shards must exist with the right
+    // element type and dimension before their row sets mean anything --
+    // a partial or mistyped layout is a structural precondition failure,
+    // exactly as the product's own fast path treats it, not a data finding.
+    check_int8_layout(storage.raw(), generation_id, dim)?;
+    let (int8_missing, int8_extra) = count_int8_set_mismatch(storage, generation_id)?;
+
+    Ok(SemanticReport { missing, extra, hash_mismatch, span_mismatch, conv_mismatch, holes, vec0_mismatch, int8_missing, int8_extra })
 }
 
 struct LexicalProjection {
@@ -314,8 +391,8 @@ fn compute_excluded_report(message_rows: &[(i64, String, String)]) -> ExcludedRe
 }
 
 fn compute_report(storage: &FrankenStorage) -> anyhow::Result<CompletenessReport> {
-    let generation_id = active_generation_id(storage)?;
-    let semantic = compute_semantic_report(storage, generation_id)?;
+    let (generation_id, dim) = active_generation(storage)?;
+    let semantic = compute_semantic_report(storage, generation_id, dim)?;
     let message_rows = fetch_all_messages(storage)?;
     let lexical = compute_lexical_report(storage, &message_rows)?;
     let excluded = compute_excluded_report(&message_rows);
@@ -624,6 +701,125 @@ mod tests {
         let (code, report, message) = run(&path);
         assert_eq!(code, 1, "{message}");
         assert_eq!(report.unwrap().semantic.vec0_mismatch, (1, 0));
+    }
+
+    // ---- PR9 task 10 AC2: the eight-shard int8 mirror ----
+
+    /// The fixture's chunk ids and their routed shards, read back from the
+    /// database rather than assumed.
+    fn chunk_shard_pairs(storage: &FrankenStorage, gen_id: i64) -> Vec<(i64, usize)> {
+        let ids: Vec<i64> = storage
+            .raw()
+            .query_all_map("SELECT chunk_id FROM message_chunks WHERE generation_id = ?1 ORDER BY chunk_id", &[Value::from(gen_id)], |row| row.get_typed(0))
+            .unwrap();
+        ids.into_iter().map(|id| (id, (id % INT8_SHARDS as i64) as usize)).collect()
+    }
+
+    /// A valid int8 encoding of a fixed unit vector, of the fixture's
+    /// dimension -- used for inserting rows the fixture never wrote.
+    fn quantized_unit_blob(storage: &FrankenStorage) -> Vec<u8> {
+        let blob = schema::f32_vector_to_le_blob(&[0.0, 0.0, 0.0, 1.0]);
+        storage
+            .raw()
+            .query_row_map("SELECT vec_quantize_int8(vec_f32(?1), 'unit')", &[Value::from(blob)], |row| row.get_typed(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn semantic_int8_missing_row_is_detected() {
+        let (_dir, path, gen_id, _ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let (chunk_id, shard) = chunk_shard_pairs(&storage, gen_id)[0];
+        let table = int8_table_name(gen_id, shard).unwrap();
+        storage.raw().execute(&format!("DELETE FROM {table} WHERE rowid = ?1"), &[Value::from(chunk_id)]).unwrap();
+        drop(storage);
+        let (code, report, message) = run(&path);
+        assert_eq!(code, 1, "{message}");
+        let report = report.unwrap();
+        assert_eq!(report.semantic.int8_missing, 1);
+        assert_eq!(report.semantic.int8_extra, 0, "a plain deletion adds no row anywhere");
+        assert_eq!(report.semantic.vec0_mismatch, (0, 0), "the float mirror still holds every row");
+    }
+
+    #[test]
+    fn semantic_int8_extra_row_is_detected() {
+        let (_dir, path, gen_id, _ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let shard = 3usize;
+        let table = int8_table_name(gen_id, shard).unwrap();
+        let orphan_id = (shard as i64) + (INT8_SHARDS as i64) * 1_000;
+        storage
+            .raw()
+            .execute(
+                &format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, vec_int8(?2))"),
+                &[Value::from(orphan_id), Value::from(quantized_unit_blob(&storage))],
+            )
+            .unwrap();
+        drop(storage);
+        let (code, report, message) = run(&path);
+        assert_eq!(code, 1, "{message}");
+        let report = report.unwrap();
+        assert_eq!(report.semantic.int8_extra, 1);
+        assert_eq!(report.semantic.int8_missing, 0, "an orphan in the right shard is extra only");
+    }
+
+    /// A chunk whose int8 row was physically moved into a different shard:
+    /// the routed shard is short one row and the other shard has one it
+    /// should not -- both sides must show, so a compensating total cannot
+    /// hide it.
+    #[test]
+    fn semantic_int8_row_moved_to_the_wrong_shard_is_detected() {
+        let (_dir, path, gen_id, _ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let (chunk_id, shard) = chunk_shard_pairs(&storage, gen_id)[0];
+        let other = (shard + 1) % INT8_SHARDS;
+        let correct = int8_table_name(gen_id, shard).unwrap();
+        let wrong = int8_table_name(gen_id, other).unwrap();
+        let blob = quantized_unit_blob(&storage);
+        storage.raw().execute(&format!("DELETE FROM {correct} WHERE rowid = ?1"), &[Value::from(chunk_id)]).unwrap();
+        storage
+            .raw()
+            .execute(&format!("INSERT INTO {wrong}(rowid, embedding) VALUES (?1, vec_int8(?2))"), &[Value::from(chunk_id), Value::from(blob)])
+            .unwrap();
+        drop(storage);
+        let (code, report, message) = run(&path);
+        assert_eq!(code, 1, "{message}");
+        let report = report.unwrap();
+        assert_eq!(report.semantic.int8_missing, 1, "the routed shard lost the row");
+        assert_eq!(report.semantic.int8_extra, 1, "the other shard gained a row that is not routed there");
+    }
+
+    /// The same chunk present in two shards: nothing is missing, but the
+    /// duplicate is extra in the shard it does not belong to.
+    #[test]
+    fn semantic_int8_duplicate_across_shards_is_detected() {
+        let (_dir, path, gen_id, _ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        let (chunk_id, shard) = chunk_shard_pairs(&storage, gen_id)[0];
+        let other = (shard + 1) % INT8_SHARDS;
+        let wrong = int8_table_name(gen_id, other).unwrap();
+        let blob = quantized_unit_blob(&storage);
+        storage
+            .raw()
+            .execute(&format!("INSERT INTO {wrong}(rowid, embedding) VALUES (?1, vec_int8(?2))"), &[Value::from(chunk_id), Value::from(blob)])
+            .unwrap();
+        drop(storage);
+        let (code, report, message) = run(&path);
+        assert_eq!(code, 1, "{message}");
+        let report = report.unwrap();
+        assert_eq!(report.semantic.int8_missing, 0, "the routed shard still holds its row");
+        assert_eq!(report.semantic.int8_extra, 1);
+    }
+
+    #[test]
+    fn semantic_int8_missing_shard_layout_is_a_precondition_error() {
+        let (_dir, path, gen_id, _ids) = fresh_baseline();
+        let storage = FrankenStorage::open_writer(&path).unwrap();
+        storage.raw().execute(&format!("DROP TABLE {}", int8_table_name(gen_id, 5).unwrap()), &[]).unwrap();
+        drop(storage);
+        let (code, report, message) = run(&path);
+        assert_eq!(code, 2, "a partial int8 layout is structure, not a data finding: {message}");
+        assert!(report.is_none());
     }
 
     // ---- lexical: missing / extra / column_mismatch (all 5 columns) / fts_integrity ----
