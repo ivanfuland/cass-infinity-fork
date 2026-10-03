@@ -1157,3 +1157,47 @@ fn offset_pagination_is_shared_by_both_modes() {
         );
     }
 }
+
+#[test]
+fn hybrid_fast_missing_shard_is_an_error_with_or_without_metadata() {
+    for metadata in [false, true] {
+        let mut args = vec![
+            "search", QUERY, "--mode", "hybrid", "--model", "bge-m3",
+            "--limit", "5", "--json", "--vector-search-mode", "fast",
+        ];
+        if metadata {
+            args.push("--robot-meta");
+        }
+        let result = cass(&args, SHARDLESS.data_dir());
+        assert_eq!(result.status.code(), Some(9), "stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout), stderr_text(&result));
+        assert!(result.stdout.is_empty(), "damage must not return lexical-only hits");
+        assert!(stderr_text(&result).contains("missing int8 mirror"));
+    }
+}
+
+#[test]
+fn stats_respects_schema_guard_without_modifying_the_archive() {
+    for version in [1, 7, schema::CURRENT_SCHEMA_VERSION, schema::CURRENT_SCHEMA_VERSION + 1] {
+        let fixture = build_fixture(16, FixtureState::Active);
+        let db_path = fixture.data_dir.join("agent_search.db");
+        {
+            let storage = FrankenStorage::open(&db_path).unwrap();
+            storage.raw().execute_batch(&format!("PRAGMA user_version={version};")).unwrap();
+        }
+        let before = std::fs::read(&db_path).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_cass"))
+            .args(["stats", "--db"]).arg(&db_path).arg("--json")
+            .current_dir(&fixture.data_dir).output().unwrap();
+        assert_eq!(std::fs::read(&db_path).unwrap(), before, "schema {version} changed");
+        if version == schema::CURRENT_SCHEMA_VERSION {
+            assert!(result.status.success(), "{}", stderr_text(&result));
+            assert!(serde_json::from_slice::<serde_json::Value>(&result.stdout).is_ok());
+        } else {
+            assert_eq!(result.status.code(), Some(9), "schema {version}: stdout={} stderr={}",
+                String::from_utf8_lossy(&result.stdout), stderr_text(&result));
+            assert!(result.stdout.is_empty());
+            assert!(stderr_text(&result).contains("schema"));
+        }
+    }
+}

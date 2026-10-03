@@ -17154,6 +17154,15 @@ fn open_franken_cli_read_db(
     ) {
         Ok(storage) => storage.into_raw(),
         Err(err) => {
+            if let Some(message) = crate::storage::sqlite::readonly_schema_guard_rejection(&err) {
+                return Err(CliError {
+                    code: 9,
+                    kind: CliErrorKind::DbOpen.kind_str(),
+                    message,
+                    hint: Some("Use a matching binary, or re-ingest into a fresh data directory.".into()),
+                    retryable: false,
+                });
+            }
             let readonly_retryable = crate::storage::sqlite::retryable_franken_anyhow(&err);
             match crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
                 &path,

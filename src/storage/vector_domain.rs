@@ -83,7 +83,7 @@ pub fn check_int8_layout(conn: &Conn, generation_id: i64, dim: i64) -> Result<()
             &params![table.clone()], |row| row.get_typed(0),
         )?;
         let Some(sql) = sql else {
-            return Err(reject(format!("vector_domain_state=building: missing int8 mirror {table}")));
+            return Err(reject(format!("vector mirror damaged: missing int8 mirror {table}")));
         };
         let normalized: String = sql.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
         let valid_header = normalized.starts_with(&format!("createvirtualtable{table}using"))
@@ -475,6 +475,16 @@ pub fn rebuild_vec0_table_for_generation(
         return Err(reject(format!("dim must be positive, got {dim}")));
     }
     conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+        // Validate before replacing mirrors: the keyset cursor cannot visit
+        // i64::MIN, and negative IDs cannot be routed by the insert contract.
+        let negative_id: Option<i64> = tx.query_opt_map(
+            "SELECT chunk_id FROM message_chunks WHERE generation_id=?1 AND chunk_id<0 LIMIT 1",
+            &params![generation_id],
+            |row| row.get_typed(0),
+        )?;
+        if negative_id.is_some() {
+            return Err(reject("negative chunk ID cannot route to an int8 shard"));
+        }
         drop_vec0_table_for_generation_in_tx(tx, generation_id)?;
         create_mirrors_in_tx(tx, generation_id, dim)?;
         let mut last_id = i64::MIN;

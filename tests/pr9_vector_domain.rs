@@ -315,3 +315,46 @@ fn pr9_int8_write_failure_rolls_back_authority_float_and_revision() {
         .unwrap();
     assert_eq!(after, revision);
 }
+
+#[test]
+fn pr9_rebuild_rejects_negative_ids_without_changing_committed_mirrors() {
+    for bad_id in [i64::MIN, -1] {
+        let (_dir, storage, generation) = archive();
+        let conn = storage.raw();
+        let valid_id = insert(conn, generation).unwrap();
+        let embedding = schema::f32_vector_to_le_blob(&[0.0, 1.0, 0.0, 0.0]);
+        conn.execute(
+            "INSERT INTO message_chunks(chunk_id,generation_id,message_id,conversation_id,chunk_idx,byte_start,byte_end,content_hash,embedding,norm,created_at) VALUES(?1,?2,1,1,1,0,7,'bad-id',?3,1.0,0)",
+            &[Value::from(bad_id), Value::from(generation), Value::from(embedding.clone())],
+        ).unwrap();
+        let before = revision(conn, generation);
+        let err = vector_domain::rebuild_vec0_table_for_generation(conn, generation, 4)
+            .expect_err("invalid authority IDs must not yield a successful partial rebuild");
+        assert!(err.to_string().contains("negative chunk ID"));
+        assert_eq!(revision(conn, generation), before);
+        assert_eq!(count(conn, "message_chunks"), 2);
+        let authority: Vec<u8> = conn.query_row_map(
+            "SELECT embedding FROM message_chunks WHERE chunk_id=?1",
+            &[Value::from(bad_id)], |row| row.get_typed(0),
+        ).unwrap();
+        assert_eq!(authority, embedding);
+        let float_table = format!("vec_index_gen_{generation}");
+        assert_eq!(count(conn, &float_table), 1);
+        let float_blob: Vec<u8> = conn.query_row_map(
+            &format!("SELECT embedding FROM {float_table} WHERE rowid=?1"),
+            &[Value::from(valid_id)], |row| row.get_typed(0),
+        ).unwrap();
+        assert_eq!(float_blob, schema::f32_vector_to_le_blob(&[1.0, 0.0, 0.0, 0.0]));
+        vector_domain::check_int8_layout(conn, generation, 4).unwrap();
+        for shard in 0..8 {
+            let table = vector_domain::int8_table_name(generation, shard).unwrap();
+            assert_eq!(count(conn, &table), i64::from(shard == (valid_id % 8) as usize));
+        }
+        let table = vector_domain::int8_table_name(generation, (valid_id % 8) as usize).unwrap();
+        let int8_blob: Vec<u8> = conn.query_row_map(
+            &format!("SELECT embedding FROM {table} WHERE rowid=?1"),
+            &[Value::from(valid_id)], |row| row.get_typed(0),
+        ).unwrap();
+        assert_eq!(int8_blob, vector_domain::quantize_unit_int8(conn, &[1.0, 0.0, 0.0, 0.0]).unwrap());
+    }
+}
