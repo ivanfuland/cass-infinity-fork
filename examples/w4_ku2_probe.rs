@@ -299,7 +299,17 @@ fn fast_rescored_hits(
             Int8Candidates::SnapshotMismatch => Err(mirror_damaged(
                 "fast probe precondition: an int8 shard snapshot disagrees with the main read snapshot",
             )),
-            Int8Candidates::Matching { rows, .. } => {
+            Int8Candidates::Matching { rows, corpus_rows } => {
+                let authoritative_rows: i64 = tx.query_row_map(
+                    "SELECT COUNT(*) FROM message_chunks WHERE generation_id=?1",
+                    &[Value::from(generation_id)],
+                    |row| row.get_typed(0),
+                )?;
+                let authoritative_rows = usize::try_from(authoritative_rows)
+                    .map_err(|_| mirror_damaged("vector mirror damaged: invalid authoritative row count"))?;
+                if corpus_rows != authoritative_rows {
+                    return Err(mirror_damaged("vector mirror damaged: int8 corpus count mismatch"));
+                }
                 let coarse_rows = rows.len();
                 let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
                 let mut rescored: Vec<Vec0KnnHit> = Vec::with_capacity(ids.len());
@@ -693,4 +703,29 @@ mod tests {
         assert_eq!(code, 2, "no active generation must be a precondition error: {message}");
         assert!(report.is_none());
     }
+    #[test]
+    fn fast_probe_rejects_partial_and_empty_shards() {
+        for empty_shard in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("archive.db");
+            let generation = build_synthetic_v5_db(&path, 200);
+            let storage = FrankenStorage::open(&path).unwrap();
+            let table = vector_domain::int8_table_name(generation, 3).unwrap();
+            let sql = if empty_shard {
+                format!("DELETE FROM {table}")
+            } else {
+                format!("DELETE FROM {table} WHERE rowid=3")
+            };
+            storage.raw().execute(&sql, &[]).unwrap();
+            drop(storage);
+            let (code, report, message) = run(&path, VectorSearchMode::Fast);
+            assert_eq!(code, 2, "empty_shard={empty_shard}: {message}");
+            assert!(report.is_none(), "damaged input must not produce a successful timing report");
+            assert!(message.contains("int8 corpus count mismatch"), "{message}");
+            let (code, report, message) = run(&path, VectorSearchMode::Exact);
+            assert_eq!(code, 0, "{message}");
+            assert_eq!(report.unwrap().vector_search_mode, "exact");
+        }
+    }
+
 }

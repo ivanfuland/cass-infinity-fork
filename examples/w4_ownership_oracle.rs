@@ -2096,7 +2096,9 @@ mod tests {
             .raw()
             .execute("UPDATE embedding_generations SET is_active = 1, audit_status = 'passed' WHERE id = ?1", &[Value::from(generation_id)])
             .unwrap();
-        let embedding = schema::f32_vector_to_le_blob(&vec![0.0f32; dim]);
+        let mut unit = vec![0.0f32; dim];
+        unit[0] = 1.0;
+        let embedding = schema::f32_vector_to_le_blob(&unit);
         storage
             .raw()
             .with_tx_no_replay(TxMode::Immediate, |tx| {
