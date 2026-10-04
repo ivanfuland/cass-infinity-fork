@@ -100,7 +100,10 @@ use super::api::{Conn, StorageError, Tx, TxMode, Value, params};
 /// pre-existing `origin_host` column and its semantics are unchanged. Also
 /// adds the per-root watermark tables `scan_watermarks` and
 /// `scan_file_state`. Rebuild-only, same as v5 and v6.
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+/// Version 8 adds eight int8 mirrors beside each float index, a database
+/// instance identity and transactionally maintained vector revisions.
+/// Older archives must be rebuilt; this is not an in-place migration.
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 /// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
 /// mode) — **must stay byte-for-byte identical** to the matching two lines
@@ -240,7 +243,7 @@ CREATE TABLE IF NOT EXISTS scan_file_state (root_id TEXT NOT NULL, connector TEX
 CREATE TABLE IF NOT EXISTS operation_commit_receipt (id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, operation TEXT NOT NULL, state TEXT NOT NULL, snapshot_root TEXT, committed_at_ms INTEGER NOT NULL, detail TEXT);
 CREATE TABLE IF NOT EXISTS lex_docs (doc_id INTEGER PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE, content TEXT NOT NULL, title TEXT NOT NULL, agent TEXT NOT NULL, workspace TEXT NOT NULL, source_path TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex USING fts5(content, title, agent, workspace, source_path, content = 'lex_docs', content_rowid = 'doc_id', tokenize = 'porter trigram');
-CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER, vector_revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(vector_revision) = 'integer' AND vector_revision >= 0));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS message_chunks (chunk_id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, UNIQUE(generation_id, message_id, chunk_idx));
 CREATE INDEX IF NOT EXISTS idx_message_chunks_generation ON message_chunks(generation_id);
@@ -248,7 +251,31 @@ CREATE INDEX IF NOT EXISTS idx_message_chunks_message ON message_chunks(message_
 CREATE INDEX IF NOT EXISTS idx_message_chunks_gen_conv ON message_chunks(generation_id, conversation_id);
 CREATE TABLE IF NOT EXISTS chunk_holes (generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, chunk_idx INTEGER NOT NULL, detected_at INTEGER NOT NULL, reason TEXT, PRIMARY KEY(generation_id, message_id, chunk_idx));
 CREATE TABLE IF NOT EXISTS chunk_staging (batch_id INTEGER NOT NULL, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, PRIMARY KEY(generation_id, message_id, chunk_idx));
+INSERT INTO meta(key,value) VALUES('vector_domain_instance_id',lower(hex(randomblob(16))));
+
 "#;
+
+// Whole CREATE TRIGGER statements live separately: each contains its own
+// semicolons, while the interrupted-DDL test deliberately splits the ordinary
+// fresh schema into statements and tests every transaction rollback boundary.
+pub(crate) const VECTOR_DOMAIN_TRIGGER_DDL: [&str; 6] = [
+    r#"CREATE TRIGGER IF NOT EXISTS vector_instance_no_replace BEFORE INSERT ON meta
+WHEN NEW.key = 'vector_domain_instance_id' AND EXISTS(SELECT 1 FROM meta WHERE key = NEW.key)
+BEGIN SELECT RAISE(ABORT,'vector domain instance identity is immutable'); END;"#,
+    r#"CREATE TRIGGER IF NOT EXISTS vector_instance_no_update BEFORE UPDATE ON meta WHEN OLD.key = 'vector_domain_instance_id'
+BEGIN SELECT RAISE(ABORT,'vector domain instance identity is immutable'); END;"#,
+    r#"CREATE TRIGGER IF NOT EXISTS vector_instance_no_delete BEFORE DELETE ON meta WHEN OLD.key = 'vector_domain_instance_id'
+BEGIN SELECT RAISE(ABORT,'vector domain instance identity is immutable'); END;"#,
+    r#"CREATE TRIGGER IF NOT EXISTS vector_chunks_insert_revision AFTER INSERT ON message_chunks
+BEGIN UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = NEW.generation_id; END;"#,
+    r#"CREATE TRIGGER IF NOT EXISTS vector_chunks_delete_revision AFTER DELETE ON message_chunks
+BEGIN UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = OLD.generation_id; END;"#,
+    r#"CREATE TRIGGER IF NOT EXISTS vector_chunks_update_revision AFTER UPDATE ON message_chunks
+BEGIN
+UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = OLD.generation_id;
+UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = NEW.generation_id AND NEW.generation_id != OLD.generation_id;
+END;"#,
+];
 
 /// `PRAGMA user_version` is not parameterizable, so it is spliced into a
 /// small standalone statement rather than folded into [`FRESH_SCHEMA_DDL`]
@@ -327,6 +354,9 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
         }
         return conn.with_tx_no_replay(TxMode::Immediate, |tx| {
             tx.execute_batch(FRESH_SCHEMA_DDL)?;
+            for ddl in VECTOR_DOMAIN_TRIGGER_DDL {
+                tx.execute_batch(ddl)?;
+            }
             tx.execute_batch(&set_user_version_sql(CURRENT_SCHEMA_VERSION))?;
             Ok(())
         });
@@ -1586,7 +1616,12 @@ mod tests {
     /// 步间 case is an obvious, deliberate gap to fill, not a silent one.
     #[test]
     fn ensure_recovers_after_interrupted_partial_ddl_application() {
-        for statements_before_interrupt in [0usize, 1, 5, FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST]
+        for statements_before_interrupt in [
+            0usize, 1, 5, FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST,
+            FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST + 1,
+            FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST + 3,
+            FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST + VECTOR_DOMAIN_TRIGGER_DDL.len(),
+        ]
         {
             let (_dir, path) = scratch_db_path();
             let conn = open_sqlite_writer(&path);
@@ -1598,8 +1633,14 @@ mod tests {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .collect();
+                assert_eq!(statements.len(), FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST);
                 for stmt in statements.iter().take(statements_before_interrupt) {
                     tx.execute_batch(&format!("{stmt};")).unwrap();
+                }
+                for trigger in VECTOR_DOMAIN_TRIGGER_DDL.iter().take(
+                    statements_before_interrupt.saturating_sub(FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST)
+                ) {
+                    tx.execute_batch(trigger).unwrap();
                 }
                 // `tx` drops here without `commit()` -- Tx's Drop rolls back
                 // (see conn.rs), simulating a crash before this transaction
@@ -1704,10 +1745,11 @@ mod tests {
     /// indexes + hole-ledger table), then up to 70 by PR8 C1 (schema 7): +1
     /// for PR6 T2a's `idx_messages_excluded_blob`, which was never counted
     /// here, and +2 for `scan_watermarks` and `scan_file_state` (the unique
-    /// conversation index was renamed, not added). Verified against
-    /// `FRESH_SCHEMA_DDL.split(';').filter(...).count()` directly (not
-    /// hand-counted) each time this constant changed.
-    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 70;
+    /// conversation index was renamed, not added). PR9 schema 8 adds one
+    /// instance identity insert here, then six compound trigger statements
+    /// in `VECTOR_DOMAIN_TRIGGER_DDL`. The trigger bodies cannot be split
+    /// on semicolons. The two counts were measured from their actual arrays.
+    const FRESH_SCHEMA_DDL_STATEMENT_COUNT_FOR_TEST: usize = 71;
 
     /// The historical `fts_messages` DDL, byte-for-byte identical to the
     /// statement W2-6 Task戊 removed from [`FRESH_SCHEMA_DDL`]. A real

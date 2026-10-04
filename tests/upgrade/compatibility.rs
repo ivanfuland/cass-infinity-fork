@@ -105,11 +105,11 @@ fn test_open_rejects_pre_rusqlite_archive_instead_of_converting_it() {
     };
     let rendered = format!("{err:#}");
     assert!(
-        rendered.contains("user_version=0 but is not empty"),
+        rendered.contains("schema version 0 predates version 8's rebuild-only shape"),
         "expected schema::ensure's pre-rusqlite-archive rejection, got: {rendered}"
     );
     assert!(
-        rendered.contains("rebuild the archive instead of trying to convert this file"),
+        rendered.contains("full re-ingest required"),
         "expected the rebuild-not-convert guidance, got: {rendered}"
     );
 }
@@ -217,6 +217,18 @@ fn test_handles_missing_optional_columns() {
             INSERT INTO sources (id, kind, path, updated_at) VALUES (0, 'local', 'default', 0);
             "#,
         )
+        .unwrap();
+        // PR9 task 07: a read-only open now checks `PRAGMA user_version` before
+        // anything else can read the archive, so a fixture that means "a
+        // current-schema database whose optional *columns* are missing" has to
+        // say so in `user_version`. Leaving it at 0 made this fixture claim to
+        // be a pre-rusqlite archive, which the read-only guard refuses by
+        // design (``meta.schema_version`` above is the retired mirror and is
+        // not what the guard reads). This keeps the test's actual subject --
+        // tolerance of a missing optional column -- unchanged.
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"
+        ))
         .unwrap();
         guard.mark_committed();
     }
@@ -479,6 +491,15 @@ fn test_search_without_fts() {
                 VALUES (1, 1, 0, 'user', 'Test message content');
             "#,
             CURRENT_SCHEMA_VERSION
+        ))
+        .unwrap();
+        // PR9 task 07: the `meta.schema_version` row above is the retired
+        // mirror; the read-only guard reads `PRAGMA user_version`, which was
+        // still 0 here and therefore looked like a pre-rusqlite archive. The
+        // fixture's subject -- reading conversations with no FTS domain --
+        // is unchanged; only the version declaration is now the real one.
+        conn.execute_batch(&format!(
+            "PRAGMA user_version = {CURRENT_SCHEMA_VERSION};"
         ))
         .unwrap();
         guard.mark_committed();

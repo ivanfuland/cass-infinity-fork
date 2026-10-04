@@ -1069,6 +1069,11 @@ pub fn run_activation_audit(
     // see [`vec0_row_embedding_blob`]'s doc comment for why KNN alone
     // cannot be trusted to catch the anchor's own vec0 row having drifted.
     if let Some(anchor_blob) = anchor_embedding_blob.as_ref() {
+        match vector_domain::int8_row_matches(conn, generation_id, anchor_chunk_id, anchor_blob) {
+            Ok(true) => {}
+            Ok(false) => failures.push(format!("③ int8 self-row verification failed: chunk_id={anchor_chunk_id}")),
+            Err(e) => failures.push(format!("③ int8 self-row verification errored: {e}")),
+        }
         match vec0_row_embedding_blob(conn, generation_id, anchor_chunk_id) {
             Ok(Some(vec0_blob)) if &vec0_blob == anchor_blob => {}
             Ok(Some(_)) => failures.push(format!(
@@ -1147,6 +1152,12 @@ pub fn run_activation_audit(
              {vec0_chunks_missing_from_message_chunks} vec0 row(s) missing from message_chunks \
              (vec0 has {vec0_row_count} row(s), message_chunks has {chunk_count})"
         ));
+    }
+
+    match vector_domain::audit_int8_mirror_identity(conn, generation_id, dim) {
+        Ok(audit) if audit.rows == chunk_count && audit.missing == 0 && audit.extra == 0 && audit.wrong_shard == 0 && audit.duplicates == 0 => {}
+        Ok(audit) => failures.push(format!("⑦ int8 mirror identity mismatch: {audit:?}, authoritative rows={chunk_count}")),
+        Err(e) => failures.push(format!("⑦ int8 mirror identity audit errored: {e}")),
     }
 
     // ⑧⑨: one pass over expected-vs-stored, keyed by (message_id, chunk_idx)
@@ -1280,6 +1291,9 @@ pub fn run_activation_audit(
                         Some(vec0_blob) if vec0_blob == stored_blob => {}
                         Some(_) => bail!("vec0 row for chunk_id={chunk_id} does not byte-match message_chunks.embedding (direct point read)"),
                         None => bail!("vec0 row for chunk_id={chunk_id} is missing (direct point read)"),
+                    }
+                    if !vector_domain::int8_row_matches(conn, generation_id, *chunk_id, &stored_blob)? {
+                        bail!("int8 mirror for chunk_id={chunk_id} does not match authoritative quantization");
                     }
                     let hits = vector_domain::vec0_knn(conn, generation_id, &stored_vec, 1)?;
                     let (top_hit, distance) = hits.first().copied().unwrap_or((-1, f64::INFINITY));
@@ -2200,7 +2214,10 @@ mod chunk_catchup_v5_tests {
                 let mut hasher = DefaultHasher::new();
                 text.hash(&mut hasher);
                 i.hash(&mut hasher);
-                1.0 + (hasher.finish() % 1000) as f32 / 1000.0
+                // Power-of-two scaling preserves the cosine direction and
+                // keeps this synthetic embedder inside the unit quantizer's
+                // component range; the old 1..2 fixture was not valid int8 input.
+                (1.0 + (hasher.finish() % 1000) as f32 / 1000.0) * 0.5
             })
             .collect()
     }
@@ -2872,8 +2889,11 @@ mod chunk_catchup_v5_tests {
         storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
-                vector_domain::delete_vec0_rows_in_tx(tx, generation_id, &[chunk_id_a])?;
-                vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &[(chunk_id_a, corrupted_blob.as_slice())])?;
+                // This specific negative fixture corrupts only the float
+                // mirror, so its direct float-byte check remains necessary.
+                // The normal primitive now correctly maintains both mirrors.
+                tx.execute(&format!("DELETE FROM vec_index_gen_{generation_id} WHERE rowid=?1"), &params![chunk_id_a])?;
+                tx.execute(&format!("INSERT INTO vec_index_gen_{generation_id}(rowid,embedding) VALUES(?1,?2)"), &params![chunk_id_a, corrupted_blob.clone()])?;
                 Ok(())
             })
             .unwrap();
@@ -2890,6 +2910,40 @@ mod chunk_catchup_v5_tests {
         );
         assert_eq!(report.ownership_checked, 2);
         assert_eq!(report.ownership_failed, 1, "only chunk_id_a's own sample must fail (its row is corrupted); chunk_id_b's own row is internally consistent: {report:?}");
+    }
+
+    #[test]
+    fn audit_3_and_10_reject_an_int8_row_with_the_right_id_but_wrong_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = open_storage(&dir.path().join("db.sqlite"));
+        let (generation_id, chunk_id, _) = clean_two_message_generation(&storage);
+        let message_id: i64 = storage.raw().query_row_map(
+            "SELECT message_id FROM message_chunks WHERE chunk_id=?1",
+            &params![chunk_id], |row| row.get_typed(0),
+        ).unwrap();
+        let clean = run_activation_audit(&storage, generation_id, 10, Some(message_id), Some(&mock_embed), 10, 1).unwrap();
+        assert!(clean.passed, "fixture must start clean: {clean:?}");
+
+        let shard = vector_domain::int8_table_name(generation_id, (chunk_id % 8) as usize).unwrap();
+        let mut bytes: Vec<u8> = storage.raw().query_row_map(
+            &format!("SELECT embedding FROM {shard} WHERE rowid=?1"),
+            &params![chunk_id], |row| row.get_typed(0),
+        ).unwrap();
+        bytes[0] ^= 1;
+        storage.raw().with_tx_no_replay(TxMode::Immediate, |tx| {
+            tx.execute(&format!("DELETE FROM {shard} WHERE rowid=?1"), &params![chunk_id])?;
+            tx.execute(
+                &format!("INSERT INTO {shard}(rowid,embedding) VALUES(?1,vec_int8(?2))"),
+                &params![chunk_id, bytes.clone()],
+            )?;
+            Ok(())
+        }).unwrap();
+
+        let report = run_activation_audit(&storage, generation_id, 10, Some(message_id), Some(&mock_embed), 10, 1).unwrap();
+        assert!(!report.passed, "wrong int8 bytes must refuse activation: {report:?}");
+        assert!(report.failure_reasons.iter().any(|r| r.contains("③ int8 self-row verification failed") && r.contains(&chunk_id.to_string())), "③ must catch the corrupt anchor: {report:?}");
+        assert!(report.failure_reasons.iter().any(|r| r.contains("⑩ ownership check failed") && r.contains("int8 mirror")), "⑩ must independently catch the corrupt sample: {report:?}");
+        assert!(!report.failure_reasons.iter().any(|r| r.contains("③ vec0 self-row verification failed")), "float mirror remained intact: {report:?}");
     }
 
     #[test]

@@ -5,22 +5,264 @@
 //! `vec0` virtual tables are a **derived index** over the authoritative
 //! `message_chunks` table (W3-1, chunk-granularity since T4/T11) — never a
 //! second source of truth. w3-d3②: no resumable/checkpointed rebuild
-//! machinery (rebuild is a minutes-scale idempotent operation: drop the
-//! table, recreate, repopulate from `message_chunks` in one transaction —
-//! an interruption leaves
-//! the previous committed state, a retry starts over cleanly, per w3-d9②'s
-//! atomicity discipline). w3-d5: no in-process stall watchdog or size/time
+//! machinery (rebuild drops, recreates and fills all mirrors in one
+//! transaction, using keyset pages of at most 2048 authoritative vectors;
+//! an interruption leaves the previous committed state). w3-d5: no in-process stall watchdog or size/time
 //! auto-decision — progress exposure (when this module's caller wants it)
 //! is a DB-internal marker or heartbeat file mtime for external sampling,
 //! not anything built into this module.
 //!
-//! One `vec0` table per generation (`embedding_generations.id`), not one
-//! shared table: `vec0`'s `float[N]` column width is fixed per table, and a
-//! future generation may carry a different `dim` (different embedder).
+//! Each generation (`embedding_generations.id`) owns its original float vec0
+//! mirror and eight int8 vec0 shards. The authoritative f32 BLOB remains in
+//! `message_chunks`. Index dimensions are fixed per generation.
 //! Table naming encodes the generation id so multiple generations' indexes
 //! can coexist during the delayed-cleanup window (W3-4).
 
 use super::api::{Conn, StorageError, Tx, TxMode, Value, params};
+
+pub const INT8_SHARDS: usize = 8;
+const REBUILD_BATCH_ROWS: usize = 2048;
+
+pub fn int8_table_name(generation_id: i64, shard: usize) -> Result<String, StorageError> {
+    validate_generation_id_for_ddl(generation_id)?;
+    if shard >= INT8_SHARDS {
+        return Err(reject(format!("invalid int8 shard {shard}")));
+    }
+    Ok(format!("vec_index_gen_{generation_id}_int8_shard_{shard}"))
+}
+
+fn bump_revision(tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
+    tx.execute(
+        "UPDATE embedding_generations SET vector_revision = vector_revision + 1 WHERE id = ?1",
+        &params![generation_id],
+    )?;
+    Ok(())
+}
+
+fn validate_quantization_input(blob: &[u8], dim: usize) -> Result<(), StorageError> {
+    if dim == 0 || blob.len() != dim.saturating_mul(4) {
+        return Err(reject("int8 quantization dimension mismatch"));
+    }
+    let vector = super::schema::le_blob_to_f32_vector(blob)?;
+    if vector.iter().any(|v| !v.is_finite() || !(-1.0..=1.0).contains(v)) {
+        return Err(reject("int8 quantization requires finite unit-range float components"));
+    }
+    Ok(())
+}
+
+fn validate_quantized(blob: Vec<u8>, dim: usize) -> Result<Vec<u8>, StorageError> {
+    if blob.len() != dim || blob.iter().all(|v| *v == 0) {
+        return Err(reject("invalid dimension or all-zero int8 quantization"));
+    }
+    Ok(blob)
+}
+
+/// The locked sqlite-vec unit quantizer is the single source of byte rules.
+/// Validate first: the extension itself clamps nonfinite/out-of-range values.
+pub fn quantize_unit_int8(conn: &Conn, vector: &[f32]) -> Result<Vec<u8>, StorageError> {
+    let blob = super::schema::f32_vector_to_le_blob(vector);
+    validate_quantization_input(&blob, vector.len())?;
+    let quantized = conn.query_row_map(
+        "SELECT vec_quantize_int8(vec_f32(?1), 'unit')",
+        &params![blob], |row| row.get_typed(0),
+    )?;
+    validate_quantized(quantized, vector.len())
+}
+
+/// Reject a partial layout or a table with a different element type/dimension.
+/// Table existence is independent of whether its shard currently has any rows.
+pub fn check_int8_layout(conn: &Conn, generation_id: i64, dim: i64) -> Result<(), StorageError> {
+    let mut owned = std::collections::HashSet::new();
+    for shard in 0..INT8_SHARDS {
+        let table = int8_table_name(generation_id, shard)?;
+        for suffix in ["", "_info", "_chunks", "_rowids", "_vector_chunks00"] {
+            owned.insert(format!("{table}{suffix}"));
+        }
+        let sql: Option<String> = conn.query_opt_map(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            &params![table.clone()], |row| row.get_typed(0),
+        )?;
+        let Some(sql) = sql else {
+            return Err(reject(format!("vector mirror damaged: missing int8 mirror {table}")));
+        };
+        let normalized: String = sql.chars().filter(|c| !c.is_whitespace()).flat_map(char::to_lowercase).collect();
+        let valid_header = normalized.starts_with(&format!("createvirtualtable{table}using"))
+            || normalized.starts_with(&format!("createvirtualtableifnotexists{table}using"));
+        let valid_body = normalized.split_once("using").is_some_and(|(_, body)| {
+            body.trim_end_matches(';') == format!("vec0(embeddingint8[{dim}]distance_metric=cosine)")
+        });
+        if !valid_header || !valid_body {
+            return Err(reject(format!("vector mirror damaged: invalid int8 layout in {table}")));
+        }
+    }
+    let prefix = format!("vec_index_gen_{generation_id}_int8_shard_");
+    let physical: Vec<String> = conn.query_all_map(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB ?1",
+        &params![format!("{prefix}*")], |row| row.get_typed(0),
+    )?;
+    if let Some(unexpected) = physical.iter().find(|name| !owned.contains(*name)) {
+        return Err(reject(format!("vector mirror damaged: unexpected int8 shard table {unexpected}")));
+    }
+    Ok(())
+}
+
+pub fn int8_row_matches(
+    conn: &Conn, generation_id: i64, chunk_id: i64, authoritative_blob: &[u8],
+) -> Result<bool, StorageError> {
+    if chunk_id < 0 { return Err(reject("negative chunk ID")); }
+    let vector = super::schema::le_blob_to_f32_vector(authoritative_blob)?;
+    let expected = quantize_unit_int8(conn, &vector)?;
+    let table = int8_table_name(generation_id, (chunk_id % INT8_SHARDS as i64) as usize)?;
+    let stored: Option<Vec<u8>> = conn.query_opt_map(
+        &format!("SELECT embedding FROM {table} WHERE rowid=?1"),
+        &params![chunk_id], |row| row.get_typed(0),
+    )?;
+    Ok(stored.as_deref() == Some(expected.as_slice()))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Int8MirrorAudit {
+    pub rows: i64,
+    pub missing: i64,
+    pub extra: i64,
+    pub wrong_shard: i64,
+    pub duplicates: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorSnapshot {
+    pub generation_id: i64,
+    pub dim: i64,
+    pub fingerprint: Vec<u8>,
+    pub revision: i64,
+    pub instance_id: String,
+}
+
+pub fn vector_snapshot_in_tx(tx: &Tx, generation_id: i64) -> Result<Option<VectorSnapshot>, StorageError> {
+    let instance_id: String = tx.query_row_map(
+        "SELECT value FROM meta WHERE key='vector_domain_instance_id'", &[], |row| row.get_typed(0),
+    )?;
+    if instance_id.len() != 32 || !instance_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(reject("vector mirror damaged: invalid database instance identity"));
+    }
+    tx.query_opt_map(
+        "SELECT dim,fingerprint,vector_revision FROM embedding_generations WHERE id=?1",
+        &params![generation_id],
+        |row| Ok(VectorSnapshot {
+            generation_id, dim: row.get_typed(0)?, fingerprint: row.get_typed(1)?,
+            revision: row.get_typed(2)?, instance_id: instance_id.clone(),
+        }),
+    )
+}
+
+#[derive(Debug)]
+pub enum Int8Candidates {
+    Matching { rows: Vec<Vec0KnnHit>, corpus_rows: usize },
+    SnapshotMismatch,
+}
+
+/// Each worker owns its read-only connection and transaction. No connection
+/// or transaction crosses threads, and every join finishes before returning.
+/// Revision mismatch discards the complete pool, never just one shard.
+pub fn parallel_int8_candidates(
+    path: &std::path::Path, snapshot: &VectorSnapshot, query: &[u8], k: usize,
+) -> Result<Int8Candidates, StorageError> {
+    let workers = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..INT8_SHARDS).map(|shard| scope.spawn(move || {
+            let conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, std::time::Duration::from_secs(1))
+                .map_err(|e| reject(e.to_string()))?;
+            crate::storage::sqlite::ensure_readonly_schema_current(&conn).map_err(|e| reject(e.to_string()))?;
+            conn.with_tx_no_replay(TxMode::Deferred, |tx| {
+                let Some(observed) = vector_snapshot_in_tx(tx, snapshot.generation_id)? else {
+                    return Ok(None);
+                };
+                if observed.instance_id != snapshot.instance_id {
+                    return Err(reject("vector_database_changed: reopen the database before retrying"));
+                }
+                if observed != *snapshot { return Ok(None); }
+                let table = int8_table_name(snapshot.generation_id, shard)?;
+                let rows: i64 = tx.query_row_map(&format!("SELECT count(*) FROM {table}"), &[], |row| row.get_typed(0))?;
+                let corpus_rows = usize::try_from(rows).map_err(|_| reject("invalid int8 shard row count"))?;
+                let actual_k = k.min(corpus_rows);
+                if actual_k == 0 { return Ok(Some((corpus_rows, Vec::new()))); }
+                let hits: Vec<Vec0KnnHit> = tx.query_all_map(
+                    &format!("SELECT rowid,distance FROM {table} WHERE embedding MATCH vec_int8(?1) AND k=?2 ORDER BY distance"),
+                    &params![query.to_vec(), actual_k as i64], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+                )?;
+                if hits.len() != actual_k || hits.iter().any(|(id, distance)| *id < 0 || *id % INT8_SHARDS as i64 != shard as i64 || !distance.is_finite()) {
+                    return Err(reject("vector mirror damaged: invalid int8 shard result"));
+                }
+                Ok(Some((corpus_rows, hits)))
+            })
+        })).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(reject("int8 search worker panicked")))).collect::<Vec<_>>()
+    });
+    let mut all = Vec::new();
+    let mut corpus_rows = 0usize;
+    let mut mismatch = false;
+    for worker in workers {
+        match worker? {
+            Some((count, rows)) => {
+                corpus_rows = corpus_rows.checked_add(count).ok_or_else(|| reject("int8 corpus count overflow"))?;
+                all.extend(rows);
+            }
+            None => mismatch = true,
+        }
+    }
+    if mismatch { return Ok(Int8Candidates::SnapshotMismatch); }
+    all.sort_by_key(|(id, _)| *id);
+    if all.windows(2).any(|w| w[0].0 == w[1].0) { return Err(reject("vector mirror damaged: duplicate int8 chunk ID")); }
+    Ok(Int8Candidates::Matching { rows: all, corpus_rows })
+}
+
+/// Identity-set audit over all eight mirrors; equal counts cannot mask a swap.
+pub fn audit_int8_mirror_identity(conn: &Conn, generation_id: i64, dim: i64) -> Result<Int8MirrorAudit, StorageError> {
+    check_int8_layout(conn, generation_id, dim)?;
+    let mut audit = Int8MirrorAudit::default();
+    let mut shard_selects = Vec::with_capacity(INT8_SHARDS);
+    for shard in 0..INT8_SHARDS {
+        let table = int8_table_name(generation_id, shard)?;
+        let count: i64 = conn.query_row_map(&format!("SELECT count(*) FROM {table}"), &[], |row| row.get_typed(0))?;
+        audit.rows += count;
+        audit.missing += conn.query_row_map::<i64>(
+            &format!("SELECT count(*) FROM message_chunks mc WHERE generation_id=?1 AND chunk_id%8=?2 AND NOT EXISTS(SELECT 1 FROM {table} v WHERE v.rowid=mc.chunk_id)"),
+            &params![generation_id, shard as i64], |row| row.get_typed(0),
+        )?;
+        audit.extra += conn.query_row_map::<i64>(
+            &format!("SELECT count(*) FROM {table} v WHERE NOT EXISTS(SELECT 1 FROM message_chunks mc WHERE mc.generation_id=?1 AND mc.chunk_id=v.rowid)"),
+            &params![generation_id], |row| row.get_typed(0),
+        )?;
+        audit.wrong_shard += conn.query_row_map::<i64>(
+            &format!("SELECT count(*) FROM {table} WHERE rowid%8 != ?1"),
+            &params![shard as i64], |row| row.get_typed(0),
+        )?;
+        shard_selects.push(format!("SELECT rowid AS chunk_id FROM {table}"));
+    }
+    audit.duplicates = conn.query_row_map(
+        &format!("SELECT coalesce(sum(n-1),0) FROM (SELECT count(*) AS n FROM ({}) GROUP BY chunk_id HAVING count(*)>1)", shard_selects.join(" UNION ALL ")),
+        &[], |row| row.get_typed(0),
+    )?;
+    Ok(audit)
+}
+
+fn create_mirrors_in_tx(tx: &Tx, generation_id: i64, dim: i64) -> Result<(), StorageError> {
+    let table = vec0_table_name(generation_id);
+    let count: i64 = tx.query_row_map("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1", &params![table.clone()], |row| row.get_typed(0))?;
+    let mut created = count == 0;
+    tx.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(embedding float[{dim}] distance_metric=cosine);"
+    ))?;
+    for shard in 0..INT8_SHARDS {
+        let table = int8_table_name(generation_id, shard)?;
+        let count: i64 = tx.query_row_map("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1", &params![table.clone()], |row| row.get_typed(0))?;
+        created |= count == 0;
+        tx.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(embedding int8[{dim}] distance_metric=cosine);"
+        ))?;
+    }
+    if created { bump_revision(tx, generation_id)?; }
+    Ok(())
+}
 
 /// `vec0` table name for a given generation. `chunk_id` (`message_chunks`'
 /// own primary key) is used as the table's `rowid` on insert — unique
@@ -52,8 +294,8 @@ fn validate_generation_id_for_ddl(generation_id: i64) -> Result<(), StorageError
     Ok(())
 }
 
-/// Create (idempotently) the `vec0` virtual table for `generation_id` with
-/// the given embedding dimension. Cosine distance metric (KU2's validated
+/// Create (idempotently) the float vec0 and eight int8 virtual tables for
+/// `generation_id` in one transaction. Cosine distance metric (KU2's validated
 /// choice — the W3-0 handoff's finding that sqlite-vec's true cosine
 /// scoring is more correct than fsvi's raw dot product on
 /// near-but-not-exactly-unit-norm vectors).
@@ -66,14 +308,11 @@ pub fn create_vec0_table_for_generation(
     if dim <= 0 {
         return Err(reject(format!("dim must be positive, got {dim}")));
     }
-    let table = vec0_table_name(generation_id);
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(embedding float[{dim}] distance_metric=cosine);"
-    ))
+    conn.with_tx_no_replay(TxMode::Immediate, |tx| create_mirrors_in_tx(tx, generation_id, dim))
 }
 
-/// Drop the `vec0` virtual table for `generation_id`, if it exists.
-/// `DROP TABLE` on a `vec0` virtual table also drops its shadow tables
+/// Drop the nine derived vector tables for `generation_id`, if present.
+/// `DROP TABLE` on each `vec0` virtual table also drops its shadow tables
 /// (verified empirically by
 /// [`vec0_shadow_tables_are_fully_enumerated_and_fully_dropped`] below —
 /// w3-d8①: shadow-table behavior is taken on real `sqlite3` enumeration,
@@ -83,8 +322,7 @@ pub fn drop_vec0_table_for_generation(
     generation_id: i64,
 ) -> Result<(), StorageError> {
     validate_generation_id_for_ddl(generation_id)?;
-    let table = vec0_table_name(generation_id);
-    conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
+    conn.with_tx_no_replay(TxMode::Immediate, |tx| drop_vec0_table_for_generation_in_tx(tx, generation_id))
 }
 
 /// Same DDL as [`drop_vec0_table_for_generation`], but issued against an
@@ -98,11 +336,16 @@ pub fn drop_vec0_table_for_generation(
 pub fn drop_vec0_table_for_generation_in_tx(tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
     validate_generation_id_for_ddl(generation_id)?;
     let table = vec0_table_name(generation_id);
-    tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+    for shard in 0..INT8_SHARDS {
+        let table = int8_table_name(generation_id, shard)?;
+        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+    }
+    bump_revision(tx, generation_id)
 }
 
-/// Real `sqlite_master` enumeration of `generation_id`'s `vec0` table and
-/// every shadow table it owns (w3-d8① discipline: never hardcode a shadow
+/// Real `sqlite_master` enumeration of `generation_id`'s float/int8 tables
+/// and their shadow tables (w3-d8① discipline: never hardcode a shadow
 /// count from documentation or a prior measurement — count what is
 /// actually there). Returns table names in `sqlite_master` order (main
 /// table first, since `vec0` creates it before its shadows and
@@ -114,11 +357,13 @@ pub fn enumerate_vec0_tables_for_generation(
     validate_generation_id_for_ddl(generation_id)?;
     let table = vec0_table_name(generation_id);
     let like_pattern = format!("{table}%");
-    conn.query_all_map(
+    let names: Vec<String> = conn.query_all_map(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE ?1 ORDER BY rowid",
         &params![like_pattern],
         |row| row.get_typed(0),
-    )
+    )?;
+    // `_` is the namespace boundary: generation 1 must not include 10.
+    Ok(names.into_iter().filter(|name| name == &table || name.starts_with(&format!("{table}_"))).collect())
 }
 
 /// Row count of `generation_id`'s main `vec0` table (never a shadow
@@ -140,7 +385,7 @@ pub fn count_vec0_rows_for_generation(conn: &Conn, generation_id: i64) -> Result
     conn.query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |row| row.get_typed(0))
 }
 
-/// One `vec0` KNN hit: `(doc_id, distance)`, ascending distance (nearest
+/// One `vec0` KNN hit: `(chunk_id, distance)`, ascending distance (nearest
 /// first) — the shape `SELECT rowid, distance ... ORDER BY distance`
 /// naturally produces.
 pub type Vec0KnnHit = (i64, f64);
@@ -215,8 +460,8 @@ pub fn count_vec0_chunks_set_mismatch_for_generation(
     Ok((missing_from_vec0, extra_in_vec0))
 }
 
-/// Rebuild `generation_id`'s `vec0` index from `message_chunks` in one
-/// transaction (drop + recreate + bulk-populate) -- chunk-domain sibling of
+/// Rebuild `generation_id`'s nine derived mirrors from `message_chunks` in one
+/// transaction (drop + recreate + bounded keyset population) -- sibling of
 /// [`rebuild_vec0_table_for_generation`], same atomicity discipline (an
 /// interruption anywhere leaves the generation's `vec0` table exactly as it
 /// was before the call). Returns the number of rows populated.
@@ -229,31 +474,39 @@ pub fn rebuild_vec0_table_for_generation(
     if dim <= 0 {
         return Err(reject(format!("dim must be positive, got {dim}")));
     }
-    let table = vec0_table_name(generation_id);
-
     conn.with_tx_no_replay(TxMode::Immediate, |tx| {
-        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
-        tx.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE {table} USING vec0(embedding float[{dim}] distance_metric=cosine);"
-        ))?;
-
-        let rows: Vec<(i64, Vec<u8>)> = tx.query_all_map(
-            "SELECT chunk_id, embedding FROM message_chunks WHERE generation_id = ?1",
+        // Validate before replacing mirrors: the keyset cursor cannot visit
+        // i64::MIN, and negative IDs cannot be routed by the insert contract.
+        let negative_id: Option<i64> = tx.query_opt_map(
+            "SELECT chunk_id FROM message_chunks WHERE generation_id=?1 AND chunk_id<0 LIMIT 1",
             &params![generation_id],
-            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            |row| row.get_typed(0),
         )?;
-
-        let insert_sql = format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, ?2)");
-        for (chunk_id, embedding) in &rows {
-            tx.execute(&insert_sql, &[Value::from(*chunk_id), Value::from(embedding.clone())])?;
+        if negative_id.is_some() {
+            return Err(reject("negative chunk ID cannot route to an int8 shard"));
         }
-
-        Ok(rows.len())
+        drop_vec0_table_for_generation_in_tx(tx, generation_id)?;
+        create_mirrors_in_tx(tx, generation_id, dim)?;
+        let mut last_id = i64::MIN;
+        let mut populated = 0usize;
+        loop {
+            let rows: Vec<(i64, Vec<u8>)> = tx.query_all_map(
+                "SELECT chunk_id,embedding FROM message_chunks WHERE generation_id=?1 AND chunk_id>?2 ORDER BY chunk_id LIMIT ?3",
+                &params![generation_id, last_id, REBUILD_BATCH_ROWS as i64],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )?;
+            if rows.is_empty() { break; }
+            let borrowed: Vec<(i64, &[u8])> = rows.iter().map(|(id, blob)| (*id, blob.as_slice())).collect();
+            insert_vec0_rows_in_tx(tx, generation_id, &borrowed)?;
+            last_id = rows[rows.len() - 1].0;
+            populated += rows.len();
+        }
+        Ok(populated)
     })
 }
 
-/// Insert `rows` (`(chunk_id, embedding_blob)` pairs) into `generation_id`'s
-/// `vec0` table -- the incremental-write counterpart to
+/// Insert authoritative f32 rows into the float mirror and their routed int8
+/// shards in one caller-owned transaction -- the incremental counterpart to
 /// [`rebuild_vec0_table_for_generation`]'s bulk rebuild, for a catch-up
 /// writer landing newly-embedded chunks one small batch at a time instead of
 /// re-populating the whole table. Returns the number of rows inserted.
@@ -264,19 +517,26 @@ pub fn insert_vec0_rows_in_tx(
 ) -> Result<u64, StorageError> {
     validate_generation_id_for_ddl(generation_id)?;
     let table = vec0_table_name(generation_id);
+    let dim: i64 = tx.query_row_map("SELECT dim FROM embedding_generations WHERE id=?1", &params![generation_id], |row| row.get_typed(0))?;
+    let dim = usize::try_from(dim).map_err(|_| reject("invalid generation dimension"))?;
     let insert_sql = format!("INSERT INTO {table}(rowid, embedding) VALUES (?1, ?2)");
     let mut inserted = 0u64;
     for (chunk_id, embedding) in rows {
+        if *chunk_id < 0 { return Err(reject("negative chunk ID cannot route to an int8 shard")); }
+        validate_quantization_input(embedding, dim)?;
+        let quantized = tx.query_row_map("SELECT vec_quantize_int8(vec_f32(?1),'unit')", &params![embedding.to_vec()], |row| row.get_typed(0))?;
+        let quantized = validate_quantized(quantized, dim)?;
         tx.execute(&insert_sql, &[Value::from(*chunk_id), Value::from(embedding.to_vec())])?;
+        let shard = int8_table_name(generation_id, (*chunk_id % INT8_SHARDS as i64) as usize)?;
+        tx.execute(&format!("INSERT INTO {shard}(rowid,embedding) VALUES(?1,vec_int8(?2))"), &params![*chunk_id, quantized])?;
         inserted += 1;
     }
+    if !rows.is_empty() { bump_revision(tx, generation_id)?; }
     Ok(inserted)
 }
 
-/// Delete `chunk_ids` from `generation_id`'s `vec0` table -- the
-/// incremental-write counterpart for chunks that were pruned/deleted from
-/// `message_chunks` and must not linger in the derived index. Returns the
-/// number of rows deleted.
+/// Delete each chunk from both derived mirrors in the same transaction as its
+/// authoritative delete. Returns the float mirror's deleted-row count.
 pub fn delete_vec0_rows_in_tx(
     tx: &Tx,
     generation_id: i64,
@@ -287,21 +547,32 @@ pub fn delete_vec0_rows_in_tx(
     let delete_sql = format!("DELETE FROM {table} WHERE rowid = ?1");
     let mut deleted = 0u64;
     for chunk_id in chunk_ids {
-        deleted += tx.execute(&delete_sql, &params![*chunk_id])? as u64;
+        if *chunk_id < 0 { return Err(reject("negative chunk ID cannot route to an int8 shard")); }
+        let shard = int8_table_name(generation_id, (*chunk_id % INT8_SHARDS as i64) as usize)?;
+        let quantized = tx.execute(&format!("DELETE FROM {shard} WHERE rowid=?1"), &params![*chunk_id])?;
+        if quantized != 1 {
+            return Err(reject(format!("vector mirror damaged: chunk_id={chunk_id} missing from its int8 shard")));
+        }
+        let float = tx.execute(&delete_sql, &params![*chunk_id])?;
+        if float != 1 {
+            return Err(reject(format!("vector mirror damaged: chunk_id={chunk_id} missing from the float mirror")));
+        }
+        deleted += 1;
     }
+    if !chunk_ids.is_empty() { bump_revision(tx, generation_id)?; }
     Ok(deleted)
 }
 
 /// Shared strict-name-parsing half of `list_vec0_generation_ids`/
 /// `list_vec0_generation_ids_in_tx` (T6, plan v5.1): whole-name regex match
-/// (`^vec_index_gen_(\d+)$`), not a `LIKE 'vec_index_gen_%'` prefix scan
-/// followed by loose parsing, so `vec0`'s own shadow tables for the same
+/// (`^vec_index_gen_(\d+)(?:_int8_shard_[0-7])?$`), not a prefix scan with
+/// loose parsing, so `vec0`'s own shadow tables for the same
 /// generation (e.g. `..._info`, `..._chunks`, `..._rowids`) are never
 /// mistaken for a second, differently-shaped "generation". Deduplicated and
 /// returned in ascending order. One regex compiled per caller-visible
 /// function, not duplicated as a second copy of the pattern string.
 fn parse_vec0_generation_table_names(names: &[String]) -> Vec<i64> {
-    let pattern = regex::Regex::new(r"^vec_index_gen_(\d+)$").expect("static regex must compile");
+    let pattern = regex::Regex::new(r"^vec_index_gen_(\d+)(?:_int8_shard_[0-7])?$").expect("static regex must compile");
     let mut ids: Vec<i64> = names
         .iter()
         .filter_map(|name| pattern.captures(name))
@@ -420,15 +691,20 @@ mod tests {
         // corroborated here on a freshly created `vec_index_gen_N` table
         // (w3-d8①: real measurement, not copied from that prior report).
         let table = vec0_table_name(gen_id);
+        let mut expected = vec![
+            table.clone(), format!("{table}_info"), format!("{table}_chunks"),
+            format!("{table}_rowids"), format!("{table}_vector_chunks00"),
+        ];
+        for shard in 0..INT8_SHARDS {
+            let table = int8_table_name(gen_id, shard).unwrap();
+            expected.extend([
+                table.clone(), format!("{table}_info"), format!("{table}_chunks"),
+                format!("{table}_rowids"), format!("{table}_vector_chunks00"),
+            ]);
+        }
         assert_eq!(
             names,
-            vec![
-                table.clone(),
-                format!("{table}_info"),
-                format!("{table}_chunks"),
-                format!("{table}_rowids"),
-                format!("{table}_vector_chunks00"),
-            ],
+            expected,
             "vec0 shadow table set drifted from the real-measured shape -- if this is an \
              intentional sqlite-vec version change, update this assertion from a fresh \
              sqlite3 enumeration, not from memory"
@@ -440,6 +716,22 @@ mod tests {
             after.is_empty(),
             "DROP TABLE on the main vec0 table must remove every shadow table too, left: {after:?}"
         );
+    }
+
+    #[test]
+    fn int8_only_generation_is_still_discovered_for_cleanup() {
+        let (_dir, conn) = scratch_conn();
+        let generation_id = create_generation(&conn, 4);
+        create_vec0_table_for_generation(&conn, generation_id, 4).unwrap();
+        conn.execute_batch(&format!("DROP TABLE vec_index_gen_{generation_id}")).unwrap();
+
+        assert_eq!(list_vec0_generation_ids(&conn).unwrap(), vec![generation_id]);
+        conn.with_tx_no_replay(TxMode::Immediate, |tx| {
+            assert_eq!(list_vec0_generation_ids_in_tx(tx)?, vec![generation_id]);
+            drop_vec0_table_for_generation_in_tx(tx, generation_id)
+        }).unwrap();
+        assert!(enumerate_vec0_tables_for_generation(&conn, generation_id).unwrap().is_empty());
+        assert!(list_vec0_generation_ids(&conn).unwrap().is_empty());
     }
 
     #[test]

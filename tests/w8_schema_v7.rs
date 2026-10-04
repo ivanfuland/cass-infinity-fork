@@ -29,7 +29,7 @@ fn v7_ddl_present() {
 
     let version: i64 =
         storage.raw().query_row_map("PRAGMA user_version;", &[], |row| row.get_typed(0)).expect("read user_version");
-    assert_eq!(version, 7, "fresh build must be schema 7");
+    assert_eq!(version, 8, "schema 8 must retain the PR8 layout");
 
     let cols = names(&storage, "SELECT name FROM pragma_table_info('conversations')");
     assert!(cols.contains(&"identity_host".to_string()), "conversations must have identity_host, got {cols:?}");
@@ -64,8 +64,8 @@ fn v6_library_requires_rebuild() {
 
     let err = schema::ensure(&conn).expect_err("ensure must reject a v6 database, not migrate it");
     assert!(
-        matches!(err, StorageError::SchemaRebuildRequired { found: 6, required: 7 }),
-        "expected SchemaRebuildRequired{{found: 6, required: 7}}, got {err:?}"
+        matches!(err, StorageError::SchemaRebuildRequired { found: 6, required: 8 }),
+        "expected SchemaRebuildRequired{{found: 6, required: 8}}, got {err:?}"
     );
 }
 

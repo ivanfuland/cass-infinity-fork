@@ -327,9 +327,22 @@ impl std::ops::Deref for SendConnection {
     }
 }
 
+/// Open the search client's raw read-only hydration connection.
+///
+/// PR9 task 07: this is the second read-only search entry -- it opens the
+/// archive directly through
+/// [`crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout`]
+/// and so does not inherit [`crate::storage::sqlite::FrankenStorage::open_readonly`]'s
+/// guard. The schema-version check therefore has to be repeated here, in the
+/// same order: read-only connection open, then version, then (only if the
+/// schema is current) the PRAGMAs and the hand-off to callers that run vector
+/// SQL. A rejected archive keeps the same "rebuild / use a matching binary"
+/// story as the shared entry, instead of surfacing later as a `vec0`
+/// int8/float type error from `search_db_vector_domain`.
 fn open_search_hydration_sqlite(path: &Path, timeout: Duration) -> Result<Connection> {
     let conn =
         crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, timeout)?;
+    crate::storage::sqlite::ensure_readonly_schema_current(&conn)?;
     conn.execute("PRAGMA query_only = 1;", &[])
         .with_context(|| "setting search hydration query_only")?;
     conn.execute("PRAGMA busy_timeout = 5000;", &[])
@@ -2179,12 +2192,19 @@ struct SemanticCandidateSearchRequest {
 /// T9 (plan v5.1): chunk-domain candidate-search mode a caller can observe
 /// via `CandidateMeta.mode` -- whether the KNN window alone satisfied
 /// `fetch_limit`, or a second, budgeted exact scan had to run.
+///
+/// PR9 task 06 adds `Exact`: when `fetch_limit` already exceeds what one
+/// `vec0` KNN pass can return (`SQLITE_VEC_KNN_K_MAX`) *and* the active
+/// generation holds more chunk rows than that ceiling, round 1 is skipped
+/// outright and every candidate comes from the budgeted exact scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CandidateMode {
     #[serde(rename = "knn")]
     Knn,
     #[serde(rename = "knn+exact")]
     KnnExact,
+    #[serde(rename = "exact")]
+    Exact,
 }
 
 /// T9 (plan v5.1): observability/diagnostics envelope for one chunk-domain
@@ -2193,25 +2213,145 @@ pub enum CandidateMode {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CandidateMeta {
     pub mode: CandidateMode,
-    /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`).
+    /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`), or
+    /// `0` on the `Exact` mode, where `vec0` was never called at all.
     pub k: usize,
     /// Raw `vec0` KNN row count, before the message-id fold or any
-    /// relational filter.
+    /// relational filter (`0` whenever no KNN round ran -- see `mode`).
     pub first_round_rows: usize,
     /// Final unique-message count in the returned candidate set (after
     /// folding, filtering, and -- if it ran -- the exact-scan round).
     pub unique_messages: usize,
     /// `true` iff a triggered exact-scan round hit `EXACT_SCAN_ROW_BUDGET`
     /// before it could confirm it had found every filter-passing message.
+    ///
+    /// Independent of `approximate`: this reports a scan that stopped early,
+    /// never a distance that was approximated. Neither field is derived from
+    /// the other.
     pub incomplete: bool,
     pub reason: Option<String>,
+    /// PR9 task 08: `true` iff the returned candidate set was produced by a
+    /// distance-approximating coarse screen instead of exact float
+    /// distances -- i.e. the caller can no longer assume the top-k order is
+    /// the true float order.
+    ///
+    /// Every path in this file computes exact float distances (the `vec0`
+    /// KNN round and the direct exact scan both compare the stored `f32`
+    /// vectors), so every construction site sets `false`. PR9 task 09 is
+    /// what introduces the real int8 coarse screen and flips it to `true`
+    /// on exactly the path that produces approximate candidates; until then
+    /// a `true` here would be a claim nothing in the build can back.
+    pub approximate: bool,
+    /// PR9 task 08: `k` requested for the coarse screen before any cap was
+    /// applied, for the approximate path task 09 adds.
+    ///
+    /// `None` on every exact/float path -- absence means "no coarse screen
+    /// ran here", which must never be read back as a measured `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_coarse_k: Option<usize>,
+    /// PR9 task 08: the `k` the coarse screen actually ran with after the
+    /// 4096 `SQLITE_VEC_KNN_K_MAX` cap and the corpus size were applied.
+    /// `None` on every exact/float path (see `requested_coarse_k`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_coarse_k: Option<usize>,
+    /// PR9 task 08: `true` iff `effective_coarse_k` was reduced by the 4096
+    /// cap rather than by the corpus. `None` when no coarse screen ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coarse_cap_hit: Option<bool>,
+    /// For a sharded screen, `true` when the collected pool covers the whole
+    /// active generation. The nominal per-shard K can exceed a small shard's
+    /// row count even when the generation as a whole is larger than K.
+    /// `None` when no coarse screen ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corpus_limited: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coarse_shard_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coarse_rows_collected: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub float_rescore_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coarse_skip_reason: Option<String>,
 }
 
+/// PR9 task 08: the two fixed wire values of the `search_precision` output
+/// field. A single spelling used by the JSON payload, both JSON fast paths,
+/// the JSONL `_meta` header and the human text renderer, so a consumer can
+/// match on the literal rather than on a per-surface string.
+const SEARCH_PRECISION_EXACT: &str = "exact";
+const SEARCH_PRECISION_APPROXIMATE: &str = "approximate";
+
 impl CandidateMeta {
+    /// PR9 task 08: complete a candidate meta whose candidates were scored by
+    /// exact float distances.
+    ///
+    /// Every construction site in this file goes through here, which is what
+    /// makes "which paths claim approximation" a one-line answer: none of
+    /// them do, and only PR9 task 09's int8 coarse screen will set
+    /// `approximate: true` / the four coarse-screen facts, on its own path.
+    /// Crate-visible so the output-layer test can drive the real serializer
+    /// with the same float-path meta the search layer really produces.
+    pub(crate) fn exact_float_path(
+        mode: CandidateMode,
+        k: usize,
+        first_round_rows: usize,
+        unique_messages: usize,
+        incomplete: bool,
+        reason: Option<String>,
+    ) -> Self {
+        CandidateMeta {
+            mode,
+            k,
+            first_round_rows,
+            unique_messages,
+            incomplete,
+            reason,
+            approximate: false,
+            requested_coarse_k: None,
+            effective_coarse_k: None,
+            coarse_cap_hit: None,
+            corpus_limited: None,
+            coarse_shard_count: None,
+            coarse_rows_collected: None,
+            float_rescore_rows: None,
+            coarse_skip_reason: None,
+        }
+    }
+
     /// Degenerate zero-candidate meta for an empty/zero-limit query that
     /// never reaches `search_db_vector_domain` at all.
     fn empty() -> Self {
-        CandidateMeta { mode: CandidateMode::Knn, k: 0, first_round_rows: 0, unique_messages: 0, incomplete: false, reason: None }
+        Self::exact_float_path(CandidateMode::Knn, 0, 0, 0, false, None)
+    }
+
+    /// PR9 task 08: the wire value a consumer reads in `search_precision`.
+    ///
+    /// `approximate` alone decides it. `incomplete` deliberately does not:
+    /// a scan that stopped at `EXACT_SCAN_ROW_BUDGET` still compares exact
+    /// float distances, so it is not an approximation and mapping it to
+    /// `approximate` would be a false claim about the distances.
+    pub fn search_precision(&self) -> &'static str {
+        if self.approximate {
+            SEARCH_PRECISION_APPROXIMATE
+        } else {
+            SEARCH_PRECISION_EXACT
+        }
+    }
+}
+
+impl SearchResult {
+    /// PR9 task 08: the single derivation every robot/human output surface
+    /// uses for `search_precision`.
+    ///
+    /// `Some` only when a chunk-domain semantic candidate search actually
+    /// ran. A lexical-only result, or a hybrid one whose semantic leg
+    /// degraded to lexical, carries `candidates: None`; those report `None`
+    /// here rather than inventing an `exact` claim about a search that never
+    /// looked at a vector at all.
+    pub fn search_precision(&self) -> Option<&'static str> {
+        self.candidates
+            .as_ref()
+            .map(CandidateMeta::search_precision)
     }
 }
 
@@ -2328,12 +2468,28 @@ struct SemanticQueryEmbedding {
 }
 
 pub struct SearchClient {
+    vector_search_mode: VectorSearchMode,
     sqlite: Mutex<Option<SendConnection>>,
     sqlite_path: Option<PathBuf>,
     prefix_cache: Mutex<CacheShards>,
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
+}
+
+/// Vector candidate strategy, independently of lexical/semantic/hybrid intent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum VectorSearchMode {
+    #[default]
+    Exact,
+    Fast,
+}
+
+// One-shot, thread-local synchronization for actual WAL interleaving tests.
+// Neither the hook nor any setter exists in product builds.
+#[cfg(test)]
+thread_local! {
+    static PR9_AFTER_MAIN_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3112,6 +3268,7 @@ impl SearchClient {
         let metrics = Metrics::default();
 
         Ok(Some(Self {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -3119,6 +3276,11 @@ impl SearchClient {
             cache_namespace,
             semantic: Mutex::new(None),
         }))
+    }
+
+    pub fn with_vector_search_mode(mut self, mode: VectorSearchMode) -> Self {
+        self.vector_search_mode = mode;
+        self
     }
 
     fn sqlite_guard(&self) -> Result<std::sync::MutexGuard<'_, Option<SendConnection>>> {
@@ -3135,6 +3297,22 @@ impl SearchClient {
                     *guard = Some(SendConnection(conn));
                 }
                 Err(err) => {
+                    // PR9 task 07: a schema-guard rejection is not a "no sqlite
+                    // backend" condition. The archive exists and is readable --
+                    // it is just not a schema this binary may read, and there is
+                    // no lexical or vector answer to be had from it. Degrading
+                    // to `None` here would resurface downstream as
+                    // `lex_domain_rebuild_state=absent -- run \`cass index
+                    // --full\``, which is the wrong remediation for a schema
+                    // mismatch and is exactly the misreport the guard exists to
+                    // prevent. Every other open failure (missing file, bad page
+                    // store, lock, I/O) keeps the debug-log + degrade-to-`None`
+                    // behaviour below.
+                    if let Some(rejection) =
+                        crate::storage::sqlite::readonly_schema_guard_rejection(&err)
+                    {
+                        return Err(anyhow!(rejection));
+                    }
                     tracing::debug!(
                         error = %err,
                         path = %path.display(),
@@ -3727,6 +3905,23 @@ impl SearchClient {
         1.0 - (dot / (norm_a * norm_b))
     }
 
+    fn sort_rescored_chunk_rows(rows: &mut [(i64, f64)]) {
+        rows.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    }
+
+    fn float_vec0_knn_in_tx(
+        tx: &crate::storage::api::Tx<'_>,
+        table: &str,
+        query_blob: &[u8],
+        k: i64,
+    ) -> Result<Vec<(i64, f64)>, StorageError> {
+        tx.query_all_map(
+            &format!("SELECT rowid, distance FROM {table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"),
+            &crate::storage::api::params![query_blob.to_vec(), k],
+            |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
+        )
+    }
+
     /// T9 (plan v5.1) chunk-domain KNN + MaxSim fold + budgeted exact-scan
     /// candidate search. Reads the active generation's `message_chunks` /
     /// `vec_index_gen_<id>` (rowid = `chunk_id` for a v5 chunk-domain
@@ -3769,6 +3964,18 @@ impl SearchClient {
         default_roles: Option<&HashSet<u8>>,
         fetch_limit: usize,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        Self::search_db_vector_domain_with_mode(conn, embedding, filters, default_roles, fetch_limit, None, VectorSearchMode::Exact)
+    }
+
+    fn search_db_vector_domain_with_mode(
+        conn: &Connection,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        default_roles: Option<&HashSet<u8>>,
+        fetch_limit: usize,
+        database_path: Option<&Path>,
+        strategy: VectorSearchMode,
+    ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         // R1-W3-B6/N1/B9 (inherited from the retired v4 path, still true
         // of this vec0 build): sqlite-vec's vec0 KNN implementation hard-
         // rejects `k > 4096` as a genuine `SQLITE_ERROR`, not a silent
@@ -3786,7 +3993,7 @@ impl SearchClient {
                 &[],
                 |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
             )?;
-            let Some((generation_id, _dim)) = active else {
+            let Some((generation_id, dim)) = active else {
                 let any_generation: i64 = tx.query_row_map(
                     "SELECT count(*) FROM embedding_generations",
                     &[],
@@ -3817,14 +4024,7 @@ impl SearchClient {
                 // Genuinely empty archive (w3-d7①): not an error.
                 return Ok((
                     Vec::new(),
-                    CandidateMeta {
-                        mode: CandidateMode::Knn,
-                        k: 0,
-                        first_round_rows: 0,
-                        unique_messages: 0,
-                        incomplete: false,
-                        reason: None,
-                    },
+                    CandidateMeta::exact_float_path(CandidateMode::Knn, 0, 0, 0, false, None),
                 ));
             }
 
@@ -3849,37 +4049,109 @@ impl SearchClient {
             }
 
             let row_count_usize = usize::try_from(row_count).unwrap_or(usize::MAX);
-            let k = fetch_limit
-                .saturating_mul(OVERFETCH_FACTOR)
-                .min(row_count_usize)
-                .min(SQLITE_VEC_KNN_K_MAX)
-                .max(1);
+
+            // PR9 task 06: when the caller asks for more messages than a
+            // single `vec0` KNN pass can return (`fetch_limit >
+            // SQLITE_VEC_KNN_K_MAX`) *and* this generation really holds
+            // more chunk rows than that ceiling, round 1's window is
+            // capped below `fetch_limit` by construction -- it can only
+            // ever produce a strict subset of what the exact scan below
+            // reads anyway, so running it is pure waste. Skip `vec0`
+            // entirely and scan the authoritative float rows directly.
+            // `k` and `first_round_rows` both report `0` so a caller can
+            // tell "vec0 was never called" apart from "vec0 was called and
+            // returned nothing"; the scan keeps the round-2 fallback's
+            // distance, filter and `EXACT_SCAN_ROW_BUDGET` semantics.
+            let direct_exact =
+                fetch_limit > SQLITE_VEC_KNN_K_MAX && row_count_usize > SQLITE_VEC_KNN_K_MAX;
+
+            let k = if direct_exact {
+                0
+            } else {
+                fetch_limit
+                    .saturating_mul(OVERFETCH_FACTOR)
+                    .min(row_count_usize)
+                    .min(SQLITE_VEC_KNN_K_MAX)
+                    .max(1)
+            };
 
             let blob = crate::storage::schema::f32_vector_to_le_blob(embedding);
             let k_i64 = i64::try_from(k).unwrap_or(i64::MAX);
             // Round 1: raw vec0 KNN over chunk_id rowids, ORDER BY distance
             // (ascending -- closest first). `first_round_rows` is this
             // row count exactly as returned, before any JOIN/fold/filter.
-            let raw_knn: Vec<(i64, f64)> = tx.query_all_map(
-                &format!(
-                    "SELECT rowid, distance FROM {vec0_table} WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
-                ),
-                &crate::storage::api::params![blob, k_i64],
-                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<f64>(1)?)),
-            )?;
+            // Never runs on the direct-exact path (see above).
+            let fast_requested = strategy == VectorSearchMode::Fast;
+            let mut coarse_ran = false;
+            let mut coarse_skip_reason = if fast_requested && direct_exact { Some("large_window".to_string()) } else { None };
+            if fast_requested && !direct_exact {
+                crate::storage::vector_domain::check_int8_layout(conn, generation_id, dim)?;
+            }
+            let mut raw_knn: Vec<(i64, f64)> = if direct_exact {
+                Vec::new()
+            } else if fast_requested {
+                use crate::storage::vector_domain::{self, Int8Candidates};
+                if usize::try_from(dim).ok() != Some(embedding.len()) {
+                    return Err(StorageError::Other { code: None, detail: "int8 query dimension mismatch".into() });
+                }
+                let snapshot = vector_domain::vector_snapshot_in_tx(tx, generation_id)?
+                    .ok_or_else(|| StorageError::Other { code: None, detail: "vector mirror damaged: missing instance identity".into() })?;
+                #[cfg(test)]
+                PR9_AFTER_MAIN_SNAPSHOT.with(|hook| {
+                    if let Some(action) = hook.borrow_mut().take() { action(); }
+                });
+                let query = vector_domain::quantize_unit_int8(conn, embedding)?;
+                let path = database_path.ok_or_else(|| StorageError::Other { code: None, detail: "fast vector search requires a file-backed database".into() })?;
+                match vector_domain::parallel_int8_candidates(path, &snapshot, &query, k)? {
+                    Int8Candidates::Matching { rows, corpus_rows } => {
+                        if corpus_rows != row_count_usize {
+                            return Err(StorageError::Other { code: None, detail: "vector mirror damaged: int8 corpus count mismatch".into() });
+                        }
+                        coarse_ran = true;
+                        rows
+                    }
+                    Int8Candidates::SnapshotMismatch => {
+                        coarse_skip_reason = Some("snapshot_mismatch".into());
+                        Self::float_vec0_knn_in_tx(tx, &vec0_table, &blob, k_i64)?
+                    }
+                }
+            } else {
+                Self::float_vec0_knn_in_tx(tx, &vec0_table, &blob, k_i64)?
+            };
             let first_round_rows = raw_knn.len();
 
-            if raw_knn.is_empty() {
+            if coarse_ran {
+                // Read/scoring is bounded per batch; retain only distances,
+                // never an all-candidate matrix of decoded vectors.
+                let ids: Vec<i64> = raw_knn.iter().map(|(id, _)| *id).collect();
+                let mut distances = HashMap::with_capacity(ids.len());
+                for batch in ids.chunks(500) {
+                    let sql = format!("SELECT chunk_id,generation_id,embedding FROM message_chunks WHERE chunk_id IN ({})", sql_placeholders(batch.len()));
+                    let params: Vec<ParamValue> = batch.iter().copied().map(ParamValue::from).collect();
+                    let rows: Vec<(i64, i64, Vec<u8>)> = tx.query_all_map(&sql, &params, |row| Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?)))?;
+                    for (id, generation, blob) in rows {
+                        let vector = crate::storage::schema::le_blob_to_f32_vector(&blob)?;
+                        if generation != generation_id || vector.len() != embedding.len()
+                            || vector.iter().any(|x| !x.is_finite() || !(-1.0..=1.0).contains(x))
+                            || vector.iter().all(|x| *x == 0.0) {
+                            return Err(StorageError::Other { code: None, detail: "vector mirror damaged: invalid authoritative float row".into() });
+                        }
+                        let distance = Self::cosine_distance(&vector, embedding);
+                        if !distance.is_finite() || distances.insert(id, distance).is_some() {
+                            return Err(StorageError::Other { code: None, detail: "vector mirror damaged: invalid float rescore".into() });
+                        }
+                    }
+                }
+                for (id, distance) in &mut raw_knn {
+                    *distance = *distances.get(id).ok_or_else(|| StorageError::Other { code: None, detail: "vector mirror damaged: int8 candidate has no authoritative row".into() })?;
+                }
+                Self::sort_rescored_chunk_rows(&mut raw_knn);
+            }
+
+            if raw_knn.is_empty() && !direct_exact {
                 return Ok((
                     Vec::new(),
-                    CandidateMeta {
-                        mode: CandidateMode::Knn,
-                        k,
-                        first_round_rows: 0,
-                        unique_messages: 0,
-                        incomplete: false,
-                        reason: None,
-                    },
+                    CandidateMeta::exact_float_path(CandidateMode::Knn, k, 0, 0, false, None),
                 ));
             }
 
@@ -3930,6 +4202,9 @@ impl SearchClient {
                 let Some((message_id, chunk_idx, byte_start, byte_end, content_hash)) =
                     provenance.get(chunk_id)
                 else {
+                    if coarse_ran {
+                        return Err(StorageError::Other { code: None, detail: "vector mirror damaged: missing candidate provenance".into() });
+                    }
                     continue;
                 };
                 if seen_messages.insert(*message_id) {
@@ -3949,19 +4224,27 @@ impl SearchClient {
             // table), same as the retired v4 path.
             let candidate_message_ids: Vec<i64> = folded.iter().map(|f| f.message_id).collect();
             let round1_folded_before_filter = folded.len();
-            let (sql, params) = Self::build_db_vector_domain_filter_sql(
-                &candidate_message_ids,
-                filters,
-                effective_roles.as_ref(),
-            );
-            let passing_ids: std::collections::HashSet<i64> =
-                tx.query_all_map(&sql, &params, |row| row.get_typed(0))?.into_iter().collect();
-            let mut filtered: Vec<ChunkFoldedCandidate> =
-                folded.into_iter().filter(|f| passing_ids.contains(&f.message_id)).collect();
+            let mut filtered: Vec<ChunkFoldedCandidate> = if candidate_message_ids.is_empty() {
+                // Nothing was folded -- either the direct-exact path never
+                // called `vec0` at all, or every KNN chunk failed its
+                // provenance lookup. Either way an id-keyed filter has no
+                // input to run against.
+                Vec::new()
+            } else {
+                // Eight shards can yield 32,768 distinct messages, exceeding
+                // SQLite's bind-variable ceiling before filter parameters.
+                let batch_rows = if coarse_ran { CHUNK_PROVENANCE_BATCH_ROWS } else { candidate_message_ids.len() };
+                let mut passing_ids = std::collections::HashSet::<i64>::new();
+                for batch in candidate_message_ids.chunks(batch_rows) {
+                    let (sql, params) = Self::build_db_vector_domain_filter_sql(batch, filters, effective_roles.as_ref());
+                    passing_ids.extend(tx.query_all_map(&sql, &params, |row| row.get_typed::<i64>(0))?);
+                }
+                folded.into_iter().filter(|f| passing_ids.contains(&f.message_id)).collect()
+            };
 
             let round1_unique_messages = filtered.len();
             // Plan v5.1: "窗满 ⟺ first_round_rows == min(k, 该代际 vec0 总行数)".
-            let window_full = first_round_rows == k.min(row_count_usize);
+            let window_full = coarse_ran || first_round_rows == k.min(row_count_usize);
             // T9 part 2 fix (plan v5.1 KNN row, "语料本就少于 limit（窗未满）→
             // incomplete=false"): when round1's raw KNN window already
             // covered every row this generation has (`first_round_rows ==
@@ -3982,12 +4265,23 @@ impl SearchClient {
             let corpus_exhausted_without_filter_loss = first_round_rows == row_count_usize
                 && round1_unique_messages == round1_folded_before_filter;
 
-            let mut mode = CandidateMode::Knn;
+            // Direct-exact never ran round 1, so its exact scan is
+            // unconditional; otherwise the scan runs only when round 1's
+            // saturated window still fell short of `fetch_limit` after the
+            // relational filter (see the long note above).
+            let exact_scan_needed = direct_exact
+                || (window_full
+                    && round1_unique_messages < fetch_limit
+                    && !corpus_exhausted_without_filter_loss);
+
+            let mut mode = if direct_exact { CandidateMode::Exact } else { CandidateMode::Knn };
             let mut incomplete = false;
             let mut reason: Option<String> = None;
 
-            if window_full && round1_unique_messages < fetch_limit && !corpus_exhausted_without_filter_loss {
-                mode = CandidateMode::KnnExact;
+            if exact_scan_needed {
+                if !direct_exact {
+                    mode = CandidateMode::KnnExact;
+                }
                 let still_needed = fetch_limit - round1_unique_messages;
                 let budget = effective_exact_scan_row_budget();
                 let (sql, params) =
@@ -4053,17 +4347,24 @@ impl SearchClient {
                 filtered.extend(extra);
             }
 
-            let unique_messages = filtered.len();
-
             // Final stable order (plan v5.1): score desc, message_id asc.
-            filtered.sort_by(|a, b| {
-                let score_a = (1.0 - a.distance) as f32;
-                let score_b = (1.0 - b.distance) as f32;
-                score_b
-                    .partial_cmp(&score_a)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.message_id.cmp(&b.message_id))
-            });
+            if coarse_ran {
+                // Keep the original f32 BLOB's f64 rescore precision through
+                // selection. Casting before ranking can erase a real winner.
+                filtered.sort_by(|a, b| a.distance.total_cmp(&b.distance).then_with(|| a.message_id.cmp(&b.message_id)));
+            } else {
+                filtered.sort_by(|a, b| {
+                    let score_a = (1.0 - a.distance) as f32;
+                    let score_b = (1.0 - b.distance) as f32;
+                    score_b
+                        .partial_cmp(&score_a)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.message_id.cmp(&b.message_id))
+                });
+            }
+
+            if coarse_ran { filtered.truncate(fetch_limit); }
+            let unique_messages = filtered.len();
 
             let results: Vec<VectorSearchResult> = filtered
                 .into_iter()
@@ -4078,10 +4379,27 @@ impl SearchClient {
                 })
                 .collect();
 
-            Ok((
-                results,
-                CandidateMeta { mode, k, first_round_rows, unique_messages, incomplete, reason },
-            ))
+            let mut meta = CandidateMeta::exact_float_path(
+                    mode,
+                    k,
+                    first_round_rows,
+                    unique_messages,
+                    incomplete,
+                    reason,
+                );
+            meta.coarse_skip_reason = coarse_skip_reason;
+            if coarse_ran {
+                let requested = fetch_limit.saturating_mul(4);
+                meta.approximate = true;
+                meta.requested_coarse_k = Some(requested);
+                meta.effective_coarse_k = Some(k);
+                meta.coarse_cap_hit = Some(requested > SQLITE_VEC_KNN_K_MAX && row_count_usize > SQLITE_VEC_KNN_K_MAX);
+                meta.corpus_limited = Some(first_round_rows == row_count_usize);
+                meta.coarse_shard_count = Some(crate::storage::vector_domain::INT8_SHARDS);
+                meta.coarse_rows_collected = Some(first_round_rows);
+                meta.float_rescore_rows = Some(first_round_rows);
+            }
+            Ok((results, meta))
         })
         .map_err(|err: crate::storage::api::StorageError| anyhow!(err.to_string()))
     }
@@ -4104,17 +4422,37 @@ impl SearchClient {
         filters: &SearchFilters,
         request: SemanticCandidateSearchRequest,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
-        let sqlite_guard = self.sqlite_guard()?;
+        self.search_vector_candidates(embedding, filters, context.roles.as_ref(), request.fetch_limit)
+    }
+
+    /// Form candidates from a caller-supplied query vector without embedding it.
+    /// Used by the semantic dispatcher and independent vector-domain probes.
+    pub fn search_vector_candidates(
+        &self,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        default_roles: Option<&HashSet<u8>>,
+        fetch_limit: usize,
+    ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        let mut sqlite_guard = self.sqlite_guard()?;
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("db vector domain search requires a database connection"))?;
-        Self::search_db_vector_domain(
+        let result = if self.vector_search_mode == VectorSearchMode::Exact {
+            Self::search_db_vector_domain(
             conn,
             embedding,
             filters,
-            context.roles.as_ref(),
-            request.fetch_limit,
-        )
+            default_roles,
+            fetch_limit,
+            )
+        } else {
+            Self::search_db_vector_domain_with_mode(conn, embedding, filters, default_roles, fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode)
+        };
+        if result.as_ref().err().is_some_and(|e| e.to_string().contains("vector_database_changed")) {
+            *sqlite_guard = None;
+        }
+        result
     }
 
     /// Semantic search over the DB-vector-domain candidate path.
@@ -8230,6 +8568,7 @@ mod tests {
     #[test]
     fn cache_skips_complex_queries() {
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -8272,6 +8611,7 @@ mod tests {
     #[test]
     fn cache_prefix_lookup_handles_utf8_boundaries() {
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -8783,6 +9123,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -8845,6 +9186,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -8925,6 +9267,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9007,6 +9350,7 @@ mod tests {
         // Opening via sqlite_guard() must remain read-only. A search path
         // should not trigger heavyweight derived-index repair.
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9136,6 +9480,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9256,6 +9601,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9321,6 +9667,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9421,6 +9768,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9505,6 +9853,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9629,6 +9978,7 @@ mod tests {
         }
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9689,6 +10039,7 @@ mod tests {
         &[])?;
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9773,6 +10124,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9849,6 +10201,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9915,6 +10268,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -9995,6 +10349,7 @@ mod tests {
         )?;
 
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -10022,6 +10377,7 @@ mod tests {
     #[test]
     fn cache_total_cap_evicts_across_shards() {
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
@@ -10072,6 +10428,7 @@ mod tests {
     #[test]
     fn cache_stats_reflect_metrics() {
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -10102,6 +10459,7 @@ mod tests {
     fn cache_eviction_count_tracks_evictions() {
         // tiny entry cap (2 entries), no byte cap - forces evictions
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
@@ -10317,6 +10675,7 @@ mod tests {
     fn cache_byte_cap_triggers_eviction() {
         // Large entry cap (1000), tiny byte cap (100 bytes) - forces byte-based evictions
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
@@ -11648,6 +12007,7 @@ mod tests {
     #[test]
     fn search_with_fallback_emits_wildcard_suggestion_on_zero_hits() -> Result<()> {
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -11730,6 +12090,7 @@ mod tests {
     fn search_with_fallback_skips_for_nonzero_offset() -> Result<()> {
         // Even with zero hits, fallback should not run when paginating (offset > 0)
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -11766,6 +12127,7 @@ mod tests {
     fn generate_suggestions_limits_and_sets_shortcuts() -> Result<()> {
         // Build a client without backends; suggestions are purely local heuristics
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -12569,6 +12931,7 @@ mod tests {
     fn filter_fidelity_cache_key_isolation() {
         // Different filters should have different cache keys
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13407,6 +13770,7 @@ mod tests {
     #[test]
     fn cache_metrics_incremented_on_operations() {
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -13437,6 +13801,7 @@ mod tests {
     fn cache_shard_name_deterministic() {
         // Verify that shard name generation is deterministic for same filters
         let client = SearchClient {
+            vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
@@ -17468,7 +17833,13 @@ mod tests {
     /// budget must cut a scan short (not error) once more filter-passing
     /// rows exist than the budget allows, reporting the result as
     /// incomplete rather than silently truncating without a signal.
+    ///
+    /// `#[serial]`: shares the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
+    /// atomic with `pr9_direct_exact_budget_marks_incomplete`, so the two
+    /// must not interleave (the first to finish would otherwise reset the
+    /// budget mid-scan for the other).
     #[test]
+    #[serial_test::serial]
     fn semantic_exact_scan_row_budget_marks_incomplete() {
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
@@ -17938,6 +18309,332 @@ mod tests {
         )
     }
 
+    fn pr9_fast_fixture() -> (TempDir, FrankenStorage, i64, SearchClient) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        let generation = seed_filter_fidelity_fixture(&storage);
+        let client = SearchClient::open(&dir.path().join("index"), Some(&path)).unwrap().unwrap()
+            .with_vector_search_mode(VectorSearchMode::Fast);
+        (dir, storage, generation, client)
+    }
+
+    #[test]
+    fn pr9_fast_huge_fetch_saturates_the_coarse_request_without_wrapping() {
+        let (_dir, _storage, _generation, client) = pr9_fast_fixture();
+        let (hits, meta) = client.search_vector_candidates(
+            &[0.5;4], &SearchFilters::default(), None, usize::MAX,
+        ).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(meta.requested_coarse_k, Some(usize::MAX));
+        assert_eq!(meta.effective_coarse_k, Some(4));
+        assert_eq!(meta.coarse_cap_hit, Some(false));
+        assert_eq!(meta.corpus_limited, Some(true));
+        assert!(meta.approximate);
+    }
+
+    #[test]
+    fn pr9_fast_empty_active_generation_has_no_coarse_claim() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        seed_active_generation_with_chunk_vectors(&storage, 2, &[]);
+        let client = SearchClient::open(&dir.path().join("index"), Some(&path))
+            .unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        let (hits, meta) = client.search_vector_candidates(
+            &[1.0, 0.0], &SearchFilters::default(), None, 10,
+        ).unwrap();
+        assert!(hits.is_empty());
+        assert!(!meta.approximate);
+        assert_eq!(meta.first_round_rows, 0);
+        assert_eq!(meta.coarse_shard_count, None);
+        assert_eq!(meta.coarse_rows_collected, None);
+        assert_eq!(meta.float_rescore_rows, None);
+        assert_eq!(meta.coarse_skip_reason, None);
+    }
+
+    #[test]
+    fn pr9_fast_filter_loss_uses_budgeted_float_fallback() {
+        const N: i64 = 200;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cass.db");
+        let storage = FrankenStorage::open(&path).unwrap();
+        let mut vectors = Vec::new();
+        for id in 1..=N {
+            seed_db3_message(&storage, &Db3SeedMessage {
+                agent_slug: if id == N { "codex" } else { "claude" },
+                workspace_path: None, source_id: "local", role: "user",
+                created_at: 100, message_id: id, conversation_id: id,
+            });
+            let vector = if id == N { vec![1.0, 0.5, 0.0, 0.0] } else { vec![1.0, 0.0, 0.0, 0.0] };
+            vectors.push((id, id, vector));
+        }
+        seed_active_generation_with_chunk_vectors(&storage, 4, &vectors);
+        let filters = SearchFilters {
+            agents: HashSet::from(["codex".to_string()]),
+            ..Default::default()
+        };
+        let (exact, _) = SearchClient::search_db_vector_domain(
+            storage.raw(), &[1.0, 0.0, 0.0, 0.0], &filters, None, 3,
+        ).unwrap();
+        let client = SearchClient::open(&dir.path().join("index"), Some(&path))
+            .unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        let (fast, meta) = client.search_vector_candidates(
+            &[1.0, 0.0, 0.0, 0.0], &filters, None, 3,
+        ).unwrap();
+
+        assert_eq!(exact.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), vec![N as u64]);
+        assert_eq!(fast.iter().map(|hit| hit.message_id).collect::<Vec<_>>(), vec![N as u64]);
+        assert_eq!(meta.mode, CandidateMode::KnnExact);
+        assert_eq!(meta.k, 12);
+        assert_eq!(meta.first_round_rows, 96);
+        assert_eq!(meta.coarse_rows_collected, Some(96));
+        assert_eq!(meta.float_rescore_rows, Some(96));
+        assert_eq!(meta.corpus_limited, Some(false));
+        assert!(meta.approximate);
+        assert!(!meta.incomplete);
+    }
+
+    #[test]
+    fn pr9_fast_all_shards_are_float_scored_and_filters_preserve_identity() {
+        let (_dir, storage, _generation, client) = pr9_fast_fixture();
+        let query = [0.5, 0.5, 0.5, 0.5];
+        for filters in [
+            SearchFilters::default(),
+            SearchFilters { agents: HashSet::from(["codex".to_string()]), ..Default::default() },
+            SearchFilters { roles: Some(HashSet::from([crate::search::vector_index::ROLE_ASSISTANT])), ..Default::default() },
+            SearchFilters { source_filter: crate::sources::provenance::SourceFilter::SourceId("remote-host".into()), ..Default::default() },
+            SearchFilters { created_from: Some(250), created_to: Some(350), ..Default::default() },
+            SearchFilters { agents: HashSet::from(["codex".to_string()]), source_filter: crate::sources::provenance::SourceFilter::SourceId("remote-host".into()), ..Default::default() },
+        ] {
+            let (exact, _) = SearchClient::search_db_vector_domain(storage.raw(), &query, &filters, None, 10).unwrap();
+            let (fast, meta) = client.search_vector_candidates(&query, &filters, None, 10).unwrap();
+            assert_eq!(fast.len(), exact.len());
+            for (a,b) in fast.iter().zip(&exact) {
+                assert_eq!(a.message_id,b.message_id);
+                assert_eq!(a.chunk_idx,b.chunk_idx);
+                assert_eq!(a.chunk_span,b.chunk_span);
+                assert_eq!(a.chunk_hash,b.chunk_hash);
+                assert!((a.score-b.score).abs()<1e-6);
+            }
+            assert_eq!(meta.coarse_shard_count,Some(8));
+            assert_eq!(meta.coarse_rows_collected,Some(4));
+            assert_eq!(meta.float_rescore_rows,Some(4));
+            assert_eq!(meta.corpus_limited,Some(true));
+            assert!(meta.approximate);
+        }
+    }
+
+    #[test]
+    fn pr9_fast_rescores_candidates_outside_the_global_quantized_top_k() {
+        let dir=TempDir::new().unwrap();
+        let path=dir.path().join("cass.db");
+        let storage=FrankenStorage::open(&path).unwrap();
+        let mut vectors=Vec::new();
+        for id in 1..=16 {
+            seed_db3_message(&storage,&Db3SeedMessage {agent_slug:"codex",workspace_path:None,source_id:"local",role:"user",created_at:100,message_id:id,conversation_id:id});
+            vectors.push((id,id,vec![1.0,if id==8 {0.003} else {0.001},0.0,0.0]));
+        }
+        seed_active_generation_with_chunk_vectors(&storage,4,&vectors);
+        let client=SearchClient::open(&dir.path().join("index"),Some(&path)).unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        let (hits,meta)=client.search_vector_candidates(&[1.0,0.003,0.0,0.0],&SearchFilters::default(),None,1).unwrap();
+        assert_eq!(hits.len(),1);
+        assert_eq!(hits[0].message_id,8,"all int8 distances tie; global int8 top4 would omit this float winner");
+        assert_eq!(meta.effective_coarse_k,Some(4));
+        assert_eq!(meta.float_rescore_rows,Some(16));
+        assert_eq!(meta.first_round_rows,16);
+        assert_eq!(meta.corpus_limited,Some(true));
+    }
+
+    #[test]
+    fn pr9_fast_equal_float_chunks_choose_the_lowest_chunk_id() {
+        let dir=TempDir::new().unwrap();
+        let path=dir.path().join("cass.db");
+        let storage=FrankenStorage::open(&path).unwrap();
+        seed_db3_message(&storage,&Db3SeedMessage {agent_slug:"codex",workspace_path:None,source_id:"local",role:"user",created_at:100,message_id:1,conversation_id:1});
+        let generation=seed_active_generation_with_chunk_vectors(&storage,4,&[(1,1,vec![1.0,0.0,0.0,0.0])]);
+        storage.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate,|tx| {
+            let id=crate::storage::schema::insert_chunk_row_in_tx(tx,&crate::storage::schema::ChunkRow {
+                generation_id:generation,message_id:1,conversation_id:1,chunk_idx:1,byte_start:1,byte_end:2,content_hash:"other span".into(),embedding:vec![1.0,0.0,0.0,0.0],norm:1.0,created_at_ms:100,
+            })?;
+            let blob=crate::storage::schema::f32_vector_to_le_blob(&[1.0,0.0,0.0,0.0]);
+            crate::storage::vector_domain::insert_vec0_rows_in_tx(tx,generation,&[(id,blob.as_slice())])?;
+            Ok(())
+        }).unwrap();
+        let client=SearchClient::open(&dir.path().join("index"),Some(&path)).unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        let (hits,meta)=client.search_vector_candidates(&[1.0,0.0,0.0,0.0],&SearchFilters::default(),None,1).unwrap();
+        assert_eq!(hits[0].chunk_idx,0);
+        assert_eq!(meta.float_rescore_rows,Some(2));
+    }
+
+    #[test]
+    fn pr9_fast_rescored_order_ignores_shuffled_shard_arrival() {
+        let original: Vec<(i64, f64)> = (1..=8)
+            .map(|id| (id, if id <= 4 { 0.1 } else { 0.2 }))
+            .collect();
+        for seed in 0_u64..32 {
+            let mut shuffled = original.clone();
+            let mut state = seed + 1;
+            for i in (1..shuffled.len()).rev() {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let j = (state % (i as u64 + 1)) as usize;
+                shuffled.swap(i, j);
+            }
+            SearchClient::sort_rescored_chunk_rows(&mut shuffled);
+            assert_eq!(shuffled.iter().map(|(id, _)| *id).collect::<Vec<_>>(), (1_i64..=8).collect::<Vec<_>>());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr9_fast_database_replacement_errors_and_next_call_reopens() {
+        let (dir,storage,_generation,client)=pr9_fast_fixture();
+        // Checkpoint the old fixture before opening the reader; the test then
+        // moves old sidecars together rather than mixing two WAL databases.
+        storage.raw().query_row_map("PRAGMA wal_checkpoint(TRUNCATE)",&[],|row|row.get_typed::<i64>(0)).unwrap();
+        drop(storage);
+        let path=dir.path().join("cass.db");
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut()=Some(Box::new(move || {
+            let replacement_path=path.with_file_name("replacement.db");
+            let replacement=FrankenStorage::open(&replacement_path).unwrap();
+            seed_db3_message(&replacement,&Db3SeedMessage {agent_slug:"codex",workspace_path:None,source_id:"local",role:"user",created_at:100,message_id:77,conversation_id:77});
+            seed_active_generation_with_chunk_vectors(&replacement,4,&[(77,77,vec![0.5;4])]);
+            let busy=replacement.raw().query_row_map("PRAGMA wal_checkpoint(TRUNCATE)",&[],|row|row.get_typed::<i64>(0)).unwrap();
+            assert_eq!(busy,0);
+            drop(replacement);
+            std::fs::rename(&path,path.with_file_name("retained-old.db")).unwrap();
+            for suffix in ["-wal","-shm"] {
+                let old=std::path::PathBuf::from(format!("{}{suffix}",path.display()));
+                if old.exists() { std::fs::rename(old,path.with_file_name(format!("retained-old.db{suffix}"))).unwrap(); }
+            }
+            std::fs::rename(replacement_path,&path).unwrap();
+        })));
+        let error=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap_err();
+        assert!(error.to_string().contains("vector_database_changed"),"{error:#}");
+        let (hits,meta)=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap();
+        assert_eq!(hits.len(),1);
+        assert_eq!(hits[0].message_id,77);
+        assert!(meta.approximate);
+    }
+
+    #[test]
+    fn pr9_fast_rejects_invalid_queries_and_missing_layout() {
+        let (_dir, storage, generation, client) = pr9_fast_fixture();
+        for query in [vec![0.0;4],vec![f32::NAN,0.0,0.0,0.0],vec![1.1,0.0,0.0,0.0],vec![1.0,0.0]] {
+            assert!(client.search_vector_candidates(&query,&SearchFilters::default(),None,10).is_err());
+        }
+        storage.raw().execute_batch(&format!("DROP TABLE vec_index_gen_{generation}_int8_shard_7")).unwrap();
+        let error=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap_err();
+        assert!(error.to_string().contains("missing int8 mirror"));
+    }
+
+    #[test]
+    fn pr9_fast_rejects_an_orphan_candidate_even_when_shard_count_matches() {
+        let (_dir, storage, generation, client) = pr9_fast_fixture();
+        let shard = format!("vec_index_gen_{generation}_int8_shard_1");
+        let blob: Vec<u8> = storage.raw().query_row_map(
+            &format!("SELECT embedding FROM {shard} WHERE rowid=1"),
+            &[], |row| row.get_typed(0),
+        ).unwrap();
+        storage.raw().execute(
+            &format!("INSERT INTO {shard}(rowid,embedding) VALUES(9,vec_int8(?1))"),
+            &crate::storage::api::params![blob],
+        ).unwrap();
+        storage.raw().execute(
+            &format!("DELETE FROM {shard} WHERE rowid=1"), &[],
+        ).unwrap();
+        let error = client.search_vector_candidates(
+            &[0.5;4], &SearchFilters::default(), None, 10,
+        ).unwrap_err();
+        assert!(error.to_string().contains("candidate has no authoritative row"), "{error:#}");
+    }
+
+    #[test]
+    fn pr9_fast_propagates_a_worker_table_error_without_exact_fallback() {
+        let (dir, _storage, generation, client) = pr9_fast_fixture();
+        let path = dir.path().join("cass.db");
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let writer = FrankenStorage::open(&path).unwrap();
+            writer.raw().execute_batch(&format!(
+                "DROP TABLE vec_index_gen_{generation}_int8_shard_7"
+            )).unwrap();
+        })));
+        let error = client.search_vector_candidates(
+            &[0.5;4], &SearchFilters::default(), None, 10,
+        ).unwrap_err();
+        assert!(error.to_string().contains("no such table"), "{error:#}");
+    }
+
+    #[test]
+    fn pr9_fast_wal_insert_between_main_and_worker_snapshots_uses_main_exact() {
+        let (dir, _storage, generation, client)=pr9_fast_fixture();
+        let path=dir.path().join("cass.db");
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut()=Some(Box::new(move || {
+            let writer=FrankenStorage::open(&path).unwrap();
+            seed_db3_message(&writer,&Db3SeedMessage {agent_slug:"codex",workspace_path:None,source_id:"local",role:"user",created_at:500,message_id:99,conversation_id:99});
+            writer.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate,|tx| {
+                let id=crate::storage::schema::insert_chunk_row_in_tx(tx,&crate::storage::schema::ChunkRow {
+                    generation_id:generation,message_id:99,conversation_id:99,chunk_idx:0,byte_start:0,byte_end:1,content_hash:"new".into(),embedding:vec![0.5;4],norm:1.0,created_at_ms:500,
+                })?;
+                let blob=crate::storage::schema::f32_vector_to_le_blob(&[0.5;4]);
+                crate::storage::vector_domain::insert_vec0_rows_in_tx(tx,generation,&[(id,blob.as_slice())])?;
+                Ok(())
+            }).unwrap();
+        })));
+        let (hits,meta)=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap();
+        assert_eq!(hits.iter().map(|h|h.message_id).collect::<Vec<_>>(),vec![1,2,3,4]);
+        assert_eq!(meta.coarse_skip_reason.as_deref(),Some("snapshot_mismatch"));
+        assert_eq!(meta.mode,CandidateMode::Knn);
+        assert_eq!(meta.k,4);
+        assert_eq!(meta.first_round_rows,4);
+        assert!(!meta.approximate);
+    }
+
+    #[test]
+    fn pr9_fast_wal_delete_between_snapshots_preserves_the_old_row() {
+        let (dir, _storage, generation, client)=pr9_fast_fixture();
+        let path=dir.path().join("cass.db");
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut()=Some(Box::new(move || {
+            let writer=FrankenStorage::open(&path).unwrap();
+            writer.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate,|tx| {
+                crate::storage::vector_domain::delete_vec0_rows_in_tx(tx,generation,&[1])?;
+                tx.execute("DELETE FROM message_chunks WHERE chunk_id=1",&[])?;
+                Ok(())
+            }).unwrap();
+        })));
+        let (hits,meta)=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap();
+        assert!(hits.iter().any(|h|h.message_id==1));
+        assert_eq!(hits.len(),4);
+        assert_eq!(meta.coarse_skip_reason.as_deref(),Some("snapshot_mismatch"));
+        assert_eq!(meta.mode,CandidateMode::Knn);
+        assert_eq!(meta.k,4);
+        assert_eq!(meta.first_round_rows,4);
+        assert!(!meta.approximate);
+    }
+
+    #[test]
+    fn pr9_fast_wal_generation_switch_and_cleanup_use_the_old_main_snapshot() {
+        let (dir, _storage, generation, client)=pr9_fast_fixture();
+        let path=dir.path().join("cass.db");
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut()=Some(Box::new(move || {
+            let writer=FrankenStorage::open(&path).unwrap();
+            seed_active_generation_with_chunk_vectors(&writer,4,&[(1,1,vec![0.5;4])]);
+            writer.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate,|tx| {
+                crate::storage::vector_domain::drop_vec0_table_for_generation_in_tx(tx,generation)?;
+                tx.execute("DELETE FROM message_chunks WHERE generation_id=?1",&crate::storage::api::params![generation])?;
+                tx.execute("DELETE FROM embedding_generations WHERE id=?1",&crate::storage::api::params![generation])?;
+                Ok(())
+            }).unwrap();
+        })));
+        let (hits,meta)=client.search_vector_candidates(&[0.5;4],&SearchFilters::default(),None,10).unwrap();
+        assert_eq!(hits.len(),4);
+        assert_eq!(meta.coarse_skip_reason.as_deref(),Some("snapshot_mismatch"));
+        assert_eq!(meta.mode,CandidateMode::Knn);
+        assert_eq!(meta.k,4);
+        assert_eq!(meta.first_round_rows,4);
+        assert!(!meta.approximate);
+    }
+
     fn db3_message_ids(storage: &FrankenStorage, filters: &SearchFilters) -> Vec<u64> {
         let (results, _retry) = SearchClient::search_db_vector_domain(
             storage.raw(),
@@ -18329,11 +19026,23 @@ mod tests {
         // (4,200 docs, dim=4) precisely so this exact-scan round is cheap,
         // matching its own doc comment ("only the k-value itself is under
         // test here, not ... realistic-scale latency").
+        // PR9 task 06 changed which mode this scenario reports, not what it
+        // returns: `fetch_limit` (80,016) exceeds `SQLITE_VEC_KNN_K_MAX`
+        // *and* the generation holds more rows than that ceiling (4,200),
+        // so the KNN round can only ever return 4,096 of the 80,016
+        // requested -- strictly less than the exact scan reads anyway.
+        // The whole `vec0` round is now skipped, and the exact scan is the
+        // only source of candidates, which is what `Exact` says. Before
+        // this change the same input ran the KNN round first (4,096 rows),
+        // then the exact scan for the remaining 104 -- same 4,200 results,
+        // same scores, same order, one wasted 4,096-row KNN pass.
         assert_eq!(
             meta.mode,
-            CandidateMode::KnnExact,
-            "the k-max clamp leaves the corpus (4,200) short of fetch_limit(80,016), driving the exact-scan round"
+            CandidateMode::Exact,
+            "fetch_limit > SQLITE_VEC_KNN_K_MAX on a >4096-row generation must skip vec0 entirely"
         );
+        assert_eq!(meta.k, 0, "the direct-exact path never calls vec0, so no k was ever passed to it");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran, so it returned no rows");
         assert!(
             !meta.incomplete,
             "4,200 docs is nowhere near EXACT_SCAN_ROW_BUDGET -- the exact scan completes comfortably"
@@ -18342,6 +19051,311 @@ mod tests {
             results.len(),
             TOTAL_DOCS as usize,
             "an unfiltered corpus smaller than fetch_limit must come back in full, not clamped to k-max(4096)"
+        );
+    }
+
+    /// PR9 task 06: when `fetch_limit` is already past what a single `vec0`
+    /// KNN pass can return (`SQLITE_VEC_KNN_K_MAX` = 4,096) *and* the
+    /// active generation holds more chunk rows than that ceiling, round 1
+    /// is skipped outright (`mode=exact`, `k=0`, `first_round_rows=0`) and
+    /// the whole candidate set comes from the budgeted exact scan. Both an
+    /// unfiltered query and a highly selective one must return exactly the
+    /// message ids, float scores and order the authoritative cosine
+    /// distance implies -- the expectation is derived here, never read
+    /// back out of a production path, and no KNN round is retained to
+    /// fake the skip.
+    ///
+    /// The corpus mirrors the sibling k-max test's 4,200-doc, dim=4 shape
+    /// (same "keep fixture setup fast, only the branch is under test"
+    /// argument), with the first `TARGET_DOCS` docs placed in
+    /// `/ws/target`. Doc `i` holds `[cos θ, sin θ, 0, 0]` for
+    /// `θ = i * THETA_STEP` against a `[1, 0, 0, 0]` query, so its true
+    /// similarity is `cos θ`. `THETA_STEP` is chosen so every `θ` stays
+    /// well below π: cosine is then strictly decreasing over the whole
+    /// fixture, which makes "score desc, message_id asc" exactly "index
+    /// asc" with no tie or precision ambiguity.
+    ///
+    /// `#[serial]`: `#[serial]` only excludes *other* `#[serial]` tests, so
+    /// without this the test below -- which shrinks the process-global
+    /// `EXACT_SCAN_ROW_BUDGET_OVERRIDE` to 10 for the duration of its own
+    /// scan -- can run concurrently with this one and flip these
+    /// `incomplete` assertions. Observed for real on this branch's first
+    /// default-parallel run (`focused-2`: 1 passed, 1 failed at the
+    /// `nowhere near EXACT_SCAN_ROW_BUDGET` assertion).
+    #[test]
+    #[serial_test::serial]
+    fn pr9_direct_exact_when_fetch_exceeds_vec0_limit() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const TOTAL_DOCS: i64 = 4_200;
+        const TARGET_DOCS: i64 = 50;
+        const BASE_ID: i64 = 4_000_000;
+        // Mirrors exec60's observed derived-k crash value for `--limit
+        // 5000` in hybrid mode -- the same number the sibling k-max test
+        // uses -- and is comfortably past SQLITE_VEC_KNN_K_MAX.
+        const FETCH_LIMIT: usize = 80_016;
+        // Exactly at the ceiling, not past it: the branch's other side.
+        const K_MAX_FETCH_LIMIT: usize = 4_096;
+        const THETA_STEP: f32 = 0.0005;
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let other_ws = storage.ensure_workspace(std::path::Path::new("/ws/other"), None).unwrap();
+        let target_ws = storage.ensure_workspace(std::path::Path::new("/ws/target"), None).unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = BASE_ID + i;
+                let workspace_id = if i < TARGET_DOCS { target_ws } else { other_ws };
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, workspace_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, ?3, 'local', 't', ?4)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(workspace_id),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + i],
+                )?;
+                let theta = (i as f32) * THETA_STEP;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
+
+        let roles = HashSet::from([
+            crate::search::vector_index::ROLE_USER,
+            crate::search::vector_index::ROLE_ASSISTANT,
+            crate::search::vector_index::ROLE_TOOL,
+        ]);
+        // `(message_id, authoritative cosine similarity)` for doc indices
+        // `idxs`, already in "score desc, message_id asc" order because
+        // THETA_STEP keeps cosine strictly decreasing over the fixture.
+        let expected = |idxs: std::ops::Range<i64>| -> Vec<(u64, f32)> {
+            idxs.map(|i| ((BASE_ID + i) as u64, ((i as f32) * THETA_STEP).cos())).collect()
+        };
+        let assert_matches_authoritative_float = |results: &[crate::search::vector_index::VectorSearchResult],
+                                                  want: &[(u64, f32)],
+                                                  label: &str| {
+            let got: Vec<(u64, f32)> = results.iter().map(|r| (r.message_id, r.score)).collect();
+            assert_eq!(got.len(), want.len(), "{label}: wrong result count");
+            for (rank, ((got_id, got_score), (want_id, want_score))) in
+                got.iter().zip(want.iter()).enumerate()
+            {
+                assert_eq!(got_id, want_id, "{label}: rank {rank} has the wrong message id");
+                assert!(
+                    (got_score - want_score).abs() < 1e-6,
+                    "{label}: rank {rank} (id {got_id}) scored {got_score}, authoritative cosine is {want_score}"
+                );
+            }
+        };
+
+        // Case 1: unfiltered, fetch_limit past the ceiling -> direct exact.
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&roles),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Exact,
+            "fetch_limit(80,016) > SQLITE_VEC_KNN_K_MAX and 4,200 rows > it too -- vec0 must be skipped"
+        );
+        assert_eq!(meta.k, 0, "no k was ever passed to vec0 on the direct-exact path");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
+        assert!(!meta.incomplete, "4,200 rows is nowhere near EXACT_SCAN_ROW_BUDGET");
+        assert_eq!(meta.unique_messages, TOTAL_DOCS as usize);
+        // The *wire* value 08/09 consume through `_meta.candidates.mode`,
+        // not merely the Rust variant name.
+        let meta_json = serde_json::to_value(&meta).expect("CandidateMeta must serialize");
+        assert_eq!(
+            meta_json.get("mode").and_then(serde_json::Value::as_str),
+            Some("exact"),
+            "the direct-exact branch must be observable as mode=\"exact\" to callers"
+        );
+        assert_matches_authoritative_float(&results, &expected(0..TOTAL_DOCS), "unfiltered direct-exact");
+
+        // Case 2: highly selective workspace filter, same oversized
+        // fetch_limit -> still direct exact, but only the /ws/target docs.
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/ws/target".to_string());
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &filters,
+            Some(&roles),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(meta.mode, CandidateMode::Exact, "the oversized fetch_limit decides the branch, filter or not");
+        assert_eq!(meta.k, 0, "no k was ever passed to vec0 on the direct-exact path");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
+        assert!(!meta.incomplete, "50 matching rows is nowhere near EXACT_SCAN_ROW_BUDGET");
+        assert_eq!(meta.unique_messages, TARGET_DOCS as usize);
+        assert_matches_authoritative_float(&results, &expected(0..TARGET_DOCS), "filtered direct-exact");
+
+        // Case 3: the other side of the threshold. `fetch_limit` equal to
+        // SQLITE_VEC_KNN_K_MAX is *not* past it, so the existing KNN path
+        // must still run unchanged: k = min(4096 * 4, 4,200, 4,096) =
+        // 4,096, and the 4,096 nearest docs (== the lowest indices, since
+        // distance ascends with θ) come back.
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&roles),
+            K_MAX_FETCH_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Knn,
+            "fetch_limit == SQLITE_VEC_KNN_K_MAX is not past it -- the KNN-only path must stay in place"
+        );
+        assert_eq!(meta.k, K_MAX_FETCH_LIMIT, "k = min(4096 * 4, 4200, 4096)");
+        assert_eq!(meta.first_round_rows, K_MAX_FETCH_LIMIT, "vec0 returned its full, saturated window");
+        assert!(!meta.incomplete, "round 1 alone met fetch_limit, so no exact scan ran");
+        assert_matches_authoritative_float(
+            &results,
+            &expected(0..K_MAX_FETCH_LIMIT as i64),
+            "k-ceiling boundary",
+        );
+
+        // A concurrent writer can invalidate the eight worker snapshots.
+        // The same main read snapshot must then use the ordinary float vec0
+        // window, not turn a small request into an entire-authority scan.
+        let db_path = dir.path().join("cass.db");
+        let fast_client = SearchClient::open(&dir.path().join("fast-index"), Some(&db_path))
+            .unwrap().unwrap().with_vector_search_mode(VectorSearchMode::Fast);
+        PR9_AFTER_MAIN_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            let writer = FrankenStorage::open(&db_path).unwrap();
+            writer.raw().execute(
+                "UPDATE message_chunks SET created_at=created_at WHERE chunk_id=1", &[],
+            ).unwrap();
+        })));
+        let (fast_hits, fast_meta) = fast_client.search_vector_candidates(
+            &[1.0, 0.0, 0.0, 0.0], &SearchFilters::default(), Some(&roles), 5,
+        ).unwrap();
+        assert_eq!(fast_meta.coarse_skip_reason.as_deref(), Some("snapshot_mismatch"));
+        assert_eq!(fast_meta.mode, CandidateMode::Knn, "snapshot mismatch must reuse float vec0 KNN");
+        assert_eq!(fast_meta.k, 20);
+        assert_eq!(fast_meta.first_round_rows, 20);
+        assert!(!fast_meta.approximate);
+        assert!(!fast_meta.incomplete);
+        assert_eq!(fast_hits[0].message_id, BASE_ID as u64);
+    }
+
+    /// PR9 task 06: the direct-exact path must honour the *same* row-budget
+    /// contract the round-2 fallback does. A scan that runs past
+    /// `EXACT_SCAN_ROW_BUDGET` reports `incomplete=true` with
+    /// `reason=exact_scan_row_budget` -- it must neither error, nor
+    /// silently truncate without a signal, nor (the failure this
+    /// explicitly pins) collapse into a *successful* empty result.
+    ///
+    /// `#[serial]`: this test and `semantic_exact_scan_row_budget_marks_incomplete`
+    /// both drive the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
+    /// atomic, so they must never interleave -- the second one to finish
+    /// would otherwise reset the budget out from under the first.
+    #[test]
+    #[serial_test::serial]
+    fn pr9_direct_exact_budget_marks_incomplete() {
+        let dir = TempDir::new().unwrap();
+        let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
+        const DIM: i64 = 4;
+        const TOTAL_DOCS: i64 = 4_200;
+        const BASE_ID: i64 = 4_100_000;
+        const FETCH_LIMIT: usize = 80_016;
+        const BUDGET: usize = 10;
+
+        struct ResetBudgetOnDrop;
+        impl Drop for ResetBudgetOnDrop {
+            fn drop(&mut self) {
+                reset_exact_scan_row_budget_for_test();
+            }
+        }
+        let _reset_guard = ResetBudgetOnDrop;
+        set_exact_scan_row_budget_for_test(BUDGET);
+
+        let agent_id = storage
+            .ensure_agent(&Agent { id: None, slug: "codex".to_string(), name: "codex".to_string(), version: None, kind: AgentKind::Cli })
+            .unwrap();
+        let conn = storage.raw();
+        conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, created_at, updated_at) VALUES ('local', 'local', 0, 0)",
+            &[],
+        )
+        .unwrap();
+        let mut vectors: Vec<(i64, i64, Vec<f32>)> = Vec::with_capacity(TOTAL_DOCS as usize);
+        conn.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            for i in 0..TOTAL_DOCS {
+                let message_id = BASE_ID + i;
+                tx.execute(
+                    "INSERT INTO conversations(id, agent_id, source_id, title, source_path) \
+                     VALUES (?1, ?2, 'local', 't', ?3)",
+                    &[
+                        ParamValue::from(message_id),
+                        ParamValue::from(agent_id),
+                        ParamValue::from(format!("/tmp/c-{message_id}.jsonl")),
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO messages(id, conversation_id, idx, role, created_at, content) \
+                     VALUES (?1, ?2, 0, 'user', ?3, 'c')",
+                    &crate::storage::api::params![message_id, message_id, 100 + i],
+                )?;
+                let theta = (i as f32) * 0.0005;
+                vectors.push((message_id, message_id, vec![theta.cos(), theta.sin(), 0.0, 0.0]));
+            }
+            Ok(())
+        })
+        .unwrap();
+        seed_active_generation_with_chunk_vectors(&storage, DIM, &vectors);
+
+        let (results, meta) = SearchClient::search_db_vector_domain(
+            storage.raw(),
+            &[1.0, 0.0, 0.0, 0.0],
+            &SearchFilters::default(),
+            Some(&HashSet::from([
+                crate::search::vector_index::ROLE_USER,
+                crate::search::vector_index::ROLE_ASSISTANT,
+                crate::search::vector_index::ROLE_TOOL,
+            ])),
+            FETCH_LIMIT,
+        )
+        .unwrap();
+
+        assert_eq!(meta.mode, CandidateMode::Exact, "the injected budget must be hit on the direct-exact path");
+        assert_eq!(meta.k, 0, "no k was ever passed to vec0 on the direct-exact path");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
+        assert!(meta.incomplete, "the scan reads 4,200 rows against an injected budget of {BUDGET}");
+        assert_eq!(meta.reason.as_deref(), Some("exact_scan_row_budget"));
+        assert_eq!(
+            meta.unique_messages, BUDGET,
+            "exactly `budget` rows make it into the result before the sentinel fires"
+        );
+        assert_eq!(
+            results.len(),
+            BUDGET,
+            "a budget breach must be reported as incomplete, never as a successful empty result"
         );
     }
 
@@ -18456,7 +19470,22 @@ mod tests {
         // occur in this design at all; what's left worth asserting is the
         // same completeness/identity claim the old assertions made, via the
         // new meta fields.
-        assert_eq!(meta.mode, CandidateMode::KnnExact, "the selective workspace filter must drive the exact-scan round");
+        // PR9 task 06: this fixture is 5,000 rows and `FETCH_LIMIT` is
+        // `usize::MAX - 1`, so it now satisfies the direct-exact
+        // precondition (`fetch_limit > 4096 && rows > 4096`) and vec0 is
+        // skipped outright -- the answer is still exactly the 10
+        // `/ws/target` docs, from the same exact scan, with `k=0`. The
+        // no-abort property this test exists for is unaffected: the exact
+        // scan never sizes an allocation from `fetch_limit` (it folds into
+        // a `HashMap` bounded by the streamed rows, then `Vec::truncate`s
+        // to `still_needed`, a no-op when that exceeds the row count).
+        assert_eq!(
+            meta.mode,
+            CandidateMode::Exact,
+            "fetch_limit > SQLITE_VEC_KNN_K_MAX on a >4096-row generation must skip vec0 entirely"
+        );
+        assert_eq!(meta.k, 0, "the direct-exact path never calls vec0");
+        assert_eq!(meta.first_round_rows, 0, "the KNN round never ran");
         assert!(
             !meta.incomplete,
             "all 10 /ws/target docs are found well within EXACT_SCAN_ROW_BUDGET -- nothing was truncated by the budget"
@@ -18986,5 +20015,532 @@ mod tests {
             after[0].score
         );
         assert_ne!(gen_a, gen_b);
+    }
+
+    // =========================================================================
+    // PR9 task 07: read-only search checks the schema version before it runs
+    // any vector SQL.
+    //
+    // Two read-only entries can be followed by vector SQL:
+    //   1. `FrankenStorage::open_readonly*` (`src/storage/sqlite.rs`) -- the
+    //      shared read-only entry.
+    //   2. `open_search_hydration_sqlite` (this file) -- the search client's
+    //      raw hydration connection, which opens the archive directly and so
+    //      does not inherit (1)'s guard.
+    //
+    // Every negative fixture below carries a *broken* `vec0` table on top of
+    // its foreign `user_version`, so "the schema error came first" is
+    // falsifiable: if the guard were absent, or ordered after the vector SQL,
+    // the reported error would be the vector domain's, not the guard's. The
+    // same broken vector layer at schema 7 is asserted separately to really
+    // produce a vector-SQL error, which is what makes that falsification
+    // meaningful rather than assumed.
+    // =========================================================================
+
+    /// The schema version this binary speaks -- the guard's `required` value.
+    /// Spelled out here (rather than importing the constant into this module)
+    /// so the tests state the number they expect independently of the
+    /// production path they exercise.
+    const PR9_CURRENT_SCHEMA_VERSION: i64 = crate::storage::sqlite::CURRENT_SCHEMA_VERSION;
+
+    fn pr9_file_sha256(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).expect("read fixture db for hashing");
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Build one schema-`PR9_CURRENT_SCHEMA_VERSION` fixture holding two messages
+    /// (7001, 7002) with one chunk each in an active, dim-2 generation, plus
+    /// that generation's `vec0` table. Closed on return, so the copy below
+    /// starts from a checkpointed file with no WAL sidecar in play.
+    fn pr9_build_schema_guard_fixture(base: &Path) {
+        let storage = FrankenStorage::open(base).expect("build the schema-8 guard fixture");
+        for message_id in [7001_i64, 7002] {
+            seed_db3_message(
+                &storage,
+                &Db3SeedMessage {
+                    agent_slug: "codex",
+                    workspace_path: None,
+                    source_id: "local",
+                    role: "user",
+                    created_at: 100,
+                    message_id,
+                    conversation_id: message_id,
+                },
+            );
+        }
+        seed_active_generation_with_multi_chunk_vectors(
+            &storage,
+            2,
+            &[
+                (7001, 7001, 0, vec![1.0_f32, 0.0_f32]),
+                (7002, 7002, 0, vec![0.0_f32, 1.0_f32]),
+            ],
+        );
+        storage.close().expect("close the guard fixture");
+    }
+
+    /// Copy `base` to `dst`, then -- through one real writable connection --
+    /// optionally break the fixture's `vec0` table and write `user_version`.
+    ///
+    /// The "broken" variant redeclares the generation's `vec0` table as
+    /// `float[3]` while the stored float rows stay dim-2, so a dim-2 KNN query
+    /// is a genuine vector-SQL width mismatch rather than a missing table: the
+    /// error a caller would see if the guard did not fire first.
+    fn pr9_make_variant(base: &Path, dst: &Path, user_version: i64, break_vector_layer: bool) {
+        std::fs::copy(base, dst).expect("copy the guard fixture");
+        let conn = crate::storage::api::Conn::open_writable(dst, Profile::Production)
+            .expect("open the fixture copy writable");
+        if break_vector_layer {
+            let generation_id: i64 = conn
+                .query_row_map(
+                    "SELECT id FROM embedding_generations WHERE is_active = 1",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .expect("read the active generation id from the fixture copy");
+            let table = format!("vec_index_gen_{generation_id}");
+            conn.execute_batch(&format!(
+                "DROP TABLE {table}; \
+                 CREATE VIRTUAL TABLE {table} USING vec0(embedding float[3]);"
+            ))
+            .expect("break the fixture's vec0 table");
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {user_version};"))
+            .expect("write user_version on the fixture copy");
+        conn.close_with_checkpoint().expect("checkpoint and close the fixture copy");
+    }
+
+    /// Independent read of the value the guard is supposed to compare against,
+    /// through a read-only connection the fixture never went through.
+    fn pr9_read_user_version_readonly(path: &Path) -> i64 {
+        let conn = crate::storage::api::Conn::open_read(path)
+            .expect("read-only open for the independent user_version check");
+        crate::storage::schema::read_user_version(&conn).expect("read user_version")
+    }
+
+    #[test]
+    fn pr9_readonly_schema_mismatch_precedes_vector_sql() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("pr9-base.db");
+        pr9_build_schema_guard_fixture(&base);
+
+        let current_ok = dir.path().join("pr9-current-ok.db");
+        let current_broken = dir.path().join("pr9-current-broken.db");
+        let old_broken = dir.path().join("pr9-old-broken.db");
+        let new_broken = dir.path().join("pr9-new-broken.db");
+        pr9_make_variant(&base, &current_ok, PR9_CURRENT_SCHEMA_VERSION, false);
+        pr9_make_variant(&base, &current_broken, PR9_CURRENT_SCHEMA_VERSION, true);
+        pr9_make_variant(&base, &old_broken, PR9_CURRENT_SCHEMA_VERSION - 1, true);
+        pr9_make_variant(&base, &new_broken, PR9_CURRENT_SCHEMA_VERSION + 1, true);
+
+        // Inputs, read back independently rather than trusted from the writer.
+        assert_eq!(pr9_read_user_version_readonly(&current_ok), PR9_CURRENT_SCHEMA_VERSION);
+        assert_eq!(pr9_read_user_version_readonly(&current_broken), PR9_CURRENT_SCHEMA_VERSION);
+        assert_eq!(pr9_read_user_version_readonly(&old_broken), PR9_CURRENT_SCHEMA_VERSION - 1);
+        assert_eq!(pr9_read_user_version_readonly(&new_broken), PR9_CURRENT_SCHEMA_VERSION + 1);
+
+        let shas_before: Vec<String> = [&current_ok, &current_broken, &old_broken, &new_broken]
+            .iter()
+            .map(|p| pr9_file_sha256(p.as_path()))
+            .collect();
+        // Evidence, not assertions: `-- --nocapture` prints the exact fixture
+        // digests and the exact rejection texts this run produced, so the
+        // report can quote the run rather than paraphrase the source.
+        for (path, sha) in [&current_ok, &current_broken, &old_broken, &new_broken]
+            .iter()
+            .zip(shas_before.iter())
+        {
+            println!(
+                "PR9-07 fixture {} user_version={} sha256={sha}",
+                path.display(),
+                pr9_read_user_version_readonly(path.as_path())
+            );
+        }
+
+        // ---- Entry 1: `FrankenStorage::open_readonly` --------------------
+        //
+        // Schema 8 opens and completes a real read.
+        {
+            let storage = FrankenStorage::open_readonly(&current_ok)
+                .expect("schema-8 read-only open must succeed");
+            let generations: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT count(*) FROM embedding_generations WHERE is_active = 1",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .expect("narrow real read through the read-only handle");
+            assert_eq!(generations, 1, "the schema-8 fixture must expose its active generation");
+        }
+        // Schema 7 and 9 are refused, with the real numbers in the message.
+        // `FrankenStorage` is not `Debug`, so the refusal is destructured
+        // rather than `expect_err`-ed.
+        let old_err = match FrankenStorage::open_readonly(&old_broken) {
+            Ok(_) => panic!("entry 1 must refuse a schema-7 archive"),
+            Err(err) => err,
+        };
+        let old_msg = format!("{old_err:#}");
+        println!("PR9-07 entry1 schema-7 rejection: {old_msg}");
+        assert!(
+            old_msg.contains("version 7") && old_msg.contains("version 8"),
+            "entry 1's schema-7 rejection must name found/required, got: {old_msg}"
+        );
+        assert!(
+            old_msg.contains("rebuild"),
+            "entry 1's schema-7 rejection must carry the rebuild story, got: {old_msg}"
+        );
+        assert!(
+            !old_msg.contains("vector") && !old_msg.contains("vec0"),
+            "entry 1 must reject a schema-7 archive before any vector-layer error, got: {old_msg}"
+        );
+
+        let new_err = match FrankenStorage::open_readonly(&new_broken) {
+            Ok(_) => panic!("entry 1 must refuse a schema-9 archive"),
+            Err(err) => err,
+        };
+        let new_msg = format!("{new_err:#}");
+        println!("PR9-07 entry1 schema-9 rejection: {new_msg}");
+        assert!(
+            new_msg.contains("version 9") && new_msg.contains("version 8"),
+            "entry 1's schema-9 rejection must name found/required, got: {new_msg}"
+        );
+        assert!(
+            new_msg.contains("newer than"),
+            "entry 1's schema-9 rejection must say the archive is newer than the binary, got: {new_msg}"
+        );
+        assert!(
+            !new_msg.contains("vector") && !new_msg.contains("vec0"),
+            "entry 1 must reject a schema-9 archive before any vector-layer error, got: {new_msg}"
+        );
+
+        // ---- Entry 2: `open_search_hydration_sqlite` ---------------------
+        //
+        // Schema 8 opens and runs the narrowest real vector search through it.
+        {
+            let conn = open_search_hydration_sqlite(&current_ok, Duration::from_secs(5))
+                .expect("schema-8 hydration open must succeed");
+            let (results, _meta) = SearchClient::search_db_vector_domain(
+                &conn,
+                &[1.0, 0.0],
+                &SearchFilters::default(),
+                None,
+                5,
+            )
+            .expect("the narrowest real vector search over the schema-8 fixture");
+            // Both fixture chunks are inside the KNN window (k = min(5*4, 2)),
+            // so both messages come back, ordered `score desc, message_id asc`:
+            // 7001's `[1,0]` against the `[1,0]` query first, 7002's orthogonal
+            // `[0,1]` second.
+            let got: Vec<(u64, f32)> = results
+                .iter()
+                .map(|r| (r.message_id, r.score))
+                .collect();
+            assert_eq!(got.len(), 2, "expected both fixture messages, got {got:?}");
+            assert_eq!(got[0].0, 7001, "the near-exact chunk must rank first, got {got:?}");
+            assert!(
+                got[0].1 > 0.9,
+                "expected the near-exact chunk's score above 0.9, got {got:?}"
+            );
+            assert_eq!(got[1].0, 7002, "the orthogonal chunk must rank second, got {got:?}");
+        }
+        for (path, found, required) in [
+            (&old_broken, PR9_CURRENT_SCHEMA_VERSION - 1, PR9_CURRENT_SCHEMA_VERSION),
+            (&new_broken, PR9_CURRENT_SCHEMA_VERSION + 1, PR9_CURRENT_SCHEMA_VERSION),
+        ] {
+            let err = open_search_hydration_sqlite(path, Duration::from_secs(5)).expect_err(
+                "entry 2 must refuse a non-current archive before handing out a connection",
+            );
+            let msg = format!("{err:#}");
+            println!("PR9-07 entry2 user_version={found} rejection: {msg}");
+            assert!(
+                msg.contains(&format!("version {found}")) && msg.contains(&format!("version {required}")),
+                "entry 2 must name found/required for user_version={found}, got: {msg}"
+            );
+            assert!(
+                !msg.contains("vector") && !msg.contains("vec0"),
+                "entry 2 must reject user_version={found} before any vector-layer error, got: {msg}"
+            );
+        }
+
+        // ---- The falsifier: the broken vector layer really does error -----
+        //
+        // Same broken `vec0` table, same query, but at the schema this binary
+        // accepts -- so the guard cannot be masking a fixture that was simply
+        // unable to reach vector SQL at all.
+        {
+            let conn = open_search_hydration_sqlite(&current_broken, Duration::from_secs(5))
+                .expect("schema 8 with a broken vec0 table still opens");
+            let err = SearchClient::search_db_vector_domain(
+                &conn,
+                &[1.0, 0.0],
+                &SearchFilters::default(),
+                None,
+                5,
+            )
+            .expect_err(
+                "a dim-3 vec0 table under dim-2 float rows must fail the KNN query -- if this \
+                 passes, the negative fixtures above prove nothing about ordering",
+            );
+            let msg = format!("{err:#}");
+            println!("PR9-07 broken-vec0-at-schema-8 vector-layer error: {msg}");
+            assert!(
+                !msg.contains("schema version"),
+                "the vector-layer error must not be the schema guard's, got: {msg}"
+            );
+        }
+
+        // ---- Neither entry may have written a byte -----------------------
+        let shas_after: Vec<String> = [&current_ok, &current_broken, &old_broken, &new_broken]
+            .iter()
+            .map(|p| pr9_file_sha256(p.as_path()))
+            .collect();
+        assert_eq!(
+            shas_before, shas_after,
+            "the read-only guard must leave every fixture byte-identical"
+        );
+    }
+
+    /// PR9 task 07: the guard's rejection has to reach the search surface as
+    /// itself. The client's lazy open used to swallow every open failure into a
+    /// debug log, which turned a schema mismatch into
+    /// `lex_domain_rebuild_state=absent -- run \`cass index --full\`` -- the
+    /// wrong remediation, and exactly what the guard exists to prevent.
+    #[test]
+    fn pr9_readonly_schema_guard_reaches_the_search_surface() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("pr9-base.db");
+        pr9_build_schema_guard_fixture(&base);
+        let old = dir.path().join("pr9-old.db");
+        pr9_make_variant(&base, &old, PR9_CURRENT_SCHEMA_VERSION - 1, false);
+        let sha_before = pr9_file_sha256(&old);
+
+        let index_path = dir.path().join("index");
+        let client = SearchClient::open(&index_path, Some(&old))
+            .expect("constructing the search client must not need the schema")
+            .expect("the fixture database exists, so a client is constructed");
+
+        let err = client
+            .lex_domain_rebuild_marker_state_for_search()
+            .expect_err("a schema-7 archive must not report a lexical marker state");
+        let msg = format!("{err:#}");
+        println!("PR9-07 search-surface rejection: {msg}");
+        assert!(
+            msg.contains(&format!("version {}", PR9_CURRENT_SCHEMA_VERSION - 1))
+                && msg.contains(&format!("version {}", PR9_CURRENT_SCHEMA_VERSION)),
+            "the search surface must report the schema guard's found/required, got: {msg}"
+        );
+        assert!(
+            !msg.contains("lex_domain_rebuild_state"),
+            "the search surface must not misreport a schema mismatch as a missing lexical \
+             index, got: {msg}"
+        );
+        assert_eq!(
+            sha_before,
+            pr9_file_sha256(&old),
+            "reaching the search surface must not modify the archive"
+        );
+    }
+
+    /// PR9 task 07 (AC2): the new read-only guard must not change what the
+    /// *writable* entry does with an old archive -- same rejection class, and
+    /// no watermark, DDL or byte-level repair on the way out.
+    #[test]
+    fn pr9_readonly_schema_guard_leaves_writable_rejection_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("pr9-base.db");
+        pr9_build_schema_guard_fixture(&base);
+        let old = dir.path().join("pr9-old.db");
+        pr9_make_variant(&base, &old, PR9_CURRENT_SCHEMA_VERSION - 1, false);
+        let sha_before = pr9_file_sha256(&old);
+
+        let err = match FrankenStorage::open(&old) {
+            Ok(_) => panic!("the writable entry must keep refusing a schema-6 archive"),
+            Err(err) => err,
+        };
+        let typed = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StorageError>())
+            .expect("the writable refusal must stay a typed StorageError");
+        assert!(
+            matches!(
+                typed,
+                StorageError::SchemaRebuildRequired { found, required }
+                    if *found == PR9_CURRENT_SCHEMA_VERSION - 1 && *required == PR9_CURRENT_SCHEMA_VERSION
+            ),
+            "the writable entry must keep its SchemaRebuildRequired{{found,required}} class, got: {typed:?}"
+        );
+
+        assert_eq!(
+            pr9_read_user_version_readonly(&old),
+            PR9_CURRENT_SCHEMA_VERSION - 1,
+            "a refused writable open must not migrate the archive"
+        );
+        assert_eq!(
+            sha_before,
+            pr9_file_sha256(&old),
+            "a refused writable open must leave the archive byte-identical"
+        );
+    }
+}
+
+/// PR9 task 08: pins the two things the new `search_precision` output
+/// contract rests on -- that `approximate` is the only input to the wire
+/// value (never `incomplete`), and that the four coarse-screen facts are
+/// absent rather than zero-valued when no coarse screen ran, so PR9 task 09
+/// can fill them in without any consumer having to re-read "0" as "unknown".
+#[cfg(test)]
+mod pr9_candidate_meta_tests {
+    use super::*;
+
+    fn float_meta() -> CandidateMeta {
+        CandidateMeta::exact_float_path(CandidateMode::KnnExact, 12, 9, 7, false, None)
+    }
+
+    /// The one construction PR9 task 09 adds: a quantized coarse screen with
+    /// all four facts measured.
+    fn approximate_meta() -> CandidateMeta {
+        CandidateMeta {
+            mode: CandidateMode::Knn,
+            k: 4096,
+            first_round_rows: 4096,
+            unique_messages: 200,
+            incomplete: false,
+            reason: None,
+            approximate: true,
+            requested_coarse_k: Some(6432),
+            effective_coarse_k: Some(4096),
+            coarse_cap_hit: Some(true),
+            corpus_limited: Some(false),
+            coarse_shard_count: None,
+            coarse_rows_collected: None,
+            float_rescore_rows: None,
+            coarse_skip_reason: None,
+        }
+    }
+
+    fn result_with(candidates: Option<CandidateMeta>) -> SearchResult {
+        SearchResult {
+            hits: Vec::new(),
+            wildcard_fallback: false,
+            cache_stats: CacheStats::default(),
+            suggestions: Vec::new(),
+            total_count: None,
+            candidates,
+            semantic_degraded: false,
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_float_paths_never_claim_approximation() {
+        let meta = float_meta();
+        assert!(!meta.approximate);
+        assert_eq!(meta.search_precision(), "exact");
+        assert_eq!(meta.requested_coarse_k, None);
+        assert_eq!(meta.effective_coarse_k, None);
+        assert_eq!(meta.coarse_cap_hit, None);
+        assert_eq!(meta.corpus_limited, None);
+    }
+
+    #[test]
+    fn pr9_candidate_meta_empty_and_knn_metas_report_exact() {
+        for meta in [
+            CandidateMeta::empty(),
+            CandidateMeta::exact_float_path(CandidateMode::Knn, 4, 0, 0, false, None),
+            CandidateMeta::exact_float_path(
+                CandidateMode::Exact,
+                0,
+                0,
+                3,
+                false,
+                None,
+            ),
+        ] {
+            assert!(!meta.approximate);
+            assert_eq!(meta.search_precision(), "exact");
+            assert_eq!(meta.requested_coarse_k, None);
+            assert_eq!(meta.effective_coarse_k, None);
+            assert_eq!(meta.coarse_cap_hit, None);
+            assert_eq!(meta.corpus_limited, None);
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_approximate_meta_reports_approximate() {
+        let meta = approximate_meta();
+        assert!(meta.approximate);
+        assert_eq!(meta.search_precision(), "approximate");
+    }
+
+    #[test]
+    fn pr9_candidate_meta_incomplete_does_not_imply_approximate() {
+        // A budget-stopped exact scan is still an exact-distance scan: the
+        // two fields answer different questions and must not be conflated.
+        let meta = CandidateMeta::exact_float_path(
+            CandidateMode::Exact,
+            0,
+            0,
+            5,
+            true,
+            Some("exact_scan_row_budget".to_string()),
+        );
+        assert!(meta.incomplete);
+        assert_eq!(meta.search_precision(), "exact");
+    }
+
+    #[test]
+    fn pr9_candidate_meta_absent_coarse_facts_stay_absent_in_json() {
+        let value = serde_json::to_value(float_meta()).expect("serialize candidate meta");
+        assert_eq!(value["approximate"], serde_json::json!(false));
+        // Old fields and their wire names are unchanged.
+        assert_eq!(value["mode"], serde_json::json!("knn+exact"));
+        assert_eq!(value["k"], serde_json::json!(12));
+        assert_eq!(value["first_round_rows"], serde_json::json!(9));
+        assert_eq!(value["unique_messages"], serde_json::json!(7));
+        assert_eq!(value["incomplete"], serde_json::json!(false));
+        assert_eq!(value["reason"], serde_json::Value::Null);
+        // A missing measurement must not be readable as a measured zero.
+        for key in [
+            "requested_coarse_k",
+            "effective_coarse_k",
+            "coarse_cap_hit",
+            "corpus_limited",
+        ] {
+            assert!(
+                value.get(key).is_none(),
+                "{key} must be absent when no coarse screen ran, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn pr9_candidate_meta_set_coarse_facts_serialize_with_their_values() {
+        let value = serde_json::to_value(approximate_meta()).expect("serialize candidate meta");
+        assert_eq!(value["approximate"], serde_json::json!(true));
+        assert_eq!(value["mode"], serde_json::json!("knn"));
+        assert_eq!(value["requested_coarse_k"], serde_json::json!(6432));
+        assert_eq!(value["effective_coarse_k"], serde_json::json!(4096));
+        assert_eq!(value["coarse_cap_hit"], serde_json::json!(true));
+        assert_eq!(value["corpus_limited"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn pr9_candidate_meta_search_result_without_candidates_claims_nothing() {
+        assert_eq!(result_with(None).search_precision(), None);
+    }
+
+    #[test]
+    fn pr9_candidate_meta_search_result_projects_its_candidate_meta() {
+        assert_eq!(
+            result_with(Some(float_meta())).search_precision(),
+            Some("exact")
+        );
+        assert_eq!(
+            result_with(Some(approximate_meta())).search_precision(),
+            Some("approximate")
+        );
     }
 }

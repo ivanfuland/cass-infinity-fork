@@ -96,8 +96,8 @@ fn sample_chunk_row(generation_id: i64, message_id: i64, chunk_idx: u32) -> Chun
         byte_start: (chunk_idx as usize) * 5,
         byte_end: (chunk_idx as usize) * 5 + 5,
         content_hash: format!("hash-{chunk_idx}"),
-        embedding: vec![1.0, 2.0, 3.0, 4.0],
-        norm: 5.477_226,
+        embedding: vec![0.1, 0.2, 0.3, 0.4],
+        norm: 0.547_722_6,
         created_at_ms: 1_000,
     }
 }
@@ -144,8 +144,8 @@ fn schema_ensure_fresh_on_empty_v0() {
     // PR6 T2a (任务书 #113) bumped CURRENT_SCHEMA_VERSION 5 -> 6
     // (`messages.excluded` JSONB); this file's own name/purpose (asserting
     // the v5 chunk-domain DDL shape) is unaffected, only the literal here.
-    // PR8 C1 bumped it again 6 -> 7 (`conversations.identity_host`).
-    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 7);
+    // PR8 C1 bumped it again 6 -> 7; PR9's new mirror layout requires 8.
+    assert_eq!(schema::CURRENT_SCHEMA_VERSION, 8);
 }
 
 // =============================================================================
@@ -505,11 +505,15 @@ fn vec0_set_mismatch_uses_chunk_id_both_directions() {
 
     // An extra vec0 row with no backing message_chunks row (rowid 9_999
     // does not exist in message_chunks) -> extra_in_vec0 = 1.
-    let fake_embedding = vec![0u8; 16]; // dim=4 * 4 bytes
+    let fake_embedding = schema::f32_vector_to_le_blob(&[0.1, 0.2, 0.3, 0.4]);
     storage
         .raw()
         .with_tx_no_replay(TxMode::Immediate, |tx| {
-            vector_domain::insert_vec0_rows_in_tx(tx, gen_id, &[(9_999, fake_embedding.as_slice())])
+            tx.execute(
+                &format!("INSERT INTO vec_index_gen_{gen_id}(rowid, embedding) VALUES (?1, ?2)"),
+                &fparams![9_999_i64, fake_embedding.clone()],
+            )?;
+            Ok(())
         })
         .unwrap();
     let (missing, extra) =

@@ -627,6 +627,102 @@ pub(crate) fn open_franken_raw_connection_with_timeout(
     }
 }
 
+/// PR9 task 07: the read-only schema guard's rejection for a database whose
+/// `user_version` is *newer* than the version this binary was built for.
+///
+/// A dedicated type rather than a bare `StorageError::Other`, so a consumer
+/// (`search::query`'s lazy hydration open, which must decide whether an open
+/// failure is the guard speaking or an ordinary "no sqlite backend" condition)
+/// can recognise it by downcast instead of by matching error text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadonlySchemaNewerThanBinary {
+    pub(crate) found: i64,
+    pub(crate) required: i64,
+}
+
+impl std::fmt::Display for ReadonlySchemaNewerThanBinary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "database schema version {} is newer than version {} this binary supports; \
+             use a binary that matches the archive (or rebuild the archive from the raw \
+             corpus with this one)",
+            self.found, self.required
+        )
+    }
+}
+
+impl std::error::Error for ReadonlySchemaNewerThanBinary {}
+
+/// PR9 task 07: read-only schema-version guard.
+///
+/// Every read-only entry that can be followed by vector SQL must call this
+/// once the connection is open and before any vector SQL runs. The writable
+/// side already refuses a non-current `user_version` through
+/// [`crate::storage::schema::ensure`] (rebuild-only: no in-place migration);
+/// this is the read-only counterpart. Without it, a schema-mismatched archive
+/// that reaches a `vec0`/int8 query is reported as a vector type error rather
+/// than as "this database needs a rebuild or a matching binary".
+///
+/// It only *reads* `PRAGMA user_version` and classifies. It never calls
+/// `ensure`, never runs DDL or a migration, never writes a watermark or any
+/// other row, and leaves the database file byte-identical.
+///
+/// - `found == CURRENT_SCHEMA_VERSION` -> `Ok`.
+/// - `found < CURRENT_SCHEMA_VERSION` (including `0`) -> the same typed
+///   `StorageError::SchemaRebuildRequired { found, required }` the writable
+///   path raises, so both sides tell the caller one story.
+/// - `found > CURRENT_SCHEMA_VERSION` -> [`ReadonlySchemaNewerThanBinary`]:
+///   the archive was written by a newer binary and must be read by a matching
+///   one (or rebuilt from the raw corpus), not opened by this build.
+///
+/// Both rejection messages carry the real `found` and `required` numbers at
+/// their top level, so a caller that only renders `{}` still reports them.
+///
+/// `pub(crate)`: `search::query`'s raw hydration connection bypasses
+/// [`FrankenStorage::open_readonly`] entirely and needs the same check.
+pub(crate) fn ensure_readonly_schema_current(conn: &FrankenConnection) -> Result<()> {
+    let found = crate::storage::schema::read_user_version(conn)
+        .context("reading PRAGMA user_version for the read-only schema guard")?;
+
+    if found == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    if found < CURRENT_SCHEMA_VERSION {
+        return Err(anyhow::Error::new(StorageError::SchemaRebuildRequired {
+            found,
+            required: CURRENT_SCHEMA_VERSION,
+        }));
+    }
+
+    Err(anyhow::Error::new(ReadonlySchemaNewerThanBinary {
+        found,
+        required: CURRENT_SCHEMA_VERSION,
+    }))
+}
+
+/// PR9 task 07: recognise the read-only schema guard's own rejection anywhere
+/// in an error chain, returning its message.
+///
+/// `None` means "this failure is not the guard speaking" -- every other
+/// read-only open failure (missing file, unreadable page store, lock, I/O)
+/// keeps whatever handling its caller already had.
+pub(crate) fn readonly_schema_guard_rejection(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|cause| {
+        if cause.downcast_ref::<ReadonlySchemaNewerThanBinary>().is_some()
+            || matches!(
+                cause.downcast_ref::<StorageError>(),
+                Some(StorageError::SchemaRebuildRequired { .. })
+            )
+        {
+            Some(cause.to_string())
+        } else {
+            None
+        }
+    })
+}
+
 pub(crate) fn open_franken_raw_readonly_connection_with_timeout(
     path: &Path,
     timeout: Duration,
@@ -2810,6 +2906,12 @@ impl FrankenStorage {
         })?;
         let conn = open_franken_with_flags(&path_str, FrankenOpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening the legacy embedded engine db readonly at {}", path.display()))?;
+        // PR9 task 07: version check goes here -- after the read-only connection
+        // exists, before `Self::new` and therefore before any caller can run
+        // vector SQL through this handle. Rebuild-only on both sides: an old
+        // archive is refused with `SchemaRebuildRequired`, a newer one with
+        // `ReadonlySchemaNewerThanBinary`, and neither path touches the file.
+        ensure_readonly_schema_current(&conn)?;
         let storage = Self::new(conn, path.to_path_buf());
         storage.apply_readonly_config()?;
         Ok(storage)
@@ -2996,6 +3098,13 @@ impl FrankenStorage {
                     self.conn
                         .execute_batch(batch.sql)
                         .with_context(|| format!("repairing current-schema batch {}", batch.name))?;
+                    if batch.name == "vector_domain" {
+                        for ddl in crate::storage::schema::VECTOR_DOMAIN_TRIGGER_DDL {
+                            self.conn
+                                .execute_batch(ddl)
+                                .context("repairing schema-8 vector-domain triggers")?;
+                        }
+                    }
                 }
 
                 // R1-B2: `CREATE VIRTUAL TABLE IF NOT EXISTS fts_lex` above
@@ -3642,11 +3751,11 @@ CREATE INDEX IF NOT EXISTS idx_umd_source_day ON usage_models_daily(source_id, d
 // chunk domain as the sole vector schema and rewrote this repair batch to
 // match: `embedding_generations` (current six-identity-field shape) plus
 // the three chunk-domain tables (`message_chunks`/`chunk_holes`/
-// `chunk_staging`), matching `FRESH_SCHEMA_DDL`'s current shape exactly --
-// this self-heal path now recreates the same five-table batch a fresh
-// build produces, not a frozen historical subset of it.
+// `chunk_staging`). PR9 keeps the schema-8 revision column in this repair
+// batch and reuses schema.rs's idempotent trigger DDL in the same transaction.
+// This self-heal path must never freeze an older vector-domain shape.
 const CURRENT_SCHEMA_REPAIR_VECTOR_DOMAIN_SQL: &str = r"
-CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER);
+CREATE TABLE IF NOT EXISTS embedding_generations (id INTEGER PRIMARY KEY AUTOINCREMENT, embedder_id TEXT NOT NULL, dim INTEGER NOT NULL CHECK (dim > 0), canonicalize_version INTEGER NOT NULL, chunking_policy_version INTEGER NOT NULL, fingerprint BLOB NOT NULL, byte_order TEXT NOT NULL DEFAULT 'le' CHECK (byte_order IN ('le', 'be')), audit_status TEXT NOT NULL DEFAULT 'pending' CHECK (audit_status IN ('pending', 'passed', 'failed')), is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1)), created_at INTEGER NOT NULL, activated_at INTEGER, vector_revision INTEGER NOT NULL DEFAULT 0 CHECK (typeof(vector_revision) = 'integer' AND vector_revision >= 0));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_embedding_generations_single_active ON embedding_generations(is_active) WHERE is_active = 1;
 CREATE TABLE IF NOT EXISTS message_chunks (chunk_id INTEGER PRIMARY KEY, generation_id INTEGER NOT NULL REFERENCES embedding_generations(id), message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE, conversation_id INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, byte_start INTEGER NOT NULL, byte_end INTEGER NOT NULL, content_hash TEXT NOT NULL, embedding BLOB NOT NULL CHECK(length(embedding) % 4 = 0), norm REAL NOT NULL CHECK(norm > 0), created_at INTEGER NOT NULL, UNIQUE(generation_id, message_id, chunk_idx));
 CREATE INDEX IF NOT EXISTS idx_message_chunks_generation ON message_chunks(generation_id);
@@ -22931,28 +23040,152 @@ mod tests {
         );
     }
 
+    /// SHA-256 of a file's bytes, for the "a refused read-only open must not
+    /// touch the archive" assertion below.
+    fn pr9_task07_file_sha256(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(path).expect("read the archive for hashing");
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// PR9 task 07: `tests/fixtures/search_demo_data/agent_search.db` is a
+    /// **schema-1** archive, and the read-only schema guard accepts only
+    /// `CURRENT_SCHEMA_VERSION`. That refusal is the intended contract
+    /// (rebuild-only: an old archive is rebuilt from the raw corpus, not
+    /// converted in place), so what this case pins is now the refusal itself:
+    /// the real `found`/`required` pair, and an archive left byte-identical.
+    ///
+    /// The subject this test used to carry -- "listing lexical rebuild
+    /// footprints still works when a current-schema archive has no tail-cache
+    /// rows" -- is preserved on a real schema-7 fixture by
+    /// `list_conversation_footprints_for_lexical_rebuild_tolerates_missing_tail_state_readonly`
+    /// below. Relabelling this historical archive's `user_version` to make it
+    /// look current would have destroyed the record of what it actually is.
     #[test]
-    fn list_conversation_footprints_for_lexical_rebuild_tolerates_legacy_search_demo_fixture() {
+    fn list_conversation_footprints_for_lexical_rebuild_legacy_search_demo_fixture_is_refused_readonly() {
         let fixture_db = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join("search_demo_data")
             .join("agent_search.db");
-        let storage = FrankenStorage::open_readonly(&fixture_db).unwrap();
+
+        // Read the input value independently of the code under test, rather
+        // than taking the guard's own `found` on trust.
+        let probe = FrankenConnection::open_read(&fixture_db)
+            .expect("open the demo archive for an independent user_version read");
+        let found = crate::storage::schema::read_user_version(&probe)
+            .expect("read the demo archive's user_version");
+        drop(probe);
+        assert_eq!(found, 1, "the checked-in demo archive is a schema-1 database");
+
+        let sha_before = pr9_task07_file_sha256(&fixture_db);
+
+        let err = match FrankenStorage::open_readonly(&fixture_db) {
+            Ok(_) => panic!(
+                "a schema-1 archive must be refused by the read-only schema guard, not opened"
+            ),
+            Err(err) => err,
+        };
+        let typed = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<StorageError>())
+            .expect("the refusal must stay a typed StorageError");
+        assert!(
+            matches!(
+                typed,
+                StorageError::SchemaRebuildRequired { found, required }
+                    if *found == 1 && *required == CURRENT_SCHEMA_VERSION
+            ),
+            "expected SchemaRebuildRequired{{found: 1, required: {CURRENT_SCHEMA_VERSION}}}, got: {typed:?}"
+        );
+
+        assert_eq!(
+            sha_before,
+            pr9_task07_file_sha256(&fixture_db),
+            "a refused read-only open must leave the archive byte-identical"
+        );
+    }
+
+    /// PR9 task 07: the read-only half of the subject the legacy
+    /// `search_demo_data` case used to carry -- listing lexical rebuild
+    /// footprints through the handle self-heal actually uses, on an archive
+    /// whose tail-cache table is gone, so counts have to come from `messages`.
+    /// (The writable-handle half already lives in
+    /// `list_conversation_footprints_for_lexical_rebuild_tolerates_missing_tail_state_table`.)
+    #[test]
+    fn list_conversation_footprints_for_lexical_rebuild_tolerates_missing_tail_state_readonly() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("agent_search.db");
+        let conversation_id = {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            let agent = Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: Some("0.2.3".into()),
+                kind: AgentKind::Cli,
+            };
+            let agent_id = storage.ensure_agent(&agent).unwrap();
+            let conversation_id = storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".into(),
+                        workspace: Some(PathBuf::from("/tmp/workspace")),
+                        external_id: Some("footprint-no-tail-state-readonly".to_string()),
+                        title: Some("footprint-no-tail-state-readonly".to_string()),
+                        source_path: PathBuf::from("/tmp/footprint-no-tail-state-readonly.jsonl"),
+                        started_at: Some(1_700_000_000_000),
+                        ended_at: Some(1_700_000_000_100),
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages: vec![Message {
+                            excluded: None,
+                            id: None,
+                            idx: 10,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(1_700_000_000_010),
+                            content: "current schema without a tail cache".into(),
+                            extra_json: serde_json::Value::Null,
+                            snippets: Vec::new(),
+                        }],
+                        source_id: LOCAL_SOURCE_ID.into(),
+                        origin_host: None,
+                    },
+                )
+                .unwrap()
+                .conversation_id;
+            storage
+                .conn
+                .execute("DROP TABLE conversation_tail_state", fparams![])
+                .unwrap();
+            conversation_id
+        };
+
+        let storage = SqliteStorage::open_readonly(&db_path)
+            .expect("a current-schema archive must still open read-only");
 
         let footprints = storage
             .list_conversation_footprints_for_lexical_rebuild()
             .unwrap();
 
-        assert!(
-            !footprints.is_empty(),
-            "search self-heal should be able to plan a lexical rebuild from the legacy search demo fixture"
-        );
-        assert!(
-            footprints
-                .iter()
-                .all(|footprint| footprint.message_count > 0),
-            "legacy fixture conversations should derive message counts from messages when tail caches are absent"
+        assert_eq!(
+            footprints,
+            vec![LexicalRebuildConversationFootprintRow {
+                conversation_id,
+                message_count: 11,
+                message_bytes: 11 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+            }],
+            "read-only lexical self-heal must tolerate a missing tail cache on a current-schema \
+             archive and derive counts from messages"
         );
     }
 
@@ -27069,6 +27302,59 @@ mod tests {
                 crate::storage::schema::create_embedding_generation(tx, "bge-m3", 1024, 1, 1, b"test-fingerprint", 1_000)
             })
             .expect("the repaired embedding_generations table must accept a real write");
+
+        let revision_column_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM pragma_table_info('embedding_generations') WHERE name='vector_revision'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(revision_column_count, 1, "schema-8 repair must restore vector_revision");
+        let revision_trigger_count: i64 = repaired
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name IN \
+                 ('vector_chunks_insert_revision','vector_chunks_delete_revision','vector_chunks_update_revision')",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(revision_trigger_count, 3, "schema-8 repair must restore all chunk revision triggers");
+        crate::storage::vector_domain::create_vec0_table_for_generation(repaired.raw(), gen_a, 1024)
+            .expect("repaired vector generation must accept mirror creation with a revision bump");
+        repaired.raw().execute_batch(
+            "INSERT INTO agents(id,slug,name,kind,created_at,updated_at) VALUES(1,'fixture','fixture','cli',0,0);
+             INSERT INTO conversations(id,agent_id,title,source_path) VALUES(1,1,'fixture','/fixture/session.jsonl');
+             INSERT INTO messages(id,conversation_id,idx,role,content) VALUES(1,1,0,'user','fixture');",
+        ).unwrap();
+        let mut vector = vec![0.0_f32; 1024];
+        vector[0] = 1.0;
+        let blob = crate::storage::schema::f32_vector_to_le_blob(&vector);
+        let revision_before: i64 = repaired.raw().query_row_map(
+            "SELECT vector_revision FROM embedding_generations WHERE id=?1",
+            fparams![gen_a],
+            |row| row.get_typed(0),
+        ).unwrap();
+        repaired.raw().with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            let chunk_id = crate::storage::schema::insert_chunk_row_in_tx(tx, &crate::storage::schema::ChunkRow {
+                generation_id: gen_a, message_id: 1, conversation_id: 1, chunk_idx: 0,
+                byte_start: 0, byte_end: 7, content_hash: "fixture".into(),
+                embedding: vector.clone(), norm: 1.0, created_at_ms: 1_000,
+            })?;
+            crate::storage::vector_domain::insert_vec0_rows_in_tx(tx, gen_a, &[(chunk_id, blob.as_slice())])?;
+            Ok(())
+        }).expect("repaired vector domain must accept an authoritative chunk and both mirrors in one transaction");
+        let revision_after: i64 = repaired.raw().query_row_map(
+            "SELECT vector_revision FROM embedding_generations WHERE id=?1",
+            fparams![gen_a],
+            |row| row.get_typed(0),
+        ).unwrap();
+        assert!(revision_after > revision_before, "repaired chunk write must advance vector_revision");
+        let mirrors = crate::storage::vector_domain::audit_int8_mirror_identity(repaired.raw(), gen_a, 1024).unwrap();
+        assert_eq!(mirrors.rows, 1);
+        assert_eq!((mirrors.missing, mirrors.extra, mirrors.wrong_shard, mirrors.duplicates), (0, 0, 0, 0));
 
         // R2-N1: the repair batch's own `idx_embedding_generations_single_active`
         // unique partial index -- previously missing entirely (silently

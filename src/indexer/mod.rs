@@ -28077,7 +28077,32 @@ mod tests {
             )
             .unwrap();
         }
+        // PR9 task 07 / 07a: the read-only schema gate refuses any archive
+        // whose `PRAGMA user_version` is not the current version, and this is
+        // a hand-built *current-shape* archive rather than a historical one,
+        // so it has to carry the version its table shape already matches.
+        // Only the missing stamp is added here: the table shape, the rows and
+        // every plan/shard assertion below are unchanged.
+        conn.execute(
+            &format!(
+                "PRAGMA user_version = {};",
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+            ),
+            &[] as &[ParamValue],
+        )
+        .unwrap();
         drop(conn);
+
+        // Read the stamp back independently of the guarded open, so a silent
+        // no-op here could not pass itself off as a current-schema fixture.
+        let stamp_conn = crate::storage::api::Conn::open_read(&db_path).unwrap();
+        let stamped_version = crate::storage::schema::read_user_version(&stamp_conn).unwrap();
+        drop(stamp_conn);
+        assert_eq!(
+            stamped_version,
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+            "the fixture must declare the schema version its shape already matches"
+        );
 
         let storage = FrankenStorage::open_readonly(&db_path).unwrap();
         assert!(
@@ -28214,7 +28239,31 @@ mod tests {
             )
             .unwrap();
         }
+        // PR9 task 07 / 07a: same as the absent-tail fixture above -- this is
+        // a hand-built current-shape archive with a sparse tail, so it needs
+        // the current version stamp the read-only gate now requires. The
+        // sparse-tail shape, the stale tail-state rows and every plan/shard
+        // assertion below are unchanged; only the missing stamp is added.
+        conn.execute(
+            &format!(
+                "PRAGMA user_version = {};",
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+            ),
+            &[] as &[ParamValue],
+        )
+        .unwrap();
         drop(conn);
+
+        // Read the stamp back independently of the guarded open, so a silent
+        // no-op here could not pass itself off as a current-schema fixture.
+        let stamp_conn = crate::storage::api::Conn::open_read(&db_path).unwrap();
+        let stamped_version = crate::storage::schema::read_user_version(&stamp_conn).unwrap();
+        drop(stamp_conn);
+        assert_eq!(
+            stamped_version,
+            crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+            "the fixture must declare the schema version its shape already matches"
+        );
 
         let storage = FrankenStorage::open_readonly(&db_path).unwrap();
         assert!(
@@ -33198,7 +33247,35 @@ mod tests {
             .unwrap();
         drop(storage);
 
-        assert!(!current_schema_fast_probe(&db_path).unwrap());
+        // PR9 task 07 / 07a: the read-only entry now checks `PRAGMA
+        // user_version` before it hands the handle to a caller, so this
+        // archive is refused at the open instead of coming back as a clean
+        // "not current schema" boolean. The future version is still the
+        // subject; what changed is the shape of the refusal, so the retired
+        // `Ok(false)` assertion is replaced by one that pins the guard's own
+        // typed error and the real `found`/`required` numbers it carries.
+        let err = match current_schema_fast_probe(&db_path) {
+            Ok(accepted) => panic!(
+                "a user_version past CURRENT_SCHEMA_VERSION must be refused by the read-only \
+                 entry, not reported as a boolean: the probe returned Ok({accepted})"
+            ),
+            Err(err) => err,
+        };
+        let typed = err
+            .chain()
+            .find_map(|cause| {
+                cause.downcast_ref::<crate::storage::sqlite::ReadonlySchemaNewerThanBinary>()
+            })
+            .expect("the refusal must stay the guard's own typed error");
+        assert_eq!(
+            (typed.found, typed.required),
+            (
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION + 1,
+                crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+            ),
+            "expected the refusal to report the archive's real version against the binary's \
+             own, got: {typed:?}"
+        );
     }
 
     #[test]

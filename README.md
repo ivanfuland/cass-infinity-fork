@@ -296,6 +296,27 @@ cass search "how to handle user login" --mode semantic --robot
 cass search "auth error handling" --mode hybrid --robot
 ```
 
+**Vector candidate strategy** (`--vector-search-mode`, independent of `--mode`):
+
+| Value | Vector leg |
+|-------|------------|
+| `exact` (default) | Unquantized float `vec0` KNN over the active generation's float mirror, with the existing budget-bounded exact fallback. |
+| `fast` | The eight int8 shards return their coarse candidates, every one of them is rescored on the authoritative float vectors, and the message-level candidates continue through the existing filtering, RRF and pagination. |
+
+`--vector-search-mode` only changes how vector candidates are formed; lexical/RRF
+behavior is untouched, and `exact` is what an omitted flag already does.
+`--mode semantic` and `--mode hybrid` (including the default hybrid-preferred
+mode) accept both values. `--mode lexical` has no vector leg at all, so passing
+`--vector-search-mode` together with it is a usage error rather than a silently
+ignored flag. Above the direct-exact window (fetch budget larger than 4096 rows
+against a generation larger than 4096 rows) `fast` keeps the existing
+large-window behavior and runs the float path, reporting the actual precision
+rather than the requested mode.
+
+```bash
+cass search "auth error handling" --mode semantic --vector-search-mode fast --robot
+```
+
 ### 🎯 Advanced Search Features
 - **Wildcard Patterns**: Full glob-style pattern support:
   - `foo*` - Prefix match (finds "foobar", "foo123")
