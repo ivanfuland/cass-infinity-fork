@@ -52,6 +52,8 @@
 //! mirror unusable -- a shard snapshot that disagrees with the main read
 //! snapshot, a missing/damaged mirror, or a candidate with no authoritative
 //! float row).
+//! Timing PASS is not a byte-integrity or ownership certificate: the frozen
+//! input must also pass the independent mirror/ownership acceptance gates.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -405,7 +407,17 @@ fn phase_stats(timings: &[QueryTiming], phase: &str) -> PhaseStats {
 
 fn run_probe(db_path: &Path, mode: VectorSearchMode) -> anyhow::Result<Ku2Report> {
     let storage = FrankenStorage::open_readonly(db_path)?;
-    let (generation_id, _dim) = active_generation(&storage)?;
+    let (generation_id, dim) = active_generation(&storage)?;
+    if mode == VectorSearchMode::Fast {
+        // Check the frozen input once before sampling/timing. Equal counts
+        // cannot establish that the mirrors contain the correct identities.
+        let audit = storage.raw().with_tx_no_replay(TxMode::Deferred, |_| {
+            vector_domain::audit_int8_mirror_identity(storage.raw(), generation_id, dim as i64)
+        })?;
+        if audit.missing != 0 || audit.extra != 0 || audit.wrong_shard != 0 || audit.duplicates != 0 {
+            return Err(mirror_damaged("vector mirror damaged: int8 mirror identity mismatch").into());
+        }
+    }
     let queries = sample_stride_vectors(&storage, generation_id, SAMPLE_COUNT)?;
 
     let mut timings: Vec<QueryTiming> = Vec::with_capacity((COLD_REPS + HOT_REPS) * queries.len());
@@ -521,7 +533,7 @@ mod tests {
             .raw()
             .with_tx_no_replay(TxMode::Immediate, |tx| {
                 for i in 0..n_chunks {
-                    let v = [1.0, i as f32 * 0.001, 0.0, 0.0];
+                    let v = [1.0, i as f32 / n_chunks as f32, 0.0, 0.0];
                     let blob = schema::f32_vector_to_le_blob(&v);
                     tx.execute(
                         "INSERT INTO message_chunks(chunk_id, generation_id, message_id, conversation_id, chunk_idx, \
@@ -721,11 +733,34 @@ mod tests {
             let (code, report, message) = run(&path, VectorSearchMode::Fast);
             assert_eq!(code, 2, "empty_shard={empty_shard}: {message}");
             assert!(report.is_none(), "damaged input must not produce a successful timing report");
-            assert!(message.contains("int8 corpus count mismatch"), "{message}");
+            assert!(message.contains("vector mirror damaged"), "{message}");
             let (code, report, message) = run(&path, VectorSearchMode::Exact);
             assert_eq!(code, 0, "{message}");
             assert_eq!(report.unwrap().vector_search_mode, "exact");
         }
+    }
+
+    #[test]
+    fn fast_probe_rejects_equal_count_wrong_shard_duplicates() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("archive.db");
+        let generation = build_synthetic_v5_db(&path, 2048);
+        let storage = FrankenStorage::open(&path).unwrap();
+        storage.raw().execute("UPDATE message_chunks SET embedding=?1 WHERE chunk_id=2048",
+            &[Value::from(schema::f32_vector_to_le_blob(&[0.0,0.0,1.0,0.0]))]).unwrap();
+        vector_domain::rebuild_vec0_table_for_generation(storage.raw(),generation,4).unwrap();
+        let first = vector_domain::int8_table_name(generation,1).unwrap();
+        let last = vector_domain::int8_table_name(generation,0).unwrap();
+        storage.raw().execute(&format!("DELETE FROM {first} WHERE rowid=1"),&[]).unwrap();
+        storage.raw().execute(&format!("INSERT INTO {first}(rowid,embedding) SELECT rowid,vec_int8(embedding) FROM {last} WHERE rowid=2048"),&[]).unwrap();
+        drop(storage);
+        let (code,report,message)=run(&path,VectorSearchMode::Fast);
+        assert_eq!(code,2,"same count does not prove valid row identity: {message}");
+        assert!(report.is_none());
+        assert!(message.contains("int8 mirror identity mismatch"));
+        let (code,report,message)=run(&path,VectorSearchMode::Exact);
+        assert_eq!(code,0,"{message}");
+        assert_eq!(report.unwrap().vector_search_mode,"exact");
     }
 
 }

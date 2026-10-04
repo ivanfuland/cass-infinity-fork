@@ -939,11 +939,12 @@ fn run(
         Ok(report) => {
             let code = if report.passed() { 0 } else { 1 };
             let msg = format!(
-                "ownership_oracle: checked={} span_failed={} cosine_failed={} vec0_mismatch={} min_cosine={:?} passed={}",
+                "ownership_oracle: checked={} span_failed={} cosine_failed={} vec0_mismatch={} int8_mismatch={} min_cosine={:?} passed={}",
                 report.checked,
                 report.span_failed,
                 report.cosine_failed,
                 report.vec0_mismatch,
+                report.int8_mismatch,
                 report.min_cosine,
                 report.passed()
             );
@@ -1858,6 +1859,7 @@ mod tests {
         let (code, report, message) = run(&path, true, None, None, &format!("http://{addr}"), None, None);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(code, 1, "a missing int8 row must fail the run: {message}");
+        assert!(message.contains("int8_mismatch=1"), "{message}");
         let report = report.unwrap();
         assert_eq!(report.int8_mismatch, 1);
         assert_eq!(report.vec0_mismatch, 0, "the float mirror still holds its row");
