@@ -872,6 +872,63 @@ mod tests {
                 )
                 .expect("raw chunk");
         }
+
+        /// Delete one archived chunk row, leaving the message/lex rows intact.
+        fn delete_chunk(&self, generation_id: i64, message_id: i64, chunk_idx: u32) {
+            self.conn()
+                .execute(
+                    "DELETE FROM message_chunks WHERE generation_id = ?1 AND message_id = ?2 \
+                     AND chunk_idx = ?3",
+                    &[
+                        Value::Integer(generation_id),
+                        Value::Integer(message_id),
+                        Value::Integer(i64::from(chunk_idx)),
+                    ],
+                )
+                .expect("delete chunk");
+        }
+
+        /// Re-point one archived chunk row's `chunk_idx`, touching nothing else.
+        fn set_chunk_idx(&self, generation_id: i64, message_id: i64, from: u32, to: u32) {
+            self.conn()
+                .execute(
+                    "UPDATE message_chunks SET chunk_idx = ?1 WHERE generation_id = ?2 \
+                     AND message_id = ?3 AND chunk_idx = ?4",
+                    &[
+                        Value::Integer(i64::from(to)),
+                        Value::Integer(generation_id),
+                        Value::Integer(message_id),
+                        Value::Integer(i64::from(from)),
+                    ],
+                )
+                .expect("update chunk idx");
+        }
+
+        /// Corrupt one archived chunk row's `content_hash`, touching nothing else.
+        fn set_chunk_hash(&self, generation_id: i64, message_id: i64, chunk_idx: u32, hash: &str) {
+            self.conn()
+                .execute(
+                    "UPDATE message_chunks SET content_hash = ?1 WHERE generation_id = ?2 \
+                     AND message_id = ?3 AND chunk_idx = ?4",
+                    &[
+                        Value::Text(hash.to_string()),
+                        Value::Integer(generation_id),
+                        Value::Integer(message_id),
+                        Value::Integer(i64::from(chunk_idx)),
+                    ],
+                )
+                .expect("update chunk hash");
+        }
+
+        /// Change only the active generation's chunking policy version.
+        fn set_chunking_version(&self, generation_id: i64, version: i64) {
+            self.conn()
+                .execute(
+                    "UPDATE embedding_generations SET chunking_policy_version = ?1 WHERE id = ?2",
+                    &[Value::Integer(version), Value::Integer(generation_id)],
+                )
+                .expect("update chunking version");
+        }
     }
 
     fn hit(message_id: i64) -> SearchHit {
@@ -904,6 +961,15 @@ mod tests {
             winning_chunk_hash: None,
             rerank_score: None,
         }
+    }
+
+    /// A complete, correct semantic-winner hit anchored on `chunks[i]`.
+    fn winner_for(chunk: &ChunkFact) -> SearchHit {
+        let mut h = hit(7);
+        h.winning_chunk_idx = Some(chunk.chunk_idx);
+        h.winning_chunk_span = Some((chunk.byte_start, chunk.byte_end));
+        h.winning_chunk_hash = Some(chunk.content_hash.clone());
+        h
     }
 
     fn standard_fixture() -> (Fixture, Vec<ChunkFact>) {
@@ -993,20 +1059,57 @@ mod tests {
             format!("{}事务{}事务{}", "a".repeat(5000), "b".repeat(5000), "c".repeat(200));
         fixture.insert_message(9, 5, &content);
         fixture.insert_lex(9, &content, "");
-        let _ = fixture.insert_chunks(1, 9, &content);
+        let chunks = fixture.insert_chunks(1, 9, &content);
 
         let h = hit(9);
         let docs = build_documents(&fixture.path, "事务", std::slice::from_ref(&h)).expect("build");
-        assert_eq!(
-            docs[0].matches(JOIN_SEPARATOR).count(),
-            1,
-            "two disjoint anchor groups must be joined by exactly one blank line"
-        );
-        // The first interval is covered back to the body start and the second
-        // forward to the body end (both anchors are interior, so the neighbour
-        // expansion reaches both edges).
-        assert!(docs[0].starts_with("aaa"));
-        assert!(docs[0].ends_with("ccc"));
+
+        // Independently hand-apply the documented rule -- anchor chunk + its two
+        // existing neighbours, intervals unioned (overlap or adjacency merge),
+        // disjoint intervals joined by a blank line -- and require the whole
+        // produced text to equal that, not merely the separator count and the
+        // first/last few characters.
+        let canonical = canonicalize_for_embedding(&content);
+        let mut anchors: Vec<u32> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_idx as usize, i, "chunk rows are idx-ordered");
+            if canonical[chunk.byte_start..chunk.byte_end].contains("事务") {
+                anchors.push(chunk.chunk_idx);
+            }
+        }
+        assert_eq!(anchors.len(), 2, "the two 事务 must land in two distinct chunks");
+
+        let mut selected: Vec<usize> = Vec::new();
+        for anchor in &anchors {
+            for delta in [-1_i64, 0, 1] {
+                let candidate = i64::from(*anchor) + delta;
+                if candidate >= 0 && (candidate as usize) < chunks.len() {
+                    selected.push(candidate as usize);
+                }
+            }
+        }
+        selected.sort_unstable();
+        selected.dedup();
+
+        let mut intervals: Vec<(usize, usize)> = selected
+            .iter()
+            .map(|i| (chunks[*i].byte_start, chunks[*i].byte_end))
+            .collect();
+        intervals.sort_unstable();
+        let mut unions: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in intervals {
+            match unions.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => unions.push((start, end)),
+            }
+        }
+        assert_eq!(unions.len(), 2, "the two anchor groups must stay disjoint");
+        let expected = unions
+            .iter()
+            .map(|(start, end)| &canonical[*start..*end])
+            .collect::<Vec<_>>()
+            .join(JOIN_SEPARATOR);
+        assert_eq!(docs[0], expected);
     }
 
     #[test]
@@ -1168,6 +1271,120 @@ mod tests {
         // Order is really reversed relative to id, so the first document is the
         // second body.
         assert_eq!(docs[0], canonical_of(bodies[1]));
+    }
+
+    // ---- C2 rework r1: one branch per targeted negative case ----------------
+    //
+    // Each test first proves the untouched synthetic fixture assembles, then
+    // changes exactly one field and requires InputIdentityMismatch. No test
+    // relies on damaging several fields at once to trip an earlier guard.
+
+    #[test]
+    fn missing_chunk_row_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        assert!(chunks.len() >= 2, "needs at least two chunks");
+        let h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        // Delete the second chunk row; message and lex rows stay.
+        fixture.delete_chunk(1, 7, chunks[1].chunk_idx);
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn wrong_recorded_chunk_idx_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        // Re-point the second row's chunk_idx; every other field stays.
+        let bogus = (chunks.len() as u32) + 50;
+        fixture.set_chunk_idx(1, 7, chunks[1].chunk_idx, bogus);
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn wrong_recorded_chunk_hash_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        // Corrupt the second row's content_hash only.
+        fixture.set_chunk_hash(1, 7, chunks[1].chunk_idx, &"ab".repeat(32));
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn winner_missing_idx_only_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let mut h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        h.winning_chunk_idx = None; // span and hash still present
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn winner_missing_span_only_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let mut h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        h.winning_chunk_span = None; // idx and hash still present
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn winner_missing_hash_only_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let mut h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        h.winning_chunk_hash = None; // idx and span still present
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn winner_span_conflict_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let mut h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        // idx and hash are correct; only the span disagrees with the archive.
+        h.winning_chunk_span = Some((chunks[0].byte_start + 1, chunks[0].byte_end));
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn winner_idx_absent_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let mut h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        // idx above every archived chunk; span and hash keep their real values.
+        h.winning_chunk_idx = Some((chunks.len() as u32) + 10);
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
+    }
+
+    #[test]
+    fn chunking_version_drift_is_identity_mismatch() {
+        let (fixture, chunks) = standard_fixture();
+        let h = winner_for(&chunks[0]);
+        assert!(build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).is_ok());
+
+        // Only the active generation's chunking policy version moves; the
+        // canonical version stays at the product constant.
+        fixture.set_chunking_version(1, 99);
+        let err = build_documents(&fixture.path, "unused", std::slice::from_ref(&h)).unwrap_err();
+        assert_eq!(err.reason, RerankFailureReason::InputIdentityMismatch);
     }
 
     #[test]
