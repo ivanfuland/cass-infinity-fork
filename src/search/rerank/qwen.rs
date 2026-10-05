@@ -28,6 +28,321 @@
 //! error, log line or panic message carries a reported model name, a context
 //! value, a response body or any other field content.
 
+use std::time::{Duration, Instant};
+
+use serde_json::{Map, Value, json};
+
+use super::http::{HttpConfig, HttpTransport};
+use super::types::{
+    CallIdentity, ProviderChoice, RerankBackend, RerankError, RerankFailureReason, RerankResponse,
+    validate_index_scores,
+};
+
+/// The origin P09 binds when `CASS_QWEN_RERANK_URL` is unset.
+///
+/// This module never reads the environment: P09 resolves the optional override
+/// once and passes the same effective origin to both the binding and
+/// [`QwenBackend::new`].
+pub const DEFAULT_ORIGIN: &str = "http://127.0.0.1:18002";
+
+/// The one served-model name this adapter accepts (the verified 20e name).
+const EXPECTED_MODEL: &str = "Qwen3-Reranker-8B-local";
+
+/// The frozen 20e rerank instruction.
+const INSTRUCT: &str = "Given a web search query, retrieve relevant passages that answer the query";
+
+/// Metadata keys that may carry the served model name.
+const SERVICE_NAME_KEYS: [&str; 3] = ["service_model", "served_model_name", "model_name"];
+
+/// Metadata keys that may carry a declared context length.
+const CONTEXT_KEYS: [&str; 4] = [
+    "context_length",
+    "max_context_length",
+    "context_window",
+    "max_model_len",
+];
+
+/// Metadata keys whose string value may prove the service is a reranker.
+const RERANK_PATH_KEYS: [&str; 3] = ["task", "pipeline", "rerank_path"];
+
+/// The context length every declared value must reach.
+const MIN_CONTEXT_LENGTH: u64 = 32768;
+
+/// Fixed transport budgets, matching the frozen 20e prototype.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+const INFO_PATH: &str = "/get_model_info";
+const MODELS_PATH: &str = "/v1/models";
+const RERANK_PATH: &str = "/v1/rerank";
+
+/// The fixed public text the P11 readiness probe scores.
+const PROBE_TEXT: &str = "rerank readiness probe";
+
+/// The exact number of requests one successful call makes.
+const REQUEST_COUNT: usize = 3;
+
+/// The local SGLang Qwen3-Reranker-8B backend.
+///
+/// The struct holds the shared transport and nothing else; it is deliberately
+/// neither `Debug` nor `Serialize`, because the transport owns the client.
+pub struct QwenBackend {
+    transport: HttpTransport,
+}
+
+impl QwenBackend {
+    /// Validate `origin`, then build the fixed local-only transport.
+    ///
+    /// This sends no request. It proves `origin` is a bare origin that resolves
+    /// to loopback and builds the client every later call reuses; a malformed
+    /// or non-loopback origin is refused here, before any request exists.
+    pub fn new(origin: &str) -> Result<Self, RerankError> {
+        let config = HttpConfig {
+            base_url: origin.to_string(),
+            local_only: true,
+            timeout: TOTAL_TIMEOUT,
+            connect_timeout: CONNECT_TIMEOUT,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        };
+        // The local service is unauthenticated, so no bearer is ever built.
+        let transport = HttpTransport::new(config, None)?;
+        Ok(Self { transport })
+    }
+
+    /// Score one fixed public probe document through the normal adapter path.
+    ///
+    /// P11 uses this for readiness. Because the probe runs the same call as a
+    /// real rerank, a successful probe returns exactly one finite score and has
+    /// also proven the service identity and context contract.
+    pub fn probe_ready(&self) -> Result<RerankResponse, RerankError> {
+        self.rerank(PROBE_TEXT, &[PROBE_TEXT.to_string()])
+    }
+}
+
+impl RerankBackend for QwenBackend {
+    fn provider(&self) -> ProviderChoice {
+        ProviderChoice::Qwen3Local
+    }
+
+    fn rerank(&self, query: &str, documents: &[String]) -> Result<RerankResponse, RerankError> {
+        validate_inputs(query, documents)?;
+        let started = Instant::now();
+
+        // The two metadata responses are one contract, and both are read
+        // before any scoring request exists.
+        let info = self.transport.get_json(INFO_PATH)?;
+        let models = self.transport.get_json(MODELS_PATH)?;
+        let service_model = verified_service_model(&info.body, &models.body)?;
+
+        let scored = self
+            .transport
+            .post_json(RERANK_PATH, &rerank_payload(query, documents))?;
+        let scores = response_scores(&scored.body, documents.len())?;
+
+        Ok(RerankResponse {
+            scores,
+            identity: CallIdentity {
+                actual_provider: Some(ProviderChoice::Qwen3Local),
+                actual_model: Some(service_model),
+                // The frozen protocol carries no field that names the serving
+                // provider, so this stays null rather than guessing "SGLang".
+                serving_provider: None,
+            },
+            http_requests: REQUEST_COUNT,
+            duration_ms: duration_ms(started.elapsed()),
+        })
+    }
+}
+
+fn invalid_input() -> RerankError {
+    RerankError::new(RerankFailureReason::InvalidInput)
+}
+
+fn invalid_response() -> RerankError {
+    RerankError::new(RerankFailureReason::InvalidResponse)
+}
+
+fn identity_mismatch() -> RerankError {
+    RerankError::new(RerankFailureReason::ModelIdentityMismatch)
+}
+
+/// Refuse anything that cannot be scored: an empty or all-whitespace query, an
+/// empty document list, or a document that is empty or all whitespace.
+///
+/// These refusals happen before the first request, so a rejected input never
+/// reaches the service.
+fn validate_inputs(query: &str, documents: &[String]) -> Result<(), RerankError> {
+    if query.trim().is_empty()
+        || documents.is_empty()
+        || documents.iter().any(|document| document.trim().is_empty())
+    {
+        return Err(invalid_input());
+    }
+    Ok(())
+}
+
+/// The whole metadata contract, in one place.
+///
+/// Both bodies must be objects, exactly one model card must match the verified
+/// service name, and the two responses must declare one usable context length
+/// between them. The verified name is returned so the caller can report it as
+/// the observed model identity.
+fn verified_service_model(info: &Value, models: &Value) -> Result<String, RerankError> {
+    let info = info.as_object().ok_or_else(invalid_response)?;
+    let models = models.as_object().ok_or_else(invalid_response)?;
+
+    let name = declared_service_name(info)?;
+
+    if !reports_rerank_path(info) {
+        return Err(invalid_response());
+    }
+
+    let cards = models
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid_response)?;
+    let mut matching = Vec::new();
+    for card in cards {
+        let Some(card) = card.as_object() else {
+            continue; // an unrelated or malformed card cannot be the match
+        };
+        if card.get("id").and_then(Value::as_str) == Some(name) {
+            matching.push(card);
+        }
+    }
+    let [card] = matching.as_slice() else {
+        return Err(invalid_response());
+    };
+
+    declared_context_length(card, info)?;
+    Ok(name.to_string())
+}
+
+/// The one name every explicitly provided name field agrees on.
+///
+/// A field that is absent, or present but empty, is not a declaration. A
+/// declared name that is not a string is an invalid response; a declared name
+/// that is a string but differs from the expected model is an identity
+/// mismatch.
+fn declared_service_name(info: &Map<String, Value>) -> Result<&str, RerankError> {
+    let mut declared = Vec::new();
+    for key in SERVICE_NAME_KEYS {
+        let Some(value) = info.get(key) else {
+            continue;
+        };
+        let name = value.as_str().ok_or_else(invalid_response)?;
+        if !name.is_empty() {
+            declared.push(name);
+        }
+    }
+
+    // "At least one non-empty name" and "every declared name agrees" collapse
+    // into: every non-empty name is the expected model.
+    if declared.is_empty() {
+        return Err(invalid_response());
+    }
+    if declared.iter().any(|name| *name != EXPECTED_MODEL) {
+        return Err(identity_mismatch());
+    }
+    Ok(EXPECTED_MODEL)
+}
+
+/// Whether the metadata proves this service can rerank.
+///
+/// `is_generation: true`, or any one string field among the rerank-path keys
+/// containing "rerank" (ASCII case-insensitive), is enough.
+fn reports_rerank_path(info: &Map<String, Value>) -> bool {
+    if info.get("is_generation") == Some(&Value::Bool(true)) {
+        return true;
+    }
+    RERANK_PATH_KEYS.iter().any(|key| {
+        info.get(*key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.to_ascii_lowercase().contains("rerank"))
+    })
+}
+
+/// The single context length the two responses declare.
+///
+/// Every declared value is checked, so a usable value in one response cannot
+/// hide a broken value in the other. Missing everywhere is a refusal, not a
+/// default.
+fn declared_context_length(
+    card: &Map<String, Value>,
+    info: &Map<String, Value>,
+) -> Result<u64, RerankError> {
+    let mut declared = Vec::new();
+    if let Some(value) = card.get("max_model_len") {
+        declared.push(context_length(value)?);
+    }
+    for key in CONTEXT_KEYS {
+        if let Some(value) = info.get(key) {
+            declared.push(context_length(value)?);
+        }
+    }
+
+    let Some(first) = declared.first().copied() else {
+        return Err(invalid_response());
+    };
+    if declared.iter().any(|other| *other != first) {
+        return Err(invalid_response());
+    }
+    Ok(first)
+}
+
+/// One declared context length: a JSON non-negative integer at or above the
+/// required floor. Floats, booleans, strings and negatives are refused.
+fn context_length(value: &Value) -> Result<u64, RerankError> {
+    let length = value.as_u64().ok_or_else(invalid_response)?;
+    if length < MIN_CONTEXT_LENGTH {
+        return Err(invalid_response());
+    }
+    Ok(length)
+}
+
+/// The frozen five-key scoring payload.
+///
+/// `documents` goes out as the input bytes; `top_n` is the actual document
+/// count, never a page length. The payload deliberately carries no `model`
+/// field.
+fn rerank_payload(query: &str, documents: &[String]) -> Value {
+    json!({
+        "query": query,
+        "documents": documents,
+        "top_n": documents.len(),
+        "return_documents": false,
+        "instruct": INSTRUCT,
+    })
+}
+
+/// Validate the native `index`/`score` array and return input-ordered scores.
+///
+/// The native `score` key is only renamed to the shared `relevance_score` key;
+/// the values are then handed to the shared completeness validator, which
+/// refuses a short, duplicate, out-of-range or non-finite set rather than
+/// sorting, truncating or filling gaps.
+fn response_scores(body: &Value, expected: usize) -> Result<Vec<f64>, RerankError> {
+    let rows = body.as_array().ok_or_else(invalid_response)?;
+    let mut mapped = Vec::with_capacity(rows.len());
+    for row in rows {
+        let row = row.as_object().ok_or_else(invalid_response)?;
+        let index = row.get("index").ok_or_else(invalid_response)?;
+        let score = row.get("score").ok_or_else(invalid_response)?;
+        let mut entry = Map::new();
+        entry.insert("index".to_string(), index.clone());
+        entry.insert("relevance_score".to_string(), score.clone());
+        mapped.push(Value::Object(entry));
+    }
+    validate_index_scores(&Value::Array(mapped), expected)
+}
+
+/// The measured duration, saturating instead of truncating on the (unreachable)
+/// overflow.
+fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,7 +789,7 @@ mod tests {
         ] {
             let server = Server::spawn(routes(
                 &info_json(EXPECTED_MODEL),
-                &models_json(data),
+                &models_json(data.clone()),
                 &json!([{ "index": 0, "score": 0.5 }]),
             ));
             let err = backend_for(&server)
