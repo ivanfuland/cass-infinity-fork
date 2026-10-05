@@ -28,9 +28,251 @@
 //! Every refusal is a short code from the shared [`RerankError`] vocabulary. No
 //! error, log line or panic message carries a reported model name, a provider
 //! name, a response body or any other field content.
-//!
-//! This revision carries the contract tests only; the implementation follows so
-//! the missing-implementation RED is a real compile failure, not a stand-in.
+
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+use super::http::{HttpConfig, HttpTransport};
+use super::types::{
+    CallIdentity, ProviderChoice, RerankBackend, RerankError, RerankFailureReason, RerankResponse,
+    validate_index_scores,
+};
+
+/// The origin P09 binds when `CASS_INFINITY_URL` is unset.
+///
+/// This module never reads the environment: P09 resolves the optional override
+/// once and passes the same effective origin to both the binding and
+/// [`BgeBackend::new`].
+pub const DEFAULT_ORIGIN: &str = "http://127.0.0.1:7997";
+
+/// The one wire model this adapter requests and requires.
+///
+/// The literal is the frozen `bge-local` protocol value; it is deliberately not
+/// read from `CASS_INFINITY_RERANK_MODEL`, so no environment override can swap
+/// the selection this adapter makes. A unit test pins it to
+/// [`ProviderChoice::BgeLocal`]'s request model so a rename cannot drift.
+const RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
+
+/// Fixed transport budgets, matching the frozen 20e prototype.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
+const MODELS_PATH: &str = "/models";
+const RERANK_PATH: &str = "/rerank";
+
+/// The fixed public text the P11 readiness probe scores.
+const PROBE_TEXT: &str = "rerank readiness probe";
+
+/// The exact number of requests one successful call makes: the readiness GET
+/// and the one scoring POST.
+const REQUEST_COUNT: usize = 2;
+
+/// The local Infinity `BAAI/bge-reranker-v2-m3` backend.
+///
+/// The struct holds the shared transport and nothing else; it is deliberately
+/// neither `Debug` nor `Serialize`, because the transport owns the client.
+pub struct BgeBackend {
+    transport: HttpTransport,
+}
+
+impl BgeBackend {
+    /// Validate `origin`, then build the fixed local-only transport.
+    ///
+    /// This sends no request. It proves `origin` is a bare origin that resolves
+    /// to loopback and builds the client every later call reuses; a malformed
+    /// or non-loopback origin is refused here, before any request exists.
+    pub fn new(origin: &str) -> Result<Self, RerankError> {
+        let config = HttpConfig {
+            base_url: origin.to_string(),
+            local_only: true,
+            timeout: TOTAL_TIMEOUT,
+            connect_timeout: CONNECT_TIMEOUT,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        };
+        // The local service is unauthenticated, so no bearer is ever built.
+        let transport = HttpTransport::new(config, None)?;
+        Ok(Self { transport })
+    }
+
+    /// Score one fixed public probe document through the normal adapter path.
+    ///
+    /// P11 uses this for readiness. Because the probe runs the same call as a
+    /// real rerank, a successful probe has proven both the served reranker model
+    /// list and a finite scoring response; it never consults the embedding
+    /// endpoint or an embedding dimension.
+    pub fn probe_ready(&self) -> Result<RerankResponse, RerankError> {
+        self.rerank(PROBE_TEXT, &[PROBE_TEXT.to_string()])
+    }
+}
+
+impl RerankBackend for BgeBackend {
+    fn provider(&self) -> ProviderChoice {
+        ProviderChoice::BgeLocal
+    }
+
+    fn rerank(&self, query: &str, documents: &[String]) -> Result<RerankResponse, RerankError> {
+        validate_inputs(query, documents)?;
+        let started = Instant::now();
+
+        // The readiness gate is read before any scoring request exists: a
+        // server that does not serve the BGE reranker must never be scored.
+        let models = self.transport.get_json(MODELS_PATH)?;
+        verify_served_reranker(&models.body)?;
+
+        let scored = self.transport.post_json(RERANK_PATH, &rerank_payload(query, documents))?;
+        let (scores, identity) = scoring_response(&scored.body, documents.len())?;
+
+        Ok(RerankResponse {
+            scores,
+            identity,
+            http_requests: REQUEST_COUNT,
+            duration_ms: duration_ms(started.elapsed()),
+        })
+    }
+}
+
+fn invalid_input() -> RerankError {
+    RerankError::new(RerankFailureReason::InvalidInput)
+}
+
+fn invalid_response() -> RerankError {
+    RerankError::new(RerankFailureReason::InvalidResponse)
+}
+
+fn identity_mismatch() -> RerankError {
+    RerankError::new(RerankFailureReason::ModelIdentityMismatch)
+}
+
+/// Refuse anything that cannot be scored: an empty or all-whitespace query, an
+/// empty document list, or a document that is empty or all whitespace.
+///
+/// These refusals happen before the first request, so a rejected input never
+/// reaches the service.
+fn validate_inputs(query: &str, documents: &[String]) -> Result<(), RerankError> {
+    if query.trim().is_empty()
+        || documents.is_empty()
+        || documents.iter().any(|document| document.trim().is_empty())
+    {
+        return Err(invalid_input());
+    }
+    Ok(())
+}
+
+/// Prove the served model list advertises exactly one BGE reranker card.
+///
+/// The body must be an object whose `data` is an array, and exactly one card
+/// must carry the frozen model id. A server that lists only the embedding model
+/// (`BAAI/bge-m3`) has zero matches and is not a ready reranker; a missing or
+/// duplicated card is likewise refused. Cards whose `id` is absent or not a
+/// string simply do not match.
+fn verify_served_reranker(body: &Value) -> Result<(), RerankError> {
+    let object = body.as_object().ok_or_else(invalid_response)?;
+    let cards = object
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid_response)?;
+
+    let mut matches = 0usize;
+    for card in cards {
+        if card.get("id").and_then(Value::as_str) == Some(RERANK_MODEL) {
+            matches += 1;
+        }
+    }
+
+    if matches == 1 {
+        Ok(())
+    } else {
+        Err(invalid_response())
+    }
+}
+
+/// The frozen six-key scoring payload.
+///
+/// `documents` goes out as the input bytes — no trimming, no 1024-character
+/// clip, no batching — and `top_n` is the actual document count, never a page
+/// length.
+fn rerank_payload(query: &str, documents: &[String]) -> Value {
+    json!({
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": documents,
+        "top_n": documents.len(),
+        "return_documents": false,
+        "raw_scores": false,
+    })
+}
+
+/// Validate one scoring response into input-ordered scores plus the identity
+/// the response itself proved.
+///
+/// The identity is read from the same object as the scores, but only what the
+/// response actually named: a missing or null field stays `None`, and the
+/// request value and the `/models` list are never substituted in. The `results`
+/// array is then handed whole to the shared completeness validator, which
+/// refuses a short, duplicate, out-of-range or non-finite set rather than
+/// sorting, truncating or filling gaps.
+fn scoring_response(
+    body: &Value,
+    expected: usize,
+) -> Result<(Vec<f64>, CallIdentity), RerankError> {
+    let object = body.as_object().ok_or_else(invalid_response)?;
+
+    let actual_model = response_model(object.get("model"))?;
+    let serving_provider = response_provider(object.get("provider"))?;
+
+    let results = object.get("results").ok_or_else(invalid_response)?;
+    let scores = validate_index_scores(results, expected)?;
+
+    Ok((
+        scores,
+        CallIdentity {
+            actual_provider: Some(ProviderChoice::BgeLocal),
+            actual_model,
+            serving_provider,
+        },
+    ))
+}
+
+/// The model the response named, or `None` when it named none.
+///
+/// A non-empty string must be an accepted alias for the frozen selection, else
+/// it is an explicit identity mismatch. An empty string or a non-string type is
+/// an invalid response.
+fn response_model(value: Option<&Value>) -> Result<Option<String>, RerankError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if name.is_empty() => Err(invalid_response()),
+        Some(Value::String(name)) => {
+            if ProviderChoice::BgeLocal.accepts_model(name) {
+                Ok(Some(name.clone()))
+            } else {
+                Err(identity_mismatch())
+            }
+        }
+        Some(_) => Err(invalid_response()),
+    }
+}
+
+/// The serving provider the response named, or `None` when it named none.
+///
+/// A present field must be a non-empty string; it is recorded verbatim and is
+/// never replaced by a guessed literal such as `"Infinity"`.
+fn response_provider(value: Option<&Value>) -> Result<Option<String>, RerankError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if name.is_empty() => Err(invalid_response()),
+        Some(Value::String(name)) => Ok(Some(name.clone())),
+        Some(_) => Err(invalid_response()),
+    }
+}
+
+/// The measured duration, saturating instead of truncating on the (unreachable)
+/// overflow.
+fn duration_ms(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
 
 #[cfg(test)]
 mod tests {
@@ -285,6 +527,13 @@ mod tests {
             .err()
             .expect("origin must parse");
         assert_eq!(err.reason, RerankFailureReason::InvalidInput);
+    }
+
+    #[test]
+    fn the_frozen_model_is_the_bge_local_request_model() {
+        // Pins the adapter's literal to the shared frozen provider mapping, so
+        // a rename in either place cannot silently desynchronise the selection.
+        assert_eq!(RERANK_MODEL, ProviderChoice::BgeLocal.request_model());
     }
 
     #[test]
@@ -606,10 +855,7 @@ mod tests {
             json!({ "model": RERANK_MODEL }),
             json!({ "results": {} }),
         ] {
-            let server = Server::spawn(routes(
-                &served_models(),
-                &body,
-            ));
+            let server = Server::spawn(routes(&served_models(), &body));
             let err = backend_for(&server)
                 .rerank("q", &["d".to_string()])
                 .unwrap_err();
