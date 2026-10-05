@@ -1060,55 +1060,26 @@ mod tests {
         fixture.insert_message(9, 5, &content);
         fixture.insert_lex(9, &content, "");
         let chunks = fixture.insert_chunks(1, 9, &content);
+        // Frozen chunking policy (1000 chars, 100 overlap, no separator in this
+        // body) gives 12 chunks, so the two anchors land on chunks 5 and 11.
+        assert_eq!(chunks.len(), 12, "frozen policy must yield 12 hard-cut chunks here");
 
         let h = hit(9);
         let docs = build_documents(&fixture.path, "事务", std::slice::from_ref(&h)).expect("build");
 
-        // Independently hand-apply the documented rule -- anchor chunk + its two
-        // existing neighbours, intervals unioned (overlap or adjacency merge),
-        // disjoint intervals joined by a blank line -- and require the whole
-        // produced text to equal that, not merely the separator count and the
-        // first/last few characters.
-        let canonical = canonicalize_for_embedding(&content);
-        let mut anchors: Vec<u32> = Vec::new();
-        for (i, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.chunk_idx as usize, i, "chunk rows are idx-ordered");
-            if canonical[chunk.byte_start..chunk.byte_end].contains("事务") {
-                anchors.push(chunk.chunk_idx);
-            }
-        }
-        assert_eq!(anchors.len(), 2, "the two 事务 must land in two distinct chunks");
-
-        let mut selected: Vec<usize> = Vec::new();
-        for anchor in &anchors {
-            for delta in [-1_i64, 0, 1] {
-                let candidate = i64::from(*anchor) + delta;
-                if candidate >= 0 && (candidate as usize) < chunks.len() {
-                    selected.push(candidate as usize);
-                }
-            }
-        }
-        selected.sort_unstable();
-        selected.dedup();
-
-        let mut intervals: Vec<(usize, usize)> = selected
-            .iter()
-            .map(|i| (chunks[*i].byte_start, chunks[*i].byte_end))
-            .collect();
-        intervals.sort_unstable();
-        let mut unions: Vec<(usize, usize)> = Vec::new();
-        for (start, end) in intervals {
-            match unions.last_mut() {
-                Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                _ => unions.push((start, end)),
-            }
-        }
-        assert_eq!(unions.len(), 2, "the two anchor groups must stay disjoint");
-        let expected = unions
-            .iter()
-            .map(|(start, end)| &canonical[*start..*end])
-            .collect::<Vec<_>>()
-            .join(JOIN_SEPARATOR);
+        // The expected text is written out literally, so it is independent of
+        // any expansion or union code in this module: the selected chunks
+        // {4,5,6} union to bytes [3600, 6404) and {10,11} to [9004, 10212), and
+        // the two disjoint slices are joined by one blank line. That is 1400
+        // a's + 事务 + 1398 b's, "\n\n", then 1002 b's + 事务 + 200 c's.
+        let expected = format!(
+            "{}事务{}\n\n{}事务{}",
+            "a".repeat(1400),
+            "b".repeat(1398),
+            "b".repeat(1002),
+            "c".repeat(200),
+        );
+        assert_eq!(expected.len(), 4014, "the frozen two-interval join is 4014 UTF-8 bytes");
         assert_eq!(docs[0], expected);
     }
 
