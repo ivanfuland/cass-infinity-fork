@@ -2508,6 +2508,13 @@ mod tests {
                 fs::write(&result_path, format!("{offset}\n{}\n", titles.join(",")))
                     .expect("write child result");
             }
+            // A model-failure window: the original RRF order is kept and no
+            // rerank score exists anywhere.
+            "save-failed" => {
+                let snap = snapshot(&db_path, NOW, false, 4, 6, 3);
+                let id = st.save(&snap, NOW).expect("save failed window");
+                fs::write(&result_path, format!("{id}\n")).expect("write child result");
+            }
             other => panic!("unknown child action {other}"),
         }
     }
@@ -2568,6 +2575,185 @@ mod tests {
         let mut lines = text.lines();
         assert_eq!(lines.next().unwrap(), "0");
         assert_eq!(lines.next().unwrap(), "hit-00,hit-01,hit-02,hit-03,hit-04");
+    }
+
+    /// A model-failure window written by one process and read by another must
+    /// keep the original RRF order, the original scores and the failure
+    /// metadata, with no rerank score anywhere.
+    #[test]
+    fn cross_process_failed_window_keeps_original_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path());
+        let result = tmp.path().join("child-failed.txt");
+        run_child(tmp.path(), &db, "save-failed", &result, None);
+
+        let id = fs::read_to_string(&result).unwrap().trim().to_string();
+        assert!(is_window_id(&id));
+
+        // This process reads what the child wrote.
+        let st = store(tmp.path());
+        let cursor = encode_cursor(&id, 0).unwrap();
+        let (snap, offset) = st.load(&cursor, &binding(6, 3), &db, NOW).unwrap();
+        assert_eq!(offset, 0);
+
+        assert_eq!(
+            titles(&snap.result.hits),
+            ["hit-00", "hit-01", "hit-02", "hit-03"]
+        );
+        assert_eq!(
+            snap.result
+                .hits
+                .iter()
+                .map(|hit| hit.score)
+                .collect::<Vec<f32>>(),
+            vec![100.0f32, 99.0, 98.0, 97.0]
+        );
+        assert!(
+            snap.result
+                .hits
+                .iter()
+                .all(|hit| hit.rerank_score.is_none()),
+            "a failed window must carry no rerank score"
+        );
+
+        assert!(!snap.rerank.applied);
+        assert_eq!(snap.rerank.scored_count, 0);
+        assert_eq!(
+            snap.rerank.failure_reason,
+            Some(RerankFailureReason::HttpError)
+        );
+        assert_eq!(snap.rerank.http_status, Some(503));
+        assert_eq!(snap.rerank.http_requests, None);
+        assert_eq!(snap.rerank.model_requests, None);
+
+        // The frozen failed window still paginates by K.
+        assert_eq!(
+            titles(&page_hits(&snap, 0).unwrap()),
+            ["hit-00", "hit-01", "hit-02"]
+        );
+        assert_eq!(titles(&page_hits(&snap, 3).unwrap()), ["hit-03"]);
+    }
+
+    /// Real concurrent saves on one private store must never exceed the
+    /// policy, must not collapse distinct snapshots onto one id, and a
+    /// contended save must refuse cleanly instead of corrupting the budget.
+    #[test]
+    fn concurrent_save_stays_within_the_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path());
+        let ttl = WindowPolicy::default().ttl_ms as i64;
+        let policy = WindowPolicy {
+            max_windows: 2,
+            max_window_bytes: 4_000_000,
+            max_total_bytes: 8_000_000,
+            ..WindowPolicy::default()
+        };
+        let st = WindowStore::new(tmp.path(), policy).unwrap();
+
+        let mut prepared = Vec::new();
+        for step in 0..4i64 {
+            let created = NOW + step;
+            let mut snap = snapshot(&db, created, true, 3, 5, 5);
+            snap.created_at_ms = created;
+            snap.expires_at_ms = created + ttl;
+            prepared.push(snap);
+        }
+
+        let threads = prepared.len();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::new();
+        for snap in prepared {
+            let st = st.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                st.save(&snap, snap.created_at_ms)
+            }));
+        }
+        let outcomes: Vec<Result<String, WindowError>> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("thread join"))
+            .collect();
+
+        let succeeded = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert!(succeeded >= 1, "at least one concurrent save must succeed");
+        for outcome in &outcomes {
+            if let Err(err) = outcome {
+                assert_eq!(
+                    *err,
+                    WindowError::CacheUnavailable,
+                    "a contended save must refuse cleanly"
+                );
+            }
+        }
+
+        // Distinct snapshots must produce distinct ids, never one overwriting
+        // another to fake the budget.
+        let ids: HashSet<&String> = outcomes.iter().filter_map(|o| o.as_ref()).collect();
+        assert_eq!(ids.len(), succeeded, "each successful save has its own id");
+
+        // The real on-disk set honours the policy.
+        let files: Vec<PathBuf> = fs::read_dir(window_dir(tmp.path()))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .into_string()
+                    .map(|name| name.ends_with(".json"))
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            files.len() <= policy.max_windows,
+            "{} files exceed max_windows {}",
+            files.len(),
+            policy.max_windows
+        );
+        let total: u64 = files
+            .iter()
+            .map(|path| fs::metadata(path).unwrap().len())
+            .sum();
+        assert!(
+            total <= policy.max_total_bytes,
+            "{total} bytes exceed max_total_bytes {}",
+            policy.max_total_bytes
+        );
+    }
+
+    /// While another holder owns the directory lock, `save` must refuse
+    /// rather than queue, and must succeed once the lock is free.
+    #[cfg(unix)]
+    #[test]
+    fn save_refuses_while_the_lock_is_held() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path());
+        let st = store(tmp.path());
+
+        let lock_path = window_dir(tmp.path()).join(LOCK_FILE_NAME);
+        let holder = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .expect("create the lock file as 0600");
+        fs2::FileExt::try_lock_exclusive(&holder).expect("acquire the lock");
+
+        let snap = snapshot(&db, NOW, true, 3, 5, 5);
+        assert_eq!(
+            st.save(&snap, NOW).unwrap_err(),
+            WindowError::CacheUnavailable,
+            "save must refuse while the lock is held"
+        );
+
+        fs2::FileExt::unlock(&holder).unwrap();
+        assert!(
+            st.save(&snap, NOW).is_ok(),
+            "save must work once the lock is free"
+        );
     }
 
     // ------------------------------------------------------------------
