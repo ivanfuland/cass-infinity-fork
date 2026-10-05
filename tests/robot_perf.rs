@@ -115,6 +115,7 @@ fn answer_pack_perf_hit(idx: usize) -> SearchHit {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     }
 }
 

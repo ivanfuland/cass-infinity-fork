@@ -2545,6 +2545,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let candidate = PackCandidate::from_search_hit(&hit, 1, 0);

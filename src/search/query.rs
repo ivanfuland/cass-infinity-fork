@@ -581,7 +581,8 @@ pub fn sql_placeholders(count: usize) -> String {
     result
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SearchFilters {
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
@@ -1244,7 +1245,7 @@ impl QueryExplanation {
 
 /// Indicates how a search result matched the query.
 /// Used for ranking: exact matches rank higher than wildcard matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchType {
     /// No wildcards - matched via exact term or edge n-gram prefix
@@ -1277,7 +1278,7 @@ impl MatchType {
 }
 
 /// Type of suggestion for did-you-mean
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionKind {
     /// Typo correction (Levenshtein distance)
@@ -1293,7 +1294,7 @@ pub enum SuggestionKind {
 }
 
 /// A "did-you-mean" suggestion when search returns zero hits.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QuerySuggestion {
     /// What kind of suggestion this is
     pub kind: SuggestionKind,
@@ -1432,21 +1433,21 @@ impl FieldMask {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,
     pub content: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,
     pub agent: String,
     pub workspace: String,
     /// Original workspace path before rewriting (P6.2)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_original: Option<String>,
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
@@ -1462,7 +1463,7 @@ pub struct SearchHit {
     #[serde(default = "default_source_id")]
     pub origin_kind: String,
     /// Origin host label for remote sources
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_host: Option<String>,
     // Chunk-domain provenance (T9, plan v5.1): which message the hit came
     // from at the block-search layer, and which of that message's chunks
@@ -1479,6 +1480,11 @@ pub struct SearchHit {
     pub winning_chunk_span: Option<(usize, usize)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winning_chunk_hash: Option<String>,
+    /// PR3 rerank score for this hit. `None` when rerank did not run, did not
+    /// apply, or was not requested for this hit; the original `score` is never
+    /// overwritten. Omitted from the public JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
 }
 
 static LAZY_FIELDS_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -1565,7 +1571,7 @@ fn like_substring_pattern(term: &str) -> String {
 
 
 /// Result of a search operation with metadata about how matches were found
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     /// The search results
     pub hits: Vec<SearchHit>,
@@ -2197,7 +2203,7 @@ struct SemanticCandidateSearchRequest {
 /// `vec0` KNN pass can return (`SQLITE_VEC_KNN_K_MAX`) *and* the active
 /// generation holds more chunk rows than that ceiling, round 1 is skipped
 /// outright and every candidate comes from the budgeted exact scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CandidateMode {
     #[serde(rename = "knn")]
     Knn,
@@ -2210,7 +2216,7 @@ pub enum CandidateMode {
 /// T9 (plan v5.1): observability/diagnostics envelope for one chunk-domain
 /// semantic candidate search, surfaced to callers via `SearchResult.
 /// candidates` and the `_meta.candidates` JSON/JSONL/robot envelope field.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CandidateMeta {
     pub mode: CandidateMode,
     /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`), or
@@ -2247,30 +2253,30 @@ pub struct CandidateMeta {
     ///
     /// `None` on every exact/float path -- absence means "no coarse screen
     /// ran here", which must never be read back as a measured `0`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_coarse_k: Option<usize>,
     /// PR9 task 08: the `k` the coarse screen actually ran with after the
     /// 4096 `SQLITE_VEC_KNN_K_MAX` cap and the corpus size were applied.
     /// `None` on every exact/float path (see `requested_coarse_k`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_coarse_k: Option<usize>,
     /// PR9 task 08: `true` iff `effective_coarse_k` was reduced by the 4096
     /// cap rather than by the corpus. `None` when no coarse screen ran.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_cap_hit: Option<bool>,
     /// For a sharded screen, `true` when the collected pool covers the whole
     /// active generation. The nominal per-shard K can exceed a small shard's
     /// row count even when the generation as a whole is larger than K.
     /// `None` when no coarse screen ran.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpus_limited: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_shard_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_rows_collected: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub float_rescore_rows: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_skip_reason: Option<String>,
 }
 
@@ -2507,7 +2513,7 @@ impl Default for SearchClientOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CacheStats {
     pub cache_hits: u64,
     pub cache_miss: u64,
@@ -2522,8 +2528,10 @@ pub struct CacheStats {
     pub approx_bytes: usize,
     /// Effective byte cap for cached hits (0 = disabled by explicit operator override)
     pub byte_cap: usize,
-    /// Active eviction/admission policy for prefix result cache
-    pub eviction_policy: &'static str,
+    /// Active eviction/admission policy for prefix result cache. Owned rather
+    /// than `&'static str` so a stats snapshot read back from the private
+    /// window cache cannot leak a fake static or force a `Box::leak`.
+    pub eviction_policy: String,
     /// Number of S3-FIFO ghost entries retained for adaptive admission
     pub ghost_entries: usize,
     /// Number of cache insertions rejected by adaptive admission
@@ -2549,7 +2557,7 @@ impl Default for CacheStats {
             eviction_count: 0,
             approx_bytes: 0,
             byte_cap: 0,
-            eviction_policy: "unknown",
+            eviction_policy: "unknown".to_string(),
             ghost_entries: 0,
             admission_rejects: 0,
             prewarm_scheduled: 0,
@@ -4800,6 +4808,7 @@ impl SearchClient {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 };
 
                 Some((message.message_id, hit))
@@ -6005,6 +6014,7 @@ impl SearchClient {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             };
             if Self::sqlite_fts5_hit_matches_filters(&hit, &filters) {
                 hits.push(hit);
@@ -6187,6 +6197,7 @@ impl SearchClient {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 })
             })?;
         Ok(rows)
@@ -6875,12 +6886,12 @@ impl SearchClient {
                 cache.eviction_count(),
                 cache.total_bytes(),
                 cache.byte_cap(),
-                cache.policy_label(),
+                cache.policy_label().to_string(),
                 cache.ghost_entries(),
                 cache.admission_rejects(),
             )
         } else {
-            (0, 0, 0, 0, 0, "unknown", 0, 0)
+            (0, 0, 0, 0, 0, "unknown".to_string(), 0, 0)
         };
         CacheStats {
             cache_hits: hits,
@@ -7214,6 +7225,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -8200,6 +8212,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
 
@@ -8259,6 +8272,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         }
     }
@@ -8473,6 +8487,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let cached = CachedHit {
@@ -8641,6 +8656,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }];
 
         client.put_cache("こん", &SearchFilters::default(), &hits);
@@ -8675,6 +8691,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
         assert!(hit_matches_query_cached(&cached, "hello"));
@@ -10407,6 +10424,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let hits = vec![hit.clone()];
 
@@ -10489,6 +10507,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         // Put 3 entries - should trigger 1 eviction (cap is 2)
@@ -10603,6 +10622,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
         let byte_cap = cached.approx_bytes() + 1_024;
@@ -10658,6 +10678,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
         let byte_cap = cached.approx_bytes() + 1_024;
@@ -10707,6 +10728,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         // Put 3 large entries - should trigger byte-based evictions
@@ -10746,6 +10768,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let large_content = "large".repeat(2_000);
         let large_hit = SearchHit {
@@ -10769,6 +10792,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let mut cache = CacheShards::new(100, 1_024);
@@ -11068,6 +11092,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11090,6 +11115,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11123,6 +11149,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11145,6 +11172,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11177,6 +11205,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let mut second = first.clone();
         second.line_number = Some(2);
@@ -11248,6 +11277,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Evening Session".into(),
@@ -11270,6 +11300,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11303,6 +11334,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11325,6 +11357,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11356,6 +11389,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11378,6 +11412,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11410,6 +11445,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title2".into(),
@@ -11432,6 +11468,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11464,6 +11501,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "real".into(),
@@ -11486,6 +11524,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11521,6 +11560,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(
@@ -11556,6 +11596,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title2".into(),
@@ -11578,6 +11619,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title3".into(),
@@ -11600,6 +11642,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11633,6 +11676,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "remote title".into(),
@@ -11655,6 +11699,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -14582,6 +14627,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -16807,6 +16853,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         // Query text doesn't matter — the point is that a hit stripped of
@@ -16849,6 +16896,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(

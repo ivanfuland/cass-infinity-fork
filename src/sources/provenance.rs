@@ -127,7 +127,7 @@ impl Default for Source {
 /// Filter for searching by source.
 ///
 /// Used in search queries to filter results by their origin.
-#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceFilter {
     /// Match all sources (no filtering).

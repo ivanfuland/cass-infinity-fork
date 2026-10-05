@@ -36,6 +36,7 @@ fn exact_hits_rank_above_wildcards_at_equal_recency_and_score() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let prefix = SearchHit {
@@ -94,6 +95,7 @@ fn recency_boost_can_outweigh_quality_when_far_newer() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let newer_suffix = SearchHit {
@@ -117,6 +119,7 @@ fn recency_boost_can_outweigh_quality_when_far_newer() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let max_created = newer_suffix.created_at.unwrap();
@@ -156,6 +159,7 @@ fn relevance_heavy_mode_prefers_quality_over_recency() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let newer_substring = SearchHit {
@@ -179,6 +183,7 @@ fn relevance_heavy_mode_prefers_quality_over_recency() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let older_score = blended_score(&older_exact, max_created, alpha);
@@ -219,6 +224,7 @@ fn match_quality_heavy_mode_balances_quality_and_recency() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let implicit = SearchHit {
@@ -271,6 +277,7 @@ fn ranking_handles_missing_created_at() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let hit_without_date = SearchHit {
@@ -294,6 +301,7 @@ fn ranking_handles_missing_created_at() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let with_date_score = blended_score(&hit_with_date, max_created, alpha);
@@ -335,6 +343,7 @@ fn ranking_handles_zero_max_created() {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     };
 
     let score = blended_score(&hit, max_created, alpha);
@@ -374,6 +383,7 @@ fn all_ranking_modes_maintain_quality_ordering_at_equal_inputs() {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let exact_score = blended_score(&base, max_created, alpha);

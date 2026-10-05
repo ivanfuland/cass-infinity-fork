@@ -1746,6 +1746,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(conversation_view_matches_hit(&view, &hit));
@@ -1804,6 +1805,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(conversation_view_matches_hit(&view, &hit));
@@ -1862,6 +1864,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(conversation_view_matches_hit(&view, &hit));
@@ -1920,6 +1923,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(!conversation_view_matches_hit(&view, &hit));
@@ -2089,6 +2093,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2142,6 +2147,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2190,6 +2196,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let loaded = load_conversation_for_hit(&storage, &hit)
             .expect("load attempt succeeds")
@@ -2248,6 +2255,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2304,6 +2312,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2360,6 +2369,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2420,6 +2430,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2481,6 +2492,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit)
@@ -2541,6 +2553,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let loaded = load_conversation_for_hit(&storage, &hit).expect("load attempt succeeds");

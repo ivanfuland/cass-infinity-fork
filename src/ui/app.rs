@@ -26872,6 +26872,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 agent: "codex".into(),
@@ -26894,6 +26895,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 agent: "claude_code".into(),
@@ -26916,6 +26918,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
         let _ = app.update(CassMsg::SearchCompleted {
@@ -28099,6 +28102,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         for mode in [
             DensityMode::Compact,
@@ -28162,6 +28166,7 @@ mod tests {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 },
                 SearchHit {
                     title: "B".into(),
@@ -28184,6 +28189,7 @@ mod tests {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 },
                 SearchHit {
                     title: "C".into(),
@@ -28206,6 +28212,7 @@ mod tests {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 },
             ],
             selected: 0,
@@ -28265,6 +28272,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }];
         let _ = app.update(CassMsg::SearchCompleted {
             generation: app.search_generation,
@@ -28304,6 +28312,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let queued_item = ResultItem {
             index: 1,
@@ -31946,6 +31955,7 @@ not jsonl",
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -35347,6 +35357,7 @@ not jsonl",
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -35374,6 +35385,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Search ranking tuning notes".into(),
@@ -35396,6 +35408,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Theme audit and contrast findings".into(),
@@ -35418,6 +35431,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Multi-agent coordination transcript".into(),
@@ -35440,6 +35454,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Large-snippet rendering edge case".into(),
@@ -35462,6 +35477,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "JSON payload decode failure".into(),
@@ -35484,6 +35500,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Legacy migration checklist".into(),
@@ -35506,6 +35523,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Background telemetry heartbeat".into(),
@@ -35528,6 +35546,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ]
     }
@@ -39155,6 +39174,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "second".into(),
@@ -39177,6 +39197,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "other".into(),
@@ -39199,6 +39220,7 @@ not jsonl",
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
         app.panes.push(AgentPane {
@@ -42727,6 +42749,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }];
         app.panes = vec![AgentPane {
             agent: "test".into(),
@@ -47511,6 +47534,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             })
             .collect();
         app.panes.push(AgentPane {

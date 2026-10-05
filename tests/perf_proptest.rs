@@ -35,6 +35,7 @@ fn make_hit(id: &str, score: f32) -> SearchHit {
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     }
 }
 

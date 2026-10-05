@@ -1703,6 +1703,7 @@ fn make_session_hit(content_hash: u64, line_number: usize, content: String) -> S
         winning_chunk_idx: None,
         winning_chunk_span: None,
         winning_chunk_hash: None,
+        rerank_score: None,
     }
 }
 

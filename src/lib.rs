@@ -27714,6 +27714,7 @@ mod pr9_candidate_meta_output_tests {
             winning_chunk_idx: Some(3),
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -93045,6 +93046,7 @@ mod robot_output_score_tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
