@@ -508,6 +508,28 @@ mod tests {
         }
     }
 
+    /// PR9 exact-scan metadata: round 1 was skipped outright, so no coarse
+    /// screen ran at all and every coarse field is absent.
+    fn exact_scan_candidates() -> CandidateMeta {
+        CandidateMeta {
+            mode: CandidateMode::Exact,
+            k: 0,
+            first_round_rows: 0,
+            unique_messages: 3,
+            incomplete: true,
+            reason: Some("exact scan stopped at the row budget".to_string()),
+            approximate: false,
+            requested_coarse_k: None,
+            effective_coarse_k: None,
+            coarse_cap_hit: None,
+            corpus_limited: None,
+            coarse_shard_count: None,
+            coarse_rows_collected: None,
+            float_rescore_rows: None,
+            coarse_skip_reason: Some("no coarse screen ran".to_string()),
+        }
+    }
+
     fn sample_result() -> SearchResult {
         let mut first = hit_with("first", 9.5);
         first.content_hash = 0xDEAD_BEEF_CAFE_1234;
@@ -888,6 +910,88 @@ mod tests {
         assert!(suggestion_filters.agents.contains("codex"));
         assert!(suggestion_filters.session_paths.contains("/tmp/s.jsonl"));
         assert_eq!(suggestion_filters.source_filter, Default::default());
+    }
+
+    #[test]
+    fn search_result_round_trips_exact_scan_metadata() {
+        let mut original = sample_result();
+        original.candidates = Some(exact_scan_candidates());
+
+        let encoded = encode_search_result(&original).unwrap();
+        let decoded = decode_search_result(encoded.clone()).unwrap();
+
+        let candidates = decoded
+            .candidates
+            .as_ref()
+            .expect("exact-scan candidates must survive the codec");
+        assert_eq!(candidates.mode, CandidateMode::Exact);
+        assert!(
+            !candidates.approximate,
+            "an exact scan must read back approximate=false, never true"
+        );
+        assert_eq!(candidates.k, 0);
+        assert_eq!(candidates.first_round_rows, 0);
+        assert_eq!(candidates.unique_messages, 3);
+        assert!(candidates.incomplete);
+        assert_eq!(
+            candidates.reason.as_deref(),
+            Some("exact scan stopped at the row budget")
+        );
+        // Absent coarse evidence must read back as absent: not as Some(0),
+        // Some(false) or a made-up value.
+        assert_eq!(candidates.requested_coarse_k, None);
+        assert_eq!(candidates.effective_coarse_k, None);
+        assert_eq!(candidates.coarse_cap_hit, None);
+        assert_eq!(candidates.corpus_limited, None);
+        assert_eq!(candidates.coarse_shard_count, None);
+        assert_eq!(candidates.coarse_rows_collected, None);
+        assert_eq!(candidates.float_rescore_rows, None);
+        assert_eq!(
+            candidates.coarse_skip_reason.as_deref(),
+            Some("no coarse screen ran")
+        );
+
+        assert_eq!(encode_search_result(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn search_result_round_trips_knn_exact_mixed_coarse_fields() {
+        let mut original = sample_result();
+        let mut candidates = sample_candidates();
+        candidates.mode = CandidateMode::KnnExact;
+        candidates.approximate = false;
+        candidates.requested_coarse_k = Some(2048);
+        candidates.effective_coarse_k = None; // absent must stay absent
+        candidates.coarse_cap_hit = Some(false); // false is not absent
+        candidates.corpus_limited = None;
+        candidates.coarse_shard_count = Some(0); // zero is not absent
+        candidates.coarse_rows_collected = None;
+        candidates.float_rescore_rows = Some(512);
+        candidates.coarse_skip_reason = Some("partial coarse screen".to_string());
+        original.candidates = Some(candidates);
+
+        let encoded = encode_search_result(&original).unwrap();
+        let decoded = decode_search_result(encoded.clone()).unwrap();
+
+        let candidates = decoded
+            .candidates
+            .as_ref()
+            .expect("knn+exact candidates must survive the codec");
+        assert_eq!(candidates.mode, CandidateMode::KnnExact);
+        assert!(!candidates.approximate);
+        assert_eq!(candidates.requested_coarse_k, Some(2048));
+        assert_eq!(candidates.effective_coarse_k, None);
+        assert_eq!(candidates.coarse_cap_hit, Some(false));
+        assert_eq!(candidates.corpus_limited, None);
+        assert_eq!(candidates.coarse_shard_count, Some(0));
+        assert_eq!(candidates.coarse_rows_collected, None);
+        assert_eq!(candidates.float_rescore_rows, Some(512));
+        assert_eq!(
+            candidates.coarse_skip_reason.as_deref(),
+            Some("partial coarse screen")
+        );
+
+        assert_eq!(encode_search_result(&decoded).unwrap(), encoded);
     }
 
     #[test]
