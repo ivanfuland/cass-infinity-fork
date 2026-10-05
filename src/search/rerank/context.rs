@@ -134,13 +134,6 @@ pub fn build_documents(
         return Ok(Vec::new());
     }
 
-    // TESTS-ONLY RED STATE: the production assembly is deliberately not
-    // implemented in this step. The module tests must fail here (behaviour
-    // failure), proving they bind to a real implementation. Removed by the
-    // implementing commit that follows.
-    unimplemented!("P03 tests-only RED: production document assembly not implemented yet");
-
-    #[allow(unreachable_code)]
     let conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
         db_path,
         READ_ONLY_OPEN_TIMEOUT,
