@@ -50,11 +50,11 @@ const FS_CASS_SCHEMA_HASH: &str =
 /// must ignore `positive`/`negative`/`or_only` and fall back to the
 /// whole-string LIKE path when it is set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct Ku3LikeTerms {
-    positive: Vec<String>,
-    negative: Vec<String>,
-    mixed_operators: bool,
-    or_only: bool,
+pub(crate) struct Ku3LikeTerms {
+    pub(crate) positive: Vec<String>,
+    pub(crate) negative: Vec<String>,
+    pub(crate) mixed_operators: bool,
+    pub(crate) or_only: bool,
 }
 
 /// Token types for cass-style boolean query parsing.
@@ -1524,7 +1524,7 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
 /// this degrade is *not* restricted by script -- any query under 3 Unicode
 /// codepoints (ASCII, CJK, emoji, or otherwise) structurally cannot match
 /// via `MATCH` and must degrade to the `LIKE` table scan.
-fn is_lexical_ku3_short_query(query: &str) -> bool {
+pub(crate) fn is_lexical_ku3_short_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -1546,7 +1546,7 @@ fn is_lexical_ku3_short_query(query: &str) -> bool {
 /// (`lex_docs_like_candidates_query`, driven off the raw, unsplit query
 /// text -- which for both examples above still appears verbatim as a
 /// contiguous substring in the content it's meant to find).
-fn query_has_short_subterm_after_normalization(query: &str) -> bool {
+pub(crate) fn query_has_short_subterm_after_normalization(query: &str) -> bool {
     fs_cass_parse_boolean_query(query).into_iter().any(|token| {
         let FsCassQueryToken::Term(t) = token else {
             return false;
@@ -5301,7 +5301,10 @@ impl SearchClient {
     /// `bm25(fts_lex, ...)` is still computed here (not dropped from the
     /// `SELECT`) to serve as the zero-score tie-break signal (design doc
     /// ⑤ "边界①") at zero extra query cost, not to order the results.
-    fn fts_lex_match_candidates_query(fts_query: &str, cap: usize) -> (String, Vec<ParamValue>) {
+    pub(crate) fn fts_lex_match_candidates_query(
+        fts_query: &str,
+        cap: usize,
+    ) -> (String, Vec<ParamValue>) {
         let sql = "SELECT rowid, bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5) FROM fts_lex \
                     WHERE fts_lex MATCH ?1 LIMIT ?2"
             .to_string();
@@ -5321,7 +5324,10 @@ impl SearchClient {
     /// `sqlite_message_scan_score`'s philosophy) is still computed in the
     /// `SELECT` to serve as the zero-score tie-break signal, not to order
     /// results. `cap` is `no_limit_result_cap()`'s value.
-    fn lex_docs_like_candidates_query(raw_term: &str, cap: usize) -> (String, Vec<ParamValue>) {
+    pub(crate) fn lex_docs_like_candidates_query(
+        raw_term: &str,
+        cap: usize,
+    ) -> (String, Vec<ParamValue>) {
         let pattern = like_substring_pattern(raw_term);
         let sql = "SELECT doc_id, \
                     CAST( \
@@ -5380,7 +5386,7 @@ impl SearchClient {
     /// `Ku3LikeTerms` purely as extraction/routing state -- it still
     /// decides whether the caller falls back to the whole-string path --
     /// but is never turned into a WHERE predicate.
-    fn lex_docs_like_candidates_query_multi_term(
+    pub(crate) fn lex_docs_like_candidates_query_multi_term(
         terms: &Ku3LikeTerms,
         cap: usize,
     ) -> (String, Vec<ParamValue>) {
@@ -5478,7 +5484,7 @@ impl SearchClient {
     /// mix has no faithful LIKE-of-terms rendering, so the caller falls
     /// all the way back to the pre-T11.11 whole-string LIKE path for it,
     /// same as it always did for any `OR`.
-    fn ku3_like_fallback_terms(raw_query: &str) -> Ku3LikeTerms {
+    pub(crate) fn ku3_like_fallback_terms(raw_query: &str) -> Ku3LikeTerms {
         let tokens = fs_cass_parse_boolean_query(raw_query);
         let has_or = tokens.iter().any(|t| matches!(t, FsCassQueryToken::Or));
         let has_and_or_not =
@@ -6218,7 +6224,7 @@ pub fn fuzz_transpile_to_fts5(raw_query: &str) -> Option<String> {
 /// Transpile a raw query string into an FTS5-compatible query string.
 /// Preserves custom precedence (OR > AND) by adding parentheses.
 /// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
-fn transpile_to_fts5(raw_query: &str) -> Option<String> {
+pub(crate) fn transpile_to_fts5(raw_query: &str) -> Option<String> {
     let tokens = fs_cass_parse_boolean_query(raw_query);
     if tokens.is_empty() {
         return Some("".to_string());
