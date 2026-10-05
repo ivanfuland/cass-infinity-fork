@@ -502,11 +502,12 @@ impl WindowStore {
             return Err(WindowError::Corrupt);
         }
 
-        let mut file = File::open(&path).map_err(|_| WindowError::Corrupt)?;
         let mut buf = Vec::new();
         let cap = self.policy.max_window_bytes.saturating_add(1);
-        file.by_ref()
-            .take(cap)
+        let mut limited = File::open(&path)
+            .map_err(|_| WindowError::Corrupt)?
+            .take(cap);
+        limited
             .read_to_end(&mut buf)
             .map_err(|_| WindowError::Corrupt)?;
         if buf.len() as u64 > self.policy.max_window_bytes {
@@ -1335,12 +1336,9 @@ fn read_created_at(path: &Path, cap: u64) -> Option<i64> {
     if !meta.file_type().is_file() || meta.len() > cap {
         return None;
     }
-    let mut file = File::open(path).ok()?;
     let mut buf = Vec::new();
-    file.by_ref()
-        .take(cap.saturating_add(1))
-        .read_to_end(&mut buf)
-        .ok()?;
+    let mut limited = File::open(path).ok()?.take(cap.saturating_add(1));
+    limited.read_to_end(&mut buf).ok()?;
     if buf.len() as u64 > cap {
         return None;
     }
