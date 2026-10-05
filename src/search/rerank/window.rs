@@ -2645,15 +2645,22 @@ mod tests {
         let db = make_db(tmp.path());
         let before = capture_index_stamp(&db).unwrap();
 
-        fs::remove_file(&db).unwrap();
+        // Build the replacement under another name first, while the original
+        // still exists, so the two files cannot share an inode; then move it
+        // into place. A same-content replacement at the same path must still
+        // invalidate the window.
+        let staged = tmp.path().join("staged.db");
+        make_db_at(&staged, false);
+        let _ = fs::remove_file(wal_path_for(&staged));
         let _ = fs::remove_file(wal_path_for(&db));
-        make_db_at(&db, false);
+        fs::remove_file(&db).unwrap();
+        fs::rename(&staged, &db).unwrap();
 
         let after = capture_index_stamp(&db).unwrap();
         assert_ne!(before, after);
         assert_ne!(
             before.db_file.inode, after.db_file.inode,
-            "a replaced file must be a new inode"
+            "a replaced file must be a different inode"
         );
     }
 
