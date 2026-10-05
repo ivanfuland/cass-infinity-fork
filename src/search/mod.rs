@@ -61,6 +61,7 @@ pub(crate) mod readiness_fixtures;
 pub(crate) mod readiness_projection;
 pub(crate) mod recovery_journeys;
 pub(crate) mod regression_corpus;
+pub mod rerank;
 pub mod reranker;
 pub mod reranker_registry;
 pub mod runtime_optimizations;
