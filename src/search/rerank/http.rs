@@ -206,9 +206,12 @@ fn validate_base_url(raw: &str, local_only: bool) -> Result<Url, RerankError> {
         _ => return Err(invalid_input()),
     }
 
-    // The URL parser normalizes an empty userinfo (`http://@host`) away, so the
-    // raw authority text is inspected as well.
-    if !url.username().is_empty() || url.password().is_some() || authority_has_at_sign(raw) {
+    // A bare origin has no legal `@` anywhere, and the URL parser normalizes
+    // several userinfo shapes (`http://@host`, `http:/@host`, `http:////@host`,
+    // a backslash authority, an upper-case scheme) into a bare origin with an
+    // empty username. Refusing any raw `@` catches all of them without
+    // rejecting a legitimate IP literal, `localhost` or port form.
+    if !url.username().is_empty() || url.password().is_some() || raw.contains('@') {
         return Err(invalid_input());
     }
 
@@ -249,16 +252,6 @@ fn host_is_loopback(host: &Host<&str>) -> bool {
 /// Whether the base URL's host is the one permitted DNS name.
 fn host_is_localhost_domain(url: &Url) -> bool {
     matches!(url.host(), Some(Host::Domain(name)) if name.eq_ignore_ascii_case("localhost"))
-}
-
-/// Detect a userinfo `@` in the raw authority, covering the empty-username form.
-fn authority_has_at_sign(raw: &str) -> bool {
-    let Some(idx) = raw.find("://") else {
-        return false;
-    };
-    let after = &raw[idx + 3..];
-    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
-    after[..end].contains('@')
 }
 
 /// Reject anything that is not a rooted, same-origin request path.
@@ -547,9 +540,10 @@ mod tests {
     /// demand `Debug` on the (deliberately non-`Debug`) success type, so this
     /// goes through `Result::err` instead.
     fn refused(config: HttpConfig, bearer: Option<String>) -> RerankError {
+        let base = config.base_url.clone();
         HttpTransport::new(config, bearer)
             .err()
-            .expect("transport must be refused")
+            .unwrap_or_else(|| panic!("transport must be refused for base {base:?}"))
     }
 
     // ------------------------------------------------------------------
@@ -681,15 +675,30 @@ mod tests {
 
     #[test]
     fn base_url_with_userinfo_is_refused() {
+        // Every form that carries an `@` in the raw base must be refused,
+        // including the shapes the URL parser would normalize to a bare origin
+        // with an empty username (`http:/@host`, `http:////@host`, a backslash
+        // authority, an upper-case scheme). A bare origin has no legal `@`, so
+        // the raw text is the authority.
         for base in [
             "http://user:pass@127.0.0.1:8080",
             "http://user@127.0.0.1:8080",
-            // Empty-username form: the URL parser drops it, so it must be
-            // caught on the raw text.
             "http://@127.0.0.1:8080",
+            "http://@localhost",
+            r"http:\@localhost",
+            "http:/@localhost",
+            "http:////@localhost",
+            r"http:\\@localhost",
+            "HTTP://@localhost",
         ] {
-            let err = refused(config(base, false), None);
-            assert_eq!(err.reason, RerankFailureReason::InvalidInput, "base {base}");
+            for local_only in [true, false] {
+                let err = refused(config(base, local_only), None);
+                assert_eq!(
+                    err.reason,
+                    RerankFailureReason::InvalidInput,
+                    "base {base:?} local_only={local_only}"
+                );
+            }
         }
     }
 
