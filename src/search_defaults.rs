@@ -502,4 +502,379 @@ mod tests {
         .unwrap();
         assert_eq!(p, PathBuf::from("/platform/cass/cass.toml"));
     }
+    // ---- search window limits (P08a) ----
+
+    /// Base `WindowLimitInputs` for a run with reranking off and nothing set;
+    /// each test tweaks only the fields it exercises.
+    fn base_inputs(config: &SearchDefaults) -> WindowLimitInputs<'_> {
+        WindowLimitInputs {
+            rerank: false,
+            cli_rrf: None,
+            cli_rerank: None,
+            env_rrf: None,
+            env_rerank: None,
+            env_legacy_limit: None,
+            config,
+        }
+    }
+
+    #[test]
+    fn window_all_defaults_off_is_zero_builtin_without_rerank() {
+        let cfg = SearchDefaults::default();
+        let r = resolve_window_limits(base_inputs(&cfg)).unwrap();
+        assert_eq!(r.rrf_limit, 0);
+        assert_eq!(r.rrf_source, DefaultSource::BuiltIn);
+        assert_eq!(r.rerank_limit, None);
+        assert_eq!(r.rerank_source, None);
+    }
+
+    #[test]
+    fn window_all_defaults_on_is_200_5_builtin() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!(r.rrf_limit, 200);
+        assert_eq!(r.rrf_source, DefaultSource::BuiltIn);
+        assert_eq!(r.rerank_limit, Some(5));
+        assert_eq!(r.rerank_source, Some(DefaultSource::BuiltIn));
+    }
+
+    #[test]
+    fn window_cli_layer_is_selected() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(300);
+        i.cli_rerank = Some(7);
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rrf_source), (300, DefaultSource::CliFlag));
+        assert_eq!(
+            (r.rerank_limit, r.rerank_source),
+            (Some(7), Some(DefaultSource::CliFlag))
+        );
+    }
+
+    #[test]
+    fn window_env_layer_is_selected() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.env_rrf = Some("300");
+        i.env_rerank = Some("7");
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rrf_source), (300, DefaultSource::EnvVar));
+        assert_eq!(
+            (r.rerank_limit, r.rerank_source),
+            (Some(7), Some(DefaultSource::EnvVar))
+        );
+    }
+
+    #[test]
+    fn window_config_layer_is_selected() {
+        let cfg = SearchDefaults {
+            rrf_limit: Some(300),
+            rerank_limit: Some(7),
+            ..SearchDefaults::default()
+        };
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!(
+            (r.rrf_limit, r.rrf_source),
+            (300, DefaultSource::ConfigFile)
+        );
+        assert_eq!(
+            (r.rerank_limit, r.rerank_source),
+            (Some(7), Some(DefaultSource::ConfigFile))
+        );
+    }
+
+    #[test]
+    fn window_valid_cli_overrides_bad_env_and_config() {
+        let cfg = SearchDefaults {
+            rrf_limit: Some(0),
+            rerank_limit: Some(0),
+            ..SearchDefaults::default()
+        };
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(300);
+        i.cli_rerank = Some(7);
+        i.env_rrf = Some("not-a-number");
+        i.env_rerank = Some("0");
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rrf_source), (300, DefaultSource::CliFlag));
+        assert_eq!(
+            (r.rerank_limit, r.rerank_source),
+            (Some(7), Some(DefaultSource::CliFlag))
+        );
+    }
+
+    #[test]
+    fn window_valid_env_overrides_bad_config() {
+        let cfg = SearchDefaults {
+            rrf_limit: Some(0),
+            rerank_limit: Some(0),
+            ..SearchDefaults::default()
+        };
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.env_rrf = Some("300");
+        i.env_rerank = Some("7");
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rrf_source), (300, DefaultSource::EnvVar));
+        assert_eq!(
+            (r.rerank_limit, r.rerank_source),
+            (Some(7), Some(DefaultSource::EnvVar))
+        );
+    }
+
+    #[test]
+    fn window_env_trims_outer_whitespace() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.env_rrf = Some("  \t 300 \n ");
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rrf_source), (300, DefaultSource::EnvVar));
+    }
+
+    #[test]
+    fn window_env_rejects_malformed_forms() {
+        let cfg = SearchDefaults::default();
+        for raw in [
+            "",
+            "   ",
+            "-5",
+            "+5",
+            "abc",
+            "5.0",
+            "12x",
+            "0x10",
+            "9_999",
+            // u64 parse overflow
+            "99999999999999999999999",
+            // parses as u64 but exceeds i64::MAX - 1
+            "9223372036854775807",
+            "18446744073709551615",
+        ] {
+            let mut i = base_inputs(&cfg);
+            i.env_rrf = Some(raw);
+            assert!(
+                resolve_window_limits(i).is_err(),
+                "env rrf value {raw:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn window_explicit_zero_rejected_for_rrf_in_every_layer() {
+        // CLI
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.cli_rrf = Some(0);
+        assert!(resolve_window_limits(i).is_err());
+        // env
+        let mut i = base_inputs(&cfg);
+        i.env_rrf = Some("0");
+        assert!(resolve_window_limits(i).is_err());
+        // config
+        let cfg = SearchDefaults {
+            rrf_limit: Some(0),
+            ..SearchDefaults::default()
+        };
+        assert!(resolve_window_limits(base_inputs(&cfg)).is_err());
+    }
+
+    #[test]
+    fn window_explicit_zero_rejected_for_rerank_when_on() {
+        let cfg = SearchDefaults::default();
+        // CLI rerank 0
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(200);
+        i.cli_rerank = Some(0);
+        assert!(resolve_window_limits(i).is_err());
+        // env rerank 0
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.env_rrf = Some("200");
+        i.env_rerank = Some("0");
+        assert!(resolve_window_limits(i).is_err());
+        // config rerank 0
+        let cfg = SearchDefaults {
+            rrf_limit: Some(200),
+            rerank_limit: Some(0),
+            ..SearchDefaults::default()
+        };
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        assert!(resolve_window_limits(i).is_err());
+    }
+
+    #[test]
+    fn window_on_n4_without_k_is_rejected_not_clamped() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(4);
+        assert!(resolve_window_limits(i).is_err());
+    }
+
+    #[test]
+    fn window_on_n4_k4_is_accepted() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(4);
+        i.cli_rerank = Some(4);
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rerank_limit), (4, Some(4)));
+    }
+
+    #[test]
+    fn window_on_n5_without_k_uses_default_5() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(5);
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rerank_limit), (5, Some(5)));
+        assert_eq!(r.rerank_source, Some(DefaultSource::BuiltIn));
+    }
+
+    #[test]
+    fn window_on_k_greater_than_n_is_rejected() {
+        let cfg = SearchDefaults::default();
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(10);
+        i.cli_rerank = Some(11);
+        assert!(resolve_window_limits(i).is_err());
+    }
+
+    #[test]
+    fn window_max_boundary_passes_and_next_value_is_rejected() {
+        let max_allowed = (i64::MAX as usize) - 1;
+        let cfg = SearchDefaults::default();
+
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(max_allowed);
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rerank_limit), (max_allowed, Some(5)));
+
+        let mut i = base_inputs(&cfg);
+        i.rerank = true;
+        i.cli_rrf = Some(max_allowed + 1);
+        assert!(resolve_window_limits(i).is_err());
+
+        let mut i = base_inputs(&cfg);
+        i.env_rrf = Some("9223372036854775806");
+        assert_eq!(
+            resolve_window_limits(i).unwrap().rrf_limit,
+            9223372036854775806
+        );
+
+        let mut i = base_inputs(&cfg);
+        i.env_rrf = Some("9223372036854775807");
+        assert!(resolve_window_limits(i).is_err());
+    }
+
+    #[test]
+    fn window_off_rejects_cli_rerank_even_at_zero() {
+        let cfg = SearchDefaults::default();
+        for k in [Some(5), Some(0)] {
+            let mut i = base_inputs(&cfg);
+            i.cli_rerank = k;
+            assert!(
+                resolve_window_limits(i).is_err(),
+                "off cli K={k:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn window_off_ignores_env_and_config_rerank() {
+        let cfg = SearchDefaults {
+            rerank_limit: Some(0),
+            ..SearchDefaults::default()
+        };
+        let mut i = base_inputs(&cfg);
+        i.cli_rrf = Some(50);
+        i.env_rerank = Some("0");
+        let r = resolve_window_limits(i).unwrap();
+        assert_eq!((r.rrf_limit, r.rrf_source), (50, DefaultSource::CliFlag));
+        assert_eq!(r.rerank_limit, None);
+        assert_eq!(r.rerank_source, None);
+
+        // A garbage env rerank value is likewise ignored while reranking is off.
+        let mut i = base_inputs(&cfg);
+        i.env_rerank = Some("not-a-number");
+        assert!(resolve_window_limits(i).is_ok());
+    }
+
+    #[test]
+    fn window_legacy_env_limit_is_a_migration_error_even_with_full_cli() {
+        let cfg = SearchDefaults::default();
+        for legacy in ["100", "", "   "] {
+            let mut i = base_inputs(&cfg);
+            i.rerank = true;
+            i.cli_rrf = Some(200);
+            i.cli_rerank = Some(5);
+            i.env_legacy_limit = Some(legacy);
+            let err = resolve_window_limits(i).unwrap_err();
+            assert!(err.contains("--rrf-limit"), "{err}");
+            assert!(err.contains("--rerank-limit"), "{err}");
+            assert!(err.contains("CASS_RRF_LIMIT"), "{err}");
+            assert!(err.contains("CASS_RERANK_LIMIT"), "{err}");
+        }
+    }
+
+    #[test]
+    fn window_legacy_config_limit_is_a_migration_error_even_at_zero() {
+        for legacy in [0usize, 100, usize::MAX] {
+            let cfg = SearchDefaults {
+                limit: Some(legacy),
+                ..SearchDefaults::default()
+            };
+            let mut i = base_inputs(&cfg);
+            i.rerank = true;
+            i.cli_rrf = Some(200);
+            i.cli_rerank = Some(5);
+            let err = resolve_window_limits(i).unwrap_err();
+            assert!(err.contains("--rrf-limit"), "{err}");
+            assert!(err.contains("--rerank-limit"), "{err}");
+            assert!(err.contains("CASS_RRF_LIMIT"), "{err}");
+            assert!(err.contains("CASS_RERANK_LIMIT"), "{err}");
+        }
+    }
+
+    #[test]
+    fn window_errors_never_echo_the_raw_input() {
+        let cfg = SearchDefaults::default();
+
+        let mut i = base_inputs(&cfg);
+        i.env_legacy_limit = Some("SECRET-LEGACY-9931");
+        let err = resolve_window_limits(i).unwrap_err();
+        assert!(!err.contains("SECRET-LEGACY-9931"), "{err}");
+        assert!(!err.contains("9931"), "{err}");
+
+        let mut i = base_inputs(&cfg);
+        i.env_rrf = Some("SECRET-ENV-7742");
+        let err = resolve_window_limits(i).unwrap_err();
+        assert!(!err.contains("SECRET-ENV-7742"), "{err}");
+        assert!(!err.contains("7742"), "{err}");
+    }
+
+    #[test]
+    fn parse_new_window_fields_load_from_toml() {
+        let toml = "[search]\nrrf_limit = 200\nrerank_limit = 5\n";
+        let d = parse_search_defaults(toml).unwrap();
+        assert_eq!(d.rrf_limit, Some(200));
+        assert_eq!(d.rerank_limit, Some(5));
+        assert_eq!(d.limit, None);
+        assert_eq!(d.timeout_ms, None);
+        assert_eq!(d.mode, None);
+    }
 }
