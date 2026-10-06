@@ -27470,8 +27470,7 @@ fn output_display_results(
 fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
     fields.as_ref().map(|f| {
         f.iter()
-            .flat_map(|field| {
-                match field.as_str() {
+            .flat_map(|field| match field.as_str() {
                 "minimal" => vec![
                     "source_path".to_string(),
                     "line_number".to_string(),
