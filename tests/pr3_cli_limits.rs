@@ -92,6 +92,12 @@ fn combined(output: &Output) -> String {
     )
 }
 
+/// Collapse all whitespace (including help-text line wrapping) to single spaces
+/// so a phrase can be asserted regardless of where the terminal wrapped it.
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn assert_usage_error(env: &Env, args: &[&str]) {
     let out = run(env, args);
     assert_eq!(
@@ -234,6 +240,96 @@ fn query_after_double_dash_is_not_a_limit_error() {
     assert_not_usage_error(&env, &["search", "--json", "--", "--limit"]);
     // A value that reads like a limit flag is also not scanned.
     assert_not_usage_error(&env, &["search", "q", "--json", "--since", "--limit"]);
+}
+
+#[test]
+fn source_alias_values_are_not_migration_errors() {
+    // Regression for F1: `--provider limit=5` (and the other source-filter
+    // aliases) must not be misread as the legacy count alias `limit=5`. The
+    // value belongs to the alias, and a dry-run must succeed on the empty dir.
+    let env = Env::new();
+    for alias in [
+        "--provider",
+        "--tool",
+        "--connector",
+        "--agent-type",
+        "--role",
+        "--agent",
+    ] {
+        let out = run(
+            &env,
+            &[
+                "search",
+                "probe",
+                "--mode",
+                "lexical",
+                "--dry-run",
+                "--json",
+                alias,
+                "limit=5",
+            ],
+        );
+        assert_eq!(
+            code(&out),
+            0,
+            "{alias} limit=5 must not be a migration error:\n{}",
+            combined(&out)
+        );
+
+        let inline = format!("{alias}=limit=5");
+        let out = run(
+            &env,
+            &[
+                "search",
+                "probe",
+                "--mode",
+                "lexical",
+                "--dry-run",
+                "--json",
+                inline.as_str(),
+            ],
+        );
+        assert_eq!(
+            code(&out),
+            0,
+            "{inline} must not be a migration error:\n{}",
+            combined(&out)
+        );
+    }
+}
+
+#[test]
+fn docs_state_window_defaults() {
+    let env = Env::new();
+
+    let cmds = flatten(&combined(&run(&env, &["robot-docs", "commands"])));
+    assert!(
+        cmds.contains("Default: 200 with --rerank"),
+        "robot-docs commands must state the on-default N=200:\n{cmds}"
+    );
+    assert!(
+        cmds.contains("internal 0"),
+        "robot-docs commands must state the off-default (legacy internal 0):\n{cmds}"
+    );
+    assert!(
+        cmds.contains("default 5"),
+        "robot-docs commands must state the K default 5:\n{cmds}"
+    );
+    assert!(
+        cmds.contains("Explicit 0 is rejected"),
+        "robot-docs commands must state explicit 0 is rejected:\n{cmds}"
+    );
+
+    let help = flatten(&help_text(&env, &["search", "--help"]));
+    assert!(help.contains("it is 200"), "search --help must state N=200 with --rerank:\n{help}");
+    assert!(
+        help.contains("internal 0"),
+        "search --help must state the off-default (legacy internal 0):\n{help}"
+    );
+    assert!(
+        help.contains("Default 5"),
+        "search --help must state the K default 5:\n{help}"
+    );
 }
 
 // --------------------------------------------------------------------------

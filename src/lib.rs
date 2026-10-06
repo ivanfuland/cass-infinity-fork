@@ -473,16 +473,20 @@ pub enum Commands {
         #[arg(long)]
         role: Vec<String>,
         /// Candidate window size N: the rrf-fusion/dedup/filter bound fetched
-        /// before pagination. Resolved with the CLI > CASS_RRF_LIMIT >
-        /// [search].rrf_limit > built-in precedence. Valid with or without
-        /// --rerank; when --rerank is off it is the fetch bound that replaces
-        /// the removed --limit. A value of 0, a non-integer, or a window whose
-        /// N+1 overflows usize/i64 is rejected before any DB or model work.
+        /// before pagination. The default depends on context: with --rerank it
+        /// is 200; without --rerank an omitted N keeps the legacy unbounded
+        /// fetch (internal 0). An explicit 0 is always rejected. Valid with or
+        /// without --rerank; when --rerank is off it is the fetch bound that
+        /// replaces the removed search count flag. Resolved with CLI >
+        /// CASS_RRF_LIMIT > [search].rrf_limit > default precedence. A window
+        /// whose N+1 overflows usize/i64 is rejected before any DB or model
+        /// work.
         #[arg(long)]
         rrf_limit: Option<usize>,
-        /// Per-page result count K when --rerank is enabled (at least 1, at most
-        /// the rrf window N). Passing an explicit value without --rerank is a
-        /// usage error; env/config K values are ignored when --rerank is off.
+        /// Per-page result count K when --rerank is enabled. Default 5; must be
+        /// at least 1 and at most the rrf window N. An explicit 0 is rejected.
+        /// Passing an explicit value without --rerank is a usage error, and
+        /// env/config K values are ignored when --rerank is off.
         #[arg(long)]
         rerank_limit: Option<usize>,
         /// Rerank backend selection. Requires --rerank. Exactly one of
@@ -4470,11 +4474,18 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
         name.as_str(),
         "agent"
             | "workspace"
+            | "role"
             | "limit"
             | "offset"
             | "rrf-limit"
             | "rerank-limit"
             | "rerank-provider"
+            | "vector-search-mode"
+            | "provider"
+            | "tool"
+            | "connector"
+            | "agent-type"
+            | "agent_type"
             | "fields"
             | "max-content-length"
             | "max_content_length"
@@ -21712,9 +21723,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search <query> [OPTIONS]".to_string(),
             "    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 22-connector inventory)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
-            "    --rrf-limit N     Candidate window N before pagination (the pre-rerank fetch bound; default: 0 = no explicit window)".to_string(),
-            "    --rerank-limit K  Per-page count K when --rerank is on (>=1, <=N; default: 5)".to_string(),
-            "    --rerank-provider P  Rerank backend when --rerank is on: qwen3-local (default) | bge-local | openrouter-qwen3-8b | openrouter-cohere-4-fast | openrouter-voyage-2.5-lite".to_string(),
+            "    --rrf-limit N     Candidate window N before pagination. Default: 200 with --rerank; without --rerank an omitted N keeps the legacy unbounded fetch (internal 0). Explicit 0 is rejected.".to_string(),
+            "    --rerank-limit K  Per-page count K when --rerank is on (default 5; must be >=1 and <=N; explicit 0 rejected)".to_string(),
+            "    --rerank-provider P  Rerank backend when --rerank is on: qwen3-local (default when omitted) | bge-local | openrouter-qwen3-8b | openrouter-cohere-4-fast | openrouter-voyage-2.5-lite".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
@@ -23893,6 +23904,44 @@ mod pr3_cli_limits {
         let parsed = parse(&["cass", "search", "q", "--since", "--limit"])
             .expect("value of --since must not be misread");
         assert!(matches!(parsed.cli.command, Some(Commands::Search { .. })));
+    }
+
+    #[test]
+    fn source_alias_values_that_look_like_counts_are_not_flagged() {
+        // `--provider`/`--tool`/`--connector`/`--agent-type` are source-filter
+        // aliases that normalize to `--agent`; `--role` and `--agent` take
+        // values too. Whatever the value is spelled like, it must never be read
+        // as a legacy result-count alias.
+        for alias in [
+            "--provider",
+            "--tool",
+            "--connector",
+            "--agent-type",
+            "--agent",
+            "--role",
+        ] {
+            for value in ["limit=5", "top_k=5", "n=5", "max-results=5", "limit"] {
+                let parsed = parse(&["cass", "search", "probe", alias, value])
+                    .unwrap_or_else(|e| panic!("{alias} {value} must parse: {e:?}"));
+                assert!(
+                    matches!(parsed.cli.command, Some(Commands::Search { .. })),
+                    "expected search for {alias} {value}"
+                );
+            }
+            let inline = format!("{alias}=limit=5");
+            let parsed = parse(&["cass", "search", "probe", &inline])
+                .unwrap_or_else(|e| panic!("{inline} must parse: {e:?}"));
+            assert!(matches!(parsed.cli.command, Some(Commands::Search { .. })));
+        }
+    }
+
+    #[test]
+    fn provider_value_is_preserved_as_the_agent_filter() {
+        let cmd = search_fields(&["cass", "search", "probe", "--provider", "limit=5"]);
+        let Commands::Search { agent, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(agent, vec!["limit=5".to_string()]);
     }
 
     #[test]
