@@ -519,7 +519,8 @@ pub enum Commands {
         /// Request ID to echo in robot _meta for correlation
         #[arg(long)]
         request_id: Option<String>,
-        /// Cursor for pagination (base64-encoded offset/limit payload from previous result)
+        /// Cursor from _meta.next_cursor. Rerank pages reuse the fixed window;
+        /// repeat the original query, limits, backend and filters.
         #[arg(long)]
         cursor: Option<String>,
         /// Human-readable display format: table (aligned columns), lines (one-liner), markdown
@@ -21919,6 +21920,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
             "  CASS_RRF_LIMIT=<N>                       default search rrf candidate window N (--rrf-limit overrides)".to_string(),
             "  CASS_RERANK_LIMIT=<K>                    default search per-page rerank count K (--rerank-limit overrides)".to_string(),
+            "  CASS_QWEN_RERANK_URL                     qwen3-local endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
+            "  CASS_INFINITY_URL                        bge-local rerank endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
+            "  OPENROUTER_API_KEY                       consumed only by an explicit OpenRouter rerank selection; never selects a cloud backend by itself".to_string(),
             "  CASS_SEARCH_LIMIT=<N>                    legacy pack default limit (--limit overrides); rejected by `cass search` (use CASS_RRF_LIMIT)".to_string(),
             "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
@@ -29874,9 +29878,7 @@ fn output_robot_results(
 /// surfaces that silently dropped candidate diagnostics before this task.
 #[cfg(test)]
 mod pr9_candidate_meta_output_tests {
-    use super::{
-        Aggregations, FieldBudgets, RobotFormat, SearchModeMeta, output_robot_results,
-    };
+    use super::{Aggregations, FieldBudgets, RobotFormat, SearchModeMeta, output_robot_results};
     use crate::search::query::{
         CacheStats, CandidateMeta, CandidateMode, MatchType, SearchHit, SearchMode, SearchResult,
     };
@@ -30273,20 +30275,45 @@ mod pr9_candidate_meta_output_tests {
         }
     }
 
+    // The TOON decoder represents all numbers as f64. Normalize only exact
+    // integer representations for JSON structural comparisons; retain every
+    // field and every numeric value, including independent fractional scores.
+    fn normalize_test_numbers(value: &mut Value) {
+        match value {
+            Value::Number(number) => {
+                if let Some(n) = number.as_f64()
+                    && n.fract() == 0.0
+                    && n.abs() <= 9_007_199_254_740_991.0
+                {
+                    *value = serde_json::json!(n as i64);
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(normalize_test_numbers),
+            Value::Object(values) => values.values_mut().for_each(normalize_test_numbers),
+            _ => {}
+        }
+    }
+
     fn decode_output(format: RobotFormat, text: &str) -> (Value, Vec<Value>) {
         if matches!(format, RobotFormat::Jsonl) {
             let mut lines = text.lines();
-            let header: Value = serde_json::from_str(lines.next().expect("header")).unwrap();
+            let mut header: Value = serde_json::from_str(lines.next().expect("header")).unwrap();
+            normalize_test_numbers(&mut header);
             let hits = lines
-                .map(|line| serde_json::from_str(line).unwrap())
+                .map(|line| {
+                    let mut hit = serde_json::from_str(line).unwrap();
+                    normalize_test_numbers(&mut hit);
+                    hit
+                })
                 .collect();
             (header, hits)
         } else {
-            let payload: Value = if matches!(format, RobotFormat::Toon) {
+            let mut payload: Value = if matches!(format, RobotFormat::Toon) {
                 toon::try_decode(text, None).expect("TOON decodes").into()
             } else {
                 serde_json::from_str(text).expect("JSON decodes")
             };
+            normalize_test_numbers(&mut payload);
             let hits = payload["hits"].as_array().expect("hits array").clone();
             (payload, hits)
         }
@@ -30424,6 +30451,44 @@ mod pr9_candidate_meta_output_tests {
             let (_, hits) = decode_output(format, &output);
             assert_eq!(hits[0], serde_json::json!({"rerank_score": null}));
         }
+    }
+
+    #[test]
+    fn p10_machine_schema_names_every_window_field_and_null_reason() {
+        let value = test_window(false, false).meta.to_json(1);
+        let schema = super::response_schema_rerank_meta();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().collect();
+        keys.sort();
+        let mut properties: Vec<_> = schema["properties"].as_object().unwrap().keys().collect();
+        properties.sort();
+        assert_eq!(keys, properties);
+        assert_eq!(schema["required"].as_array().unwrap().len(), keys.len());
+        for (field, fact) in value.as_object().unwrap() {
+            if fact.is_null() && schema["properties"][field].get("enum").is_some() {
+                assert!(
+                    schema["properties"][field]["enum"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::Value::Null)
+                );
+            }
+        }
+        assert_eq!(schema["properties"]["returned_count"]["minimum"], 0);
+        assert!(
+            schema["properties"]["pagination_unavailable_reason"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("search_timeout"))
+        );
+        let hit = super::response_schema_search_hit();
+        assert_eq!(
+            hit["properties"]["rerank_score"]["type"],
+            serde_json::json!(["number", "null"])
+        );
+        assert_eq!(
+            super::build_response_schemas()["search"]["properties"]["_meta"]["properties"]["rerank"],
+            schema
+        );
     }
 }
 
@@ -86214,6 +86279,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     let mut schemas = std::collections::BTreeMap::new();
 
     schemas.insert("search".to_string(), response_schema_search());
+    schemas.insert("search-rerank-meta".to_string(), response_schema_rerank_meta());
     schemas.insert("pack".to_string(), response_schema_pack());
 
     schemas.insert(

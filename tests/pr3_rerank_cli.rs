@@ -1964,7 +1964,13 @@ fn p10_structured_output(output: &Output, format: &str) -> serde_json::Value {
             );
             header
         }
-        "toon" => toon::try_decode(text, None).expect("decode actual TOON").into(),
+        "toon" => {
+            let mut value: serde_json::Value = toon::try_decode(text, None)
+                .expect("decode actual TOON")
+                .into();
+            p10_normalize_toon_integers(&mut value);
+            value
+        }
         _ => serde_json::from_str(text).expect("decode actual JSON"),
     }
 }
@@ -1974,6 +1980,26 @@ fn p10_args(n: usize, k: usize, format: &str) -> Vec<String> {
     args.retain(|arg| arg != "--json" && arg != "--robot-meta");
     args.extend(["--robot-format".to_string(), format.to_string()]);
     args
+}
+
+// TOON uses f64 for numbers. Only normalize exactly representable integers;
+// do not remove fields or change numeric values for cross-format assertions.
+fn p10_normalize_toon_integers(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(n) = number.as_f64()
+                && n.fract() == 0.0
+                && n.abs() <= 9_007_199_254_740_991.0
+            {
+                *value = serde_json::json!(n as i64);
+            }
+        }
+        serde_json::Value::Array(values) => values.iter_mut().for_each(p10_normalize_toon_integers),
+        serde_json::Value::Object(values) => {
+            values.values_mut().for_each(p10_normalize_toon_integers)
+        }
+        _ => {}
+    }
 }
 
 #[test]
@@ -2064,4 +2090,60 @@ fn p10_budgeted_compact_to_jsonl_continuation_has_no_gap() {
             .iter()
             .all(|hit| hit["rerank_score"].is_number())
     );
+}
+
+#[test]
+fn p10_sessions_remains_current_page_paths_only() {
+    let fixture = build_fixture(FixtureOptions::default());
+    let stub = Stub::start(StubMode::Ordered);
+    let env = RunEnv::with_stub(&fixture, &stub);
+    let first = p10_structured_output(&env.run(&as_args(&p10_args(8, 3, "json"))), "json");
+    let mut page_args = p10_args(8, 3, "sessions");
+    page_args.extend(["--cursor".to_string(), require_cursor(&first)]);
+    let output = env.run(&as_args(&page_args));
+    assert_success(&output, "sessions continuation");
+    let mut expected = closed_first_n(&env, 8);
+    expected.reverse();
+    let expected: std::collections::BTreeSet<_> = expected[3..6].iter().cloned().collect();
+    let lines: std::collections::BTreeSet<_> = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines, expected);
+    assert_eq!(stub.request_count(), 2);
+}
+
+#[test]
+fn p10_human_formats_label_backend_and_both_scores_without_raw_errors() {
+    for mode in [StubMode::Tied, StubMode::MissingScore] {
+        let fixture = build_fixture(FixtureOptions::default());
+        let stub = Stub::start(mode);
+        let env = RunEnv::with_stub(&fixture, &stub).env("CASS_OUTPUT_FORMAT", "");
+        for display in ["table", "lines", "markdown"] {
+            let mut args = rerank_args(8, 3);
+            args.retain(|arg| arg != "--json" && arg != "--robot-meta");
+            args.extend(["--display".to_string(), display.to_string()]);
+            let output = env.run(&as_args(&args));
+            assert_success(&output, "human rerank output");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("Rerank: bge-local"), "{text}");
+            assert!(text.to_ascii_lowercase().contains("score"), "{text}");
+            assert!(text.to_ascii_lowercase().contains("rerank"), "{text}");
+            if mode == StubMode::Tied {
+                assert!(
+                    text.contains("| applied"),
+                    "equal scores still applied: {text}"
+                );
+            } else {
+                assert!(text.contains("invalid_response"), "{text}");
+                assert!(
+                    text.contains("unscored"),
+                    "failure must not show zero: {text}"
+                );
+            }
+            assert!(!text.contains("relevance_score"));
+            assert!(!text.contains("content_hash"));
+        }
+    }
 }
