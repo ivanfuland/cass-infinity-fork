@@ -23499,8 +23499,24 @@ mod pr3_cli_limits {
         }
     }
 
+    /// `Cli`/`Commands` is a large enum; cloning it inside `parse_cli` needs a
+    /// stack larger than the default test thread (same reason as
+    /// `tests/cli_search_semantic_flags.rs`).
+    fn run_on_large_stack<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        std::thread::Builder::new()
+            .name("pr3-cli-limits".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack parser thread")
+            .join()
+            .expect("large-stack parser thread should not panic")
+    }
+
     fn parse(args: &[&str]) -> CliResult<ParsedCli> {
-        parse_cli(args.iter().map(|s| (*s).to_string()).collect())
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        run_on_large_stack(move || parse_cli(owned))
     }
 
     fn parse_err(args: &[&str]) -> CliError {
