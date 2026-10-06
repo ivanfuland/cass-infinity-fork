@@ -187,7 +187,7 @@ fn smoke_surfaces(data_dir: &str) -> Vec<SmokeSurface> {
                     "search",
                     "cass smoke probe alpha",
                     "--robot",
-                    "--limit",
+                    "--rrf-limit",
                     "3",
                 ],
                 dd,

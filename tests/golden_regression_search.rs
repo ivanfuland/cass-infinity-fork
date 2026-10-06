@@ -116,7 +116,7 @@ fn indexed_claude_code_positive_search_matches_golden() {
             "--json",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "3",
             "--data-dir",
             data_dir.to_str().expect("utf8 data dir"),

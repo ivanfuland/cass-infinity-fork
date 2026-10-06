@@ -273,7 +273,7 @@ fn indexed_archive_storage_state_agrees_across_doctor_status_search() -> Result<
         &fixture,
         &build_argv(
             &fixture,
-            &["search", KEYWORD, "--json", "--robot-meta", "--limit", "5"],
+            &["search", KEYWORD, "--json", "--robot-meta", "--rrf-limit", "5"],
         ),
         "search/indexed",
         SURFACE_TIMEOUT,

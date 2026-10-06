@@ -269,7 +269,7 @@ impl LiveBootstrapHarnessConfig {
                 "cass health --json --data-dir <data_dir>",
                 "cass status --json --data-dir <data_dir>",
                 "cass models status --json --data-dir <data_dir>",
-                "cass search <query> --json --robot-meta --limit <limit> --data-dir <data_dir>",
+                "cass search <query> --json --robot-meta --rrf-limit <limit> --data-dir <data_dir>",
                 "cass models backfill --tier <tier> --embedder <embedder> --batch-conversations <n> --json --data-dir <data_dir> --db <db_path>"
             ]
         })
@@ -638,7 +638,7 @@ fn live_canonical_bootstrap_captures_repeatable_robot_artifacts() -> TestResult 
             config.query.clone(),
             "--json".to_string(),
             "--robot-meta".to_string(),
-            "--limit".to_string(),
+            "--rrf-limit".to_string(),
             config.limit.to_string(),
             "--data-dir".to_string(),
             config.data_dir.display().to_string(),
@@ -709,7 +709,7 @@ fn live_canonical_bootstrap_captures_repeatable_robot_artifacts() -> TestResult 
             config.query.clone(),
             "--json".to_string(),
             "--robot-meta".to_string(),
-            "--limit".to_string(),
+            "--rrf-limit".to_string(),
             config.limit.to_string(),
             "--data-dir".to_string(),
             config.data_dir.display().to_string(),

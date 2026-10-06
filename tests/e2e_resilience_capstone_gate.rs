@@ -642,7 +642,7 @@ fn fresh_failure_bundle_surfaces_are_bounded_clean_and_safe() -> TestResult {
         ("support-bundle", &["support-bundle", "--json"]),
         (
             "search",
-            &["search", "resilience", "--robot", "--limit", "3"],
+            &["search", "resilience", "--robot", "--rrf-limit", "3"],
         ),
     ];
 
@@ -799,7 +799,7 @@ fn cross_surface_readiness_has_no_contradiction_with_human_parity() -> TestResul
             &home,
             &xdg,
             Some(&codex),
-            &argv(&["search", "unique-keyword-zzqqxx", "--robot", "--limit", "3"]),
+            &argv(&["search", "unique-keyword-zzqqxx", "--robot", "--rrf-limit", "3"]),
             "search-indexed",
             SURFACE_TIMEOUT,
         )?;

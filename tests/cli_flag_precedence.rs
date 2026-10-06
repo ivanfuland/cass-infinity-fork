@@ -167,7 +167,7 @@ fn search_display_flag_overrides_default_json_when_no_robot_format() {
             .arg(&data_dir)
             .arg("search")
             .arg("regression-needle-for-issue-245")
-            .arg("--limit")
+            .arg("--rrf-limit")
             .arg("1")
             .arg("--display")
             .arg(mode);

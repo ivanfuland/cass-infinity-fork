@@ -85,7 +85,7 @@ fn explicit_hybrid_mode_fails_open_to_lexical_when_semantic_assets_missing() {
             "--robot-meta",
             "--mode",
             "hybrid",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
@@ -246,7 +246,7 @@ fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
             "equivprobe",
             "--json",
             "--robot-meta",
-            "--limit",
+            "--rrf-limit",
             "10",
             "--data-dir",
         ])
@@ -319,7 +319,7 @@ fn default_hybrid_hit_list_equals_explicit_lexical_when_semantic_absent() {
             "--robot-meta",
             "--mode",
             "lexical",
-            "--limit",
+            "--rrf-limit",
             "10",
             "--data-dir",
         ])

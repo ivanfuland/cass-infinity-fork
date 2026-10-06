@@ -281,7 +281,7 @@ fn run_fts5_lexical_search(binary: &str, data_dir: &str, config_dir: &str, query
             query,
             "--mode",
             "lexical",
-            "--limit",
+            "--rrf-limit",
             "10",
             "--json",
             "--fields",

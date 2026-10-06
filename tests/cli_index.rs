@@ -762,7 +762,7 @@ fn watch_once_indexes_real_aider_session_with_deferred_tantivy_open() {
     search
         .args(["search", "lazywatchprobe", "--json", "--data-dir"])
         .arg(&data_dir)
-        .args(["--limit", "5", "--mode", "lexical", "--color=never"]);
+        .args(["--rrf-limit", "5", "--mode", "lexical", "--color=never"]);
     let output = search.output().expect("run search after watch-once index");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

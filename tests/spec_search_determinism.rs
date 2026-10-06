@@ -1,6 +1,6 @@
 //! INV-cass-2: `cass search` is deterministic across repeated calls against
-//! the same archive, and `--limit N` is a strict prefix of `--limit 2N` (the
-//! cursor-pagination correctness guarantee).
+//! the same archive, and `--rrf-limit N` is a strict prefix of `--rrf-limit 2N`
+//! (the cursor-pagination correctness guarantee).
 //!
 //! Foundational invariants every cache, pager, and cursor consumer depends on:
 //!
@@ -9,8 +9,8 @@
 //!     invocations, then `--cursor`, prefix-warming, the BM25 ratchet, and the
 //!     two-tier semantic refinement all break in subtle ways agents see only
 //!     as flake.
-//!   - **Limit-prefix**: the first N hits of `--limit 2N` are the N hits of
-//!     `--limit N` in the same order. This is the cursor-paging soundness
+//!   - **Limit-prefix**: the first N hits of `--rrf-limit 2N` are the N hits of
+//!     `--rrf-limit N` in the same order. This is the cursor-paging soundness
 //!     property; `--cursor` token correctness depends on it.
 //!
 //! Verified against the checked-in `search_demo_data` fixture with a query
@@ -117,8 +117,8 @@ fn search_returns_deterministic_hits_across_repeated_calls() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
 
-    let a = run_search(&data_dir, &[QUERY, "--limit", "5"])?;
-    let b = run_search(&data_dir, &[QUERY, "--limit", "5"])?;
+    let a = run_search(&data_dir, &[QUERY, "--rrf-limit", "5"])?;
+    let b = run_search(&data_dir, &[QUERY, "--rrf-limit", "5"])?;
 
     let hits_a = hits(&a)?;
     let hits_b = hits(&b)?;
@@ -145,35 +145,35 @@ fn search_limit_n_is_strict_prefix_of_limit_2n() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
 
-    let small = run_search(&data_dir, &[QUERY, "--limit", "1"])?;
-    let large = run_search(&data_dir, &[QUERY, "--limit", "2"])?;
+    let small = run_search(&data_dir, &[QUERY, "--rrf-limit", "1"])?;
+    let large = run_search(&data_dir, &[QUERY, "--rrf-limit", "2"])?;
 
     let small_hits = hits(&small)?;
     let large_hits = hits(&large)?;
 
     ensure(
         !small_hits.is_empty(),
-        format!("limit=1 against {QUERY:?} should return at least 1 hit"),
+        format!("rrf-limit=1 against {QUERY:?} should return at least 1 hit"),
     )?;
     ensure(
         large_hits.len() >= small_hits.len(),
         format!(
-            "--limit 2 must not return fewer hits than --limit 1; got {} vs {}",
+            "--rrf-limit 2 must not return fewer hits than --rrf-limit 1; got {} vs {}",
             large_hits.len(),
             small_hits.len()
         ),
     )?;
     let large_prefix = large_hits
         .get(..small_hits.len())
-        .ok_or_else(|| test_error("--limit 2 did not contain enough hits for prefix check"))?;
+        .ok_or_else(|| test_error("--rrf-limit 2 did not contain enough hits for prefix check"))?;
 
     // Strict prefix: hits[0..N] of the larger result equals the entire smaller result.
     ensure(
         large_prefix == small_hits,
         format!(
-            "--limit 1 result is not a prefix of --limit 2; cursor-paging soundness broken.\n\
-             limit=1: {} hit(s)\n\
-             limit=2: {} hit(s) (first {} prefix should match limit=1 byte-for-byte)",
+            "--rrf-limit 1 result is not a prefix of --rrf-limit 2; cursor-paging soundness broken.\n\
+             rrf-limit=1: {} hit(s)\n\
+             rrf-limit=2: {} hit(s) (first {} prefix should match rrf-limit=1 byte-for-byte)",
             small_hits.len(),
             large_hits.len(),
             small_hits.len()

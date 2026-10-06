@@ -353,7 +353,7 @@ fn kill_relaunch_recovers_lexical_publish_and_search_stays_stable() {
             "lexical",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
