@@ -96,7 +96,8 @@ impl Stub {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Some(request) = read_http_request(stream.try_clone().expect("clone")) {
+                        if let Some(request) = read_http_request(stream.try_clone().expect("clone"))
+                        {
                             if !delay.is_zero() {
                                 thread::sleep(delay);
                             }
@@ -149,7 +150,9 @@ impl Drop for Stub {
 }
 
 fn read_http_request(mut stream: TcpStream) -> Option<RecordedRequest> {
-    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .ok()?;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -250,7 +253,9 @@ fn response_for(mode: StubMode, request: &RecordedRequest) -> Vec<u8> {
             .to_string()
             .into_bytes();
     }
-    serde_json::json!({ "error": "not found" }).to_string().into_bytes()
+    serde_json::json!({ "error": "not found" })
+        .to_string()
+        .into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +509,9 @@ impl<'a> RunEnv<'a> {
             .unwrap_or_else(|| DEAD_ORIGIN.to_string());
         command.env("CASS_INFINITY_URL", infinity);
         let qwen = if self.qwen_at_stub {
-            stub_origin.clone().unwrap_or_else(|| DEAD_ORIGIN.to_string())
+            stub_origin
+                .clone()
+                .unwrap_or_else(|| DEAD_ORIGIN.to_string())
         } else {
             DEAD_ORIGIN.to_string()
         };
@@ -690,7 +697,11 @@ fn group1_first_lookup_posts_n_returns_k_in_the_reranked_order() {
     assert_eq!(requests[0].path, "/models");
     assert_eq!(requests[1].method, "POST");
     assert_eq!(requests[1].path, "/rerank");
-    assert_eq!(posted_top_n(&stub), Some(DEFAULT_N as u64), "top_n must be N");
+    assert_eq!(
+        posted_top_n(&stub),
+        Some(DEFAULT_N as u64),
+        "top_n must be N"
+    );
     assert_eq!(
         posted_documents(&stub).len(),
         DEFAULT_N,
@@ -703,7 +714,11 @@ fn group1_first_lookup_posts_n_returns_k_in_the_reranked_order() {
     assert_success(&closed, "closed lexical lookup");
     let closed_payload = stdout_json(&closed);
     let window_ids: Vec<String> = ids(&closed_payload).into_iter().take(DEFAULT_N).collect();
-    assert_eq!(window_ids.len(), DEFAULT_N, "the closed run fills the window");
+    assert_eq!(
+        window_ids.len(),
+        DEFAULT_N,
+        "the closed run fills the window"
+    );
     let mut expected_order = window_ids.clone();
     expected_order.reverse();
 
@@ -737,7 +752,10 @@ fn group1_first_lookup_posts_n_returns_k_in_the_reranked_order() {
         );
     }
     for hit in hits(&payload) {
-        assert!(hit.get("content_hash").is_none(), "no private hash in public JSON");
+        assert!(
+            hit.get("content_hash").is_none(),
+            "no private hash in public JSON"
+        );
     }
 
     let meta = rerank_meta(&payload).expect("_meta.rerank is present");
@@ -755,7 +773,10 @@ fn group1_first_lookup_posts_n_returns_k_in_the_reranked_order() {
     assert_eq!(meta["first_model_requests"], serde_json::json!(1));
     assert_eq!(meta["model_requests"], serde_json::json!(1));
     assert_eq!(meta["failure_reason"], serde_json::Value::Null);
-    assert!(next_cursor(&payload).is_some(), "a full window emits a cursor");
+    assert!(
+        next_cursor(&payload).is_some(),
+        "a full window emits a cursor"
+    );
 
     // The POSTed documents are the closed-state first N, in order, each
     // canonicalized exactly as `context::build_documents` assembles a
@@ -902,15 +923,21 @@ fn online_success_window_continuation_makes_no_backend_request() {
         "ONLINE_SUCCESS_REQUESTS before={} after={} new={:?}",
         requests_before.len(),
         requests_after.len(),
-        requests_after.iter().skip(requests_before.len())
-            .map(|request| (&request.method, &request.path)).collect::<Vec<_>>()
+        requests_after
+            .iter()
+            .skip(requests_before.len())
+            .map(|request| (&request.method, &request.path))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         requests_after.len(),
         requests_before.len(),
         "the still-running service received no request from the continuation"
     );
-    assert_eq!(requests_after, requests_before, "the actual request list is unchanged");
+    assert_eq!(
+        requests_after, requests_before,
+        "the actual request list is unchanged"
+    );
     let second_payload = stdout_json(&second);
     assert_eq!(
         ids(&second_payload),
@@ -921,15 +948,29 @@ fn online_success_window_continuation_makes_no_backend_request() {
         assert!(score.is_some(), "the successful window keeps its scores");
     }
     let second_meta = rerank_meta(&second_payload).expect("continuation rerank metadata");
-    for field in ["first_http_requests", "first_model_requests", "first_duration_ms",
-        "applied", "scored_count", "failure_reason", "http_status"] {
-        assert_eq!(second_meta[field], first_meta[field], "frozen field {field}");
+    for field in [
+        "first_http_requests",
+        "first_model_requests",
+        "first_duration_ms",
+        "applied",
+        "scored_count",
+        "failure_reason",
+        "http_status",
+    ] {
+        assert_eq!(
+            second_meta[field], first_meta[field],
+            "frozen field {field}"
+        );
     }
     assert_eq!(second_meta["cache_reused"], serde_json::json!(true));
     assert_eq!(second_meta["offset"], serde_json::json!(DEFAULT_K));
     assert_eq!(second_meta["returned_count"], serde_json::json!(DEFAULT_K));
     for field in ["http_requests", "model_requests", "duration_ms"] {
-        assert_eq!(second_meta[field], serde_json::json!(0), "current field {field}");
+        assert_eq!(
+            second_meta[field],
+            serde_json::json!(0),
+            "current field {field}"
+        );
     }
 }
 
@@ -958,28 +999,41 @@ fn online_failed_window_continuation_makes_no_backend_request() {
 
     assert_eq!(ids(&first_payload), original[..DEFAULT_K].to_vec());
     let requests_before = stub.requests();
-    assert_eq!(requests_before.len(), 2, "the first lookup attempted scoring");
+    assert_eq!(
+        requests_before.len(),
+        2,
+        "the first lookup attempted scoring"
+    );
     assert_eq!(requests_before[0].path, "/models");
     assert_eq!(requests_before[1].path, "/rerank");
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
     args.push("--cursor".to_string());
     args.push(cursor);
     let second = env.run(&as_args(&args));
-    assert_success(&second, "failed-window continuation with the service still up");
+    assert_success(
+        &second,
+        "failed-window continuation with the service still up",
+    );
     let requests_after = stub.requests();
     eprintln!(
         "ONLINE_FAILED_REQUESTS before={} after={} new={:?}",
         requests_before.len(),
         requests_after.len(),
-        requests_after.iter().skip(requests_before.len())
-            .map(|request| (&request.method, &request.path)).collect::<Vec<_>>()
+        requests_after
+            .iter()
+            .skip(requests_before.len())
+            .map(|request| (&request.method, &request.path))
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         requests_after.len(),
         requests_before.len(),
         "a failed window's continuation also makes no call, proven against a service that is up"
     );
-    assert_eq!(requests_after, requests_before, "the actual request list is unchanged");
+    assert_eq!(
+        requests_after, requests_before,
+        "the actual request list is unchanged"
+    );
     let second_payload = stdout_json(&second);
     assert_eq!(
         ids(&second_payload),
@@ -987,18 +1041,35 @@ fn online_failed_window_continuation_makes_no_backend_request() {
         "the failed window replays in the original order"
     );
     for (_, _, score) in scored_hits(&second_payload) {
-        assert!(score.is_none(), "the failed continuation has no rerank score");
+        assert!(
+            score.is_none(),
+            "the failed continuation has no rerank score"
+        );
     }
     let second_meta = rerank_meta(&second_payload).expect("continuation rerank metadata");
-    for field in ["first_http_requests", "first_model_requests", "first_duration_ms",
-        "applied", "scored_count", "failure_reason", "http_status"] {
-        assert_eq!(second_meta[field], first_meta[field], "frozen field {field}");
+    for field in [
+        "first_http_requests",
+        "first_model_requests",
+        "first_duration_ms",
+        "applied",
+        "scored_count",
+        "failure_reason",
+        "http_status",
+    ] {
+        assert_eq!(
+            second_meta[field], first_meta[field],
+            "frozen field {field}"
+        );
     }
     assert_eq!(second_meta["cache_reused"], serde_json::json!(true));
     assert_eq!(second_meta["offset"], serde_json::json!(DEFAULT_K));
     assert_eq!(second_meta["returned_count"], serde_json::json!(DEFAULT_K));
     for field in ["http_requests", "model_requests", "duration_ms"] {
-        assert_eq!(second_meta[field], serde_json::json!(0), "current field {field}");
+        assert_eq!(
+            second_meta[field],
+            serde_json::json!(0),
+            "current field {field}"
+        );
     }
 }
 
@@ -1006,7 +1077,10 @@ fn online_failed_window_continuation_makes_no_backend_request() {
 fn group2_window_boundaries() {
     // (a) A window exactly one page long delivers the whole window and stops.
     // K may not exceed N, so the shortest honest page is K == N == 3.
-    let fixture = build_fixture(FixtureOptions { rows: 4, ..FixtureOptions::default() });
+    let fixture = build_fixture(FixtureOptions {
+        rows: 4,
+        ..FixtureOptions::default()
+    });
     let stub = Stub::start(StubMode::Ordered);
     let env = RunEnv::with_stub(&fixture, &stub);
     let short = env.run(&as_args(&rerank_args(3, 3)));
@@ -1022,7 +1096,10 @@ fn group2_window_boundaries() {
     );
 
     // (b) The last page of a two-page window stops cleanly.
-    let fixture = build_fixture(FixtureOptions { rows: 7, ..FixtureOptions::default() });
+    let fixture = build_fixture(FixtureOptions {
+        rows: 7,
+        ..FixtureOptions::default()
+    });
     let stub = Stub::start(StubMode::Ordered);
     let env = RunEnv::with_stub(&fixture, &stub);
     let page1 = env.run(&as_args(&rerank_args(7, 5)));
@@ -1034,7 +1111,11 @@ fn group2_window_boundaries() {
     let page2 = env.run(&as_args(&args));
     assert_success(&page2, "page 2 of a 7-hit window");
     let page2_payload = stdout_json(&page2);
-    assert_eq!(ids(&page2_payload).len(), 2, "the trailing page holds the remainder");
+    assert_eq!(
+        ids(&page2_payload).len(),
+        2,
+        "the trailing page holds the remainder"
+    );
     assert!(
         next_cursor(&page2_payload).is_none(),
         "the last page emits no cursor"
@@ -1067,7 +1148,10 @@ fn group2_window_boundaries() {
     assert_eq!(meta["applied"], serde_json::json!(false));
     assert_eq!(meta["scored_count"], serde_json::json!(0));
     assert_eq!(meta["first_http_requests"], serde_json::json!(0));
-    assert!(next_cursor(&empty_payload).is_none(), "an empty window has no next page");
+    assert!(
+        next_cursor(&empty_payload).is_none(),
+        "an empty window has no next page"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,7 +1160,11 @@ fn group2_window_boundaries() {
 
 #[test]
 fn group3_a_bad_response_keeps_the_original_order_and_is_not_retried() {
-    for mode in [StubMode::MissingScore, StubMode::DuplicateIndex, StubMode::IdentityMismatch] {
+    for mode in [
+        StubMode::MissingScore,
+        StubMode::DuplicateIndex,
+        StubMode::IdentityMismatch,
+    ] {
         let fixture = build_fixture(FixtureOptions::default());
         let stub = Stub::start(mode);
         let env = RunEnv::with_stub(&fixture, &stub);
@@ -1096,12 +1184,18 @@ fn group3_a_bad_response_keeps_the_original_order_and_is_not_retried() {
             "a failed window keeps the original RRF order for {mode:?}"
         );
         for (_, _, rerank_score) in scored_hits(&payload) {
-            assert!(rerank_score.is_none(), "no hit carries a score after a failure");
+            assert!(
+                rerank_score.is_none(),
+                "no hit carries a score after a failure"
+            );
         }
         let meta = rerank_meta(&payload).expect("_meta.rerank");
         assert_eq!(meta["applied"], serde_json::json!(false));
         assert_eq!(meta["scored_count"], serde_json::json!(0));
-        assert!(meta["failure_reason"].is_string(), "the failure reason is a short code");
+        assert!(
+            meta["failure_reason"].is_string(),
+            "the failure reason is a short code"
+        );
 
         // The failed window is still frozen: its continuation replays the same
         // original order and makes no further model call.
@@ -1125,10 +1219,18 @@ fn group3_a_bad_response_keeps_the_original_order_and_is_not_retried() {
             "the failed window's next page keeps the original order"
         );
         let meta = rerank_meta(&second_payload).expect("_meta.rerank");
-        assert_eq!(meta["applied"], serde_json::json!(false), "no re-application");
+        assert_eq!(
+            meta["applied"],
+            serde_json::json!(false),
+            "no re-application"
+        );
         assert_eq!(meta["http_requests"], serde_json::json!(0), "no retry");
         assert_eq!(meta["model_requests"], serde_json::json!(0), "no retry");
-        assert_eq!(stub.request_count(), requests_before, "the stub saw nothing new");
+        assert_eq!(
+            stub.request_count(),
+            requests_before,
+            "the stub saw nothing new"
+        );
     }
 }
 
@@ -1152,7 +1254,11 @@ fn group3_an_unverifiable_candidate_sends_nothing_to_the_model() {
         "a candidate that cannot be proven means the whole window sends nothing"
     );
     let payload = stdout_json(&output);
-    assert_eq!(ids(&payload).len(), DEFAULT_K, "the original page is delivered");
+    assert_eq!(
+        ids(&payload).len(),
+        DEFAULT_K,
+        "the original page is delivered"
+    );
     for (_, _, rerank_score) in scored_hits(&payload) {
         assert!(rerank_score.is_none(), "no partial scores leak out");
     }
@@ -1190,66 +1296,51 @@ fn group4_a_cursor_is_refused_when_the_request_or_index_changes() {
     };
 
     let cases: Vec<(&str, Vec<String>)> = vec![
-        (
-            "changed query",
-            {
-                let mut args = with_cursor(&[]);
-                args[1] = "p09 anchor token other".to_string();
-                args
-            },
-        ),
-        (
-            "changed K",
-            {
-                let mut args = with_cursor(&[]);
-                let k = args.iter().position(|a| a == "--rerank-limit").unwrap();
-                args[k + 1] = "7".to_string();
-                args
-            },
-        ),
-        (
-            "changed N",
-            {
-                let mut args = with_cursor(&[]);
-                let n = args.iter().position(|a| a == "--rrf-limit").unwrap();
-                args[n + 1] = "199".to_string();
-                args
-            },
-        ),
-        (
-            "changed provider",
-            {
-                let mut args = with_cursor(&[]);
-                let p = args.iter().position(|a| a == "--rerank-provider").unwrap();
-                args[p + 1] = "qwen3-local".to_string();
-                args
-            },
-        ),
+        ("changed query", {
+            let mut args = with_cursor(&[]);
+            args[1] = "p09 anchor token other".to_string();
+            args
+        }),
+        ("changed K", {
+            let mut args = with_cursor(&[]);
+            let k = args.iter().position(|a| a == "--rerank-limit").unwrap();
+            args[k + 1] = "7".to_string();
+            args
+        }),
+        ("changed N", {
+            let mut args = with_cursor(&[]);
+            let n = args.iter().position(|a| a == "--rrf-limit").unwrap();
+            args[n + 1] = "199".to_string();
+            args
+        }),
+        ("changed provider", {
+            let mut args = with_cursor(&[]);
+            let p = args.iter().position(|a| a == "--rerank-provider").unwrap();
+            args[p + 1] = "qwen3-local".to_string();
+            args
+        }),
         ("changed filter", with_cursor(&["--agent", "other-agent"])),
         ("changed relative time", with_cursor(&["--days", "1"])),
         ("refresh with a cursor", with_cursor(&["--refresh"])),
-        ("non-zero offset with a cursor", with_cursor(&["--offset", "3"])),
         (
-            "malformed cursor",
-            {
-                let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
-                args.push("--cursor".to_string());
-                args.push("not-a-cursor".to_string());
-                args
-            },
+            "non-zero offset with a cursor",
+            with_cursor(&["--offset", "3"]),
         ),
-        (
-            "a window that does not exist",
-            {
-                let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
-                args.push("--cursor".to_string());
-                args.push(synthetic_cursor(
-                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-                    0,
-                ));
-                args
-            },
-        ),
+        ("malformed cursor", {
+            let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
+            args.push("--cursor".to_string());
+            args.push("not-a-cursor".to_string());
+            args
+        }),
+        ("a window that does not exist", {
+            let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
+            args.push("--cursor".to_string());
+            args.push(synthetic_cursor(
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                0,
+            ));
+            args
+        }),
     ];
 
     for (label, args) in &cases {
@@ -1324,7 +1415,9 @@ fn group5_projection_and_budget_do_not_change_the_model_input() {
         "field projection and content budgets never change what the model sees"
     );
     assert_eq!(
-        projected_body.get("top_n").and_then(serde_json::Value::as_u64),
+        projected_body
+            .get("top_n")
+            .and_then(serde_json::Value::as_u64),
         Some(DEFAULT_N as u64),
         "top_n stays the window size under every projection"
     );
@@ -1347,8 +1440,14 @@ fn group5_a_shrunk_page_advances_by_delivered_hits_without_skipping() {
     assert_success(&first, "budgeted first lookup");
     let first_payload = stdout_json(&first);
     let returned = ids(&first_payload);
-    assert!(!returned.is_empty(), "a budget still delivers at least one hit");
-    assert!(returned.len() < DEFAULT_K, "the budget shrinks the page below K");
+    assert!(
+        !returned.is_empty(),
+        "a budget still delivers at least one hit"
+    );
+    assert!(
+        returned.len() < DEFAULT_K,
+        "the budget shrinks the page below K"
+    );
     assert_eq!(
         returned,
         expected_order[..returned.len()].to_vec(),
@@ -1422,7 +1521,10 @@ fn group6_aggregates_and_explanation_match_the_closed_scope_and_are_reused() {
     let closed_payload = stdout_json(&closed_out);
     assert_eq!(
         first_aggregations,
-        closed_payload.get("aggregations").cloned().unwrap_or_default(),
+        closed_payload
+            .get("aggregations")
+            .cloned()
+            .unwrap_or_default(),
         "the rerank window's aggregate scope matches the closed-state scope"
     );
     assert!(
@@ -1438,13 +1540,22 @@ fn group6_aggregates_and_explanation_match_the_closed_scope_and_are_reused() {
     assert_success(&second, "continuation with aggregate/explain");
     let second_payload = stdout_json(&second);
     assert_eq!(
-        second_payload.get("aggregations").cloned().unwrap_or_default(),
+        second_payload
+            .get("aggregations")
+            .cloned()
+            .unwrap_or_default(),
         first_aggregations,
         "the continuation reuses the frozen aggregates"
     );
     assert_eq!(
-        second_payload.get("explanation").cloned().unwrap_or_default(),
-        first_payload.get("explanation").cloned().unwrap_or_default(),
+        second_payload
+            .get("explanation")
+            .cloned()
+            .unwrap_or_default(),
+        first_payload
+            .get("explanation")
+            .cloned()
+            .unwrap_or_default(),
         "the continuation reuses the frozen explanation"
     );
 }
@@ -1475,7 +1586,11 @@ fn group6_dry_run_writes_no_cache_and_sends_no_request() {
     assert_eq!(payload["dry_run"], serde_json::json!(true));
     assert_eq!(stub.request_count(), 0, "a dry run sends no HTTP request");
     assert!(
-        !fixture.data_dir.join("cache").join("rerank-windows").exists(),
+        !fixture
+            .data_dir
+            .join("cache")
+            .join("rerank-windows")
+            .exists(),
         "a dry run writes no window cache"
     );
 }
@@ -1496,8 +1611,14 @@ fn group6_partial_timeout_and_unwritable_cache_deliver_a_page_without_a_cursor()
     let partial = env.run(&as_args(&args));
     assert_success(&partial, "partial-index rerank");
     let payload = stdout_json(&partial);
-    assert!(!hits(&payload).is_empty(), "the current page is still delivered");
-    assert!(next_cursor(&payload).is_none(), "a partial index yields no cursor");
+    assert!(
+        !hits(&payload).is_empty(),
+        "the current page is still delivered"
+    );
+    assert!(
+        next_cursor(&payload).is_none(),
+        "a partial index yields no cursor"
+    );
     let meta = rerank_meta(&payload).expect("_meta.rerank present without --robot-meta");
     assert_eq!(
         meta["pagination_unavailable_reason"],
@@ -1514,8 +1635,14 @@ fn group6_partial_timeout_and_unwritable_cache_deliver_a_page_without_a_cursor()
     let blocked = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
     assert_success(&blocked, "rerank with an unwritable cache");
     let payload = stdout_json(&blocked);
-    assert!(!hits(&payload).is_empty(), "the current page survives a cache failure");
-    assert!(next_cursor(&payload).is_none(), "an unusable cache yields no cursor");
+    assert!(
+        !hits(&payload).is_empty(),
+        "the current page survives a cache failure"
+    );
+    assert!(
+        next_cursor(&payload).is_none(),
+        "an unusable cache yields no cursor"
+    );
     let meta = rerank_meta(&payload).expect("_meta.rerank");
     assert_eq!(
         meta["pagination_unavailable_reason"],
@@ -1531,8 +1658,14 @@ fn group6_partial_timeout_and_unwritable_cache_deliver_a_page_without_a_cursor()
     args.push("300".to_string());
     let timed = env.run(&as_args(&args));
     let payload = stdout_json(&timed);
-    assert!(!hits(&payload).is_empty(), "the current page survives a timeout");
-    assert!(next_cursor(&payload).is_none(), "a timed-out lookup yields no cursor");
+    assert!(
+        !hits(&payload).is_empty(),
+        "the current page survives a timeout"
+    );
+    assert!(
+        next_cursor(&payload).is_none(),
+        "a timed-out lookup yields no cursor"
+    );
     let meta = rerank_meta(&payload).expect("_meta.rerank");
     assert_eq!(
         meta["pagination_unavailable_reason"],
@@ -1564,7 +1697,11 @@ fn a_bad_local_endpoint_still_delivers_the_page() {
         .into_iter()
         .take(DEFAULT_K)
         .collect();
-    assert_eq!(ids(&payload), expected, "the original RRF page is delivered");
+    assert_eq!(
+        ids(&payload),
+        expected,
+        "the original RRF page is delivered"
+    );
 
     for (_, _, rerank_score) in scored_hits(&payload) {
         assert!(rerank_score.is_none(), "no scores without a frozen request");
@@ -1575,7 +1712,10 @@ fn a_bad_local_endpoint_still_delivers_the_page() {
         meta["pagination_unavailable_reason"],
         serde_json::json!("invalid_input")
     );
-    assert!(next_cursor(&payload).is_none(), "a refused binding yields no cursor");
+    assert!(
+        next_cursor(&payload).is_none(),
+        "a refused binding yields no cursor"
+    );
 }
 
 #[test]
@@ -1769,16 +1909,29 @@ fn group7_the_closed_path_reports_no_rerank_fields() {
     let closed = env.run(&as_args(&args));
     assert_success(&closed, "closed lexical lookup");
     let payload = stdout_json(&closed);
-    assert!(rerank_meta(&payload).is_none(), "a closed search emits no _meta.rerank");
+    assert!(
+        rerank_meta(&payload).is_none(),
+        "a closed search emits no _meta.rerank"
+    );
     assert!(
         payload.get("rerank_requested").is_none(),
         "a closed search emits no rerank_requested"
     );
-    assert!(!hits(&payload).is_empty(), "the closed lexical path still returns hits");
+    assert!(
+        !hits(&payload).is_empty(),
+        "the closed lexical path still returns hits"
+    );
     for (_, _, rerank_score) in scored_hits(&payload) {
-        assert!(rerank_score.is_none(), "a closed search writes no rerank_score");
+        assert!(
+            rerank_score.is_none(),
+            "a closed search writes no rerank_score"
+        );
     }
-    assert_eq!(stub.request_count(), 0, "the closed path never builds a rerank backend");
+    assert_eq!(
+        stub.request_count(),
+        0,
+        "the closed path never builds a rerank backend"
+    );
 
     // The PR9 candidate-strategy guard is unchanged: it is still refused with
     // lexical mode, which is the one entry point P09's changes could have
@@ -1791,5 +1944,124 @@ fn group7_the_closed_path_reports_no_rerank_fields() {
         refused.status.code(),
         Some(2),
         "--vector-search-mode still conflicts with lexical mode"
+    );
+}
+
+// Each fixture and HTTP listener is owned by its test. Environment overrides
+// are child-process-local; no shared static or parent environment is modified.
+fn p10_structured_output(output: &Output, format: &str) -> serde_json::Value {
+    assert_success(output, format);
+    let text = std::str::from_utf8(&output.stdout).expect("output UTF-8");
+    match format {
+        "jsonl" => {
+            let mut lines = text.lines();
+            let mut header: serde_json::Value =
+                serde_json::from_str(lines.next().expect("header")).unwrap();
+            header["hits"] = serde_json::Value::Array(
+                lines
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect(),
+            );
+            header
+        }
+        "toon" => toon::try_decode(text, None).expect("decode actual TOON"),
+        _ => serde_json::from_str(text).expect("decode actual JSON"),
+    }
+}
+
+fn p10_args(n: usize, k: usize, format: &str) -> Vec<String> {
+    let mut args = rerank_args(n, k);
+    args.retain(|arg| arg != "--json" && arg != "--robot-meta");
+    args.extend(["--robot-format".to_string(), format.to_string()]);
+    args
+}
+
+#[test]
+fn p10_format_switch_continuation_keeps_order_and_original_scores() {
+    for mode in [StubMode::Ordered, StubMode::MissingScore] {
+        let fixture = build_fixture(FixtureOptions::default());
+        let stub = Stub::start(mode);
+        let env = RunEnv::with_stub(&fixture, &stub);
+        let closed = stdout_json(&env.run(&as_args(&closed_args(8))));
+        let original = scored_hits(&closed);
+        let mut expected = ids(&closed);
+        expected.truncate(8);
+        if mode == StubMode::Ordered {
+            expected.reverse();
+        }
+        let first = p10_structured_output(&env.run(&as_args(&p10_args(8, 3, "json"))), "json");
+        let first_meta = first["_meta"]["rerank"].clone();
+        let request_count = stub.request_count();
+        let mut collected = ids(&first);
+        let mut cursor = next_cursor(&first);
+        for format in ["jsonl", "toon"] {
+            let mut args = p10_args(8, 3, format);
+            args.extend([
+                "--cursor".to_string(),
+                cursor.take().expect("continuation cursor"),
+            ]);
+            let page = p10_structured_output(&env.run(&as_args(&args)), format);
+            let meta = &page["_meta"]["rerank"];
+            assert_eq!(meta["applied"], mode == StubMode::Ordered);
+            assert_eq!(meta["failure_reason"], first_meta["failure_reason"]);
+            assert_eq!(meta["cache_reused"], true);
+            assert_eq!(meta["http_requests"], 0);
+            assert_eq!(meta["model_requests"], 0);
+            assert_eq!(meta["duration_ms"], 0);
+            assert_eq!(meta["first_duration_ms"], first_meta["first_duration_ms"]);
+            assert_eq!(meta["offset"], collected.len());
+            for (id, score, rerank_score) in scored_hits(&page) {
+                assert_eq!(score, original.iter().find(|row| row.0 == id).unwrap().1);
+                assert_eq!(rerank_score.is_some(), mode == StubMode::Ordered);
+            }
+            assert!(
+                hits(&page)
+                    .iter()
+                    .all(|hit| hit.get("rerank_score").is_some())
+            );
+            collected.extend(ids(&page));
+            cursor = next_cursor(&page);
+            assert_eq!(collected, expected[..collected.len()]);
+        }
+        assert_eq!(collected, expected);
+        assert!(
+            cursor.is_none(),
+            "fixed window ends even if database has more matches"
+        );
+        assert_eq!(
+            stub.request_count(),
+            request_count,
+            "format switch never calls backend"
+        );
+    }
+}
+
+#[test]
+fn p10_budgeted_compact_to_jsonl_continuation_has_no_gap() {
+    let fixture = build_fixture(FixtureOptions::default());
+    let stub = Stub::start(StubMode::Ordered);
+    let env = RunEnv::with_stub(&fixture, &stub);
+    let mut expected = closed_first_n(&env, 8);
+    expected.reverse();
+    let mut first_args = p10_args(8, 3, "compact");
+    first_args.extend(["--max-tokens".to_string(), "1".to_string()]);
+    let first = p10_structured_output(&env.run(&as_args(&first_args)), "compact");
+    assert_eq!(ids(&first).len(), 1);
+    assert_eq!(first["_meta"]["rerank"]["returned_count"], 1);
+    let mut second_args = p10_args(8, 3, "jsonl");
+    second_args.extend([
+        "--cursor".to_string(),
+        require_cursor(&first),
+        "--fields".to_string(),
+        "source_path,score,rerank_score".to_string(),
+    ]);
+    let second = p10_structured_output(&env.run(&as_args(&second_args)), "jsonl");
+    assert_eq!(second["_meta"]["rerank"]["offset"], 1);
+    let joined: Vec<_> = ids(&first).into_iter().chain(ids(&second)).collect();
+    assert_eq!(joined, expected[..joined.len()]);
+    assert!(
+        hits(&second)
+            .iter()
+            .all(|hit| hit["rerank_score"].is_number())
     );
 }

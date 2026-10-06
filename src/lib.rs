@@ -593,13 +593,12 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Enable reranking of search results for improved relevance.
-        /// Requires a reranker model to be available.
+        /// Enable complete-window reranking (off by default).
+        /// Default: qwen3-local, N=200 candidates, K=5 results per page.
         #[arg(long, default_value_t = false)]
         rerank: bool,
 
-        /// Reranker model to use (requires --rerank).
-        /// Use `cass models --list` to see available options.
+        /// Deprecated reranker selector. Use --rerank-provider instead.
         #[arg(long)]
         reranker: Option<String>,
 
@@ -21754,6 +21753,10 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "",
         "OUTPUT:",
         "  --robot | --json   Machine-readable JSON output (auto-quiet enabled)",
+        "  --rerank enables qwen3-local by default (N=200/K=5); select --rerank-provider explicitly to change backend.",
+        "  Search uses --rrf-limit N and --rerank-limit K; legacy search --limit is refused. Pack --limit is unchanged.",
+        "  _meta.rerank is present in JSON/compact/JSONL/TOON when enabled, without --robot-meta; score and rerank_score are separate.",
+        "  Cursor pages repeat query/N/K/provider/filters and reuse the window without another model call.",
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
@@ -21768,7 +21771,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
 }
 
 fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
-    let lines: Vec<String> = match topic {
+    let mut lines: Vec<String> = match topic {
         RobotTopic::Commands => vec![
             "commands:".to_string(),
             "  (global) --quiet / -q  Suppress info logs (auto-enabled in robot mode)".to_string(),
@@ -21784,7 +21787,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
             "                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)".to_string(),
-            "                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
+            "                      Fields: score,rerank_score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
             "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
             "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
@@ -22240,6 +22243,21 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             .map(|s| s.to_string())
             .collect(),
     };
+
+    if matches!(
+        topic,
+        RobotTopic::Guide | RobotTopic::Contracts | RobotTopic::Examples
+    ) {
+        lines.extend([
+            "  Rerank is off by default. --rerank uses qwen3-local with N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.".to_string(),
+            "  Choose --rerank-provider qwen3-local|bge-local|openrouter-qwen3-8b|openrouter-cohere-4-fast|openrouter-voyage-2.5-lite. --provider still filters the session source.".to_string(),
+            "  score keeps its search meaning. rerank_score is separate and null when unscored; minimal/summary omit it unless explicitly added. JSON/compact/JSONL/TOON carry _meta.rerank without --robot-meta.".to_string(),
+            "  Failure keeps original order and K-result paging; failure_reason is a short code, not response text. No automatic backend switch. Actual identity and unproven counts stay null.".to_string(),
+            "  First page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json".to_string(),
+            "  Next page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor \"<next_cursor>\"".to_string(),
+            "  Repeat the original query, N/K, provider and filters. Only display fields and content/token budgets may change. Pages reuse a fixed window; current model requests and duration are zero, first-call facts remain. A reduced page advances by its delivered count.".to_string(),
+        ]);
+    }
 
     println!("{}", render_block(&lines, wrap));
     Ok(())
@@ -26274,11 +26292,19 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
         if let Some(precision) = display_result.search_precision() {
             println!("Search precision: {precision}");
         }
+        if let Some(window) = window.as_ref() {
+            let status = if window.meta.applied {
+                "applied"
+            } else {
+                window.meta.failure_reason.unwrap_or("not applied")
+            };
+            println!("Rerank: {} | {status}", window.meta.requested_provider);
+        }
         if display_result.hits.is_empty() {
             eprintln!("No results found.");
         } else if let Some(display) = display_format {
             // Human-readable display formats
-            output_display_results(&display_result.hits, display, wrap, &query, highlight)?;
+            output_display_results(&display_result.hits, display, wrap, &query, highlight, rerank_requested)?;
         } else {
             // Default plain text output
             for hit in &display_result.hits {
@@ -26287,6 +26313,9 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
                     "Score: {:.2} | Agent: {} | WS: {}",
                     hit.score, hit.agent, hit.workspace
                 );
+                if rerank_requested {
+                    println!("Rerank score: {}", display_rerank_score(hit.rerank_score));
+                }
                 println!("Path: {}", hit.source_path);
                 let snippet = hit.snippet.replace('\n', " ");
                 let snippet = if highlight {
@@ -27323,17 +27352,29 @@ mod pack_field_mask_tests {
 }
 
 /// Output search results in human-readable display format
+fn display_rerank_score(score: Option<f64>) -> String {
+    score.map_or_else(|| "unscored".to_string(), |score| format!("{score:.4}"))
+}
+
 fn output_display_results(
     hits: &[crate::search::query::SearchHit],
     format: DisplayFormat,
     wrap: WrapConfig,
     query: &str,
     highlight: bool,
+    rerank_requested: bool,
 ) -> CliResult<()> {
     match format {
         DisplayFormat::Table => {
             // Aligned columns with headers
-            println!("{:<6} {:<12} {:<25} SNIPPET", "SCORE", "AGENT", "WORKSPACE");
+            if rerank_requested {
+                println!(
+                    "{:<6} {:<10} {:<12} {:<25} SNIPPET",
+                    "SCORE", "RERANK", "AGENT", "WORKSPACE"
+                );
+            } else {
+                println!("{:<6} {:<12} {:<25} SNIPPET", "SCORE", "AGENT", "WORKSPACE");
+            }
             println!("{}", "-".repeat(80));
             for hit in hits {
                 let workspace = truncate_start(&hit.workspace, 24);
@@ -27344,10 +27385,21 @@ fn output_display_results(
                     snippet
                 };
                 let snippet_display = truncate_end(&snippet, 50);
-                println!(
-                    "{:<6.2} {:<12} {:<25} {}",
-                    hit.score, hit.agent, workspace, snippet_display
-                );
+                if rerank_requested {
+                    println!(
+                        "{:<6.2} {:<10} {:<12} {:<25} {}",
+                        hit.score,
+                        display_rerank_score(hit.rerank_score),
+                        hit.agent,
+                        workspace,
+                        snippet_display
+                    );
+                } else {
+                    println!(
+                        "{:<6.2} {:<12} {:<25} {}",
+                        hit.score, hit.agent, workspace, snippet_display
+                    );
+                }
             }
             println!("\n{} results", hits.len());
         }
@@ -27361,10 +27413,21 @@ fn output_display_results(
                     snippet
                 };
                 let snippet_short = truncate_end(&snippet, 60);
-                println!(
-                    "[{:.1}] {} | {} | {}",
-                    hit.score, hit.agent, hit.source_path, snippet_short
-                );
+                if rerank_requested {
+                    println!(
+                        "[score: {:.1}, rerank: {}] {} | {} | {}",
+                        hit.score,
+                        display_rerank_score(hit.rerank_score),
+                        hit.agent,
+                        hit.source_path,
+                        snippet_short
+                    );
+                } else {
+                    println!(
+                        "[{:.1}] {} | {} | {}",
+                        hit.score, hit.agent, hit.source_path, snippet_short
+                    );
+                }
             }
         }
         DisplayFormat::Markdown => {
@@ -27373,6 +27436,12 @@ fn output_display_results(
             println!("Found **{}** results.\n", hits.len());
             for (i, hit) in hits.iter().enumerate() {
                 println!("## {}. {} (score: {:.2})\n", i + 1, hit.agent, hit.score);
+                if rerank_requested {
+                    println!(
+                        "- **Rerank score**: {}",
+                        display_rerank_score(hit.rerank_score)
+                    );
+                }
                 println!("- **Workspace**: `{}`", hit.workspace);
                 println!("- **Path**: `{}`", hit.source_path);
                 if let Some(ts) = hit.created_at {
@@ -27401,7 +27470,8 @@ fn output_display_results(
 fn expand_field_presets(fields: &Option<Vec<String>>) -> Option<Vec<String>> {
     fields.as_ref().map(|f| {
         f.iter()
-            .flat_map(|field| match field.as_str() {
+            .flat_map(|field| {
+                match field.as_str() {
                 "minimal" => vec![
                     "source_path".to_string(),
                     "line_number".to_string(),
@@ -27655,6 +27725,7 @@ fn projected_hit_field_value(
 ) -> Option<serde_json::Value> {
     match field {
         "score" => Some(safe_robot_score_value(hit.score)),
+        "rerank_score" => Some(serde_json::json!(hit.rerank_score)),
         "agent" => Some(serde_json::Value::String(hit.agent.clone())),
         "workspace" => Some(serde_json::Value::String(hit.workspace.clone())),
         "source_path" => Some(serde_json::Value::String(hit.source_path.clone())),
@@ -27704,6 +27775,7 @@ fn filter_hit_fields(
             let mut filtered = serde_json::Map::new();
             let known_fields = [
                 "score",
+                "rerank_score",
                 "agent",
                 "workspace",
                 "source_path",
@@ -28412,7 +28484,7 @@ fn output_robot_results(
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
-    // R1-W3-B7: whether reranking actually changed `result`'s hit order --
+    // Whether complete rerank scoring was applied, even if order stayed equal.
     // `false` covers both "never requested" and "requested but no
     // reranker was available", same convention as `rerank_ms` (0 covers
     // both cases too). Distinguishing those two `false` cases is what the
@@ -28811,7 +28883,7 @@ fn output_robot_results(
         return Ok(());
     }
 
-    let filtered_hits: Vec<serde_json::Value> = if minimal_projection {
+    let mut filtered_hits: Vec<serde_json::Value> = if minimal_projection {
         result
             .hits
             .iter()
@@ -28876,6 +28948,19 @@ fn output_robot_results(
             .collect()
     };
 
+    // Full rerank output always carries the independent score, including null
+    // on failure. Presets keep their fixed fields. Do this before the budget.
+    if rerank_requested && all_fields_requested {
+        for (hit, value) in result.hits.iter().zip(&mut filtered_hits) {
+            if let Some(map) = value.as_object_mut() {
+                map.insert(
+                    "rerank_score".to_string(),
+                    serde_json::json!(hit.rerank_score),
+                );
+            }
+        }
+    }
+
     // Clamp hits to token budget if provided (approx 4 chars per token)
     let jsonl_meta_emitted = matches!(format, RobotFormat::Jsonl)
         && (include_meta
@@ -28918,6 +29003,8 @@ fn output_robot_results(
 
     let search_page_count = result.hits.len();
     let returned_count = filtered_hits.len();
+    // One post-budget projection shared by every structured format.
+    let rerank_meta = window.map(|window| window.meta.to_json(returned_count));
     let clamped_unemitted_hits = returned_count < search_page_count;
     let realized_cursor_limit = if cursor_page_limit == 0 {
         limit
@@ -29049,6 +29136,27 @@ fn output_robot_results(
         None
     } else {
         Some(serde_json::to_value(aggregations).unwrap_or_default())
+    };
+
+    // Apply after each format's optional metadata so it cannot overwrite the
+    // common window facts. JSONL uses this on its header object.
+    let attach_rerank_meta = |payload: &mut serde_json::Value| {
+        if let Some(rerank) = rerank_meta.as_ref() {
+            payload["rerank_requested"] = serde_json::json!(rerank_requested);
+            payload["rerank_applied"] = serde_json::json!(rerank_applied);
+            if payload.get("_meta").is_none() {
+                payload["_meta"] = serde_json::json!({});
+            }
+            payload["_meta"]["rerank"] = rerank.clone();
+            payload["_meta"]["next_cursor"] = serde_json::json!(next_cursor);
+            if !matches!(format, RobotFormat::Jsonl) {
+                let projection = search_precision_projection(result);
+                if let Some(precision) = projection.search_precision {
+                    payload["search_precision"] = serde_json::json!(precision);
+                    payload["candidates"] = serde_json::json!(projection.candidates);
+                }
+            }
+        }
     };
 
     match format {
@@ -29213,16 +29321,6 @@ fn output_robot_results(
                     }
                 }
                 map.insert("_meta".to_string(), meta);
-                // P09: the frozen rerank window block. `returned_count` is the
-                // post-budget count computed above, so it always matches the
-                // hits actually emitted (the next cursor advances by it).
-                if let Some(window) = window
-                    && let Some(meta_map) =
-                        map.get_mut("_meta").and_then(serde_json::Value::as_object_mut)
-                {
-                    meta_map.insert("rerank".to_string(), window.meta.to_json(returned_count));
-                }
-
                 if let Some(warn) = &warning {
                     map.insert(
                         "_warning".to_string(),
@@ -29244,6 +29342,7 @@ fn output_robot_results(
                 }
             }
 
+            attach_rerank_meta(&mut payload);
             let mut out = BufWriter::new(&mut *out);
             serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
                 code: 9,
@@ -29432,6 +29531,7 @@ fn output_robot_results(
                         }),
                     );
                 }
+                attach_rerank_meta(&mut meta);
                 serde_json::to_writer(&mut out, &meta).map_err(|e| CliError {
                     code: 9,
                     kind: CliErrorKind::EncodeJson.kind_str(),
@@ -29587,6 +29687,7 @@ fn output_robot_results(
                 }
             }
 
+            attach_rerank_meta(&mut payload);
             let encoded = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
@@ -29724,6 +29825,7 @@ fn output_robot_results(
                 }
             }
 
+            attach_rerank_meta(&mut payload);
             let json_str = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
@@ -29862,19 +29964,36 @@ mod pr9_candidate_meta_output_tests {
         fields: &Option<Vec<String>>,
         result: &SearchResult,
     ) -> String {
+        render_window(format, include_meta, fields, result, None, None, None)
+    }
+
+    fn render_window(
+        format: RobotFormat,
+        include_meta: bool,
+        fields: &Option<Vec<String>>,
+        result: &SearchResult,
+        window: Option<&super::WindowRenderCtx>,
+        max_tokens: Option<usize>,
+        max_content_length: Option<usize>,
+    ) -> String {
         let mut sink: Vec<u8> = Vec::new();
         output_robot_results(
             "hello",
             8,
             8,
-            0,
+            window.map_or(0, |window| window.offset),
             result,
             format,
             include_meta,
             1,
             fields,
-            FieldBudgets { snippet: None, content: None, title: None, fallback: None },
-            None,
+            FieldBudgets {
+                snippet: max_content_length,
+                content: max_content_length,
+                title: max_content_length,
+                fallback: max_content_length,
+            },
+            max_tokens,
             None,
             None,
             false,
@@ -29892,9 +30011,9 @@ mod pr9_candidate_meta_output_tests {
             SearchModeMeta::new(SearchMode::Hybrid, false),
             1,
             0,
-            false,
-            false,
-            None,
+            window.is_some_and(|window| window.meta.applied),
+            window.is_some(),
+            window,
             &mut sink,
         )
         .expect("render robot output");
@@ -29902,7 +30021,12 @@ mod pr9_candidate_meta_output_tests {
     }
 
     fn render_json(include_meta: bool) -> Value {
-        let out = render(RobotFormat::Json, include_meta, &None, &result_with(Some(exact_candidates())));
+        let out = render(
+            RobotFormat::Json,
+            include_meta,
+            &None,
+            &result_with(Some(exact_candidates())),
+        );
         serde_json::from_str(&out).expect("default JSON payload parses")
     }
 
@@ -29923,7 +30047,10 @@ mod pr9_candidate_meta_output_tests {
 
     fn render_jsonl_first_line(result: &SearchResult, include_meta: bool) -> String {
         let out = render(RobotFormat::Jsonl, include_meta, &None, result);
-        out.lines().next().expect("jsonl has a first line").to_string()
+        out.lines()
+            .next()
+            .expect("jsonl has a first line")
+            .to_string()
     }
 
     #[test]
@@ -29933,7 +30060,12 @@ mod pr9_candidate_meta_output_tests {
         assert_eq!(value["search_precision"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["mode"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["approximate"], serde_json::json!(false));
-        for key in ["requested_coarse_k", "effective_coarse_k", "coarse_cap_hit", "corpus_limited"] {
+        for key in [
+            "requested_coarse_k",
+            "effective_coarse_k",
+            "coarse_cap_hit",
+            "corpus_limited",
+        ] {
             assert!(
                 value["candidates"].get(key).is_none(),
                 "{key} must stay absent on the float path, got {value}"
@@ -29946,7 +30078,10 @@ mod pr9_candidate_meta_output_tests {
         let value = render_json_summary(&result_with(Some(exact_candidates())));
         assert_eq!(value["search_precision"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["approximate"], serde_json::json!(false));
-        assert_eq!(value["hits"][0]["source_path"], serde_json::json!("/tmp/session.jsonl"));
+        assert_eq!(
+            value["hits"][0]["source_path"],
+            serde_json::json!("/tmp/session.jsonl")
+        );
     }
 
     #[test]
@@ -29955,8 +30090,14 @@ mod pr9_candidate_meta_output_tests {
         assert_eq!(value["search_precision"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["mode"], serde_json::json!("exact"));
         // The pre-existing `_meta.candidates` diagnostic keeps its place.
-        assert_eq!(value["_meta"]["candidates"]["mode"], serde_json::json!("exact"));
-        assert_eq!(value["_meta"]["candidates"]["approximate"], serde_json::json!(false));
+        assert_eq!(
+            value["_meta"]["candidates"]["mode"],
+            serde_json::json!("exact")
+        );
+        assert_eq!(
+            value["_meta"]["candidates"]["approximate"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
@@ -29964,27 +30105,51 @@ mod pr9_candidate_meta_output_tests {
         let value = render_json_approximate();
         assert_eq!(value["search_precision"], serde_json::json!("approximate"));
         assert_eq!(value["candidates"]["approximate"], serde_json::json!(true));
-        assert_eq!(value["candidates"]["requested_coarse_k"], serde_json::json!(6432));
-        assert_eq!(value["candidates"]["effective_coarse_k"], serde_json::json!(4096));
-        assert_eq!(value["candidates"]["coarse_cap_hit"], serde_json::json!(true));
-        assert_eq!(value["candidates"]["corpus_limited"], serde_json::json!(false));
+        assert_eq!(
+            value["candidates"]["requested_coarse_k"],
+            serde_json::json!(6432)
+        );
+        assert_eq!(
+            value["candidates"]["effective_coarse_k"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            value["candidates"]["coarse_cap_hit"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            value["candidates"]["corpus_limited"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
     fn pr9_candidate_meta_approximate_summary_json_is_visible_without_robot_meta() {
         let value = render_json_summary(&result_with(Some(approximate_candidates())));
         assert_eq!(value["search_precision"], serde_json::json!("approximate"));
-        assert_eq!(value["candidates"]["effective_coarse_k"], serde_json::json!(4096));
+        assert_eq!(
+            value["candidates"]["effective_coarse_k"],
+            serde_json::json!(4096)
+        );
     }
 
     #[test]
     fn pr9_candidate_meta_approximate_jsonl_header_is_visible_without_robot_meta() {
         let result = result_with(Some(approximate_candidates()));
-        let header: Value =
-            serde_json::from_str(&render_jsonl_first_line(&result, false)).expect("jsonl header parses");
-        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("approximate"));
-        assert_eq!(header["_meta"]["candidates"]["approximate"], serde_json::json!(true));
-        assert_eq!(header["_meta"]["candidates"]["requested_coarse_k"], serde_json::json!(6432));
+        let header: Value = serde_json::from_str(&render_jsonl_first_line(&result, false))
+            .expect("jsonl header parses");
+        assert_eq!(
+            header["_meta"]["search_precision"],
+            serde_json::json!("approximate")
+        );
+        assert_eq!(
+            header["_meta"]["candidates"]["approximate"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            header["_meta"]["candidates"]["requested_coarse_k"],
+            serde_json::json!(6432)
+        );
     }
 
     #[test]
@@ -29995,13 +30160,26 @@ mod pr9_candidate_meta_output_tests {
         let result = result_with(Some(exact_candidates()));
         let out = render(RobotFormat::Jsonl, false, &None, &result);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2, "one header line plus one hit line, got {out}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "one header line plus one hit line, got {out}"
+        );
         let header: Value = serde_json::from_str(lines[0]).expect("jsonl header parses");
-        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("exact"));
-        assert_eq!(header["_meta"]["candidates"]["mode"], serde_json::json!("exact"));
+        assert_eq!(
+            header["_meta"]["search_precision"],
+            serde_json::json!("exact")
+        );
+        assert_eq!(
+            header["_meta"]["candidates"]["mode"],
+            serde_json::json!("exact")
+        );
         let hit: Value = serde_json::from_str(lines[1]).expect("jsonl hit parses");
         assert_eq!(hit["source_path"], serde_json::json!("/tmp/session.jsonl"));
-        assert!(hit.get("_meta").is_none(), "the per-hit line must not become a meta line");
+        assert!(
+            hit.get("_meta").is_none(),
+            "the per-hit line must not become a meta line"
+        );
     }
 
     /// PR9 task 09 re-runs the same three-format acceptance on its real int8
@@ -30019,10 +30197,12 @@ mod pr9_candidate_meta_output_tests {
         assert_eq!(parsed["search_precision"], serde_json::json!("approximate"));
         let parsed: Value = serde_json::from_str(&json_summary).expect("summary JSON parses");
         assert_eq!(parsed["search_precision"], serde_json::json!("approximate"));
-        let header: Value =
-            serde_json::from_str(jsonl.lines().next().expect("jsonl first line"))
-                .expect("jsonl header parses");
-        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("approximate"));
+        let header: Value = serde_json::from_str(jsonl.lines().next().expect("jsonl first line"))
+            .expect("jsonl header parses");
+        assert_eq!(
+            header["_meta"]["search_precision"],
+            serde_json::json!("approximate")
+        );
 
         for (label, body) in [
             ("json_full", json_full.as_str()),
@@ -30046,14 +30226,205 @@ mod pr9_candidate_meta_output_tests {
         assert!(value.get("search_precision").is_none(), "got {value}");
         assert!(value.get("candidates").is_none(), "got {value}");
         let meta_json = render(RobotFormat::Json, true, &None, &lexical);
-        let value: Value = serde_json::from_str(&meta_json).expect("lexical robot-meta payload parses");
+        let value: Value =
+            serde_json::from_str(&meta_json).expect("lexical robot-meta payload parses");
         assert!(value["_meta"]["candidates"].is_null());
         // No header at all, so the only line keeps its per-hit shape.
         let jsonl = render(RobotFormat::Jsonl, false, &None, &lexical);
         let first: Value = serde_json::from_str(jsonl.lines().next().expect("first line"))
             .expect("lexical jsonl line parses");
         assert!(first.get("_meta").is_none(), "got {first}");
-        assert_eq!(first["source_path"], serde_json::json!("/tmp/session.jsonl"));
+        assert_eq!(
+            first["source_path"],
+            serde_json::json!("/tmp/session.jsonl")
+        );
+    }
+
+    // No process-global state: each render owns its sink and window.
+    fn test_window(applied: bool, cache_reused: bool) -> super::WindowRenderCtx {
+        use crate::search::rerank::types::ProviderChoice;
+        super::WindowRenderCtx {
+            window_id: None,
+            snapshot: None,
+            offset: usize::from(cache_reused) * 2,
+            continuable: false,
+            meta: super::RerankWindowMeta {
+                requested_provider: ProviderChoice::BgeLocal,
+                requested_model: ProviderChoice::BgeLocal.request_model(),
+                actual_provider: applied.then_some(ProviderChoice::BgeLocal),
+                actual_model: applied.then(|| ProviderChoice::BgeLocal.request_model().to_string()),
+                serving_provider: None,
+                rrf_limit: 8,
+                window_count: 3,
+                scored_count: if applied { 3 } else { 0 },
+                rerank_limit: 2,
+                offset: usize::from(cache_reused) * 2,
+                applied,
+                cache_reused,
+                first_http_requests: Some(2),
+                http_requests: Some(if cache_reused { 0 } else { 2 }),
+                first_model_requests: Some(1),
+                model_requests: Some(usize::from(!cache_reused)),
+                first_duration_ms: 7,
+                duration_ms: if cache_reused { 0 } else { 7 },
+                failure_reason: (!applied).then_some("invalid_response"),
+                http_status: Some(200),
+                pagination_unavailable_reason: Some("cache_unavailable".to_string()),
+            },
+        }
+    }
+
+    fn decode_output(format: RobotFormat, text: &str) -> (Value, Vec<Value>) {
+        if matches!(format, RobotFormat::Jsonl) {
+            let mut lines = text.lines();
+            let header: Value = serde_json::from_str(lines.next().expect("header")).unwrap();
+            let hits = lines
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            (header, hits)
+        } else {
+            let payload: Value = if matches!(format, RobotFormat::Toon) {
+                toon::try_decode(text, None).expect("TOON decodes")
+            } else {
+                serde_json::from_str(text).expect("JSON decodes")
+            };
+            let hits = payload["hits"].as_array().expect("hits array").clone();
+            (payload, hits)
+        }
+    }
+
+    #[test]
+    fn p10_all_formats_preserve_window_scores_and_projection() {
+        for (applied, cache_reused) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let window = test_window(applied, cache_reused);
+            let mut result = result_with(Some(exact_candidates()));
+            result.hits[0].rerank_score = applied.then_some(0.75);
+            let mut other = test_hit();
+            other.source_path = "/tmp/other.jsonl".to_string();
+            other.score = 4.0;
+            other.rerank_score = applied.then_some(0.5);
+            result.hits.push(other);
+            for include_meta in [false, true] {
+                for fields in [
+                    None,
+                    Some(vec!["minimal".to_string()]),
+                    Some(vec!["summary".to_string()]),
+                    Some(vec![
+                        "source_path".to_string(),
+                        "score".to_string(),
+                        "rerank_score".to_string(),
+                    ]),
+                ] {
+                    let mut expected = None;
+                    for format in [
+                        RobotFormat::Json,
+                        RobotFormat::Compact,
+                        RobotFormat::Jsonl,
+                        RobotFormat::Toon,
+                    ] {
+                        let text = render_window(
+                            format,
+                            include_meta,
+                            &fields,
+                            &result,
+                            Some(&window),
+                            None,
+                            Some(4),
+                        );
+                        let (payload, hits) = decode_output(format, &text);
+                        assert_eq!(payload["_meta"]["rerank"], window.meta.to_json(hits.len()));
+                        assert_eq!(payload["rerank_requested"], true);
+                        assert_eq!(payload["rerank_applied"], applied);
+                        let projection = fields
+                            .as_ref()
+                            .and_then(|fields| fields.first())
+                            .map(String::as_str);
+                        if matches!(projection, Some("minimal" | "summary")) {
+                            assert!(hits.iter().all(|hit| hit.get("rerank_score").is_none()));
+                        } else {
+                            assert_eq!(hits[0]["score"], 1.25);
+                            assert_eq!(
+                                hits[0]["rerank_score"],
+                                serde_json::json!(result.hits[0].rerank_score)
+                            );
+                            assert!(hits.iter().all(|hit| hit.get("rerank_score").is_some()));
+                        }
+                        for hit in &hits {
+                            assert!(hit.get("content_hash").is_none());
+                            assert!(hit.get("conversation_id").is_none());
+                            assert!(hit.get("snapshot_path").is_none());
+                        }
+                        // Trust carries observation time; compare stable fields.
+                        let stable_hits: Vec<_> = hits
+                            .iter()
+                            .cloned()
+                            .map(|mut hit| {
+                                hit.as_object_mut().unwrap().remove("trust");
+                                hit
+                            })
+                            .collect();
+                        if let Some(expected) = &expected {
+                            assert_eq!(&stable_hits, expected, "format {format:?}");
+                        } else {
+                            expected = Some(stable_hits);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p10_budget_reports_actual_count_and_empty_window_has_no_cursor() {
+        let window = test_window(false, false);
+        let mut result = result_with(None);
+        result.hits.push(test_hit());
+        for format in [
+            RobotFormat::Json,
+            RobotFormat::Compact,
+            RobotFormat::Jsonl,
+            RobotFormat::Toon,
+        ] {
+            let (payload, hits) = decode_output(
+                format,
+                &render_window(format, false, &None, &result, Some(&window), Some(1), None),
+            );
+            assert_eq!(hits.len(), 1, "nonempty budget keeps first hit");
+            assert_eq!(payload["_meta"]["rerank"]["returned_count"], 1);
+            result.hits.clear();
+            let (payload, hits) = decode_output(
+                format,
+                &render_window(format, false, &None, &result, Some(&window), Some(1), None),
+            );
+            assert!(hits.is_empty());
+            assert_eq!(payload["_meta"]["rerank"]["returned_count"], 0);
+            assert!(payload["_meta"]["next_cursor"].is_null());
+            result.hits = vec![test_hit(), test_hit()];
+        }
+    }
+
+    #[test]
+    fn p10_closed_score_is_omitted_unless_explicitly_projected() {
+        for format in [
+            RobotFormat::Json,
+            RobotFormat::Compact,
+            RobotFormat::Jsonl,
+            RobotFormat::Toon,
+        ] {
+            let output = render(format, false, &None, &result_with(Some(exact_candidates())));
+            let (payload, hits) = decode_output(format, &output);
+            assert!(hits[0].get("rerank_score").is_none());
+            assert!(payload["_meta"].get("rerank").is_none());
+            let output = render(
+                format,
+                false,
+                &Some(vec!["rerank_score".to_string()]),
+                &result_with(Some(exact_candidates())),
+            );
+            let (_, hits) = decode_output(format, &output);
+            assert_eq!(hits[0], serde_json::json!({"rerank_score": null}));
+        }
     }
 }
 
@@ -80836,6 +81207,21 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml.",
         ),
         env_var_capability(
+            "CASS_QWEN_RERANK_URL",
+            None,
+            "Local Qwen rerank endpoint. Only loopback targets are accepted; proxies and redirects are disabled. Used by qwen3-local, the default when --rerank is enabled.",
+        ),
+        env_var_capability(
+            "CASS_INFINITY_URL",
+            None,
+            "Local Infinity endpoint for bge-local reranking and Infinity embeddings. Reranking accepts only loopback targets; proxies and redirects are disabled.",
+        ),
+        env_var_capability(
+            "OPENROUTER_API_KEY",
+            None,
+            "Credential consumed only by an explicitly selected OpenRouter rerank provider. Missing credentials keep original order with missing_credentials; no backend switch.",
+        ),
+        env_var_capability(
             "CASS_SEARCH_LIMIT",
             None,
             "Legacy pack result limit (0 = no limit, RAM-capped). Consumed by `cass pack` via [search].limit; `cass search` rejects it with a migration error and uses CASS_RRF_LIMIT instead.",
@@ -85060,6 +85446,10 @@ fn response_schema_search_hit() -> serde_json::Value {
         ("content", serde_json::json!({ "type": ["string", "null"] })),
         ("snippet", serde_json::json!({ "type": ["string", "null"] })),
         ("score", serde_json::json!({ "type": ["number", "null"] })),
+        ("rerank_score", serde_json::json!({
+            "type": ["number", "null"],
+            "description": "Independent rerank score. Full rerank output includes null when unscored; closed output omits it. Explicit field projection includes it."
+        })),
         (
             "created_at",
             serde_json::json!({ "type": ["integer", "string", "null"] }),
@@ -85359,6 +85749,96 @@ fn response_schema_root_cause_attribution() -> serde_json::Value {
     })
 }
 
+fn response_schema_rerank_meta() -> serde_json::Value {
+    use crate::search::rerank::types::ProviderChoice;
+    let providers = serde_json::json!([
+        ProviderChoice::Qwen3Local,
+        ProviderChoice::BgeLocal,
+        ProviderChoice::OpenrouterQwen38b,
+        ProviderChoice::OpenrouterCohere4Fast,
+        ProviderChoice::OpenrouterVoyage25Lite
+    ]);
+    let mut nullable_providers = providers.clone();
+    nullable_providers
+        .as_array_mut()
+        .expect("provider array")
+        .push(serde_json::Value::Null);
+    let mut schema = response_schema_object([
+        (
+            "requested_provider",
+            serde_json::json!({"type": "string", "enum": providers}),
+        ),
+        ("requested_model", serde_json::json!({"type": "string"})),
+        (
+            "actual_provider",
+            serde_json::json!({"type": ["string", "null"], "enum": nullable_providers}),
+        ),
+        (
+            "actual_model",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "serving_provider",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "applied",
+            serde_json::json!({"type": "boolean", "description": "Complete scoring applied, including unchanged order."}),
+        ),
+        ("cache_reused", serde_json::json!({"type": "boolean"})),
+        (
+            "http_status",
+            serde_json::json!({"type": ["integer", "null"], "minimum": 100, "maximum": 599}),
+        ),
+        (
+            "failure_reason",
+            serde_json::json!({"type": ["string", "null"], "enum": [
+                "unsupported_provider", "invalid_input", "missing_credentials", "non_loopback_endpoint",
+                "http_error", "timeout", "transport_error", "invalid_response", "model_identity_mismatch",
+                "unscoreable_input", "input_identity_mismatch", null
+            ]}),
+        ),
+        (
+            "pagination_unavailable_reason",
+            serde_json::json!({"type": ["string", "null"], "enum": [
+                "invalid_input", "cache_unavailable", "not_found", "invalid_cursor", "corrupt", "expired",
+                "binding_mismatch", "index_changed", "partial_results", "search_timeout", null
+            ]}),
+        ),
+    ]);
+    let properties = schema["properties"]
+        .as_object_mut()
+        .expect("schema properties");
+    for field in [
+        "rrf_limit",
+        "window_count",
+        "scored_count",
+        "rerank_limit",
+        "offset",
+        "returned_count",
+        "first_duration_ms",
+        "duration_ms",
+    ] {
+        properties.insert(
+            field.to_string(),
+            serde_json::json!({"type": "integer", "minimum": 0}),
+        );
+    }
+    for field in [
+        "first_http_requests",
+        "http_requests",
+        "first_model_requests",
+        "model_requests",
+    ] {
+        properties.insert(
+            field.to_string(),
+            serde_json::json!({"type": ["integer", "null"], "minimum": 0}),
+        );
+    }
+    schema["required"] = serde_json::json!(properties.keys().cloned().collect::<Vec<_>>());
+    schema
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -85401,10 +85881,8 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("cursor_manifest", response_schema_cursor_manifest()),
         ("explanation_cards", response_schema_explanation_cards()),
         ("timing", response_schema_search_timing()),
-        (
-            "rerank_applied",
-            serde_json::json!({ "type": "boolean" }),
-        ),
+        ("rerank", response_schema_rerank_meta()),
+        ("rerank_applied", serde_json::json!({ "type": "boolean" })),
         (
             "tokens_estimated",
             serde_json::json!({ "type": ["integer", "null"] }),
@@ -85453,6 +85931,8 @@ fn response_schema_search_meta() -> serde_json::Value {
 fn response_schema_search() -> serde_json::Value {
     response_schema_object([
         ("query", serde_json::json!({ "type": "string" })),
+        ("rerank_requested", serde_json::json!({"type": "boolean"})),
+        ("rerank_applied", serde_json::json!({"type": "boolean"})),
         ("limit", serde_json::json!({ "type": "integer" })),
         ("offset", serde_json::json!({ "type": "integer" })),
         ("count", serde_json::json!({ "type": "integer" })),

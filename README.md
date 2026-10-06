@@ -855,6 +855,19 @@ The CLI applies multiple normalization layers:
 
 **Search result windows**: Reranking is off by default. `cass search` uses `--rrf-limit N` for the rrf candidate window and `--rerank-limit K` for the per-page rerank count (requires `--rerank`). With `--rerank` off, an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on, N defaults to 200 and K defaults to 5 per page (K must be at most N). An explicit `0` is rejected for either, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
 
+`--rerank` scores every actual candidate before it selects a page. The default backend is `qwen3-local`. Choose `bge-local`, `openrouter-qwen3-8b`, `openrouter-cohere-4-fast`, or `openrouter-voyage-2.5-lite` explicitly to use another backend. `--provider` still filters session sources. Local endpoints use `CASS_QWEN_RERANK_URL` or `CASS_INFINITY_URL` and must resolve to loopback. Only an explicit cloud selection consumes `OPENROUTER_API_KEY` and sends the query and verified passages to OpenRouter. Search does not start a service or download a model.
+
+The original `score` remains unchanged. Full rerank output adds `rerank_score`, with `null` for unscored hits. The `minimal` and `summary` presets keep their fields; use `--fields source_path,score,rerank_score` to select both scores. JSON, compact JSON, JSONL headers, and decoded TOON carry the same `_meta.rerank` facts even without `--robot-meta`. Requested and actual identities are separate. Unproven identities or counts remain `null`. `applied=true` means complete scoring succeeded, including when tied scores keep the original order.
+
+On failure, search keeps original order and returns at most K hits per page. It reports a short `failure_reason` and does not switch backends. A stable failed window can still be paged without retrying the model. Continuation pages report `cache_reused=true`, zero current request counts and duration, and the unchanged `first_*` facts. Display budgets act after scoring. If a budget reduces a page, the cursor advances by the actual delivered count.
+
+```bash
+cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json
+cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"
+```
+
+Copy `_meta.next_cursor` from the first response. Repeat the query, N/K, backend, and filters on later pages. Display fields and display budgets may change. The fixed window ends after its actual candidates, even when the archive has more matches. A changed query, filter, backend, or index requires a new search. `sessions` output still lists only unique paths from the current page.
+
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
 ### Structured Output Formats
