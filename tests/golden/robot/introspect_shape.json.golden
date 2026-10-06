@@ -56329,6 +56329,22 @@
                     }
                   }
                 },
+                "rerank_requested": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "rerank_applied": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                },
                 "limit": {
                   "type": "object",
                   "properties": {
@@ -56510,6 +56526,20 @@
                                   "items": {
                                     "type": "string"
                                   }
+                                }
+                              }
+                            },
+                            "rerank_score": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "description": {
+                                  "type": "string"
                                 }
                               }
                             },
@@ -57685,6 +57715,300 @@
                                     }
                                   }
                                 }
+                              }
+                            }
+                          }
+                        },
+                        "rerank": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "requested_provider": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "requested_model": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "actual_provider": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "actual_model": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "serving_provider": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "applied": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "cache_reused": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "http_status": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    },
+                                    "maximum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "failure_reason": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "pagination_unavailable_reason": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "enum": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "rrf_limit": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "window_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "scored_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "rerank_limit": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "offset": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "returned_count": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "first_duration_ms": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "duration_ms": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "first_http_requests": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "http_requests": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "first_model_requests": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                },
+                                "model_requests": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "minimum": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "required": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
                               }
                             }
                           }
@@ -59629,6 +59953,300 @@
                     }
                   }
                 }
+              }
+            }
+          }
+        },
+        "search-rerank-meta": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "properties": {
+              "type": "object",
+              "properties": {
+                "requested_provider": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "enum": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "requested_model": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "actual_provider": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "enum": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "actual_model": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "serving_provider": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "applied": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "cache_reused": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "http_status": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    },
+                    "maximum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "failure_reason": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "enum": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "pagination_unavailable_reason": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "enum": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "rrf_limit": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "window_count": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "scored_count": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "rerank_limit": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "offset": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "returned_count": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "first_duration_ms": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "duration_ms": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "first_http_requests": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "http_requests": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "first_model_requests": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                },
+                "model_requests": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "minimum": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            },
+            "required": {
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             }
           }

@@ -577,7 +577,7 @@
         },
         {
           "name": "cursor",
-          "description": "Cursor for pagination (base64-encoded offset/limit payload from previous result)",
+          "description": "Cursor from _meta.next_cursor. Rerank pages reuse the fixed window; repeat the original query, limits, backend and filters",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -743,7 +743,7 @@
         },
         {
           "name": "rerank",
-          "description": "Enable reranking of search results for improved relevance. Requires a reranker model to be available",
+          "description": "Enable complete-window reranking (off by default). Default: qwen3-local, N=200 candidates, K=5 results per page",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -754,7 +754,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Deprecated reranker selector. Use --rerank-provider instead",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -29627,6 +29627,12 @@
         "query": {
           "type": "string"
         },
+        "rerank_requested": {
+          "type": "boolean"
+        },
+        "rerank_applied": {
+          "type": "boolean"
+        },
         "limit": {
           "type": "integer"
         },
@@ -29713,6 +29719,13 @@
                   "number",
                   "null"
                 ]
+              },
+              "rerank_score": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "description": "Independent rerank score. Full rerank output includes null when unscored; closed output omits it. Explicit field projection includes it."
               },
               "created_at": {
                 "type": [
@@ -30230,6 +30243,188 @@
                   "type": "integer"
                 }
               }
+            },
+            "rerank": {
+              "type": "object",
+              "properties": {
+                "requested_provider": {
+                  "type": "string",
+                  "enum": [
+                    "qwen3-local",
+                    "bge-local",
+                    "openrouter-qwen3-8b",
+                    "openrouter-cohere-4-fast",
+                    "openrouter-voyage-2.5-lite"
+                  ]
+                },
+                "requested_model": {
+                  "type": "string"
+                },
+                "actual_provider": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "qwen3-local",
+                    "bge-local",
+                    "openrouter-qwen3-8b",
+                    "openrouter-cohere-4-fast",
+                    "openrouter-voyage-2.5-lite",
+                    null
+                  ]
+                },
+                "actual_model": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "serving_provider": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "applied": {
+                  "type": "boolean",
+                  "description": "Complete scoring applied, including unchanged order."
+                },
+                "cache_reused": {
+                  "type": "boolean"
+                },
+                "http_status": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 100,
+                  "maximum": 599
+                },
+                "failure_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "unsupported_provider",
+                    "invalid_input",
+                    "missing_credentials",
+                    "non_loopback_endpoint",
+                    "http_error",
+                    "timeout",
+                    "transport_error",
+                    "invalid_response",
+                    "model_identity_mismatch",
+                    "unscoreable_input",
+                    "input_identity_mismatch",
+                    null
+                  ]
+                },
+                "pagination_unavailable_reason": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "enum": [
+                    "invalid_input",
+                    "cache_unavailable",
+                    "not_found",
+                    "invalid_cursor",
+                    "corrupt",
+                    "expired",
+                    "binding_mismatch",
+                    "index_changed",
+                    "partial_results",
+                    "search_timeout",
+                    null
+                  ]
+                },
+                "rrf_limit": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "window_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "scored_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "rerank_limit": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "returned_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "first_duration_ms": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "duration_ms": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "first_http_requests": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "http_requests": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "first_model_requests": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "model_requests": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "requested_provider",
+                "requested_model",
+                "actual_provider",
+                "actual_model",
+                "serving_provider",
+                "applied",
+                "cache_reused",
+                "http_status",
+                "failure_reason",
+                "pagination_unavailable_reason",
+                "rrf_limit",
+                "window_count",
+                "scored_count",
+                "rerank_limit",
+                "offset",
+                "returned_count",
+                "first_duration_ms",
+                "duration_ms",
+                "first_http_requests",
+                "http_requests",
+                "first_model_requests",
+                "model_requests"
+              ]
             },
             "rerank_applied": {
               "type": "boolean"
@@ -31130,6 +31325,188 @@
           "additionalProperties": true
         }
       }
+    },
+    "search-rerank-meta": {
+      "type": "object",
+      "properties": {
+        "requested_provider": {
+          "type": "string",
+          "enum": [
+            "qwen3-local",
+            "bge-local",
+            "openrouter-qwen3-8b",
+            "openrouter-cohere-4-fast",
+            "openrouter-voyage-2.5-lite"
+          ]
+        },
+        "requested_model": {
+          "type": "string"
+        },
+        "actual_provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "qwen3-local",
+            "bge-local",
+            "openrouter-qwen3-8b",
+            "openrouter-cohere-4-fast",
+            "openrouter-voyage-2.5-lite",
+            null
+          ]
+        },
+        "actual_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "serving_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "applied": {
+          "type": "boolean",
+          "description": "Complete scoring applied, including unchanged order."
+        },
+        "cache_reused": {
+          "type": "boolean"
+        },
+        "http_status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 100,
+          "maximum": 599
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "unsupported_provider",
+            "invalid_input",
+            "missing_credentials",
+            "non_loopback_endpoint",
+            "http_error",
+            "timeout",
+            "transport_error",
+            "invalid_response",
+            "model_identity_mismatch",
+            "unscoreable_input",
+            "input_identity_mismatch",
+            null
+          ]
+        },
+        "pagination_unavailable_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "invalid_input",
+            "cache_unavailable",
+            "not_found",
+            "invalid_cursor",
+            "corrupt",
+            "expired",
+            "binding_mismatch",
+            "index_changed",
+            "partial_results",
+            "search_timeout",
+            null
+          ]
+        },
+        "rrf_limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "window_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "scored_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rerank_limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "returned_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "first_duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "first_http_requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "http_requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "first_model_requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "model_requests": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "requested_provider",
+        "requested_model",
+        "actual_provider",
+        "actual_model",
+        "serving_provider",
+        "applied",
+        "cache_reused",
+        "http_status",
+        "failure_reason",
+        "pagination_unavailable_reason",
+        "rrf_limit",
+        "window_count",
+        "scored_count",
+        "rerank_limit",
+        "offset",
+        "returned_count",
+        "first_duration_ms",
+        "duration_ms",
+        "first_http_requests",
+        "http_requests",
+        "first_model_requests",
+        "model_requests"
+      ]
     },
     "sessions": {
       "type": "object",

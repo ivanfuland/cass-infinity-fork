@@ -12,7 +12,7 @@ commands:
     --json | --robot  JSON output for automation
     --fields F1,F2    Select specific fields in hits (reduces token usage)
                       Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)
-                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host
+                      Fields: score,rerank_score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host
     --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')
                             Adds *_truncated: true indicator for each truncated field
     --today           Filter to today only

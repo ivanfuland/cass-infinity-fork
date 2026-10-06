@@ -635,7 +635,7 @@
         },
         {
           "name": "cursor",
-          "description": "Cursor for pagination (base64-encoded offset/limit payload from previous result)",
+          "description": "Cursor from _meta.next_cursor. Rerank pages reuse the fixed window; repeat the original query, limits, backend and filters",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -801,7 +801,7 @@
         },
         {
           "name": "rerank",
-          "description": "Enable reranking of search results for improved relevance. Requires a reranker model to be available",
+          "description": "Enable complete-window reranking (off by default). Default: qwen3-local, N=200 candidates, K=5 results per page",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -812,7 +812,7 @@
         },
         {
           "name": "reranker",
-          "description": "Reranker model to use (requires --rerank). Use `cass models --list` to see available options",
+          "description": "Deprecated reranker selector. Use --rerank-provider instead",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -3517,6 +3517,18 @@
     {
       "name": "CASS_RERANK_LIMIT",
       "description": "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml."
+    },
+    {
+      "name": "CASS_QWEN_RERANK_URL",
+      "description": "Local Qwen rerank endpoint. Only loopback targets are accepted; proxies and redirects are disabled. Used by qwen3-local, the default when --rerank is enabled."
+    },
+    {
+      "name": "CASS_INFINITY_URL",
+      "description": "Local Infinity endpoint for bge-local reranking and Infinity embeddings. Reranking accepts only loopback targets; proxies and redirects are disabled."
+    },
+    {
+      "name": "OPENROUTER_API_KEY",
+      "description": "Credential consumed only by an explicitly selected OpenRouter rerank provider. Missing credentials keep original order with missing_credentials; no backend switch."
     },
     {
       "name": "CASS_SEARCH_LIMIT",
