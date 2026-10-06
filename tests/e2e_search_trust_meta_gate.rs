@@ -321,7 +321,7 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
         &home,
         &codex_home,
         &data_dir,
-        &["search", KEYWORD, "--json", "--robot-meta", "--limit", "10"],
+        &["search", KEYWORD, "--json", "--robot-meta", "--rrf-limit", "10"],
         "search_robot_meta",
     )?;
     let meta_hits = hits(&meta);
@@ -376,7 +376,7 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
         &home,
         &codex_home,
         &data_dir,
-        &["search", KEYWORD, "--json", "--limit", "10"],
+        &["search", KEYWORD, "--json", "--rrf-limit", "10"],
         "search_plain",
     )?;
     let plain_hits = hits(&plain);
@@ -402,7 +402,7 @@ fn search_robot_meta_carries_trust_and_default_paths_do_not() -> TestResult {
             "--robot-meta",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "10",
         ],
         "search_minimal_meta",
@@ -554,7 +554,7 @@ fn search_source_probe_marks_deleted_source_unhealthy() -> TestResult {
         &home,
         &codex_home,
         &data_dir,
-        &["search", keyword, "--json", "--robot-meta", "--limit", "5"],
+        &["search", keyword, "--json", "--robot-meta", "--rrf-limit", "5"],
         "source_probe_search",
     )?;
     let found = hits(&payload);
@@ -634,7 +634,7 @@ fn search_on_project_correlation_links_bead() -> TestResult {
 
     // Search from inside the project so the correlation index builds against it.
     let args = argv(
-        &["search", keyword, "--json", "--robot-meta", "--limit", "5"],
+        &["search", keyword, "--json", "--robot-meta", "--rrf-limit", "5"],
         &data_dir,
     );
     let cmd = cass_cmd_in(&proj, &home, &codex_home, &args);

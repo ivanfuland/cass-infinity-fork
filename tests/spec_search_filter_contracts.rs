@@ -1,15 +1,18 @@
-//! INV-cass-8 — `cass search` filter contracts: `--limit 0`, `--agent`,
-//! and `--days` honor the documented semantics agents rely on.
+//! INV-cass-8 — `cass search` filter contracts: the omitted search window
+//! (`--rrf-limit`), `--agent`, and `--days` honor the documented semantics
+//! agents rely on.
 //!
 //! Four invariants are locked here:
 //!
-//!   1. **`--limit 0` is the "no cap" sentinel.** Project memory records a
-//!      v0.6.x regression (`19d79089`) where `--limit 0` ran
-//!      `take(0)` and silently dropped all results. The README's pack
-//!      help says `0` uses the planner default; the same convention
-//!      applies to search. This test guards against re-introducing the
-//!      drop-all-results regression by asserting `--limit 0` returns at
-//!      least as many hits as `--limit 1`.
+//!   1. **An omitted window is the "no cap" sentinel.** Project memory
+//!      records a v0.6.x regression (`19d79089`) where a zero result count
+//!      ran `take(0)` and silently dropped all results. The README's pack
+//!      help says `0` uses the planner default; the same convention now
+//!      applies to search as "omit `--rrf-limit`" (an explicit
+//!      `--rrf-limit 0` is rejected, and the removed `--limit 0` is a
+//!      migration error). This test guards against re-introducing the
+//!      drop-all-results regression by asserting the omitted window returns
+//!      at least as many hits as an explicit `--rrf-limit 1`.
 //!
 //!   2. **`--agent X` projects only matching hits.** Agents pass user-
 //!      supplied agent names verbatim; a regression that quietly stops
@@ -127,21 +130,24 @@ fn search_limit_0_returns_all_available_hits_not_empty_set() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
 
-    let limit_zero = run_search(&data_dir, &["--limit", "0"])?;
-    let limit_one = run_search(&data_dir, &["--limit", "1"])?;
+    // The "no cap" case is now an omitted `--rrf-limit` (the legacy
+    // `--limit 0` is a migration error; an explicit `--rrf-limit 0` is
+    // rejected). The capped case uses the smallest explicit window.
+    let no_window = run_search(&data_dir, &[])?;
+    let limit_one = run_search(&data_dir, &["--rrf-limit", "1"])?;
 
-    let n_zero = hit_count(&limit_zero)?;
+    let n_zero = hit_count(&no_window)?;
     let n_one = hit_count(&limit_one)?;
 
-    // The regression caught by this assertion: --limit 0 used to run
-    // `.take(0)` and drop every result. The current contract treats 0 as
-    // "use the planner default" / no cap, so 0 must yield at least as many
-    // hits as the explicit `--limit 1`.
+    // The regression caught by this assertion: a zero result count used to
+    // run `.take(0)` and drop every result. The current contract treats an
+    // omitted window as "no cap", so it must yield at least as many hits as
+    // the explicit `--rrf-limit 1`.
     ensure(
         n_zero >= n_one,
         format!(
-            "--limit 0 must mean 'no cap' (return all available hits), not 'return zero'.\n\
-             got --limit 0 = {n_zero} hits; --limit 1 = {n_one} hits\n\
+            "an omitted --rrf-limit must mean 'no cap' (return all available hits), not 'return zero'.\n\
+             got omitted window = {n_zero} hits; --rrf-limit 1 = {n_one} hits\n\
              A regression here re-introduces the take(0) drop-all bug."
         ),
     )?;

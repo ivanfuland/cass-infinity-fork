@@ -229,7 +229,7 @@ fn recovery_surfaces(data_dir: &str) -> Vec<RecoverySurface> {
                     "search",
                     "cass recovery probe alpha",
                     "--robot",
-                    "--limit",
+                    "--rrf-limit",
                     "3",
                 ],
                 dd,

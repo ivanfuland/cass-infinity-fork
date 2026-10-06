@@ -152,7 +152,7 @@ fn assert_key_set_equals(
 fn fields_minimal_preset_emits_exactly_the_documented_three_keys() -> TestResult {
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
-    let (_stdout, parsed) = run_search(&data_dir, &["--fields", "minimal", "--limit", "1"])?;
+    let (_stdout, parsed) = run_search(&data_dir, &["--fields", "minimal", "--rrf-limit", "1"])?;
     let keys = first_hit_keys(&parsed)?;
     let documented: BTreeSet<String> = ["agent", "line_number", "source_path"]
         .iter()
@@ -193,7 +193,7 @@ fn fields_explicit_comma_list_emits_exactly_requested_keys() -> TestResult {
     let data_dir = copy_search_demo_fixture(tmp.path())?;
     let (_stdout, parsed) = run_search(
         &data_dir,
-        &["--fields", "source_path,score", "--limit", "1"],
+        &["--fields", "source_path,score", "--rrf-limit", "1"],
     )?;
     let keys = first_hit_keys(&parsed)?;
     let requested: BTreeSet<String> = ["score", "source_path"]

@@ -425,7 +425,7 @@ fn search_large_result_set() {
             "search",
             "searchterm",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "1000",
             "--data-dir",
         ],

@@ -540,7 +540,7 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
                     "lexical",
                     "--fields",
                     "minimal",
-                    "--limit",
+                    "--rrf-limit",
                     "5",
                     "--data-dir",
                 ])
@@ -611,7 +611,7 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
                     "lexical",
                     "--fields",
                     "minimal",
-                    "--limit",
+                    "--rrf-limit",
                     "5",
                     "--data-dir",
                 ])
@@ -756,7 +756,7 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
             "lexical",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "10",
             "--data-dir",
         ])
@@ -1550,7 +1550,7 @@ fn search_returns_pagination_info() {
         .args([
             "search",
             "pagination_test_term",
-            "--limit",
+            "--rrf-limit",
             "3",
             "--robot",
             "--data-dir",
@@ -1819,7 +1819,7 @@ fn search_help_includes_options() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("--robot"), "Help should mention --robot");
-    assert!(stdout.contains("--limit"), "Help should mention --limit");
+    assert!(stdout.contains("--rrf-limit"), "Help should mention --rrf-limit");
     assert!(stdout.contains("--agent"), "Help should mention --agent");
     assert!(
         stdout.contains("--aggregate"),
@@ -2072,7 +2072,7 @@ fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
             "lexical",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
@@ -2313,7 +2313,7 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
             "lexical",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
@@ -2349,7 +2349,7 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
             "lexical",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
@@ -2381,7 +2381,7 @@ fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_ne
             "lexical",
             "--fields",
             "minimal",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
