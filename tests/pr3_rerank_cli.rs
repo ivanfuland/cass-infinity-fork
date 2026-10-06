@@ -33,9 +33,11 @@ use coding_agent_search::search::chunking::{CHUNKING_POLICY_VERSION, chunk_norma
 use coding_agent_search::storage::api::{TxMode, Value};
 use coding_agent_search::storage::schema::{self, ChunkRow};
 use coding_agent_search::storage::sqlite::FrankenStorage;
+use coding_agent_search::storage::vector_domain;
 
 const EMBED_DIM: i64 = 1024;
 const RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
+const EMBED_MODEL: &str = "BAAI/bge-m3";
 const QUERY: &str = "p09 anchor token";
 const DEFAULT_N: usize = 200;
 const DEFAULT_K: usize = 5;
@@ -212,7 +214,18 @@ fn response_for(mode: StubMode, request: &RecordedRequest) -> Vec<u8> {
         } else {
             RERANK_MODEL
         };
-        return serde_json::json!({ "data": [ { "id": id } ] })
+        return serde_json::json!({ "data": [ { "id": id }, { "id": EMBED_MODEL } ] })
+            .to_string()
+            .into_bytes();
+    }
+    if request.path == "/embeddings" {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("embedding body");
+        assert_eq!(body["model"], EMBED_MODEL);
+        let inputs = body["input"].as_array().expect("embedding inputs");
+        let data: Vec<_> = (0..inputs.len())
+            .map(|index| serde_json::json!({ "index": index, "embedding": fixture_embedding() }))
+            .collect();
+        return serde_json::json!({ "model": EMBED_MODEL, "data": data })
             .to_string()
             .into_bytes();
     }
@@ -265,6 +278,8 @@ fn response_for(mode: StubMode, request: &RecordedRequest) -> Vec<u8> {
 #[derive(Clone, Copy)]
 struct FixtureOptions {
     rows: usize,
+    /// Install a genuine float/vector domain for synthetic hybrid searches.
+    semantic: bool,
     /// Write a scan watermark ahead of the indexed watermark, the durable
     /// half-finished-index signature `state_meta_json` reports as `partial`.
     partial: bool,
@@ -280,6 +295,7 @@ impl Default for FixtureOptions {
     fn default() -> Self {
         FixtureOptions {
             rows: DEFAULT_N + 1,
+            semantic: false,
             partial: false,
             block_cache: false,
             corrupt_chunk_at: None,
@@ -292,6 +308,12 @@ struct Fixture {
     home: PathBuf,
     data_dir: PathBuf,
     db_path: PathBuf,
+}
+
+fn fixture_embedding() -> Vec<f32> {
+    let mut vector = vec![0.0; EMBED_DIM as usize];
+    vector[0] = 1.0;
+    vector
 }
 
 fn build_fixture(options: FixtureOptions) -> Fixture {
@@ -324,6 +346,10 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
                 )
             })
             .expect("create generation");
+        if options.semantic {
+            vector_domain::create_vec0_table_for_generation(conn, generation, EMBED_DIM)
+                .expect("create synthetic vector domain");
+        }
 
         for index in 0..options.rows {
             let message_id = 1000 + index as i64;
@@ -365,7 +391,12 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
                 let canonical = canonicalize_for_embedding(&content);
                 for span in chunk_normalized(&canonical) {
                     let hash = content_hash_hex(&canonical[span.byte_start..span.byte_end]);
-                    schema::insert_chunk_row_in_tx(
+                    let embedding = if options.semantic {
+                        fixture_embedding()
+                    } else {
+                        vec![0.0_f32; EMBED_DIM as usize]
+                    };
+                    let chunk_id = schema::insert_chunk_row_in_tx(
                         tx,
                         &ChunkRow {
                             generation_id: generation,
@@ -375,12 +406,20 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
                             byte_start: span.byte_start,
                             byte_end: span.byte_end,
                             content_hash: hash,
-                            embedding: vec![0.0_f32; EMBED_DIM as usize],
+                            embedding: embedding.clone(),
                             // The schema enforces `norm > 0`.
                             norm: 1.0,
                             created_at_ms: 1,
                         },
                     )?;
+                    if options.semantic {
+                        let blob = schema::f32_vector_to_le_blob(&embedding);
+                        vector_domain::insert_vec0_rows_in_tx(
+                            tx,
+                            generation,
+                            &[(chunk_id, blob.as_slice())],
+                        )?;
+                    }
                 }
                 Ok(())
             })
@@ -1489,11 +1528,29 @@ fn group5_a_shrunk_page_advances_by_delivered_hits_without_skipping() {
 
 #[test]
 fn group6_aggregates_and_explanation_match_the_closed_scope_and_are_reused() {
-    let fixture = build_fixture(FixtureOptions::default());
+    assert_frozen_aggregate_statistics(false);
+}
+
+#[test]
+fn group6_hybrid_aggregates_freeze_prefetch_statistics_without_an_exact_total() {
+    assert_frozen_aggregate_statistics(true);
+}
+
+fn assert_frozen_aggregate_statistics(semantic: bool) {
+    // All state belongs to this fixture or its child processes. No global
+    // environment or shared counter is changed by either parallel test.
+    let fixture = build_fixture(FixtureOptions {
+        semantic,
+        ..FixtureOptions::default()
+    });
     let stub = Stub::start(StubMode::Ordered);
     let env = RunEnv::with_stub(&fixture, &stub);
 
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
+    if semantic {
+        args[3] = "hybrid".to_string();
+        args.extend_from_slice(&["--model".to_string(), "bge-m3".to_string()]);
+    }
     args.extend_from_slice(&[
         "--aggregate".to_string(),
         "agent".to_string(),
@@ -1507,10 +1564,39 @@ fn group6_aggregates_and_explanation_match_the_closed_scope_and_are_reused() {
         .cloned()
         .expect("aggregations present");
     let cursor = require_cursor(&first_payload);
+    assert_eq!(first_payload["total_matches"], DEFAULT_N + 1);
+    assert_eq!(
+        first_payload["_meta"]["cursor_manifest"]["count_precision"],
+        "lower_bound"
+    );
+    assert_eq!(posted_documents(&stub).len(), DEFAULT_N);
+    if semantic {
+        assert_eq!(first_payload["_meta"]["search_mode"], "hybrid");
+        assert_eq!(first_payload["candidates"]["incomplete"], false);
+        let window_id = coding_agent_search::search::rerank::window::cursor_window_id(&cursor)
+            .expect("validated window cursor");
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                fixture
+                    .data_dir
+                    .join("cache/rerank-windows")
+                    .join(format!("{window_id}.json")),
+            )
+            .expect("read actual persisted window"),
+        )
+        .expect("window JSON");
+        assert!(snapshot["result"]["total_count"].is_null());
+        assert_eq!(snapshot["retrieval_status"]["total_matches"], DEFAULT_N + 1);
+        assert_eq!(snapshot["retrieval_status"]["total_matches_exact"], false);
+    }
 
     // The closed state computes the same aggregates over the same prefetch
     // scope; the two must agree value for value.
     let mut closed = closed_args(DEFAULT_N);
+    if semantic {
+        closed[3] = "hybrid".to_string();
+        closed.extend_from_slice(&["--model".to_string(), "bge-m3".to_string()]);
+    }
     closed.extend_from_slice(&[
         "--aggregate".to_string(),
         "agent".to_string(),
@@ -1539,6 +1625,11 @@ fn group6_aggregates_and_explanation_match_the_closed_scope_and_are_reused() {
     let second = env.run(&as_args(&next));
     assert_success(&second, "continuation with aggregate/explain");
     let second_payload = stdout_json(&second);
+    assert_eq!(second_payload["total_matches"], first_payload["total_matches"]);
+    assert_eq!(
+        second_payload["_meta"]["cursor_manifest"]["count_precision"],
+        first_payload["_meta"]["cursor_manifest"]["count_precision"]
+    );
     assert_eq!(
         second_payload
             .get("aggregations")

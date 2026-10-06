@@ -39,11 +39,9 @@
 //! - `IndexChanged` — the database or vector generation changed since the
 //!   window was written (or changed while it was being fingerprinted).
 //!
-//! The WAL boundary follows the frozen P04 verdict
-//! (`reports/window-stamp-boundary-verdict.md`): "no WAL" and "a zero-length
-//! regular WAL" normalise to the same absent state, the SHM file is never part
-//! of the identity, and every other DB/WAL field plus the first 32 WAL header
-//! bytes are compared strictly.
+//! An absent WAL and a zero-length regular WAL normalise to the same absent
+//! state. The SHM file is never part of the identity. Every other DB/WAL field
+//! and the first 32 WAL header bytes are compared strictly.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};

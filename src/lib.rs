@@ -25736,6 +25736,14 @@ fn run_cli_search(
         // prefetch scope, before the display projection.
         let aggregate_scope: &[crate::search::query::SearchHit] =
             rerank_prefetch_hits.as_deref().unwrap_or(&window_result.hits);
+        let (frozen_total_matches, frozen_total_matches_exact) = if has_aggregation {
+            (aggregate_scope.len(), false)
+        } else {
+            (
+                window_result.total_count.unwrap_or(window_count),
+                window_result.total_count.is_some(),
+            )
+        };
         let aggregates_value = if has_aggregation {
             serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
         } else {
@@ -25758,14 +25766,17 @@ fn run_cli_search(
         // not once for `partial` and again for `--robot-meta`.
         let state_meta_value =
             state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true);
-        // Partial-index signal, independent of the caller's `--robot-meta`
-        // choice (a partial index must block a cursor regardless of the output
-        // projection the caller asked for).
-        let partial_now = state_meta_value
-            .get("index")
-            .and_then(|index| index.get("partial"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // Partial indexes and incomplete candidate scans both block a cursor,
+        // independent of the caller's `--robot-meta` projection.
+        let partial_now = window_result
+            .candidates
+            .as_ref()
+            .is_some_and(|candidates| candidates.incomplete)
+            || state_meta_value
+                .get("index")
+                .and_then(|index| index.get("partial"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
 
         // The robot-meta display facts, built from the one collection above and
         // frozen into the window so a continuation renders exactly these. This
@@ -25820,8 +25831,8 @@ fn run_cli_search(
                     "fallback_reason": mode_meta.fallback_reason.clone(),
                     "search_ms": search_ms,
                     "timed_out": timed_out_now,
-                    "total_matches": window_result.total_count.unwrap_or(window_count),
-                    "total_matches_exact": window_result.total_count.is_some(),
+                    "total_matches": frozen_total_matches,
+                    "total_matches_exact": frozen_total_matches_exact,
                     "robot_meta": robot_meta,
                     "display": frozen_display.to_json(),
                 }),
