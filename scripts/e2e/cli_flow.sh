@@ -439,7 +439,7 @@ run_step "health" env "${CASS_ENV[@]}" "${CASS_BIN_RESOLVED}" \
     --db "${DB_PATH}" health --json --data-dir "${DATA_DIR}" --robot-meta
 
 run_step "search" env "${CASS_ENV[@]}" "${CASS_BIN_RESOLVED}" \
-    --db "${DB_PATH}" search "authentication" --robot --limit 5 --data-dir "${DATA_DIR}"
+    --db "${DB_PATH}" search "authentication" --robot --rrf-limit 5 --data-dir "${DATA_DIR}"
 
 run_step "view" env "${CASS_ENV[@]}" "${CASS_BIN_RESOLVED}" \
     --db "${DB_PATH}" view --json "${CODEX_HOME}/sessions/2024/12/01/rollout-test.jsonl"

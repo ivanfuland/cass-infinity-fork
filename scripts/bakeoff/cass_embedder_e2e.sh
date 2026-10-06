@@ -126,7 +126,7 @@ run_test "CLI help shows --model flag" test_help_shows_model_flag
 test_hash_embedder_lexical() {
     # Hash embedder should be available even without semantic mode
     # Just verify the CLI parses the flag without error
-    "$CASS_BIN" search "test" --model hash --limit 1 --robot 2>&1 | head -1 | grep -qE '^\{|^No results'
+    "$CASS_BIN" search "test" --model hash --rrf-limit 1 --robot 2>&1 | head -1 | grep -qE '^\{|^No results'
     return 0  # Either result or empty is fine
 }
 run_test "Hash embedder works in lexical mode" test_hash_embedder_lexical || true
@@ -135,7 +135,7 @@ run_test "Hash embedder works in lexical mode" test_hash_embedder_lexical || tru
 test_invalid_model_error() {
     local output
     # Must use --mode semantic to trigger validation
-    output=$("$CASS_BIN" search "test" --model nonexistent --mode semantic --limit 1 --robot 2>&1) || true
+    output=$("$CASS_BIN" search "test" --model nonexistent --mode semantic --rrf-limit 1 --robot 2>&1) || true
     # Should contain error about unknown embedder
     echo "$output" | grep -qi "unknown\|unavailable\|Available" || return 1
 }

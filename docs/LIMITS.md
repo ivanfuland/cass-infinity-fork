@@ -14,7 +14,7 @@ This document describes the tested performance limits and resource constraints f
 ### Recommendations
 
 - For archives under 10,000 conversations, expect near-instant search results
-- For larger archives, use `--limit` to cap result count
+- For larger archives, use `--rrf-limit` to cap the search candidate window
 - Consider using `--fields minimal` for faster response times with large result sets
 
 ## Message Size Limits
@@ -75,7 +75,7 @@ This document describes the tested performance limits and resource constraints f
 ### Query Recommendations
 
 - Prefer prefix wildcards over suffix/substring when possible
-- Use `--limit` to cap expensive queries
+- Use `--rrf-limit` to cap the search candidate window on expensive queries
 - Combine filters with queries to reduce search space
 
 ## Index Limits
@@ -144,7 +144,7 @@ Concurrent Tests:
 
 1. Check index health: `cass health --json`
 2. Rebuild if needed: `cass index --full`
-3. Use `--limit` to cap results
+3. Use `--rrf-limit` to cap the search candidate window
 4. Try `--fields minimal` for faster response
 
 ### High Memory Usage

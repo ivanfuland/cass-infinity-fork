@@ -8,7 +8,7 @@ Updated: 2026-05-09
 - Leading flag recovery: `cass --json search "query"` is accepted as `cass search "query" --json`
 - Named input recovery: `cass search --query "query" --json` and `cass view --path session.jsonl --line 42 --json` are accepted
 - Format recovery: `cass search "query" --format json` and `cass --format json status` are accepted as `--robot-format json`
-- Result-count recovery: `cass search "query" --max-results 5`, `--top-k 5`, and `-n 5` are accepted as `--limit 5`
+- Result-count recovery: `cass pack "query" --max-results 5`, `--top-k 5`, and `-n 5` are accepted as `--limit 5`. `cass search` no longer accepts result-count flags: its legacy count spellings are a migration error — use `--rrf-limit N` (candidate window) or `--rerank-limit K` (per-page rerank count)
 - First index: `cass index --full --json`
 - Search JSON: `cass search "query" --robot`
 - Handoff pack: `cass pack "query" --robot --max-tokens 12000 --limit 40`
@@ -76,7 +76,7 @@ Updated: 2026-05-09
 
 ## Best practices for agents
 - Always pass `--robot`/`--json` and `--robot-meta` when you care about freshness or pagination.
-- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, `cass --robot-format json`, and `cass --format json` default to the same read-only triage response. If the agent puts `--json`, `--robot`, or `--format json` before a robot-capable subcommand, cass moves it to that subcommand. If the agent spells required inputs as named options, cass converts `--query` and `--path` forms to the required positional syntax for the robot-facing workflow commands. If it uses a familiar count alias such as `--max-results`, `--count`, `--top-k`, or `-n`, cass converts that to `--limit` on commands with result limits.
+- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, `cass --robot-format json`, and `cass --format json` default to the same read-only triage response. If the agent puts `--json`, `--robot`, or `--format json` before a robot-capable subcommand, cass moves it to that subcommand. If the agent spells required inputs as named options, cass converts `--query` and `--path` forms to the required positional syntax for the robot-facing workflow commands. If it uses a familiar count alias such as `--max-results`, `--count`, `--top-k`, or `-n`, cass converts that to `--limit` on commands with result limits (`cass search` is the exception: its legacy count spellings are a migration error — use `--rrf-limit`/`--rerank-limit`).
 - Use `--fields minimal` during wide scans; fetch details with `cass view` if needed.
 - Respect `_warning`, `index_freshness.stale`, and health/status `recommended_action`; run `cass index --full` for first setup or explicit recommended refresh, not as a blind repair loop.
 - Treat lexical fallback in default hybrid search as expected when semantic assets are not ready. Escalate only when lexical itself is unavailable after the recommended rebuild path.
@@ -103,7 +103,7 @@ cass triage --json
 cass status --json
 
 # 2. Broad exploration
-cass search "checkout timeout after redirect" --robot --robot-meta --fields summary --limit 20
+cass search "checkout timeout after redirect" --robot --robot-meta --fields summary --rrf-limit 20
 
 # 3. Cited handoff pack
 cass pack "checkout timeout after redirect" --robot --max-tokens 12000 --limit 40

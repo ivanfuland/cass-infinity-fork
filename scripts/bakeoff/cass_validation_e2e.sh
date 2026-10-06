@@ -309,7 +309,7 @@ for q in queries:
     cmd = base_cmd + [
         "search",
         q_text,
-        "--limit",
+        "--rrf-limit",
         str(limit),
         "--robot",
         "--fields",
@@ -324,6 +324,9 @@ for q in queries:
         cmd += ["--model", model]
     if rerank:
         cmd += ["--rerank"]
+        # Preserve the pre-migration output count: with --rerank the per-page
+        # count K defaults to 5, so set K to the requested window.
+        cmd += ["--rerank-limit", str(limit)]
     if reranker:
         cmd += ["--reranker", reranker]
     if daemon:

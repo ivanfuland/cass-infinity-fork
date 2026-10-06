@@ -9,7 +9,7 @@
 cass health --json || cass index --full
 
 # Search (minimal payload for LLMs)
-cass search "auth error" --robot --limit 5 --fields minimal
+cass search "auth error" --robot --rrf-limit 5 --fields minimal
 
 # Build a cited handoff pack after search narrows the question
 cass pack "auth error root cause" --robot --max-tokens 12000 --limit 40
@@ -26,7 +26,7 @@ cass robot-docs schemas
 **Key flags**
 - `--robot` / `--json`: machine-readable output (stdout only)
 - `--fields minimal`: lowest-token payload
-- `--limit N`: cap results
+- `--rrf-limit N`: cap the search candidate window
 - `--agent NAME`: filter (claude, codex, cursor, gemini, aider, etc.)
 - `--days N`: recent window
 
