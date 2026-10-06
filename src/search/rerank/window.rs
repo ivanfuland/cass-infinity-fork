@@ -2689,7 +2689,7 @@ mod tests {
 
         // Distinct snapshots must produce distinct ids, never one overwriting
         // another to fake the budget.
-        let ids: HashSet<&String> = outcomes.iter().filter_map(|o| o.as_ref()).collect();
+        let ids: HashSet<&String> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
         assert_eq!(ids.len(), succeeded, "each successful save has its own id");
 
         // The real on-disk set honours the policy.
