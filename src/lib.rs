@@ -3064,7 +3064,7 @@ impl AggregateField {
 }
 
 /// A single bucket in an aggregation result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregationBucket {
     /// The grouped key value
     pub key: String,
@@ -3073,7 +3073,7 @@ pub struct AggregationBucket {
 }
 
 /// Aggregation result for a single field
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldAggregation {
     /// Top buckets (limited to 10 by default)
     pub buckets: Vec<AggregationBucket>,
@@ -3082,7 +3082,8 @@ pub struct FieldAggregation {
 }
 
 /// Container for all aggregation results
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Aggregations {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<FieldAggregation>,
@@ -7221,6 +7222,40 @@ async fn execute_cli(
                         ));
                     }
 
+                    // P09: a rerank (`--rerank`) first lookup freezes the window
+                    // from offset 0, and the frozen `RequestBinding` carries no
+                    // offset field -- so a non-zero `--offset` cannot be
+                    // represented and its continuation could not be told apart
+                    // from an offset-0 window. A continuation cursor is likewise
+                    // frozen against the index state of the first lookup, so it
+                    // can never be valid together with an ingest that runs first
+                    // (`--refresh`/`--catch-up`) nor with a caller-supplied
+                    // `--offset` (the cursor already carries its own window
+                    // offset). All of these are rejected here, before
+                    // `refresh_index_inline` ingests anything and before the
+                    // database or any model is touched. The closed (no
+                    // `--rerank`) cursor path keeps its original semantics.
+                    if rerank {
+                        if offset != 0 {
+                            return Err(CliError::usage(
+                                "--rerank does not support a non-zero --offset",
+                                Some(
+                                    "A rerank window always starts at offset 0; use --cursor --offset for later pages."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                        if cursor.is_some() && refresh {
+                            return Err(CliError::usage(
+                                "--cursor cannot be combined with --refresh",
+                                Some(
+                                    "A rerank continuation page reads the frozen window; drop --refresh for it."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                    }
+
                     if refresh {
                         refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
@@ -7240,6 +7275,24 @@ async fn execute_cli(
                     // so `--display table|lines|markdown` actually wins when
                     // no structured format was asked for.
                     let effective_format = cli.robot_format.or_else(robot_format_from_env);
+
+                    // P09: preserve the values the frozen `RequestBinding`
+                    // needs but the legacy flow folds away before
+                    // `run_cli_search` -- the user's original relative-time
+                    // selection (never re-resolved against a later clock) and
+                    // the original daemon flags.
+                    let rerank_ctx = RerankRequestContext {
+                        time_selectors: crate::search::rerank::window::TimeSelectors {
+                            days,
+                            today,
+                            yesterday,
+                            week,
+                            since: since.clone(),
+                            until: until.clone(),
+                        },
+                        daemon,
+                        no_daemon,
+                    };
 
                     run_cli_search(
                         &query,
@@ -7280,6 +7333,7 @@ async fn execute_cli(
                         defaults.mode,
                         vector_search_mode,
                         semantic_opts,
+                        rerank_ctx,
                     )?;
                 }
                 Commands::Pack {
@@ -23998,6 +24052,473 @@ fn search_mode_from_canonical_str(s: &str) -> Option<crate::search::query::Searc
     }
 }
 
+/// P09: the private values the CLI dispatch must preserve for the rerank window
+/// path but the legacy flow folds away before `run_cli_search` runs. The frozen
+/// [`crate::search::rerank::window::RequestBinding`] needs the user's original
+/// relative-time selection (re-resolving it on a later page would drift with the
+/// clock) and the original `--daemon`/`--no-daemon` booleans (which
+/// [`SemanticSearchOptions`] collapses into one `use_daemon`).
+#[derive(Debug, Clone, Default)]
+struct RerankRequestContext {
+    time_selectors: crate::search::rerank::window::TimeSelectors,
+    daemon: bool,
+    no_daemon: bool,
+}
+
+/// Whether the P09 rerank window path is active for this search: `--rerank` was
+/// requested and both the per-page K and the backend were resolved. The closed
+/// path is exactly `false`.
+fn rerank_window_enabled(opts: &SemanticSearchOptions) -> bool {
+    opts.rerank && opts.rerank_limit.is_some() && opts.rerank_provider.is_some()
+}
+
+/// The wire spelling the binding freezes for a vector candidate strategy.
+fn vector_search_mode_wire(mode: crate::search::query::VectorSearchMode) -> &'static str {
+    match mode {
+        crate::search::query::VectorSearchMode::Exact => "exact",
+        crate::search::query::VectorSearchMode::Fast => "fast",
+    }
+}
+
+/// The effective endpoint origin for a rerank backend selection.
+///
+/// A local selection honours its existing service env override
+/// (`CASS_QWEN_RERANK_URL` for Qwen, `CASS_INFINITY_URL` for BGE) and otherwise
+/// binds the adapter's frozen default origin. A cloud selection always binds the
+/// fixed OpenRouter origin: there is deliberately no CLI or env endpoint
+/// override, so a test can never redirect a real credential.
+fn rerank_endpoint_origin(provider: crate::search::rerank::types::ProviderChoice) -> String {
+    use crate::search::rerank::types::ProviderChoice;
+    match provider {
+        ProviderChoice::Qwen3Local => dotenvy::var("CASS_QWEN_RERANK_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| crate::search::rerank::qwen::DEFAULT_ORIGIN.to_string()),
+        ProviderChoice::BgeLocal => dotenvy::var("CASS_INFINITY_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| crate::search::rerank::bge::DEFAULT_ORIGIN.to_string()),
+        ProviderChoice::OpenrouterQwen38b
+        | ProviderChoice::OpenrouterCohere4Fast
+        | ProviderChoice::OpenrouterVoyage25Lite => {
+            crate::search::rerank::openrouter::DEFAULT_ORIGIN.to_string()
+        }
+    }
+}
+
+/// The effective embedding-model selection the semantic loader will use: the
+/// CLI `--model` when given, else `CASS_SEMANTIC_EMBEDDER` resolved exactly as
+/// that loader resolves it (the literal `hash`, or a canonical FastEmbedder
+/// name). It reads no registry, builds no client and sends no request, so the
+/// first lookup's retrieval and both sides of the frozen binding consume one
+/// identical value. An unsupported env string yields `None`, exactly as the
+/// loader treats it -- it never invents a model.
+fn effective_embedding_model(cli_model: Option<&str>) -> Option<String> {
+    if let Some(model) = cli_model {
+        return Some(model.to_string());
+    }
+    dotenvy::var("CASS_SEMANTIC_EMBEDDER")
+        .ok()
+        .and_then(|value| {
+            if value.trim().eq_ignore_ascii_case("hash") {
+                Some("hash".to_string())
+            } else {
+                crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
+                    .map(str::to_string)
+            }
+        })
+}
+
+/// Build the one rerank backend for `provider`, binding `origin` for a local
+/// selection and reading only `OPENROUTER_API_KEY` for a cloud one.
+///
+/// Construction sends no request for a local selection; a cloud selection
+/// refuses before a transport exists when its credential is missing.
+fn build_rerank_backend(
+    provider: crate::search::rerank::types::ProviderChoice,
+    origin: &str,
+) -> Result<Box<dyn crate::search::rerank::types::RerankBackend>, crate::search::rerank::types::RerankError>
+{
+    use crate::search::rerank::types::ProviderChoice;
+    match provider {
+        ProviderChoice::Qwen3Local => Ok(Box::new(
+            crate::search::rerank::qwen::QwenBackend::new(origin)?,
+        )),
+        ProviderChoice::BgeLocal => Ok(Box::new(
+            crate::search::rerank::bge::BgeBackend::new(origin)?,
+        )),
+        ProviderChoice::OpenrouterQwen38b
+        | ProviderChoice::OpenrouterCohere4Fast
+        | ProviderChoice::OpenrouterVoyage25Lite => Ok(Box::new(
+            crate::search::rerank::openrouter::OpenRouterBackend::from_env(provider)?,
+        )),
+    }
+}
+
+/// P09: assemble the frozen [`RequestBinding`] from the current request.
+///
+/// Both the first lookup and a later page build the binding through this one
+/// function, so the two can never disagree about a field the continuation check
+/// compares. A field whose value is unavailable (a missing credential, an auto
+/// embedder) is represented by its own absent form, never back-filled.
+#[allow(clippy::too_many_arguments)]
+fn build_request_binding(
+    query: &str,
+    filters: &crate::search::query::SearchFilters,
+    time_selectors: &crate::search::rerank::window::TimeSelectors,
+    mode: &str,
+    vector_search_mode: &str,
+    embedding_model: Option<&str>,
+    rrf_limit: usize,
+    rerank_limit: usize,
+    provider: crate::search::rerank::types::ProviderChoice,
+    endpoint: &str,
+    aggregate: Option<&[String]>,
+    explain: bool,
+    timeout_ms: Option<u64>,
+    daemon: bool,
+    no_daemon: bool,
+) -> Result<crate::search::rerank::window::RequestBinding, crate::search::rerank::window::WindowError> {
+    use crate::search::rerank::window::RequestBinding;
+    let roles = filters.roles.as_ref().map(|set| {
+        let mut codes: Vec<u8> = set.iter().copied().collect();
+        codes.sort_unstable();
+        codes
+    });
+    let binding = RequestBinding {
+        query: query.to_string(),
+        agents: filters.agents.iter().cloned().collect(),
+        workspaces: filters.workspaces.iter().cloned().collect(),
+        roles,
+        source_filter: filters.source_filter.clone(),
+        session_paths: filters.session_paths.iter().cloned().collect(),
+        time: time_selectors.clone(),
+        mode: mode.to_string(),
+        vector_search_mode: vector_search_mode.to_string(),
+        embedding_model: embedding_model.map(str::to_string),
+        rrf_limit,
+        rerank_limit,
+        provider,
+        endpoint: endpoint.to_string(),
+        aggregate: aggregate.map(|values| values.to_vec()),
+        explain,
+        timeout_ms,
+        daemon,
+        no_daemon,
+    };
+    binding.normalized()
+}
+
+/// P09: the frozen `_meta.rerank` projection for a rerank-enabled search.
+///
+/// `returned_count` is filled in by the renderer, after the display budget has
+/// decided how many hits actually went out. Every other field is decided while
+/// the window is built or loaded; a value the call could not prove stays `None`
+/// and serializes as `null` rather than being guessed.
+#[derive(Debug, Clone)]
+struct RerankWindowMeta {
+    requested_provider: crate::search::rerank::types::ProviderChoice,
+    requested_model: &'static str,
+    actual_provider: Option<crate::search::rerank::types::ProviderChoice>,
+    actual_model: Option<String>,
+    serving_provider: Option<String>,
+    rrf_limit: usize,
+    window_count: usize,
+    scored_count: usize,
+    rerank_limit: usize,
+    offset: usize,
+    applied: bool,
+    cache_reused: bool,
+    first_http_requests: Option<usize>,
+    http_requests: Option<usize>,
+    first_model_requests: Option<usize>,
+    model_requests: Option<usize>,
+    first_duration_ms: u64,
+    duration_ms: u64,
+    failure_reason: Option<&'static str>,
+    http_status: Option<u16>,
+    pagination_unavailable_reason: Option<String>,
+}
+
+impl RerankWindowMeta {
+    /// The `_meta.rerank` JSON object, with the post-budget `returned_count`.
+    fn to_json(&self, returned_count: usize) -> serde_json::Value {
+        serde_json::json!({
+            "requested_provider": self.requested_provider,
+            "requested_model": self.requested_model,
+            "actual_provider": self.actual_provider,
+            "actual_model": self.actual_model,
+            "serving_provider": self.serving_provider,
+            "rrf_limit": self.rrf_limit,
+            "window_count": self.window_count,
+            "scored_count": self.scored_count,
+            "rerank_limit": self.rerank_limit,
+            "offset": self.offset,
+            "returned_count": returned_count,
+            "applied": self.applied,
+            "cache_reused": self.cache_reused,
+            "first_http_requests": self.first_http_requests,
+            "http_requests": self.http_requests,
+            "first_model_requests": self.first_model_requests,
+            "model_requests": self.model_requests,
+            "first_duration_ms": self.first_duration_ms,
+            "duration_ms": self.duration_ms,
+            "failure_reason": self.failure_reason,
+            "http_status": self.http_status,
+            "pagination_unavailable_reason": self.pagination_unavailable_reason,
+        })
+    }
+}
+
+/// P09: everything the robot renderer needs when a rerank window is in play.
+///
+/// `snapshot` is the frozen window (saved on the first lookup, loaded on a
+/// continuation); the cursor is built from it at the renderer's real
+/// `returned_count`, after the display budget, so the next page always starts
+/// exactly where this one stopped. `unavailable_reason` names why there is no
+/// cursor when the window is not continuable.
+struct WindowRenderCtx {
+    window_id: Option<String>,
+    snapshot: Option<crate::search::rerank::window::WindowSnapshot>,
+    /// The page's starting offset inside the window.
+    offset: usize,
+    /// Whether a continuation is permitted at all (both a saved id and its
+    /// snapshot are present). When false, `meta.pagination_unavailable_reason`
+    /// names why.
+    continuable: bool,
+    meta: RerankWindowMeta,
+}
+
+/// Assemble a [`WindowRenderCtx`] from the window facts a lookup produced.
+/// `None` only when no `_meta.rerank` projection exists (the closed path).
+fn build_window_render_ctx(
+    window_id: Option<String>,
+    snapshot: Option<crate::search::rerank::window::WindowSnapshot>,
+    offset: usize,
+    continuable: bool,
+    meta: Option<RerankWindowMeta>,
+) -> Option<WindowRenderCtx> {
+    let meta = meta?;
+    let continuable = continuable && window_id.is_some() && snapshot.is_some();
+    Some(WindowRenderCtx {
+        window_id,
+        snapshot,
+        offset,
+        continuable,
+        meta,
+    })
+}
+
+/// P09: the robot-meta display facts a first lookup collects from the live
+/// index state. They are frozen into the window snapshot so a continuation page
+/// renders exactly what page 1 rendered instead of re-reading state that may
+/// have moved since.
+#[derive(Debug, Clone, Default)]
+struct FrozenDisplayState {
+    state_meta_with_warning: Option<serde_json::Value>,
+    index_freshness: Option<serde_json::Value>,
+    storage_integrity_meta: Option<serde_json::Value>,
+    search_completeness: Option<serde_json::Value>,
+    warning: Option<String>,
+}
+
+/// Build the robot-meta display facts from an already-collected index state.
+///
+/// It does not collect the index state itself -- the caller passes the one
+/// `state_meta_json` value the first lookup already collected (for the partial
+/// decision), so that read is shared. It does, however, read filesystem state
+/// (whether the index exists, the ingest-quarantine summary), so a first lookup
+/// must call it *before* its final index-stamp check, or those reads would fall
+/// outside the guard. `None` means "do not render the robot-meta block" -- the
+/// caller passes `None` whenever `--robot-meta` is off.
+fn collect_display_state(
+    data_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    state_meta: Option<serde_json::Value>,
+) -> FrozenDisplayState {
+    let robot_meta = state_meta.is_some();
+    let index_freshness = state_meta.as_ref().and_then(state_index_freshness);
+    let storage_integrity_meta = state_meta.as_ref().map(|state| {
+        let not_initialized = cass_not_initialized(
+            db_path.exists(),
+            cass_lexical_index_initialized(data_dir),
+            false,
+        );
+        storage_integrity_value_from_state(db_path, state, not_initialized)
+    });
+    let partial_warning = index_freshness
+        .as_ref()
+        .and_then(|f: &serde_json::Value| f.get("partial"))
+        .and_then(|v: &serde_json::Value| v.as_bool())
+        .filter(|partial| *partial)
+        .map(|_| {
+            index_freshness
+                .as_ref()
+                .and_then(|f: &serde_json::Value| f.get("partial_reason"))
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "Lexical index is PARTIAL (a prior `cass index --full` was aborted); results may omit conversations. Re-run `cass index --full`.".to_string()
+                })
+        });
+    let warning = partial_warning.or_else(|| {
+        index_freshness
+            .as_ref()
+            .and_then(|f: &serde_json::Value| f.get("stale"))
+            .and_then(|v: &serde_json::Value| v.as_bool())
+            .filter(|stale| *stale)
+            .map(|_| {
+                let age = index_freshness
+                    .as_ref()
+                    .and_then(|f: &serde_json::Value| f.get("age_seconds"))
+                    .and_then(|v: &serde_json::Value| v.as_u64()).map_or_else(|| "an unknown age".to_string(), |s| format!("{s} seconds"));
+                let pending = index_freshness
+                    .as_ref()
+                    .and_then(|f: &serde_json::Value| f.get("pending_sessions"))
+                    .and_then(|v: &serde_json::Value| v.as_u64())
+                    .unwrap_or(0);
+                format!(
+                    "Index may be stale (age: {age}; pending sessions: {pending}). Run `cass index --full` or enable watch mode for fresh results."
+                )
+            })
+    });
+    let index_freshness_for_closure = index_freshness.clone();
+    let state_meta_with_warning = state_meta.map(|mut meta| {
+        if let Some(fresh) = index_freshness_for_closure
+            && let serde_json::Value::Object(ref mut m) = meta
+        {
+            m.insert("index_freshness".to_string(), fresh);
+        }
+        if let Some(warn) = &warning
+            && let serde_json::Value::Object(ref mut m) = meta
+        {
+            m.insert(
+                "_warning".to_string(),
+                serde_json::Value::String(warn.clone()),
+            );
+        }
+        meta
+    });
+    let search_completeness = if robot_meta {
+        let quarantine = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+        if quarantine.quarantined_conversations > 0 || quarantine.circuit_breaker_active {
+            serde_json::to_value(
+                crate::search::quarantine_status::project_search_completeness(
+                    quarantine.quarantined_conversations as u64,
+                    quarantine.circuit_breaker_active,
+                ),
+            )
+            .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    FrozenDisplayState {
+        state_meta_with_warning,
+        index_freshness,
+        storage_integrity_meta,
+        search_completeness,
+        warning,
+    }
+}
+
+impl FrozenDisplayState {
+    /// Freeze into the window snapshot's `retrieval_status.display`.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state_meta": self.state_meta_with_warning,
+            "index_freshness": self.index_freshness,
+            "storage_integrity": self.storage_integrity_meta,
+            "search_completeness": self.search_completeness,
+            "warning": self.warning,
+        })
+    }
+
+    /// Restore a frozen bundle. Every key must be present and of the right
+    /// kind: a malformed stored bundle is refused, never defaulted.
+    fn from_json(value: &serde_json::Value) -> Option<FrozenDisplayState> {
+        let object = value.as_object()?;
+        let optional = |key: &str| -> Option<Option<serde_json::Value>> {
+            match object.get(key)? {
+                serde_json::Value::Null => Some(None),
+                other if other.is_object() => Some(Some(other.clone())),
+                _ => None,
+            }
+        };
+        let warning = match object.get("warning")? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(text) => Some(text.clone()),
+            _ => return None,
+        };
+        Some(FrozenDisplayState {
+            state_meta_with_warning: optional("state_meta")?,
+            index_freshness: optional("index_freshness")?,
+            storage_integrity_meta: optional("storage_integrity")?,
+            search_completeness: optional("search_completeness")?,
+            warning,
+        })
+    }
+}
+
+/// P09: the one CLI error a refused rerank cursor produces.
+///
+/// Short code and a "re-search" hint only: the cursor's full text, the window
+/// body and any key are never echoed.
+fn cursor_window_cli_error(
+    error: crate::search::rerank::window::WindowError,
+) -> CliError {
+    CliError {
+        code: 2,
+        kind: CliErrorKind::CursorDecode.kind_str(),
+        message: format!("rerank cursor refused: {}", error.as_str()),
+        hint: Some("Re-run the search to start a new page sequence.".to_string()),
+        retryable: false,
+    }
+}
+
+/// P09: the fully-resolved inputs the shared search renderer consumes. Both the
+/// first lookup and a continuation page build one and call
+/// [`render_search_output`], so the two paths cannot drift in their JSON/human
+/// projection.
+struct SearchRenderInput {
+    query: String,
+    limit: usize,
+    cursor_page_limit: usize,
+    offset: usize,
+    display_result: crate::search::query::SearchResult,
+    effective_robot: Option<RobotFormat>,
+    robot_meta: bool,
+    elapsed_ms: u64,
+    fields: Option<Vec<String>>,
+    max_content_length: Option<usize>,
+    max_tokens: Option<usize>,
+    request_id: Option<String>,
+    cursor: Option<String>,
+    has_more_results: bool,
+    total_matches: usize,
+    total_matches_exact: bool,
+    aggregations: Aggregations,
+    explanation: Option<crate::search::query::QueryExplanation>,
+    timed_out: bool,
+    timeout_ms: Option<u64>,
+    mode_meta: SearchModeMeta,
+    search_ms: u64,
+    rerank_ms: u64,
+    rerank_applied: bool,
+    rerank_requested: bool,
+    window: Option<WindowRenderCtx>,
+    /// P09: the first lookup's frozen robot-meta display facts. `Some` only on a
+    /// continuation page, which must not re-read the live index state.
+    display_state: Option<FrozenDisplayState>,
+    data_dir: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    display_format: Option<DisplayFormat>,
+    wrap: WrapConfig,
+    highlight: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -24031,6 +24552,7 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     vector_search_mode: Option<crate::search::query::VectorSearchMode>,
     semantic_opts: SemanticSearchOptions,
+    rerank_ctx: RerankRequestContext,
 ) -> CliResult<()> {
     #[cfg(feature = "infinity")]
     use crate::search::model_manager::load_infinity_semantic_context;
@@ -24096,33 +24618,74 @@ fn run_cli_search(
         filters.session_paths = session_paths;
     }
 
-    // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
+    // Apply cursor overrides. Two cursor families exist and are never mixed:
+    // the closed-state legacy cursor (base64 `{offset,limit}`) and the P09
+    // rerank window cursor (base64 `{version:2,window_id,offset}`). `--rerank`
+    // decides which family is accepted, so neither can be silently mis-read as
+    // the other.
+    let rerank_on = rerank_window_enabled(&semantic_opts);
+    // One effective embedding selection, shared by the retrieval and by both
+    // sides of the frozen binding.
+    let effective_model = effective_embedding_model(semantic_opts.model.as_deref());
     let mut limit_val = *limit;
     let mut offset_val = *offset;
+    let mut window_cursor: Option<String> = None;
     if let Some(ref cursor_str) = cursor {
-        let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
-            code: 2,
-            kind: CliErrorKind::CursorDecode.kind_str(),
-            message: format!("invalid cursor: {e}"),
-            hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
-            retryable: false,
-        })?;
-        let cursor_json: serde_json::Value =
-            serde_json::from_slice(&decoded).map_err(|e| CliError {
+        if rerank_on {
+            // Validate the cursor shape now, before the database or any model
+            // is touched; the window itself is loaded only after the dry-run
+            // check below, so `--dry-run --cursor` never opens a window.
+            if crate::search::rerank::window::cursor_window_id(cursor_str).is_err() {
+                return Err(CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorDecode.kind_str(),
+                    message: "invalid rerank cursor".to_string(),
+                    hint: Some(
+                        "Pass the `_meta.next_cursor` from a previous --rerank search, or re-run without --cursor."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
+            window_cursor = Some(cursor_str.clone());
+        } else {
+            let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
                 code: 2,
-                kind: CliErrorKind::CursorParse.kind_str(),
-                message: format!("invalid cursor payload: {e}"),
-                hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
+                kind: CliErrorKind::CursorDecode.kind_str(),
+                message: format!("invalid cursor: {e}"),
+                hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
                 retryable: false,
             })?;
-        if let Some(o) = cursor_json
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-        {
-            offset_val = o as usize;
-        }
-        if let Some(l) = cursor_json.get("limit").and_then(serde_json::Value::as_u64) {
-            limit_val = l as usize;
+            let cursor_json: serde_json::Value =
+                serde_json::from_slice(&decoded).map_err(|e| CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorParse.kind_str(),
+                    message: format!("invalid cursor payload: {e}"),
+                    hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
+                    retryable: false,
+                })?;
+            if cursor_json.get("version").is_some() {
+                return Err(CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorDecode.kind_str(),
+                    message: "cursor belongs to a rerank window, but this search is not --rerank"
+                        .to_string(),
+                    hint: Some(
+                        "Re-run the continuation with the same --rerank flags that produced the cursor."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
+            if let Some(o) = cursor_json
+                .get("offset")
+                .and_then(serde_json::Value::as_u64)
+            {
+                offset_val = o as usize;
+            }
+            if let Some(l) = cursor_json.get("limit").and_then(serde_json::Value::as_u64) {
+                limit_val = l as usize;
+            }
         }
     }
 
@@ -24145,6 +24708,14 @@ fn run_cli_search(
         effective_robot,
         display_format,
     );
+    // P09: a rerank first lookup fetches the full, un-projected hit body so
+    // both the frozen window and the rerank input are complete regardless of
+    // the display projection. The closed path keeps its display-driven mask.
+    let search_field_mask = if rerank_on {
+        crate::search::query::FieldMask::FULL
+    } else {
+        field_mask
+    };
 
     // Parse aggregate fields if provided
     let agg_fields = aggregate
@@ -24177,6 +24748,222 @@ fn run_cli_search(
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
         );
         return Ok(());
+    }
+
+    // ------------------------------------------------------------------
+    // P09 rerank window: continuation page.
+    // ------------------------------------------------------------------
+    //
+    // A continuation runs before self-heal, before `SearchClient` is opened and
+    // before any semantic setup: it only rebuilds the request binding from the
+    // current parameters, loads the frozen window, and slices the page. It never
+    // constructs a backend, reads a cloud key, re-searches or re-resolves the
+    // relative time range.
+    if let Some(cursor_str) = window_cursor.as_deref() {
+        let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
+        let provider = semantic_opts
+            .rerank_provider
+            .expect("rerank_window_enabled guarantees a provider");
+        let endpoint = rerank_endpoint_origin(provider);
+        let binding = build_request_binding(
+            query,
+            &filters,
+            &rerank_ctx.time_selectors,
+            search_mode_canonical_str(mode.unwrap_or_default()),
+            vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
+            effective_model.as_deref(),
+            limit_val,
+            rerank_k,
+            provider,
+            &endpoint,
+            aggregate.as_deref(),
+            explain,
+            timeout_ms,
+            rerank_ctx.daemon,
+            rerank_ctx.no_daemon,
+        )
+        .map_err(cursor_window_cli_error)?;
+
+        let store = crate::search::rerank::window::WindowStore::new(
+            &data_dir,
+            crate::search::rerank::window::WindowPolicy::default(),
+        )
+        .map_err(cursor_window_cli_error)?;
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let (snapshot, page_offset) = store
+            .load(cursor_str, &binding, &db_path, now_ms)
+            .map_err(cursor_window_cli_error)?;
+        let resolved_window_id = crate::search::rerank::window::cursor_window_id(cursor_str)
+            .map_err(cursor_window_cli_error)?;
+        let page_hits = crate::search::rerank::window::page_hits(&snapshot, page_offset)
+            .map_err(cursor_window_cli_error)?;
+
+        // Restore the frozen first-lookup facts; never recompute them against
+        // the current data (that would let a later page fabricate aggregates
+        // that do not match the frozen result).
+        let status = &snapshot.retrieval_status;
+        // Every restored fact is required and type-checked. A missing key, a
+        // wrong type or an unknown enum is a refusal, never a default: a
+        // snapshot this build cannot render must not be dressed up as a valid
+        // page.
+        let bad_meta = || CliError {
+            code: 2,
+            kind: CliErrorKind::CursorDecode.kind_str(),
+            message: "rerank window metadata is missing or malformed".to_string(),
+            hint: Some("Re-run the search to start a new page sequence.".to_string()),
+            retryable: false,
+        };
+        let requested_mode = status
+            .get("requested_search_mode")
+            .and_then(serde_json::Value::as_str)
+            .and_then(search_mode_from_canonical_str)
+            .ok_or_else(bad_meta)?;
+        let realized_mode = status
+            .get("search_mode")
+            .and_then(serde_json::Value::as_str)
+            .and_then(search_mode_from_canonical_str)
+            .ok_or_else(bad_meta)?;
+        let mode_defaulted = status
+            .get("mode_defaulted")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(bad_meta)?;
+        let mut mode_meta = SearchModeMeta::new(requested_mode, mode_defaulted);
+        mode_meta.realized = realized_mode;
+        match status.get("fallback_tier") {
+            Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(text)) if text == "lexical" => {
+                mode_meta.fallback_tier = Some("lexical");
+            }
+            // A stored fallback tier that is not part of the frozen vocabulary
+            // means the snapshot is not one this build can render.
+            _ => return Err(bad_meta()),
+        }
+        mode_meta.fallback_reason = match status.get("fallback_reason") {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            _ => return Err(bad_meta()),
+        };
+
+        let mut display_result = snapshot.result.clone();
+        let window_len = display_result.hits.len();
+        let delivered = page_hits.len();
+        display_result.hits = page_hits;
+        let has_more = page_offset.saturating_add(delivered) < window_len;
+        let total_matches = status
+            .get("total_matches")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .ok_or_else(bad_meta)?;
+        let total_matches_exact = status
+            .get("total_matches_exact")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(bad_meta)?;
+        let timed_out = status
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(bad_meta)?;
+        let frozen_display = status
+            .get("display")
+            .and_then(FrozenDisplayState::from_json)
+            .ok_or_else(bad_meta)?;
+
+        let aggregations = match snapshot.aggregates.clone() {
+            Some(value) => serde_json::from_value::<Aggregations>(value).map_err(|_| CliError {
+                code: 2,
+                kind: CliErrorKind::CursorDecode.kind_str(),
+                message: "rerank window aggregates could not be restored".to_string(),
+                hint: Some("Re-run the search to start a new page sequence.".to_string()),
+                retryable: false,
+            })?,
+            None => Aggregations::default(),
+        };
+        let explanation = match snapshot.explanation.clone() {
+            Some(value) => {
+                Some(
+                    serde_json::from_value::<QueryExplanation>(value).map_err(|_| CliError {
+                        code: 2,
+                        kind: CliErrorKind::CursorDecode.kind_str(),
+                        message: "rerank window explanation could not be restored".to_string(),
+                        hint: Some(
+                            "Re-run the search to start a new page sequence.".to_string(),
+                        ),
+                        retryable: false,
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        let meta = RerankWindowMeta {
+            requested_provider: snapshot.request_binding.provider,
+            requested_model: snapshot.request_binding.provider.request_model(),
+            actual_provider: snapshot.rerank.identity.actual_provider,
+            actual_model: snapshot.rerank.identity.actual_model.clone(),
+            serving_provider: snapshot.rerank.identity.serving_provider.clone(),
+            rrf_limit: snapshot.request_binding.rrf_limit,
+            window_count: window_len,
+            scored_count: snapshot.rerank.scored_count,
+            rerank_limit: snapshot.request_binding.rerank_limit,
+            offset: page_offset,
+            applied: snapshot.rerank.applied,
+            // The window was loaded successfully, so its ordering is reused.
+            cache_reused: true,
+            first_http_requests: snapshot.rerank.http_requests,
+            http_requests: Some(0),
+            first_model_requests: snapshot.rerank.model_requests,
+            model_requests: Some(0),
+            first_duration_ms: snapshot.rerank.duration_ms,
+            duration_ms: 0,
+            failure_reason: snapshot.rerank.failure_reason.map(|reason| reason.as_str()),
+            http_status: snapshot.rerank.http_status,
+            pagination_unavailable_reason: None,
+        };
+        let window_render = Some(WindowRenderCtx {
+            window_id: Some(resolved_window_id),
+            snapshot: Some(snapshot),
+            offset: page_offset,
+            continuable: true,
+            meta,
+        });
+
+        return render_search_output(SearchRenderInput {
+            query: query.to_string(),
+            limit: limit_val,
+            cursor_page_limit: rerank_k,
+            offset: page_offset,
+            display_result,
+            effective_robot,
+            robot_meta,
+            elapsed_ms: start_time.elapsed().as_millis() as u64,
+            fields,
+            max_content_length,
+            max_tokens,
+            request_id,
+            cursor,
+            has_more_results: has_more,
+            total_matches,
+            total_matches_exact,
+            aggregations,
+            explanation,
+            timed_out,
+            timeout_ms,
+            mode_meta,
+            // A later page runs no retrieval and no model call of its own.
+            search_ms: 0,
+            rerank_ms: 0,
+            rerank_applied: window_render
+                .as_ref()
+                .map(|ctx| ctx.meta.applied)
+                .unwrap_or(false),
+            rerank_requested: true,
+            window: window_render,
+            display_state: Some(frozen_display),
+            data_dir,
+            db_path,
+            display_format,
+            wrap,
+            highlight,
+        });
     }
 
     let search_self_heal = ensure_lexical_assets_for_search(
@@ -24438,6 +25225,17 @@ fn run_cli_search(
         }
     }
 
+    // P09: read the index fingerprint once the first-lookup setup (self-heal
+    // and semantic context) is complete and before the candidate fetch, then
+    // re-check it after assembly and scoring. A window is only continuable when
+    // the two reads agree; reading before this point would mistake an allowed
+    // first-lookup repair for a concurrent change.
+    let rerank_stamp_before = if rerank_on {
+        crate::search::rerank::window::capture_index_stamp(&db_path).ok()
+    } else {
+        None
+    };
+
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
 
@@ -24445,7 +25243,12 @@ fn run_cli_search(
     // For non-aggregation mode, overfetch by one so cursor pagination can reliably
     // signal whether additional pages exist without a second query.
     let token_budget_page_limit = token_budget_search_limit(max_tokens);
-    let cursor_page_limit = if has_aggregation {
+    // P09: a rerank page is always K wide (`--rerank-limit`), independent of
+    // the window size N the top-level `--rrf-limit` expresses. The closed path
+    // keeps its original page width.
+    let cursor_page_limit = if rerank_on {
+        semantic_opts.rerank_limit.unwrap_or(0)
+    } else if has_aggregation {
         limit_val
     } else if limit_val == 0 {
         token_budget_page_limit.unwrap_or(0)
@@ -24512,7 +25315,7 @@ fn run_cli_search(
                 search_limit,
                 search_offset,
                 search_sparse_threshold,
-                field_mask,
+                search_field_mask,
             )
             .map_err(|e| {
                 let chain = format!("{e:#}");
@@ -24558,7 +25361,7 @@ fn run_cli_search(
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
                 let (hits, candidate_meta) = client
-                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, field_mask)
+                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
                         if err_str.contains("unavailable")
@@ -24605,7 +25408,7 @@ fn run_cli_search(
             search_limit,
             search_offset,
             search_sparse_threshold,
-            field_mask,
+            search_field_mask,
         ) {
             Ok(result) => {
                 sync_search_mode_meta_after_hybrid(&mut mode_meta, &result);
@@ -24624,7 +25427,7 @@ fn run_cli_search(
                             search_limit,
                             search_offset,
                             search_sparse_threshold,
-                            field_mask,
+                            search_field_mask,
                         )
                         .map_err(|fallback_err| {
                             let chain = format!("{fallback_err:#}");
@@ -24672,168 +25475,395 @@ fn run_cli_search(
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 
-    // Apply reranking if enabled (bd-2t2d)
+    // ------------------------------------------------------------------
+    // P09 rerank window: first lookup.
+    // ------------------------------------------------------------------
+    //
+    // A rerank search freezes the fetched candidate pool into a window of `N`
+    // hits, reranks exactly once, and stores the ordering so a later page reuses
+    // it instead of re-running retrieval or the model. The closed path
+    // (`!rerank_on`) is untouched: it keeps the legacy offset/limit cursor and
+    // the display-driven fetch.
+    //
+    // This replaces the old in-tree cross-encoder path (`FastEmbedReranker` /
+    // `DaemonFallbackReranker`): that path overwrote `hit.score`, had no window,
+    // and silently no-op'd when no reranker was available. P09 never overwrites
+    // the original score -- it writes a separate `rerank_score` and sorts by it
+    // -- and it never falls back across models or providers.
     let rerank_start = Instant::now();
-    // R1-W3-B7: tracks whether reranking was *actually* applied to `result`
-    // below, independent of whether it was requested. `--rerank` requested
-    // with no reranker available (the local cross-encoder is a permanent
-    // stub in this build, cass#256; daemon rerank unconfigured or
-    // unreachable) used to be an indistinguishable, deterministic no-op --
-    // `Ok(())`, unmodified results, and (outside `!use_daemon`-gated
-    // `tracing::debug!`) not even a log line. Threaded into
-    // `output_robot_results` below as `rerank_applied` so a caller that
-    // never inspects logs still gets an honest answer.
     let mut rerank_applied = false;
-    let result = if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::fastembed_reranker::FastEmbedReranker;
-        use crate::search::reranker::{Reranker, rerank_texts};
+    // Window facts the renderer needs. `None` on the closed path.
+    let mut window_snapshot: Option<crate::search::rerank::window::WindowSnapshot> = None;
+    let mut window_id: Option<String> = None;
+    let mut window_continuable = false;
+    let mut window_unavailable: Option<&'static str> = None;
+    let mut window_meta: Option<RerankWindowMeta> = None;
+    let mut window_display_state: Option<FrozenDisplayState> = None;
+    // The over-fetch beyond the window (the N+1 sentinel and any aggregate
+    // pre-fetch), kept so aggregate/explain keep their closed-state scope.
+    let mut rerank_prefetch_hits: Option<Vec<crate::search::query::SearchHit>> = None;
 
-        let model_dir = FastEmbedReranker::default_model_dir(&data_dir);
-        let local_reranker: Option<Arc<dyn Reranker>> =
-            match FastEmbedReranker::load_from_dir(&model_dir) {
-                Ok(reranker) => Some(Arc::new(reranker)),
-                Err(e) => {
-                    if !semantic_opts.use_daemon {
-                        tracing::debug!(error = %e, "Reranker not available, skipping rerank");
-                    }
-                    None
-                }
-            };
+    let result = if !rerank_on {
+        result
+    } else {
+        let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
+        let provider = semantic_opts
+            .rerank_provider
+            .expect("rerank_window_enabled guarantees a provider");
+        let endpoint = rerank_endpoint_origin(provider);
+        let binding = build_request_binding(
+            query,
+            &filters,
+            &rerank_ctx.time_selectors,
+            search_mode_canonical_str(mode.unwrap_or_default()),
+            vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
+            effective_model.as_deref(),
+            limit_val,
+            rerank_k,
+            provider,
+            &endpoint,
+            aggregate.as_deref(),
+            explain,
+            timeout_ms,
+            rerank_ctx.daemon,
+            rerank_ctx.no_daemon,
+        )
+        .ok();
+        // A request that cannot even be frozen (a bad local endpoint, a limit
+        // the binding rejects) must not drop the page: it degrades to
+        // "no rerank, no cursor" exactly like any other optional-stage failure.
+        if binding.is_none() {
+            window_unavailable =
+                Some(crate::search::rerank::window::WindowError::InvalidInput.as_str());
+        }
 
-        let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
+        let crate::search::query::SearchResult {
+            hits: mut fetched_hits,
+            wildcard_fallback,
+            cache_stats,
+            suggestions,
+            total_count,
+            candidates,
+            semantic_degraded,
+        } = result;
 
-            #[cfg(unix)]
-            {
-                // M4-pre spike: route rerank through Infinity HTTP (bge-reranker-v2-m3)
-                // when built with `--features infinity`. Baseline's local ONNX
-                // reranker is unavailable, so this is what revives reranking.
-                #[cfg(feature = "infinity")]
-                let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
-                    match crate::search::infinity::InfinityDaemonClient::new() {
-                        Ok(c) => Arc::new(c),
-                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "infinity-unavailable",
-                        )),
-                    };
-                #[cfg(not(feature = "infinity"))]
-                let daemon = crate::daemon::client::try_connect()
-                    .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                    .unwrap_or_else(|| {
-                        Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "daemon-unconfigured",
-                        ))
-                    });
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
-            }
-            #[cfg(not(unix))]
-            {
-                let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                    "daemon-unconfigured",
-                ));
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
-            }
-        } else {
-            local_reranker
+        // The window is the first `N` hits; the sentinel/aggregate over-fetch
+        // never reaches the model. The *whole* fetched pool (window + overflow)
+        // is what the aggregate/explain scope must be measured over, to match
+        // the closed-state path's scope exactly.
+        let window_len = limit_val.min(fetched_hits.len());
+        let overflow = fetched_hits.split_off(window_len);
+        let window_count = fetched_hits.len();
+        let mut scope_pool = fetched_hits.clone();
+        scope_pool.extend(overflow);
+        rerank_prefetch_hits = Some(scope_pool);
+
+        let mut window_result = crate::search::query::SearchResult {
+            hits: fetched_hits,
+            wildcard_fallback,
+            cache_stats,
+            suggestions,
+            total_count,
+            candidates,
+            semantic_degraded,
         };
 
-        if let Some(reranker) = reranker {
-            // Extract content from hits for reranking (use snippet if content is empty)
-            let docs: Vec<String> = result
-                .hits
-                .iter()
-                .map(|hit| {
-                    if hit.content.is_empty() {
-                        hit.snippet.clone()
-                    } else {
-                        hit.content.clone()
-                    }
-                })
-                .collect();
+        let mut identity = crate::search::rerank::types::CallIdentity {
+            actual_provider: None,
+            actual_model: None,
+            serving_provider: None,
+        };
+        let mut scored_count = 0usize;
+        let mut http_requests: Option<usize> = None;
+        let mut model_requests: Option<usize> = None;
+        let mut duration_ms = 0u64;
+        let mut failure_reason: Option<crate::search::rerank::types::RerankFailureReason> = None;
+        let mut http_status: Option<u16> = None;
 
-            // Skip reranking if any document is empty (reranker rejects empty docs)
-            let has_empty_doc = docs.iter().any(|d| d.is_empty());
-            if has_empty_doc {
-                tracing::debug!("Skipping rerank: one or more hits have empty content and snippet");
-                result
-            } else {
-                let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-
-                match rerank_texts(&*reranker, query, &doc_refs) {
-                    Ok(scores) => {
-                        // Update scores and re-sort hits
-                        let mut scored_hits: Vec<_> = result
-                            .hits
-                            .into_iter()
-                            .zip(scores)
-                            .map(|(mut hit, score)| {
-                                hit.score = score;
-                                hit
-                            })
-                            .collect();
-                        scored_hits.sort_by(|a, b| {
-                            b.score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        tracing::debug!(
-                            reranker_id = reranker.id(),
-                            hits_reranked = scored_hits.len(),
-                            "Reranking complete"
-                        );
-                        rerank_applied = true;
-
-                        crate::search::query::SearchResult {
-                            hits: scored_hits,
-                            wildcard_fallback: result.wildcard_fallback,
-                            cache_stats: result.cache_stats,
-                            suggestions: result.suggestions,
-                            total_count: result.total_count,
-                            candidates: result.candidates,
-                            semantic_degraded: result.semantic_degraded,
+        if window_result.hits.is_empty() {
+            // Empty window: no model call at all.
+            http_requests = Some(0);
+            model_requests = Some(0);
+        } else if binding.is_none() {
+            // The request could not be frozen, so nothing may be sent to the
+            // model; the page is delivered unranked and without a cursor.
+            http_requests = Some(0);
+            model_requests = Some(0);
+        } else {
+            match crate::search::rerank::context::build_documents(
+                &db_path,
+                query,
+                &window_result.hits,
+            ) {
+                Ok(documents) if !documents.is_empty() => {
+                    match build_rerank_backend(provider, &endpoint) {
+                        Ok(backend) => {
+                            let call_started = Instant::now();
+                            match backend.rerank(query, &documents) {
+                                Ok(response) => {
+                                    duration_ms = response.duration_ms;
+                                    // The call layer re-proves the completeness
+                                    // the adapter promises: the score set must be
+                                    // exactly the window length and a valid
+                                    // permutation of it. Only then is the window
+                                    // replaced -- in one step, so a short,
+                                    // duplicated or out-of-range set can never
+                                    // drop a candidate or half-apply scores.
+                                    let expected_len = window_result.hits.len();
+                                    let order = (response.scores.len() == expected_len)
+                                        .then(|| {
+                                            crate::search::rerank::types::stable_rank_order(
+                                                &response.scores,
+                                            )
+                                            .ok()
+                                        })
+                                        .flatten()
+                                        .filter(|order| {
+                                            let mut seen = vec![false; expected_len];
+                                            order.len() == expected_len
+                                                && order.iter().all(|&index| {
+                                                    index < expected_len
+                                                        && !std::mem::replace(
+                                                            &mut seen[index],
+                                                            true,
+                                                        )
+                                                })
+                                        });
+                                    match order {
+                                        Some(order) => {
+                                            let hits =
+                                                std::mem::take(&mut window_result.hits);
+                                            let mut slots: Vec<
+                                                Option<crate::search::query::SearchHit>,
+                                            > = hits.into_iter().map(Some).collect();
+                                            let mut reordered =
+                                                Vec::with_capacity(slots.len());
+                                            for &index in &order {
+                                                if let Some(mut hit) = slots[index].take() {
+                                                    hit.rerank_score =
+                                                        Some(response.scores[index]);
+                                                    reordered.push(hit);
+                                                }
+                                            }
+                                            debug_assert_eq!(reordered.len(), expected_len);
+                                            window_result.hits = reordered;
+                                            rerank_applied = true;
+                                            scored_count = expected_len;
+                                            http_requests = Some(response.http_requests);
+                                            model_requests = Some(1);
+                                            identity = response.identity;
+                                        }
+                                        None => {
+                                            // Not a complete, valid permutation:
+                                            // every original hit and score is
+                                            // kept exactly as it was.
+                                            failure_reason = Some(
+                                                crate::search::rerank::types::RerankFailureReason::InvalidResponse,
+                                            );
+                                            duration_ms =
+                                                call_started.elapsed().as_millis() as u64;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    // The call really ran and really waited, so
+                                    // its duration is the measured one -- not 0,
+                                    // which is reserved for "no call". Its
+                                    // request count is not provable, so it stays
+                                    // null rather than guessed 0.
+                                    duration_ms = call_started.elapsed().as_millis() as u64;
+                                    failure_reason = Some(error.reason);
+                                    http_status = error.http_status;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            // Construction sent no request, so both counts are a
+                            // provable 0 and no time was spent calling.
+                            http_requests = Some(0);
+                            model_requests = Some(0);
+                            failure_reason = Some(error.reason);
+                            http_status = error.http_status;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Reranking failed, returning original results"
-                        );
-                        result
-                    }
+                }
+                Ok(_) => {
+                    // Empty document list (a candidate could not be proven):
+                    // the whole window is returned unranked, no request made.
+                    http_requests = Some(0);
+                    model_requests = Some(0);
+                    failure_reason = Some(
+                        crate::search::rerank::types::RerankFailureReason::UnscoreableInput,
+                    );
+                }
+                Err(error) => {
+                    // Document assembly failed before any request.
+                    http_requests = Some(0);
+                    model_requests = Some(0);
+                    failure_reason = Some(error.reason);
+                    http_status = error.http_status;
                 }
             }
-        } else {
-            // R1-W3-B7: `--rerank` was requested but no reranker at all
-            // could be constructed (permanent local stub + daemon
-            // unconfigured/unreachable) -- previously a fully silent,
-            // deterministic no-op outside a `!use_daemon`-gated
-            // `tracing::debug!`. Warn unconditionally at a level visible
-            // under default log settings; `rerank_applied=false` in the
-            // output (below) carries the same fact to a caller that never
-            // inspects logs.
-            tracing::warn!(
-                "--rerank requested but no reranker is available (local cross-encoder is a \
-                 permanent stub in this build, cass#256; daemon rerank is unconfigured or \
-                 unreachable); returning unreranked results"
-            );
-            result
         }
-    } else {
-        result
+
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let policy = crate::search::rerank::window::WindowPolicy::default();
+        let expires_at_ms = now_ms.saturating_add(policy.ttl_ms as i64);
+
+        // Aggregate/explain facts for the window, computed over the *original*
+        // prefetch scope, before the display projection.
+        let aggregate_scope: &[crate::search::query::SearchHit] =
+            rerank_prefetch_hits.as_deref().unwrap_or(&window_result.hits);
+        let aggregates_value = if has_aggregation {
+            serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
+        } else {
+            None
+        };
+        let explanation_value = if explain {
+            serde_json::to_value(
+                QueryExplanation::analyze(query, &filters)
+                    .with_wildcard_fallback(window_result.wildcard_fallback),
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let timed_out_now = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
+        // The first lookup's single index-state collection. The partial-index
+        // decision reads it directly, and the frozen display facts are built
+        // from this same value, so a first lookup reads the index state once --
+        // not once for `partial` and again for `--robot-meta`.
+        let state_meta_value =
+            state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true);
+        // Partial-index signal, independent of the caller's `--robot-meta`
+        // choice (a partial index must block a cursor regardless of the output
+        // projection the caller asked for).
+        let partial_now = state_meta_value
+            .get("index")
+            .and_then(|index| index.get("partial"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        // The robot-meta display facts, built from the one collection above and
+        // frozen into the window so a continuation renders exactly these. This
+        // still reads filesystem state (index existence, quarantine summary), so
+        // it runs *before* the final index check below to stay covered by it.
+        let frozen_display = collect_display_state(
+            &data_dir,
+            &db_path,
+            if robot_meta { Some(state_meta_value) } else { None },
+        );
+
+        // The after-stamp is the last read of this lookup: every assembly,
+        // scoring and state collection above has finished by now, so a change
+        // made by any of them is caught rather than ordered behind the check.
+        let index_stamp_ok = rerank_stamp_before.as_ref().is_some_and(|before| {
+            crate::search::rerank::window::capture_index_stamp(&db_path)
+                .map(|after| &after == before)
+                .unwrap_or(false)
+        });
+        if window_unavailable.is_none() {
+            if rerank_stamp_before.is_none() || !index_stamp_ok {
+                window_unavailable = Some("index_changed");
+            } else if timed_out_now {
+                window_unavailable = Some("search_timeout");
+            } else if partial_now {
+                window_unavailable = Some("partial_results");
+            }
+        }
+
+        // A window is only continuable when the first lookup is a clean, frozen
+        // success and the snapshot saves. Otherwise the current page is still
+        // delivered but carries no cursor and a short reason.
+        if window_unavailable.is_none() {
+            let snapshot = crate::search::rerank::window::WindowSnapshot {
+                created_at_ms: now_ms,
+                expires_at_ms,
+                request_binding: binding
+                    .clone()
+                    .expect("a continuable window always has a binding"),
+                index_stamp: rerank_stamp_before
+                    .clone()
+                    .expect("checked continuable"),
+                resolved_filters: filters.clone(),
+                result: window_result.clone(),
+                aggregates: aggregates_value.clone(),
+                explanation: explanation_value.clone(),
+                retrieval_status: serde_json::json!({
+                    "search_mode": search_mode_canonical_str(mode_meta.realized),
+                    "requested_search_mode": search_mode_canonical_str(mode_meta.requested),
+                    "mode_defaulted": mode_meta.defaulted,
+                    "fallback_tier": mode_meta.fallback_tier,
+                    "fallback_reason": mode_meta.fallback_reason.clone(),
+                    "search_ms": search_ms,
+                    "timed_out": timed_out_now,
+                    "total_matches": window_result.total_count.unwrap_or(window_count),
+                    "total_matches_exact": window_result.total_count.is_some(),
+                    "robot_meta": robot_meta,
+                    "display": frozen_display.to_json(),
+                }),
+                rerank: crate::search::rerank::window::WindowRerankMeta {
+                    requested_provider: provider,
+                    requested_model: provider.request_model().to_string(),
+                    identity: identity.clone(),
+                    applied: rerank_applied,
+                    failure_reason,
+                    http_status,
+                    scored_count,
+                    http_requests,
+                    model_requests,
+                    duration_ms,
+                },
+            };
+            match crate::search::rerank::window::WindowStore::new(&data_dir, policy) {
+                Ok(store) => match store.save(&snapshot, now_ms) {
+                    Ok(id) => {
+                        window_id = Some(id);
+                        window_snapshot = Some(snapshot);
+                        window_continuable = true;
+                    }
+                    Err(_) => {
+                        window_unavailable =
+                            Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
+                    }
+                },
+                Err(_) => {
+                    window_unavailable =
+                        Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
+                }
+            }
+        }
+
+        window_display_state = Some(frozen_display);
+        window_meta = Some(RerankWindowMeta {
+            requested_provider: provider,
+            requested_model: provider.request_model(),
+            actual_provider: identity.actual_provider,
+            actual_model: identity.actual_model.clone(),
+            serving_provider: identity.serving_provider.clone(),
+            rrf_limit: limit_val,
+            window_count,
+            scored_count,
+            rerank_limit: rerank_k,
+            offset: 0,
+            applied: rerank_applied,
+            cache_reused: false,
+            first_http_requests: http_requests,
+            http_requests,
+            first_model_requests: model_requests,
+            model_requests,
+            first_duration_ms: duration_ms,
+            duration_ms,
+            failure_reason: failure_reason.map(|reason| reason.as_str()),
+            http_status,
+            pagination_unavailable_reason: window_unavailable.map(str::to_string),
+        });
+
+        window_result
     };
     // Track reranking time (0 if not applied) (T7.4)
-    let rerank_ms = if semantic_opts.rerank {
+    let rerank_ms = if rerank_on {
         rerank_start.elapsed().as_millis() as u64
     } else {
         0
@@ -24855,13 +25885,23 @@ fn run_cli_search(
     // Compute aggregations and create display result based on mode
     let (aggregations, display_result, total_matches, has_more_results, total_matches_exact) =
         if has_aggregation {
-            // Compute aggregations from all fetched results
-            let aggs = compute_aggregations(&result.hits, &agg_fields);
-            let total = result.hits.len();
+            // Aggregations keep the *original* first-lookup prefetch scope: for
+            // a rerank search that is the fetched pool before the window was
+            // clamped to N, so the counts match the closed-state path.
+            let aggregate_scope: &[crate::search::query::SearchHit] = if rerank_on {
+                rerank_prefetch_hits.as_deref().unwrap_or(&result.hits)
+            } else {
+                &result.hits
+            };
+            let aggs = compute_aggregations(aggregate_scope, &agg_fields);
+            let total = aggregate_scope.len();
 
             // Apply offset and limit to get display hits.
-            // When limit_val == 0 (meaning "no limit"), take all results.
-            let agg_effective_limit = if limit_val == 0 {
+            // When limit_val == 0 (meaning "no limit"), take all results. A
+            // rerank page is always K wide.
+            let agg_effective_limit = if rerank_on {
+                cursor_page_limit
+            } else if limit_val == 0 {
                 usize::MAX
             } else {
                 limit_val
@@ -24889,19 +25929,26 @@ fn run_cli_search(
             // No aggregation - result was over-fetched by one to derive pagination state.
             // When limit_val == 0 (meaning "no limit"), take all results.
             let total_matches_exact = result.total_count.is_some();
-            let has_more = cursor_page_limit > 0 && result.hits.len() > cursor_page_limit;
+            let window_total = result.hits.len();
+            let has_more = cursor_page_limit > 0 && window_total > cursor_page_limit;
             let effective_limit = if cursor_page_limit == 0 {
                 usize::MAX
             } else {
                 cursor_page_limit
             };
             let display_hits: Vec<_> = result.hits.into_iter().take(effective_limit).collect();
-            // Use the true total from Tantivy's Count collector when available;
-            // fall back to the page-window lower bound for semantic/hybrid/cached paths.
+            // Use the true total from the search engine when available; a
+            // rerank window's own size is the only total a first lookup can
+            // prove, and the closed path falls back to the page-window lower
+            // bound for semantic/hybrid/cached paths.
             let known_total = result.total_count.unwrap_or_else(|| {
-                offset_val
-                    .saturating_add(display_hits.len())
-                    .saturating_add(usize::from(has_more))
+                if rerank_on {
+                    window_total
+                } else {
+                    offset_val
+                        .saturating_add(display_hits.len())
+                        .saturating_add(usize::from(has_more))
+                }
             });
             let display = crate::search::query::SearchResult {
                 hits: display_hits,
@@ -24922,6 +25969,89 @@ fn run_cli_search(
         };
 
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
+    let window_render = build_window_render_ctx(
+        window_id,
+        window_snapshot,
+        // A first lookup always starts at offset 0 in its own window.
+        0,
+        window_continuable,
+        window_meta,
+    );
+    render_search_output(SearchRenderInput {
+        query: query.to_string(),
+        limit: limit_val,
+        cursor_page_limit,
+        offset: offset_val,
+        display_result,
+        effective_robot,
+        robot_meta,
+        elapsed_ms,
+        fields,
+        max_content_length,
+        max_tokens,
+        request_id,
+        cursor,
+        has_more_results,
+        total_matches,
+        total_matches_exact,
+        aggregations,
+        explanation,
+        timed_out,
+        timeout_ms,
+        mode_meta,
+        search_ms,
+        rerank_ms,
+        rerank_applied,
+        rerank_requested: semantic_opts.rerank,
+        window: window_render,
+        display_state: window_display_state,
+        data_dir,
+        db_path,
+        display_format,
+        wrap,
+        highlight,
+    })
+}
+
+/// P09: the shared search renderer -- everything from the display budget down.
+/// Both the first lookup and a continuation page build a [`SearchRenderInput`]
+/// and land here, so the two cannot drift in their JSON/human projection.
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
+    let SearchRenderInput {
+        query,
+        limit,
+        cursor_page_limit,
+        offset,
+        display_result,
+        effective_robot,
+        robot_meta,
+        elapsed_ms,
+        fields,
+        max_content_length,
+        max_tokens,
+        request_id,
+        cursor,
+        has_more_results,
+        total_matches,
+        total_matches_exact,
+        aggregations,
+        explanation,
+        timed_out,
+        timeout_ms,
+        mode_meta,
+        search_ms,
+        rerank_ms,
+        rerank_applied,
+        rerank_requested,
+        window,
+        display_state,
+        data_dir,
+        db_path,
+        display_format,
+        wrap,
+        highlight,
+    } = inp;
 
     // Derive per-field budgets, preferring snippet > content > title
     let (snippet_budget, content_budget, title_budget, fallback_budget) = {
@@ -24950,8 +26080,12 @@ fn run_cli_search(
         fallback: fallback_budget,
     };
 
-    // Gather state meta for robot output (index/db freshness)
-    let state_meta = if robot_meta {
+    // Gather state meta for robot output (index/db freshness). A continuation
+    // page passes the first lookup's frozen bundle instead, so this live read
+    // is skipped entirely.
+    let state_meta = if display_state.is_some() {
+        None
+    } else if robot_meta {
         Some(state_meta_json(
             &data_dir,
             &db_path,
@@ -25038,7 +26172,9 @@ fn run_cli_search(
     // to _meta when conversations are quarantined, so agents know results exclude
     // known content (distinct from mere staleness). Skipped entirely otherwise to
     // keep the common complete-coverage payload unchanged.
-    let search_completeness = if robot_meta {
+    let search_completeness = if display_state.is_some() {
+        None
+    } else if robot_meta {
         let quarantine = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
         if quarantine.quarantined_conversations > 0 || quarantine.circuit_breaker_active {
             serde_json::to_value(
@@ -25055,6 +26191,32 @@ fn run_cli_search(
         None
     };
 
+    // P09: a continuation renders the frozen display facts; a first lookup (or
+    // the closed path) keeps the live ones just collected.
+    let (
+        state_meta_with_warning,
+        index_freshness,
+        storage_integrity_meta,
+        search_completeness,
+        warning,
+    ) = if let Some(frozen) = display_state {
+        (
+            frozen.state_meta_with_warning,
+            frozen.index_freshness,
+            frozen.storage_integrity_meta,
+            frozen.search_completeness,
+            frozen.warning,
+        )
+    } else {
+        (
+            state_meta_with_warning,
+            index_freshness,
+            storage_integrity_meta,
+            search_completeness,
+            warning,
+        )
+    };
+
     // Bead v6vuz: captured before the output chain because `warning` and
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
@@ -25063,10 +26225,10 @@ fn run_cli_search(
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
         output_robot_results(
-            query,
-            limit_val,
+            &query,
+            limit,
             cursor_page_limit,
-            offset_val,
+            offset,
             &display_result,
             format,
             robot_meta,
@@ -25092,7 +26254,10 @@ fn run_cli_search(
             search_ms,
             rerank_ms,
             rerank_applied,
-            semantic_opts.rerank,
+            rerank_requested,
+            // P09: the window facts (cursor + `_meta.rerank`), present only for
+            // a --rerank search. Old callers and the closed path pass None.
+            window.as_ref(),
             // PR9 task 08: the one production sink -- same stdout the seven
             // former inline `std::io::stdout()` sites wrote to.
             &mut std::io::stdout(),
@@ -25113,7 +26278,7 @@ fn run_cli_search(
             eprintln!("No results found.");
         } else if let Some(display) = display_format {
             // Human-readable display formats
-            output_display_results(&display_result.hits, display, wrap, query, highlight)?;
+            output_display_results(&display_result.hits, display, wrap, &query, highlight)?;
         } else {
             // Default plain text output
             for hit in &display_result.hits {
@@ -25125,7 +26290,7 @@ fn run_cli_search(
                 println!("Path: {}", hit.source_path);
                 let snippet = hit.snippet.replace('\n', " ");
                 let snippet = if highlight {
-                    highlight_matches(&snippet, query, "**", "**")
+                    highlight_matches(&snippet, &query, "**", "**")
                 } else {
                     snippet
                 };
@@ -27262,6 +28427,10 @@ fn output_robot_results(
     // JSON/JSONL top-level fields this gates must appear whenever the
     // caller asked for `--rerank`, not only when it succeeded.
     rerank_requested: bool,
+    // P09: the rerank window facts (continuation cursor + `_meta.rerank`).
+    // Present only for a --rerank search; the closed path and old callers pass
+    // `None`, so every existing surface is byte-for-byte unchanged.
+    window: Option<&WindowRenderCtx>,
     // PR9 task 08: the sink every robot format writes to. This was
     // `std::io::stdout()` at each of the seven write sites, which made the
     // payload-construction code unreachable from a test -- and the reason a
@@ -27750,16 +28919,46 @@ fn output_robot_results(
     let search_page_count = result.hits.len();
     let returned_count = filtered_hits.len();
     let clamped_unemitted_hits = returned_count < search_page_count;
-    let cursor_has_more = has_more_results || clamped_unemitted_hits;
     let realized_cursor_limit = if cursor_page_limit == 0 {
         limit
     } else {
         cursor_page_limit
     };
-    let next_cursor = if cursor_has_more && cursor_page_limit > 0 && returned_count > 0 {
+    // P09: a rerank window's continuation cursor is built from the frozen
+    // snapshot at the real `returned_count` the display budget produced, so the
+    // next page starts exactly where this one stopped. A window that is not
+    // continuable gets no cursor at all. The closed path keeps the legacy
+    // offset/limit cursor unchanged.
+    let next_cursor = if let Some(window) = window {
+        if window.continuable {
+            match (window.window_id.as_deref(), window.snapshot.as_ref()) {
+                (Some(id), Some(snapshot)) => {
+                    crate::search::rerank::window::next_cursor(
+                        id,
+                        snapshot,
+                        window.offset,
+                        returned_count,
+                    )
+                    .ok()
+                    .flatten()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else if (has_more_results || clamped_unemitted_hits)
+        && cursor_page_limit > 0
+        && returned_count > 0
+    {
         encode_search_cursor(offset.saturating_add(returned_count), cursor_page_limit)
     } else {
         None
+    };
+    let cursor_has_more = if window.is_some() {
+        next_cursor.is_some() || clamped_unemitted_hits
+    } else {
+        has_more_results || clamped_unemitted_hits
     };
     let query_plan = crate::query_cost_planner::build_query_cost_plan(
         crate::query_cost_planner::QueryCostPlanInput {
@@ -27923,8 +29122,13 @@ fn output_robot_results(
                 );
             }
 
-            // Add extended metadata if requested
-            if include_meta && let serde_json::Value::Object(ref mut map) = payload {
+            // Add extended metadata if requested. P09: a --rerank search emits
+            // `_meta` (carrying the frozen `_meta.rerank` block) whether or not
+            // the caller asked for --robot-meta, so a bare `--json --rerank`
+            // call still carries the window facts P10 completes.
+            if (include_meta || window.is_some())
+                && let serde_json::Value::Object(ref mut map) = payload
+            {
                 let mut meta = serde_json::json!({
                     "elapsed_ms": elapsed_ms,
                     "search_mode": search_mode_meta.realized,
@@ -28009,6 +29213,15 @@ fn output_robot_results(
                     }
                 }
                 map.insert("_meta".to_string(), meta);
+                // P09: the frozen rerank window block. `returned_count` is the
+                // post-budget count computed above, so it always matches the
+                // hits actually emitted (the next cursor advances by it).
+                if let Some(window) = window
+                    && let Some(meta_map) =
+                        map.get_mut("_meta").and_then(serde_json::Value::as_object_mut)
+                {
+                    meta_map.insert("rerank".to_string(), window.meta.to_json(returned_count));
+                }
 
                 if let Some(warn) = &warning {
                     map.insert(
@@ -28681,6 +29894,7 @@ mod pr9_candidate_meta_output_tests {
             0,
             false,
             false,
+            None,
             &mut sink,
         )
         .expect("render robot output");

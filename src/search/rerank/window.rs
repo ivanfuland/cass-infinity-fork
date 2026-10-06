@@ -753,6 +753,21 @@ pub fn next_cursor(
     Ok(Some(encode_cursor(window_id, next)?))
 }
 
+/// Extract the window id a continuation cursor names, without opening the
+/// cache.
+///
+/// A later page needs the same `window_id` [`next_cursor`] embedded, so it can
+/// address the frozen snapshot. This is a pure decode: it delegates to the one
+/// cursor codec the store's own `load` uses, so a cursor it accepts is exactly
+/// one `load` accepts and a malformed or version-1 cursor is refused with the
+/// same `InvalidCursor` short code. It never reads, writes or repairs a window
+/// file, and it does not validate the offset against any window bound (that is
+/// `load`'s job, once the snapshot is in hand).
+pub fn cursor_window_id(cursor: &str) -> Result<String, WindowError> {
+    let (window_id, _offset) = decode_cursor(cursor)?;
+    Ok(window_id)
+}
+
 /// Capture the cross-process index identity of the database at `db_path`.
 ///
 /// The DB and WAL files must be regular files (a symlink is refused). A fresh
@@ -2239,6 +2254,41 @@ mod tests {
                     Err(WindowError::InvalidCursor) | Err(WindowError::NotFound)
                 ),
                 "cursor {cursor:?} must be refused, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_window_id_reads_the_id_and_refuses_malformed_cursors() {
+        use base64::Engine as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path());
+        let st = store(tmp.path());
+        let snap = snapshot(&db, NOW, true, 12, 12, 5);
+        let (id, cursor) = save_and_cursor(&st, &snap, 5);
+
+        // A cursor this store just produced resolves to the id it names,
+        // without touching the cache (no `load`, no window file opened).
+        assert_eq!(cursor_window_id(&cursor).unwrap(), id);
+
+        let bad = vec![
+            // old version-1 cursor
+            raw_cursor(json!({"version": 1, "window_id": id.clone(), "offset": 0})),
+            // wrong key set
+            raw_cursor(json!({"version": 2, "window_id": id.clone()})),
+            // not the frozen lowercase-hex id spelling
+            raw_cursor(json!({"version": 2, "window_id": id.to_uppercase(), "offset": 0})),
+            // not base64
+            "not-base64!!".to_string(),
+            // base64 of a non-JSON body
+            base64::prelude::BASE64_STANDARD.encode(b"not json"),
+        ];
+        for cursor in bad {
+            assert_eq!(
+                cursor_window_id(&cursor),
+                Err(WindowError::InvalidCursor),
+                "cursor {cursor:?} must be refused"
             );
         }
     }

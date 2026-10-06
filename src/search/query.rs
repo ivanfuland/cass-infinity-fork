@@ -811,7 +811,7 @@ fn hybrid_candidate_budget(
 // ============================================================================
 
 /// Classification of query type for explanation purposes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryType {
     /// Single term without operators
@@ -829,7 +829,7 @@ pub enum QueryType {
 }
 
 /// How the index will execute this query
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexStrategy {
     /// Fast path: edge n-gram prefix matching
@@ -845,7 +845,7 @@ pub enum IndexStrategy {
 }
 
 /// Rough complexity indicator for query execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryCost {
     /// Very fast (under 10ms typical)
@@ -857,14 +857,14 @@ pub enum QueryCost {
 }
 
 /// Sub-component of a parsed term
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParsedSubTerm {
     pub text: String,
     pub pattern: String,
 }
 
 /// Parsed term from the query
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParsedTerm {
     /// Original term text
     pub text: String,
@@ -875,7 +875,7 @@ pub struct ParsedTerm {
 }
 
 /// Parsed structure of the query
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParsedQuery {
     /// Individual terms extracted
     pub terms: Vec<ParsedTerm>,
@@ -888,7 +888,7 @@ pub struct ParsedQuery {
 }
 
 /// Comprehensive query explanation for debugging and understanding search behavior
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryExplanation {
     /// Exact input string
     pub original_query: String,
@@ -911,7 +911,7 @@ pub struct QueryExplanation {
 }
 
 /// Summary of active filters for explanation
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FiltersSummary {
     /// Number of agent filters
     pub agent_count: usize,
