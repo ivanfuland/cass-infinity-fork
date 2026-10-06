@@ -62,7 +62,7 @@ Updated: 2026-05-09
 - Capabilities: `crate_version, api_version, contract_version, features[], connectors[], workflows[], mistake_recoveries[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
 
 ## Flags worth knowing
-- Search window: `--rrf-limit N` sets the rrf candidate window and `--rerank-limit K` the per-page rerank count (requires `--rerank`). With `--rerank` off an omitted N keeps the legacy unbounded fetch (internal 0); with `--rerank` on N defaults to 200. K defaults to 5 per page and must be at most N. An explicit `0` is rejected, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
+- Search window: reranking is off by default. `--rrf-limit N` sets the rrf candidate window and `--rerank-limit K` the per-page rerank count (requires `--rerank`). With `--rerank` off an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on N defaults to 200. K defaults to 5 per page and must be at most N. An explicit `0` is rejected, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
 - `--fields minimal|summary|<list>`: reduce payload size
 - `--max-content-length N` / `--max-tokens N`: truncate per-field / by budget
 - `--robot-format json|jsonl|compact`: choose encoding

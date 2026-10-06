@@ -853,7 +853,7 @@ The CLI applies multiple normalization layers:
 22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
 23. **Global flag hoisting**: Position-independent flag handling
 
-**Search result windows**: `cass search` uses `--rrf-limit N` for the rrf candidate window and `--rerank-limit K` for the per-page rerank count (requires `--rerank`). With `--rerank` off, an omitted N keeps the legacy unbounded fetch (internal 0); with `--rerank` on, N defaults to 200 and K defaults to 5 per page (K must be at most N). An explicit `0` is rejected for either, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
+**Search result windows**: Reranking is off by default. `cass search` uses `--rrf-limit N` for the rrf candidate window and `--rerank-limit K` for the per-page rerank count (requires `--rerank`). With `--rerank` off, an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on, N defaults to 200 and K defaults to 5 per page (K must be at most N). An explicit `0` is rejected for either, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
