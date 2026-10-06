@@ -1000,7 +1000,7 @@ mod tests {
         // Both local selections are rejected before the environment is read, so
         // this holds whatever OPENROUTER_API_KEY contains.
         for local in [ProviderChoice::Qwen3Local, ProviderChoice::BgeLocal] {
-            let err = from_env(local)
+            let err = OpenRouterBackend::from_env(local)
                 .err()
                 .expect("a local selection must be refused");
             assert_eq!(err.reason, RerankFailureReason::UnsupportedProvider);
@@ -1094,13 +1094,13 @@ mod tests {
         match scenario.as_str() {
             "missing" | "empty" | "whitespace" => {
                 for provider in cloud {
-                    let err = from_env(provider)
+                    let err = OpenRouterBackend::from_env(provider)
                         .err()
                         .expect("a missing or blank credential must fail");
                     assert_eq!(err.reason, RerankFailureReason::MissingCredentials);
                 }
                 for local in [ProviderChoice::Qwen3Local, ProviderChoice::BgeLocal] {
-                    let err = from_env(local)
+                    let err = OpenRouterBackend::from_env(local)
                         .err()
                         .expect("a local selection must be refused");
                     assert_eq!(err.reason, RerankFailureReason::UnsupportedProvider);
@@ -1108,7 +1108,7 @@ mod tests {
             }
             "nonunicode" => {
                 for provider in cloud {
-                    let err = from_env(provider)
+                    let err = OpenRouterBackend::from_env(provider)
                         .err()
                         .expect("a non-Unicode credential must fail");
                     assert_eq!(err.reason, RerankFailureReason::InvalidInput);
@@ -1116,12 +1116,12 @@ mod tests {
             }
             "valid" => {
                 for provider in cloud {
-                    let backend = from_env(provider)
+                    let backend = OpenRouterBackend::from_env(provider)
                         .unwrap_or_else(|err| panic!("a valid key must construct: {err}"));
                     assert_eq!(backend.provider, provider);
                 }
                 for local in [ProviderChoice::Qwen3Local, ProviderChoice::BgeLocal] {
-                    let err = from_env(local)
+                    let err = OpenRouterBackend::from_env(local)
                         .err()
                         .expect("a local selection must be refused");
                     assert_eq!(err.reason, RerankFailureReason::UnsupportedProvider);
