@@ -21961,7 +21961,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search --query \"auth\" --json  # --query is accepted and converted to positional syntax".to_string(),
             "  cass search \"auth\" --format json  # --format json is accepted as --robot-format json".to_string(),
             "  cass search \"auth\" --output json  # --output json also becomes --robot-format json".to_string(),
-            "  cass search \"auth\" --rrf-limit 5 --json  # candidate window N (replaces the removed search --limit)".to_string(),
+            "  cass search \"auth\" --rrf-limit 5 --json  # candidate window N (replaces the removed search count flag)".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
