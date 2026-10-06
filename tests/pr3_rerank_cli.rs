@@ -44,7 +44,7 @@ const DEFAULT_K: usize = 5;
 // A tiny loopback HTTP fixture that records every request it answers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RecordedRequest {
     method: String,
     path: String,
@@ -863,72 +863,143 @@ fn group2_continuation_reuses_the_window_and_pages_exactly() {
 /// A continuation must not call the model, and that has to be proven against a
 /// service that could record the call. The stub stays up for the whole test, so
 /// its received-request count is real evidence: a continuation that re-ran the
-/// model would be counted here. Both the successful window and the failed
-/// window are covered; a pure re-call mutation (no metadata change) turns this
-/// red.
+/// model would be counted here. The failed window has a separate test so a
+/// failure in this test cannot prevent its mutation check from running.
 #[test]
-fn a_continuation_makes_no_model_call_while_the_service_is_still_observable() {
-    // --- (a) a successful first lookup ---
+fn online_success_window_continuation_makes_no_backend_request() {
     let fixture = build_fixture(FixtureOptions::default());
     let stub = Stub::start(StubMode::Ordered);
     let env = RunEnv::with_stub(&fixture, &stub);
 
     let first = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
     assert_success(&first, "first rerank lookup");
-    let cursor = require_cursor(&stdout_json(&first));
+    let first_payload = stdout_json(&first);
+    let cursor = require_cursor(&first_payload);
+    let first_meta = rerank_meta(&first_payload).expect("first rerank metadata");
+    assert_eq!(first_meta["applied"], serde_json::json!(true));
+    assert_eq!(first_meta["scored_count"], serde_json::json!(DEFAULT_N));
+    assert!(first_meta["failure_reason"].is_null());
 
     let closed = env.run(&as_args(&closed_args(DEFAULT_N)));
+    assert_success(&closed, "closed-state ordering reference");
     let mut expected_order: Vec<String> = ids(&stdout_json(&closed));
     expected_order.truncate(DEFAULT_N);
     expected_order.reverse();
 
-    // The stub is NOT stopped: it can still observe any new request.
-    let requests_before = stub.request_count();
+    assert_eq!(ids(&first_payload), expected_order[..DEFAULT_K].to_vec());
+    // All state is fixture-local. The stub stays online for the second process.
+    let requests_before = stub.requests();
+    assert_eq!(requests_before.len(), 2, "first lookup reached the backend");
+    assert_eq!(requests_before[0].path, "/models");
+    assert_eq!(requests_before[1].path, "/rerank");
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
     args.push("--cursor".to_string());
     args.push(cursor);
     let second = env.run(&as_args(&args));
     assert_success(&second, "continuation with the service still up");
-    assert_eq!(
-        stub.request_count(),
-        requests_before,
-        "the still-running service received no request from the continuation"
+    let requests_after = stub.requests();
+    eprintln!(
+        "ONLINE_SUCCESS_REQUESTS before={} after={} new={:?}",
+        requests_before.len(),
+        requests_after.len(),
+        requests_after.iter().skip(requests_before.len())
+            .map(|request| (&request.method, &request.path)).collect::<Vec<_>>()
     );
     assert_eq!(
-        ids(&stdout_json(&second)),
+        requests_after.len(),
+        requests_before.len(),
+        "the still-running service received no request from the continuation"
+    );
+    assert_eq!(requests_after, requests_before, "the actual request list is unchanged");
+    let second_payload = stdout_json(&second);
+    assert_eq!(
+        ids(&second_payload),
         expected_order[DEFAULT_K..DEFAULT_K * 2].to_vec(),
         "the continuation still returns the frozen second page"
     );
+    for (_, _, score) in scored_hits(&second_payload) {
+        assert!(score.is_some(), "the successful window keeps its scores");
+    }
+    let second_meta = rerank_meta(&second_payload).expect("continuation rerank metadata");
+    for field in ["first_http_requests", "first_model_requests", "first_duration_ms",
+        "applied", "scored_count", "failure_reason", "http_status"] {
+        assert_eq!(second_meta[field], first_meta[field], "frozen field {field}");
+    }
+    assert_eq!(second_meta["cache_reused"], serde_json::json!(true));
+    assert_eq!(second_meta["offset"], serde_json::json!(DEFAULT_K));
+    assert_eq!(second_meta["returned_count"], serde_json::json!(DEFAULT_K));
+    for field in ["http_requests", "model_requests", "duration_ms"] {
+        assert_eq!(second_meta[field], serde_json::json!(0), "current field {field}");
+    }
+}
 
-    // --- (b) a failed first lookup, whose window is still frozen ---
+#[test]
+fn online_failed_window_continuation_makes_no_backend_request() {
     let fixture = build_fixture(FixtureOptions::default());
     let stub = Stub::start(StubMode::MissingScore);
     let env = RunEnv::with_stub(&fixture, &stub);
 
     let first = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
     assert_success(&first, "first lookup with a failing score response");
-    let cursor = require_cursor(&stdout_json(&first));
+    let first_payload = stdout_json(&first);
+    let cursor = require_cursor(&first_payload);
+    let first_meta = rerank_meta(&first_payload).expect("first rerank metadata");
+    assert_eq!(first_meta["applied"], serde_json::json!(false));
+    assert_eq!(first_meta["scored_count"], serde_json::json!(0));
+    assert!(first_meta["failure_reason"].is_string());
+    for (_, _, score) in scored_hits(&first_payload) {
+        assert!(score.is_none(), "the failed first page has no rerank score");
+    }
 
     let closed = env.run(&as_args(&closed_args(DEFAULT_N)));
+    assert_success(&closed, "closed-state ordering reference");
     let mut original: Vec<String> = ids(&stdout_json(&closed));
     original.truncate(DEFAULT_N);
 
-    let requests_before = stub.request_count();
+    assert_eq!(ids(&first_payload), original[..DEFAULT_K].to_vec());
+    let requests_before = stub.requests();
+    assert_eq!(requests_before.len(), 2, "the first lookup attempted scoring");
+    assert_eq!(requests_before[0].path, "/models");
+    assert_eq!(requests_before[1].path, "/rerank");
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
     args.push("--cursor".to_string());
     args.push(cursor);
     let second = env.run(&as_args(&args));
     assert_success(&second, "failed-window continuation with the service still up");
-    assert_eq!(
-        stub.request_count(),
-        requests_before,
-        "a failed window's continuation also makes no call, proven against a service that is up"
+    let requests_after = stub.requests();
+    eprintln!(
+        "ONLINE_FAILED_REQUESTS before={} after={} new={:?}",
+        requests_before.len(),
+        requests_after.len(),
+        requests_after.iter().skip(requests_before.len())
+            .map(|request| (&request.method, &request.path)).collect::<Vec<_>>()
     );
     assert_eq!(
-        ids(&stdout_json(&second)),
+        requests_after.len(),
+        requests_before.len(),
+        "a failed window's continuation also makes no call, proven against a service that is up"
+    );
+    assert_eq!(requests_after, requests_before, "the actual request list is unchanged");
+    let second_payload = stdout_json(&second);
+    assert_eq!(
+        ids(&second_payload),
         original[DEFAULT_K..DEFAULT_K * 2].to_vec(),
         "the failed window replays in the original order"
     );
+    for (_, _, score) in scored_hits(&second_payload) {
+        assert!(score.is_none(), "the failed continuation has no rerank score");
+    }
+    let second_meta = rerank_meta(&second_payload).expect("continuation rerank metadata");
+    for field in ["first_http_requests", "first_model_requests", "first_duration_ms",
+        "applied", "scored_count", "failure_reason", "http_status"] {
+        assert_eq!(second_meta[field], first_meta[field], "frozen field {field}");
+    }
+    assert_eq!(second_meta["cache_reused"], serde_json::json!(true));
+    assert_eq!(second_meta["offset"], serde_json::json!(DEFAULT_K));
+    assert_eq!(second_meta["returned_count"], serde_json::json!(DEFAULT_K));
+    for field in ["http_requests", "model_requests", "duration_ms"] {
+        assert_eq!(second_meta[field], serde_json::json!(0), "current field {field}");
+    }
 }
 
 #[test]
