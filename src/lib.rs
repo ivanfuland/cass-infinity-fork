@@ -23293,6 +23293,7 @@ fn resolve_search_defaults(
 /// Resolved `cass search` defaults: `--timeout`/`--mode` (same resolution as
 /// [`resolve_search_defaults`]) plus the P08a window limits N/K and the
 /// CLI-only rerank provider selection.
+#[derive(Debug)]
 struct SearchWindowDefaults {
     timeout_ms: Option<u64>,
     mode: Option<crate::search::query::SearchMode>,
@@ -23479,7 +23480,6 @@ mod pr3_cli_limits {
 
     use super::*;
     use crate::search::rerank::types::ProviderChoice;
-    use crate::search::query::SearchMode;
     use crate::search_defaults::SearchDefaults;
 
     fn base_inputs(config: &SearchDefaults) -> SearchWindowInputs<'_> {
@@ -23501,6 +23501,13 @@ mod pr3_cli_limits {
 
     fn parse(args: &[&str]) -> CliResult<ParsedCli> {
         parse_cli(args.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn parse_err(args: &[&str]) -> CliError {
+        match parse(args) {
+            Ok(_) => panic!("expected a usage error for {args:?}"),
+            Err(err) => err,
+        }
     }
 
     fn search_fields(args: &[&str]) -> Commands {
@@ -23784,15 +23791,14 @@ mod pr3_cli_limits {
 
     #[test]
     fn unknown_provider_is_a_usage_error() {
-        let err = parse(&[
+        let err = parse_err(&[
             "cass",
             "search",
             "q",
             "--rerank",
             "--rerank-provider",
             "not-a-provider",
-        ])
-        .expect_err("unknown provider must fail");
+        ]);
         assert_eq!(err.code, 2);
     }
 
@@ -23836,7 +23842,7 @@ mod pr3_cli_limits {
             vec!["cass", "search", "q", "limit", "5"],
             vec!["cass", "search", "q", "n", "5"],
         ] {
-            let err = parse(&args).expect_err(&format!("must reject {args:?}"));
+            let err = parse_err(&args);
             assert_eq!(err.code, 2, "{args:?} -> {err:?}");
             assert_eq!(err.kind, "usage", "{args:?} -> {err:?}");
             assert!(
@@ -23850,8 +23856,7 @@ mod pr3_cli_limits {
     fn legacy_alias_rescue_does_not_succeed_via_heuristic() {
         // A near-miss typo must not be rescued into a now-removed --limit that
         // would be silently accepted.
-        let err = parse(&["cass", "search", "q", "--limt", "5"])
-            .expect_err("ambiguous count typo must not resolve");
+        let err = parse_err(&["cass", "search", "q", "--limt", "5"]);
         assert_eq!(err.code, 2);
     }
 
