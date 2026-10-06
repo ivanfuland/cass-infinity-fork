@@ -57689,6 +57689,14 @@
                             }
                           }
                         },
+                        "rerank_applied": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
                         "tokens_estimated": {
                           "type": "object",
                           "properties": {
