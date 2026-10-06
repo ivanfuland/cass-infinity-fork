@@ -472,12 +472,27 @@ pub enum Commands {
         /// role filter instead of intersecting with it.
         #[arg(long)]
         role: Vec<String>,
-        /// Max results. 0 = "no limit" but is auto-capped to a RAM-proportional ceiling
-        /// (1/16 of MemAvailable, clamped to [256 MiB, 16 GiB] of result-heap) so a single
-        /// query can't tie up the whole machine. Override with CASS_SEARCH_NO_LIMIT_CAP=<hits>
-        /// or CASS_SEARCH_NO_LIMIT_BYTES=<bytes>.
-        #[arg(long, default_value_t = 0)]
-        limit: usize,
+        /// Candidate window size N: the rrf-fusion/dedup/filter bound fetched
+        /// before pagination. Resolved with the CLI > CASS_RRF_LIMIT >
+        /// [search].rrf_limit > built-in precedence. Valid with or without
+        /// --rerank; when --rerank is off it is the fetch bound that replaces
+        /// the removed --limit. A value of 0, a non-integer, or a window whose
+        /// N+1 overflows usize/i64 is rejected before any DB or model work.
+        #[arg(long)]
+        rrf_limit: Option<usize>,
+        /// Per-page result count K when --rerank is enabled (at least 1, at most
+        /// the rrf window N). Passing an explicit value without --rerank is a
+        /// usage error; env/config K values are ignored when --rerank is off.
+        #[arg(long)]
+        rerank_limit: Option<usize>,
+        /// Rerank backend selection. Requires --rerank. Exactly one of
+        /// qwen3-local (the default when omitted), bge-local,
+        /// openrouter-qwen3-8b, openrouter-cohere-4-fast,
+        /// openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage
+        /// error. Nothing is read from env or config; omitting it never selects a
+        /// cloud backend.
+        #[arg(long, value_enum)]
+        rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
         /// Offset for pagination (start at Nth result)
         #[arg(long, default_value_t = 0)]
         offset: usize,
@@ -532,7 +547,7 @@ pub enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         until: Option<String>,
         /// Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type`
-        /// Returns buckets with counts instead of full results. Use with --limit to get both.
+        /// Returns buckets with counts instead of full results. Use with --rrf-limit to get both.
         #[arg(long, value_delimiter = ',')]
         aggregate: Option<Vec<String>>,
         /// Include query explanation in output (shows parsed query, index strategy, cost estimate)
@@ -3543,7 +3558,7 @@ mod robot_docs_shorthand_regression_tests {
             "help".to_string(),
             "--json".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -3568,7 +3583,7 @@ mod robot_docs_shorthand_regression_tests {
             "search".to_string(),
             "--help".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -3593,7 +3608,7 @@ mod robot_docs_shorthand_regression_tests {
             "health".to_string(),
             "--json".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -3620,7 +3635,7 @@ mod robot_docs_shorthand_regression_tests {
             "models".to_string(),
             "verify".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -4805,7 +4820,12 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
 fn command_accepts_limit_alias(rest: &[String]) -> bool {
     match rest.first().map(String::as_str) {
         Some("analytics") => rest.get(1).is_some_and(|arg| arg == "tools"),
-        Some("context" | "pack" | "search" | "sessions") => true,
+        // NOTE: `search` is intentionally absent. PR3 removed `--limit` (and
+        // every result-count alias that normalized to it) from `cass search`;
+        // those spellings now produce a migration error via
+        // `legacy_search_limit_migration_error` instead of being rewritten into
+        // a still-valid `--limit`. Other commands keep their old behavior.
+        Some("context" | "pack" | "sessions") => true,
         _ => false,
     }
 }
@@ -4866,6 +4886,114 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
     corrections.push(format!(
         "'{command} {flag} <value>' → '{command} --limit {value}' (result-count alias)"
     ));
+}
+
+/// The legacy `cass search` result-count long-flag spellings that must now fail
+/// with a migration error instead of resolving to a fetch bound.
+///
+/// These are the double-dash forms; single-dash / case / snake_case variants
+/// have already been normalized to these by `normalize_single_arg` before this
+/// list is consulted.
+const LEGACY_SEARCH_LIMIT_FLAGS: &[&str] = &[
+    "--limit",
+    "--max-results",
+    "--num-results",
+    "--results",
+    "--count",
+    "--top-k",
+    "--topk",
+    "--top_k",
+    "--n",
+    "-n",
+];
+
+/// True when `arg` is a bare `key=value` assignment whose key is a legacy
+/// result-count alias (`limit`, `max_results`, `top_k`, `n`, ...).
+fn legacy_search_limit_assignment(arg: &str) -> bool {
+    let Some((key, value)) = arg.split_once('=') else {
+        return false;
+    };
+    !value.is_empty() && is_result_count_assignment_key(&key.to_ascii_lowercase())
+}
+
+/// Detect a legacy `cass search` result-count spelling in the already-normalized
+/// argument list (`rest[0]` is the canonical subcommand).
+///
+/// Returns the offending spelling for the migration message. Scanning stops at
+/// a `--` terminator so a query literal is never misread as a flag, and the
+/// value of a value-taking option (`--since`, `--agent`, ...) is skipped so its
+/// contents cannot be mistaken for a stale flag. Runs after the recovery passes
+/// (so an implicit-`search` invocation is included) but before the query-folding
+/// passes (so a bare `limit 5` pair is still two tokens).
+fn legacy_search_limit_spelling(rest: &[String]) -> Option<String> {
+    if rest.first().map(String::as_str) != Some("search") {
+        return None;
+    }
+
+    let mut index = 1;
+    while index < rest.len() {
+        let arg = &rest[index];
+
+        // `--` terminates option parsing; everything after is the query literal.
+        if arg == "--" {
+            return None;
+        }
+
+        // Long-flag spellings, including the `--flag=value` form.
+        if let Some(flag) = LEGACY_SEARCH_LIMIT_FLAGS.iter().find(|flag| {
+            arg.as_str() == **flag
+                || arg
+                    .strip_prefix(**flag)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        }) {
+            return Some((*flag).to_string());
+        }
+        if arg.starts_with('-') {
+            // Skip the option and any value it consumes, so a value that reads
+            // like a legacy flag is not flagged.
+            let width = search_like_option_value_count("search", arg)
+                .unwrap_or(1)
+                .max(1);
+            index += width;
+            continue;
+        }
+
+        // Bare `limit=5` assignment.
+        if legacy_search_limit_assignment(arg) {
+            return Some(arg.clone());
+        }
+
+        // Bare `limit 5` pair. Mirrors `recover_bare_option_value_pairs`'s
+        // `search` start index so `cass search limit 5` (a query) is not flagged
+        // while `cass search foo limit 5` is.
+        if index >= 2
+            && is_result_count_assignment_key(&arg.to_ascii_lowercase())
+            && rest
+                .get(index + 1)
+                .is_some_and(|value| !value.starts_with("--"))
+        {
+            return Some(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+/// The short migration error for a legacy `cass search` result-count spelling.
+/// The offending spelling is the caller's own argument, so echoing it is safe
+/// and clarifies which token to replace.
+fn legacy_search_limit_migration_error(spelling: &str) -> CliError {
+    CliError::usage(
+        format!("`cass search {spelling}` is no longer supported"),
+        Some(
+            "cass search now uses --rrf-limit N (candidate window) and --rerank-limit K \
+             (per-page rerank count). Replace the legacy result-count flag or alias with one \
+             of those."
+                .to_string(),
+        ),
+    )
 }
 
 fn has_explicit_structured_output_request(rest: &[String]) -> bool {
@@ -5066,7 +5194,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 8. **Named positional recovery**: `search --query foo` → `search foo`
 /// 9. **Multi-word query recovery**: `search foo bar --json` → `search "foo bar" --json`
 /// 10. **Structured format alias recovery**: `search foo --format json`/`--output json` → `search foo --robot-format json`
-/// 11. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
+/// 11. **Result-count alias recovery**: `pack foo --max-results 5` → `pack foo --limit 5` (search no longer accepts `--limit`; its legacy count spellings are a PR3 migration error)
 /// 12. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
 /// 13. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
 /// 14. **Bare option-pair recovery**: `search foo provider codex` → `search foo --agent codex`
@@ -5082,9 +5210,9 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 24. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
-fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
+fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> {
     if raw.is_empty() {
-        return (raw, None);
+        return Ok((raw, None));
     }
     let prog = &raw[0];
     let mut globals: Vec<String> = Vec::new();
@@ -5501,6 +5629,16 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     recover_explicit_search_pack_intent(&mut rest, &mut corrections);
     recover_structured_format_aliases(&mut rest, &mut corrections);
     recover_limit_aliases(&mut rest, &mut corrections);
+
+    // PR3: `cass search` dropped `--limit` and every alias that normalized to
+    // it. Detect those on the canonical `rest` (implicit-search already
+    // resolved, pack-intent already split off) and fail with a migration error
+    // before the query-folding passes below would swallow a bare `limit 5`
+    // pair into the query text.
+    if let Some(spelling) = legacy_search_limit_spelling(&rest) {
+        return Err(legacy_search_limit_migration_error(&spelling));
+    }
+
     recover_time_alias_flags(&mut rest, &mut corrections);
     recover_agent_filter_alias_flags(&mut rest, &mut corrections);
     recover_named_required_positionals(&mut rest, &mut corrections);
@@ -5803,7 +5941,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             }
         ))
     };
-    (normalized, note)
+    Ok((normalized, note))
 }
 
 /// Build a helpful error message when a command group (e.g. `analytics`, `sources`,
@@ -5933,7 +6071,7 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
         err_map.insert(
             "flag_syntax".into(),
             serde_json::json!({
-                "correct": ["--limit 5", "--robot", "--json"],
+                "correct": ["--rrf-limit 5", "--robot", "--json"],
                 "incorrect": ["--limt 5", "-limit 5", "--Limit"]
             }),
         );
@@ -5962,8 +6100,8 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
     }
     parts.push(String::new());
     parts.push("Quick syntax reference:".to_string());
-    parts.push("  - Long flags use double-dash: --robot, --limit 5".to_string());
-    parts.push("  - Flag values use space or equals: --limit 5 or --limit=5".to_string());
+    parts.push("  - Long flags use double-dash: --robot, --rrf-limit 5".to_string());
+    parts.push("  - Flag values use space or equals: --rrf-limit 5 or --rrf-limit=5".to_string());
     parts.push("  - Subcommands come first: cass search \"query\"".to_string());
     parts.join("\n")
 }
@@ -6006,7 +6144,7 @@ fn detect_command_intent(raw_str: &str) -> String {
 fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
     if intent.contains("search") {
         vec![
-            "cass search \"error handling\" --robot --limit 10",
+            "cass search \"error handling\" --robot --rrf-limit 10",
             "cass search \"authentication\" --robot --agent claude",
             "cass search \"database\" --robot --since 2024-01-01",
             "cass search \"TODO\" --robot --workspace /path/to/project",
@@ -6075,7 +6213,7 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
         && !raw_str.contains("--limit=")
         && !raw_str.contains("-limit=")
     {
-        hints.push("Use '--limit 5' or '--limit=5', not 'limit=5'".to_string());
+        hints.push("Use '--flag value' or '--flag=value', not 'flag=value'".to_string());
     }
     if raw_str.contains("--robot-docs") {
         hints.push(
@@ -6111,8 +6249,8 @@ fn get_common_mistakes(intent: &str) -> Option<serde_json::Value> {
             ("cass query=\"foo\" --robot", "cass search \"foo\" --robot"),
             // Missing query entirely
             (
-                "cass search --robot --limit 5",
-                "cass search \"your query\" --robot --limit 5",
+                "cass search --robot --rrf-limit 5",
+                "cass search \"your query\" --robot --rrf-limit 5",
             ),
         ]
     } else if intent.contains("documentation") {
@@ -6416,8 +6554,9 @@ pub struct ParsedCli {
 }
 
 pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
-    // First normalization pass (global flags lift)
-    let (normalized_args, parse_note) = normalize_args(raw_args.clone());
+    // First normalization pass (global flags lift). A legacy `cass search`
+    // result-count spelling is refused here as a usage error (PR3 migration).
+    let (normalized_args, parse_note) = normalize_args(raw_args.clone())?;
 
     let (cli, heuristic_note) = match Cli::try_parse_from(&normalized_args) {
         Ok(cli) => (cli, None),
@@ -6961,7 +7100,9 @@ async fn execute_cli(
                     agent,
                     workspace,
                     role,
-                    limit,
+                    rrf_limit,
+                    rerank_limit,
+                    rerank_provider,
                     offset,
                     json,
                     robot_meta,
@@ -7005,11 +7146,59 @@ async fn execute_cli(
                         ));
                     }
 
-                    // Warn about reranker without rerank flag
-                    if reranker.is_some() && !rerank {
+                    // `--reranker` is deprecated: it is still parsed for
+                    // compatibility, but it never selects a backend and its
+                    // value is never echoed. Combining it with the new
+                    // `--rerank-provider` is an explicit conflict rather than a
+                    // silent preference for one of them.
+                    if reranker.is_some() {
+                        if rerank_provider.is_some() {
+                            return Err(CliError::usage(
+                                "--reranker cannot be combined with --rerank-provider",
+                                Some(
+                                    "--rerank-provider now selects the rerank backend; drop --reranker."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
                         eprintln!(
-                            "Warning: --reranker specified but --rerank not enabled; reranker will be ignored"
+                            "Warning: --reranker is deprecated and no longer selects a rerank backend; use --rerank-provider"
                         );
+                    }
+
+                    // Resolve configurable search defaults (#303 + PR3 windows)
+                    // in one pass: timeout/mode as before, plus the window limits
+                    // N/K and the rerank provider. This MUST run before
+                    // `refresh_index_inline` so an invalid window/provider
+                    // argument fails before any ingest, DB or model work starts.
+                    let defaults = resolve_search_window_defaults(
+                        timeout,
+                        mode,
+                        rerank,
+                        rrf_limit,
+                        rerank_limit,
+                        rerank_provider,
+                    )?;
+
+                    // PR9 09a: `--vector-search-mode` is an independent
+                    // dimension from `--mode`, but lexical search has no
+                    // vector leg at all -- silently accepting the flag there
+                    // would report a vector mode that never ran. Checked
+                    // against the *effective* mode (flag > env > config >
+                    // default) and before the database is opened.
+                    if vector_search_mode.is_some()
+                        && matches!(
+                            defaults.mode,
+                            Some(crate::search::query::SearchMode::Lexical)
+                        )
+                    {
+                        return Err(CliError::usage(
+                            "--vector-search-mode cannot be combined with lexical search",
+                            Some(
+                                "Vector search modes apply to --mode semantic, --mode hybrid, or the default hybrid-preferred mode. Lexical (BM25) search has no vector candidate leg; drop --vector-search-mode or switch --mode."
+                                    .to_string(),
+                            ),
+                        ));
                     }
 
                     if refresh {
@@ -7021,6 +7210,8 @@ async fn execute_cli(
                         rerank,
                         reranker: reranker.clone(),
                         use_daemon: daemon && !no_daemon,
+                        rerank_limit: defaults.rerank_limit,
+                        rerank_provider: defaults.rerank_provider,
                     };
 
                     // Only pass through robot_format when it was explicitly
@@ -7031,39 +7222,12 @@ async fn execute_cli(
                     // no structured format was asked for.
                     let effective_format = cli.robot_format.or_else(robot_format_from_env);
 
-                    // Resolve configurable search defaults (#303): the explicit
-                    // CLI flag wins, then the env var, then `~/.config/cass/cass.toml`
-                    // `[search]`, then the built-in default. This lets agents set a
-                    // default timeout/limit/mode once instead of appending flags to
-                    // every invocation. A broken config file or a malformed env value
-                    // is a clear usage error rather than a silent fall-through.
-                    let (eff_timeout, eff_limit, eff_mode) =
-                        resolve_search_defaults(timeout, limit, mode)?;
-
-                    // PR9 09a: `--vector-search-mode` is an independent
-                    // dimension from `--mode`, but lexical search has no
-                    // vector leg at all -- silently accepting the flag there
-                    // would report a vector mode that never ran. Checked
-                    // against the *effective* mode (flag > env > config >
-                    // default) and before the database is opened.
-                    if vector_search_mode.is_some()
-                        && matches!(eff_mode, Some(crate::search::query::SearchMode::Lexical))
-                    {
-                        return Err(CliError::usage(
-                            "--vector-search-mode cannot be combined with lexical search",
-                            Some(
-                                "Vector search modes apply to --mode semantic, --mode hybrid, or the default hybrid-preferred mode. Lexical (BM25) search has no vector candidate leg; drop --vector-search-mode or switch --mode."
-                                    .to_string(),
-                            ),
-                        ));
-                    }
-
                     run_cli_search(
                         &query,
                         &agent,
                         &workspace,
                         &role,
-                        &eff_limit,
+                        &defaults.rrf_limit,
                         &offset,
                         &json,
                         effective_format,
@@ -7090,11 +7254,11 @@ async fn execute_cli(
                         aggregate,
                         explain,
                         dry_run,
-                        eff_timeout,
+                        defaults.timeout_ms,
                         highlight,
                         source,
                         sessions_from,
-                        eff_mode,
+                        defaults.mode,
                         vector_search_mode,
                         semantic_opts,
                     )?;
@@ -20184,7 +20348,7 @@ fn readiness_recommended_commands(
                         "--robot",
                         "--mode",
                         "lexical",
-                        "--limit",
+                        "--rrf-limit",
                         "10",
                         "--fields",
                         "summary",
@@ -20213,7 +20377,7 @@ fn readiness_recommended_commands(
                         "search",
                         "'<query>'",
                         "--robot",
-                        "--limit",
+                        "--rrf-limit",
                         "10",
                         "--fields",
                         "summary",
@@ -21540,7 +21704,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search <query> [OPTIONS]".to_string(),
             "    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 22-connector inventory)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
-            "    --limit N         Max results (default: 0 = no limit)".to_string(),
+            "    --rrf-limit N     Candidate window N before pagination (the pre-rerank fetch bound; default: 0 = no explicit window)".to_string(),
+            "    --rerank-limit K  Per-page count K when --rerank is on (>=1, <=N; default: 5)".to_string(),
+            "    --rerank-provider P  Rerank backend when --rerank is on: qwen3-local (default) | bge-local | openrouter-qwen3-8b | openrouter-cohere-4-fast | openrouter-voyage-2.5-lite".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
@@ -21675,7 +21841,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DB_PATH                             override db path".to_string(),
             "  CASS_OUTPUT_FORMAT=json|jsonl|compact|sessions|toon  default structured output".to_string(),
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
-            "  CASS_SEARCH_LIMIT=<N>                    default search/pack limit (--limit overrides; 0=no limit)".to_string(),
+            "  CASS_RRF_LIMIT=<N>                       default search rrf candidate window N (--rrf-limit overrides)".to_string(),
+            "  CASS_RERANK_LIMIT=<K>                    default search per-page rerank count K (--rerank-limit overrides)".to_string(),
+            "  CASS_SEARCH_LIMIT=<N>                    legacy pack default limit (--limit overrides); rejected by `cass search` (use CASS_RRF_LIMIT)".to_string(),
             "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
             "  TOON_INDENT=<N>                           pretty-print TOON with indent".to_string(),
@@ -21785,7 +21953,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search --query \"auth\" --json  # --query is accepted and converted to positional syntax".to_string(),
             "  cass search \"auth\" --format json  # --format json is accepted as --robot-format json".to_string(),
             "  cass search \"auth\" --output json  # --output json also becomes --robot-format json".to_string(),
-            "  cass search \"auth\" --max-results 5 --json  # result-count aliases become --limit".to_string(),
+            "  cass search \"auth\" --rrf-limit 5 --json  # candidate window N (replaces the removed search --limit)".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
@@ -21801,7 +21969,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  # Read warnings[] plus health/freshness/privacy before copying a pack into another prompt.".to_string(),
             "  # Contributor check for docs/goldens: rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_cass_answer_pack_docs cargo test --test golden_robot_docs".to_string(),
             "# Token-budgeted search with cursor + request-id".to_string(),
-            "  cass search \"error\" --robot --max-tokens 200 --request-id run-1 --limit 2 --robot-meta".to_string(),
+            "  cass search \"error\" --robot --max-tokens 200 --request-id run-1 --rrf-limit 2 --robot-meta".to_string(),
             "  cass search \"error\" --robot --cursor <_meta.next_cursor> --request-id run-1b --robot-meta".to_string(),
             String::new(),
             "# Search with time filters".to_string(),
@@ -21809,7 +21977,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search \"api\" --week                  # last 7 days".to_string(),
             "  cass search \"feature\" --days 30           # last 30 days".to_string(),
             "  cass search \"fix\" --since 2025-01-01      # since date".to_string(),
-            "  cass search \"error\" --robot --limit 5 --offset 5  # paginate robot output".to_string(),
+            "  cass search \"error\" --robot --rrf-limit 5 --offset 5  # paginate robot output".to_string(),
             String::new(),
             "# Filter by agent or workspace".to_string(),
             "  cass search \"error\" --agent codex         # codex sessions only".to_string(),
@@ -22241,9 +22409,19 @@ pub struct SemanticSearchOptions {
     /// Enable reranking of results
     pub rerank: bool,
     /// Reranker model to use (if rerank is enabled)
+    ///
+    /// Deprecated: parsed for compatibility but never selects a backend. The
+    /// rerank backend now comes from [`Self::rerank_provider`].
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
+    /// Per-page rerank window K. Resolved by the search defaults bridge; `None`
+    /// when reranking is off. Carried through to the rerank stage (P09).
+    pub rerank_limit: Option<usize>,
+    /// Selected rerank backend. `Some` only when reranking is on (defaulting to
+    /// `qwen3-local`); `None` when reranking is off. Carried through to the
+    /// rerank stage (P09).
+    pub rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
 impl TimeFilter {
@@ -23041,9 +23219,13 @@ mod search_lexical_self_heal_tests {
     }
 }
 
-/// Resolve the effective `(timeout_ms, limit, mode)` for a `cass search` /
-/// `cass pack` invocation by layering the configurable defaults (#303) under
+/// Resolve the effective `(timeout_ms, limit, mode)` for a `cass pack`
+/// invocation by layering the configurable defaults (#303) under
 /// the explicit CLI flags.
+///
+/// PR3 kept this resolver for `cass pack` only, because pack still consumes the
+/// legacy `limit`; `cass search` now resolves its own defaults through
+/// [`resolve_search_window_defaults`] and rejects the legacy limit.
 ///
 /// Precedence (highest wins): CLI flag > env var > `~/.config/cass/cass.toml`
 /// `[search]` > built-in default. The config file is loaded once per
@@ -23051,7 +23233,7 @@ mod search_lexical_self_heal_tests {
 /// as a clear usage error rather than silently ignored.
 ///
 /// `cli_limit == 0` is treated as "not explicitly set" so a configured default
-/// limit engages for the common `cass search "<q>"` (no `--limit`) case; an
+/// limit engages for the common `cass pack "<q>"` (no `--limit`) case; an
 /// explicit `--limit 0` is semantically identical to the unset default ("no
 /// limit", still RAM-capped downstream), so nothing surprising happens there.
 fn resolve_search_defaults(
@@ -23098,6 +23280,121 @@ fn resolve_search_defaults(
     let mode = mode_str.and_then(|m| search_mode_from_canonical_str(&m));
 
     Ok((timeout, limit, mode))
+}
+
+/// Resolved `cass search` defaults: `--timeout`/`--mode` (same resolution as
+/// [`resolve_search_defaults`]) plus the P08a window limits N/K and the
+/// CLI-only rerank provider selection.
+struct SearchWindowDefaults {
+    timeout_ms: Option<u64>,
+    mode: Option<crate::search::query::SearchMode>,
+    /// Rrf candidate-pool window N. `0` is the built-in "no explicit window"
+    /// sentinel (rerank off, no source configured one).
+    rrf_limit: usize,
+    /// Per-page rerank window K, present only when reranking is enabled.
+    rerank_limit: Option<usize>,
+    /// Selected rerank backend, present only when reranking is enabled.
+    rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
+}
+
+/// Resolve the effective `cass search` defaults in a single pass.
+///
+/// This is the search-only sibling of [`resolve_search_defaults`], which stays
+/// in place for `cass pack` (pack still consumes the legacy `limit`). The
+/// config file is loaded once; `--timeout`/`--mode` keep their existing pure
+/// resolvers, while the window limits N/K go through P08a's
+/// `search_defaults::resolve_window_limits`, so a legacy `[search].limit` or
+/// `CASS_SEARCH_LIMIT` is a migration error instead of a silent fetch bound.
+///
+/// The rerank provider is a pure CLI selection: it requires `--rerank`,
+/// defaults to the local Qwen backend when omitted, and never reads env or
+/// config. Every error is produced here, before the DB is opened, before any
+/// refresh/ingest, and before any model request.
+fn resolve_search_window_defaults(
+    cli_timeout: Option<u64>,
+    cli_mode: Option<crate::search::query::SearchMode>,
+    rerank: bool,
+    cli_rrf: Option<usize>,
+    cli_rerank: Option<usize>,
+    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
+) -> CliResult<SearchWindowDefaults> {
+    use crate::search::rerank::types::ProviderChoice;
+    use crate::search_defaults as sd;
+
+    // The provider only exists when reranking is on. An explicit selection with
+    // --rerank off is a usage error, not a silently ignored flag.
+    if !rerank && cli_provider.is_some() {
+        return Err(CliError::usage(
+            "--rerank-provider requires --rerank",
+            Some("Enable --rerank to select a rerank backend, or drop --rerank-provider.".to_string()),
+        ));
+    }
+    let rerank_provider = if rerank {
+        Some(cli_provider.unwrap_or(ProviderChoice::Qwen3Local))
+    } else {
+        None
+    };
+
+    let defaults = sd::load_search_defaults().map_err(|e| {
+        CliError::usage(
+            e.to_string(),
+            Some("Fix or remove ~/.config/cass/cass.toml; expected a [search] table".to_string()),
+        )
+    })?;
+
+    let (timeout, _t_src) = sd::resolve_timeout_ms(
+        cli_timeout,
+        sd::timeout_env().as_deref(),
+        defaults.timeout_ms,
+    )
+    .map_err(|e| {
+        CliError::usage(
+            e,
+            Some("Set a non-negative integer of milliseconds".to_string()),
+        )
+    })?;
+
+    let cli_mode_str = cli_mode.map(search_mode_canonical_str);
+    let (mode_str, _m_src) = sd::resolve_mode(
+        cli_mode_str,
+        sd::mode_env().as_deref(),
+        defaults.mode.as_deref(),
+    )
+    .map_err(|e| CliError::usage(e, Some("Use one of: lexical, semantic, hybrid".to_string())))?;
+    let mode = mode_str.and_then(|m| search_mode_from_canonical_str(&m));
+
+    // Window limits: read the raw env strings here and let P08a's pure resolver
+    // own the precedence and validation. The bindings outlive the borrow that
+    // `WindowLimitInputs` takes.
+    let env_rrf = dotenvy::var("CASS_RRF_LIMIT").ok();
+    let env_rerank = dotenvy::var("CASS_RERANK_LIMIT").ok();
+    let env_legacy_limit = dotenvy::var("CASS_SEARCH_LIMIT").ok();
+    let resolved = sd::resolve_window_limits(sd::WindowLimitInputs {
+        rerank,
+        cli_rrf,
+        cli_rerank,
+        env_rrf: env_rrf.as_deref(),
+        env_rerank: env_rerank.as_deref(),
+        env_legacy_limit: env_legacy_limit.as_deref(),
+        config: &defaults,
+    })
+    .map_err(|e| {
+        CliError::usage(
+            e,
+            Some(
+                "Use --rrf-limit N and --rerank-limit K (or CASS_RRF_LIMIT / CASS_RERANK_LIMIT)."
+                    .to_string(),
+            ),
+        )
+    })?;
+
+    Ok(SearchWindowDefaults {
+        timeout_ms: timeout,
+        mode,
+        rrf_limit: resolved.rrf_limit,
+        rerank_limit: resolved.rerank_limit,
+        rerank_provider,
+    })
 }
 
 /// Canonical lowercase name for a [`crate::search::query::SearchMode`].
@@ -78736,9 +79033,19 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Default search/pack timeout in milliseconds (0 = no timeout). The --timeout flag overrides; also configurable via [search].timeout_ms in ~/.config/cass/cass.toml. Alias: CASS_SEARCH_TIMEOUT.",
         ),
         env_var_capability(
+            "CASS_RRF_LIMIT",
+            None,
+            "Default search rrf candidate window N. The --rrf-limit flag overrides; also [search].rrf_limit in ~/.config/cass/cass.toml.",
+        ),
+        env_var_capability(
+            "CASS_RERANK_LIMIT",
+            None,
+            "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml.",
+        ),
+        env_var_capability(
             "CASS_SEARCH_LIMIT",
             None,
-            "Default search/pack result limit (0 = no limit, RAM-capped). The --limit flag overrides; also [search].limit in ~/.config/cass/cass.toml.",
+            "Legacy pack result limit (0 = no limit, RAM-capped). Consumed by `cass pack` via [search].limit; `cass search` rejects it with a migration error and uses CASS_RRF_LIMIT instead.",
         ),
         env_var_capability(
             "CASS_SEARCH_MODE",
@@ -78928,21 +79235,21 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
         workflow_capability(
             "bounded-search",
             "Search sessions without flooding the caller's token budget.",
-            "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+            "cass search \"<query>\" --robot --rrf-limit 10 --fields summary --max-content-length 800 --robot-meta",
             &[
                 "cass view <source_path> -n <line_number> --json",
                 "cass expand <source_path> --line <line_number> -C 3 --json",
                 "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10",
             ],
             "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
-            "Prefer an explicit --limit in automation; limit 0 intentionally means unbounded.",
+            "Prefer an explicit --rrf-limit in automation; an omitted window keeps the legacy unbounded fetch.",
         ),
         workflow_capability(
             "answer-pack",
             "Build a deterministic cited handoff bundle for another agent.",
             "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
             &[
-                "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
+                "cass search \"<question>\" --robot --rrf-limit 10 --fields provenance --robot-meta",
                 "cass view <source_path> -n <line_number> --json",
             ],
             "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
@@ -78993,8 +79300,8 @@ fn mistake_recovery_capability(
 fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
     vec![
         mistake_recovery_capability(
-            "cass searh \"query\" --robot --limit 10",
-            "cass search \"query\" --robot --limit 10",
+            "cass searh \"query\" --robot --rrf-limit 10",
+            "cass search \"query\" --robot --rrf-limit 10",
             true,
             "Levenshtein command recovery corrects the top-level subcommand typo.",
         ),
@@ -79023,8 +79330,8 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search.",
         ),
         mistake_recovery_capability(
-            "cass search \"query\" limit=5",
-            "cass search \"query\" --limit 5",
+            "cass search \"query\" agent=codex",
+            "cass search \"query\" --agent codex",
             true,
             "Bare key=value arguments are promoted to known long flags.",
         ),
@@ -79216,21 +79523,21 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
         ),
         mistake_recovery_capability(
             "cass search auth --max-results 5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "A common result-count alias is converted to the canonical limit flag.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "Result-count aliases are refused on cass search; use --rrf-limit N (candidate window) or --rerank-limit K.",
         ),
         mistake_recovery_capability(
             "cass search auth --max_results 5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "Snake_case long flags are normalized to kebab-case before alias recovery runs.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "Snake_case long flags are normalized to kebab-case, but the result-count alias is then refused on cass search; use --rrf-limit N.",
         ),
         mistake_recovery_capability(
             "cass search auth max_results=5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "A bare result-count assignment is converted to the canonical limit flag.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "A bare result-count assignment is refused on cass search; use --rrf-limit N.",
         ),
         mistake_recovery_capability(
             "cass search auth agent=codex days=7 fields=minimal --json",
@@ -79257,22 +79564,22 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "Provider/tool/connector filter aliases are converted to the canonical agent filter.",
         ),
         mistake_recovery_capability(
-            "cass search auth provider codex limit 5 last 7d --json",
-            "cass search auth --agent codex --limit 5 --since -7d --json",
+            "cass search auth provider codex last 7d --json",
+            "cass search auth --agent codex --since -7d --json",
             true,
             "Bare filter key/value pairs after a query are converted before remaining words are folded into the query.",
         ),
         mistake_recovery_capability(
-            "cass search --agent codex --limit 5 auth error --json",
-            "cass search \"auth error\" --agent codex --limit 5 --json",
+            "cass search --agent codex --rrf-limit 5 auth error --json",
+            "cass search \"auth error\" --agent codex --rrf-limit 5 --json",
             true,
             "A query placed after leading search/pack filters is moved back to the required query positional.",
         ),
         mistake_recovery_capability(
             "cass search auth -n 5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "A familiar short result-count spelling is converted to the canonical limit flag.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "The short result-count spelling is refused on cass search; use --rrf-limit N.",
         ),
     ]
 }
@@ -80195,6 +80502,8 @@ fn argument_schema_from_clap(arg: &Arg) -> ArgumentSchema {
 
 const INTEGER_ARG_NAMES: &[&str] = &[
     "limit",
+    "rrf-limit",
+    "rerank-limit",
     "offset",
     "max-content-length",
     "max-tokens",
