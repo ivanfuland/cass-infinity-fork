@@ -253,7 +253,6 @@ fn source_alias_values_are_not_migration_errors() {
         "--tool",
         "--connector",
         "--agent-type",
-        "--role",
         "--agent",
     ] {
         let out = run(
@@ -296,6 +295,53 @@ fn source_alias_values_are_not_migration_errors() {
             combined(&out)
         );
     }
+}
+
+#[test]
+fn role_value_is_validated_not_treated_as_a_count_alias() {
+    // `--role` takes a value too, but unlike the source aliases the product
+    // validates it: `--role limit=5` is an invalid-role usage error, not a
+    // legacy-count migration error. A valid role still succeeds.
+    let env = Env::new();
+
+    let bad = run(
+        &env,
+        &[
+            "search",
+            "probe",
+            "--mode",
+            "lexical",
+            "--dry-run",
+            "--json",
+            "--role",
+            "limit=5",
+        ],
+    );
+    assert_eq!(code(&bad), 2, "unknown role must be a usage error:\n{}", combined(&bad));
+    let text = combined(&bad);
+    assert!(
+        text.to_lowercase().contains("role"),
+        "error must name the invalid role:\n{text}"
+    );
+    assert!(
+        !text.contains("no longer supported"),
+        "unknown role must not be reported as a legacy count migration:\n{text}"
+    );
+
+    let good = run(
+        &env,
+        &[
+            "search",
+            "probe",
+            "--mode",
+            "lexical",
+            "--dry-run",
+            "--json",
+            "--role",
+            "tool",
+        ],
+    );
+    assert_eq!(code(&good), 0, "a valid role must succeed:\n{}", combined(&good));
 }
 
 #[test]
