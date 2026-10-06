@@ -281,7 +281,7 @@ fn surface_command(
                     "search".to_string(),
                     "hello".to_string(),
                     "--json".to_string(),
-                    "--limit".to_string(),
+                    "--rrf-limit".to_string(),
                     "2".to_string(),
                     "--data-dir".to_string(),
                     demo_data.to_string(),
