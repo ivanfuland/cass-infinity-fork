@@ -30283,7 +30283,7 @@ mod pr9_candidate_meta_output_tests {
             (header, hits)
         } else {
             let payload: Value = if matches!(format, RobotFormat::Toon) {
-                toon::try_decode(text, None).expect("TOON decodes")
+                toon::try_decode(text, None).expect("TOON decodes").into()
             } else {
                 serde_json::from_str(text).expect("JSON decodes")
             };

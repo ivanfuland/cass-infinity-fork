@@ -1964,7 +1964,7 @@ fn p10_structured_output(output: &Output, format: &str) -> serde_json::Value {
             );
             header
         }
-        "toon" => toon::try_decode(text, None).expect("decode actual TOON"),
+        "toon" => toon::try_decode(text, None).expect("decode actual TOON").into(),
         _ => serde_json::from_str(text).expect("decode actual JSON"),
     }
 }
