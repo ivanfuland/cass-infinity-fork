@@ -219,7 +219,8 @@ fn response_for(mode: StubMode, request: &RecordedRequest) -> Vec<u8> {
             .into_bytes();
     }
     if request.path == "/embeddings" {
-        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("embedding body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("embedding body");
         assert_eq!(body["model"], EMBED_MODEL);
         let inputs = body["input"].as_array().expect("embedding inputs");
         let data: Vec<_> = (0..inputs.len())
@@ -1625,7 +1626,10 @@ fn assert_frozen_aggregate_statistics(semantic: bool) {
     let second = env.run(&as_args(&next));
     assert_success(&second, "continuation with aggregate/explain");
     let second_payload = stdout_json(&second);
-    assert_eq!(second_payload["total_matches"], first_payload["total_matches"]);
+    assert_eq!(
+        second_payload["total_matches"],
+        first_payload["total_matches"]
+    );
     assert_eq!(
         second_payload["_meta"]["cursor_manifest"]["count_precision"],
         first_payload["_meta"]["cursor_manifest"]["count_precision"]
