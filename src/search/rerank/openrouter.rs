@@ -77,7 +77,9 @@ impl OpenRouterBackend {
             std::env::VarError::NotPresent => {
                 RerankError::new(RerankFailureReason::MissingCredentials)
             }
-            std::env::VarError::NotUnicode(_) => RerankError::new(RerankFailureReason::InvalidInput),
+            std::env::VarError::NotUnicode(_) => {
+                RerankError::new(RerankFailureReason::InvalidInput)
+            }
         })?;
         let token = raw.trim();
         if token.is_empty() {
@@ -85,7 +87,10 @@ impl OpenRouterBackend {
         }
 
         let transport = HttpTransport::new(production_config(), Some(token.to_string()))?;
-        Ok(Self { provider, transport })
+        Ok(Self {
+            provider,
+            transport,
+        })
     }
 
     /// Send one fixed public pair through the normal call path.
@@ -184,7 +189,10 @@ fn invalid_response() -> RerankError {
 ///
 /// A missing or null field proves nothing; a non-empty string must be an
 /// accepted alias for the selection; any other value is unparseable.
-fn parse_actual_model(body: &Value, provider: ProviderChoice) -> Result<Option<String>, RerankError> {
+fn parse_actual_model(
+    body: &Value,
+    provider: ProviderChoice,
+) -> Result<Option<String>, RerankError> {
     match body.get("model") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(model)) => {
@@ -647,7 +655,11 @@ mod tests {
             }),
         );
         let fixture = Fixture::spawn(reply);
-        let backend = backend_for(ProviderChoice::OpenrouterVoyage25Lite, &fixture.base(), &token);
+        let backend = backend_for(
+            ProviderChoice::OpenrouterVoyage25Lite,
+            &fixture.base(),
+            &token,
+        );
 
         let response = backend
             .rerank("q", &["a".to_string(), "b".to_string(), "c".to_string()])
@@ -684,7 +696,11 @@ mod tests {
             ),
         ] {
             let fixture = Fixture::spawn(reply);
-            let backend = backend_for(ProviderChoice::OpenrouterCohere4Fast, &fixture.base(), &token);
+            let backend = backend_for(
+                ProviderChoice::OpenrouterCohere4Fast,
+                &fixture.base(),
+                &token,
+            );
             let response = backend
                 .rerank("q", &["d".to_string()])
                 .unwrap_or_else(|err| panic!("{label} failed: {err}"));
@@ -745,7 +761,11 @@ mod tests {
                 .rerank("q", &documents)
                 .err()
                 .expect("a bad model field must fail");
-            assert_eq!(err.reason, RerankFailureReason::InvalidResponse, "model {label}");
+            assert_eq!(
+                err.reason,
+                RerankFailureReason::InvalidResponse,
+                "model {label}"
+            );
         }
     }
 
@@ -761,7 +781,11 @@ mod tests {
             ("null", Some(json!(null)), None),
             ("fireworks", Some(json!("Fireworks")), Some("Fireworks")),
             ("cohere", Some(json!("cohere")), Some("cohere")),
-            ("arbitrary", Some(json!("some-new-host")), Some("some-new-host")),
+            (
+                "arbitrary",
+                Some(json!("some-new-host")),
+                Some("some-new-host"),
+            ),
         ] {
             let mut body = json!({
                 "results": [{"index": 0, "relevance_score": 0.5}]
@@ -770,7 +794,11 @@ mod tests {
                 body["provider"] = value;
             }
             let fixture = Fixture::spawn(json_reply("200 OK", body));
-            let backend = backend_for(ProviderChoice::OpenrouterVoyage25Lite, &fixture.base(), &token);
+            let backend = backend_for(
+                ProviderChoice::OpenrouterVoyage25Lite,
+                &fixture.base(),
+                &token,
+            );
             let response = backend
                 .rerank("q", &documents)
                 .unwrap_or_else(|err| panic!("{label} failed: {err}"));
@@ -796,12 +824,20 @@ mod tests {
                 }),
             );
             let fixture = Fixture::spawn(reply);
-            let backend = backend_for(ProviderChoice::OpenrouterVoyage25Lite, &fixture.base(), &token);
+            let backend = backend_for(
+                ProviderChoice::OpenrouterVoyage25Lite,
+                &fixture.base(),
+                &token,
+            );
             let err = backend
                 .rerank("q", &documents)
                 .err()
                 .expect("a bad provider field must fail");
-            assert_eq!(err.reason, RerankFailureReason::InvalidResponse, "provider {label}");
+            assert_eq!(
+                err.reason,
+                RerankFailureReason::InvalidResponse,
+                "provider {label}"
+            );
         }
     }
 
@@ -986,7 +1022,10 @@ mod tests {
         assert_eq!(err.http_status, Some(500));
 
         let rendered = format!("{err}");
-        assert!(!rendered.contains(&secret), "response body leaked: {rendered}");
+        assert!(
+            !rendered.contains(&secret),
+            "response body leaked: {rendered}"
+        );
         assert!(!rendered.contains(&token), "token leaked: {rendered}");
         assert_eq!(fixture.hits(), 1);
     }
@@ -998,7 +1037,11 @@ mod tests {
             "200 OK",
             json!({"results": [{"index": 0, "relevance_score": 0.0}]}),
         ));
-        let backend = backend_for(ProviderChoice::OpenrouterCohere4Fast, &fixture.base(), &token);
+        let backend = backend_for(
+            ProviderChoice::OpenrouterCohere4Fast,
+            &fixture.base(),
+            &token,
+        );
 
         let response = backend
             .probe_ready()
@@ -1057,7 +1100,9 @@ mod tests {
                     assert_eq!(err.reason, RerankFailureReason::MissingCredentials);
                 }
                 for local in [ProviderChoice::Qwen3Local, ProviderChoice::BgeLocal] {
-                    let err = from_env(local).err().expect("a local selection must be refused");
+                    let err = from_env(local)
+                        .err()
+                        .expect("a local selection must be refused");
                     assert_eq!(err.reason, RerankFailureReason::UnsupportedProvider);
                 }
             }
@@ -1076,7 +1121,9 @@ mod tests {
                     assert_eq!(backend.provider, provider);
                 }
                 for local in [ProviderChoice::Qwen3Local, ProviderChoice::BgeLocal] {
-                    let err = from_env(local).err().expect("a local selection must be refused");
+                    let err = from_env(local)
+                        .err()
+                        .expect("a local selection must be refused");
                     assert_eq!(err.reason, RerankFailureReason::UnsupportedProvider);
                 }
             }
@@ -1122,7 +1169,10 @@ mod tests {
     fn from_env_credential_and_selection_boundaries() {
         for scenario in ["missing", "empty", "whitespace", "valid"] {
             let status = spawn_env_child(scenario);
-            assert!(status.success(), "child scenario {scenario} failed: {status:?}");
+            assert!(
+                status.success(),
+                "child scenario {scenario} failed: {status:?}"
+            );
         }
         #[cfg(unix)]
         {
