@@ -239,8 +239,19 @@
           ]
         },
         {
-          "name": "build-hnsw",
-          "description": "Build HNSW index for approximate nearest neighbor search (requires --semantic). Enables O(log n) search with `--approximate` flag at query time",
+          "name": "no-ingest",
+          "description": "PR6 T5: skip the entire source scan/ingest phase and only run the semantic hole-draining/reconciliation. Requires `--semantic`; refuses `--watch`, `--watch-once`, `--full` and `--force-rebuild` (exit 2). Used by the T12 protocol v2 exam hall so the corpus stays identical",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "ingest",
+          "description": "PR8 C8: state the scan/ingest intent explicitly. Mutually exclusive with `--no-ingest` (both together is a usage error). A bare `cass index --semantic` still ingests -- the default is unchanged -- but it now says so on stderr, so a read-only semantic run can never be started by omission",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -251,11 +262,11 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (hash, fastembed)",
+          "description": "Embedder to use for semantic indexing (infinity, hash; `fastembed` requires the `semantic` build feature, retired in this build -- R1-W3-N2: defaults to `infinity` under the `infinity` feature so a bare `cass index --semantic` reaches the DB vector domain instead of the retired default)",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
-          "default": "fastembed"
+          "default": "infinity"
         },
         {
           "name": "data-dir",
@@ -303,6 +314,66 @@
         {
           "name": "robot-trace-ingest",
           "description": "Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "sync",
+      "description": "One incremental sync round: pull configured mirrors, ingest local sessions, drain the semantic domain, report once as JSON",
+      "arguments": [
+        {
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "data-dir",
+          "description": "Override data dir (mirror + db + logs). Defaults to platform data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "no-ingest",
+          "description": "Do not pull mirrors and do not scan local roots -- only drain the derived semantic holes. Implies `--no-mirror` and reads no `sources.toml`",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "no-mirror",
+          "description": "Skip the remote mirror stage but still ingest local sessions",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -420,12 +491,32 @@
           "repeatable": true
         },
         {
-          "name": "limit",
-          "description": "Max results. 0 = \"no limit\" but is auto-capped to a RAM-proportional ceiling (1/16 of MemAvailable, clamped to [256 MiB, 16 GiB] of result-heap) so a single query can't tie up the whole machine. Override with CASS_SEARCH_NO_LIMIT_CAP=<hits> or CASS_SEARCH_NO_LIMIT_BYTES=<bytes>",
+          "name": "rrf-limit",
+          "description": "Candidate window size N: the rrf-fusion/dedup/filter bound fetched before pagination. The default depends on context: with --rerank it is 200; without --rerank an omitted N keeps the legacy unbounded fetch (internal 0). An explicit 0 is always rejected. Valid with or without --rerank; when --rerank is off it is the fetch bound that replaces the removed search count flag. Resolved with CLI > CASS_RRF_LIMIT > [search].rrf_limit > default precedence. A window whose N+1 overflows usize/i64 is rejected before any DB or model work",
           "arg_type": "option",
           "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "rerank-limit",
+          "description": "Per-page result count K when --rerank is enabled. Default 5; must be at least 1 and at most the rrf window N. An explicit 0 is rejected. Passing an explicit value without --rerank is a usage error, and env/config K values are ignored when --rerank is off",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "rerank-provider",
+          "description": "Rerank backend selection. Requires --rerank. Exactly one of qwen3-local (the default when omitted), bge-local, openrouter-qwen3-8b, openrouter-cohere-4-fast, openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage error. Nothing is read from env or config; omitting it never selects a cloud backend",
+          "arg_type": "option",
+          "value_type": "enum",
           "required": false,
-          "default": "0"
+          "enum_values": [
+            "qwen3-local",
+            "bge-local",
+            "openrouter-qwen3-8b",
+            "openrouter-cohere-4-fast",
+            "openrouter-voyage-2.5-lite"
+          ]
         },
         {
           "name": "offset",
@@ -563,7 +654,7 @@
         },
         {
           "name": "aggregate",
-          "description": "Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type` Returns buckets with counts instead of full results. Use with --limit to get both",
+          "description": "Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type` Returns buckets with counts instead of full results. Use with --rrf-limit to get both",
           "arg_type": "option",
           "value_type": "string",
           "required": false,
@@ -644,17 +735,6 @@
           ]
         },
         {
-          "name": "approximate",
-          "description": "Use approximate nearest neighbor (ANN) search with HNSW for faster semantic/hybrid queries. Trades slight accuracy loss for O(log n) search complexity instead of O(n). Only affects semantic and hybrid modes; ignored for lexical search. Requires an HNSW index built with `cass index --semantic --approximate`",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
           "name": "model",
           "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
           "arg_type": "option",
@@ -693,39 +773,6 @@
         {
           "name": "no-daemon",
           "description": "Disable daemon usage even if available (force direct inference)",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "two-tier",
-          "description": "Enable two-tier progressive search: fast results immediately, refined via daemon. Returns initial results from fast embedder (~1ms), then refines with quality embedder via daemon (~130ms). Best of both worlds for interactive search",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "fast-only",
-          "description": "Fast-only search: use lightweight embedder for instant results, no refinement. Ideal for real-time search-as-you-type scenarios where latency is critical",
-          "arg_type": "flag",
-          "required": false,
-          "default": "false",
-          "enum_values": [
-            "true",
-            "false"
-          ]
-        },
-        {
-          "name": "quality-only",
-          "description": "Quality-only search: wait for full transformer model results. Higher latency (~130ms) but most accurate semantic matching. Requires daemon to be available; falls back to fast if unavailable",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -1037,8 +1084,206 @@
       "has_json_output": true
     },
     {
+      "name": "mirror-relink",
+      "description": "Show statistics about indexed data Rebuild raw-mirror manifest `db_links` from real identity (dry-run by default)",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "apply",
+          "description": "Actually write the rebuilt db_links. Without this flag nothing is written",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "journal",
+          "description": "本轮的 journal 落点。给了它，`--apply` 走**带 journal 的**那条路 （七态推进 + receipt），崩溃后可以 `--recover --journal <同一路径>` 收敛。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "recover",
+          "description": "崩溃后收敛：**输入只有磁盘上的 journal**。",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "mirror-restore",
+      "description": "Plan (and optionally apply) a restore from the sealed raw-mirror into a candidate database",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "mirror 面的根。**入参而非常量** —— E8 给封存件只读面， E8b 换 materialize 出来的可写工作树。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "candidate-db",
+          "description": "候选 DB 的稳定副本。dry-run 只读它。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "scratch",
+          "description": "投影物化用的隔离根。**不进任何判定**。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "snapshot-root",
+          "description": "本轮消费的封存件根。",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "out",
+          "description": "六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "apply",
+          "description": "真正执行计划。",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "recover",
+          "description": "崩溃后收敛：**输入只有磁盘上的 journal + receipt**。 没有这个入口，七态恢复器就只有测试能调 —— 而操作者在真崩之后无路可走。",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "qualify",
+          "description": "只跑**解析级资格门**（不写任何东西）：解析 W1 commit marker 并逐层复核 journal 终态 / closure verdict / 双身份 / receipt 交叉核 / 代际。",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "deep-verify",
+          "description": "`--qualify` 的**深度档**：把每个 blob 的真实字节全读一遍重算 blake3。",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "journal",
+          "description": "`--apply` 的 journal 落点（七态状态机的真源）。`--apply` 时必需。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "marker",
+          "description": "W1 commit marker 的落点。**不给则默认与候选 DB 同居** （`<db 所在目录>/w1-commit-marker.json`）—— wire 说明定的就是这个约定， 由 CLI 兑现它，而不是让每个调用方自己拼一遍。",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "generation",
+          "description": "本次 restore 推进到的内容代际。`--apply` 时必需。",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "stats",
-      "description": "Show statistics about indexed data",
+      "description": "",
       "arguments": [
         {
           "name": "data-dir",
@@ -2924,6 +3169,12 @@
     {
       "name": "import",
       "description": "Import data from external sources",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "ingest",
+      "description": "Staging reingest candidate-inventory and coverage tooling (plan v6 Stage C)",
       "arguments": [],
       "has_json_output": false
     },
@@ -27722,7 +27973,18 @@
               "type": "boolean",
               "description": "True when CASS_RESPONSIVENESS_DISABLE pins capacity at 100%."
             },
-            "last_snapshot": "[LIVE_SAMPLE]",
+            "last_snapshot": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "properties": {
+                "load_per_core": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
                 "psi_cpu_some_avg10": {
                   "type": [
                     "number",
@@ -29968,6 +30230,9 @@
                   "type": "integer"
                 }
               }
+            },
+            "rerank_applied": {
+              "type": "boolean"
             },
             "tokens_estimated": {
               "type": [
