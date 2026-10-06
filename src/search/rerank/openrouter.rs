@@ -1,8 +1,222 @@
-//! Shared OpenRouter rerank adapter (three models).
+//! Shared OpenRouter rerank adapter for the three cloud selections.
 //!
-//! Reserved for P07. This ticket implements the shared adapter for the three
-//! OpenRouter selections; the tests below pin its contract before the adapter
-//! exists.
+//! All three OpenRouter selections (`openrouter-qwen3-8b`,
+//! `openrouter-cohere-4-fast`, `openrouter-voyage-2.5-lite`) run through this
+//! one adapter: only the request model differs, so there is no per-vendor
+//! client and no historical serving-provider list is baked in here.
+//!
+//! - [`OpenRouterBackend::from_env`] is the production constructor. It refuses
+//!   the two local selections, reads only `OPENROUTER_API_KEY`, and sends no
+//!   HTTP request.
+//! - [`DEFAULT_ORIGIN`] and the fixed `RERANK_PATH` pin the production
+//!   endpoint; there is no environment or CLI override.
+//! - [`OpenRouterBackend::probe_ready`] sends one fixed public pair through the
+//!   same code path, for a later readiness check.
+//!
+//! Request and response are deliberately narrow. The request body carries only
+//! `model`, `query`, `documents`, `top_n` and `provider.allow_fallbacks`; the
+//! response is reduced to input-order scores plus proven identity fields. No
+//! response body, query, document, credential or request payload can reach an
+//! error value or a log line: the adapter emits no tracing and every failure is
+//! a short code, plus an HTTP status when one was observed.
+
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use super::http::{HttpConfig, HttpTransport};
+use super::types::{
+    CallIdentity, ProviderChoice, RerankBackend, RerankError, RerankFailureReason, RerankResponse,
+    validate_index_scores,
+};
+
+/// The fixed production origin of the OpenRouter rerank service.
+///
+/// P09 binds this value, and production construction uses the same constant, so
+/// the two can never drift apart.
+pub const DEFAULT_ORIGIN: &str = "https://openrouter.ai";
+
+/// The fixed production rerank path. There is no environment or CLI override.
+const RERANK_PATH: &str = "/api/v1/rerank";
+
+/// The only credential source this adapter reads.
+const API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// The fixed text [`OpenRouterBackend::probe_ready`] sends.
+const PROBE_TEXT: &str = "rerank readiness probe";
+
+/// The shared OpenRouter adapter for the three cloud selections.
+///
+/// It holds the bearer token inside its transport, so it deliberately
+/// implements neither `Debug` nor `Serialize`.
+pub struct OpenRouterBackend {
+    provider: ProviderChoice,
+    transport: HttpTransport,
+}
+
+impl OpenRouterBackend {
+    /// Build the production adapter for `provider` from the process environment.
+    ///
+    /// Only `OPENROUTER_API_KEY` is read; no other provider key and no
+    /// credential file is consulted. The two local selections are refused, a
+    /// missing or blank key is [`RerankFailureReason::MissingCredentials`] and a
+    /// non-Unicode key is [`RerankFailureReason::InvalidInput`]. Every one of
+    /// those failures is decided before a transport exists, so the constructor
+    /// sends no request.
+    pub fn from_env(provider: ProviderChoice) -> Result<Self, RerankError> {
+        match provider {
+            ProviderChoice::Qwen3Local | ProviderChoice::BgeLocal => {
+                return Err(RerankError::new(RerankFailureReason::UnsupportedProvider));
+            }
+            ProviderChoice::OpenrouterQwen38b
+            | ProviderChoice::OpenrouterCohere4Fast
+            | ProviderChoice::OpenrouterVoyage25Lite => {}
+        }
+
+        let raw = std::env::var(API_KEY_ENV).map_err(|err| match err {
+            std::env::VarError::NotPresent => {
+                RerankError::new(RerankFailureReason::MissingCredentials)
+            }
+            std::env::VarError::NotUnicode(_) => RerankError::new(RerankFailureReason::InvalidInput),
+        })?;
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(RerankError::new(RerankFailureReason::MissingCredentials));
+        }
+
+        let transport = HttpTransport::new(production_config(), Some(token.to_string()))?;
+        Ok(Self { provider, transport })
+    }
+
+    /// Send one fixed public pair through the normal call path.
+    ///
+    /// This exists so a later ticket can verify readiness without an extra
+    /// request during ordinary search.
+    pub fn probe_ready(&self) -> Result<RerankResponse, RerankError> {
+        let documents = [PROBE_TEXT.to_string()];
+        self.call(PROBE_TEXT, &documents)
+    }
+
+    /// Send one request and reduce it to input-order scores plus identity.
+    fn call(&self, query: &str, documents: &[String]) -> Result<RerankResponse, RerankError> {
+        if query.trim().is_empty()
+            || documents.is_empty()
+            || documents.iter().any(|document| document.trim().is_empty())
+        {
+            return Err(RerankError::new(RerankFailureReason::InvalidInput));
+        }
+
+        let started = Instant::now();
+        let body = serde_json::json!({
+            "model": self.provider.request_model(),
+            "query": query,
+            "documents": documents,
+            "top_n": documents.len(),
+            "provider": { "allow_fallbacks": false },
+        });
+
+        let response = self.transport.post_json(RERANK_PATH, &body)?;
+        let expected = documents.len();
+
+        let results = response.body.get("results").ok_or_else(invalid_response)?;
+        let scores = validate_index_scores(results, expected)?;
+        let actual_model = parse_actual_model(&response.body, self.provider)?;
+        let serving_provider = parse_serving_provider(&response.body)?;
+
+        Ok(RerankResponse {
+            scores,
+            identity: CallIdentity {
+                actual_provider: Some(self.provider),
+                actual_model,
+                serving_provider,
+            },
+            http_requests: 1,
+            duration_ms: started.elapsed().as_millis() as u64,
+        })
+    }
+}
+
+impl RerankBackend for OpenRouterBackend {
+    fn provider(&self) -> ProviderChoice {
+        self.provider
+    }
+
+    fn rerank(&self, query: &str, documents: &[String]) -> Result<RerankResponse, RerankError> {
+        self.call(query, documents)
+    }
+}
+
+/// The test-only constructor: inject a transport pointed at a local fixture.
+///
+/// This is compiled only under `#[cfg(test)]`, so no product path can redirect
+/// a real credential to another endpoint.
+#[cfg(test)]
+impl OpenRouterBackend {
+    fn with_transport(provider: ProviderChoice, transport: HttpTransport) -> Self {
+        Self {
+            provider,
+            transport,
+        }
+    }
+}
+
+/// The fixed production transport configuration.
+///
+/// The origin is [`DEFAULT_ORIGIN`] and the path is imposed by the adapter, so
+/// there is no environment or CLI override. `local_only` stays false because the
+/// service is remote; the three budgets and the bearer come from the shared P02
+/// transport.
+fn production_config() -> HttpConfig {
+    HttpConfig {
+        base_url: DEFAULT_ORIGIN.to_string(),
+        local_only: false,
+        timeout: Duration::from_secs(60),
+        connect_timeout: Duration::from_secs(5),
+        max_response_bytes: 64 * 1024 * 1024,
+    }
+}
+
+fn invalid_response() -> RerankError {
+    RerankError::new(RerankFailureReason::InvalidResponse)
+}
+
+/// Reduce the response's `model` field to proven identity evidence.
+///
+/// A missing or null field proves nothing; a non-empty string must be an
+/// accepted alias for the selection; any other value is unparseable.
+fn parse_actual_model(body: &Value, provider: ProviderChoice) -> Result<Option<String>, RerankError> {
+    match body.get("model") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(model)) => {
+            if model.is_empty() {
+                return Err(invalid_response());
+            }
+            if !provider.accepts_model(model.as_str()) {
+                return Err(RerankError::new(RerankFailureReason::ModelIdentityMismatch));
+            }
+            Ok(Some(model.to_string()))
+        }
+        Some(_) => Err(invalid_response()),
+    }
+}
+
+/// Reduce the response's `provider` field to the value the service claimed.
+///
+/// The value is recorded as-is and is not checked against any historical
+/// serving-provider list. A present but empty, control-bearing or non-string
+/// value is unparseable, and absence proves only `None`.
+fn parse_serving_provider(body: &Value) -> Result<Option<String>, RerankError> {
+    match body.get("provider") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => {
+            if name.is_empty() || name.chars().any(char::is_control) {
+                return Err(invalid_response());
+            }
+            Ok(Some(name.to_string()))
+        }
+        Some(_) => Err(invalid_response()),
+    }
+}
 
 #[cfg(test)]
 mod tests {
