@@ -4472,6 +4472,9 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "workspace"
             | "limit"
             | "offset"
+            | "rrf-limit"
+            | "rerank-limit"
+            | "rerank-provider"
             | "fields"
             | "max-content-length"
             | "max_content_length"
@@ -4983,14 +4986,17 @@ fn legacy_search_limit_spelling(rest: &[String]) -> Option<String> {
 
 /// The short migration error for a legacy `cass search` result-count spelling.
 /// The offending spelling is the caller's own argument, so echoing it is safe
-/// and clarifies which token to replace.
+/// and clarifies which token to replace. The replacement flags are named in the
+/// message itself so they survive the human (non-JSON) error rendering, which
+/// prints only the message and not the hint.
 fn legacy_search_limit_migration_error(spelling: &str) -> CliError {
     CliError::usage(
-        format!("`cass search {spelling}` is no longer supported"),
+        format!(
+            "`cass search {spelling}` is no longer supported; use --rrf-limit N (candidate window) \
+             or --rerank-limit K (per-page rerank count)"
+        ),
         Some(
-            "cass search now uses --rrf-limit N (candidate window) and --rerank-limit K \
-             (per-page rerank count). Replace the legacy result-count flag or alias with one \
-             of those."
+            "Replace the legacy result-count flag or alias with --rrf-limit N or --rerank-limit K."
                 .to_string(),
         ),
     )
@@ -5234,6 +5240,9 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
         "top_k",
         "n",
         "offset",
+        "rrf-limit",
+        "rerank-limit",
+        "rerank-provider",
         "agent",
         "provider",
         "tool",
@@ -7205,14 +7214,13 @@ async fn execute_cli(
                         refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
 
-                    let semantic_opts = SemanticSearchOptions {
-                        model: model.clone(),
+                    let semantic_opts = semantic_search_options_from_defaults(
+                        model.clone(),
                         rerank,
-                        reranker: reranker.clone(),
-                        use_daemon: daemon && !no_daemon,
-                        rerank_limit: defaults.rerank_limit,
-                        rerank_provider: defaults.rerank_provider,
-                    };
+                        reranker.clone(),
+                        daemon && !no_daemon,
+                        &defaults,
+                    );
 
                     // Only pass through robot_format when it was explicitly
                     // requested (CLI flag or env var). Returning `None` here
@@ -23297,6 +23305,45 @@ struct SearchWindowDefaults {
     rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
+/// Map the resolved search defaults onto the [`SemanticSearchOptions`] carried
+/// into the search engine. Extracted from the dispatch so the mapping (which
+/// propagates the per-page rerank window K and the selected backend) is
+/// unit-testable without opening a database.
+fn semantic_search_options_from_defaults(
+    model: Option<String>,
+    rerank: bool,
+    reranker: Option<String>,
+    use_daemon: bool,
+    defaults: &SearchWindowDefaults,
+) -> SemanticSearchOptions {
+    SemanticSearchOptions {
+        model,
+        rerank,
+        reranker,
+        use_daemon,
+        rerank_limit: defaults.rerank_limit,
+        rerank_provider: defaults.rerank_provider,
+    }
+}
+
+/// Pure inputs for [`resolve_search_window_defaults_from`]. Every env/config
+/// value is passed in, so the resolution logic is unit-testable without
+/// touching process-global env or the real config file.
+struct SearchWindowInputs<'a> {
+    rerank: bool,
+    cli_rrf: Option<usize>,
+    cli_rerank: Option<usize>,
+    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
+    cli_timeout: Option<u64>,
+    cli_mode: Option<crate::search::query::SearchMode>,
+    env_timeout: Option<&'a str>,
+    env_mode: Option<&'a str>,
+    env_rrf: Option<&'a str>,
+    env_rerank: Option<&'a str>,
+    env_legacy_limit: Option<&'a str>,
+    config: &'a crate::search_defaults::SearchDefaults,
+}
+
 /// Resolve the effective `cass search` defaults in a single pass.
 ///
 /// This is the search-only sibling of [`resolve_search_defaults`], which stays
@@ -23318,65 +23365,86 @@ fn resolve_search_window_defaults(
     cli_rerank: Option<usize>,
     cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
 ) -> CliResult<SearchWindowDefaults> {
-    use crate::search::rerank::types::ProviderChoice;
     use crate::search_defaults as sd;
 
-    // The provider only exists when reranking is on. An explicit selection with
-    // --rerank off is a usage error, not a silently ignored flag.
-    if !rerank && cli_provider.is_some() {
-        return Err(CliError::usage(
-            "--rerank-provider requires --rerank",
-            Some("Enable --rerank to select a rerank backend, or drop --rerank-provider.".to_string()),
-        ));
-    }
-    let rerank_provider = if rerank {
-        Some(cli_provider.unwrap_or(ProviderChoice::Qwen3Local))
-    } else {
-        None
-    };
-
-    let defaults = sd::load_search_defaults().map_err(|e| {
+    let config = sd::load_search_defaults().map_err(|e| {
         CliError::usage(
             e.to_string(),
             Some("Fix or remove ~/.config/cass/cass.toml; expected a [search] table".to_string()),
         )
     })?;
 
-    let (timeout, _t_src) = sd::resolve_timeout_ms(
-        cli_timeout,
-        sd::timeout_env().as_deref(),
-        defaults.timeout_ms,
-    )
-    .map_err(|e| {
-        CliError::usage(
-            e,
-            Some("Set a non-negative integer of milliseconds".to_string()),
-        )
-    })?;
+    let env_timeout = sd::timeout_env();
+    let env_mode = sd::mode_env();
+    let env_rrf = dotenvy::var("CASS_RRF_LIMIT").ok();
+    let env_rerank = dotenvy::var("CASS_RERANK_LIMIT").ok();
+    let env_legacy_limit = dotenvy::var("CASS_SEARCH_LIMIT").ok();
 
-    let cli_mode_str = cli_mode.map(search_mode_canonical_str);
+    resolve_search_window_defaults_from(SearchWindowInputs {
+        rerank,
+        cli_rrf,
+        cli_rerank,
+        cli_provider,
+        cli_timeout,
+        cli_mode,
+        env_timeout: env_timeout.as_deref(),
+        env_mode: env_mode.as_deref(),
+        env_rrf: env_rrf.as_deref(),
+        env_rerank: env_rerank.as_deref(),
+        env_legacy_limit: env_legacy_limit.as_deref(),
+        config: &config,
+    })
+}
+
+/// The pure core of [`resolve_search_window_defaults`]. Reads nothing from the
+/// process environment or the filesystem.
+fn resolve_search_window_defaults_from(
+    inputs: SearchWindowInputs<'_>,
+) -> CliResult<SearchWindowDefaults> {
+    use crate::search::rerank::types::ProviderChoice;
+    use crate::search_defaults as sd;
+
+    // The provider only exists when reranking is on. An explicit selection with
+    // --rerank off is a usage error, not a silently ignored flag.
+    if !inputs.rerank && inputs.cli_provider.is_some() {
+        return Err(CliError::usage(
+            "--rerank-provider requires --rerank",
+            Some("Enable --rerank to select a rerank backend, or drop --rerank-provider.".to_string()),
+        ));
+    }
+    let rerank_provider = if inputs.rerank {
+        Some(inputs.cli_provider.unwrap_or(ProviderChoice::Qwen3Local))
+    } else {
+        None
+    };
+
+    let (timeout, _t_src) =
+        sd::resolve_timeout_ms(inputs.cli_timeout, inputs.env_timeout, inputs.config.timeout_ms)
+            .map_err(|e| {
+                CliError::usage(
+                    e,
+                    Some("Set a non-negative integer of milliseconds".to_string()),
+                )
+            })?;
+
+    let cli_mode_str = inputs.cli_mode.map(search_mode_canonical_str);
     let (mode_str, _m_src) = sd::resolve_mode(
         cli_mode_str,
-        sd::mode_env().as_deref(),
-        defaults.mode.as_deref(),
+        inputs.env_mode,
+        inputs.config.mode.as_deref(),
     )
     .map_err(|e| CliError::usage(e, Some("Use one of: lexical, semantic, hybrid".to_string())))?;
     let mode = mode_str.and_then(|m| search_mode_from_canonical_str(&m));
 
-    // Window limits: read the raw env strings here and let P08a's pure resolver
-    // own the precedence and validation. The bindings outlive the borrow that
-    // `WindowLimitInputs` takes.
-    let env_rrf = dotenvy::var("CASS_RRF_LIMIT").ok();
-    let env_rerank = dotenvy::var("CASS_RERANK_LIMIT").ok();
-    let env_legacy_limit = dotenvy::var("CASS_SEARCH_LIMIT").ok();
+    // Window limits: the pure resolver owns the precedence and validation.
     let resolved = sd::resolve_window_limits(sd::WindowLimitInputs {
-        rerank,
-        cli_rrf,
-        cli_rerank,
-        env_rrf: env_rrf.as_deref(),
-        env_rerank: env_rerank.as_deref(),
-        env_legacy_limit: env_legacy_limit.as_deref(),
-        config: &defaults,
+        rerank: inputs.rerank,
+        cli_rrf: inputs.cli_rrf,
+        cli_rerank: inputs.cli_rerank,
+        env_rrf: inputs.env_rrf,
+        env_rerank: inputs.env_rerank,
+        env_legacy_limit: inputs.env_legacy_limit,
+        config: inputs.config,
     })
     .map_err(|e| {
         CliError::usage(
@@ -23395,6 +23463,447 @@ fn resolve_search_window_defaults(
         rerank_limit: resolved.rerank_limit,
         rerank_provider,
     })
+}
+
+#[cfg(test)]
+mod pr3_cli_limits {
+    //! P08b targeted tests for the `cass search` window CLI: the new
+    //! `--rrf-limit` / `--rerank-limit` / `--rerank-provider` flags, the pure
+    //! defaults bridge, and the legacy result-count migration errors.
+    //!
+    //! These are deliberately environment-free: the pure bridge takes every
+    //! env/config value as an argument, and the CLI-parse tests run through
+    //! `parse_cli`, which never reads `CASS_RRF_LIMIT`/`CASS_SEARCH_LIMIT`.
+    //! Env/config behavior is covered by `tests/pr3_cli_limits.rs` with a
+    //! subprocess-isolated environment.
+
+    use super::*;
+    use crate::search::rerank::types::ProviderChoice;
+    use crate::search::query::SearchMode;
+    use crate::search_defaults::SearchDefaults;
+
+    fn base_inputs(config: &SearchDefaults) -> SearchWindowInputs<'_> {
+        SearchWindowInputs {
+            rerank: false,
+            cli_rrf: None,
+            cli_rerank: None,
+            cli_provider: None,
+            cli_timeout: None,
+            cli_mode: None,
+            env_timeout: None,
+            env_mode: None,
+            env_rrf: None,
+            env_rerank: None,
+            env_legacy_limit: None,
+            config,
+        }
+    }
+
+    fn parse(args: &[&str]) -> CliResult<ParsedCli> {
+        parse_cli(args.iter().map(|s| (*s).to_string()).collect())
+    }
+
+    fn search_fields(args: &[&str]) -> Commands {
+        match parse(args).expect("parse should succeed").cli.command {
+            Some(cmd @ Commands::Search { .. }) => cmd,
+            other => panic!("expected search command, got {other:?}"),
+        }
+    }
+
+    // ---- pure bridge ----
+
+    #[test]
+    fn off_omitted_defaults_are_zero_none_none() {
+        let config = SearchDefaults::default();
+        let resolved = resolve_search_window_defaults_from(base_inputs(&config))
+            .expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 0, "rerank off keeps the legacy no-window sentinel");
+        assert_eq!(resolved.rerank_limit, None);
+        assert_eq!(resolved.rerank_provider, None);
+    }
+
+    #[test]
+    fn on_omitted_defaults_are_200_5_qwen() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 200);
+        assert_eq!(resolved.rerank_limit, Some(5));
+        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
+    }
+
+    #[test]
+    fn explicit_n_k_provider_propagate_field_by_field() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(50);
+        inputs.cli_rerank = Some(3);
+        inputs.cli_provider = Some(ProviderChoice::BgeLocal);
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 50);
+        assert_eq!(resolved.rerank_limit, Some(3));
+        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::BgeLocal));
+    }
+
+    #[test]
+    fn explicit_n_with_rerank_off_still_propagates() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rrf = Some(7);
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 7);
+        assert_eq!(resolved.rerank_limit, None);
+        assert_eq!(resolved.rerank_provider, None);
+    }
+
+    #[test]
+    fn provider_with_rerank_off_is_a_usage_error() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_provider = Some(ProviderChoice::OpenrouterQwen38b);
+        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--rerank-provider"), "{}", err.message);
+    }
+
+    #[test]
+    fn provider_is_not_read_from_env_or_config() {
+        // Env has no provider input at all, and config carries none, so an
+        // enabled rerank with no CLI selection must land on qwen3-local.
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.env_rrf = Some("300");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
+    }
+
+    #[test]
+    fn explicit_zero_window_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rrf = Some(0);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn k_greater_than_n_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(10);
+        inputs.cli_rerank = Some(11);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn explicit_k_when_off_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rerank = Some(3);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn small_n_with_omitted_k_errors_when_on() {
+        // N<5 with K omitted defaults K to 5, which exceeds N, so it must error
+        // rather than silently clamp.
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(3);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn cli_beats_env_beats_config() {
+        let mut config = SearchDefaults::default();
+        config.rrf_limit = Some(300);
+        config.rerank_limit = Some(30);
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(50);
+        inputs.cli_rerank = Some(3);
+        inputs.env_rrf = Some("200");
+        inputs.env_rerank = Some("20");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 50);
+        assert_eq!(resolved.rerank_limit, Some(3));
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.env_rrf = Some("150");
+        inputs.env_rerank = Some("15");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 150);
+        assert_eq!(resolved.rerank_limit, Some(15));
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 300);
+        assert_eq!(resolved.rerank_limit, Some(30));
+    }
+
+    #[test]
+    fn off_ignores_env_and_config_k() {
+        let mut config = SearchDefaults::default();
+        config.rerank_limit = Some(4);
+        let mut inputs = base_inputs(&config);
+        inputs.env_rerank = Some("9");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 0);
+        assert_eq!(resolved.rerank_limit, None);
+    }
+
+    #[test]
+    fn legacy_config_limit_is_a_migration_error_even_with_explicit_cli() {
+        let mut config = SearchDefaults::default();
+        config.limit = Some(10);
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rrf = Some(500);
+        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert!(err.hint.as_deref().unwrap_or("").contains("rrf-limit"), "{err:?}");
+    }
+
+    #[test]
+    fn legacy_env_limit_is_a_migration_error() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.env_legacy_limit = Some("10");
+        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert!(err.hint.as_deref().unwrap_or("").contains("rrf-limit"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_env_rrf_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.env_rrf = Some("lots");
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn overflow_window_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(usize::MAX);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    // ---- dispatch mapping ----
+
+    #[test]
+    fn semantic_options_carry_k_and_provider_only_when_on() {
+        let config = SearchDefaults::default();
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(80);
+        inputs.cli_rerank = Some(4);
+        inputs.cli_provider = Some(ProviderChoice::OpenrouterCohere4Fast);
+        let defaults = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        let opts =
+            semantic_search_options_from_defaults(None, true, None, false, &defaults);
+        assert_eq!(opts.rerank_limit, Some(4));
+        assert_eq!(opts.rerank_provider, Some(ProviderChoice::OpenrouterCohere4Fast));
+        assert!(opts.rerank);
+        assert_eq!(defaults.rrf_limit, 80, "N is carried as the fetch window");
+
+        let defaults =
+            resolve_search_window_defaults_from(base_inputs(&config)).expect("defaults resolve");
+        let opts = semantic_search_options_from_defaults(
+            Some("bge-m3".to_string()),
+            false,
+            Some("legacy".to_string()),
+            true,
+            &defaults,
+        );
+        assert_eq!(opts.model.as_deref(), Some("bge-m3"));
+        assert_eq!(opts.reranker.as_deref(), Some("legacy"));
+        assert!(opts.use_daemon);
+        assert_eq!(opts.rerank_limit, None);
+        assert_eq!(opts.rerank_provider, None);
+    }
+
+    // ---- CLI parsing ----
+
+    #[test]
+    fn search_parses_new_window_flags() {
+        let cmd = search_fields(&[
+            "cass",
+            "search",
+            "q",
+            "--rerank",
+            "--rrf-limit",
+            "10",
+            "--rerank-limit",
+            "3",
+            "--rerank-provider",
+            "bge-local",
+        ]);
+        let Commands::Search {
+            rrf_limit,
+            rerank_limit,
+            rerank_provider,
+            rerank,
+            ..
+        } = cmd
+        else {
+            unreachable!()
+        };
+        assert!(rerank);
+        assert_eq!(rrf_limit, Some(10));
+        assert_eq!(rerank_limit, Some(3));
+        assert_eq!(rerank_provider, Some(ProviderChoice::BgeLocal));
+    }
+
+    #[test]
+    fn search_defaults_are_none_without_new_flags() {
+        let cmd = search_fields(&["cass", "search", "q"]);
+        let Commands::Search {
+            rrf_limit,
+            rerank_limit,
+            rerank_provider,
+            ..
+        } = cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(rrf_limit, None);
+        assert_eq!(rerank_limit, None);
+        assert_eq!(rerank_provider, None);
+    }
+
+    #[test]
+    fn unknown_provider_is_a_usage_error() {
+        let err = parse(&[
+            "cass",
+            "search",
+            "q",
+            "--rerank",
+            "--rerank-provider",
+            "not-a-provider",
+        ])
+        .expect_err("unknown provider must fail");
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn search_source_provider_still_maps_to_agent() {
+        let cmd = search_fields(&["cass", "search", "q", "--provider", "codex"]);
+        let Commands::Search { agent, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(agent, vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn search_model_still_selects_the_embedder() {
+        let cmd = search_fields(&["cass", "search", "q", "--model", "bge-m3"]);
+        let Commands::Search { model, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(model.as_deref(), Some("bge-m3"));
+    }
+
+    #[test]
+    fn legacy_search_limit_spellings_are_usage_errors() {
+        for args in [
+            vec!["cass", "search", "q", "--limit", "5"],
+            vec!["cass", "search", "q", "--limit=5"],
+            vec!["cass", "search", "q", "--max-results", "5"],
+            vec!["cass", "search", "q", "--max_results", "5"],
+            vec!["cass", "search", "q", "--num-results", "5"],
+            vec!["cass", "search", "q", "--results", "5"],
+            vec!["cass", "search", "q", "--count", "5"],
+            vec!["cass", "search", "q", "--top-k", "5"],
+            vec!["cass", "search", "q", "--topk", "5"],
+            vec!["cass", "search", "q", "--top_k", "5"],
+            vec!["cass", "search", "q", "--n", "5"],
+            vec!["cass", "search", "q", "-n", "5"],
+            vec!["cass", "search", "q", "-limit", "5"],
+            vec!["cass", "search", "q", "--LIMIT", "5"],
+            vec!["cass", "search", "q", "limit=5"],
+            vec!["cass", "search", "q", "max_results=5"],
+            vec!["cass", "search", "q", "limit", "5"],
+            vec!["cass", "search", "q", "n", "5"],
+        ] {
+            let err = parse(&args).expect_err(&format!("must reject {args:?}"));
+            assert_eq!(err.code, 2, "{args:?} -> {err:?}");
+            assert_eq!(err.kind, "usage", "{args:?} -> {err:?}");
+            assert!(
+                err.hint.as_deref().unwrap_or("").contains("rrf-limit"),
+                "migration hint missing for {args:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_alias_rescue_does_not_succeed_via_heuristic() {
+        // A near-miss typo must not be rescued into a now-removed --limit that
+        // would be silently accepted.
+        let err = parse(&["cass", "search", "q", "--limt", "5"])
+            .expect_err("ambiguous count typo must not resolve");
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn search_query_literal_after_terminator_is_not_a_limit_flag() {
+        let parsed = parse(&["cass", "search", "--", "--limit"]).expect("literal query");
+        let Some(Commands::Search { query, rrf_limit, .. }) = parsed.cli.command else {
+            panic!("expected search");
+        };
+        assert_eq!(query, "--limit");
+        assert_eq!(rrf_limit, None);
+    }
+
+    #[test]
+    fn option_value_that_reads_like_a_limit_flag_is_not_flagged() {
+        // `--since --limit`: the scanner must treat `--limit` as `--since`'s
+        // value, not as a legacy count flag.
+        let parsed = parse(&["cass", "search", "q", "--since", "--limit"])
+            .expect("value of --since must not be misread");
+        assert!(matches!(parsed.cli.command, Some(Commands::Search { .. })));
+    }
+
+    #[test]
+    fn query_token_containing_limit_word_is_not_flagged() {
+        // A quoted query token that happens to contain the word "limit" is a
+        // positional value, not a flag, and must not be scanned as a legacy
+        // spelling.
+        let parsed = parse(&["cass", "search", "the limit of code"])
+            .expect("multi-word query token must parse");
+        let Some(Commands::Search { query, rrf_limit, .. }) = parsed.cli.command else {
+            panic!("expected search");
+        };
+        assert_eq!(query, "the limit of code");
+        assert_eq!(rrf_limit, None);
+    }
+
+    #[test]
+    fn other_commands_keep_their_limit_flag() {
+        assert!(matches!(
+            parse(&["cass", "pack", "q", "--limit", "5"]).expect("pack keeps --limit").cli.command,
+            Some(Commands::Pack { limit: 5, .. })
+        ));
+        assert!(matches!(
+            parse(&["cass", "sessions", "--limit", "5"]).expect("sessions keeps --limit").cli.command,
+            Some(Commands::Sessions { limit: Some(5), .. })
+        ));
+        // `--max-results` still recovers to `--limit` for pack.
+        assert!(matches!(
+            parse(&["cass", "pack", "q", "--max-results", "5"]).expect("pack alias").cli.command,
+            Some(Commands::Pack { limit: 5, .. })
+        ));
+    }
 }
 
 /// Canonical lowercase name for a [`crate::search::query::SearchMode`].
