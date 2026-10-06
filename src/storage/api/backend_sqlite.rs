@@ -507,13 +507,68 @@ mod tests {
         assert!(plan.unsafe_nondurable_warning.is_none());
     }
 
+    const BULK_REBUILD_CHILD: &str = "CASS_TEST_BULK_REBUILD_CHILD";
+
+    fn bulk_rebuild_child_output(name: &str, value: Option<&str>) -> std::process::Output {
+        let key = super::super::config::BULK_REBUILD_UNSAFE_ENV;
+        let previous = std::env::var_os(key);
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--nocapture", "--format", "pretty", "--color", "never"])
+            .env(BULK_REBUILD_CHILD, name);
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+        let output = command.output().expect("run isolated BulkRebuild test");
+        assert_eq!(std::env::var_os(key), previous, "child must not change parent environment");
+        output
+    }
+
+    fn bulk_rebuild_child_passed(output: &std::process::Output, name: &str) -> bool {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_test = format!("test {name} ... ok");
+        output.status.success()
+            && stdout.lines().filter(|line| *line == "running 1 test").count() == 1
+            && stdout.lines().filter(|line| *line == expected_test).count() == 1
+            && stdout.lines().filter(|line| line.starts_with("test result:")).count() == 1
+            && stdout.lines().any(|line| {
+                line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            })
+    }
+
+    fn in_bulk_rebuild_child(test: &str, value: Option<&str>) -> bool {
+        let name = format!("storage::api::backend_sqlite::tests::{test}");
+        if std::env::var(BULK_REBUILD_CHILD).as_deref() == Ok(name.as_str()) {
+            return true;
+        }
+        let output = bulk_rebuild_child_output(&name, value);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("BulkRebuild child {name}: {}\n{stdout}\n{stderr}", output.status);
+        assert!(bulk_rebuild_child_passed(&output, &name), "child must execute exactly one passing test");
+        false
+    }
+
+    #[test]
+    fn bulk_rebuild_child_rejects_failure_and_empty_selection() {
+        let absent = "storage::api::backend_sqlite::tests::bulk_rebuild_missing_child";
+        let output = bulk_rebuild_child_output(absent, None);
+        println!("empty selection: {}\n{}", output.status, String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "libtest accepts an empty exact selection");
+        assert!(!bulk_rebuild_child_passed(&output, absent), "zero tests must not count as success");
+
+        let failing = "storage::api::backend_sqlite::tests::bulk_rebuild_unsafe_nondurable_requires_exact_env_value";
+        let output = bulk_rebuild_child_output(failing, None);
+        println!("failing child: {}\n{}", output.status, String::from_utf8_lossy(&output.stdout));
+        assert!(!output.status.success(), "the real NORMAL assertion must fail without the env value");
+        assert!(!bulk_rebuild_child_passed(&output, failing), "failed child must not count as success");
+    }
+
     #[test]
     fn bulk_rebuild_defaults_to_production_without_env_var() {
-        // SAFETY: test-local env var scoped to this process; #[serial_test::serial]
-        // would be needed if another test in this module also touched this var --
-        // none currently do.
-        unsafe {
-            std::env::remove_var(super::super::config::BULK_REBUILD_UNSAFE_ENV);
+        if !in_bulk_rebuild_child("bulk_rebuild_defaults_to_production_without_env_var", None) {
+            return;
         }
         let plan = Profile::BulkRebuild.pragma_plan();
         assert_eq!(plan.synchronous, Some(2), "must silently downgrade to Production/FULL");
@@ -522,19 +577,19 @@ mod tests {
 
     #[test]
     fn bulk_rebuild_unsafe_nondurable_requires_exact_env_value() {
-        unsafe {
-            std::env::set_var(super::super::config::BULK_REBUILD_UNSAFE_ENV, "1");
+        if !in_bulk_rebuild_child("bulk_rebuild_unsafe_nondurable_requires_exact_env_value", Some("1")) {
+            return;
         }
         let plan = Profile::BulkRebuild.pragma_plan();
         assert_eq!(plan.synchronous, Some(1));
         assert!(plan.unsafe_nondurable_warning.is_some());
-        unsafe {
-            std::env::remove_var(super::super::config::BULK_REBUILD_UNSAFE_ENV);
-        }
     }
 
     #[test]
     fn bulk_rebuild_unsafe_nondurable_actually_applies_through_real_open() {
+        if !in_bulk_rebuild_child("bulk_rebuild_unsafe_nondurable_actually_applies_through_real_open", Some("1")) {
+            return;
+        }
         // Not just the declarative `PragmaPlan` shape (covered above) -- a
         // real `open_writable(Profile::BulkRebuild)` call with the env var
         // set, proving `apply_profile`'s `unsafe_nondurable_warning` branch
@@ -545,14 +600,8 @@ mod tests {
             .join(format!("cc-cass-w1b-b2-bulkrebuild-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("t.db");
-        unsafe {
-            std::env::set_var(super::super::config::BULK_REBUILD_UNSAFE_ENV, "1");
-        }
         let backend =
             SqliteBackend::open_writable(db_path.to_str().unwrap(), Profile::BulkRebuild).unwrap();
-        unsafe {
-            std::env::remove_var(super::super::config::BULK_REBUILD_UNSAFE_ENV);
-        }
 
         let mut synchronous = -1_i64;
         backend

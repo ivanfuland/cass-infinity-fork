@@ -34956,7 +34956,7 @@ mod tests {
             "seed watch-once run should have populated exactly 2 conversations, got {conversation_count}"
         );
 
-        crate::storage::sqlite::REBUILD_LEX_DOMAIN_FROM_DB_CALLS.store(0, Ordering::Relaxed);
+        crate::storage::sqlite::register_rebuild_lex_domain_calls(&db_path);
 
         // Pin the lex-domain rebuild pipeline's worker pool to 1: it
         // otherwise sizes to `available_parallelism()` (see
@@ -34982,7 +34982,7 @@ mod tests {
         run_index(full_opts, None)?;
 
         let calls =
-            crate::storage::sqlite::REBUILD_LEX_DOMAIN_FROM_DB_CALLS.load(Ordering::Relaxed);
+            crate::storage::sqlite::take_rebuild_lex_domain_calls(&db_path);
         anyhow::ensure!(
             calls == 1,
             "cass index --full must rebuild the whole-archive lex domain exactly once, got {calls} calls"
