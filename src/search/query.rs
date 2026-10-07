@@ -2396,10 +2396,9 @@ const EXACT_SCAN_ROW_BUDGET: usize = 6_000_000;
 
 /// Test-only override for `EXACT_SCAN_ROW_BUDGET` (`0` = unset, use the
 /// real constant) -- lets tests exercise the budget-exceeded path without
-/// scanning millions of synthetic rows. Plain `AtomicUsize`, not a
-/// `Mutex`/`RefCell`: this codebase's own testing discipline mandates
-/// `--test-threads=1` for `--lib` runs, so there is never genuine
-/// cross-test concurrency to race against.
+/// scanning millions of synthetic rows. Tests that set this override run
+/// their entire body in isolated test subprocesses; parallel readers in
+/// the parent process retain the default budget.
 static EXACT_SCAN_ROW_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -2436,8 +2435,8 @@ const HYDRATE_ID_BATCH_ROWS: usize = 900;
 /// candidate set in one statement, to diff against the real (900-row)
 /// batched path over the *same* candidate set (T9 part 2:
 /// `hybrid_limit_5000_hydrates_in_batches`) without depending on the
-/// retired v4 path as a reference. Same `AtomicUsize`/`--test-threads=1`
-/// justification as `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above.
+/// retired v4 path as a reference. The default and widened passes run in
+/// the same isolated test subprocess, leaving parent-process readers alone.
 static HYDRATE_ID_BATCH_ROWS_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -6930,6 +6929,54 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    const ISOLATED_QUERY_CHILD: &str = "CASS_TEST_ISOLATED_QUERY_CHILD";
+
+    fn isolated_query_child_output(name: &str) -> std::process::Output {
+        let previous_url = std::env::var_os("CASS_INFINITY_URL");
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", name, "--nocapture", "--format", "pretty", "--color", "never"])
+            .env(ISOLATED_QUERY_CHILD, name);
+        if name == "search::query::tests::hybrid_fails_open_when_infinity_unreachable" {
+            command.env("CASS_INFINITY_URL", "http://127.0.0.1:1");
+        }
+        let output = command.output().expect("run isolated query test");
+        assert_eq!(std::env::var_os("CASS_INFINITY_URL"), previous_url, "child must preserve parent Infinity URL");
+        output
+    }
+
+    fn isolated_query_child_passed(output: &std::process::Output, name: &str) -> bool {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_test = format!("test {name} ... ok");
+        output.status.success()
+            && stdout.lines().filter(|line| *line == "running 1 test").count() == 1
+            && stdout.lines().filter(|line| *line == expected_test).count() == 1
+            && stdout.lines().filter(|line| line.starts_with("test result:")).count() == 1
+            && stdout.lines().any(|line| {
+                line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            })
+    }
+
+    fn in_isolated_query_child(test: &str) -> bool {
+        let name = format!("search::query::tests::{test}");
+        if std::env::var(ISOLATED_QUERY_CHILD).as_deref() == Ok(name.as_str()) {
+            return true;
+        }
+        let output = isolated_query_child_output(&name);
+        println!("isolated query child {name}: {}\n{}\n{}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(isolated_query_child_passed(&output, &name), "query child must execute exactly one passing test");
+        false
+    }
+
+    #[test]
+    fn isolated_query_child_rejects_empty_selection() {
+        let absent = "search::query::tests::isolated_query_missing_child";
+        let output = isolated_query_child_output(absent);
+        println!("empty query selection: {}\n{}", output.status, String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "libtest accepts an empty exact selection");
+        assert!(!isolated_query_child_passed(&output, absent), "zero tests must not count as success");
+    }
+
     // Reference implementation of the stable dedup key prior to bead num7z.
     // Kept in tests so the optimized `search_hit_key_doc_id` is pinned to
     // byte-identical output; any drift trips this assertion.
@@ -7760,6 +7807,9 @@ mod tests {
     #[test]
     #[cfg(feature = "infinity")]
     fn hybrid_fails_open_when_infinity_unreachable() -> Result<()> {
+        if !in_isolated_query_child("hybrid_fails_open_when_infinity_unreachable") {
+            return Ok(());
+        }
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -7783,27 +7833,9 @@ mod tests {
         let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
-        // T9 part 2: point a real InfinityEmbedder at a dead local port
-        // (nothing listens on 127.0.0.1:1) -- `InfinityEmbedder::new()`
-        // only reads its base_url from `CASS_INFINITY_URL`
-        // (`InfinityConfig::from_env`), so setting/restoring the env var is
-        // the only public seam; safe under this codebase's own
-        // `--test-threads=1` testing discipline (same justification as
-        // `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above).
-        let previous_url = std::env::var("CASS_INFINITY_URL").ok();
-        // SAFETY: `--test-threads=1` (this codebase's own testing
-        // discipline, see `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above) means no
-        // other thread reads/writes env vars concurrently with this test.
-        unsafe {
-            std::env::set_var("CASS_INFINITY_URL", "http://127.0.0.1:1");
-        }
+        // The parent binds the dead local port only in this child process.
+        // Keep the real constructor and unreachable HTTP fail-open path.
         let embedder_result = crate::search::infinity::InfinityEmbedder::new();
-        unsafe {
-            match previous_url {
-                Some(url) => std::env::set_var("CASS_INFINITY_URL", url),
-                None => std::env::remove_var("CASS_INFINITY_URL"),
-            }
-        }
         let embedder = embedder_result.expect("constructing the embedder itself does not touch the network");
         client.set_semantic_context(Arc::new(embedder), None)?;
 
@@ -7834,6 +7866,9 @@ mod tests {
     /// retired v4 path.
     #[test]
     fn hybrid_limit_5000_hydrates_in_batches() -> Result<()> {
+        if !in_isolated_query_child("hybrid_limit_5000_hydrates_in_batches") {
+            return Ok(());
+        }
         // Pinned: the real batch size must stay small enough that this
         // test's candidate count genuinely spans multiple SQL statements
         // (otherwise the "batched" and "reference" runs below would both
@@ -17888,13 +17923,14 @@ mod tests {
     /// rows exist than the budget allows, reporting the result as
     /// incomplete rather than silently truncating without a signal.
     ///
-    /// `#[serial]`: shares the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
-    /// atomic with `pr9_direct_exact_budget_marks_incomplete`, so the two
-    /// must not interleave (the first to finish would otherwise reset the
-    /// budget mid-scan for the other).
+    /// The override and its reset stay inside this test's child process,
+    /// so normal-budget readers can continue in the parallel parent suite.
     #[test]
     #[serial_test::serial]
     fn semantic_exact_scan_row_budget_marks_incomplete() {
+        if !in_isolated_query_child("semantic_exact_scan_row_budget_marks_incomplete") {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
         const OTHER_DOCS: i64 = 80;
@@ -19325,13 +19361,14 @@ mod tests {
     /// silently truncate without a signal, nor (the failure this
     /// explicitly pins) collapse into a *successful* empty result.
     ///
-    /// `#[serial]`: this test and `semantic_exact_scan_row_budget_marks_incomplete`
-    /// both drive the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
-    /// atomic, so they must never interleave -- the second one to finish
-    /// would otherwise reset the budget out from under the first.
+    /// The override and its reset run in a private child process, isolated
+    /// from both the other budget test and normal-budget parent readers.
     #[test]
     #[serial_test::serial]
     fn pr9_direct_exact_budget_marks_incomplete() {
+        if !in_isolated_query_child("pr9_direct_exact_budget_marks_incomplete") {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
         const DIM: i64 = 4;

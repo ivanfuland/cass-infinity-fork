@@ -34559,6 +34559,9 @@ mod tests {
     #[test]
     #[serial]
     fn reindex_paths_zeroes_codex_host_shell_hits_between_watch_cycles() {
+        if !in_isolated_indexer_child("reindex_paths_zeroes_codex_host_shell_hits_between_watch_cycles") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -38378,6 +38381,18 @@ mod tests {
             })
     }
 
+    fn in_isolated_indexer_child(test: &str) -> bool {
+        let name = format!("indexer::tests::{test}");
+        if std::env::var(PREPARE_BROKEN_CONFIG_CHILD).as_deref() == Ok(name.as_str()) {
+            return true;
+        }
+        let config_home = TempDir::new().expect("private indexer child config");
+        let output = prepare_config_child_output(&name, config_home.path());
+        println!("isolated indexer child {name}: {}\n{}\n{}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(prepare_config_child_passed(&output, &name), "indexer child must execute exactly one passing test");
+        false
+    }
+
     #[test]
     #[serial]
     fn prepare_conversation_for_ingest_child_rejects_empty_selection_and_failed_assertion() {
@@ -38587,6 +38602,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_counts_codex_idx0_candidate_even_when_alignment_fails() {
+        if !in_isolated_indexer_child("judge_reparsed_conversation_counts_codex_idx0_candidate_even_when_alignment_fails") {
+            return;
+        }
         reset_last_index_run_counters();
         let mut conv = norm_conv(Some("n16-misaligned-codex"), vec![norm_msg(0, 10), norm_msg(1, 20)]);
         conv.agent_slug = "codex".to_string();
@@ -38612,6 +38630,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment() {
+        if !in_isolated_indexer_child("judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment") {
+            return;
+        }
         let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -38677,6 +38698,9 @@ mod tests {
     #[test]
     #[serial]
     fn prepare_records_capture_na_and_capture_failed_separately() {
+        if !in_isolated_indexer_child("prepare_records_capture_na_and_capture_failed_separately") {
+            return;
+        }
         let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -38744,6 +38768,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_does_not_count_event_align_failed_for_connectors_without_structural_facts() {
+        if !in_isolated_indexer_child("judge_reparsed_conversation_does_not_count_event_align_failed_for_connectors_without_structural_facts") {
+            return;
+        }
         reset_last_index_run_counters();
         let mut conv = norm_conv(Some("n16-opencode-session"), vec![norm_msg(0, 10)]);
         conv.agent_slug = "opencode".to_string();
