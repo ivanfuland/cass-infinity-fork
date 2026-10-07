@@ -34559,6 +34559,9 @@ mod tests {
     #[test]
     #[serial]
     fn reindex_paths_zeroes_codex_host_shell_hits_between_watch_cycles() {
+        if !in_isolated_indexer_child("reindex_paths_zeroes_codex_host_shell_hits_between_watch_cycles") {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -34956,7 +34959,7 @@ mod tests {
             "seed watch-once run should have populated exactly 2 conversations, got {conversation_count}"
         );
 
-        crate::storage::sqlite::REBUILD_LEX_DOMAIN_FROM_DB_CALLS.store(0, Ordering::Relaxed);
+        crate::storage::sqlite::register_rebuild_lex_domain_calls(&db_path);
 
         // Pin the lex-domain rebuild pipeline's worker pool to 1: it
         // otherwise sizes to `available_parallelism()` (see
@@ -34982,7 +34985,7 @@ mod tests {
         run_index(full_opts, None)?;
 
         let calls =
-            crate::storage::sqlite::REBUILD_LEX_DOMAIN_FROM_DB_CALLS.load(Ordering::Relaxed);
+            crate::storage::sqlite::take_rebuild_lex_domain_calls(&db_path);
         anyhow::ensure!(
             calls == 1,
             "cass index --full must rebuild the whole-archive lex domain exactly once, got {calls} calls"
@@ -38351,6 +38354,61 @@ mod tests {
         );
     }
 
+    const PREPARE_BROKEN_CONFIG_CHILD: &str = "CASS_TEST_PREPARE_BROKEN_CONFIG_CHILD";
+    const PREPARE_BROKEN_CONFIG_TEST: &str = "indexer::tests::prepare_conversation_for_ingest_fails_loud_on_broken_excluded_context_paths_config";
+
+    fn prepare_config_child_output(name: &str, config_home: &Path) -> std::process::Output {
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--nocapture", "--format", "pretty", "--color", "never"])
+            .env(PREPARE_BROKEN_CONFIG_CHILD, name)
+            .env("XDG_CONFIG_HOME", config_home)
+            .output()
+            .expect("run isolated prepare config test");
+        assert_eq!(std::env::var_os("XDG_CONFIG_HOME"), previous, "child must preserve parent XDG_CONFIG_HOME");
+        output
+    }
+
+    fn prepare_config_child_passed(output: &std::process::Output, name: &str) -> bool {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_test = format!("test {name} ... ok");
+        output.status.success()
+            && stdout.lines().filter(|line| *line == "running 1 test").count() == 1
+            && stdout.lines().filter(|line| *line == expected_test).count() == 1
+            && stdout.lines().filter(|line| line.starts_with("test result:")).count() == 1
+            && stdout.lines().any(|line| {
+                line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            })
+    }
+
+    fn in_isolated_indexer_child(test: &str) -> bool {
+        let name = format!("indexer::tests::{test}");
+        if std::env::var(PREPARE_BROKEN_CONFIG_CHILD).as_deref() == Ok(name.as_str()) {
+            return true;
+        }
+        let config_home = TempDir::new().expect("private indexer child config");
+        let output = prepare_config_child_output(&name, config_home.path());
+        println!("isolated indexer child {name}: {}\n{}\n{}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(prepare_config_child_passed(&output, &name), "indexer child must execute exactly one passing test");
+        false
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_conversation_for_ingest_child_rejects_empty_selection_and_failed_assertion() {
+        let empty_config_home = TempDir::new().expect("empty config directory");
+        let absent = "indexer::tests::prepare_conversation_for_ingest_missing_child";
+        let output = prepare_config_child_output(absent, empty_config_home.path());
+        println!("empty selection: {}\n{}", output.status, String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "libtest accepts an empty exact selection");
+        assert!(!prepare_config_child_passed(&output, absent), "zero tests must not count as success");
+
+        let output = prepare_config_child_output(PREPARE_BROKEN_CONFIG_TEST, empty_config_home.path());
+        println!("failed child: {}\n{}\n{}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(!output.status.success(), "the real expect_err must fail with an empty config directory");
+        assert!(!prepare_config_child_passed(&output, PREPARE_BROKEN_CONFIG_TEST), "failed child must not count as success");
+    }
+
     /// R1-N8 (任务书 #118b): a broken `excluded_context_paths.toml` must
     /// fail the whole ingest of the session loudly, not be swallowed and
     /// silently replaced by the built-in default (wider) rule set.
@@ -38362,27 +38420,25 @@ mod tests {
     /// this only asserts `prepare_conversation_for_ingest` returns `Err`
     /// naming the failure, not a process exit code.
     ///
-    /// `#[serial]`: mutates the process-wide `XDG_CONFIG_HOME` env var,
-    /// which `ExcludedContextPaths::load()` (and `SourcesConfig::load()`)
-    /// read from any thread; serializes against every other `#[serial]`
-    /// test in this crate the same way `reindex_paths_zeroes_codex_host_
-    /// shell_hits_between_watch_cycles` above already does for its own
-    /// global-state mutation.
+    /// The broken configuration is bound only in a child process, so other
+    /// tests can read their configuration concurrently. `#[serial]` keeps
+    /// the parent's environment snapshot stable against cooperating writers.
     #[test]
     #[serial]
     fn prepare_conversation_for_ingest_fails_loud_on_broken_excluded_context_paths_config() {
         let temp = TempDir::new().expect("tempdir");
         let data_dir = temp.path().join("cass-data");
         std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let xdg_config_home = temp.path().join("xdg-config");
-        let config_dir = xdg_config_home.join("cass");
-        std::fs::create_dir_all(&config_dir).expect("mkdir xdg config dir");
-        std::fs::write(config_dir.join("excluded_context_paths.toml"), "memory_files = [this is not valid toml")
-            .expect("write broken config");
-
-        let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &xdg_config_home);
+        if std::env::var(PREPARE_BROKEN_CONFIG_CHILD).as_deref() != Ok(PREPARE_BROKEN_CONFIG_TEST) {
+            let xdg_config_home = temp.path().join("xdg-config");
+            let config_dir = xdg_config_home.join("cass");
+            std::fs::create_dir_all(&config_dir).expect("mkdir xdg config dir");
+            std::fs::write(config_dir.join("excluded_context_paths.toml"), "memory_files = [this is not valid toml")
+                .expect("write broken config");
+            let output = prepare_config_child_output(PREPARE_BROKEN_CONFIG_TEST, &xdg_config_home);
+            println!("broken config child: {}\n{}\n{}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(prepare_config_child_passed(&output, PREPARE_BROKEN_CONFIG_TEST), "child must execute exactly one passing test");
+            return;
         }
 
         let sessions_dir = temp.path().join(".codex").join("sessions").join("2026").join("09");
@@ -38402,13 +38458,6 @@ mod tests {
         let source_kind = CaptureSourceKind::File(conv.source_path.clone());
         let codex_connector = crate::connectors::codex::CodexConnector::new();
         let result = prepare_conversation_for_ingest(&data_dir, "codex", &codex_connector, &Origin::local(), &IngestIdentity::local(), None, source_kind, conv);
-
-        unsafe {
-            match &prior_xdg {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
 
         let err = result.expect_err("a broken excluded_context_paths.toml must fail the whole ingest, not silently fall back to defaults");
         assert!(
@@ -38553,6 +38602,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_counts_codex_idx0_candidate_even_when_alignment_fails() {
+        if !in_isolated_indexer_child("judge_reparsed_conversation_counts_codex_idx0_candidate_even_when_alignment_fails") {
+            return;
+        }
         reset_last_index_run_counters();
         let mut conv = norm_conv(Some("n16-misaligned-codex"), vec![norm_msg(0, 10), norm_msg(1, 20)]);
         conv.agent_slug = "codex".to_string();
@@ -38578,6 +38630,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment() {
+        if !in_isolated_indexer_child("judge_reparsed_conversation_lists_the_session_it_skipped_for_alignment") {
+            return;
+        }
         let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -38643,6 +38698,9 @@ mod tests {
     #[test]
     #[serial]
     fn prepare_records_capture_na_and_capture_failed_separately() {
+        if !in_isolated_indexer_child("prepare_records_capture_na_and_capture_failed_separately") {
+            return;
+        }
         let _serialize = GLOBAL_COUNTER_TEST_SERIALIZE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -38710,6 +38768,9 @@ mod tests {
     #[test]
     #[serial]
     fn judge_reparsed_conversation_does_not_count_event_align_failed_for_connectors_without_structural_facts() {
+        if !in_isolated_indexer_child("judge_reparsed_conversation_does_not_count_event_align_failed_for_connectors_without_structural_facts") {
+            return;
+        }
         reset_last_index_run_counters();
         let mut conv = norm_conv(Some("n16-opencode-session"), vec![norm_msg(0, 10)]);
         conv.agent_slug = "opencode".to_string();

@@ -237,7 +237,7 @@ Full runtime benchmarks:
 ### Search Performance
 
 1. **Use prefix wildcards over suffix**: `foo*` is faster than `*foo`
-2. **Limit result count**: Use `--limit` to cap expensive queries
+2. **Limit result count**: Use `--rrf-limit` to cap the search candidate window on expensive queries
 3. **Use field masks**: `--fields minimal` reduces data transfer
 4. **Warm the cache**: First search may be slower; cache improves subsequent queries
 

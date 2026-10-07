@@ -55,7 +55,7 @@ cass triage --json
 
 # 2) Search across all agent history. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
-cass search "authentication error" --robot --limit 5 --fields minimal
+cass search "authentication error" --robot --rrf-limit 5 --fields minimal
 
 # 3) Find the current or recent session for this workspace
 cass sessions --current --json
@@ -788,7 +788,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 |---------------|------------------------|-----------------|
 | `cass -robot --limit=5` | `cass --robot --limit=5` | Single-dash long flags normalized |
 | `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized |
-| `cass search "auth" --max_results 5` | `cass search "auth" --limit 5` | Snake-case long flag normalized before alias recovery |
+| `cass search "auth" --max_results 5` | *refused: use `cass search "auth" --rrf-limit 5`* | Snake-case normalized, then the search result-count spelling is a migration error |
 | `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` via alias table |
 | `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
 | `cass commands --json` | `cass robot-docs commands` | Robot-docs topic shorthand detected |
@@ -810,7 +810,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass search --q "auth" --json` | `cass search "auth" --json` | Short/familiar query aliases converted to required positional query |
 | `cass search auth error --json` | `cass search "auth error" --json` | Adjacent unquoted query words folded into one search |
 | `cass auth error --json` | `cass search "auth error" --json` | Unquoted robot-mode query words folded into search |
-| `cass search --agent codex --limit 5 auth error --json` | `cass search "auth error" --agent codex --limit 5 --json` | Query moved before leading search filters |
+| `cass search --agent codex --rrf-limit 5 auth error --json` | `cass search "auth error" --agent codex --rrf-limit 5 --json` | Query moved before leading search filters |
 | `cass view --path session.jsonl --line 42 --json` | `cass view session.jsonl --line 42 --json` | Named path option converted to required positional path |
 | `cass view session.jsonl --line-number 42 --json` | `cass view session.jsonl --line 42 --json` | Search result field name accepted as a line alias |
 | `cass view session.jsonl line_number=42 --json` | `cass view session.jsonl --line 42 --json` | Search result field assignment accepted as a line option |
@@ -819,14 +819,14 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass search "auth" --output json` | `cass search "auth" --robot-format json` | Familiar output spelling converted to robot format |
 | `cass help search --json` | `cass robot-docs commands` | Structured help intent routed to the machine-readable command reference |
 | `cass --format json status` | `cass status --robot-format json` | Leading format request moved to the target subcommand |
-| `cass search "auth" --max-results 5` | `cass search "auth" --limit 5` | Result-count alias converted to canonical limit |
-| `cass search "auth" -n 5` | `cass search "auth" --limit 5` | Familiar short count flag converted to canonical limit |
+| `cass search "auth" --max-results 5` | *refused: use `cass search "auth" --rrf-limit 5`* | Result-count aliases are a migration error on `cass search` |
+| `cass search "auth" -n 5` | *refused: use `cass search "auth" --rrf-limit 5`* | The short result-count spelling is a migration error on `cass search` |
 | `cass search "auth" --last 7 --before now` | `cass search "auth" --since -7d --until now` | Familiar time-window aliases converted to canonical filters |
 | `cass search "auth" last=7d before=now` | `cass search "auth" --since -7d --until now` | Bare time-window assignments converted to canonical filters |
 | `cass search "auth" --provider codex` | `cass search "auth" --agent codex` | Provider/tool/connector aliases converted to canonical agent filter |
 | `cass search "auth" provider=codex` | `cass search "auth" --agent codex` | Bare provider assignment converted to canonical agent filter |
-| `cass search auth provider codex limit 5` | `cass search auth --agent codex --limit 5` | Bare filter key/value pairs after a query converted to canonical flags |
-| `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
+| `cass search auth provider codex last 7d` | `cass search auth --agent codex --since -7d` | Bare filter key/value pairs after a query converted to canonical flags (the `limit` pair is a migration error on `cass search`) |
+| `cass pack "auth" --limt 5` | `cass pack "auth" --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
 1. **Flag typo correction**: Long flag names within Levenshtein distance 2 are auto-corrected (e.g. `--limt` → `--limit`). *Subcommand typos are NOT fuzzy-corrected* — use one of the documented aliases instead (see layer 5 below). A typo that isn't a known alias will produce a clap usage error with the canonical form in the hint.
@@ -841,10 +841,10 @@ The CLI applies multiple normalization layers:
 10. **Multi-word query recovery**: adjacent unquoted query words after `search`/`pack` become one query positional
 11. **Structured format recovery**: `--format json|jsonl|compact|sessions|toon`, `--output json|jsonl|compact|sessions|toon`, and `--output-format ...` are accepted as `--robot-format ...` on robot-capable commands; `export --format ...` and `export --output <file>` keep their export meanings
 12. **Structured help recovery**: `help --json`, `help commands --json`, and `search --help --json` route to `robot-docs guide` / `robot-docs commands`; plain `--help` stays native clap help
-13. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits
+13. **Result-count aliases**: `--max-results`, `--num-results`, `--results`, `--count`, `--top-k`, and `-n` become `--limit` on commands with result limits. `cass search` no longer accepts them: its legacy result-count spellings are a migration error — use `--rrf-limit N` (candidate window) or `--rerank-limit K` (per-page rerank count)
 14. **Time-window aliases**: `--last 7`, `--before now`, `last=7d`, and `before=now` become canonical `--since`/`--until` filters
 15. **Provider aliases**: `--provider`, `--tool`, `--connector`, and matching assignments become canonical `--agent` filters on search-like commands
-16. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
+16. **Bare option pairs**: after at least one search/pack query word, `provider codex` and `last 7d` become canonical filter flags before the remaining words are folded into the query; a `limit 5` pair is a migration error on `cass search` (still accepted on `pack`)
 17. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
 18. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
 19. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
@@ -852,6 +852,21 @@ The CLI applies multiple normalization layers:
 21. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
 22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
 23. **Global flag hoisting**: Position-independent flag handling
+
+**Search result windows**: Reranking is off by default. `cass search` uses `--rrf-limit N` for the rrf candidate window and `--rerank-limit K` for the per-page rerank count (requires `--rerank`). With `--rerank` off, an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on, N defaults to 200 and K defaults to 5 per page (K must be at most N). An explicit `0` is rejected for either, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
+
+`--rerank` scores every actual candidate before it selects a page. The default backend is `qwen3-local`. Choose `bge-local`, `openrouter-qwen3-8b`, `openrouter-cohere-4-fast`, or `openrouter-voyage-2.5-lite` explicitly to use another backend. `--provider` still filters session sources. Local endpoints use `CASS_QWEN_RERANK_URL` or `CASS_INFINITY_URL` and must resolve to loopback. Only an explicit cloud selection consumes `OPENROUTER_API_KEY` and sends the query and verified passages to OpenRouter. Search does not start a service or download a model.
+
+The original `score` remains unchanged. Full rerank output adds `rerank_score`, with `null` for unscored hits. The `minimal` and `summary` presets keep their fields; use `--fields source_path,score,rerank_score` to select both scores. JSON, compact JSON, JSONL headers, and decoded TOON carry the same `_meta.rerank` facts even without `--robot-meta`. Requested and actual identities are separate. Unproven identities or counts remain `null`. `applied=true` means complete scoring succeeded, including when tied scores keep the original order.
+
+On failure, search keeps original order and returns at most K hits per page. It reports a short `failure_reason` and does not switch backends. A stable failed window can still be paged without retrying the model. Continuation pages report `cache_reused=true`, zero current request counts and duration, and the unchanged `first_*` facts. Display budgets act after scoring. If a budget reduces a page, the cursor advances by the actual delivered count.
+
+```bash
+cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json
+cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"
+```
+
+Copy `_meta.next_cursor` from the first response. Repeat the query, N/K, backend, and filters on later pages. Display fields and display budgets may change. The fixed window ends after its actual candidates, even when the archive has more matches. A changed query, filter, backend, or index requires a new search. `sessions` output still lists only unique paths from the current page.
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
@@ -996,7 +1011,7 @@ LLMs have context limits. `cass` provides multiple levers to control output size
 | `--fields score,title,snippet` | Custom field selection |
 | `--max-content-length 500` | Truncate long fields (UTF-8 safe, adds "...") |
 | `--max-tokens 2000` | Soft budget (~4 chars/token); adjusts truncation dynamically |
-| `--limit 5` | Cap number of results |
+| `--rrf-limit 5` | Cap the search candidate window |
 | `cass pack "query" --robot` | Build a cited handoff pack from selected search evidence |
 | `pack --max-tokens N` | Set the pack planner's soft budget |
 | `pack --max-evidence N` | Cap evidence items selected into the pack |
@@ -1177,11 +1192,11 @@ For large result sets, use cursor-based pagination:
 
 ```bash
 # First page
-cass search "TODO" --robot --robot-meta --limit 20
+cass search "TODO" --robot --robot-meta --rrf-limit 20
 # → { "hits": [...], "_meta": { "next_cursor": "eyJ..." } }
 
 # Next page
-cass search "TODO" --robot --robot-meta --limit 20 --cursor "eyJ..."
+cass search "TODO" --robot --robot-meta --rrf-limit 20 --cursor "eyJ..."
 ```
 
 Cursors are opaque tokens encoding the pagination state. They remain valid as long as the index isn't rebuilt.
@@ -1316,7 +1331,7 @@ cass introspect --json
  cass triage --json
 
  # Search across all agent histories
- cass search "authentication error" --robot --limit 5
+ cass search "authentication error" --robot --rrf-limit 5
 
  # Build a cited handoff pack from search evidence
  cass pack "authentication error root cause" --robot --max-tokens 12000 --limit 40
@@ -1348,7 +1363,7 @@ cass introspect --json
  | --robot / --json | Machine-readable JSON output (required!) |
  | --fields minimal | Reduce payload: source_path, line_number, agent only |
  | pack --max-tokens N | Budget a cited handoff pack |
- | --limit N | Cap result count |
+ | --rrf-limit N | Cap the search candidate window |
  | --agent NAME | Filter to specific agent (claude, codex, cursor, etc.) |
  | --days N | Limit to recent N days |
 
@@ -1849,7 +1864,7 @@ cass view /path/to/session.jsonl -n 42 --json
 
 ```bash
 # Export high-quality problem-solving sessions
-cass search "bug fix" --robot --limit 100 | \
+cass search "bug fix" --robot --rrf-limit 100 | \
   jq '.hits[] | select(.score > 0.8)' > training_candidates.json
 ```
 
@@ -2595,7 +2610,7 @@ cass [tui] [--data-dir DIR] [--once] [--asciicast FILE]
 cass index [--full] [--watch] [--data-dir DIR] [--idempotency-key KEY]
 
 # Search
-cass search "query" --robot --limit 5 [--timeout 5000] [--explain] [--dry-run]
+cass search "query" --robot --rrf-limit 5 [--timeout 5000] [--explain] [--dry-run]
 cass search "error" --robot --aggregate agent,workspace --fields minimal
 cass pack "query" --robot --max-tokens 12000 [--limit 40] [--sessions-from FILE|-]
 cass pack "query" --robot --freshness-policy strict --freshness-window-seconds 604800 --require-evidence

@@ -305,11 +305,11 @@ e2e_phase_end "wildcard_queries" $((phase_end - phase_start))
 e2e_phase_start "filtered_queries" "Testing queries with filters"
 phase_start=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 
-run_query_ok "filter_with_limit" "database" --limit 1
+run_query_ok "filter_with_limit" "database" --rrf-limit 1
 run_query_ok "filter_with_days" "authentication" --days 365
 run_query_ok "filter_with_agent" "database" --agent codex
 run_query_ok "filter_with_since" "authentication" --since "2024-01-01"
-run_query_ok "filter_combined" "database" --limit 5 --days 365
+run_query_ok "filter_combined" "database" --rrf-limit 5 --days 365
 
 phase_end=$(date +%s%3N 2>/dev/null || echo $(($(date +%s) * 1000)))
 e2e_phase_end "filtered_queries" $((phase_end - phase_start))

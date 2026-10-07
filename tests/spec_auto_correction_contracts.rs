@@ -5,14 +5,16 @@
 //!
 //!   - `-robot`   → `--robot`   ("long flags need double-dash")
 //!   - `--Robot`  → `--robot`   ("flags are lowercase")
-//!   - `--LIMIT`  → `--limit`
+//!   - `--RRF-LIMIT` → `--rrf-limit`
 //!   - `find "q"` → `search "q"` (5 search aliases: find, query, q, lookup, grep)
 //!
 //! INV-cass-7 already locks the *declaration* of subcommand aliases by
 //! cross-checking against `cass introspect --json`. This file locks the
 //! *behavior*: the alias actually invokes the search subcommand and
 //! produces the same hit set, and the flag-correction layer preserves
-//! the flag's value (not just its name) so `--LIMIT 1` actually limits.
+//! the flag's value (not just its name) so `--RRF-LIMIT 1` actually limits.
+//! The legacy `--LIMIT` still case-normalizes to `--limit`, which PR3 turned
+//! into a migration error rather than a bound result count.
 //!
 //! Four invariants:
 //!
@@ -24,7 +26,7 @@
 //!   3. `--Robot` (uppercase) produces robot JSON AND emits a
 //!      "Auto-corrected" note to stderr — the affordance must be
 //!      visible so users learn the canonical form.
-//!   4. `--LIMIT N` (uppercase) correctly limits the result count to
+//!   4. `--RRF-LIMIT N` (uppercase) correctly bounds the search window to
 //!      `N`, not just translating the flag name but preserving its
 //!      bound value. A regression that mangled value-binding would
 //!      pass test (3)'s name-only check but fail this one.
@@ -218,17 +220,44 @@ fn uppercase_limit_flag_preserves_value_binding_after_correction() -> TestResult
     let tmp = TempDir::new()?;
     let data_dir = copy_search_demo_fixture(tmp.path())?;
 
-    // `--LIMIT 1` — the value binding (1) must survive the flag-case
+    // `--RRF-LIMIT 1` — the value binding (1) must survive the flag-case
     // correction. A regression that mapped the flag name to its
     // canonical form but failed to bind the value would slip past the
     // simpler "--Robot works" test in (3) above — this test catches it
-    // by asserting the limit was actually applied to the result set.
-    let outcome = run_cass(&data_dir, &["search", "the", "--robot", "--LIMIT", "1"])?;
-    let count = hit_count_for_outcome("uppercase --LIMIT 1", &outcome)?;
+    // by asserting the window was actually applied to the result set.
+    let outcome = run_cass(&data_dir, &["search", "the", "--robot", "--RRF-LIMIT", "1"])?;
+    let count = hit_count_for_outcome("uppercase --RRF-LIMIT 1", &outcome)?;
     ensure(
         count == 1,
         format!(
-            "`--LIMIT 1` should bind the value `1` to the corrected --limit flag; got {count} hits"
+            "`--RRF-LIMIT 1` should bind the value `1` to the corrected --rrf-limit flag; got {count} hits"
+        ),
+    )?;
+    Ok(())
+}
+
+/// The legacy `--LIMIT` case-normalizes to the removed `--limit`, so it is a
+/// migration error now rather than a silently-corrected alias. The uppercase
+/// form must therefore exit 2 with the window-migration message, not bind a
+/// result count.
+#[test]
+fn legacy_uppercase_limit_flag_is_a_migration_error() -> TestResult {
+    let tmp = TempDir::new()?;
+    let data_dir = copy_search_demo_fixture(tmp.path())?;
+
+    let outcome = run_cass(&data_dir, &["search", "the", "--robot", "--LIMIT", "1"])?;
+    ensure(
+        outcome.exit_code == Some(2),
+        format!(
+            "`--LIMIT 1` must be a usage (exit 2) migration error, not a bound count; got exit {:?}, stderr:\n{}",
+            outcome.exit_code, outcome.stderr
+        ),
+    )?;
+    ensure(
+        outcome.stderr.contains("--rrf-limit"),
+        format!(
+            "the `--LIMIT` migration error must name --rrf-limit; got stderr:\n{}",
+            outcome.stderr
         ),
     )?;
     Ok(())

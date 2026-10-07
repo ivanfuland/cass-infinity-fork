@@ -125,7 +125,7 @@ fn role_filter_tool_matches_tool_result_not_user_message() {
 /// field), operating on an already-fetched hit window sized ~2-3x
 /// `offset+limit`. The dedup/shortfall retry previously only widened its fetch
 /// for `session_paths`, NOT `roles`. So when many higher-BM25 user/assistant
-/// hits outrank the single `tool_result` hit, `search X --role tool --limit 1`
+/// hits outrank the single `tool_result` hit, `search X --role tool --rrf-limit 1`
 /// returned EMPTY even though the tool_result exists. The fix makes
 /// `fallback_fetch_limit` role-aware (over-fetch capped at
 /// `no_limit_result_cap()`), mirroring the session-path treatment.
@@ -215,7 +215,7 @@ fn role_filter_lexical_recalls_tool_result_ranked_below_default_window() {
     assert_eq!(
         tool_hits.len(),
         1,
-        "--role tool --limit 1 must recall the tool_result even when it ranks \
+        "--role tool --rrf-limit 1 must recall the tool_result even when it ranks \
          below the default fetch window"
     );
 

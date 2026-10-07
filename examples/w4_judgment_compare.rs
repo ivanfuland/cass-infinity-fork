@@ -138,7 +138,7 @@ fn search_args(channel: &str, query: &str) -> Vec<String> {
         query.into(),
         "--mode".into(),
         channel.into(),
-        "--limit".into(),
+        "--rrf-limit".into(),
         "5000".into(),
         "--json".into(),
         "--fields".into(),

@@ -142,12 +142,32 @@ impl std::ops::Deref for SendFrankenConnection {
 
 static FRANKEN_RETRY_JITTER_STATE: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
 static DOCTOR_MUTATION_DB_OPEN_BYPASS_DEPTH: AtomicUsize = AtomicUsize::new(0);
-/// W2-6 exec41: test-only call counter for `rebuild_lex_domain_from_db`
+/// Test-only counters for explicitly registered database paths. Calls from
+/// other fixtures must not affect the `run_index --full` regression assertion.
+/// W2-6 exec41: call counter for `rebuild_lex_domain_from_db`
 /// (whole-archive lex_docs/fts_lex rebuild), used to regression-lock the
 /// `--full` double/triple-invocation bug (indexer/mod.rs `run_index` tail
 /// block). Not read in production builds.
 #[cfg(test)]
-pub(crate) static REBUILD_LEX_DOMAIN_FROM_DB_CALLS: AtomicUsize = AtomicUsize::new(0);
+static REBUILD_LEX_DOMAIN_FROM_DB_CALLS: std::sync::LazyLock<parking_lot::Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn register_rebuild_lex_domain_calls(db_path: &Path) {
+    REBUILD_LEX_DOMAIN_FROM_DB_CALLS.lock().insert(db_path.to_path_buf(), 0);
+}
+
+#[cfg(test)]
+pub(crate) fn take_rebuild_lex_domain_calls(db_path: &Path) -> usize {
+    REBUILD_LEX_DOMAIN_FROM_DB_CALLS.lock().remove(db_path).expect("registered rebuild path")
+}
+
+#[cfg(test)]
+fn record_rebuild_lex_domain_call(db_path: &Path) {
+    if let Some(calls) = REBUILD_LEX_DOMAIN_FROM_DB_CALLS.lock().get_mut(db_path) {
+        *calls += 1;
+    }
+}
 static MESSAGE_LOOKUP_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static MESSAGE_LOOKUP_EXACT_IDX_PROBES: AtomicU64 = AtomicU64::new(0);
 static MESSAGE_LOOKUP_BOUNDED_QUERIES: AtomicU64 = AtomicU64::new(0);
@@ -7391,7 +7411,7 @@ impl FrankenStorage {
         progress: Option<&Arc<crate::indexer::IndexingProgress>>,
     ) -> Result<LexDomainRebuildStats> {
         #[cfg(test)]
-        REBUILD_LEX_DOMAIN_FROM_DB_CALLS.fetch_add(1, Ordering::Relaxed);
+        record_rebuild_lex_domain_call(&self.db_path);
         const CONVERSATIONS_PER_TX: usize = 200;
         let conversation_ids: Vec<i64> = self
             .conn
@@ -17162,6 +17182,58 @@ mod tests {
                 },
             )
             .expect("insert_conversation_tree");
+    }
+
+    fn rebuild_count_fixture(path: &Path) -> SqliteStorage {
+        let storage = SqliteStorage::open(path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        insert_conversation_with_message(&storage, agent_id, "rebuild-count", "fixture content");
+        storage
+    }
+
+    #[test]
+    fn rebuild_lex_domain_call_counts_isolate_concurrent_databases() {
+        let dir = TempDir::new().unwrap();
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        drop(rebuild_count_fixture(&a));
+        drop(rebuild_count_fixture(&b));
+        register_rebuild_lex_domain_calls(&a);
+        register_rebuild_lex_domain_calls(&b);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for path in [&a, &b] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let storage = SqliteStorage::open(path).unwrap();
+                    let stats = storage.rebuild_lex_domain_from_db(None).unwrap();
+                    assert_eq!(stats.conversations_processed, 1);
+                });
+            }
+        });
+        assert_eq!(take_rebuild_lex_domain_calls(&a), 1, "A must exclude B's rebuild");
+        assert_eq!(take_rebuild_lex_domain_calls(&b), 1, "B must exclude A's rebuild");
+    }
+
+    #[test]
+    fn rebuild_lex_domain_call_counts_include_both_handles_of_one_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.db");
+        let first = rebuild_count_fixture(&path);
+        let second = SqliteStorage::open(&path).unwrap();
+        register_rebuild_lex_domain_calls(&path);
+        first.rebuild_lex_domain_from_db(None).unwrap();
+        second.rebuild_lex_domain_from_db(None).unwrap();
+        assert_eq!(take_rebuild_lex_domain_calls(&path), 2, "both handles must count for the same DB");
     }
 
     /// W2-6 Task A: a freshly-migrated (never-rebuilt) database has no

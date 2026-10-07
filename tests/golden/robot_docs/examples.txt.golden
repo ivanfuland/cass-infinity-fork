@@ -9,7 +9,7 @@ examples:
   cass search --query "auth" --json  # --query is accepted and converted to positional syntax
   cass search "auth" --format json  # --format json is accepted as --robot-format json
   cass search "auth" --output json  # --output json also becomes --robot-format json
-  cass search "auth" --max-results 5 --json  # result-count aliases become --limit
+  cass search "auth" --rrf-limit 5 --json  # candidate window N (replaces the removed search count flag)
   # Follow next_command when present; use discovery.schemas_command for typed clients.
 
 # Basic search with JSON output for agents
@@ -25,7 +25,7 @@ examples:
   # Read warnings[] plus health/freshness/privacy before copying a pack into another prompt.
   # Contributor check for docs/goldens: rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_cass_answer_pack_docs cargo test --test golden_robot_docs
 # Token-budgeted search with cursor + request-id
-  cass search "error" --robot --max-tokens 200 --request-id run-1 --limit 2 --robot-meta
+  cass search "error" --robot --max-tokens 200 --request-id run-1 --rrf-limit 2 --robot-meta
   cass search "error" --robot --cursor <_meta.next_cursor> --request-id run-1b --robot-meta
 
 # Search with time filters
@@ -33,7 +33,7 @@ examples:
   cass search "api" --week                  # last 7 days
   cass search "feature" --days 30           # last 30 days
   cass search "fix" --since 2025-01-01      # since date
-  cass search "error" --robot --limit 5 --offset 5  # paginate robot output
+  cass search "error" --robot --rrf-limit 5 --offset 5  # paginate robot output
 
 # Filter by agent or workspace
   cass search "error" --agent codex         # codex sessions only
@@ -95,3 +95,10 @@ examples:
   # Enter on selected result -> detail modal (Messages tab default)
   # Enter with no selected hit -> query submit behavior
   # In modal: / find, n/N next/prev, Esc exits find then closes modal, F8 opens in editor
+  Rerank is off by default. --rerank uses qwen3-local with N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.
+  Choose --rerank-provider qwen3-local|bge-local|openrouter-qwen3-8b|openrouter-cohere-4-fast|openrouter-voyage-2.5-lite. --provider still filters the session source.
+  score keeps its search meaning. rerank_score is separate and null when unscored; minimal/summary omit it unless explicitly added. JSON/compact/JSONL/TOON carry _meta.rerank without --robot-meta.
+  Failure keeps original order and K-result paging; failure_reason is a short code, not response text. No automatic backend switch. Actual identity and unproven counts stay null.
+  First page: cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json
+  Next page: cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"
+  Repeat the original query, N/K, provider and filters. Only display fields and content/token budgets may change. Pages reuse a fixed window; current model requests and duration are zero, first-call facts remain. A reduced page advances by its delivered count.

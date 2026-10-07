@@ -3125,6 +3125,30 @@ schemas: (auto-generated from contract)
       - refinement_level: string
       - request_id: ?
       - requested_search_mode: ?
+      - rerank: object
+        - actual_model: ?
+        - actual_provider: ?
+        - applied: boolean
+        - cache_reused: boolean
+        - duration_ms: integer
+        - failure_reason: ?
+        - first_duration_ms: integer
+        - first_http_requests: ?
+        - first_model_requests: ?
+        - http_requests: ?
+        - http_status: ?
+        - model_requests: ?
+        - offset: integer
+        - pagination_unavailable_reason: ?
+        - requested_model: string
+        - requested_provider: string
+        - rerank_limit: integer
+        - returned_count: integer
+        - rrf_limit: integer
+        - scored_count: integer
+        - serving_provider: ?
+        - window_count: integer
+      - rerank_applied: boolean
       - search_completeness: object
         - can_search: boolean
         - complete: boolean
@@ -3171,8 +3195,33 @@ schemas: (auto-generated from contract)
     - offset: integer
     - query: string
     - request_id: ?
+    - rerank_applied: boolean
+    - rerank_requested: boolean
     - suggestions: array
     - total_matches: integer
+  search-rerank-meta:
+    - actual_model: ?
+    - actual_provider: ?
+    - applied: boolean
+    - cache_reused: boolean
+    - duration_ms: integer
+    - failure_reason: ?
+    - first_duration_ms: integer
+    - first_http_requests: ?
+    - first_model_requests: ?
+    - http_requests: ?
+    - http_status: ?
+    - model_requests: ?
+    - offset: integer
+    - pagination_unavailable_reason: ?
+    - requested_model: string
+    - requested_provider: string
+    - rerank_limit: integer
+    - returned_count: integer
+    - rrf_limit: integer
+    - scored_count: integer
+    - serving_provider: ?
+    - window_count: integer
   sessions:
     - sessions: array
   state:

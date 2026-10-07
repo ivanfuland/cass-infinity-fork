@@ -358,7 +358,7 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     assert_eq!(conversations[0].agent_slug, "codex");
 
     let search_output = cargo_bin_cmd!("cass")
-        .args(["search", "purge-me", "--robot", "--limit", "5"])
+        .args(["search", "purge-me", "--robot", "--rrf-limit", "5"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
         .output()
@@ -396,7 +396,7 @@ fn sources_agents_exclude_purges_local_archive_data_by_default() {
     );
 
     let search_output = cargo_bin_cmd!("cass")
-        .args(["search", "keep-me", "--robot", "--limit", "5"])
+        .args(["search", "keep-me", "--robot", "--rrf-limit", "5"])
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
         .output()

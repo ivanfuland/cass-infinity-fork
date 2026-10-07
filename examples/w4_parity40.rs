@@ -115,7 +115,7 @@ impl LexicalSearch for SubprocessSearch {
         let output = Command::new(&self.binary)
             .env("XDG_CONFIG_HOME", &self.config_dir)
             .env("CASS_DATA_DIR", &self.data_dir)
-            .args(["search", query, "--mode", "lexical", "--limit", "10", "--json", "--fields", "source_path"])
+            .args(["search", query, "--mode", "lexical", "--rrf-limit", "10", "--json", "--fields", "source_path"])
             .output()
             .map_err(|e| anyhow::anyhow!("spawning candidate binary for query {query:?}: {e}"))?;
         anyhow::ensure!(

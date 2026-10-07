@@ -60,7 +60,7 @@ searcher() {
     local err_file="$OUT_DIR/.searcher${id}-${n}.stderr"
     local t0 t1 rc elapsed_ms
     t0=$(date +%s.%N)
-    timeout "$HARD_TIMEOUT_SECS" "$BIN" search "$q" --mode lexical --limit 5 \
+    timeout "$HARD_TIMEOUT_SECS" "$BIN" search "$q" --mode lexical --rrf-limit 5 \
       --timeout "$SEARCH_TIMEOUT_MS" --data-dir "$DATA_DIR" --json \
       >/dev/null 2>"$err_file"
     rc=$?

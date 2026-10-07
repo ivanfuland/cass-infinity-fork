@@ -50,11 +50,11 @@ const FS_CASS_SCHEMA_HASH: &str =
 /// must ignore `positive`/`negative`/`or_only` and fall back to the
 /// whole-string LIKE path when it is set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct Ku3LikeTerms {
-    positive: Vec<String>,
-    negative: Vec<String>,
-    mixed_operators: bool,
-    or_only: bool,
+pub(crate) struct Ku3LikeTerms {
+    pub(crate) positive: Vec<String>,
+    pub(crate) negative: Vec<String>,
+    pub(crate) mixed_operators: bool,
+    pub(crate) or_only: bool,
 }
 
 /// Token types for cass-style boolean query parsing.
@@ -581,7 +581,8 @@ pub fn sql_placeholders(count: usize) -> String {
     result
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SearchFilters {
     pub agents: HashSet<String>,
     pub workspaces: HashSet<String>,
@@ -810,7 +811,7 @@ fn hybrid_candidate_budget(
 // ============================================================================
 
 /// Classification of query type for explanation purposes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryType {
     /// Single term without operators
@@ -828,7 +829,7 @@ pub enum QueryType {
 }
 
 /// How the index will execute this query
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexStrategy {
     /// Fast path: edge n-gram prefix matching
@@ -844,7 +845,7 @@ pub enum IndexStrategy {
 }
 
 /// Rough complexity indicator for query execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryCost {
     /// Very fast (under 10ms typical)
@@ -856,14 +857,14 @@ pub enum QueryCost {
 }
 
 /// Sub-component of a parsed term
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParsedSubTerm {
     pub text: String,
     pub pattern: String,
 }
 
 /// Parsed term from the query
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParsedTerm {
     /// Original term text
     pub text: String,
@@ -874,7 +875,7 @@ pub struct ParsedTerm {
 }
 
 /// Parsed structure of the query
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ParsedQuery {
     /// Individual terms extracted
     pub terms: Vec<ParsedTerm>,
@@ -887,7 +888,7 @@ pub struct ParsedQuery {
 }
 
 /// Comprehensive query explanation for debugging and understanding search behavior
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueryExplanation {
     /// Exact input string
     pub original_query: String,
@@ -910,7 +911,7 @@ pub struct QueryExplanation {
 }
 
 /// Summary of active filters for explanation
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FiltersSummary {
     /// Number of agent filters
     pub agent_count: usize,
@@ -1244,7 +1245,7 @@ impl QueryExplanation {
 
 /// Indicates how a search result matched the query.
 /// Used for ranking: exact matches rank higher than wildcard matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MatchType {
     /// No wildcards - matched via exact term or edge n-gram prefix
@@ -1277,7 +1278,7 @@ impl MatchType {
 }
 
 /// Type of suggestion for did-you-mean
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SuggestionKind {
     /// Typo correction (Levenshtein distance)
@@ -1293,7 +1294,7 @@ pub enum SuggestionKind {
 }
 
 /// A "did-you-mean" suggestion when search returns zero hits.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QuerySuggestion {
     /// What kind of suggestion this is
     pub kind: SuggestionKind,
@@ -1432,21 +1433,21 @@ impl FieldMask {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchHit {
     pub title: String,
     pub snippet: String,
     pub content: String,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub content_hash: u64,
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing, default)]
     pub conversation_id: Option<i64>,
     pub score: f32,
     pub source_path: String,
     pub agent: String,
     pub workspace: String,
     /// Original workspace path before rewriting (P6.2)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_original: Option<String>,
     pub created_at: Option<i64>,
     /// Line number in the source file where the matched message starts (1-indexed)
@@ -1462,7 +1463,7 @@ pub struct SearchHit {
     #[serde(default = "default_source_id")]
     pub origin_kind: String,
     /// Origin host label for remote sources
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_host: Option<String>,
     // Chunk-domain provenance (T9, plan v5.1): which message the hit came
     // from at the block-search layer, and which of that message's chunks
@@ -1479,6 +1480,11 @@ pub struct SearchHit {
     pub winning_chunk_span: Option<(usize, usize)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winning_chunk_hash: Option<String>,
+    /// PR3 rerank score for this hit. `None` when rerank did not run, did not
+    /// apply, or was not requested for this hit; the original `score` is never
+    /// overwritten. Omitted from the public JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerank_score: Option<f64>,
 }
 
 static LAZY_FIELDS_ENABLED: Lazy<bool> = Lazy::new(|| {
@@ -1518,7 +1524,7 @@ fn effective_field_mask(field_mask: FieldMask) -> FieldMask {
 /// this degrade is *not* restricted by script -- any query under 3 Unicode
 /// codepoints (ASCII, CJK, emoji, or otherwise) structurally cannot match
 /// via `MATCH` and must degrade to the `LIKE` table scan.
-fn is_lexical_ku3_short_query(query: &str) -> bool {
+pub(crate) fn is_lexical_ku3_short_query(query: &str) -> bool {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return false;
@@ -1540,7 +1546,7 @@ fn is_lexical_ku3_short_query(query: &str) -> bool {
 /// (`lex_docs_like_candidates_query`, driven off the raw, unsplit query
 /// text -- which for both examples above still appears verbatim as a
 /// contiguous substring in the content it's meant to find).
-fn query_has_short_subterm_after_normalization(query: &str) -> bool {
+pub(crate) fn query_has_short_subterm_after_normalization(query: &str) -> bool {
     fs_cass_parse_boolean_query(query).into_iter().any(|token| {
         let FsCassQueryToken::Term(t) = token else {
             return false;
@@ -1565,7 +1571,7 @@ fn like_substring_pattern(term: &str) -> String {
 
 
 /// Result of a search operation with metadata about how matches were found
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SearchResult {
     /// The search results
     pub hits: Vec<SearchHit>,
@@ -2197,7 +2203,7 @@ struct SemanticCandidateSearchRequest {
 /// `vec0` KNN pass can return (`SQLITE_VEC_KNN_K_MAX`) *and* the active
 /// generation holds more chunk rows than that ceiling, round 1 is skipped
 /// outright and every candidate comes from the budgeted exact scan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CandidateMode {
     #[serde(rename = "knn")]
     Knn,
@@ -2210,7 +2216,7 @@ pub enum CandidateMode {
 /// T9 (plan v5.1): observability/diagnostics envelope for one chunk-domain
 /// semantic candidate search, surfaced to callers via `SearchResult.
 /// candidates` and the `_meta.candidates` JSON/JSONL/robot envelope field.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CandidateMeta {
     pub mode: CandidateMode,
     /// The `k` passed to `vec0`'s KNN (`min(fetch_limit * 4, 4096)`), or
@@ -2247,30 +2253,30 @@ pub struct CandidateMeta {
     ///
     /// `None` on every exact/float path -- absence means "no coarse screen
     /// ran here", which must never be read back as a measured `0`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_coarse_k: Option<usize>,
     /// PR9 task 08: the `k` the coarse screen actually ran with after the
     /// 4096 `SQLITE_VEC_KNN_K_MAX` cap and the corpus size were applied.
     /// `None` on every exact/float path (see `requested_coarse_k`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_coarse_k: Option<usize>,
     /// PR9 task 08: `true` iff `effective_coarse_k` was reduced by the 4096
     /// cap rather than by the corpus. `None` when no coarse screen ran.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_cap_hit: Option<bool>,
     /// For a sharded screen, `true` when the collected pool covers the whole
     /// active generation. The nominal per-shard K can exceed a small shard's
     /// row count even when the generation as a whole is larger than K.
     /// `None` when no coarse screen ran.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corpus_limited: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_shard_count: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_rows_collected: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub float_rescore_rows: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coarse_skip_reason: Option<String>,
 }
 
@@ -2390,10 +2396,9 @@ const EXACT_SCAN_ROW_BUDGET: usize = 6_000_000;
 
 /// Test-only override for `EXACT_SCAN_ROW_BUDGET` (`0` = unset, use the
 /// real constant) -- lets tests exercise the budget-exceeded path without
-/// scanning millions of synthetic rows. Plain `AtomicUsize`, not a
-/// `Mutex`/`RefCell`: this codebase's own testing discipline mandates
-/// `--test-threads=1` for `--lib` runs, so there is never genuine
-/// cross-test concurrency to race against.
+/// scanning millions of synthetic rows. Tests that set this override run
+/// their entire body in isolated test subprocesses; parallel readers in
+/// the parent process retain the default budget.
 static EXACT_SCAN_ROW_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -2430,8 +2435,8 @@ const HYDRATE_ID_BATCH_ROWS: usize = 900;
 /// candidate set in one statement, to diff against the real (900-row)
 /// batched path over the *same* candidate set (T9 part 2:
 /// `hybrid_limit_5000_hydrates_in_batches`) without depending on the
-/// retired v4 path as a reference. Same `AtomicUsize`/`--test-threads=1`
-/// justification as `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above.
+/// retired v4 path as a reference. The default and widened passes run in
+/// the same isolated test subprocess, leaving parent-process readers alone.
 static HYDRATE_ID_BATCH_ROWS_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -2507,7 +2512,7 @@ impl Default for SearchClientOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CacheStats {
     pub cache_hits: u64,
     pub cache_miss: u64,
@@ -2522,8 +2527,10 @@ pub struct CacheStats {
     pub approx_bytes: usize,
     /// Effective byte cap for cached hits (0 = disabled by explicit operator override)
     pub byte_cap: usize,
-    /// Active eviction/admission policy for prefix result cache
-    pub eviction_policy: &'static str,
+    /// Active eviction/admission policy for prefix result cache. Owned rather
+    /// than `&'static str` so a stats snapshot read back from the private
+    /// window cache cannot leak a fake static or force a `Box::leak`.
+    pub eviction_policy: String,
     /// Number of S3-FIFO ghost entries retained for adaptive admission
     pub ghost_entries: usize,
     /// Number of cache insertions rejected by adaptive admission
@@ -2549,7 +2556,7 @@ impl Default for CacheStats {
             eviction_count: 0,
             approx_bytes: 0,
             byte_cap: 0,
-            eviction_policy: "unknown",
+            eviction_policy: "unknown".to_string(),
             ghost_entries: 0,
             admission_rejects: 0,
             prewarm_scheduled: 0,
@@ -4800,6 +4807,7 @@ impl SearchClient {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 };
 
                 Some((message.message_id, hit))
@@ -5292,7 +5300,10 @@ impl SearchClient {
     /// `bm25(fts_lex, ...)` is still computed here (not dropped from the
     /// `SELECT`) to serve as the zero-score tie-break signal (design doc
     /// ⑤ "边界①") at zero extra query cost, not to order the results.
-    fn fts_lex_match_candidates_query(fts_query: &str, cap: usize) -> (String, Vec<ParamValue>) {
+    pub(crate) fn fts_lex_match_candidates_query(
+        fts_query: &str,
+        cap: usize,
+    ) -> (String, Vec<ParamValue>) {
         let sql = "SELECT rowid, bm25(fts_lex, 1.0, 3.0, 0.1, 0.1, 0.5) FROM fts_lex \
                     WHERE fts_lex MATCH ?1 LIMIT ?2"
             .to_string();
@@ -5312,7 +5323,10 @@ impl SearchClient {
     /// `sqlite_message_scan_score`'s philosophy) is still computed in the
     /// `SELECT` to serve as the zero-score tie-break signal, not to order
     /// results. `cap` is `no_limit_result_cap()`'s value.
-    fn lex_docs_like_candidates_query(raw_term: &str, cap: usize) -> (String, Vec<ParamValue>) {
+    pub(crate) fn lex_docs_like_candidates_query(
+        raw_term: &str,
+        cap: usize,
+    ) -> (String, Vec<ParamValue>) {
         let pattern = like_substring_pattern(raw_term);
         let sql = "SELECT doc_id, \
                     CAST( \
@@ -5371,7 +5385,7 @@ impl SearchClient {
     /// `Ku3LikeTerms` purely as extraction/routing state -- it still
     /// decides whether the caller falls back to the whole-string path --
     /// but is never turned into a WHERE predicate.
-    fn lex_docs_like_candidates_query_multi_term(
+    pub(crate) fn lex_docs_like_candidates_query_multi_term(
         terms: &Ku3LikeTerms,
         cap: usize,
     ) -> (String, Vec<ParamValue>) {
@@ -5469,7 +5483,7 @@ impl SearchClient {
     /// mix has no faithful LIKE-of-terms rendering, so the caller falls
     /// all the way back to the pre-T11.11 whole-string LIKE path for it,
     /// same as it always did for any `OR`.
-    fn ku3_like_fallback_terms(raw_query: &str) -> Ku3LikeTerms {
+    pub(crate) fn ku3_like_fallback_terms(raw_query: &str) -> Ku3LikeTerms {
         let tokens = fs_cass_parse_boolean_query(raw_query);
         let has_or = tokens.iter().any(|t| matches!(t, FsCassQueryToken::Or));
         let has_and_or_not =
@@ -6005,6 +6019,7 @@ impl SearchClient {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             };
             if Self::sqlite_fts5_hit_matches_filters(&hit, &filters) {
                 hits.push(hit);
@@ -6187,6 +6202,7 @@ impl SearchClient {
                     winning_chunk_idx: None,
                     winning_chunk_span: None,
                     winning_chunk_hash: None,
+                    rerank_score: None,
                 })
             })?;
         Ok(rows)
@@ -6207,7 +6223,7 @@ pub fn fuzz_transpile_to_fts5(raw_query: &str) -> Option<String> {
 /// Transpile a raw query string into an FTS5-compatible query string.
 /// Preserves custom precedence (OR > AND) by adding parentheses.
 /// Returns None if the query contains features unsupported by FTS5 (e.g. leading wildcards).
-fn transpile_to_fts5(raw_query: &str) -> Option<String> {
+pub(crate) fn transpile_to_fts5(raw_query: &str) -> Option<String> {
     let tokens = fs_cass_parse_boolean_query(raw_query);
     if tokens.is_empty() {
         return Some("".to_string());
@@ -6875,12 +6891,12 @@ impl SearchClient {
                 cache.eviction_count(),
                 cache.total_bytes(),
                 cache.byte_cap(),
-                cache.policy_label(),
+                cache.policy_label().to_string(),
                 cache.ghost_entries(),
                 cache.admission_rejects(),
             )
         } else {
-            (0, 0, 0, 0, 0, "unknown", 0, 0)
+            (0, 0, 0, 0, 0, "unknown".to_string(), 0, 0)
         };
         CacheStats {
             cache_hits: hits,
@@ -6912,6 +6928,54 @@ mod tests {
     use crate::storage::sqlite::FrankenStorage;
     use serde_json::json;
     use tempfile::TempDir;
+
+    const ISOLATED_QUERY_CHILD: &str = "CASS_TEST_ISOLATED_QUERY_CHILD";
+
+    fn isolated_query_child_output(name: &str) -> std::process::Output {
+        let previous_url = std::env::var_os("CASS_INFINITY_URL");
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args(["--exact", name, "--nocapture", "--format", "pretty", "--color", "never"])
+            .env(ISOLATED_QUERY_CHILD, name);
+        if name == "search::query::tests::hybrid_fails_open_when_infinity_unreachable" {
+            command.env("CASS_INFINITY_URL", "http://127.0.0.1:1");
+        }
+        let output = command.output().expect("run isolated query test");
+        assert_eq!(std::env::var_os("CASS_INFINITY_URL"), previous_url, "child must preserve parent Infinity URL");
+        output
+    }
+
+    fn isolated_query_child_passed(output: &std::process::Output, name: &str) -> bool {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected_test = format!("test {name} ... ok");
+        output.status.success()
+            && stdout.lines().filter(|line| *line == "running 1 test").count() == 1
+            && stdout.lines().filter(|line| *line == expected_test).count() == 1
+            && stdout.lines().filter(|line| line.starts_with("test result:")).count() == 1
+            && stdout.lines().any(|line| {
+                line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+            })
+    }
+
+    fn in_isolated_query_child(test: &str) -> bool {
+        let name = format!("search::query::tests::{test}");
+        if std::env::var(ISOLATED_QUERY_CHILD).as_deref() == Ok(name.as_str()) {
+            return true;
+        }
+        let output = isolated_query_child_output(&name);
+        println!("isolated query child {name}: {}\n{}\n{}", output.status, String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(isolated_query_child_passed(&output, &name), "query child must execute exactly one passing test");
+        false
+    }
+
+    #[test]
+    fn isolated_query_child_rejects_empty_selection() {
+        let absent = "search::query::tests::isolated_query_missing_child";
+        let output = isolated_query_child_output(absent);
+        println!("empty query selection: {}\n{}", output.status, String::from_utf8_lossy(&output.stdout));
+        assert!(output.status.success(), "libtest accepts an empty exact selection");
+        assert!(!isolated_query_child_passed(&output, absent), "zero tests must not count as success");
+    }
 
     // Reference implementation of the stable dedup key prior to bead num7z.
     // Kept in tests so the optimized `search_hit_key_doc_id` is pinned to
@@ -7214,6 +7278,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -7742,6 +7807,9 @@ mod tests {
     #[test]
     #[cfg(feature = "infinity")]
     fn hybrid_fails_open_when_infinity_unreachable() -> Result<()> {
+        if !in_isolated_query_child("hybrid_fails_open_when_infinity_unreachable") {
+            return Ok(());
+        }
         let conv = NormalizedConversation {
             agent_slug: "codex".into(),
             external_id: None,
@@ -7765,27 +7833,9 @@ mod tests {
         let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
         let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
 
-        // T9 part 2: point a real InfinityEmbedder at a dead local port
-        // (nothing listens on 127.0.0.1:1) -- `InfinityEmbedder::new()`
-        // only reads its base_url from `CASS_INFINITY_URL`
-        // (`InfinityConfig::from_env`), so setting/restoring the env var is
-        // the only public seam; safe under this codebase's own
-        // `--test-threads=1` testing discipline (same justification as
-        // `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above).
-        let previous_url = std::env::var("CASS_INFINITY_URL").ok();
-        // SAFETY: `--test-threads=1` (this codebase's own testing
-        // discipline, see `EXACT_SCAN_ROW_BUDGET_OVERRIDE` above) means no
-        // other thread reads/writes env vars concurrently with this test.
-        unsafe {
-            std::env::set_var("CASS_INFINITY_URL", "http://127.0.0.1:1");
-        }
+        // The parent binds the dead local port only in this child process.
+        // Keep the real constructor and unreachable HTTP fail-open path.
         let embedder_result = crate::search::infinity::InfinityEmbedder::new();
-        unsafe {
-            match previous_url {
-                Some(url) => std::env::set_var("CASS_INFINITY_URL", url),
-                None => std::env::remove_var("CASS_INFINITY_URL"),
-            }
-        }
         let embedder = embedder_result.expect("constructing the embedder itself does not touch the network");
         client.set_semantic_context(Arc::new(embedder), None)?;
 
@@ -7816,6 +7866,9 @@ mod tests {
     /// retired v4 path.
     #[test]
     fn hybrid_limit_5000_hydrates_in_batches() -> Result<()> {
+        if !in_isolated_query_child("hybrid_limit_5000_hydrates_in_batches") {
+            return Ok(());
+        }
         // Pinned: the real batch size must stay small enough that this
         // test's candidate count genuinely spans multiple SQL statements
         // (otherwise the "batched" and "reference" runs below would both
@@ -8200,6 +8253,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
 
@@ -8259,6 +8313,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         }
     }
@@ -8473,6 +8528,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let cached = CachedHit {
@@ -8641,6 +8697,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }];
 
         client.put_cache("こん", &SearchFilters::default(), &hits);
@@ -8675,6 +8732,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
         assert!(hit_matches_query_cached(&cached, "hello"));
@@ -10407,6 +10465,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let hits = vec![hit.clone()];
 
@@ -10489,6 +10548,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         // Put 3 entries - should trigger 1 eviction (cap is 2)
@@ -10603,6 +10663,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
         let byte_cap = cached.approx_bytes() + 1_024;
@@ -10658,6 +10719,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let cached = cached_hit_from(&hit);
         let byte_cap = cached.approx_bytes() + 1_024;
@@ -10707,6 +10769,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         // Put 3 large entries - should trigger byte-based evictions
@@ -10746,6 +10809,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let large_content = "large".repeat(2_000);
         let large_hit = SearchHit {
@@ -10769,6 +10833,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         let mut cache = CacheShards::new(100, 1_024);
@@ -11068,6 +11133,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11090,6 +11156,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11123,6 +11190,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11145,6 +11213,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11177,6 +11246,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
         let mut second = first.clone();
         second.line_number = Some(2);
@@ -11248,6 +11318,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "Evening Session".into(),
@@ -11270,6 +11341,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11303,6 +11375,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11325,6 +11398,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11356,6 +11430,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title1".into(),
@@ -11378,6 +11453,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11410,6 +11486,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title2".into(),
@@ -11432,6 +11509,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11464,6 +11542,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "real".into(),
@@ -11486,6 +11565,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11521,6 +11601,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(
@@ -11556,6 +11637,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title2".into(),
@@ -11578,6 +11660,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "title3".into(),
@@ -11600,6 +11683,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -11633,6 +11717,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
             SearchHit {
                 title: "remote title".into(),
@@ -11655,6 +11740,7 @@ mod tests {
                 winning_chunk_idx: None,
                 winning_chunk_span: None,
                 winning_chunk_hash: None,
+                rerank_score: None,
             },
         ];
 
@@ -14582,6 +14668,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -16807,6 +16894,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         // Query text doesn't matter — the point is that a hit stripped of
@@ -16849,6 +16937,7 @@ mod tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         };
 
         assert!(
@@ -17834,13 +17923,14 @@ mod tests {
     /// rows exist than the budget allows, reporting the result as
     /// incomplete rather than silently truncating without a signal.
     ///
-    /// `#[serial]`: shares the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
-    /// atomic with `pr9_direct_exact_budget_marks_incomplete`, so the two
-    /// must not interleave (the first to finish would otherwise reset the
-    /// budget mid-scan for the other).
+    /// The override and its reset stay inside this test's child process,
+    /// so normal-budget readers can continue in the parallel parent suite.
     #[test]
     #[serial_test::serial]
     fn semantic_exact_scan_row_budget_marks_incomplete() {
+        if !in_isolated_query_child("semantic_exact_scan_row_budget_marks_incomplete") {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
         const OTHER_DOCS: i64 = 80;
@@ -19271,13 +19361,14 @@ mod tests {
     /// silently truncate without a signal, nor (the failure this
     /// explicitly pins) collapse into a *successful* empty result.
     ///
-    /// `#[serial]`: this test and `semantic_exact_scan_row_budget_marks_incomplete`
-    /// both drive the process-global `EXACT_SCAN_ROW_BUDGET_OVERRIDE`
-    /// atomic, so they must never interleave -- the second one to finish
-    /// would otherwise reset the budget out from under the first.
+    /// The override and its reset run in a private child process, isolated
+    /// from both the other budget test and normal-budget parent readers.
     #[test]
     #[serial_test::serial]
     fn pr9_direct_exact_budget_marks_incomplete() {
+        if !in_isolated_query_child("pr9_direct_exact_budget_marks_incomplete") {
+            return;
+        }
         let dir = TempDir::new().unwrap();
         let storage = FrankenStorage::open(&dir.path().join("cass.db")).unwrap();
         const DIM: i64 = 4;

@@ -130,7 +130,7 @@ fn build_fixture(data_dir: &Path) {
 }
 
 fn run_search(data_dir: &Path, test_home: &Path, extra_args: &[&str], query: &str) -> Json {
-    let output = cass_cmd(data_dir, test_home).args(["search", query]).args(extra_args).args(["--limit", "5", "--model", "bge-m3"]).output().expect("run cass search");
+    let output = cass_cmd(data_dir, test_home).args(["search", query]).args(extra_args).args(["--rrf-limit", "5", "--model", "bge-m3"]).output().expect("run cass search");
     assert!(
         output.status.success(),
         "cass search {extra_args:?} exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
@@ -223,7 +223,7 @@ fn jsonl_semantic_hit_has_provenance() {
     build_fixture(&data_dir);
 
     let output =
-        cass_cmd(&data_dir, dir.path()).args(["search", SEMANTIC_QUERY, "--robot-format", "jsonl", "--mode", "semantic", "--daemon", "--limit", "5", "--model", "bge-m3"]).output().expect("run cass search --robot-format jsonl");
+        cass_cmd(&data_dir, dir.path()).args(["search", SEMANTIC_QUERY, "--robot-format", "jsonl", "--mode", "semantic", "--daemon", "--rrf-limit", "5", "--model", "bge-m3"]).output().expect("run cass search --robot-format jsonl");
     assert!(output.status.success(), "cass search --robot-format jsonl exited non-zero: {:?}\nstderr:\n{}", output.status, String::from_utf8_lossy(&output.stderr));
     let stdout = String::from_utf8(output.stdout).expect("utf8 jsonl stdout");
     let hit_line = stdout.lines().find_map(|line| {

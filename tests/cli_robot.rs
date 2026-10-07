@@ -533,7 +533,7 @@ fn capabilities_are_self_describing_for_agents() {
         bounded_search["first_command"]
             .as_str()
             .unwrap_or_default()
-            .contains("--limit 10"),
+            .contains("--rrf-limit 10"),
         "bounded-search workflow should teach explicit robot limits"
     );
     assert!(
@@ -681,17 +681,17 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
-            == "cass search auth provider codex limit 5 last 7d --json"
+            == "cass search auth provider codex last 7d --json"
             && recovery["canonical"]
-                == "cass search auth --agent codex --limit 5 --since -7d --json"
+                == "cass search auth --agent codex --since -7d --json"
             && recovery["accepted"] == true),
         "capabilities should advertise bare filter pair recovery"
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
-            == "cass search --agent codex --limit 5 auth error --json"
+            == "cass search --agent codex --rrf-limit 5 auth error --json"
             && recovery["canonical"]
-                == "cass search \"auth error\" --agent codex --limit 5 --json"
+                == "cass search \"auth error\" --agent codex --rrf-limit 5 --json"
             && recovery["accepted"] == true),
         "capabilities should advertise leading-filter query recovery"
     );
@@ -735,9 +735,9 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth --max_results 5 --json"
-            && recovery["canonical"] == "cass search auth --limit 5 --json"
-            && recovery["accepted"] == true),
-        "capabilities should advertise snake-case long flag recovery"
+            && recovery["canonical"] == "cass search auth --rrf-limit 5 --json"
+            && recovery["accepted"] == false),
+        "capabilities should advertise the refused snake-case result-count flag"
     );
     assert!(
         recoveries.iter().any(
@@ -750,9 +750,9 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth max_results=5 --json"
-            && recovery["canonical"] == "cass search auth --limit 5 --json"
-            && recovery["accepted"] == true),
-        "capabilities should advertise result-count assignment recovery"
+            && recovery["canonical"] == "cass search auth --rrf-limit 5 --json"
+            && recovery["accepted"] == false),
+        "capabilities should advertise the refused result-count assignment"
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
@@ -1756,7 +1756,7 @@ fn introspect_repeatable_and_value_types() {
     let mut found_agent = false;
     let mut found_workspace = false;
     let mut found_data_dir = false;
-    let mut found_limit = false;
+    let mut found_rrf_limit = false;
     let mut found_aggregate = false;
 
     for arg in args {
@@ -1774,10 +1774,16 @@ fn introspect_repeatable_and_value_types() {
                 found_data_dir = true;
                 assert_eq!(arg["value_type"], "path");
             }
-            "limit" => {
-                found_limit = true;
+            "rrf-limit" => {
+                found_rrf_limit = true;
                 assert_eq!(arg["value_type"], "integer");
-                assert_eq!(arg["default"], "0");
+                // `--rrf-limit` is an optional window with no clap-level
+                // default (the effective value is resolved at runtime).
+                assert!(
+                    arg["default"].is_null(),
+                    "search --rrf-limit must not carry a clap default; got {}",
+                    arg["default"]
+                );
             }
             "aggregate" => {
                 found_aggregate = true;
@@ -1793,7 +1799,7 @@ fn introspect_repeatable_and_value_types() {
         "search should document repeatable workspace arg"
     );
     assert!(found_data_dir, "search should document data-dir path type");
-    assert!(found_limit, "search should document integer limit");
+    assert!(found_rrf_limit, "search should document integer rrf-limit");
     assert!(
         found_aggregate,
         "search should document repeatable aggregate"
@@ -1972,7 +1978,7 @@ fn search_cursor_and_token_budget() {
         "search",
         "metamorphprobe",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "2",
         "--robot-meta",
         "--fields",
@@ -2141,7 +2147,7 @@ fn search_cursor_jsonl_and_compact() {
         "--robot-format",
         "jsonl",
         "--robot-meta",
-        "--limit",
+        "--rrf-limit",
         "2",
         "--data-dir",
         data_dir,
@@ -2190,7 +2196,7 @@ fn search_cursor_jsonl_and_compact() {
         "--robot-format",
         "compact",
         "--robot-meta",
-        "--limit",
+        "--rrf-limit",
         "2",
         "--data-dir",
         data_dir,
@@ -2234,7 +2240,7 @@ fn search_robot_format_sessions_matches_source_paths() {
         "compact",
         "--fields",
         "minimal",
-        "--limit",
+        "--rrf-limit",
         "50",
         "--data-dir",
         data_dir,
@@ -2261,7 +2267,7 @@ fn search_robot_format_sessions_matches_source_paths() {
         "hello",
         "--robot-format",
         "sessions",
-        "--limit",
+        "--rrf-limit",
         "50",
         "--data-dir",
         data_dir,
@@ -2550,13 +2556,13 @@ fn search_returns_json_results() {
 
 #[test]
 fn search_respects_limit() {
-    // E2E test: --limit restricts results (yln.5)
+    // E2E test: --rrf-limit restricts results (yln.5)
     let mut cmd = base_cmd();
     cmd.args([
         "search",
         "Gemini",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -2603,51 +2609,57 @@ fn search_empty_query_returns_all() {
     );
 }
 
-fn assert_search_limit_alias_limits_to_one(alias_args: &[&str]) {
+/// A legacy `cass search` result-count spelling is a migration error now, not
+/// a silently recovered alias: the command must exit 2 and name the new
+/// window flags rather than binding a count.
+fn assert_legacy_search_count_is_rejected(alias_args: &[&str]) {
     let mut cmd = base_cmd();
     let mut args = vec!["search", "", "--json"];
     args.extend(alias_args.iter().copied());
     args.extend(["--data-dir", "tests/fixtures/search_demo_data"]);
     cmd.args(args);
 
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
-    let hits = json["hits"].as_array().expect("hits array");
-
-    assert_eq!(json["limit"].as_u64(), Some(1));
-    assert_eq!(json["count"].as_u64(), Some(1));
-    assert_eq!(hits.len(), 1);
+    let output = cmd.assert().failure().get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a legacy search count spelling must be a usage (exit 2) error; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--rrf-limit"),
+        "the migration error must name --rrf-limit; stderr:\n{stderr}"
+    );
 }
 
 #[test]
-fn search_max_results_alias_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["--max-results", "1"]);
+fn search_max_results_alias_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["--max-results", "1"]);
 }
 
 #[test]
-fn search_snake_case_max_results_flag_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["--max_results", "1"]);
+fn search_snake_case_max_results_flag_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["--max_results", "1"]);
 }
 
 #[test]
-fn search_snake_case_max_results_equals_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["--max_results=1"]);
+fn search_snake_case_max_results_equals_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["--max_results=1"]);
 }
 
 #[test]
-fn search_count_alias_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["--count=1"]);
+fn search_count_alias_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["--count=1"]);
 }
 
 #[test]
-fn search_limit_assignment_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["limit=1"]);
+fn search_limit_assignment_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["limit=1"]);
 }
 
 #[test]
-fn search_max_results_assignment_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["max_results=1"]);
+fn search_max_results_assignment_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["max_results=1"]);
 }
 
 #[test]
@@ -2657,7 +2669,8 @@ fn search_filter_assignments_attach_to_options() {
         "search",
         "",
         "--json",
-        "limit=1",
+        "--rrf-limit",
+        "1",
         "agent=aider",
         "fields=minimal",
         "mode=lexical",
@@ -2714,7 +2727,8 @@ fn search_since_now_assignment_filters_to_zero_hits() {
         "",
         "--json",
         "since=now",
-        "limit=1",
+        "--rrf-limit",
+        "1",
         "data_dir=tests/fixtures/search_demo_data",
     ]);
 
@@ -2737,7 +2751,8 @@ fn search_time_window_alias_flags_filter_to_zero_hits() {
         "--last",
         "7",
         "--before=now",
-        "limit=1",
+        "--rrf-limit",
+        "1",
         "data_dir=tests/fixtures/search_demo_data",
     ]);
 
@@ -2751,8 +2766,8 @@ fn search_time_window_alias_flags_filter_to_zero_hits() {
 }
 
 #[test]
-fn search_short_n_alias_attaches_to_limit() {
-    assert_search_limit_alias_limits_to_one(&["-n", "1"]);
+fn search_short_n_alias_is_rejected() {
+    assert_legacy_search_count_is_rejected(&["-n", "1"]);
 }
 
 #[test]
@@ -3039,7 +3054,7 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
         "hello",
         "--json",
         "--robot-meta",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -3216,7 +3231,7 @@ fn search_cursor_manifest_marks_rebuilding_generation_best_effort() -> Result<()
         "hello",
         "--json",
         "--robot-meta",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         data_dir.path().to_str().expect("utf8 fixture path"),
@@ -3277,7 +3292,7 @@ fn search_robot_meta_reports_explicit_hybrid_fail_open() {
         "--robot-meta",
         "--mode",
         "hybrid",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -3328,7 +3343,7 @@ fn search_robot_meta_reports_explicit_lexical_override() {
         "--robot-meta",
         "--mode",
         "lexical",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -3586,9 +3601,13 @@ fn introspect_arguments_capture_types_defaults_and_repeatable() {
     let json = fetch_introspect_json();
 
     let search = find_command(&json, "search");
-    let limit = find_arg(search, "limit");
-    assert_eq!(limit["value_type"], "integer");
-    assert_eq!(limit["default"], "0");
+    let rrf_limit = find_arg(search, "rrf-limit");
+    assert_eq!(rrf_limit["value_type"], "integer");
+    // `--rrf-limit` is an optional window with no clap-level default.
+    assert!(rrf_limit["default"].is_null());
+    let rerank_limit = find_arg(search, "rerank-limit");
+    assert_eq!(rerank_limit["value_type"], "integer");
+    assert!(rerank_limit["default"].is_null());
 
     let offset = find_arg(search, "offset");
     assert_eq!(offset["value_type"], "integer");
@@ -3805,7 +3824,7 @@ fn search_provider_alias_filters_like_agent() {
         vec!["provider=aider"],
     ] {
         let mut cmd = base_cmd();
-        cmd.args(["search", "", "--json", "--limit", "10"]);
+        cmd.args(["search", "", "--json", "--rrf-limit", "10"]);
         cmd.args(alias_args);
         cmd.args(["--data-dir", "tests/fixtures/search_demo_data"]);
 
@@ -3834,7 +3853,7 @@ fn search_offset_skips_results() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "3",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -3853,7 +3872,7 @@ fn search_offset_skips_results() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--offset",
         "1",
@@ -3886,7 +3905,7 @@ fn robot_mode_auto_quiet_suppresses_info_logs() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -3914,7 +3933,7 @@ fn non_robot_mode_shows_info_logs() {
     cmd.args([
         "search",
         "hello",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -3942,7 +3961,7 @@ fn fields_filters_to_requested_only() {
         "search",
         "",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--fields",
         "source_path,line_number",
@@ -3978,7 +3997,7 @@ fn fields_minimal_preset_expands() {
         "search",
         "",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--fields",
         "minimal",
@@ -4013,7 +4032,7 @@ fn fields_summary_preset_expands() {
         "search",
         "",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--fields",
         "summary",
@@ -4052,7 +4071,7 @@ fn fields_works_with_jsonl_format() {
         "--json",
         "--robot-format",
         "jsonl",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--fields",
         "source_path,score",
@@ -4092,7 +4111,7 @@ fn max_content_length_truncates_long_content() {
         "search",
         "",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--max-content-length",
         "5",
@@ -4136,7 +4155,7 @@ fn max_content_length_adds_truncated_indicator() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--max-content-length",
         "3",
@@ -4177,7 +4196,7 @@ fn max_content_length_preserves_short_content() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--max-content-length",
         "1000",
@@ -4217,7 +4236,7 @@ fn max_content_length_works_with_fields() {
         "search",
         "",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--max-content-length",
         "5",
@@ -4959,7 +4978,7 @@ fn aggregate_includes_total_matches() {
 
 #[test]
 fn aggregate_with_limit_returns_both_hits_and_aggs() {
-    // rob.flow.agg: --aggregate with --limit returns both aggregations and hits
+    // rob.flow.agg: --aggregate with --rrf-limit returns both aggregations and hits
     let mut cmd = base_cmd();
     cmd.args([
         "search",
@@ -4967,7 +4986,7 @@ fn aggregate_with_limit_returns_both_hits_and_aggs() {
         "--json",
         "--aggregate",
         "agent",
-        "--limit",
+        "--rrf-limit",
         "2",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -4988,7 +5007,7 @@ fn aggregate_with_limit_returns_both_hits_and_aggs() {
     let hits = json["hits"].as_array().expect("hits array");
     assert!(
         hits.len() <= 2,
-        "Hits should respect --limit even with aggregation"
+        "Hits should respect --rrf-limit even with aggregation"
     );
 }
 
@@ -5070,7 +5089,7 @@ fn aggregate_preserves_offset_when_not_aggregating() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--offset",
         "1",
@@ -5673,7 +5692,8 @@ fn implicit_robot_search_folds_unquoted_query_words() {
         "--robot",
         "--dry-run",
         "provider=codex",
-        "max_results=5",
+        "--rrf-limit",
+        "5",
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -5752,7 +5772,8 @@ fn explicit_search_folds_unquoted_query_words_before_assignments() {
         "--robot",
         "--dry-run",
         "provider=codex",
-        "max_results=5",
+        "--rrf-limit",
+        "5",
     ]);
 
     let output = cmd.assert().success().get_output().clone();
@@ -5773,7 +5794,7 @@ fn explicit_search_recovers_bare_filter_pairs_after_query_words() {
         "error",
         "provider",
         "codex",
-        "limit",
+        "--rrf-limit",
         "5",
         "last",
         "7d",
@@ -5800,7 +5821,7 @@ fn explicit_search_recovers_query_after_leading_filters() {
         "search",
         "--agent",
         "codex",
-        "--limit",
+        "--rrf-limit",
         "5",
         "authentication",
         "error",
@@ -5851,7 +5872,7 @@ fn search_json_includes_source_id_provenance() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -5887,7 +5908,7 @@ fn search_fields_provenance_preset_expands() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--fields",
         "provenance,source_path",
@@ -5930,7 +5951,7 @@ fn search_default_output_includes_provenance_fields() {
         "search",
         "hello",
         "--json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -6623,15 +6644,35 @@ fn global_wrap_flag_accepts_integer() {
     cmd.assert().success();
 }
 
-/// Search limit flag should have correct default in introspect
+/// The search window flags must be optional integers with no clap-level
+/// default in introspect (the effective window is resolved at runtime), and
+/// the rerank provider must enumerate its five backends.
 #[test]
 fn introspect_search_limit_default() {
     let json = fetch_introspect_json();
     let search = find_command(&json, "search");
-    let limit = find_arg(search, "limit");
+    let rrf = find_arg(search, "rrf-limit");
 
-    assert_eq!(limit["value_type"], "integer");
-    assert_eq!(limit["default"], "0", "search --limit should default to 0");
+    assert_eq!(rrf["value_type"], "integer");
+    assert!(
+        rrf["default"].is_null(),
+        "search --rrf-limit must not carry a clap default"
+    );
+
+    let rerank = find_arg(search, "rerank-limit");
+    assert_eq!(rerank["value_type"], "integer");
+    assert!(
+        rerank["default"].is_null(),
+        "search --rerank-limit must not carry a clap default"
+    );
+
+    let provider = find_arg(search, "rerank-provider");
+    assert_eq!(provider["value_type"], "enum");
+    assert_eq!(
+        provider["enum_values"].as_array().map(Vec::len),
+        Some(5),
+        "rerank-provider must enumerate its five backends"
+    );
 }
 
 /// Search offset flag should have correct default in introspect
@@ -7134,7 +7175,7 @@ fn introspect_all_integer_options_documented() {
     let json = fetch_introspect_json();
 
     let search = find_command(&json, "search");
-    for name in ["limit", "offset", "days"] {
+    for name in ["rrf-limit", "rerank-limit", "offset", "days"] {
         let arg = find_arg(search, name);
         assert_eq!(
             arg["value_type"], "integer",
@@ -7184,13 +7225,13 @@ fn introspect_all_integer_options_documented() {
 fn robot_format_toon_is_valid_option() {
     let mut cmd = base_cmd();
     // Should not fail with "invalid value" error
-    // Use --limit 1 since limit 0 causes panic in tantivy
+    // Use --rrf-limit 1 (an explicit 0 window is rejected before execution)
     cmd.args([
         "search",
         "hello",
         "--robot-format",
         "toon",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -7207,7 +7248,7 @@ fn cass_output_format_env_triggers_robot_mode() {
     cmd.args([
         "search",
         "hello",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -7229,7 +7270,7 @@ fn toon_default_format_env_json_works() {
     cmd.args([
         "search",
         "hello",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -7253,7 +7294,7 @@ fn cli_robot_format_overrides_env() {
         "hello",
         "--robot-format",
         "json",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -7320,7 +7361,7 @@ fn cass_output_format_takes_precedence() {
     cmd.args([
         "search",
         "hello",
-        "--limit",
+        "--rrf-limit",
         "1",
         "--data-dir",
         "tests/fixtures/search_demo_data",
@@ -7564,7 +7605,7 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
             "--json",
             "--mode",
             "semantic",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
@@ -7672,8 +7713,8 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
 //      leading/trailing whitespace; a refactor that trusted the
 //      operator to pre-trim would silently regress this surface.
 //
-//   3. Limit monotonicity — the top-N hits of `search X --limit N`
-//      must be a prefix of the top-M hits of `search X --limit M` for
+//   3. Limit monotonicity — the top-N hits of `search X --rrf-limit N`
+//      must be a prefix of the top-M hits of `search X --rrf-limit M` for
 //      M > N. This is the deterministic-ordering property the pager
 //      and `--cursor` paths rely on; a regression that applied the
 //      limit BEFORE ranking would trip this test immediately.
@@ -7763,7 +7804,7 @@ fn search_is_case_insensitive_for_ascii_queries() {
             "search",
             "metamorphprobe",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7775,7 +7816,7 @@ fn search_is_case_insensitive_for_ascii_queries() {
             "search",
             "METAMORPHPROBE",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7787,7 +7828,7 @@ fn search_is_case_insensitive_for_ascii_queries() {
             "search",
             "MetaMorphProbe",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7832,7 +7873,7 @@ fn search_trims_leading_and_trailing_whitespace_from_query() {
             "search",
             "metamorphprobe",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7844,7 +7885,7 @@ fn search_trims_leading_and_trailing_whitespace_from_query() {
             "search",
             "  metamorphprobe  ",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7856,7 +7897,7 @@ fn search_trims_leading_and_trailing_whitespace_from_query() {
             "search",
             "\tmetamorphprobe\n",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7892,7 +7933,7 @@ fn search_limit_monotonicity_smaller_is_prefix_of_larger() {
             "search",
             "metamorphprobe",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "2",
             "--data-dir",
         ],
@@ -7904,7 +7945,7 @@ fn search_limit_monotonicity_smaller_is_prefix_of_larger() {
             "search",
             "metamorphprobe",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ],
@@ -7920,30 +7961,30 @@ fn search_limit_monotonicity_smaller_is_prefix_of_larger() {
     );
     assert!(
         large_keys.len() >= small_keys.len(),
-        "larger --limit must return at least as many hits as a smaller one; \
+        "larger --rrf-limit must return at least as many hits as a smaller one; \
          small.len()={}, large.len()={}",
         small_keys.len(),
         large_keys.len(),
     );
 
-    // The prefix property: every key returned at --limit 2 must be
-    // present in the same position at --limit 20. This is what the
+    // The prefix property: every key returned at --rrf-limit 2 must be
+    // present in the same position at --rrf-limit 20. This is what the
     // pager's `--cursor`/`--offset` path relies on.
     assert_eq!(
         &large_keys[..small_keys.len()],
         small_keys.as_slice(),
-        "--limit N hits must be a prefix of --limit M hits (M > N); \
+        "--rrf-limit N hits must be a prefix of --rrf-limit M hits (M > N); \
          small.keys={small_keys:?}\nlarge.keys (prefix)={:?}",
         &large_keys[..small_keys.len().min(large_keys.len())],
     );
 
-    // Also pin that total_matches is invariant under --limit — the
+    // Also pin that total_matches is invariant under --rrf-limit — the
     // limit only clamps how MANY we return, not the reported universe
     // size.
     assert_eq!(
         small.get("total_matches"),
         large.get("total_matches"),
-        "total_matches must be invariant across --limit; small: {small}\nlarge: {large}"
+        "total_matches must be invariant across --rrf-limit; small: {small}\nlarge: {large}"
     );
 }
 
@@ -8197,7 +8238,9 @@ fn search_rerank_without_robot_meta_reports_top_level_activation_fields_json() -
         "--json",
         "--rerank",
         "--no-daemon",
-        "--limit",
+        "--rrf-limit",
+        "1",
+        "--rerank-limit",
         "1",
         "--data-dir",
         fixture.path().to_str().expect("utf8 fixture path"),
@@ -8241,7 +8284,9 @@ fn search_rerank_without_robot_meta_reports_top_level_activation_fields_jsonl() 
         "jsonl",
         "--rerank",
         "--no-daemon",
-        "--limit",
+        "--rrf-limit",
+        "1",
+        "--rerank-limit",
         "1",
         "--data-dir",
         fixture.path().to_str().expect("utf8 fixture path"),

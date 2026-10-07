@@ -8,7 +8,7 @@ Updated: 2026-05-09
 - Leading flag recovery: `cass --json search "query"` is accepted as `cass search "query" --json`
 - Named input recovery: `cass search --query "query" --json` and `cass view --path session.jsonl --line 42 --json` are accepted
 - Format recovery: `cass search "query" --format json` and `cass --format json status` are accepted as `--robot-format json`
-- Result-count recovery: `cass search "query" --max-results 5`, `--top-k 5`, and `-n 5` are accepted as `--limit 5`
+- Result-count recovery: `cass pack "query" --max-results 5`, `--top-k 5`, and `-n 5` are accepted as `--limit 5`. `cass search` no longer accepts the legacy result-count spellings (`--limit`, `--max-results`, `--top-k`, `-n`, …): they are a migration error — use `--rrf-limit N` (candidate window) or `--rerank-limit K` (per-page rerank count)
 - First index: `cass index --full --json`
 - Search JSON: `cass search "query" --robot`
 - Handoff pack: `cass pack "query" --robot --max-tokens 12000 --limit 40`
@@ -62,6 +62,10 @@ Updated: 2026-05-09
 - Capabilities: `crate_version, api_version, contract_version, features[], connectors[], workflows[], mistake_recoveries[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
 
 ## Flags worth knowing
+- Search window: reranking is off by default. `--rrf-limit N` sets the rrf candidate window and `--rerank-limit K` the per-page rerank count (requires `--rerank`). With `--rerank` off an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on N defaults to 200. K defaults to 5 per page and must be at most N. An explicit `0` is rejected, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
+- Rerank backend: `--rerank` defaults to `qwen3-local`. Explicit choices are `qwen3-local`, `bge-local`, `openrouter-qwen3-8b`, `openrouter-cohere-4-fast`, and `openrouter-voyage-2.5-lite`. `--provider` still filters session sources. `CASS_QWEN_RERANK_URL` and `CASS_INFINITY_URL` accept only loopback rerank targets. Only an explicit cloud choice consumes `OPENROUTER_API_KEY`. No automatic backend switch occurs.
+- Rerank output: `score` remains the search score. Full output adds numeric or null `rerank_score`; minimal/summary keep their fields. Explicit `--fields source_path,score,rerank_score` selects both scores. JSON/compact/JSONL headers/decoded TOON share `_meta.rerank` without requiring `--robot-meta`. Requested identity is separate from actual identity; unproven actual fields and counts are null. `applied` means complete scoring, including unchanged order. Failures use short codes and retain original order with K-result paging.
+- Rerank continuation: repeat the original query, N/K, backend and filters, then add `_meta.next_cursor`. For example: `cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json`; then `cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"`. Display fields and budgets may change. The page reuses the fixed window and makes no new model request. Current request counts/duration are zero; `first_*` facts stay unchanged. Budgets apply after scoring and the cursor advances by actual delivered hits. The window ends independently of total archive matches. `sessions` keeps its current-page unique-path output.
 - `--fields minimal|summary|<list>`: reduce payload size
 - `--max-content-length N` / `--max-tokens N`: truncate per-field / by budget
 - `--robot-format json|jsonl|compact`: choose encoding
@@ -76,7 +80,7 @@ Updated: 2026-05-09
 
 ## Best practices for agents
 - Always pass `--robot`/`--json` and `--robot-meta` when you care about freshness or pagination.
-- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, `cass --robot-format json`, and `cass --format json` default to the same read-only triage response. If the agent puts `--json`, `--robot`, or `--format json` before a robot-capable subcommand, cass moves it to that subcommand. If the agent spells required inputs as named options, cass converts `--query` and `--path` forms to the required positional syntax for the robot-facing workflow commands. If it uses a familiar count alias such as `--max-results`, `--count`, `--top-k`, or `-n`, cass converts that to `--limit` on commands with result limits.
+- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted. If an agent only knows to request structured output, `cass --json`, `cass --robot`, `cass --robot-format json`, and `cass --format json` default to the same read-only triage response. If the agent puts `--json`, `--robot`, or `--format json` before a robot-capable subcommand, cass moves it to that subcommand. If the agent spells required inputs as named options, cass converts `--query` and `--path` forms to the required positional syntax for the robot-facing workflow commands. If it uses a familiar count alias such as `--max-results`, `--count`, `--top-k`, or `-n`, cass converts that to `--limit` on commands with result limits (`cass search` is the exception: its legacy result-count spellings are a migration error — use `--rrf-limit`/`--rerank-limit`).
 - Use `--fields minimal` during wide scans; fetch details with `cass view` if needed.
 - Respect `_warning`, `index_freshness.stale`, and health/status `recommended_action`; run `cass index --full` for first setup or explicit recommended refresh, not as a blind repair loop.
 - Treat lexical fallback in default hybrid search as expected when semantic assets are not ready. Escalate only when lexical itself is unavailable after the recommended rebuild path.
@@ -103,7 +107,7 @@ cass triage --json
 cass status --json
 
 # 2. Broad exploration
-cass search "checkout timeout after redirect" --robot --robot-meta --fields summary --limit 20
+cass search "checkout timeout after redirect" --robot --robot-meta --fields summary --rrf-limit 20
 
 # 3. Cited handoff pack
 cass pack "checkout timeout after redirect" --robot --max-tokens 12000 --limit 40

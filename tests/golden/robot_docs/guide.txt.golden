@@ -27,3 +27,10 @@ guide:
   Detail modal shortcuts: / opens find, n/N cycles matches, Esc exits find then closes modal, F8 opens selected hit in $EDITOR
   Safety: prefer --color=never in non-TTY; use --trace-file for spans; reset TUI via `cass tui --reset-state`
   Quick refs: cass triage --json | cass capabilities --json | cass --robot-help | cass robot-docs commands | cass robot-docs examples | cass robot-docs sources
+  Rerank is off by default. --rerank uses qwen3-local with N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.
+  Choose --rerank-provider qwen3-local|bge-local|openrouter-qwen3-8b|openrouter-cohere-4-fast|openrouter-voyage-2.5-lite. --provider still filters the session source.
+  score keeps its search meaning. rerank_score is separate and null when unscored; minimal/summary omit it unless explicitly added. JSON/compact/JSONL/TOON carry _meta.rerank without --robot-meta.
+  Failure keeps original order and K-result paging; failure_reason is a short code, not response text. No automatic backend switch. Actual identity and unproven counts stay null.
+  First page: cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json
+  Next page: cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"
+  Repeat the original query, N/K, provider and filters. Only display fields and content/token budgets may change. Pages reuse a fixed window; current model requests and duration are zero, first-call facts remain. A reduced page advances by its delivered count.

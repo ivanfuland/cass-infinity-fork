@@ -432,7 +432,7 @@ test_search_provenance() {
         CODING_AGENT_SEARCH_NO_UPDATE_PROMPT=1 \
         NO_COLOR=1 \
         "${CASS_BIN_RESOLVED}" search "authentication" \
-        --robot --limit 5 \
+        --robot --rrf-limit 5 \
         --fields "source_path,source_id,origin_kind,origin_host" 2>&1) || exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then

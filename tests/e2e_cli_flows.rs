@@ -616,7 +616,7 @@ fn search_returns_hits_with_expected_fields() {
             "search",
             "authentication",
             "--robot",
-            "--limit",
+            "--rrf-limit",
             "5",
             "--data-dir",
         ])
@@ -833,7 +833,7 @@ fn search_combined_filters() {
             "search",
             "error",
             "--robot",
-            "--limit",
+            "--rrf-limit",
             "10",
             "--days",
             "30",
@@ -854,7 +854,7 @@ fn search_combined_filters() {
         .or_else(|| json.get("results"))
         .and_then(|h| h.as_array())
     {
-        assert!(hits.len() <= 10, "Should respect limit=10");
+        assert!(hits.len() <= 10, "Should respect rrf-limit=10");
     }
 }
 
@@ -1556,7 +1556,7 @@ fn search_across_multiple_agents() {
             "search",
             "error OR database",
             "--robot",
-            "--limit",
+            "--rrf-limit",
             "20",
             "--data-dir",
         ])

@@ -17,7 +17,7 @@
 //! - `w2_judgment_cases_gate`: a manually-run acceptance gate, `#[ignore]`d
 //!   because it needs a real candidate binary + the multi-GB w2 staging DB
 //!   (staging-dependent, not runnable in CI). Runs each case at a high
-//!   `--limit` (ranks in this corpus have been observed in the hundreds, not
+//!   `--rrf-limit` (ranks in this corpus have been observed in the hundreds, not
 //!   just within top-10 -- see the exec46 Task乙 report) and reports
 //!   rank(A)/rank(B) per case; does not force a PASS/FAIL judgment by fiat
 //!   -- each case's outcome is asserted mechanically and a failing case's
@@ -108,7 +108,7 @@ fn run_lexical_search(binary: &str, data_dir: &str, config_dir: &str, query: &st
             query,
             "--mode",
             "lexical",
-            "--limit",
+            "--rrf-limit",
             &JUDGMENT_SEARCH_LIMIT.to_string(),
             "--json",
             "--fields",

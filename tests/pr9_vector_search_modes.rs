@@ -34,7 +34,7 @@ const EMBED_DIM: usize = 1024;
 const EMBED_MODEL: &str = "BAAI/bge-m3";
 const QUERY: &str = "pr9 cli candidate ranking fixture";
 
-/// `--limit 1` makes the CLI ask for `(1 + 1) * OVERFETCH_FACTOR(4) = 8`
+/// `--rrf-limit 1` makes the CLI ask for `(1 + 1) * OVERFETCH_FACTOR(4) = 8`
 /// candidates, so each int8 shard is asked for `8 * 4 = 32` rows: an 8-shard
 /// pool of 256 out of 804 stored chunks.
 const PER_SHARD_K: usize = 32;
@@ -517,10 +517,10 @@ fn build_fixture(rows: usize, state: FixtureState) -> Fixture {
     }
 }
 
-/// 804 chunks over eight shards, 256 of them inside the `--limit 1` coarse pool.
+/// 804 chunks over eight shards, 256 of them inside the `--rrf-limit 1` coarse pool.
 static SMALL: Lazy<Fixture> = Lazy::new(|| build_fixture(804, FixtureState::Active));
 
-/// The large-window fixture is its own corpus: `--limit 1025` asks for
+/// The large-window fixture is its own corpus: `--rrf-limit 1025` asks for
 /// `(1025 + 1) * 4 = 4104` candidates, which is above both the vec0 `k` ceiling
 /// and this generation's row count, so the direct-exact window applies.
 static LARGE: Lazy<Fixture> = Lazy::new(|| build_fixture(4204, FixtureState::Active));
@@ -575,7 +575,7 @@ fn stdout_json(output: &Output) -> serde_json::Value {
 
 fn semantic_search(fixture: &Fixture, limit: usize, extra: &[&str]) -> Output {
     let mut args = vec![
-        "search", QUERY, "--mode", "semantic", "--model", "bge-m3", "--limit",
+        "search", QUERY, "--mode", "semantic", "--model", "bge-m3", "--rrf-limit",
     ];
     let limit = limit.to_string();
     args.push(&limit);
@@ -664,7 +664,7 @@ fn lexical_search_without_the_flag_is_untouched() {
             "synthetic",
             "--mode",
             "lexical",
-            "--limit",
+            "--rrf-limit",
             "3",
             "--json",
         ],
@@ -850,7 +850,7 @@ fn hybrid_accepts_both_vector_search_modes() {
                 "hybrid",
                 "--model",
                 "bge-m3",
-                "--limit",
+                "--rrf-limit",
                 "3",
                 "--json",
                 "--vector-search-mode",
@@ -895,7 +895,7 @@ fn all_three_output_formats_report_the_actual_precision() {
             "semantic",
             "--model",
             "bge-m3",
-            "--limit",
+            "--rrf-limit",
             "1",
             "--robot-format",
             "jsonl",
@@ -927,7 +927,7 @@ fn all_three_output_formats_report_the_actual_precision() {
             "semantic",
             "--model",
             "bge-m3",
-            "--limit",
+            "--rrf-limit",
             "1",
             "--vector-search-mode",
             "fast",
@@ -949,7 +949,7 @@ fn all_three_output_formats_report_the_actual_precision() {
             "semantic",
             "--model",
             "bge-m3",
-            "--limit",
+            "--rrf-limit",
             "1",
             "--vector-search-mode",
             "exact",
@@ -998,7 +998,7 @@ fn fast_keeps_the_exact_float_path_above_the_large_window_boundary() {
             "semantic",
             "--model",
             "bge-m3",
-            "--limit",
+            "--rrf-limit",
             "1025",
             "--robot-format",
             "jsonl",
@@ -1036,7 +1036,7 @@ fn fast_keeps_the_exact_float_path_above_the_large_window_boundary() {
             "semantic",
             "--model",
             "bge-m3",
-            "--limit",
+            "--rrf-limit",
             "1025",
             "--vector-search-mode",
             "fast",
@@ -1163,7 +1163,7 @@ fn hybrid_fast_missing_shard_is_an_error_with_or_without_metadata() {
     for metadata in [false, true] {
         let mut args = vec![
             "search", QUERY, "--mode", "hybrid", "--model", "bge-m3",
-            "--limit", "5", "--json", "--vector-search-mode", "fast",
+            "--rrf-limit", "5", "--json", "--vector-search-mode", "fast",
         ];
         if metadata {
             args.push("--robot-meta");

@@ -472,12 +472,31 @@ pub enum Commands {
         /// role filter instead of intersecting with it.
         #[arg(long)]
         role: Vec<String>,
-        /// Max results. 0 = "no limit" but is auto-capped to a RAM-proportional ceiling
-        /// (1/16 of MemAvailable, clamped to [256 MiB, 16 GiB] of result-heap) so a single
-        /// query can't tie up the whole machine. Override with CASS_SEARCH_NO_LIMIT_CAP=<hits>
-        /// or CASS_SEARCH_NO_LIMIT_BYTES=<bytes>.
-        #[arg(long, default_value_t = 0)]
-        limit: usize,
+        /// Candidate window size N: the rrf-fusion/dedup/filter bound fetched
+        /// before pagination. The default depends on context: with --rerank it
+        /// is 200; without --rerank an omitted N keeps the legacy unbounded
+        /// fetch (internal 0). An explicit 0 is always rejected. Valid with or
+        /// without --rerank; when --rerank is off it is the fetch bound that
+        /// replaces the removed search count flag. Resolved with CLI >
+        /// CASS_RRF_LIMIT > [search].rrf_limit > default precedence. A window
+        /// whose N+1 overflows usize/i64 is rejected before any DB or model
+        /// work.
+        #[arg(long)]
+        rrf_limit: Option<usize>,
+        /// Per-page result count K when --rerank is enabled. Default 5; must be
+        /// at least 1 and at most the rrf window N. An explicit 0 is rejected.
+        /// Passing an explicit value without --rerank is a usage error, and
+        /// env/config K values are ignored when --rerank is off.
+        #[arg(long)]
+        rerank_limit: Option<usize>,
+        /// Rerank backend selection. Requires --rerank. Exactly one of
+        /// qwen3-local (the default when omitted), bge-local,
+        /// openrouter-qwen3-8b, openrouter-cohere-4-fast,
+        /// openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage
+        /// error. Nothing is read from env or config; omitting it never selects a
+        /// cloud backend.
+        #[arg(long, value_enum)]
+        rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
         /// Offset for pagination (start at Nth result)
         #[arg(long, default_value_t = 0)]
         offset: usize,
@@ -500,7 +519,8 @@ pub enum Commands {
         /// Request ID to echo in robot _meta for correlation
         #[arg(long)]
         request_id: Option<String>,
-        /// Cursor for pagination (base64-encoded offset/limit payload from previous result)
+        /// Cursor from _meta.next_cursor. Rerank pages reuse the fixed window;
+        /// repeat the original query, limits, backend and filters.
         #[arg(long)]
         cursor: Option<String>,
         /// Human-readable display format: table (aligned columns), lines (one-liner), markdown
@@ -532,7 +552,7 @@ pub enum Commands {
         #[arg(long, allow_hyphen_values = true)]
         until: Option<String>,
         /// Server-side aggregation by field(s). Comma-separated: `agent,workspace,date,match_type`
-        /// Returns buckets with counts instead of full results. Use with --limit to get both.
+        /// Returns buckets with counts instead of full results. Use with --rrf-limit to get both.
         #[arg(long, value_delimiter = ',')]
         aggregate: Option<Vec<String>>,
         /// Include query explanation in output (shows parsed query, index strategy, cost estimate)
@@ -574,13 +594,12 @@ pub enum Commands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Enable reranking of search results for improved relevance.
-        /// Requires a reranker model to be available.
+        /// Enable complete-window reranking (off by default).
+        /// Default: qwen3-local, N=200 candidates, K=5 results per page.
         #[arg(long, default_value_t = false)]
         rerank: bool,
 
-        /// Reranker model to use (requires --rerank).
-        /// Use `cass models --list` to see available options.
+        /// Deprecated reranker selector. Use --rerank-provider instead.
         #[arg(long)]
         reranker: Option<String>,
 
@@ -3045,7 +3064,7 @@ impl AggregateField {
 }
 
 /// A single bucket in an aggregation result
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregationBucket {
     /// The grouped key value
     pub key: String,
@@ -3054,7 +3073,7 @@ pub struct AggregationBucket {
 }
 
 /// Aggregation result for a single field
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldAggregation {
     /// Top buckets (limited to 10 by default)
     pub buckets: Vec<AggregationBucket>,
@@ -3063,7 +3082,8 @@ pub struct FieldAggregation {
 }
 
 /// Container for all aggregation results
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Aggregations {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<FieldAggregation>,
@@ -3543,7 +3563,7 @@ mod robot_docs_shorthand_regression_tests {
             "help".to_string(),
             "--json".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -3568,7 +3588,7 @@ mod robot_docs_shorthand_regression_tests {
             "search".to_string(),
             "--help".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -3593,7 +3613,7 @@ mod robot_docs_shorthand_regression_tests {
             "health".to_string(),
             "--json".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -3620,7 +3640,7 @@ mod robot_docs_shorthand_regression_tests {
             "models".to_string(),
             "verify".to_string(),
         ];
-        let (normalized, note) = normalize_args(raw);
+        let (normalized, note) = normalize_args(raw).expect("normalize");
         assert_eq!(
             normalized,
             vec![
@@ -4455,8 +4475,18 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
         name.as_str(),
         "agent"
             | "workspace"
+            | "role"
             | "limit"
             | "offset"
+            | "rrf-limit"
+            | "rerank-limit"
+            | "rerank-provider"
+            | "vector-search-mode"
+            | "provider"
+            | "tool"
+            | "connector"
+            | "agent-type"
+            | "agent_type"
             | "fields"
             | "max-content-length"
             | "max_content_length"
@@ -4805,7 +4835,12 @@ fn recover_structured_format_aliases(rest: &mut Vec<String>, corrections: &mut V
 fn command_accepts_limit_alias(rest: &[String]) -> bool {
     match rest.first().map(String::as_str) {
         Some("analytics") => rest.get(1).is_some_and(|arg| arg == "tools"),
-        Some("context" | "pack" | "search" | "sessions") => true,
+        // NOTE: `search` is intentionally absent. PR3 removed `--limit` (and
+        // every result-count alias that normalized to it) from `cass search`;
+        // those spellings now produce a migration error via
+        // `legacy_search_limit_migration_error` instead of being rewritten into
+        // a still-valid `--limit`. Other commands keep their old behavior.
+        Some("context" | "pack" | "sessions") => true,
         _ => false,
     }
 }
@@ -4866,6 +4901,117 @@ fn recover_limit_aliases(rest: &mut Vec<String>, corrections: &mut Vec<String>) 
     corrections.push(format!(
         "'{command} {flag} <value>' → '{command} --limit {value}' (result-count alias)"
     ));
+}
+
+/// The legacy `cass search` result-count long-flag spellings that must now fail
+/// with a migration error instead of resolving to a fetch bound.
+///
+/// These are the double-dash forms; single-dash / case / snake_case variants
+/// have already been normalized to these by `normalize_single_arg` before this
+/// list is consulted.
+const LEGACY_SEARCH_LIMIT_FLAGS: &[&str] = &[
+    "--limit",
+    "--max-results",
+    "--num-results",
+    "--results",
+    "--count",
+    "--top-k",
+    "--topk",
+    "--top_k",
+    "--n",
+    "-n",
+];
+
+/// True when `arg` is a bare `key=value` assignment whose key is a legacy
+/// result-count alias (`limit`, `max_results`, `top_k`, `n`, ...).
+fn legacy_search_limit_assignment(arg: &str) -> bool {
+    let Some((key, value)) = arg.split_once('=') else {
+        return false;
+    };
+    !value.is_empty() && is_result_count_assignment_key(&key.to_ascii_lowercase())
+}
+
+/// Detect a legacy `cass search` result-count spelling in the already-normalized
+/// argument list (`rest[0]` is the canonical subcommand).
+///
+/// Returns the offending spelling for the migration message. Scanning stops at
+/// a `--` terminator so a query literal is never misread as a flag, and the
+/// value of a value-taking option (`--since`, `--agent`, ...) is skipped so its
+/// contents cannot be mistaken for a stale flag. Runs after the recovery passes
+/// (so an implicit-`search` invocation is included) but before the query-folding
+/// passes (so a bare `limit 5` pair is still two tokens).
+fn legacy_search_limit_spelling(rest: &[String]) -> Option<String> {
+    if rest.first().map(String::as_str) != Some("search") {
+        return None;
+    }
+
+    let mut index = 1;
+    while index < rest.len() {
+        let arg = &rest[index];
+
+        // `--` terminates option parsing; everything after is the query literal.
+        if arg == "--" {
+            return None;
+        }
+
+        // Long-flag spellings, including the `--flag=value` form.
+        if let Some(flag) = LEGACY_SEARCH_LIMIT_FLAGS.iter().find(|flag| {
+            arg.as_str() == **flag
+                || arg
+                    .strip_prefix(**flag)
+                    .is_some_and(|suffix| suffix.starts_with('='))
+        }) {
+            return Some((*flag).to_string());
+        }
+        if arg.starts_with('-') {
+            // Skip the option and any value it consumes, so a value that reads
+            // like a legacy flag is not flagged.
+            let width = search_like_option_value_count("search", arg)
+                .unwrap_or(1)
+                .max(1);
+            index += width;
+            continue;
+        }
+
+        // Bare `limit=5` assignment.
+        if legacy_search_limit_assignment(arg) {
+            return Some(arg.clone());
+        }
+
+        // Bare `limit 5` pair. Mirrors `recover_bare_option_value_pairs`'s
+        // `search` start index so `cass search limit 5` (a query) is not flagged
+        // while `cass search foo limit 5` is.
+        if index >= 2
+            && is_result_count_assignment_key(&arg.to_ascii_lowercase())
+            && rest
+                .get(index + 1)
+                .is_some_and(|value| !value.starts_with("--"))
+        {
+            return Some(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+/// The short migration error for a legacy `cass search` result-count spelling.
+/// The offending spelling is the caller's own argument, so echoing it is safe
+/// and clarifies which token to replace. The replacement flags are named in the
+/// message itself so they survive the human (non-JSON) error rendering, which
+/// prints only the message and not the hint.
+fn legacy_search_limit_migration_error(spelling: &str) -> CliError {
+    CliError::usage(
+        format!(
+            "`cass search {spelling}` is no longer supported; use --rrf-limit N (candidate window) \
+             or --rerank-limit K (per-page rerank count)"
+        ),
+        Some(
+            "Replace the legacy result-count flag or alias with --rrf-limit N or --rerank-limit K."
+                .to_string(),
+        ),
+    )
 }
 
 fn has_explicit_structured_output_request(rest: &[String]) -> bool {
@@ -5066,7 +5212,7 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 8. **Named positional recovery**: `search --query foo` → `search foo`
 /// 9. **Multi-word query recovery**: `search foo bar --json` → `search "foo bar" --json`
 /// 10. **Structured format alias recovery**: `search foo --format json`/`--output json` → `search foo --robot-format json`
-/// 11. **Result-count alias recovery**: `search foo --max-results 5` → `search foo --limit 5`
+/// 11. **Result-count alias recovery**: `pack foo --max-results 5` → `pack foo --limit 5` (search no longer accepts `--limit`; its legacy count spellings are a PR3 migration error)
 /// 12. **Time-window alias recovery**: `search foo --last 7` → `search foo --since -7d`
 /// 13. **Provider alias recovery**: `search foo --provider codex` → `search foo --agent codex`
 /// 14. **Bare option-pair recovery**: `search foo provider codex` → `search foo --agent codex`
@@ -5082,9 +5228,9 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 24. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
-fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
+fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> {
     if raw.is_empty() {
-        return (raw, None);
+        return Ok((raw, None));
     }
     let prog = &raw[0];
     let mut globals: Vec<String> = Vec::new();
@@ -5106,6 +5252,9 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
         "top_k",
         "n",
         "offset",
+        "rrf-limit",
+        "rerank-limit",
+        "rerank-provider",
         "agent",
         "provider",
         "tool",
@@ -5501,6 +5650,16 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
     recover_explicit_search_pack_intent(&mut rest, &mut corrections);
     recover_structured_format_aliases(&mut rest, &mut corrections);
     recover_limit_aliases(&mut rest, &mut corrections);
+
+    // PR3: `cass search` dropped `--limit` and every alias that normalized to
+    // it. Detect those on the canonical `rest` (implicit-search already
+    // resolved, pack-intent already split off) and fail with a migration error
+    // before the query-folding passes below would swallow a bare `limit 5`
+    // pair into the query text.
+    if let Some(spelling) = legacy_search_limit_spelling(&rest) {
+        return Err(legacy_search_limit_migration_error(&spelling));
+    }
+
     recover_time_alias_flags(&mut rest, &mut corrections);
     recover_agent_filter_alias_flags(&mut rest, &mut corrections);
     recover_named_required_positionals(&mut rest, &mut corrections);
@@ -5803,7 +5962,7 @@ fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
             }
         ))
     };
-    (normalized, note)
+    Ok((normalized, note))
 }
 
 /// Build a helpful error message when a command group (e.g. `analytics`, `sources`,
@@ -5933,7 +6092,7 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
         err_map.insert(
             "flag_syntax".into(),
             serde_json::json!({
-                "correct": ["--limit 5", "--robot", "--json"],
+                "correct": ["--rrf-limit 5", "--robot", "--json"],
                 "incorrect": ["--limt 5", "-limit 5", "--Limit"]
             }),
         );
@@ -5962,8 +6121,8 @@ fn format_friendly_parse_error(err: clap::Error, raw: &[String], normalized: &[S
     }
     parts.push(String::new());
     parts.push("Quick syntax reference:".to_string());
-    parts.push("  - Long flags use double-dash: --robot, --limit 5".to_string());
-    parts.push("  - Flag values use space or equals: --limit 5 or --limit=5".to_string());
+    parts.push("  - Long flags use double-dash: --robot, --rrf-limit 5".to_string());
+    parts.push("  - Flag values use space or equals: --rrf-limit 5 or --rrf-limit=5".to_string());
     parts.push("  - Subcommands come first: cass search \"query\"".to_string());
     parts.join("\n")
 }
@@ -6006,7 +6165,7 @@ fn detect_command_intent(raw_str: &str) -> String {
 fn get_contextual_examples(intent: &str) -> Vec<&'static str> {
     if intent.contains("search") {
         vec![
-            "cass search \"error handling\" --robot --limit 10",
+            "cass search \"error handling\" --robot --rrf-limit 10",
             "cass search \"authentication\" --robot --agent claude",
             "cass search \"database\" --robot --since 2024-01-01",
             "cass search \"TODO\" --robot --workspace /path/to/project",
@@ -6075,7 +6234,7 @@ fn get_contextual_hints(intent: &str, raw_str: &str) -> Vec<String> {
         && !raw_str.contains("--limit=")
         && !raw_str.contains("-limit=")
     {
-        hints.push("Use '--limit 5' or '--limit=5', not 'limit=5'".to_string());
+        hints.push("Use '--flag value' or '--flag=value', not 'flag=value'".to_string());
     }
     if raw_str.contains("--robot-docs") {
         hints.push(
@@ -6111,8 +6270,8 @@ fn get_common_mistakes(intent: &str) -> Option<serde_json::Value> {
             ("cass query=\"foo\" --robot", "cass search \"foo\" --robot"),
             // Missing query entirely
             (
-                "cass search --robot --limit 5",
-                "cass search \"your query\" --robot --limit 5",
+                "cass search --robot --rrf-limit 5",
+                "cass search \"your query\" --robot --rrf-limit 5",
             ),
         ]
     } else if intent.contains("documentation") {
@@ -6416,8 +6575,9 @@ pub struct ParsedCli {
 }
 
 pub fn parse_cli(raw_args: Vec<String>) -> CliResult<ParsedCli> {
-    // First normalization pass (global flags lift)
-    let (normalized_args, parse_note) = normalize_args(raw_args.clone());
+    // First normalization pass (global flags lift). A legacy `cass search`
+    // result-count spelling is refused here as a usage error (PR3 migration).
+    let (normalized_args, parse_note) = normalize_args(raw_args.clone())?;
 
     let (cli, heuristic_note) = match Cli::try_parse_from(&normalized_args) {
         Ok(cli) => (cli, None),
@@ -6961,7 +7121,9 @@ async fn execute_cli(
                     agent,
                     workspace,
                     role,
-                    limit,
+                    rrf_limit,
+                    rerank_limit,
+                    rerank_provider,
                     offset,
                     json,
                     robot_meta,
@@ -7005,40 +7167,39 @@ async fn execute_cli(
                         ));
                     }
 
-                    // Warn about reranker without rerank flag
-                    if reranker.is_some() && !rerank {
+                    // `--reranker` is deprecated: it is still parsed for
+                    // compatibility, but it never selects a backend and its
+                    // value is never echoed. Combining it with the new
+                    // `--rerank-provider` is an explicit conflict rather than a
+                    // silent preference for one of them.
+                    if reranker.is_some() {
+                        if rerank_provider.is_some() {
+                            return Err(CliError::usage(
+                                "--reranker cannot be combined with --rerank-provider",
+                                Some(
+                                    "--rerank-provider now selects the rerank backend; drop --reranker."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
                         eprintln!(
-                            "Warning: --reranker specified but --rerank not enabled; reranker will be ignored"
+                            "Warning: --reranker is deprecated and no longer selects a rerank backend; use --rerank-provider"
                         );
                     }
 
-                    if refresh {
-                        refresh_index_inline(cli.db.clone(), data_dir.clone());
-                    }
-
-                    let semantic_opts = SemanticSearchOptions {
-                        model: model.clone(),
+                    // Resolve configurable search defaults (#303 + PR3 windows)
+                    // in one pass: timeout/mode as before, plus the window limits
+                    // N/K and the rerank provider. This MUST run before
+                    // `refresh_index_inline` so an invalid window/provider
+                    // argument fails before any ingest, DB or model work starts.
+                    let defaults = resolve_search_window_defaults(
+                        timeout,
+                        mode,
                         rerank,
-                        reranker: reranker.clone(),
-                        use_daemon: daemon && !no_daemon,
-                    };
-
-                    // Only pass through robot_format when it was explicitly
-                    // requested (CLI flag or env var). Returning `None` here
-                    // lets `run_cli_search` apply its full precedence chain
-                    // (robot_format > --json > env > robot_auto > display),
-                    // so `--display table|lines|markdown` actually wins when
-                    // no structured format was asked for.
-                    let effective_format = cli.robot_format.or_else(robot_format_from_env);
-
-                    // Resolve configurable search defaults (#303): the explicit
-                    // CLI flag wins, then the env var, then `~/.config/cass/cass.toml`
-                    // `[search]`, then the built-in default. This lets agents set a
-                    // default timeout/limit/mode once instead of appending flags to
-                    // every invocation. A broken config file or a malformed env value
-                    // is a clear usage error rather than a silent fall-through.
-                    let (eff_timeout, eff_limit, eff_mode) =
-                        resolve_search_defaults(timeout, limit, mode)?;
+                        rrf_limit,
+                        rerank_limit,
+                        rerank_provider,
+                    )?;
 
                     // PR9 09a: `--vector-search-mode` is an independent
                     // dimension from `--mode`, but lexical search has no
@@ -7047,7 +7208,10 @@ async fn execute_cli(
                     // against the *effective* mode (flag > env > config >
                     // default) and before the database is opened.
                     if vector_search_mode.is_some()
-                        && matches!(eff_mode, Some(crate::search::query::SearchMode::Lexical))
+                        && matches!(
+                            defaults.mode,
+                            Some(crate::search::query::SearchMode::Lexical)
+                        )
                     {
                         return Err(CliError::usage(
                             "--vector-search-mode cannot be combined with lexical search",
@@ -7058,12 +7222,84 @@ async fn execute_cli(
                         ));
                     }
 
+                    // P09: a rerank (`--rerank`) first lookup freezes the window
+                    // from offset 0, and the frozen `RequestBinding` carries no
+                    // offset field -- so a non-zero `--offset` cannot be
+                    // represented and its continuation could not be told apart
+                    // from an offset-0 window. A continuation cursor is likewise
+                    // frozen against the index state of the first lookup, so it
+                    // can never be valid together with an ingest that runs first
+                    // (`--refresh`/`--catch-up`) nor with a caller-supplied
+                    // `--offset` (the cursor already carries its own window
+                    // offset). All of these are rejected here, before
+                    // `refresh_index_inline` ingests anything and before the
+                    // database or any model is touched. The closed (no
+                    // `--rerank`) cursor path keeps its original semantics.
+                    if rerank {
+                        if offset != 0 {
+                            return Err(CliError::usage(
+                                "--rerank does not support a non-zero --offset",
+                                Some(
+                                    "A rerank window always starts at offset 0; use --cursor --offset for later pages."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                        if cursor.is_some() && refresh {
+                            return Err(CliError::usage(
+                                "--cursor cannot be combined with --refresh",
+                                Some(
+                                    "A rerank continuation page reads the frozen window; drop --refresh for it."
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                    }
+
+                    if refresh {
+                        refresh_index_inline(cli.db.clone(), data_dir.clone());
+                    }
+
+                    let semantic_opts = semantic_search_options_from_defaults(
+                        model.clone(),
+                        rerank,
+                        reranker.clone(),
+                        daemon && !no_daemon,
+                        &defaults,
+                    );
+
+                    // Only pass through robot_format when it was explicitly
+                    // requested (CLI flag or env var). Returning `None` here
+                    // lets `run_cli_search` apply its full precedence chain
+                    // (robot_format > --json > env > robot_auto > display),
+                    // so `--display table|lines|markdown` actually wins when
+                    // no structured format was asked for.
+                    let effective_format = cli.robot_format.or_else(robot_format_from_env);
+
+                    // P09: preserve the values the frozen `RequestBinding`
+                    // needs but the legacy flow folds away before
+                    // `run_cli_search` -- the user's original relative-time
+                    // selection (never re-resolved against a later clock) and
+                    // the original daemon flags.
+                    let rerank_ctx = RerankRequestContext {
+                        time_selectors: crate::search::rerank::window::TimeSelectors {
+                            days,
+                            today,
+                            yesterday,
+                            week,
+                            since: since.clone(),
+                            until: until.clone(),
+                        },
+                        daemon,
+                        no_daemon,
+                    };
+
                     run_cli_search(
                         &query,
                         &agent,
                         &workspace,
                         &role,
-                        &eff_limit,
+                        &defaults.rrf_limit,
                         &offset,
                         &json,
                         effective_format,
@@ -7090,13 +7326,14 @@ async fn execute_cli(
                         aggregate,
                         explain,
                         dry_run,
-                        eff_timeout,
+                        defaults.timeout_ms,
                         highlight,
                         source,
                         sessions_from,
-                        eff_mode,
+                        defaults.mode,
                         vector_search_mode,
                         semantic_opts,
+                        rerank_ctx,
                     )?;
                 }
                 Commands::Pack {
@@ -20184,7 +20421,7 @@ fn readiness_recommended_commands(
                         "--robot",
                         "--mode",
                         "lexical",
-                        "--limit",
+                        "--rrf-limit",
                         "10",
                         "--fields",
                         "summary",
@@ -20213,7 +20450,7 @@ fn readiness_recommended_commands(
                         "search",
                         "'<query>'",
                         "--robot",
-                        "--limit",
+                        "--rrf-limit",
                         "10",
                         "--fields",
                         "summary",
@@ -21517,6 +21754,10 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "",
         "OUTPUT:",
         "  --robot | --json   Machine-readable JSON output (auto-quiet enabled)",
+        "  --rerank enables qwen3-local by default (N=200/K=5); select --rerank-provider explicitly to change backend.",
+        "  Search uses --rrf-limit N and --rerank-limit K; legacy search --limit is refused. Pack --limit is unchanged.",
+        "  _meta.rerank is present in JSON/compact/JSONL/TOON when enabled, without --robot-meta; score and rerank_score are separate.",
+        "  Cursor pages repeat query/N/K/provider/filters and reuse the window without another model call.",
         "  stdout=data only; stderr=warnings/errors only (INFO auto-suppressed)",
         "  Use -v/--verbose with --json to enable INFO logs if needed",
         "",
@@ -21531,7 +21772,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
 }
 
 fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
-    let lines: Vec<String> = match topic {
+    let mut lines: Vec<String> = match topic {
         RobotTopic::Commands => vec![
             "commands:".to_string(),
             "  (global) --quiet / -q  Suppress info logs (auto-enabled in robot mode)".to_string(),
@@ -21540,12 +21781,14 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search <query> [OPTIONS]".to_string(),
             "    --agent A         Filter by agent (e.g. codex, claude_code, gemini, opencode, antigravity; run `cass capabilities --json | jq .connectors` for the full 22-connector inventory)".to_string(),
             "    --workspace W     Filter by workspace path".to_string(),
-            "    --limit N         Max results (default: 0 = no limit)".to_string(),
+            "    --rrf-limit N     Candidate window N before pagination. Default: 200 with --rerank; without --rerank an omitted N keeps the legacy unbounded fetch (internal 0). Explicit 0 is rejected.".to_string(),
+            "    --rerank-limit K  Per-page count K when --rerank is on (default 5; must be >=1 and <=N; explicit 0 rejected)".to_string(),
+            "    --rerank-provider P  Rerank backend when --rerank is on: qwen3-local (default when omitted) | bge-local | openrouter-qwen3-8b | openrouter-cohere-4-fast | openrouter-voyage-2.5-lite".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
             "                      Presets: minimal (path,line,agent), summary (+title,score), provenance (source_id,origin_kind,origin_host)".to_string(),
-            "                      Fields: score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
+            "                      Fields: score,rerank_score,agent,workspace,workspace_original,source_path,snippet,content,title,created_at,line_number,match_type,source_id,origin_kind,origin_host".to_string(),
             "    --max-content-length N  Truncate content/snippet/title to N chars (UTF-8 safe, adds '...')".to_string(),
             "                            Adds *_truncated: true indicator for each truncated field".to_string(),
             "    --today           Filter to today only".to_string(),
@@ -21675,7 +21918,12 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_DB_PATH                             override db path".to_string(),
             "  CASS_OUTPUT_FORMAT=json|jsonl|compact|sessions|toon  default structured output".to_string(),
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
-            "  CASS_SEARCH_LIMIT=<N>                    default search/pack limit (--limit overrides; 0=no limit)".to_string(),
+            "  CASS_RRF_LIMIT=<N>                       default search rrf candidate window N (--rrf-limit overrides)".to_string(),
+            "  CASS_RERANK_LIMIT=<K>                    default search per-page rerank count K (--rerank-limit overrides)".to_string(),
+            "  CASS_QWEN_RERANK_URL                     qwen3-local endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
+            "  CASS_INFINITY_URL                        bge-local rerank endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
+            "  OPENROUTER_API_KEY                       consumed only by an explicit OpenRouter rerank selection; never selects a cloud backend by itself".to_string(),
+            "  CASS_SEARCH_LIMIT=<N>                    legacy pack default limit (--limit overrides); rejected by `cass search` (use CASS_RRF_LIMIT)".to_string(),
             "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
             "  TOON_INDENT=<N>                           pretty-print TOON with indent".to_string(),
@@ -21785,7 +22033,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search --query \"auth\" --json  # --query is accepted and converted to positional syntax".to_string(),
             "  cass search \"auth\" --format json  # --format json is accepted as --robot-format json".to_string(),
             "  cass search \"auth\" --output json  # --output json also becomes --robot-format json".to_string(),
-            "  cass search \"auth\" --max-results 5 --json  # result-count aliases become --limit".to_string(),
+            "  cass search \"auth\" --rrf-limit 5 --json  # candidate window N (replaces the removed search count flag)".to_string(),
             "  # Follow next_command when present; use discovery.schemas_command for typed clients.".to_string(),
             String::new(),
             "# Basic search with JSON output for agents".to_string(),
@@ -21801,7 +22049,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  # Read warnings[] plus health/freshness/privacy before copying a pack into another prompt.".to_string(),
             "  # Contributor check for docs/goldens: rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_cass_answer_pack_docs cargo test --test golden_robot_docs".to_string(),
             "# Token-budgeted search with cursor + request-id".to_string(),
-            "  cass search \"error\" --robot --max-tokens 200 --request-id run-1 --limit 2 --robot-meta".to_string(),
+            "  cass search \"error\" --robot --max-tokens 200 --request-id run-1 --rrf-limit 2 --robot-meta".to_string(),
             "  cass search \"error\" --robot --cursor <_meta.next_cursor> --request-id run-1b --robot-meta".to_string(),
             String::new(),
             "# Search with time filters".to_string(),
@@ -21809,7 +22057,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass search \"api\" --week                  # last 7 days".to_string(),
             "  cass search \"feature\" --days 30           # last 30 days".to_string(),
             "  cass search \"fix\" --since 2025-01-01      # since date".to_string(),
-            "  cass search \"error\" --robot --limit 5 --offset 5  # paginate robot output".to_string(),
+            "  cass search \"error\" --robot --rrf-limit 5 --offset 5  # paginate robot output".to_string(),
             String::new(),
             "# Filter by agent or workspace".to_string(),
             "  cass search \"error\" --agent codex         # codex sessions only".to_string(),
@@ -21999,6 +22247,21 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             .map(|s| s.to_string())
             .collect(),
     };
+
+    if matches!(
+        topic,
+        RobotTopic::Guide | RobotTopic::Contracts | RobotTopic::Examples
+    ) {
+        lines.extend([
+            "  Rerank is off by default. --rerank uses qwen3-local with N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.".to_string(),
+            "  Choose --rerank-provider qwen3-local|bge-local|openrouter-qwen3-8b|openrouter-cohere-4-fast|openrouter-voyage-2.5-lite. --provider still filters the session source.".to_string(),
+            "  score keeps its search meaning. rerank_score is separate and null when unscored; minimal/summary omit it unless explicitly added. JSON/compact/JSONL/TOON carry _meta.rerank without --robot-meta.".to_string(),
+            "  Failure keeps original order and K-result paging; failure_reason is a short code, not response text. No automatic backend switch. Actual identity and unproven counts stay null.".to_string(),
+            "  First page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json".to_string(),
+            "  Next page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor \"<next_cursor>\"".to_string(),
+            "  Repeat the original query, N/K, provider and filters. Only display fields and content/token budgets may change. Pages reuse a fixed window; current model requests and duration are zero, first-call facts remain. A reduced page advances by its delivered count.".to_string(),
+        ]);
+    }
 
     println!("{}", render_block(&lines, wrap));
     Ok(())
@@ -22241,9 +22504,19 @@ pub struct SemanticSearchOptions {
     /// Enable reranking of results
     pub rerank: bool,
     /// Reranker model to use (if rerank is enabled)
+    ///
+    /// Deprecated: parsed for compatibility but never selects a backend. The
+    /// rerank backend now comes from [`Self::rerank_provider`].
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
+    /// Per-page rerank window K. Resolved by the search defaults bridge; `None`
+    /// when reranking is off. Carried through to the rerank stage (P09).
+    pub rerank_limit: Option<usize>,
+    /// Selected rerank backend. `Some` only when reranking is on (defaulting to
+    /// `qwen3-local`); `None` when reranking is off. Carried through to the
+    /// rerank stage (P09).
+    pub rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
 impl TimeFilter {
@@ -23041,9 +23314,13 @@ mod search_lexical_self_heal_tests {
     }
 }
 
-/// Resolve the effective `(timeout_ms, limit, mode)` for a `cass search` /
-/// `cass pack` invocation by layering the configurable defaults (#303) under
+/// Resolve the effective `(timeout_ms, limit, mode)` for a `cass pack`
+/// invocation by layering the configurable defaults (#303) under
 /// the explicit CLI flags.
+///
+/// PR3 kept this resolver for `cass pack` only, because pack still consumes the
+/// legacy `limit`; `cass search` now resolves its own defaults through
+/// [`resolve_search_window_defaults`] and rejects the legacy limit.
 ///
 /// Precedence (highest wins): CLI flag > env var > `~/.config/cass/cass.toml`
 /// `[search]` > built-in default. The config file is loaded once per
@@ -23051,7 +23328,7 @@ mod search_lexical_self_heal_tests {
 /// as a clear usage error rather than silently ignored.
 ///
 /// `cli_limit == 0` is treated as "not explicitly set" so a configured default
-/// limit engages for the common `cass search "<q>"` (no `--limit`) case; an
+/// limit engages for the common `cass pack "<q>"` (no `--limit`) case; an
 /// explicit `--limit 0` is semantically identical to the unset default ("no
 /// limit", still RAM-capped downstream), so nothing surprising happens there.
 fn resolve_search_defaults(
@@ -23100,6 +23377,681 @@ fn resolve_search_defaults(
     Ok((timeout, limit, mode))
 }
 
+/// Resolved `cass search` defaults: `--timeout`/`--mode` (same resolution as
+/// [`resolve_search_defaults`]) plus the P08a window limits N/K and the
+/// CLI-only rerank provider selection.
+#[derive(Debug)]
+struct SearchWindowDefaults {
+    timeout_ms: Option<u64>,
+    mode: Option<crate::search::query::SearchMode>,
+    /// Rrf candidate-pool window N. `0` is the built-in "no explicit window"
+    /// sentinel (rerank off, no source configured one).
+    rrf_limit: usize,
+    /// Per-page rerank window K, present only when reranking is enabled.
+    rerank_limit: Option<usize>,
+    /// Selected rerank backend, present only when reranking is enabled.
+    rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
+}
+
+/// Map the resolved search defaults onto the [`SemanticSearchOptions`] carried
+/// into the search engine. Extracted from the dispatch so the mapping (which
+/// propagates the per-page rerank window K and the selected backend) is
+/// unit-testable without opening a database.
+fn semantic_search_options_from_defaults(
+    model: Option<String>,
+    rerank: bool,
+    reranker: Option<String>,
+    use_daemon: bool,
+    defaults: &SearchWindowDefaults,
+) -> SemanticSearchOptions {
+    SemanticSearchOptions {
+        model,
+        rerank,
+        reranker,
+        use_daemon,
+        rerank_limit: defaults.rerank_limit,
+        rerank_provider: defaults.rerank_provider,
+    }
+}
+
+/// Pure inputs for [`resolve_search_window_defaults_from`]. Every env/config
+/// value is passed in, so the resolution logic is unit-testable without
+/// touching process-global env or the real config file.
+struct SearchWindowInputs<'a> {
+    rerank: bool,
+    cli_rrf: Option<usize>,
+    cli_rerank: Option<usize>,
+    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
+    cli_timeout: Option<u64>,
+    cli_mode: Option<crate::search::query::SearchMode>,
+    env_timeout: Option<&'a str>,
+    env_mode: Option<&'a str>,
+    env_rrf: Option<&'a str>,
+    env_rerank: Option<&'a str>,
+    env_legacy_limit: Option<&'a str>,
+    config: &'a crate::search_defaults::SearchDefaults,
+}
+
+/// Resolve the effective `cass search` defaults in a single pass.
+///
+/// This is the search-only sibling of [`resolve_search_defaults`], which stays
+/// in place for `cass pack` (pack still consumes the legacy `limit`). The
+/// config file is loaded once; `--timeout`/`--mode` keep their existing pure
+/// resolvers, while the window limits N/K go through P08a's
+/// `search_defaults::resolve_window_limits`, so a legacy `[search].limit` or
+/// `CASS_SEARCH_LIMIT` is a migration error instead of a silent fetch bound.
+///
+/// The rerank provider is a pure CLI selection: it requires `--rerank`,
+/// defaults to the local Qwen backend when omitted, and never reads env or
+/// config. Every error is produced here, before the DB is opened, before any
+/// refresh/ingest, and before any model request.
+fn resolve_search_window_defaults(
+    cli_timeout: Option<u64>,
+    cli_mode: Option<crate::search::query::SearchMode>,
+    rerank: bool,
+    cli_rrf: Option<usize>,
+    cli_rerank: Option<usize>,
+    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
+) -> CliResult<SearchWindowDefaults> {
+    use crate::search_defaults as sd;
+
+    let config = sd::load_search_defaults().map_err(|e| {
+        CliError::usage(
+            e.to_string(),
+            Some("Fix or remove ~/.config/cass/cass.toml; expected a [search] table".to_string()),
+        )
+    })?;
+
+    let env_timeout = sd::timeout_env();
+    let env_mode = sd::mode_env();
+    let env_rrf = dotenvy::var("CASS_RRF_LIMIT").ok();
+    let env_rerank = dotenvy::var("CASS_RERANK_LIMIT").ok();
+    let env_legacy_limit = dotenvy::var("CASS_SEARCH_LIMIT").ok();
+
+    resolve_search_window_defaults_from(SearchWindowInputs {
+        rerank,
+        cli_rrf,
+        cli_rerank,
+        cli_provider,
+        cli_timeout,
+        cli_mode,
+        env_timeout: env_timeout.as_deref(),
+        env_mode: env_mode.as_deref(),
+        env_rrf: env_rrf.as_deref(),
+        env_rerank: env_rerank.as_deref(),
+        env_legacy_limit: env_legacy_limit.as_deref(),
+        config: &config,
+    })
+}
+
+/// The pure core of [`resolve_search_window_defaults`]. Reads nothing from the
+/// process environment or the filesystem.
+fn resolve_search_window_defaults_from(
+    inputs: SearchWindowInputs<'_>,
+) -> CliResult<SearchWindowDefaults> {
+    use crate::search::rerank::types::ProviderChoice;
+    use crate::search_defaults as sd;
+
+    // The provider only exists when reranking is on. An explicit selection with
+    // --rerank off is a usage error, not a silently ignored flag.
+    if !inputs.rerank && inputs.cli_provider.is_some() {
+        return Err(CliError::usage(
+            "--rerank-provider requires --rerank",
+            Some("Enable --rerank to select a rerank backend, or drop --rerank-provider.".to_string()),
+        ));
+    }
+    let rerank_provider = if inputs.rerank {
+        Some(inputs.cli_provider.unwrap_or(ProviderChoice::Qwen3Local))
+    } else {
+        None
+    };
+
+    let (timeout, _t_src) =
+        sd::resolve_timeout_ms(inputs.cli_timeout, inputs.env_timeout, inputs.config.timeout_ms)
+            .map_err(|e| {
+                CliError::usage(
+                    e,
+                    Some("Set a non-negative integer of milliseconds".to_string()),
+                )
+            })?;
+
+    let cli_mode_str = inputs.cli_mode.map(search_mode_canonical_str);
+    let (mode_str, _m_src) = sd::resolve_mode(
+        cli_mode_str,
+        inputs.env_mode,
+        inputs.config.mode.as_deref(),
+    )
+    .map_err(|e| CliError::usage(e, Some("Use one of: lexical, semantic, hybrid".to_string())))?;
+    let mode = mode_str.and_then(|m| search_mode_from_canonical_str(&m));
+
+    // Window limits: the pure resolver owns the precedence and validation.
+    let resolved = sd::resolve_window_limits(sd::WindowLimitInputs {
+        rerank: inputs.rerank,
+        cli_rrf: inputs.cli_rrf,
+        cli_rerank: inputs.cli_rerank,
+        env_rrf: inputs.env_rrf,
+        env_rerank: inputs.env_rerank,
+        env_legacy_limit: inputs.env_legacy_limit,
+        config: inputs.config,
+    })
+    .map_err(|e| {
+        CliError::usage(
+            e,
+            Some(
+                "Use --rrf-limit N and --rerank-limit K (or CASS_RRF_LIMIT / CASS_RERANK_LIMIT)."
+                    .to_string(),
+            ),
+        )
+    })?;
+
+    Ok(SearchWindowDefaults {
+        timeout_ms: timeout,
+        mode,
+        rrf_limit: resolved.rrf_limit,
+        rerank_limit: resolved.rerank_limit,
+        rerank_provider,
+    })
+}
+
+#[cfg(test)]
+mod pr3_cli_limits {
+    //! P08b targeted tests for the `cass search` window CLI: the new
+    //! `--rrf-limit` / `--rerank-limit` / `--rerank-provider` flags, the pure
+    //! defaults bridge, and the legacy result-count migration errors.
+    //!
+    //! These are deliberately environment-free: the pure bridge takes every
+    //! env/config value as an argument, and the CLI-parse tests run through
+    //! `parse_cli`, which never reads `CASS_RRF_LIMIT`/`CASS_SEARCH_LIMIT`.
+    //! Env/config behavior is covered by `tests/pr3_cli_limits.rs` with a
+    //! subprocess-isolated environment.
+
+    use super::*;
+    use crate::search::rerank::types::ProviderChoice;
+    use crate::search_defaults::SearchDefaults;
+
+    fn base_inputs(config: &SearchDefaults) -> SearchWindowInputs<'_> {
+        SearchWindowInputs {
+            rerank: false,
+            cli_rrf: None,
+            cli_rerank: None,
+            cli_provider: None,
+            cli_timeout: None,
+            cli_mode: None,
+            env_timeout: None,
+            env_mode: None,
+            env_rrf: None,
+            env_rerank: None,
+            env_legacy_limit: None,
+            config,
+        }
+    }
+
+    /// `Cli`/`Commands` is a large enum; cloning it inside `parse_cli` needs a
+    /// stack larger than the default test thread (same reason as
+    /// `tests/cli_search_semantic_flags.rs`).
+    fn run_on_large_stack<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        std::thread::Builder::new()
+            .name("pr3-cli-limits".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(f)
+            .expect("spawn large-stack parser thread")
+            .join()
+            .expect("large-stack parser thread should not panic")
+    }
+
+    fn parse(args: &[&str]) -> CliResult<ParsedCli> {
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        run_on_large_stack(move || parse_cli(owned))
+    }
+
+    fn parse_err(args: &[&str]) -> CliError {
+        match parse(args) {
+            Ok(_) => panic!("expected a usage error for {args:?}"),
+            Err(err) => err,
+        }
+    }
+
+    fn search_fields(args: &[&str]) -> Commands {
+        match parse(args).expect("parse should succeed").cli.command {
+            Some(cmd @ Commands::Search { .. }) => cmd,
+            other => panic!("expected search command, got {other:?}"),
+        }
+    }
+
+    // ---- pure bridge ----
+
+    #[test]
+    fn off_omitted_defaults_are_zero_none_none() {
+        let config = SearchDefaults::default();
+        let resolved = resolve_search_window_defaults_from(base_inputs(&config))
+            .expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 0, "rerank off keeps the legacy no-window sentinel");
+        assert_eq!(resolved.rerank_limit, None);
+        assert_eq!(resolved.rerank_provider, None);
+    }
+
+    #[test]
+    fn on_omitted_defaults_are_200_5_qwen() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 200);
+        assert_eq!(resolved.rerank_limit, Some(5));
+        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
+    }
+
+    #[test]
+    fn explicit_n_k_provider_propagate_field_by_field() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(50);
+        inputs.cli_rerank = Some(3);
+        inputs.cli_provider = Some(ProviderChoice::BgeLocal);
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 50);
+        assert_eq!(resolved.rerank_limit, Some(3));
+        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::BgeLocal));
+    }
+
+    #[test]
+    fn explicit_n_with_rerank_off_still_propagates() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rrf = Some(7);
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 7);
+        assert_eq!(resolved.rerank_limit, None);
+        assert_eq!(resolved.rerank_provider, None);
+    }
+
+    #[test]
+    fn provider_with_rerank_off_is_a_usage_error() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_provider = Some(ProviderChoice::OpenrouterQwen38b);
+        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("--rerank-provider"), "{}", err.message);
+    }
+
+    #[test]
+    fn provider_is_not_read_from_env_or_config() {
+        // Env has no provider input at all, and config carries none, so an
+        // enabled rerank with no CLI selection must land on qwen3-local.
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.env_rrf = Some("300");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
+    }
+
+    #[test]
+    fn explicit_zero_window_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rrf = Some(0);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn k_greater_than_n_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(10);
+        inputs.cli_rerank = Some(11);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn explicit_k_when_off_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rerank = Some(3);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn small_n_with_omitted_k_errors_when_on() {
+        // N<5 with K omitted defaults K to 5, which exceeds N, so it must error
+        // rather than silently clamp.
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(3);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn cli_beats_env_beats_config() {
+        let mut config = SearchDefaults::default();
+        config.rrf_limit = Some(300);
+        config.rerank_limit = Some(30);
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(50);
+        inputs.cli_rerank = Some(3);
+        inputs.env_rrf = Some("200");
+        inputs.env_rerank = Some("20");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 50);
+        assert_eq!(resolved.rerank_limit, Some(3));
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.env_rrf = Some("150");
+        inputs.env_rerank = Some("15");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 150);
+        assert_eq!(resolved.rerank_limit, Some(15));
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 300);
+        assert_eq!(resolved.rerank_limit, Some(30));
+    }
+
+    #[test]
+    fn off_ignores_env_and_config_k() {
+        let mut config = SearchDefaults::default();
+        config.rerank_limit = Some(4);
+        let mut inputs = base_inputs(&config);
+        inputs.env_rerank = Some("9");
+        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        assert_eq!(resolved.rrf_limit, 0);
+        assert_eq!(resolved.rerank_limit, None);
+    }
+
+    #[test]
+    fn legacy_config_limit_is_a_migration_error_even_with_explicit_cli() {
+        let mut config = SearchDefaults::default();
+        config.limit = Some(10);
+        let mut inputs = base_inputs(&config);
+        inputs.cli_rrf = Some(500);
+        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert!(err.hint.as_deref().unwrap_or("").contains("rrf-limit"), "{err:?}");
+    }
+
+    #[test]
+    fn legacy_env_limit_is_a_migration_error() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.env_legacy_limit = Some("10");
+        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
+        assert_eq!(err.code, 2);
+        assert!(err.hint.as_deref().unwrap_or("").contains("rrf-limit"), "{err:?}");
+    }
+
+    #[test]
+    fn malformed_env_rrf_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.env_rrf = Some("lots");
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    #[test]
+    fn overflow_window_is_rejected() {
+        let config = SearchDefaults::default();
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(usize::MAX);
+        assert!(resolve_search_window_defaults_from(inputs).is_err());
+    }
+
+    // ---- dispatch mapping ----
+
+    #[test]
+    fn semantic_options_carry_k_and_provider_only_when_on() {
+        let config = SearchDefaults::default();
+
+        let mut inputs = base_inputs(&config);
+        inputs.rerank = true;
+        inputs.cli_rrf = Some(80);
+        inputs.cli_rerank = Some(4);
+        inputs.cli_provider = Some(ProviderChoice::OpenrouterCohere4Fast);
+        let defaults = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
+        let opts =
+            semantic_search_options_from_defaults(None, true, None, false, &defaults);
+        assert_eq!(opts.rerank_limit, Some(4));
+        assert_eq!(opts.rerank_provider, Some(ProviderChoice::OpenrouterCohere4Fast));
+        assert!(opts.rerank);
+        assert_eq!(defaults.rrf_limit, 80, "N is carried as the fetch window");
+
+        let defaults =
+            resolve_search_window_defaults_from(base_inputs(&config)).expect("defaults resolve");
+        let opts = semantic_search_options_from_defaults(
+            Some("bge-m3".to_string()),
+            false,
+            Some("legacy".to_string()),
+            true,
+            &defaults,
+        );
+        assert_eq!(opts.model.as_deref(), Some("bge-m3"));
+        assert_eq!(opts.reranker.as_deref(), Some("legacy"));
+        assert!(opts.use_daemon);
+        assert_eq!(opts.rerank_limit, None);
+        assert_eq!(opts.rerank_provider, None);
+    }
+
+    // ---- CLI parsing ----
+
+    #[test]
+    fn search_parses_new_window_flags() {
+        let cmd = search_fields(&[
+            "cass",
+            "search",
+            "q",
+            "--rerank",
+            "--rrf-limit",
+            "10",
+            "--rerank-limit",
+            "3",
+            "--rerank-provider",
+            "bge-local",
+        ]);
+        let Commands::Search {
+            rrf_limit,
+            rerank_limit,
+            rerank_provider,
+            rerank,
+            ..
+        } = cmd
+        else {
+            unreachable!()
+        };
+        assert!(rerank);
+        assert_eq!(rrf_limit, Some(10));
+        assert_eq!(rerank_limit, Some(3));
+        assert_eq!(rerank_provider, Some(ProviderChoice::BgeLocal));
+    }
+
+    #[test]
+    fn search_defaults_are_none_without_new_flags() {
+        let cmd = search_fields(&["cass", "search", "q"]);
+        let Commands::Search {
+            rrf_limit,
+            rerank_limit,
+            rerank_provider,
+            ..
+        } = cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(rrf_limit, None);
+        assert_eq!(rerank_limit, None);
+        assert_eq!(rerank_provider, None);
+    }
+
+    #[test]
+    fn unknown_provider_is_a_usage_error() {
+        let err = parse_err(&[
+            "cass",
+            "search",
+            "q",
+            "--rerank",
+            "--rerank-provider",
+            "not-a-provider",
+        ]);
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn search_source_provider_still_maps_to_agent() {
+        let cmd = search_fields(&["cass", "search", "q", "--provider", "codex"]);
+        let Commands::Search { agent, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(agent, vec!["codex".to_string()]);
+    }
+
+    #[test]
+    fn search_model_still_selects_the_embedder() {
+        let cmd = search_fields(&["cass", "search", "q", "--model", "bge-m3"]);
+        let Commands::Search { model, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(model.as_deref(), Some("bge-m3"));
+    }
+
+    #[test]
+    fn legacy_search_limit_spellings_are_usage_errors() {
+        for args in [
+            vec!["cass", "search", "q", "--limit", "5"],
+            vec!["cass", "search", "q", "--limit=5"],
+            vec!["cass", "search", "q", "--max-results", "5"],
+            vec!["cass", "search", "q", "--max_results", "5"],
+            vec!["cass", "search", "q", "--num-results", "5"],
+            vec!["cass", "search", "q", "--results", "5"],
+            vec!["cass", "search", "q", "--count", "5"],
+            vec!["cass", "search", "q", "--top-k", "5"],
+            vec!["cass", "search", "q", "--topk", "5"],
+            vec!["cass", "search", "q", "--top_k", "5"],
+            vec!["cass", "search", "q", "--n", "5"],
+            vec!["cass", "search", "q", "-n", "5"],
+            vec!["cass", "search", "q", "-limit", "5"],
+            vec!["cass", "search", "q", "--LIMIT", "5"],
+            vec!["cass", "search", "q", "limit=5"],
+            vec!["cass", "search", "q", "max_results=5"],
+            vec!["cass", "search", "q", "limit", "5"],
+            vec!["cass", "search", "q", "n", "5"],
+        ] {
+            let err = parse_err(&args);
+            assert_eq!(err.code, 2, "{args:?} -> {err:?}");
+            assert_eq!(err.kind, "usage", "{args:?} -> {err:?}");
+            assert!(
+                err.hint.as_deref().unwrap_or("").contains("rrf-limit"),
+                "migration hint missing for {args:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_alias_rescue_does_not_succeed_via_heuristic() {
+        // A near-miss typo must not be rescued into a now-removed --limit that
+        // would be silently accepted.
+        let err = parse_err(&["cass", "search", "q", "--limt", "5"]);
+        assert_eq!(err.code, 2);
+    }
+
+    #[test]
+    fn search_query_literal_after_terminator_is_not_a_limit_flag() {
+        let parsed = parse(&["cass", "search", "--", "--limit"]).expect("literal query");
+        let Some(Commands::Search { query, rrf_limit, .. }) = parsed.cli.command else {
+            panic!("expected search");
+        };
+        assert_eq!(query, "--limit");
+        assert_eq!(rrf_limit, None);
+    }
+
+    #[test]
+    fn option_value_that_reads_like_a_limit_flag_is_not_flagged() {
+        // `--since --limit`: the scanner must treat `--limit` as `--since`'s
+        // value, not as a legacy count flag.
+        let parsed = parse(&["cass", "search", "q", "--since", "--limit"])
+            .expect("value of --since must not be misread");
+        assert!(matches!(parsed.cli.command, Some(Commands::Search { .. })));
+    }
+
+    #[test]
+    fn source_alias_values_that_look_like_counts_are_not_flagged() {
+        // `--provider`/`--tool`/`--connector`/`--agent-type` are source-filter
+        // aliases that normalize to `--agent`; `--role` and `--agent` take
+        // values too. Whatever the value is spelled like, it must never be read
+        // as a legacy result-count alias.
+        for alias in [
+            "--provider",
+            "--tool",
+            "--connector",
+            "--agent-type",
+            "--agent",
+            "--role",
+        ] {
+            for value in ["limit=5", "top_k=5", "n=5", "max-results=5", "limit"] {
+                let parsed = parse(&["cass", "search", "probe", alias, value])
+                    .unwrap_or_else(|e| panic!("{alias} {value} must parse: {e:?}"));
+                assert!(
+                    matches!(parsed.cli.command, Some(Commands::Search { .. })),
+                    "expected search for {alias} {value}"
+                );
+            }
+            let inline = format!("{alias}=limit=5");
+            let parsed = parse(&["cass", "search", "probe", &inline])
+                .unwrap_or_else(|e| panic!("{inline} must parse: {e:?}"));
+            assert!(matches!(parsed.cli.command, Some(Commands::Search { .. })));
+        }
+    }
+
+    #[test]
+    fn provider_value_is_preserved_as_the_agent_filter() {
+        let cmd = search_fields(&["cass", "search", "probe", "--provider", "limit=5"]);
+        let Commands::Search { agent, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(agent, vec!["limit=5".to_string()]);
+    }
+
+    #[test]
+    fn query_token_containing_limit_word_is_not_flagged() {
+        // A quoted query token that happens to contain the word "limit" is a
+        // positional value, not a flag, and must not be scanned as a legacy
+        // spelling.
+        let parsed = parse(&["cass", "search", "the limit of code"])
+            .expect("multi-word query token must parse");
+        let Some(Commands::Search { query, rrf_limit, .. }) = parsed.cli.command else {
+            panic!("expected search");
+        };
+        assert_eq!(query, "the limit of code");
+        assert_eq!(rrf_limit, None);
+    }
+
+    #[test]
+    fn other_commands_keep_their_limit_flag() {
+        assert!(matches!(
+            parse(&["cass", "pack", "q", "--limit", "5"]).expect("pack keeps --limit").cli.command,
+            Some(Commands::Pack { limit: 5, .. })
+        ));
+        assert!(matches!(
+            parse(&["cass", "sessions", "--limit", "5"]).expect("sessions keeps --limit").cli.command,
+            Some(Commands::Sessions { limit: Some(5), .. })
+        ));
+        // `--max-results` still recovers to `--limit` for pack.
+        assert!(matches!(
+            parse(&["cass", "pack", "q", "--max-results", "5"]).expect("pack alias").cli.command,
+            Some(Commands::Pack { limit: 5, .. })
+        ));
+    }
+}
+
 /// Canonical lowercase name for a [`crate::search::query::SearchMode`].
 fn search_mode_canonical_str(mode: crate::search::query::SearchMode) -> &'static str {
     use crate::search::query::SearchMode;
@@ -23120,6 +24072,473 @@ fn search_mode_from_canonical_str(s: &str) -> Option<crate::search::query::Searc
         "hybrid" => Some(SearchMode::Hybrid),
         _ => None,
     }
+}
+
+/// P09: the private values the CLI dispatch must preserve for the rerank window
+/// path but the legacy flow folds away before `run_cli_search` runs. The frozen
+/// [`crate::search::rerank::window::RequestBinding`] needs the user's original
+/// relative-time selection (re-resolving it on a later page would drift with the
+/// clock) and the original `--daemon`/`--no-daemon` booleans (which
+/// [`SemanticSearchOptions`] collapses into one `use_daemon`).
+#[derive(Debug, Clone, Default)]
+struct RerankRequestContext {
+    time_selectors: crate::search::rerank::window::TimeSelectors,
+    daemon: bool,
+    no_daemon: bool,
+}
+
+/// Whether the P09 rerank window path is active for this search: `--rerank` was
+/// requested and both the per-page K and the backend were resolved. The closed
+/// path is exactly `false`.
+fn rerank_window_enabled(opts: &SemanticSearchOptions) -> bool {
+    opts.rerank && opts.rerank_limit.is_some() && opts.rerank_provider.is_some()
+}
+
+/// The wire spelling the binding freezes for a vector candidate strategy.
+fn vector_search_mode_wire(mode: crate::search::query::VectorSearchMode) -> &'static str {
+    match mode {
+        crate::search::query::VectorSearchMode::Exact => "exact",
+        crate::search::query::VectorSearchMode::Fast => "fast",
+    }
+}
+
+/// The effective endpoint origin for a rerank backend selection.
+///
+/// A local selection honours its existing service env override
+/// (`CASS_QWEN_RERANK_URL` for Qwen, `CASS_INFINITY_URL` for BGE) and otherwise
+/// binds the adapter's frozen default origin. A cloud selection always binds the
+/// fixed OpenRouter origin: there is deliberately no CLI or env endpoint
+/// override, so a test can never redirect a real credential.
+fn rerank_endpoint_origin(provider: crate::search::rerank::types::ProviderChoice) -> String {
+    use crate::search::rerank::types::ProviderChoice;
+    match provider {
+        ProviderChoice::Qwen3Local => dotenvy::var("CASS_QWEN_RERANK_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| crate::search::rerank::qwen::DEFAULT_ORIGIN.to_string()),
+        ProviderChoice::BgeLocal => dotenvy::var("CASS_INFINITY_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| crate::search::rerank::bge::DEFAULT_ORIGIN.to_string()),
+        ProviderChoice::OpenrouterQwen38b
+        | ProviderChoice::OpenrouterCohere4Fast
+        | ProviderChoice::OpenrouterVoyage25Lite => {
+            crate::search::rerank::openrouter::DEFAULT_ORIGIN.to_string()
+        }
+    }
+}
+
+/// The effective embedding-model selection the semantic loader will use: the
+/// CLI `--model` when given, else `CASS_SEMANTIC_EMBEDDER` resolved exactly as
+/// that loader resolves it (the literal `hash`, or a canonical FastEmbedder
+/// name). It reads no registry, builds no client and sends no request, so the
+/// first lookup's retrieval and both sides of the frozen binding consume one
+/// identical value. An unsupported env string yields `None`, exactly as the
+/// loader treats it -- it never invents a model.
+fn effective_embedding_model(cli_model: Option<&str>) -> Option<String> {
+    if let Some(model) = cli_model {
+        return Some(model.to_string());
+    }
+    dotenvy::var("CASS_SEMANTIC_EMBEDDER")
+        .ok()
+        .and_then(|value| {
+            if value.trim().eq_ignore_ascii_case("hash") {
+                Some("hash".to_string())
+            } else {
+                crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
+                    .map(str::to_string)
+            }
+        })
+}
+
+/// Build the one rerank backend for `provider`, binding `origin` for a local
+/// selection and reading only `OPENROUTER_API_KEY` for a cloud one.
+///
+/// Construction sends no request for a local selection; a cloud selection
+/// refuses before a transport exists when its credential is missing.
+fn build_rerank_backend(
+    provider: crate::search::rerank::types::ProviderChoice,
+    origin: &str,
+) -> Result<Box<dyn crate::search::rerank::types::RerankBackend>, crate::search::rerank::types::RerankError>
+{
+    use crate::search::rerank::types::ProviderChoice;
+    match provider {
+        ProviderChoice::Qwen3Local => Ok(Box::new(
+            crate::search::rerank::qwen::QwenBackend::new(origin)?,
+        )),
+        ProviderChoice::BgeLocal => Ok(Box::new(
+            crate::search::rerank::bge::BgeBackend::new(origin)?,
+        )),
+        ProviderChoice::OpenrouterQwen38b
+        | ProviderChoice::OpenrouterCohere4Fast
+        | ProviderChoice::OpenrouterVoyage25Lite => Ok(Box::new(
+            crate::search::rerank::openrouter::OpenRouterBackend::from_env(provider)?,
+        )),
+    }
+}
+
+/// P09: assemble the frozen [`RequestBinding`] from the current request.
+///
+/// Both the first lookup and a later page build the binding through this one
+/// function, so the two can never disagree about a field the continuation check
+/// compares. A field whose value is unavailable (a missing credential, an auto
+/// embedder) is represented by its own absent form, never back-filled.
+#[allow(clippy::too_many_arguments)]
+fn build_request_binding(
+    query: &str,
+    filters: &crate::search::query::SearchFilters,
+    time_selectors: &crate::search::rerank::window::TimeSelectors,
+    mode: &str,
+    vector_search_mode: &str,
+    embedding_model: Option<&str>,
+    rrf_limit: usize,
+    rerank_limit: usize,
+    provider: crate::search::rerank::types::ProviderChoice,
+    endpoint: &str,
+    aggregate: Option<&[String]>,
+    explain: bool,
+    timeout_ms: Option<u64>,
+    daemon: bool,
+    no_daemon: bool,
+) -> Result<crate::search::rerank::window::RequestBinding, crate::search::rerank::window::WindowError> {
+    use crate::search::rerank::window::RequestBinding;
+    let roles = filters.roles.as_ref().map(|set| {
+        let mut codes: Vec<u8> = set.iter().copied().collect();
+        codes.sort_unstable();
+        codes
+    });
+    let binding = RequestBinding {
+        query: query.to_string(),
+        agents: filters.agents.iter().cloned().collect(),
+        workspaces: filters.workspaces.iter().cloned().collect(),
+        roles,
+        source_filter: filters.source_filter.clone(),
+        session_paths: filters.session_paths.iter().cloned().collect(),
+        time: time_selectors.clone(),
+        mode: mode.to_string(),
+        vector_search_mode: vector_search_mode.to_string(),
+        embedding_model: embedding_model.map(str::to_string),
+        rrf_limit,
+        rerank_limit,
+        provider,
+        endpoint: endpoint.to_string(),
+        aggregate: aggregate.map(|values| values.to_vec()),
+        explain,
+        timeout_ms,
+        daemon,
+        no_daemon,
+    };
+    binding.normalized()
+}
+
+/// P09: the frozen `_meta.rerank` projection for a rerank-enabled search.
+///
+/// `returned_count` is filled in by the renderer, after the display budget has
+/// decided how many hits actually went out. Every other field is decided while
+/// the window is built or loaded; a value the call could not prove stays `None`
+/// and serializes as `null` rather than being guessed.
+#[derive(Debug, Clone)]
+struct RerankWindowMeta {
+    requested_provider: crate::search::rerank::types::ProviderChoice,
+    requested_model: &'static str,
+    actual_provider: Option<crate::search::rerank::types::ProviderChoice>,
+    actual_model: Option<String>,
+    serving_provider: Option<String>,
+    rrf_limit: usize,
+    window_count: usize,
+    scored_count: usize,
+    rerank_limit: usize,
+    offset: usize,
+    applied: bool,
+    cache_reused: bool,
+    first_http_requests: Option<usize>,
+    http_requests: Option<usize>,
+    first_model_requests: Option<usize>,
+    model_requests: Option<usize>,
+    first_duration_ms: u64,
+    duration_ms: u64,
+    failure_reason: Option<&'static str>,
+    http_status: Option<u16>,
+    pagination_unavailable_reason: Option<String>,
+}
+
+impl RerankWindowMeta {
+    /// The `_meta.rerank` JSON object, with the post-budget `returned_count`.
+    fn to_json(&self, returned_count: usize) -> serde_json::Value {
+        serde_json::json!({
+            "requested_provider": self.requested_provider,
+            "requested_model": self.requested_model,
+            "actual_provider": self.actual_provider,
+            "actual_model": self.actual_model,
+            "serving_provider": self.serving_provider,
+            "rrf_limit": self.rrf_limit,
+            "window_count": self.window_count,
+            "scored_count": self.scored_count,
+            "rerank_limit": self.rerank_limit,
+            "offset": self.offset,
+            "returned_count": returned_count,
+            "applied": self.applied,
+            "cache_reused": self.cache_reused,
+            "first_http_requests": self.first_http_requests,
+            "http_requests": self.http_requests,
+            "first_model_requests": self.first_model_requests,
+            "model_requests": self.model_requests,
+            "first_duration_ms": self.first_duration_ms,
+            "duration_ms": self.duration_ms,
+            "failure_reason": self.failure_reason,
+            "http_status": self.http_status,
+            "pagination_unavailable_reason": self.pagination_unavailable_reason,
+        })
+    }
+}
+
+/// P09: everything the robot renderer needs when a rerank window is in play.
+///
+/// `snapshot` is the frozen window (saved on the first lookup, loaded on a
+/// continuation); the cursor is built from it at the renderer's real
+/// `returned_count`, after the display budget, so the next page always starts
+/// exactly where this one stopped. `unavailable_reason` names why there is no
+/// cursor when the window is not continuable.
+struct WindowRenderCtx {
+    window_id: Option<String>,
+    snapshot: Option<crate::search::rerank::window::WindowSnapshot>,
+    /// The page's starting offset inside the window.
+    offset: usize,
+    /// Whether a continuation is permitted at all (both a saved id and its
+    /// snapshot are present). When false, `meta.pagination_unavailable_reason`
+    /// names why.
+    continuable: bool,
+    meta: RerankWindowMeta,
+}
+
+/// Assemble a [`WindowRenderCtx`] from the window facts a lookup produced.
+/// `None` only when no `_meta.rerank` projection exists (the closed path).
+fn build_window_render_ctx(
+    window_id: Option<String>,
+    snapshot: Option<crate::search::rerank::window::WindowSnapshot>,
+    offset: usize,
+    continuable: bool,
+    meta: Option<RerankWindowMeta>,
+) -> Option<WindowRenderCtx> {
+    let meta = meta?;
+    let continuable = continuable && window_id.is_some() && snapshot.is_some();
+    Some(WindowRenderCtx {
+        window_id,
+        snapshot,
+        offset,
+        continuable,
+        meta,
+    })
+}
+
+/// P09: the robot-meta display facts a first lookup collects from the live
+/// index state. They are frozen into the window snapshot so a continuation page
+/// renders exactly what page 1 rendered instead of re-reading state that may
+/// have moved since.
+#[derive(Debug, Clone, Default)]
+struct FrozenDisplayState {
+    state_meta_with_warning: Option<serde_json::Value>,
+    index_freshness: Option<serde_json::Value>,
+    storage_integrity_meta: Option<serde_json::Value>,
+    search_completeness: Option<serde_json::Value>,
+    warning: Option<String>,
+}
+
+/// Build the robot-meta display facts from an already-collected index state.
+///
+/// It does not collect the index state itself -- the caller passes the one
+/// `state_meta_json` value the first lookup already collected (for the partial
+/// decision), so that read is shared. It does, however, read filesystem state
+/// (whether the index exists, the ingest-quarantine summary), so a first lookup
+/// must call it *before* its final index-stamp check, or those reads would fall
+/// outside the guard. `None` means "do not render the robot-meta block" -- the
+/// caller passes `None` whenever `--robot-meta` is off.
+fn collect_display_state(
+    data_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    state_meta: Option<serde_json::Value>,
+) -> FrozenDisplayState {
+    let robot_meta = state_meta.is_some();
+    let index_freshness = state_meta.as_ref().and_then(state_index_freshness);
+    let storage_integrity_meta = state_meta.as_ref().map(|state| {
+        let not_initialized = cass_not_initialized(
+            db_path.exists(),
+            cass_lexical_index_initialized(data_dir),
+            false,
+        );
+        storage_integrity_value_from_state(db_path, state, not_initialized)
+    });
+    let partial_warning = index_freshness
+        .as_ref()
+        .and_then(|f: &serde_json::Value| f.get("partial"))
+        .and_then(|v: &serde_json::Value| v.as_bool())
+        .filter(|partial| *partial)
+        .map(|_| {
+            index_freshness
+                .as_ref()
+                .and_then(|f: &serde_json::Value| f.get("partial_reason"))
+                .and_then(|v: &serde_json::Value| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "Lexical index is PARTIAL (a prior `cass index --full` was aborted); results may omit conversations. Re-run `cass index --full`.".to_string()
+                })
+        });
+    let warning = partial_warning.or_else(|| {
+        index_freshness
+            .as_ref()
+            .and_then(|f: &serde_json::Value| f.get("stale"))
+            .and_then(|v: &serde_json::Value| v.as_bool())
+            .filter(|stale| *stale)
+            .map(|_| {
+                let age = index_freshness
+                    .as_ref()
+                    .and_then(|f: &serde_json::Value| f.get("age_seconds"))
+                    .and_then(|v: &serde_json::Value| v.as_u64()).map_or_else(|| "an unknown age".to_string(), |s| format!("{s} seconds"));
+                let pending = index_freshness
+                    .as_ref()
+                    .and_then(|f: &serde_json::Value| f.get("pending_sessions"))
+                    .and_then(|v: &serde_json::Value| v.as_u64())
+                    .unwrap_or(0);
+                format!(
+                    "Index may be stale (age: {age}; pending sessions: {pending}). Run `cass index --full` or enable watch mode for fresh results."
+                )
+            })
+    });
+    let index_freshness_for_closure = index_freshness.clone();
+    let state_meta_with_warning = state_meta.map(|mut meta| {
+        if let Some(fresh) = index_freshness_for_closure
+            && let serde_json::Value::Object(ref mut m) = meta
+        {
+            m.insert("index_freshness".to_string(), fresh);
+        }
+        if let Some(warn) = &warning
+            && let serde_json::Value::Object(ref mut m) = meta
+        {
+            m.insert(
+                "_warning".to_string(),
+                serde_json::Value::String(warn.clone()),
+            );
+        }
+        meta
+    });
+    let search_completeness = if robot_meta {
+        let quarantine = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+        if quarantine.quarantined_conversations > 0 || quarantine.circuit_breaker_active {
+            serde_json::to_value(
+                crate::search::quarantine_status::project_search_completeness(
+                    quarantine.quarantined_conversations as u64,
+                    quarantine.circuit_breaker_active,
+                ),
+            )
+            .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    FrozenDisplayState {
+        state_meta_with_warning,
+        index_freshness,
+        storage_integrity_meta,
+        search_completeness,
+        warning,
+    }
+}
+
+impl FrozenDisplayState {
+    /// Freeze into the window snapshot's `retrieval_status.display`.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state_meta": self.state_meta_with_warning,
+            "index_freshness": self.index_freshness,
+            "storage_integrity": self.storage_integrity_meta,
+            "search_completeness": self.search_completeness,
+            "warning": self.warning,
+        })
+    }
+
+    /// Restore a frozen bundle. Every key must be present and of the right
+    /// kind: a malformed stored bundle is refused, never defaulted.
+    fn from_json(value: &serde_json::Value) -> Option<FrozenDisplayState> {
+        let object = value.as_object()?;
+        let optional = |key: &str| -> Option<Option<serde_json::Value>> {
+            match object.get(key)? {
+                serde_json::Value::Null => Some(None),
+                other if other.is_object() => Some(Some(other.clone())),
+                _ => None,
+            }
+        };
+        let warning = match object.get("warning")? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(text) => Some(text.clone()),
+            _ => return None,
+        };
+        Some(FrozenDisplayState {
+            state_meta_with_warning: optional("state_meta")?,
+            index_freshness: optional("index_freshness")?,
+            storage_integrity_meta: optional("storage_integrity")?,
+            search_completeness: optional("search_completeness")?,
+            warning,
+        })
+    }
+}
+
+/// P09: the one CLI error a refused rerank cursor produces.
+///
+/// Short code and a "re-search" hint only: the cursor's full text, the window
+/// body and any key are never echoed.
+fn cursor_window_cli_error(
+    error: crate::search::rerank::window::WindowError,
+) -> CliError {
+    CliError {
+        code: 2,
+        kind: CliErrorKind::CursorDecode.kind_str(),
+        message: format!("rerank cursor refused: {}", error.as_str()),
+        hint: Some("Re-run the search to start a new page sequence.".to_string()),
+        retryable: false,
+    }
+}
+
+/// P09: the fully-resolved inputs the shared search renderer consumes. Both the
+/// first lookup and a continuation page build one and call
+/// [`render_search_output`], so the two paths cannot drift in their JSON/human
+/// projection.
+struct SearchRenderInput {
+    query: String,
+    limit: usize,
+    cursor_page_limit: usize,
+    offset: usize,
+    display_result: crate::search::query::SearchResult,
+    effective_robot: Option<RobotFormat>,
+    robot_meta: bool,
+    elapsed_ms: u64,
+    fields: Option<Vec<String>>,
+    max_content_length: Option<usize>,
+    max_tokens: Option<usize>,
+    request_id: Option<String>,
+    cursor: Option<String>,
+    has_more_results: bool,
+    total_matches: usize,
+    total_matches_exact: bool,
+    aggregations: Aggregations,
+    explanation: Option<crate::search::query::QueryExplanation>,
+    timed_out: bool,
+    timeout_ms: Option<u64>,
+    mode_meta: SearchModeMeta,
+    search_ms: u64,
+    rerank_ms: u64,
+    rerank_applied: bool,
+    rerank_requested: bool,
+    window: Option<WindowRenderCtx>,
+    /// P09: the first lookup's frozen robot-meta display facts. `Some` only on a
+    /// continuation page, which must not re-read the live index state.
+    display_state: Option<FrozenDisplayState>,
+    data_dir: std::path::PathBuf,
+    db_path: std::path::PathBuf,
+    display_format: Option<DisplayFormat>,
+    wrap: WrapConfig,
+    highlight: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -23155,6 +24574,7 @@ fn run_cli_search(
     mode: Option<crate::search::query::SearchMode>,
     vector_search_mode: Option<crate::search::query::VectorSearchMode>,
     semantic_opts: SemanticSearchOptions,
+    rerank_ctx: RerankRequestContext,
 ) -> CliResult<()> {
     #[cfg(feature = "infinity")]
     use crate::search::model_manager::load_infinity_semantic_context;
@@ -23220,33 +24640,74 @@ fn run_cli_search(
         filters.session_paths = session_paths;
     }
 
-    // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
+    // Apply cursor overrides. Two cursor families exist and are never mixed:
+    // the closed-state legacy cursor (base64 `{offset,limit}`) and the P09
+    // rerank window cursor (base64 `{version:2,window_id,offset}`). `--rerank`
+    // decides which family is accepted, so neither can be silently mis-read as
+    // the other.
+    let rerank_on = rerank_window_enabled(&semantic_opts);
+    // One effective embedding selection, shared by the retrieval and by both
+    // sides of the frozen binding.
+    let effective_model = effective_embedding_model(semantic_opts.model.as_deref());
     let mut limit_val = *limit;
     let mut offset_val = *offset;
+    let mut window_cursor: Option<String> = None;
     if let Some(ref cursor_str) = cursor {
-        let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
-            code: 2,
-            kind: CliErrorKind::CursorDecode.kind_str(),
-            message: format!("invalid cursor: {e}"),
-            hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
-            retryable: false,
-        })?;
-        let cursor_json: serde_json::Value =
-            serde_json::from_slice(&decoded).map_err(|e| CliError {
+        if rerank_on {
+            // Validate the cursor shape now, before the database or any model
+            // is touched; the window itself is loaded only after the dry-run
+            // check below, so `--dry-run --cursor` never opens a window.
+            if crate::search::rerank::window::cursor_window_id(cursor_str).is_err() {
+                return Err(CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorDecode.kind_str(),
+                    message: "invalid rerank cursor".to_string(),
+                    hint: Some(
+                        "Pass the `_meta.next_cursor` from a previous --rerank search, or re-run without --cursor."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
+            window_cursor = Some(cursor_str.clone());
+        } else {
+            let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
                 code: 2,
-                kind: CliErrorKind::CursorParse.kind_str(),
-                message: format!("invalid cursor payload: {e}"),
-                hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
+                kind: CliErrorKind::CursorDecode.kind_str(),
+                message: format!("invalid cursor: {e}"),
+                hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
                 retryable: false,
             })?;
-        if let Some(o) = cursor_json
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-        {
-            offset_val = o as usize;
-        }
-        if let Some(l) = cursor_json.get("limit").and_then(serde_json::Value::as_u64) {
-            limit_val = l as usize;
+            let cursor_json: serde_json::Value =
+                serde_json::from_slice(&decoded).map_err(|e| CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorParse.kind_str(),
+                    message: format!("invalid cursor payload: {e}"),
+                    hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
+                    retryable: false,
+                })?;
+            if cursor_json.get("version").is_some() {
+                return Err(CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorDecode.kind_str(),
+                    message: "cursor belongs to a rerank window, but this search is not --rerank"
+                        .to_string(),
+                    hint: Some(
+                        "Re-run the continuation with the same --rerank flags that produced the cursor."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                });
+            }
+            if let Some(o) = cursor_json
+                .get("offset")
+                .and_then(serde_json::Value::as_u64)
+            {
+                offset_val = o as usize;
+            }
+            if let Some(l) = cursor_json.get("limit").and_then(serde_json::Value::as_u64) {
+                limit_val = l as usize;
+            }
         }
     }
 
@@ -23269,6 +24730,14 @@ fn run_cli_search(
         effective_robot,
         display_format,
     );
+    // P09: a rerank first lookup fetches the full, un-projected hit body so
+    // both the frozen window and the rerank input are complete regardless of
+    // the display projection. The closed path keeps its display-driven mask.
+    let search_field_mask = if rerank_on {
+        crate::search::query::FieldMask::FULL
+    } else {
+        field_mask
+    };
 
     // Parse aggregate fields if provided
     let agg_fields = aggregate
@@ -23301,6 +24770,222 @@ fn run_cli_search(
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
         );
         return Ok(());
+    }
+
+    // ------------------------------------------------------------------
+    // P09 rerank window: continuation page.
+    // ------------------------------------------------------------------
+    //
+    // A continuation runs before self-heal, before `SearchClient` is opened and
+    // before any semantic setup: it only rebuilds the request binding from the
+    // current parameters, loads the frozen window, and slices the page. It never
+    // constructs a backend, reads a cloud key, re-searches or re-resolves the
+    // relative time range.
+    if let Some(cursor_str) = window_cursor.as_deref() {
+        let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
+        let provider = semantic_opts
+            .rerank_provider
+            .expect("rerank_window_enabled guarantees a provider");
+        let endpoint = rerank_endpoint_origin(provider);
+        let binding = build_request_binding(
+            query,
+            &filters,
+            &rerank_ctx.time_selectors,
+            search_mode_canonical_str(mode.unwrap_or_default()),
+            vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
+            effective_model.as_deref(),
+            limit_val,
+            rerank_k,
+            provider,
+            &endpoint,
+            aggregate.as_deref(),
+            explain,
+            timeout_ms,
+            rerank_ctx.daemon,
+            rerank_ctx.no_daemon,
+        )
+        .map_err(cursor_window_cli_error)?;
+
+        let store = crate::search::rerank::window::WindowStore::new(
+            &data_dir,
+            crate::search::rerank::window::WindowPolicy::default(),
+        )
+        .map_err(cursor_window_cli_error)?;
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let (snapshot, page_offset) = store
+            .load(cursor_str, &binding, &db_path, now_ms)
+            .map_err(cursor_window_cli_error)?;
+        let resolved_window_id = crate::search::rerank::window::cursor_window_id(cursor_str)
+            .map_err(cursor_window_cli_error)?;
+        let page_hits = crate::search::rerank::window::page_hits(&snapshot, page_offset)
+            .map_err(cursor_window_cli_error)?;
+
+        // Restore the frozen first-lookup facts; never recompute them against
+        // the current data (that would let a later page fabricate aggregates
+        // that do not match the frozen result).
+        let status = &snapshot.retrieval_status;
+        // Every restored fact is required and type-checked. A missing key, a
+        // wrong type or an unknown enum is a refusal, never a default: a
+        // snapshot this build cannot render must not be dressed up as a valid
+        // page.
+        let bad_meta = || CliError {
+            code: 2,
+            kind: CliErrorKind::CursorDecode.kind_str(),
+            message: "rerank window metadata is missing or malformed".to_string(),
+            hint: Some("Re-run the search to start a new page sequence.".to_string()),
+            retryable: false,
+        };
+        let requested_mode = status
+            .get("requested_search_mode")
+            .and_then(serde_json::Value::as_str)
+            .and_then(search_mode_from_canonical_str)
+            .ok_or_else(bad_meta)?;
+        let realized_mode = status
+            .get("search_mode")
+            .and_then(serde_json::Value::as_str)
+            .and_then(search_mode_from_canonical_str)
+            .ok_or_else(bad_meta)?;
+        let mode_defaulted = status
+            .get("mode_defaulted")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(bad_meta)?;
+        let mut mode_meta = SearchModeMeta::new(requested_mode, mode_defaulted);
+        mode_meta.realized = realized_mode;
+        match status.get("fallback_tier") {
+            Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(text)) if text == "lexical" => {
+                mode_meta.fallback_tier = Some("lexical");
+            }
+            // A stored fallback tier that is not part of the frozen vocabulary
+            // means the snapshot is not one this build can render.
+            _ => return Err(bad_meta()),
+        }
+        mode_meta.fallback_reason = match status.get("fallback_reason") {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            _ => return Err(bad_meta()),
+        };
+
+        let mut display_result = snapshot.result.clone();
+        let window_len = display_result.hits.len();
+        let delivered = page_hits.len();
+        display_result.hits = page_hits;
+        let has_more = page_offset.saturating_add(delivered) < window_len;
+        let total_matches = status
+            .get("total_matches")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize)
+            .ok_or_else(bad_meta)?;
+        let total_matches_exact = status
+            .get("total_matches_exact")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(bad_meta)?;
+        let timed_out = status
+            .get("timed_out")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(bad_meta)?;
+        let frozen_display = status
+            .get("display")
+            .and_then(FrozenDisplayState::from_json)
+            .ok_or_else(bad_meta)?;
+
+        let aggregations = match snapshot.aggregates.clone() {
+            Some(value) => serde_json::from_value::<Aggregations>(value).map_err(|_| CliError {
+                code: 2,
+                kind: CliErrorKind::CursorDecode.kind_str(),
+                message: "rerank window aggregates could not be restored".to_string(),
+                hint: Some("Re-run the search to start a new page sequence.".to_string()),
+                retryable: false,
+            })?,
+            None => Aggregations::default(),
+        };
+        let explanation = match snapshot.explanation.clone() {
+            Some(value) => {
+                Some(
+                    serde_json::from_value::<QueryExplanation>(value).map_err(|_| CliError {
+                        code: 2,
+                        kind: CliErrorKind::CursorDecode.kind_str(),
+                        message: "rerank window explanation could not be restored".to_string(),
+                        hint: Some(
+                            "Re-run the search to start a new page sequence.".to_string(),
+                        ),
+                        retryable: false,
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        let meta = RerankWindowMeta {
+            requested_provider: snapshot.request_binding.provider,
+            requested_model: snapshot.request_binding.provider.request_model(),
+            actual_provider: snapshot.rerank.identity.actual_provider,
+            actual_model: snapshot.rerank.identity.actual_model.clone(),
+            serving_provider: snapshot.rerank.identity.serving_provider.clone(),
+            rrf_limit: snapshot.request_binding.rrf_limit,
+            window_count: window_len,
+            scored_count: snapshot.rerank.scored_count,
+            rerank_limit: snapshot.request_binding.rerank_limit,
+            offset: page_offset,
+            applied: snapshot.rerank.applied,
+            // The window was loaded successfully, so its ordering is reused.
+            cache_reused: true,
+            first_http_requests: snapshot.rerank.http_requests,
+            http_requests: Some(0),
+            first_model_requests: snapshot.rerank.model_requests,
+            model_requests: Some(0),
+            first_duration_ms: snapshot.rerank.duration_ms,
+            duration_ms: 0,
+            failure_reason: snapshot.rerank.failure_reason.map(|reason| reason.as_str()),
+            http_status: snapshot.rerank.http_status,
+            pagination_unavailable_reason: None,
+        };
+        let window_render = Some(WindowRenderCtx {
+            window_id: Some(resolved_window_id),
+            snapshot: Some(snapshot),
+            offset: page_offset,
+            continuable: true,
+            meta,
+        });
+
+        return render_search_output(SearchRenderInput {
+            query: query.to_string(),
+            limit: limit_val,
+            cursor_page_limit: rerank_k,
+            offset: page_offset,
+            display_result,
+            effective_robot,
+            robot_meta,
+            elapsed_ms: start_time.elapsed().as_millis() as u64,
+            fields,
+            max_content_length,
+            max_tokens,
+            request_id,
+            cursor,
+            has_more_results: has_more,
+            total_matches,
+            total_matches_exact,
+            aggregations,
+            explanation,
+            timed_out,
+            timeout_ms,
+            mode_meta,
+            // A later page runs no retrieval and no model call of its own.
+            search_ms: 0,
+            rerank_ms: 0,
+            rerank_applied: window_render
+                .as_ref()
+                .map(|ctx| ctx.meta.applied)
+                .unwrap_or(false),
+            rerank_requested: true,
+            window: window_render,
+            display_state: Some(frozen_display),
+            data_dir,
+            db_path,
+            display_format,
+            wrap,
+            highlight,
+        });
     }
 
     let search_self_heal = ensure_lexical_assets_for_search(
@@ -23562,6 +25247,17 @@ fn run_cli_search(
         }
     }
 
+    // P09: read the index fingerprint once the first-lookup setup (self-heal
+    // and semantic context) is complete and before the candidate fetch, then
+    // re-check it after assembly and scoring. A window is only continuable when
+    // the two reads agree; reading before this point would mistake an allowed
+    // first-lookup repair for a concurrent change.
+    let rerank_stamp_before = if rerank_on {
+        crate::search::rerank::window::capture_index_stamp(&db_path).ok()
+    } else {
+        None
+    };
+
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
 
@@ -23569,7 +25265,12 @@ fn run_cli_search(
     // For non-aggregation mode, overfetch by one so cursor pagination can reliably
     // signal whether additional pages exist without a second query.
     let token_budget_page_limit = token_budget_search_limit(max_tokens);
-    let cursor_page_limit = if has_aggregation {
+    // P09: a rerank page is always K wide (`--rerank-limit`), independent of
+    // the window size N the top-level `--rrf-limit` expresses. The closed path
+    // keeps its original page width.
+    let cursor_page_limit = if rerank_on {
+        semantic_opts.rerank_limit.unwrap_or(0)
+    } else if has_aggregation {
         limit_val
     } else if limit_val == 0 {
         token_budget_page_limit.unwrap_or(0)
@@ -23636,7 +25337,7 @@ fn run_cli_search(
                 search_limit,
                 search_offset,
                 search_sparse_threshold,
-                field_mask,
+                search_field_mask,
             )
             .map_err(|e| {
                 let chain = format!("{e:#}");
@@ -23682,7 +25383,7 @@ fn run_cli_search(
             #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
                 let (hits, candidate_meta) = client
-                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, field_mask)
+                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
                     .map_err(|e| {
                         let err_str = e.to_string();
                         if err_str.contains("unavailable")
@@ -23729,7 +25430,7 @@ fn run_cli_search(
             search_limit,
             search_offset,
             search_sparse_threshold,
-            field_mask,
+            search_field_mask,
         ) {
             Ok(result) => {
                 sync_search_mode_meta_after_hybrid(&mut mode_meta, &result);
@@ -23748,7 +25449,7 @@ fn run_cli_search(
                             search_limit,
                             search_offset,
                             search_sparse_threshold,
-                            field_mask,
+                            search_field_mask,
                         )
                         .map_err(|fallback_err| {
                             let chain = format!("{fallback_err:#}");
@@ -23796,168 +25497,406 @@ fn run_cli_search(
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
 
-    // Apply reranking if enabled (bd-2t2d)
+    // ------------------------------------------------------------------
+    // P09 rerank window: first lookup.
+    // ------------------------------------------------------------------
+    //
+    // A rerank search freezes the fetched candidate pool into a window of `N`
+    // hits, reranks exactly once, and stores the ordering so a later page reuses
+    // it instead of re-running retrieval or the model. The closed path
+    // (`!rerank_on`) is untouched: it keeps the legacy offset/limit cursor and
+    // the display-driven fetch.
+    //
+    // This replaces the old in-tree cross-encoder path (`FastEmbedReranker` /
+    // `DaemonFallbackReranker`): that path overwrote `hit.score`, had no window,
+    // and silently no-op'd when no reranker was available. P09 never overwrites
+    // the original score -- it writes a separate `rerank_score` and sorts by it
+    // -- and it never falls back across models or providers.
     let rerank_start = Instant::now();
-    // R1-W3-B7: tracks whether reranking was *actually* applied to `result`
-    // below, independent of whether it was requested. `--rerank` requested
-    // with no reranker available (the local cross-encoder is a permanent
-    // stub in this build, cass#256; daemon rerank unconfigured or
-    // unreachable) used to be an indistinguishable, deterministic no-op --
-    // `Ok(())`, unmodified results, and (outside `!use_daemon`-gated
-    // `tracing::debug!`) not even a log line. Threaded into
-    // `output_robot_results` below as `rerank_applied` so a caller that
-    // never inspects logs still gets an honest answer.
     let mut rerank_applied = false;
-    let result = if semantic_opts.rerank && !result.hits.is_empty() {
-        use crate::search::fastembed_reranker::FastEmbedReranker;
-        use crate::search::reranker::{Reranker, rerank_texts};
+    // Window facts the renderer needs. `None` on the closed path.
+    let mut window_snapshot: Option<crate::search::rerank::window::WindowSnapshot> = None;
+    let mut window_id: Option<String> = None;
+    let mut window_continuable = false;
+    let mut window_unavailable: Option<&'static str> = None;
+    let mut window_meta: Option<RerankWindowMeta> = None;
+    let mut window_display_state: Option<FrozenDisplayState> = None;
+    // The over-fetch beyond the window (the N+1 sentinel and any aggregate
+    // pre-fetch), kept so aggregate/explain keep their closed-state scope.
+    let mut rerank_prefetch_hits: Option<Vec<crate::search::query::SearchHit>> = None;
 
-        let model_dir = FastEmbedReranker::default_model_dir(&data_dir);
-        let local_reranker: Option<Arc<dyn Reranker>> =
-            match FastEmbedReranker::load_from_dir(&model_dir) {
-                Ok(reranker) => Some(Arc::new(reranker)),
-                Err(e) => {
-                    if !semantic_opts.use_daemon {
-                        tracing::debug!(error = %e, "Reranker not available, skipping rerank");
-                    }
-                    None
-                }
-            };
+    let result = if !rerank_on {
+        result
+    } else {
+        let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
+        let provider = semantic_opts
+            .rerank_provider
+            .expect("rerank_window_enabled guarantees a provider");
+        let endpoint = rerank_endpoint_origin(provider);
+        let binding = build_request_binding(
+            query,
+            &filters,
+            &rerank_ctx.time_selectors,
+            search_mode_canonical_str(mode.unwrap_or_default()),
+            vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
+            effective_model.as_deref(),
+            limit_val,
+            rerank_k,
+            provider,
+            &endpoint,
+            aggregate.as_deref(),
+            explain,
+            timeout_ms,
+            rerank_ctx.daemon,
+            rerank_ctx.no_daemon,
+        )
+        .ok();
+        // A request that cannot even be frozen (a bad local endpoint, a limit
+        // the binding rejects) must not drop the page: it degrades to
+        // "no rerank, no cursor" exactly like any other optional-stage failure.
+        if binding.is_none() {
+            window_unavailable =
+                Some(crate::search::rerank::window::WindowError::InvalidInput.as_str());
+        }
 
-        let reranker: Option<Arc<dyn Reranker>> = if semantic_opts.use_daemon {
-            use crate::search::daemon_client::{DaemonFallbackReranker, DaemonRetryConfig};
+        let crate::search::query::SearchResult {
+            hits: mut fetched_hits,
+            wildcard_fallback,
+            cache_stats,
+            suggestions,
+            total_count,
+            candidates,
+            semantic_degraded,
+        } = result;
 
-            #[cfg(unix)]
-            {
-                // M4-pre spike: route rerank through Infinity HTTP (bge-reranker-v2-m3)
-                // when built with `--features infinity`. Baseline's local ONNX
-                // reranker is unavailable, so this is what revives reranking.
-                #[cfg(feature = "infinity")]
-                let daemon: Arc<dyn crate::search::daemon_client::DaemonClient> =
-                    match crate::search::infinity::InfinityDaemonClient::new() {
-                        Ok(c) => Arc::new(c),
-                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "infinity-unavailable",
-                        )),
-                    };
-                #[cfg(not(feature = "infinity"))]
-                let daemon = crate::daemon::client::try_connect()
-                    .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                    .unwrap_or_else(|| {
-                        Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "daemon-unconfigured",
-                        ))
-                    });
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
-            }
-            #[cfg(not(unix))]
-            {
-                let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                    "daemon-unconfigured",
-                ));
-                let config = DaemonRetryConfig::from_env();
-                Some(Arc::new(DaemonFallbackReranker::new(
-                    daemon,
-                    local_reranker,
-                    config,
-                )))
-            }
-        } else {
-            local_reranker
+        // The window is the first `N` hits; the sentinel/aggregate over-fetch
+        // never reaches the model. The *whole* fetched pool (window + overflow)
+        // is what the aggregate/explain scope must be measured over, to match
+        // the closed-state path's scope exactly.
+        let window_len = limit_val.min(fetched_hits.len());
+        let overflow = fetched_hits.split_off(window_len);
+        let window_count = fetched_hits.len();
+        let mut scope_pool = fetched_hits.clone();
+        scope_pool.extend(overflow);
+        rerank_prefetch_hits = Some(scope_pool);
+
+        let mut window_result = crate::search::query::SearchResult {
+            hits: fetched_hits,
+            wildcard_fallback,
+            cache_stats,
+            suggestions,
+            total_count,
+            candidates,
+            semantic_degraded,
         };
 
-        if let Some(reranker) = reranker {
-            // Extract content from hits for reranking (use snippet if content is empty)
-            let docs: Vec<String> = result
-                .hits
-                .iter()
-                .map(|hit| {
-                    if hit.content.is_empty() {
-                        hit.snippet.clone()
-                    } else {
-                        hit.content.clone()
-                    }
-                })
-                .collect();
+        let mut identity = crate::search::rerank::types::CallIdentity {
+            actual_provider: None,
+            actual_model: None,
+            serving_provider: None,
+        };
+        let mut scored_count = 0usize;
+        let mut http_requests: Option<usize> = None;
+        let mut model_requests: Option<usize> = None;
+        let mut duration_ms = 0u64;
+        let mut failure_reason: Option<crate::search::rerank::types::RerankFailureReason> = None;
+        let mut http_status: Option<u16> = None;
 
-            // Skip reranking if any document is empty (reranker rejects empty docs)
-            let has_empty_doc = docs.iter().any(|d| d.is_empty());
-            if has_empty_doc {
-                tracing::debug!("Skipping rerank: one or more hits have empty content and snippet");
-                result
-            } else {
-                let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
-
-                match rerank_texts(&*reranker, query, &doc_refs) {
-                    Ok(scores) => {
-                        // Update scores and re-sort hits
-                        let mut scored_hits: Vec<_> = result
-                            .hits
-                            .into_iter()
-                            .zip(scores)
-                            .map(|(mut hit, score)| {
-                                hit.score = score;
-                                hit
-                            })
-                            .collect();
-                        scored_hits.sort_by(|a, b| {
-                            b.score
-                                .partial_cmp(&a.score)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-
-                        tracing::debug!(
-                            reranker_id = reranker.id(),
-                            hits_reranked = scored_hits.len(),
-                            "Reranking complete"
-                        );
-                        rerank_applied = true;
-
-                        crate::search::query::SearchResult {
-                            hits: scored_hits,
-                            wildcard_fallback: result.wildcard_fallback,
-                            cache_stats: result.cache_stats,
-                            suggestions: result.suggestions,
-                            total_count: result.total_count,
-                            candidates: result.candidates,
-                            semantic_degraded: result.semantic_degraded,
+        if window_result.hits.is_empty() {
+            // Empty window: no model call at all.
+            http_requests = Some(0);
+            model_requests = Some(0);
+        } else if binding.is_none() {
+            // The request could not be frozen, so nothing may be sent to the
+            // model; the page is delivered unranked and without a cursor.
+            http_requests = Some(0);
+            model_requests = Some(0);
+        } else {
+            match crate::search::rerank::context::build_documents(
+                &db_path,
+                query,
+                &window_result.hits,
+            ) {
+                Ok(documents) if !documents.is_empty() => {
+                    match build_rerank_backend(provider, &endpoint) {
+                        Ok(backend) => {
+                            let call_started = Instant::now();
+                            match backend.rerank(query, &documents) {
+                                Ok(response) => {
+                                    duration_ms = response.duration_ms;
+                                    // The call layer re-proves the completeness
+                                    // the adapter promises: the score set must be
+                                    // exactly the window length and a valid
+                                    // permutation of it. Only then is the window
+                                    // replaced -- in one step, so a short,
+                                    // duplicated or out-of-range set can never
+                                    // drop a candidate or half-apply scores.
+                                    let expected_len = window_result.hits.len();
+                                    let order = (response.scores.len() == expected_len)
+                                        .then(|| {
+                                            crate::search::rerank::types::stable_rank_order(
+                                                &response.scores,
+                                            )
+                                            .ok()
+                                        })
+                                        .flatten()
+                                        .filter(|order| {
+                                            let mut seen = vec![false; expected_len];
+                                            order.len() == expected_len
+                                                && order.iter().all(|&index| {
+                                                    index < expected_len
+                                                        && !std::mem::replace(
+                                                            &mut seen[index],
+                                                            true,
+                                                        )
+                                                })
+                                        });
+                                    match order {
+                                        Some(order) => {
+                                            let hits =
+                                                std::mem::take(&mut window_result.hits);
+                                            let mut slots: Vec<
+                                                Option<crate::search::query::SearchHit>,
+                                            > = hits.into_iter().map(Some).collect();
+                                            let mut reordered =
+                                                Vec::with_capacity(slots.len());
+                                            for &index in &order {
+                                                if let Some(mut hit) = slots[index].take() {
+                                                    hit.rerank_score =
+                                                        Some(response.scores[index]);
+                                                    reordered.push(hit);
+                                                }
+                                            }
+                                            debug_assert_eq!(reordered.len(), expected_len);
+                                            window_result.hits = reordered;
+                                            rerank_applied = true;
+                                            scored_count = expected_len;
+                                            http_requests = Some(response.http_requests);
+                                            model_requests = Some(1);
+                                            identity = response.identity;
+                                        }
+                                        None => {
+                                            // Not a complete, valid permutation:
+                                            // every original hit and score is
+                                            // kept exactly as it was.
+                                            failure_reason = Some(
+                                                crate::search::rerank::types::RerankFailureReason::InvalidResponse,
+                                            );
+                                            duration_ms =
+                                                call_started.elapsed().as_millis() as u64;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    // The call really ran and really waited, so
+                                    // its duration is the measured one -- not 0,
+                                    // which is reserved for "no call". Its
+                                    // request count is not provable, so it stays
+                                    // null rather than guessed 0.
+                                    duration_ms = call_started.elapsed().as_millis() as u64;
+                                    failure_reason = Some(error.reason);
+                                    http_status = error.http_status;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            // Construction sent no request, so both counts are a
+                            // provable 0 and no time was spent calling.
+                            http_requests = Some(0);
+                            model_requests = Some(0);
+                            failure_reason = Some(error.reason);
+                            http_status = error.http_status;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Reranking failed, returning original results"
-                        );
-                        result
-                    }
+                }
+                Ok(_) => {
+                    // Empty document list (a candidate could not be proven):
+                    // the whole window is returned unranked, no request made.
+                    http_requests = Some(0);
+                    model_requests = Some(0);
+                    failure_reason = Some(
+                        crate::search::rerank::types::RerankFailureReason::UnscoreableInput,
+                    );
+                }
+                Err(error) => {
+                    // Document assembly failed before any request.
+                    http_requests = Some(0);
+                    model_requests = Some(0);
+                    failure_reason = Some(error.reason);
+                    http_status = error.http_status;
                 }
             }
-        } else {
-            // R1-W3-B7: `--rerank` was requested but no reranker at all
-            // could be constructed (permanent local stub + daemon
-            // unconfigured/unreachable) -- previously a fully silent,
-            // deterministic no-op outside a `!use_daemon`-gated
-            // `tracing::debug!`. Warn unconditionally at a level visible
-            // under default log settings; `rerank_applied=false` in the
-            // output (below) carries the same fact to a caller that never
-            // inspects logs.
-            tracing::warn!(
-                "--rerank requested but no reranker is available (local cross-encoder is a \
-                 permanent stub in this build, cass#256; daemon rerank is unconfigured or \
-                 unreachable); returning unreranked results"
-            );
-            result
         }
-    } else {
-        result
+
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let policy = crate::search::rerank::window::WindowPolicy::default();
+        let expires_at_ms = now_ms.saturating_add(policy.ttl_ms as i64);
+
+        // Aggregate/explain facts for the window, computed over the *original*
+        // prefetch scope, before the display projection.
+        let aggregate_scope: &[crate::search::query::SearchHit] =
+            rerank_prefetch_hits.as_deref().unwrap_or(&window_result.hits);
+        let (frozen_total_matches, frozen_total_matches_exact) = if has_aggregation {
+            (aggregate_scope.len(), false)
+        } else {
+            (
+                window_result.total_count.unwrap_or(window_count),
+                window_result.total_count.is_some(),
+            )
+        };
+        let aggregates_value = if has_aggregation {
+            serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
+        } else {
+            None
+        };
+        let explanation_value = if explain {
+            serde_json::to_value(
+                QueryExplanation::analyze(query, &filters)
+                    .with_wildcard_fallback(window_result.wildcard_fallback),
+            )
+            .ok()
+        } else {
+            None
+        };
+
+        let timed_out_now = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
+        // The first lookup's single index-state collection. The partial-index
+        // decision reads it directly, and the frozen display facts are built
+        // from this same value, so a first lookup reads the index state once --
+        // not once for `partial` and again for `--robot-meta`.
+        let state_meta_value =
+            state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true);
+        // Partial indexes and incomplete candidate scans both block a cursor,
+        // independent of the caller's `--robot-meta` projection.
+        let partial_now = window_result
+            .candidates
+            .as_ref()
+            .is_some_and(|candidates| candidates.incomplete)
+            || state_meta_value
+                .get("index")
+                .and_then(|index| index.get("partial"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+        // The robot-meta display facts, built from the one collection above and
+        // frozen into the window so a continuation renders exactly these. This
+        // still reads filesystem state (index existence, quarantine summary), so
+        // it runs *before* the final index check below to stay covered by it.
+        let frozen_display = collect_display_state(
+            &data_dir,
+            &db_path,
+            if robot_meta { Some(state_meta_value) } else { None },
+        );
+
+        // The after-stamp is the last read of this lookup: every assembly,
+        // scoring and state collection above has finished by now, so a change
+        // made by any of them is caught rather than ordered behind the check.
+        let index_stamp_ok = rerank_stamp_before.as_ref().is_some_and(|before| {
+            crate::search::rerank::window::capture_index_stamp(&db_path)
+                .map(|after| &after == before)
+                .unwrap_or(false)
+        });
+        if window_unavailable.is_none() {
+            if rerank_stamp_before.is_none() || !index_stamp_ok {
+                window_unavailable = Some("index_changed");
+            } else if timed_out_now {
+                window_unavailable = Some("search_timeout");
+            } else if partial_now {
+                window_unavailable = Some("partial_results");
+            }
+        }
+
+        // A window is only continuable when the first lookup is a clean, frozen
+        // success and the snapshot saves. Otherwise the current page is still
+        // delivered but carries no cursor and a short reason.
+        if window_unavailable.is_none() {
+            let snapshot = crate::search::rerank::window::WindowSnapshot {
+                created_at_ms: now_ms,
+                expires_at_ms,
+                request_binding: binding
+                    .clone()
+                    .expect("a continuable window always has a binding"),
+                index_stamp: rerank_stamp_before
+                    .clone()
+                    .expect("checked continuable"),
+                resolved_filters: filters.clone(),
+                result: window_result.clone(),
+                aggregates: aggregates_value.clone(),
+                explanation: explanation_value.clone(),
+                retrieval_status: serde_json::json!({
+                    "search_mode": search_mode_canonical_str(mode_meta.realized),
+                    "requested_search_mode": search_mode_canonical_str(mode_meta.requested),
+                    "mode_defaulted": mode_meta.defaulted,
+                    "fallback_tier": mode_meta.fallback_tier,
+                    "fallback_reason": mode_meta.fallback_reason.clone(),
+                    "search_ms": search_ms,
+                    "timed_out": timed_out_now,
+                    "total_matches": frozen_total_matches,
+                    "total_matches_exact": frozen_total_matches_exact,
+                    "robot_meta": robot_meta,
+                    "display": frozen_display.to_json(),
+                }),
+                rerank: crate::search::rerank::window::WindowRerankMeta {
+                    requested_provider: provider,
+                    requested_model: provider.request_model().to_string(),
+                    identity: identity.clone(),
+                    applied: rerank_applied,
+                    failure_reason,
+                    http_status,
+                    scored_count,
+                    http_requests,
+                    model_requests,
+                    duration_ms,
+                },
+            };
+            match crate::search::rerank::window::WindowStore::new(&data_dir, policy) {
+                Ok(store) => match store.save(&snapshot, now_ms) {
+                    Ok(id) => {
+                        window_id = Some(id);
+                        window_snapshot = Some(snapshot);
+                        window_continuable = true;
+                    }
+                    Err(_) => {
+                        window_unavailable =
+                            Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
+                    }
+                },
+                Err(_) => {
+                    window_unavailable =
+                        Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
+                }
+            }
+        }
+
+        window_display_state = Some(frozen_display);
+        window_meta = Some(RerankWindowMeta {
+            requested_provider: provider,
+            requested_model: provider.request_model(),
+            actual_provider: identity.actual_provider,
+            actual_model: identity.actual_model.clone(),
+            serving_provider: identity.serving_provider.clone(),
+            rrf_limit: limit_val,
+            window_count,
+            scored_count,
+            rerank_limit: rerank_k,
+            offset: 0,
+            applied: rerank_applied,
+            cache_reused: false,
+            first_http_requests: http_requests,
+            http_requests,
+            first_model_requests: model_requests,
+            model_requests,
+            first_duration_ms: duration_ms,
+            duration_ms,
+            failure_reason: failure_reason.map(|reason| reason.as_str()),
+            http_status,
+            pagination_unavailable_reason: window_unavailable.map(str::to_string),
+        });
+
+        window_result
     };
     // Track reranking time (0 if not applied) (T7.4)
-    let rerank_ms = if semantic_opts.rerank {
+    let rerank_ms = if rerank_on {
         rerank_start.elapsed().as_millis() as u64
     } else {
         0
@@ -23979,13 +25918,23 @@ fn run_cli_search(
     // Compute aggregations and create display result based on mode
     let (aggregations, display_result, total_matches, has_more_results, total_matches_exact) =
         if has_aggregation {
-            // Compute aggregations from all fetched results
-            let aggs = compute_aggregations(&result.hits, &agg_fields);
-            let total = result.hits.len();
+            // Aggregations keep the *original* first-lookup prefetch scope: for
+            // a rerank search that is the fetched pool before the window was
+            // clamped to N, so the counts match the closed-state path.
+            let aggregate_scope: &[crate::search::query::SearchHit] = if rerank_on {
+                rerank_prefetch_hits.as_deref().unwrap_or(&result.hits)
+            } else {
+                &result.hits
+            };
+            let aggs = compute_aggregations(aggregate_scope, &agg_fields);
+            let total = aggregate_scope.len();
 
             // Apply offset and limit to get display hits.
-            // When limit_val == 0 (meaning "no limit"), take all results.
-            let agg_effective_limit = if limit_val == 0 {
+            // When limit_val == 0 (meaning "no limit"), take all results. A
+            // rerank page is always K wide.
+            let agg_effective_limit = if rerank_on {
+                cursor_page_limit
+            } else if limit_val == 0 {
                 usize::MAX
             } else {
                 limit_val
@@ -24013,19 +25962,26 @@ fn run_cli_search(
             // No aggregation - result was over-fetched by one to derive pagination state.
             // When limit_val == 0 (meaning "no limit"), take all results.
             let total_matches_exact = result.total_count.is_some();
-            let has_more = cursor_page_limit > 0 && result.hits.len() > cursor_page_limit;
+            let window_total = result.hits.len();
+            let has_more = cursor_page_limit > 0 && window_total > cursor_page_limit;
             let effective_limit = if cursor_page_limit == 0 {
                 usize::MAX
             } else {
                 cursor_page_limit
             };
             let display_hits: Vec<_> = result.hits.into_iter().take(effective_limit).collect();
-            // Use the true total from Tantivy's Count collector when available;
-            // fall back to the page-window lower bound for semantic/hybrid/cached paths.
+            // Use the true total from the search engine when available; a
+            // rerank window's own size is the only total a first lookup can
+            // prove, and the closed path falls back to the page-window lower
+            // bound for semantic/hybrid/cached paths.
             let known_total = result.total_count.unwrap_or_else(|| {
-                offset_val
-                    .saturating_add(display_hits.len())
-                    .saturating_add(usize::from(has_more))
+                if rerank_on {
+                    window_total
+                } else {
+                    offset_val
+                        .saturating_add(display_hits.len())
+                        .saturating_add(usize::from(has_more))
+                }
             });
             let display = crate::search::query::SearchResult {
                 hits: display_hits,
@@ -24046,6 +26002,89 @@ fn run_cli_search(
         };
 
     let elapsed_ms = start_time.elapsed().as_millis() as u64;
+    let window_render = build_window_render_ctx(
+        window_id,
+        window_snapshot,
+        // A first lookup always starts at offset 0 in its own window.
+        0,
+        window_continuable,
+        window_meta,
+    );
+    render_search_output(SearchRenderInput {
+        query: query.to_string(),
+        limit: limit_val,
+        cursor_page_limit,
+        offset: offset_val,
+        display_result,
+        effective_robot,
+        robot_meta,
+        elapsed_ms,
+        fields,
+        max_content_length,
+        max_tokens,
+        request_id,
+        cursor,
+        has_more_results,
+        total_matches,
+        total_matches_exact,
+        aggregations,
+        explanation,
+        timed_out,
+        timeout_ms,
+        mode_meta,
+        search_ms,
+        rerank_ms,
+        rerank_applied,
+        rerank_requested: semantic_opts.rerank,
+        window: window_render,
+        display_state: window_display_state,
+        data_dir,
+        db_path,
+        display_format,
+        wrap,
+        highlight,
+    })
+}
+
+/// P09: the shared search renderer -- everything from the display budget down.
+/// Both the first lookup and a continuation page build a [`SearchRenderInput`]
+/// and land here, so the two cannot drift in their JSON/human projection.
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
+    let SearchRenderInput {
+        query,
+        limit,
+        cursor_page_limit,
+        offset,
+        display_result,
+        effective_robot,
+        robot_meta,
+        elapsed_ms,
+        fields,
+        max_content_length,
+        max_tokens,
+        request_id,
+        cursor,
+        has_more_results,
+        total_matches,
+        total_matches_exact,
+        aggregations,
+        explanation,
+        timed_out,
+        timeout_ms,
+        mode_meta,
+        search_ms,
+        rerank_ms,
+        rerank_applied,
+        rerank_requested,
+        window,
+        display_state,
+        data_dir,
+        db_path,
+        display_format,
+        wrap,
+        highlight,
+    } = inp;
 
     // Derive per-field budgets, preferring snippet > content > title
     let (snippet_budget, content_budget, title_budget, fallback_budget) = {
@@ -24074,8 +26113,12 @@ fn run_cli_search(
         fallback: fallback_budget,
     };
 
-    // Gather state meta for robot output (index/db freshness)
-    let state_meta = if robot_meta {
+    // Gather state meta for robot output (index/db freshness). A continuation
+    // page passes the first lookup's frozen bundle instead, so this live read
+    // is skipped entirely.
+    let state_meta = if display_state.is_some() {
+        None
+    } else if robot_meta {
         Some(state_meta_json(
             &data_dir,
             &db_path,
@@ -24162,7 +26205,9 @@ fn run_cli_search(
     // to _meta when conversations are quarantined, so agents know results exclude
     // known content (distinct from mere staleness). Skipped entirely otherwise to
     // keep the common complete-coverage payload unchanged.
-    let search_completeness = if robot_meta {
+    let search_completeness = if display_state.is_some() {
+        None
+    } else if robot_meta {
         let quarantine = crate::indexer::conversation_ingest_quarantine_summary(&data_dir);
         if quarantine.quarantined_conversations > 0 || quarantine.circuit_breaker_active {
             serde_json::to_value(
@@ -24179,6 +26224,32 @@ fn run_cli_search(
         None
     };
 
+    // P09: a continuation renders the frozen display facts; a first lookup (or
+    // the closed path) keeps the live ones just collected.
+    let (
+        state_meta_with_warning,
+        index_freshness,
+        storage_integrity_meta,
+        search_completeness,
+        warning,
+    ) = if let Some(frozen) = display_state {
+        (
+            frozen.state_meta_with_warning,
+            frozen.index_freshness,
+            frozen.storage_integrity_meta,
+            frozen.search_completeness,
+            frozen.warning,
+        )
+    } else {
+        (
+            state_meta_with_warning,
+            index_freshness,
+            storage_integrity_meta,
+            search_completeness,
+            warning,
+        )
+    };
+
     // Bead v6vuz: captured before the output chain because `warning` and
     // `effective_robot` are conditionally moved into the robot branch below.
     let is_human_search = effective_robot.is_none();
@@ -24187,10 +26258,10 @@ fn run_cli_search(
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
         output_robot_results(
-            query,
-            limit_val,
+            &query,
+            limit,
             cursor_page_limit,
-            offset_val,
+            offset,
             &display_result,
             format,
             robot_meta,
@@ -24216,7 +26287,10 @@ fn run_cli_search(
             search_ms,
             rerank_ms,
             rerank_applied,
-            semantic_opts.rerank,
+            rerank_requested,
+            // P09: the window facts (cursor + `_meta.rerank`), present only for
+            // a --rerank search. Old callers and the closed path pass None.
+            window.as_ref(),
             // PR9 task 08: the one production sink -- same stdout the seven
             // former inline `std::io::stdout()` sites wrote to.
             &mut std::io::stdout(),
@@ -24233,11 +26307,19 @@ fn run_cli_search(
         if let Some(precision) = display_result.search_precision() {
             println!("Search precision: {precision}");
         }
+        if let Some(window) = window.as_ref() {
+            let status = if window.meta.applied {
+                "applied"
+            } else {
+                window.meta.failure_reason.unwrap_or("not applied")
+            };
+            println!("Rerank: {} | {status}", window.meta.requested_provider);
+        }
         if display_result.hits.is_empty() {
             eprintln!("No results found.");
         } else if let Some(display) = display_format {
             // Human-readable display formats
-            output_display_results(&display_result.hits, display, wrap, query, highlight)?;
+            output_display_results(&display_result.hits, display, wrap, &query, highlight, rerank_requested)?;
         } else {
             // Default plain text output
             for hit in &display_result.hits {
@@ -24246,10 +26328,13 @@ fn run_cli_search(
                     "Score: {:.2} | Agent: {} | WS: {}",
                     hit.score, hit.agent, hit.workspace
                 );
+                if rerank_requested {
+                    println!("Rerank score: {}", display_rerank_score(hit.rerank_score));
+                }
                 println!("Path: {}", hit.source_path);
                 let snippet = hit.snippet.replace('\n', " ");
                 let snippet = if highlight {
-                    highlight_matches(&snippet, query, "**", "**")
+                    highlight_matches(&snippet, &query, "**", "**")
                 } else {
                     snippet
                 };
@@ -25282,17 +27367,29 @@ mod pack_field_mask_tests {
 }
 
 /// Output search results in human-readable display format
+fn display_rerank_score(score: Option<f64>) -> String {
+    score.map_or_else(|| "unscored".to_string(), |score| format!("{score:.4}"))
+}
+
 fn output_display_results(
     hits: &[crate::search::query::SearchHit],
     format: DisplayFormat,
     wrap: WrapConfig,
     query: &str,
     highlight: bool,
+    rerank_requested: bool,
 ) -> CliResult<()> {
     match format {
         DisplayFormat::Table => {
             // Aligned columns with headers
-            println!("{:<6} {:<12} {:<25} SNIPPET", "SCORE", "AGENT", "WORKSPACE");
+            if rerank_requested {
+                println!(
+                    "{:<6} {:<10} {:<12} {:<25} SNIPPET",
+                    "SCORE", "RERANK", "AGENT", "WORKSPACE"
+                );
+            } else {
+                println!("{:<6} {:<12} {:<25} SNIPPET", "SCORE", "AGENT", "WORKSPACE");
+            }
             println!("{}", "-".repeat(80));
             for hit in hits {
                 let workspace = truncate_start(&hit.workspace, 24);
@@ -25303,10 +27400,21 @@ fn output_display_results(
                     snippet
                 };
                 let snippet_display = truncate_end(&snippet, 50);
-                println!(
-                    "{:<6.2} {:<12} {:<25} {}",
-                    hit.score, hit.agent, workspace, snippet_display
-                );
+                if rerank_requested {
+                    println!(
+                        "{:<6.2} {:<10} {:<12} {:<25} {}",
+                        hit.score,
+                        display_rerank_score(hit.rerank_score),
+                        hit.agent,
+                        workspace,
+                        snippet_display
+                    );
+                } else {
+                    println!(
+                        "{:<6.2} {:<12} {:<25} {}",
+                        hit.score, hit.agent, workspace, snippet_display
+                    );
+                }
             }
             println!("\n{} results", hits.len());
         }
@@ -25320,10 +27428,21 @@ fn output_display_results(
                     snippet
                 };
                 let snippet_short = truncate_end(&snippet, 60);
-                println!(
-                    "[{:.1}] {} | {} | {}",
-                    hit.score, hit.agent, hit.source_path, snippet_short
-                );
+                if rerank_requested {
+                    println!(
+                        "[score: {:.1}, rerank: {}] {} | {} | {}",
+                        hit.score,
+                        display_rerank_score(hit.rerank_score),
+                        hit.agent,
+                        hit.source_path,
+                        snippet_short
+                    );
+                } else {
+                    println!(
+                        "[{:.1}] {} | {} | {}",
+                        hit.score, hit.agent, hit.source_path, snippet_short
+                    );
+                }
             }
         }
         DisplayFormat::Markdown => {
@@ -25332,6 +27451,12 @@ fn output_display_results(
             println!("Found **{}** results.\n", hits.len());
             for (i, hit) in hits.iter().enumerate() {
                 println!("## {}. {} (score: {:.2})\n", i + 1, hit.agent, hit.score);
+                if rerank_requested {
+                    println!(
+                        "- **Rerank score**: {}",
+                        display_rerank_score(hit.rerank_score)
+                    );
+                }
                 println!("- **Workspace**: `{}`", hit.workspace);
                 println!("- **Path**: `{}`", hit.source_path);
                 if let Some(ts) = hit.created_at {
@@ -25614,6 +27739,7 @@ fn projected_hit_field_value(
 ) -> Option<serde_json::Value> {
     match field {
         "score" => Some(safe_robot_score_value(hit.score)),
+        "rerank_score" => Some(serde_json::json!(hit.rerank_score)),
         "agent" => Some(serde_json::Value::String(hit.agent.clone())),
         "workspace" => Some(serde_json::Value::String(hit.workspace.clone())),
         "source_path" => Some(serde_json::Value::String(hit.source_path.clone())),
@@ -25663,6 +27789,7 @@ fn filter_hit_fields(
             let mut filtered = serde_json::Map::new();
             let known_fields = [
                 "score",
+                "rerank_score",
                 "agent",
                 "workspace",
                 "source_path",
@@ -26371,7 +28498,7 @@ fn output_robot_results(
     search_mode_meta: SearchModeMeta,
     search_ms: u64,
     rerank_ms: u64,
-    // R1-W3-B7: whether reranking actually changed `result`'s hit order --
+    // Whether complete rerank scoring was applied, even if order stayed equal.
     // `false` covers both "never requested" and "requested but no
     // reranker was available", same convention as `rerank_ms` (0 covers
     // both cases too). Distinguishing those two `false` cases is what the
@@ -26386,6 +28513,10 @@ fn output_robot_results(
     // JSON/JSONL top-level fields this gates must appear whenever the
     // caller asked for `--rerank`, not only when it succeeded.
     rerank_requested: bool,
+    // P09: the rerank window facts (continuation cursor + `_meta.rerank`).
+    // Present only for a --rerank search; the closed path and old callers pass
+    // `None`, so every existing surface is byte-for-byte unchanged.
+    window: Option<&WindowRenderCtx>,
     // PR9 task 08: the sink every robot format writes to. This was
     // `std::io::stdout()` at each of the seven write sites, which made the
     // payload-construction code unreachable from a test -- and the reason a
@@ -26766,7 +28897,7 @@ fn output_robot_results(
         return Ok(());
     }
 
-    let filtered_hits: Vec<serde_json::Value> = if minimal_projection {
+    let mut filtered_hits: Vec<serde_json::Value> = if minimal_projection {
         result
             .hits
             .iter()
@@ -26831,6 +28962,19 @@ fn output_robot_results(
             .collect()
     };
 
+    // Full rerank output always carries the independent score, including null
+    // on failure. Presets keep their fixed fields. Do this before the budget.
+    if rerank_requested && all_fields_requested {
+        for (hit, value) in result.hits.iter().zip(&mut filtered_hits) {
+            if let Some(map) = value.as_object_mut() {
+                map.insert(
+                    "rerank_score".to_string(),
+                    serde_json::json!(hit.rerank_score),
+                );
+            }
+        }
+    }
+
     // Clamp hits to token budget if provided (approx 4 chars per token)
     let jsonl_meta_emitted = matches!(format, RobotFormat::Jsonl)
         && (include_meta
@@ -26873,17 +29017,49 @@ fn output_robot_results(
 
     let search_page_count = result.hits.len();
     let returned_count = filtered_hits.len();
+    // One post-budget projection shared by every structured format.
+    let rerank_meta = window.map(|window| window.meta.to_json(returned_count));
     let clamped_unemitted_hits = returned_count < search_page_count;
-    let cursor_has_more = has_more_results || clamped_unemitted_hits;
     let realized_cursor_limit = if cursor_page_limit == 0 {
         limit
     } else {
         cursor_page_limit
     };
-    let next_cursor = if cursor_has_more && cursor_page_limit > 0 && returned_count > 0 {
+    // P09: a rerank window's continuation cursor is built from the frozen
+    // snapshot at the real `returned_count` the display budget produced, so the
+    // next page starts exactly where this one stopped. A window that is not
+    // continuable gets no cursor at all. The closed path keeps the legacy
+    // offset/limit cursor unchanged.
+    let next_cursor = if let Some(window) = window {
+        if window.continuable {
+            match (window.window_id.as_deref(), window.snapshot.as_ref()) {
+                (Some(id), Some(snapshot)) => {
+                    crate::search::rerank::window::next_cursor(
+                        id,
+                        snapshot,
+                        window.offset,
+                        returned_count,
+                    )
+                    .ok()
+                    .flatten()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else if (has_more_results || clamped_unemitted_hits)
+        && cursor_page_limit > 0
+        && returned_count > 0
+    {
         encode_search_cursor(offset.saturating_add(returned_count), cursor_page_limit)
     } else {
         None
+    };
+    let cursor_has_more = if window.is_some() {
+        next_cursor.is_some() || clamped_unemitted_hits
+    } else {
+        has_more_results || clamped_unemitted_hits
     };
     let query_plan = crate::query_cost_planner::build_query_cost_plan(
         crate::query_cost_planner::QueryCostPlanInput {
@@ -26976,6 +29152,27 @@ fn output_robot_results(
         Some(serde_json::to_value(aggregations).unwrap_or_default())
     };
 
+    // Apply after each format's optional metadata so it cannot overwrite the
+    // common window facts. JSONL uses this on its header object.
+    let attach_rerank_meta = |payload: &mut serde_json::Value| {
+        if let Some(rerank) = rerank_meta.as_ref() {
+            payload["rerank_requested"] = serde_json::json!(rerank_requested);
+            payload["rerank_applied"] = serde_json::json!(rerank_applied);
+            if payload.get("_meta").is_none() {
+                payload["_meta"] = serde_json::json!({});
+            }
+            payload["_meta"]["rerank"] = rerank.clone();
+            payload["_meta"]["next_cursor"] = serde_json::json!(next_cursor);
+            if !matches!(format, RobotFormat::Jsonl) {
+                let projection = search_precision_projection(result);
+                if let Some(precision) = projection.search_precision {
+                    payload["search_precision"] = serde_json::json!(precision);
+                    payload["candidates"] = serde_json::json!(projection.candidates);
+                }
+            }
+        }
+    };
+
     match format {
         RobotFormat::Json => {
             let mut payload = serde_json::json!({
@@ -27047,8 +29244,13 @@ fn output_robot_results(
                 );
             }
 
-            // Add extended metadata if requested
-            if include_meta && let serde_json::Value::Object(ref mut map) = payload {
+            // Add extended metadata if requested. P09: a --rerank search emits
+            // `_meta` (carrying the frozen `_meta.rerank` block) whether or not
+            // the caller asked for --robot-meta, so a bare `--json --rerank`
+            // call still carries the window facts P10 completes.
+            if (include_meta || window.is_some())
+                && let serde_json::Value::Object(ref mut map) = payload
+            {
                 let mut meta = serde_json::json!({
                     "elapsed_ms": elapsed_ms,
                     "search_mode": search_mode_meta.realized,
@@ -27133,7 +29335,6 @@ fn output_robot_results(
                     }
                 }
                 map.insert("_meta".to_string(), meta);
-
                 if let Some(warn) = &warning {
                     map.insert(
                         "_warning".to_string(),
@@ -27155,6 +29356,7 @@ fn output_robot_results(
                 }
             }
 
+            attach_rerank_meta(&mut payload);
             let mut out = BufWriter::new(&mut *out);
             serde_json::to_writer_pretty(&mut out, &payload).map_err(|e| CliError {
                 code: 9,
@@ -27343,6 +29545,7 @@ fn output_robot_results(
                         }),
                     );
                 }
+                attach_rerank_meta(&mut meta);
                 serde_json::to_writer(&mut out, &meta).map_err(|e| CliError {
                     code: 9,
                     kind: CliErrorKind::EncodeJson.kind_str(),
@@ -27498,6 +29701,7 @@ fn output_robot_results(
                 }
             }
 
+            attach_rerank_meta(&mut payload);
             let encoded = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
@@ -27635,6 +29839,7 @@ fn output_robot_results(
                 }
             }
 
+            attach_rerank_meta(&mut payload);
             let json_str = serde_json::to_string(&payload).map_err(|e| CliError {
                 code: 9,
                 kind: CliErrorKind::EncodeJson.kind_str(),
@@ -27684,9 +29889,7 @@ fn output_robot_results(
 /// surfaces that silently dropped candidate diagnostics before this task.
 #[cfg(test)]
 mod pr9_candidate_meta_output_tests {
-    use super::{
-        Aggregations, FieldBudgets, RobotFormat, SearchModeMeta, output_robot_results,
-    };
+    use super::{Aggregations, FieldBudgets, RobotFormat, SearchModeMeta, output_robot_results};
     use crate::search::query::{
         CacheStats, CandidateMeta, CandidateMode, MatchType, SearchHit, SearchMode, SearchResult,
     };
@@ -27714,6 +29917,7 @@ mod pr9_candidate_meta_output_tests {
             winning_chunk_idx: Some(3),
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 
@@ -27772,19 +29976,36 @@ mod pr9_candidate_meta_output_tests {
         fields: &Option<Vec<String>>,
         result: &SearchResult,
     ) -> String {
+        render_window(format, include_meta, fields, result, None, None, None)
+    }
+
+    fn render_window(
+        format: RobotFormat,
+        include_meta: bool,
+        fields: &Option<Vec<String>>,
+        result: &SearchResult,
+        window: Option<&super::WindowRenderCtx>,
+        max_tokens: Option<usize>,
+        max_content_length: Option<usize>,
+    ) -> String {
         let mut sink: Vec<u8> = Vec::new();
         output_robot_results(
             "hello",
             8,
             8,
-            0,
+            window.map_or(0, |window| window.offset),
             result,
             format,
             include_meta,
             1,
             fields,
-            FieldBudgets { snippet: None, content: None, title: None, fallback: None },
-            None,
+            FieldBudgets {
+                snippet: max_content_length,
+                content: max_content_length,
+                title: max_content_length,
+                fallback: max_content_length,
+            },
+            max_tokens,
             None,
             None,
             false,
@@ -27802,8 +30023,9 @@ mod pr9_candidate_meta_output_tests {
             SearchModeMeta::new(SearchMode::Hybrid, false),
             1,
             0,
-            false,
-            false,
+            window.is_some_and(|window| window.meta.applied),
+            window.is_some(),
+            window,
             &mut sink,
         )
         .expect("render robot output");
@@ -27811,7 +30033,12 @@ mod pr9_candidate_meta_output_tests {
     }
 
     fn render_json(include_meta: bool) -> Value {
-        let out = render(RobotFormat::Json, include_meta, &None, &result_with(Some(exact_candidates())));
+        let out = render(
+            RobotFormat::Json,
+            include_meta,
+            &None,
+            &result_with(Some(exact_candidates())),
+        );
         serde_json::from_str(&out).expect("default JSON payload parses")
     }
 
@@ -27832,7 +30059,10 @@ mod pr9_candidate_meta_output_tests {
 
     fn render_jsonl_first_line(result: &SearchResult, include_meta: bool) -> String {
         let out = render(RobotFormat::Jsonl, include_meta, &None, result);
-        out.lines().next().expect("jsonl has a first line").to_string()
+        out.lines()
+            .next()
+            .expect("jsonl has a first line")
+            .to_string()
     }
 
     #[test]
@@ -27842,7 +30072,12 @@ mod pr9_candidate_meta_output_tests {
         assert_eq!(value["search_precision"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["mode"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["approximate"], serde_json::json!(false));
-        for key in ["requested_coarse_k", "effective_coarse_k", "coarse_cap_hit", "corpus_limited"] {
+        for key in [
+            "requested_coarse_k",
+            "effective_coarse_k",
+            "coarse_cap_hit",
+            "corpus_limited",
+        ] {
             assert!(
                 value["candidates"].get(key).is_none(),
                 "{key} must stay absent on the float path, got {value}"
@@ -27855,7 +30090,10 @@ mod pr9_candidate_meta_output_tests {
         let value = render_json_summary(&result_with(Some(exact_candidates())));
         assert_eq!(value["search_precision"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["approximate"], serde_json::json!(false));
-        assert_eq!(value["hits"][0]["source_path"], serde_json::json!("/tmp/session.jsonl"));
+        assert_eq!(
+            value["hits"][0]["source_path"],
+            serde_json::json!("/tmp/session.jsonl")
+        );
     }
 
     #[test]
@@ -27864,8 +30102,14 @@ mod pr9_candidate_meta_output_tests {
         assert_eq!(value["search_precision"], serde_json::json!("exact"));
         assert_eq!(value["candidates"]["mode"], serde_json::json!("exact"));
         // The pre-existing `_meta.candidates` diagnostic keeps its place.
-        assert_eq!(value["_meta"]["candidates"]["mode"], serde_json::json!("exact"));
-        assert_eq!(value["_meta"]["candidates"]["approximate"], serde_json::json!(false));
+        assert_eq!(
+            value["_meta"]["candidates"]["mode"],
+            serde_json::json!("exact")
+        );
+        assert_eq!(
+            value["_meta"]["candidates"]["approximate"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
@@ -27873,27 +30117,51 @@ mod pr9_candidate_meta_output_tests {
         let value = render_json_approximate();
         assert_eq!(value["search_precision"], serde_json::json!("approximate"));
         assert_eq!(value["candidates"]["approximate"], serde_json::json!(true));
-        assert_eq!(value["candidates"]["requested_coarse_k"], serde_json::json!(6432));
-        assert_eq!(value["candidates"]["effective_coarse_k"], serde_json::json!(4096));
-        assert_eq!(value["candidates"]["coarse_cap_hit"], serde_json::json!(true));
-        assert_eq!(value["candidates"]["corpus_limited"], serde_json::json!(false));
+        assert_eq!(
+            value["candidates"]["requested_coarse_k"],
+            serde_json::json!(6432)
+        );
+        assert_eq!(
+            value["candidates"]["effective_coarse_k"],
+            serde_json::json!(4096)
+        );
+        assert_eq!(
+            value["candidates"]["coarse_cap_hit"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            value["candidates"]["corpus_limited"],
+            serde_json::json!(false)
+        );
     }
 
     #[test]
     fn pr9_candidate_meta_approximate_summary_json_is_visible_without_robot_meta() {
         let value = render_json_summary(&result_with(Some(approximate_candidates())));
         assert_eq!(value["search_precision"], serde_json::json!("approximate"));
-        assert_eq!(value["candidates"]["effective_coarse_k"], serde_json::json!(4096));
+        assert_eq!(
+            value["candidates"]["effective_coarse_k"],
+            serde_json::json!(4096)
+        );
     }
 
     #[test]
     fn pr9_candidate_meta_approximate_jsonl_header_is_visible_without_robot_meta() {
         let result = result_with(Some(approximate_candidates()));
-        let header: Value =
-            serde_json::from_str(&render_jsonl_first_line(&result, false)).expect("jsonl header parses");
-        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("approximate"));
-        assert_eq!(header["_meta"]["candidates"]["approximate"], serde_json::json!(true));
-        assert_eq!(header["_meta"]["candidates"]["requested_coarse_k"], serde_json::json!(6432));
+        let header: Value = serde_json::from_str(&render_jsonl_first_line(&result, false))
+            .expect("jsonl header parses");
+        assert_eq!(
+            header["_meta"]["search_precision"],
+            serde_json::json!("approximate")
+        );
+        assert_eq!(
+            header["_meta"]["candidates"]["approximate"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            header["_meta"]["candidates"]["requested_coarse_k"],
+            serde_json::json!(6432)
+        );
     }
 
     #[test]
@@ -27904,13 +30172,26 @@ mod pr9_candidate_meta_output_tests {
         let result = result_with(Some(exact_candidates()));
         let out = render(RobotFormat::Jsonl, false, &None, &result);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2, "one header line plus one hit line, got {out}");
+        assert_eq!(
+            lines.len(),
+            2,
+            "one header line plus one hit line, got {out}"
+        );
         let header: Value = serde_json::from_str(lines[0]).expect("jsonl header parses");
-        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("exact"));
-        assert_eq!(header["_meta"]["candidates"]["mode"], serde_json::json!("exact"));
+        assert_eq!(
+            header["_meta"]["search_precision"],
+            serde_json::json!("exact")
+        );
+        assert_eq!(
+            header["_meta"]["candidates"]["mode"],
+            serde_json::json!("exact")
+        );
         let hit: Value = serde_json::from_str(lines[1]).expect("jsonl hit parses");
         assert_eq!(hit["source_path"], serde_json::json!("/tmp/session.jsonl"));
-        assert!(hit.get("_meta").is_none(), "the per-hit line must not become a meta line");
+        assert!(
+            hit.get("_meta").is_none(),
+            "the per-hit line must not become a meta line"
+        );
     }
 
     /// PR9 task 09 re-runs the same three-format acceptance on its real int8
@@ -27928,10 +30209,12 @@ mod pr9_candidate_meta_output_tests {
         assert_eq!(parsed["search_precision"], serde_json::json!("approximate"));
         let parsed: Value = serde_json::from_str(&json_summary).expect("summary JSON parses");
         assert_eq!(parsed["search_precision"], serde_json::json!("approximate"));
-        let header: Value =
-            serde_json::from_str(jsonl.lines().next().expect("jsonl first line"))
-                .expect("jsonl header parses");
-        assert_eq!(header["_meta"]["search_precision"], serde_json::json!("approximate"));
+        let header: Value = serde_json::from_str(jsonl.lines().next().expect("jsonl first line"))
+            .expect("jsonl header parses");
+        assert_eq!(
+            header["_meta"]["search_precision"],
+            serde_json::json!("approximate")
+        );
 
         for (label, body) in [
             ("json_full", json_full.as_str()),
@@ -27955,14 +30238,268 @@ mod pr9_candidate_meta_output_tests {
         assert!(value.get("search_precision").is_none(), "got {value}");
         assert!(value.get("candidates").is_none(), "got {value}");
         let meta_json = render(RobotFormat::Json, true, &None, &lexical);
-        let value: Value = serde_json::from_str(&meta_json).expect("lexical robot-meta payload parses");
+        let value: Value =
+            serde_json::from_str(&meta_json).expect("lexical robot-meta payload parses");
         assert!(value["_meta"]["candidates"].is_null());
         // No header at all, so the only line keeps its per-hit shape.
         let jsonl = render(RobotFormat::Jsonl, false, &None, &lexical);
         let first: Value = serde_json::from_str(jsonl.lines().next().expect("first line"))
             .expect("lexical jsonl line parses");
         assert!(first.get("_meta").is_none(), "got {first}");
-        assert_eq!(first["source_path"], serde_json::json!("/tmp/session.jsonl"));
+        assert_eq!(
+            first["source_path"],
+            serde_json::json!("/tmp/session.jsonl")
+        );
+    }
+
+    // No process-global state: each render owns its sink and window.
+    fn test_window(applied: bool, cache_reused: bool) -> super::WindowRenderCtx {
+        use crate::search::rerank::types::ProviderChoice;
+        super::WindowRenderCtx {
+            window_id: None,
+            snapshot: None,
+            offset: usize::from(cache_reused) * 2,
+            continuable: false,
+            meta: super::RerankWindowMeta {
+                requested_provider: ProviderChoice::BgeLocal,
+                requested_model: ProviderChoice::BgeLocal.request_model(),
+                actual_provider: applied.then_some(ProviderChoice::BgeLocal),
+                actual_model: applied.then(|| ProviderChoice::BgeLocal.request_model().to_string()),
+                serving_provider: None,
+                rrf_limit: 8,
+                window_count: 3,
+                scored_count: if applied { 3 } else { 0 },
+                rerank_limit: 2,
+                offset: usize::from(cache_reused) * 2,
+                applied,
+                cache_reused,
+                first_http_requests: Some(2),
+                http_requests: Some(if cache_reused { 0 } else { 2 }),
+                first_model_requests: Some(1),
+                model_requests: Some(usize::from(!cache_reused)),
+                first_duration_ms: 7,
+                duration_ms: if cache_reused { 0 } else { 7 },
+                failure_reason: (!applied).then_some("invalid_response"),
+                http_status: Some(200),
+                pagination_unavailable_reason: Some("cache_unavailable".to_string()),
+            },
+        }
+    }
+
+    // The TOON decoder represents all numbers as f64. Normalize only exact
+    // integer representations for JSON structural comparisons; retain every
+    // field and every numeric value, including independent fractional scores.
+    fn normalize_test_numbers(value: &mut Value) {
+        match value {
+            Value::Number(number) => {
+                if let Some(n) = number.as_f64()
+                    && n.fract() == 0.0
+                    && n.abs() <= 9_007_199_254_740_991.0
+                {
+                    *value = serde_json::json!(n as i64);
+                }
+            }
+            Value::Array(values) => values.iter_mut().for_each(normalize_test_numbers),
+            Value::Object(values) => values.values_mut().for_each(normalize_test_numbers),
+            _ => {}
+        }
+    }
+
+    fn decode_output(format: RobotFormat, text: &str) -> (Value, Vec<Value>) {
+        if matches!(format, RobotFormat::Jsonl) {
+            let mut lines = text.lines();
+            let mut header: Value = serde_json::from_str(lines.next().expect("header")).unwrap();
+            normalize_test_numbers(&mut header);
+            let hits = lines
+                .map(|line| {
+                    let mut hit = serde_json::from_str(line).unwrap();
+                    normalize_test_numbers(&mut hit);
+                    hit
+                })
+                .collect();
+            (header, hits)
+        } else {
+            let mut payload: Value = if matches!(format, RobotFormat::Toon) {
+                toon::try_decode(text, None).expect("TOON decodes").into()
+            } else {
+                serde_json::from_str(text).expect("JSON decodes")
+            };
+            normalize_test_numbers(&mut payload);
+            let hits = payload["hits"].as_array().expect("hits array").clone();
+            (payload, hits)
+        }
+    }
+
+    #[test]
+    fn p10_all_formats_preserve_window_scores_and_projection() {
+        for (applied, cache_reused) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let window = test_window(applied, cache_reused);
+            let mut result = result_with(Some(exact_candidates()));
+            result.hits[0].rerank_score = applied.then_some(0.75);
+            let mut other = test_hit();
+            other.source_path = "/tmp/other.jsonl".to_string();
+            other.score = 4.0;
+            other.rerank_score = applied.then_some(0.5);
+            result.hits.push(other);
+            for include_meta in [false, true] {
+                for fields in [
+                    None,
+                    Some(vec!["minimal".to_string()]),
+                    Some(vec!["summary".to_string()]),
+                    Some(vec![
+                        "source_path".to_string(),
+                        "score".to_string(),
+                        "rerank_score".to_string(),
+                    ]),
+                ] {
+                    let mut expected = None;
+                    for format in [
+                        RobotFormat::Json,
+                        RobotFormat::Compact,
+                        RobotFormat::Jsonl,
+                        RobotFormat::Toon,
+                    ] {
+                        let text = render_window(
+                            format,
+                            include_meta,
+                            &fields,
+                            &result,
+                            Some(&window),
+                            None,
+                            Some(4),
+                        );
+                        let (payload, hits) = decode_output(format, &text);
+                        assert_eq!(payload["_meta"]["rerank"], window.meta.to_json(hits.len()));
+                        assert_eq!(payload["rerank_requested"], true);
+                        assert_eq!(payload["rerank_applied"], applied);
+                        let projection = fields
+                            .as_ref()
+                            .and_then(|fields| fields.first())
+                            .map(String::as_str);
+                        if matches!(projection, Some("minimal" | "summary")) {
+                            assert!(hits.iter().all(|hit| hit.get("rerank_score").is_none()));
+                        } else {
+                            assert_eq!(hits[0]["score"], 1.25);
+                            assert_eq!(
+                                hits[0]["rerank_score"],
+                                serde_json::json!(result.hits[0].rerank_score)
+                            );
+                            assert!(hits.iter().all(|hit| hit.get("rerank_score").is_some()));
+                        }
+                        for hit in &hits {
+                            assert!(hit.get("content_hash").is_none());
+                            assert!(hit.get("conversation_id").is_none());
+                            assert!(hit.get("snapshot_path").is_none());
+                        }
+                        // Trust carries observation time; compare stable fields.
+                        let stable_hits: Vec<_> = hits
+                            .iter()
+                            .cloned()
+                            .map(|mut hit| {
+                                hit.as_object_mut().unwrap().remove("trust");
+                                hit
+                            })
+                            .collect();
+                        if let Some(expected) = &expected {
+                            assert_eq!(&stable_hits, expected, "format {format:?}");
+                        } else {
+                            expected = Some(stable_hits);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn p10_budget_reports_actual_count_and_empty_window_has_no_cursor() {
+        let window = test_window(false, false);
+        let mut result = result_with(None);
+        result.hits.push(test_hit());
+        for format in [
+            RobotFormat::Json,
+            RobotFormat::Compact,
+            RobotFormat::Jsonl,
+            RobotFormat::Toon,
+        ] {
+            let (payload, hits) = decode_output(
+                format,
+                &render_window(format, false, &None, &result, Some(&window), Some(1), None),
+            );
+            assert_eq!(hits.len(), 1, "nonempty budget keeps first hit");
+            assert_eq!(payload["_meta"]["rerank"]["returned_count"], 1);
+            result.hits.clear();
+            let (payload, hits) = decode_output(
+                format,
+                &render_window(format, false, &None, &result, Some(&window), Some(1), None),
+            );
+            assert!(hits.is_empty());
+            assert_eq!(payload["_meta"]["rerank"]["returned_count"], 0);
+            assert!(payload["_meta"]["next_cursor"].is_null());
+            result.hits = vec![test_hit(), test_hit()];
+        }
+    }
+
+    #[test]
+    fn p10_closed_score_is_omitted_unless_explicitly_projected() {
+        for format in [
+            RobotFormat::Json,
+            RobotFormat::Compact,
+            RobotFormat::Jsonl,
+            RobotFormat::Toon,
+        ] {
+            let output = render(format, false, &None, &result_with(Some(exact_candidates())));
+            let (payload, hits) = decode_output(format, &output);
+            assert!(hits[0].get("rerank_score").is_none());
+            assert!(payload["_meta"].get("rerank").is_none());
+            let output = render(
+                format,
+                false,
+                &Some(vec!["rerank_score".to_string()]),
+                &result_with(Some(exact_candidates())),
+            );
+            let (_, hits) = decode_output(format, &output);
+            assert_eq!(hits[0], serde_json::json!({"rerank_score": null}));
+        }
+    }
+
+    #[test]
+    fn p10_machine_schema_names_every_window_field_and_null_reason() {
+        let value = test_window(false, false).meta.to_json(1);
+        let schema = super::response_schema_rerank_meta();
+        let mut keys: Vec<_> = value.as_object().unwrap().keys().collect();
+        keys.sort();
+        let mut properties: Vec<_> = schema["properties"].as_object().unwrap().keys().collect();
+        properties.sort();
+        assert_eq!(keys, properties);
+        assert_eq!(schema["required"].as_array().unwrap().len(), keys.len());
+        for (field, fact) in value.as_object().unwrap() {
+            if fact.is_null() && schema["properties"][field].get("enum").is_some() {
+                assert!(
+                    schema["properties"][field]["enum"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::Value::Null)
+                );
+            }
+        }
+        assert_eq!(schema["properties"]["returned_count"]["minimum"], 0);
+        assert!(
+            schema["properties"]["pagination_unavailable_reason"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("search_timeout"))
+        );
+        let hit = super::response_schema_search_hit();
+        assert_eq!(
+            hit["properties"]["rerank_score"]["type"],
+            serde_json::json!(["number", "null"])
+        );
+        assert_eq!(
+            super::build_response_schemas()["search"]["properties"]["_meta"]["properties"]["rerank"],
+            schema
+        );
     }
 }
 
@@ -78735,9 +81272,34 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Default search/pack timeout in milliseconds (0 = no timeout). The --timeout flag overrides; also configurable via [search].timeout_ms in ~/.config/cass/cass.toml. Alias: CASS_SEARCH_TIMEOUT.",
         ),
         env_var_capability(
+            "CASS_RRF_LIMIT",
+            None,
+            "Default search rrf candidate window N. The --rrf-limit flag overrides; also [search].rrf_limit in ~/.config/cass/cass.toml.",
+        ),
+        env_var_capability(
+            "CASS_RERANK_LIMIT",
+            None,
+            "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml.",
+        ),
+        env_var_capability(
+            "CASS_QWEN_RERANK_URL",
+            None,
+            "Local Qwen rerank endpoint. Only loopback targets are accepted; proxies and redirects are disabled. Used by qwen3-local, the default when --rerank is enabled.",
+        ),
+        env_var_capability(
+            "CASS_INFINITY_URL",
+            None,
+            "Local Infinity endpoint for bge-local reranking and Infinity embeddings. Reranking accepts only loopback targets; proxies and redirects are disabled.",
+        ),
+        env_var_capability(
+            "OPENROUTER_API_KEY",
+            None,
+            "Credential consumed only by an explicitly selected OpenRouter rerank provider. Missing credentials keep original order with missing_credentials; no backend switch.",
+        ),
+        env_var_capability(
             "CASS_SEARCH_LIMIT",
             None,
-            "Default search/pack result limit (0 = no limit, RAM-capped). The --limit flag overrides; also [search].limit in ~/.config/cass/cass.toml.",
+            "Legacy pack result limit (0 = no limit, RAM-capped). Consumed by `cass pack` via [search].limit; `cass search` rejects it with a migration error and uses CASS_RRF_LIMIT instead.",
         ),
         env_var_capability(
             "CASS_SEARCH_MODE",
@@ -78927,21 +81489,21 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
         workflow_capability(
             "bounded-search",
             "Search sessions without flooding the caller's token budget.",
-            "cass search \"<query>\" --robot --limit 10 --fields summary --max-content-length 800 --robot-meta",
+            "cass search \"<query>\" --robot --rrf-limit 10 --fields summary --max-content-length 800 --robot-meta",
             &[
                 "cass view <source_path> -n <line_number> --json",
                 "cass expand <source_path> --line <line_number> -C 3 --json",
                 "cass pack \"<query>\" --robot --max-tokens 4000 --limit 10",
             ],
             "Parse hits[], _meta.realized_mode, _meta.fallback_mode, cursor, and *_truncated flags.",
-            "Prefer an explicit --limit in automation; limit 0 intentionally means unbounded.",
+            "Prefer an explicit --rrf-limit in automation; an omitted window keeps the legacy unbounded fetch.",
         ),
         workflow_capability(
             "answer-pack",
             "Build a deterministic cited handoff bundle for another agent.",
             "cass pack \"<question>\" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --require-evidence",
             &[
-                "cass search \"<question>\" --robot --limit 10 --fields provenance --robot-meta",
+                "cass search \"<question>\" --robot --rrf-limit 10 --fields provenance --robot-meta",
                 "cass view <source_path> -n <line_number> --json",
             ],
             "Parse evidence[], warnings[], privacy, freshness, health, and omitted[].",
@@ -78992,8 +81554,8 @@ fn mistake_recovery_capability(
 fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
     vec![
         mistake_recovery_capability(
-            "cass searh \"query\" --robot --limit 10",
-            "cass search \"query\" --robot --limit 10",
+            "cass searh \"query\" --robot --rrf-limit 10",
+            "cass search \"query\" --robot --rrf-limit 10",
             true,
             "Levenshtein command recovery corrects the top-level subcommand typo.",
         ),
@@ -79022,8 +81584,8 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search.",
         ),
         mistake_recovery_capability(
-            "cass search \"query\" limit=5",
-            "cass search \"query\" --limit 5",
+            "cass search \"query\" agent=codex",
+            "cass search \"query\" --agent codex",
             true,
             "Bare key=value arguments are promoted to known long flags.",
         ),
@@ -79215,21 +81777,21 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
         ),
         mistake_recovery_capability(
             "cass search auth --max-results 5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "A common result-count alias is converted to the canonical limit flag.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "Result-count aliases are refused on cass search; use --rrf-limit N (candidate window) or --rerank-limit K.",
         ),
         mistake_recovery_capability(
             "cass search auth --max_results 5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "Snake_case long flags are normalized to kebab-case before alias recovery runs.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "Snake_case long flags are normalized to kebab-case, but the result-count alias is then refused on cass search; use --rrf-limit N.",
         ),
         mistake_recovery_capability(
             "cass search auth max_results=5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "A bare result-count assignment is converted to the canonical limit flag.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "A bare result-count assignment is refused on cass search; use --rrf-limit N.",
         ),
         mistake_recovery_capability(
             "cass search auth agent=codex days=7 fields=minimal --json",
@@ -79256,22 +81818,22 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "Provider/tool/connector filter aliases are converted to the canonical agent filter.",
         ),
         mistake_recovery_capability(
-            "cass search auth provider codex limit 5 last 7d --json",
-            "cass search auth --agent codex --limit 5 --since -7d --json",
+            "cass search auth provider codex last 7d --json",
+            "cass search auth --agent codex --since -7d --json",
             true,
             "Bare filter key/value pairs after a query are converted before remaining words are folded into the query.",
         ),
         mistake_recovery_capability(
-            "cass search --agent codex --limit 5 auth error --json",
-            "cass search \"auth error\" --agent codex --limit 5 --json",
+            "cass search --agent codex --rrf-limit 5 auth error --json",
+            "cass search \"auth error\" --agent codex --rrf-limit 5 --json",
             true,
             "A query placed after leading search/pack filters is moved back to the required query positional.",
         ),
         mistake_recovery_capability(
             "cass search auth -n 5 --json",
-            "cass search auth --limit 5 --json",
-            true,
-            "A familiar short result-count spelling is converted to the canonical limit flag.",
+            "cass search auth --rrf-limit 5 --json",
+            false,
+            "The short result-count spelling is refused on cass search; use --rrf-limit N.",
         ),
     ]
 }
@@ -80194,6 +82756,8 @@ fn argument_schema_from_clap(arg: &Arg) -> ArgumentSchema {
 
 const INTEGER_ARG_NAMES: &[&str] = &[
     "limit",
+    "rrf-limit",
+    "rerank-limit",
     "offset",
     "max-content-length",
     "max-tokens",
@@ -82957,6 +85521,10 @@ fn response_schema_search_hit() -> serde_json::Value {
         ("content", serde_json::json!({ "type": ["string", "null"] })),
         ("snippet", serde_json::json!({ "type": ["string", "null"] })),
         ("score", serde_json::json!({ "type": ["number", "null"] })),
+        ("rerank_score", serde_json::json!({
+            "type": ["number", "null"],
+            "description": "Independent rerank score. Full rerank output includes null when unscored; closed output omits it. Explicit field projection includes it."
+        })),
         (
             "created_at",
             serde_json::json!({ "type": ["integer", "string", "null"] }),
@@ -83256,6 +85824,96 @@ fn response_schema_root_cause_attribution() -> serde_json::Value {
     })
 }
 
+fn response_schema_rerank_meta() -> serde_json::Value {
+    use crate::search::rerank::types::ProviderChoice;
+    let providers = serde_json::json!([
+        ProviderChoice::Qwen3Local,
+        ProviderChoice::BgeLocal,
+        ProviderChoice::OpenrouterQwen38b,
+        ProviderChoice::OpenrouterCohere4Fast,
+        ProviderChoice::OpenrouterVoyage25Lite
+    ]);
+    let mut nullable_providers = providers.clone();
+    nullable_providers
+        .as_array_mut()
+        .expect("provider array")
+        .push(serde_json::Value::Null);
+    let mut schema = response_schema_object([
+        (
+            "requested_provider",
+            serde_json::json!({"type": "string", "enum": providers}),
+        ),
+        ("requested_model", serde_json::json!({"type": "string"})),
+        (
+            "actual_provider",
+            serde_json::json!({"type": ["string", "null"], "enum": nullable_providers}),
+        ),
+        (
+            "actual_model",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "serving_provider",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "applied",
+            serde_json::json!({"type": "boolean", "description": "Complete scoring applied, including unchanged order."}),
+        ),
+        ("cache_reused", serde_json::json!({"type": "boolean"})),
+        (
+            "http_status",
+            serde_json::json!({"type": ["integer", "null"], "minimum": 100, "maximum": 599}),
+        ),
+        (
+            "failure_reason",
+            serde_json::json!({"type": ["string", "null"], "enum": [
+                "unsupported_provider", "invalid_input", "missing_credentials", "non_loopback_endpoint",
+                "http_error", "timeout", "transport_error", "invalid_response", "model_identity_mismatch",
+                "unscoreable_input", "input_identity_mismatch", null
+            ]}),
+        ),
+        (
+            "pagination_unavailable_reason",
+            serde_json::json!({"type": ["string", "null"], "enum": [
+                "invalid_input", "cache_unavailable", "not_found", "invalid_cursor", "corrupt", "expired",
+                "binding_mismatch", "index_changed", "partial_results", "search_timeout", null
+            ]}),
+        ),
+    ]);
+    let properties = schema["properties"]
+        .as_object_mut()
+        .expect("schema properties");
+    for field in [
+        "rrf_limit",
+        "window_count",
+        "scored_count",
+        "rerank_limit",
+        "offset",
+        "returned_count",
+        "first_duration_ms",
+        "duration_ms",
+    ] {
+        properties.insert(
+            field.to_string(),
+            serde_json::json!({"type": "integer", "minimum": 0}),
+        );
+    }
+    for field in [
+        "first_http_requests",
+        "http_requests",
+        "first_model_requests",
+        "model_requests",
+    ] {
+        properties.insert(
+            field.to_string(),
+            serde_json::json!({"type": ["integer", "null"], "minimum": 0}),
+        );
+    }
+    schema["required"] = serde_json::json!(properties.keys().cloned().collect::<Vec<_>>());
+    schema
+}
+
 fn response_schema_search_meta() -> serde_json::Value {
     response_schema_object([
         ("elapsed_ms", serde_json::json!({ "type": "integer" })),
@@ -83298,10 +85956,8 @@ fn response_schema_search_meta() -> serde_json::Value {
         ("cursor_manifest", response_schema_cursor_manifest()),
         ("explanation_cards", response_schema_explanation_cards()),
         ("timing", response_schema_search_timing()),
-        (
-            "rerank_applied",
-            serde_json::json!({ "type": "boolean" }),
-        ),
+        ("rerank", response_schema_rerank_meta()),
+        ("rerank_applied", serde_json::json!({ "type": "boolean" })),
         (
             "tokens_estimated",
             serde_json::json!({ "type": ["integer", "null"] }),
@@ -83350,6 +86006,8 @@ fn response_schema_search_meta() -> serde_json::Value {
 fn response_schema_search() -> serde_json::Value {
     response_schema_object([
         ("query", serde_json::json!({ "type": "string" })),
+        ("rerank_requested", serde_json::json!({"type": "boolean"})),
+        ("rerank_applied", serde_json::json!({"type": "boolean"})),
         ("limit", serde_json::json!({ "type": "integer" })),
         ("offset", serde_json::json!({ "type": "integer" })),
         ("count", serde_json::json!({ "type": "integer" })),
@@ -83632,6 +86290,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     let mut schemas = std::collections::BTreeMap::new();
 
     schemas.insert("search".to_string(), response_schema_search());
+    schemas.insert("search-rerank-meta".to_string(), response_schema_rerank_meta());
     schemas.insert("pack".to_string(), response_schema_pack());
 
     schemas.insert(
@@ -93045,6 +95704,7 @@ mod robot_output_score_tests {
             winning_chunk_idx: None,
             winning_chunk_span: None,
             winning_chunk_hash: None,
+            rerank_score: None,
         }
     }
 

@@ -119,7 +119,7 @@ TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
 QUERY="${TEST_QUERIES[0]}"
 START_TIME=$(date +%s%N)
-BASELINE_RESULT=$($CASS_BIN search "$QUERY" --limit 20 --json 2>/dev/null || echo '{"hits":[]}')
+BASELINE_RESULT=$($CASS_BIN search "$QUERY" --rrf-limit 20 --json 2>/dev/null || echo '{"hits":[]}')
 END_TIME=$(date +%s%N)
 BASELINE_LATENCY=$(( (END_TIME - START_TIME) / 1000000 ))
 
@@ -142,7 +142,7 @@ TOTAL_TESTS=$((TOTAL_TESTS + 1))
 
 START_TIME=$(date +%s%N)
 set +e
-RERANK_RESULT=$($CASS_BIN search "$QUERY" --limit 20 --rerank --json 2>>"$LOG_FILE")
+RERANK_RESULT=$($CASS_BIN search "$QUERY" --rrf-limit 20 --rerank --rerank-limit 20 --json 2>>"$LOG_FILE")
 RERANK_STATUS=$?
 set -e
 END_TIME=$(date +%s%N)

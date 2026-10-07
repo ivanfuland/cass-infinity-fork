@@ -340,6 +340,29 @@ fn normalize_live_robot_values(value: &mut Value) {
                     continue;
                 }
 
+                // `last_snapshot` / `last_reason` in health --json vary between
+                // `null` (sampler has not fired) and a populated value once it
+                // has. Fold the benign live shapes to a sentinel *here*, after
+                // the `response_schemas` / JSON-schema guard, so a schema
+                // property that shares the name is untouched and nested objects
+                // are handled by the parsed JSON tree, not a `[^}]*` text
+                // regex. Non-null/non-object `last_snapshot` and
+                // non-null/non-string `last_reason` shapes are left visible:
+                // they are contract drift, not sampler timing, and must fail
+                // the golden rather than being swallowed.
+                if key == "last_snapshot" {
+                    if child.is_null() || child.is_object() {
+                        *child = json!("[LIVE_SAMPLE]");
+                    }
+                    continue;
+                }
+                if key == "last_reason" {
+                    if child.is_null() || child.is_string() {
+                        *child = json!("[LIVE_SAMPLE]");
+                    }
+                    continue;
+                }
+
                 if redact_result_content && key == "content" && child.is_string() {
                     *child = json!("[RESULT_CONTENT]");
                     continue;
@@ -571,6 +594,142 @@ fn live_value_scrubbing_normalizes_runtime_objects_with_type_fields() {
 }
 
 #[test]
+fn scrub_nested_last_snapshot_preserves_schema() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    // `response_schemas` defines the health payload; its `last_snapshot`
+    // property is a *nested* schema object that shares the live field name.
+    // Scrubbing folds only the live sample, never the schema definition, and
+    // must not tear nested JSON apart while doing so.
+    let input = serde_json::to_string_pretty(&json!({
+        "response_schemas": {
+            "health": {
+                "type": "object",
+                "properties": {
+                    "last_snapshot": {
+                        "type": "object",
+                        "properties": {
+                            "load_per_core": { "type": "number" },
+                            "topology": {
+                                "type": "object",
+                                "properties": {
+                                    "logical_cpus": { "type": "integer" }
+                                }
+                            }
+                        }
+                    },
+                    "last_reason": { "type": "string" }
+                }
+            }
+        },
+        "state": {
+            "watchdog": {
+                "last_snapshot": {
+                    "load_per_core": 0.5,
+                    "topology": { "logical_cpus": 999 }
+                },
+                "last_reason": null
+            }
+        }
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value =
+        serde_json::from_str(&scrubbed).expect("scrubbed fixture must be valid JSON");
+
+    // The schema definition inside `response_schemas` survives untouched.
+    let schema = &scrubbed["response_schemas"]["health"]["properties"]["last_snapshot"];
+    assert_eq!(schema["type"], "object");
+    assert_eq!(
+        schema["properties"]["topology"]["properties"]["logical_cpus"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        scrubbed["response_schemas"]["health"]["properties"]["last_reason"]["type"],
+        "string"
+    );
+
+    // The live watchdog sample folds to the sentinel.
+    assert_eq!(
+        scrubbed["state"]["watchdog"]["last_snapshot"],
+        "[LIVE_SAMPLE]"
+    );
+    assert_eq!(
+        scrubbed["state"]["watchdog"]["last_reason"],
+        "[LIVE_SAMPLE]"
+    );
+}
+
+#[test]
+fn scrub_live_last_sample_nested_and_null() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    // A runtime sample with a *nested* `last_snapshot` object and a `null`
+    // `last_reason` (sampler has not fired yet). Both fold to the sentinel
+    // without disturbing sibling fields.
+    let input = serde_json::to_string_pretty(&json!({
+        "state": {
+            "topology_class": "single_socket",
+            "watchdog": {
+                "last_snapshot": {
+                    "load_per_core": 0.25,
+                    "mem": { "available_bytes": 123456 }
+                },
+                "last_reason": null,
+                "healthy_streak": 7
+            }
+        }
+    }))
+    .expect("serialize fixture");
+
+    let scrubbed = scrub_robot_json(&input, test_home.path());
+    let scrubbed: Value =
+        serde_json::from_str(&scrubbed).expect("scrubbed fixture must be valid JSON");
+
+    // Both `last_snapshot` (nested object) and `last_reason` (null) fold.
+    assert_eq!(
+        scrubbed["state"]["watchdog"]["last_snapshot"],
+        "[LIVE_SAMPLE]"
+    );
+    assert_eq!(
+        scrubbed["state"]["watchdog"]["last_reason"],
+        "[LIVE_SAMPLE]"
+    );
+    // Sibling fields keep their (normalized) values.
+    assert_eq!(
+        scrubbed["state"]["topology_class"],
+        "many_core_single_socket"
+    );
+    assert_eq!(
+        scrubbed["state"]["watchdog"]["healthy_streak"],
+        "[LIVE_COUNTER]"
+    );
+}
+
+#[test]
+#[should_panic(expected = "is not valid JSON")]
+fn contract_golden_rejects_invalid_json() {
+    // The two full-contract JSON goldens must be complete JSON objects. A
+    // malformed capture must fail at the legality gate *before* any
+    // UPDATE_GOLDENS write, so a corrupt capture is never frozen to disk.
+    assert!(
+        std::env::var("UPDATE_GOLDENS").is_err(),
+        "this counterexample must run without UPDATE_GOLDENS so it never rewrites a real golden"
+    );
+    assert_golden("robot/capabilities.json.golden", "{ this is not json ");
+}
+
+#[test]
+#[should_panic(expected = "must be a single JSON object")]
+fn contract_golden_rejects_non_object() {
+    // Valid JSON of the wrong shape (an array) is rejected at the same gate.
+    assert!(
+        std::env::var("UPDATE_GOLDENS").is_err(),
+        "this counterexample must run without UPDATE_GOLDENS so it never rewrites a real golden"
+    );
+    assert_golden("robot/introspect.json.golden", "[1, 2, 3]\n");
+}
+
+#[test]
 fn live_value_scrubbing_redacts_repo_paths_and_result_content() -> Result<(), String> {
     let test_home = tempfile::tempdir().expect("create temp home");
     let repo_root = env!("CARGO_MANIFEST_DIR");
@@ -740,37 +899,11 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
             .to_string();
     }
 
-    // 8. `last_snapshot` + `last_reason` in health --json vary between
-    // `null` (sampler has not yet fired) and a populated object/string
-    // (sampler has fired at least once) depending on timing. The content
-    // of the populated form already has its inner floats scrubbed by
-    // rule 6; the remaining difference is whether the sampler fired. Fold
-    // both forms to a single sentinel so the golden does not race the
-    // sampler timer. We match `null`, a string value, or a `{...}` object
-    // by consuming everything up to the next unescaped `"..."` key at the
-    // same indentation — kept narrow so the scrub only fires on the
-    // health watchdog block.
-    //
-    // The object form is multi-line pretty-printed JSON; `(?s)` enables
-    // `.` to match newlines. Non-greedy match `.*?` stops at the first
-    // closing `}` on its own line at the correct indent. We rely on the
-    // outer scrub-then-compare discipline: any false-positive collapse
-    // would still fail the golden because the sentinel would differ
-    // between runs — the goal is deterministic scrubbing, not semantic
-    // parsing.
-    let last_snapshot_obj_re = regex::Regex::new(r#"(?s)"last_snapshot"\s*:\s*\{[^}]*\}"#).unwrap();
-    out = last_snapshot_obj_re
-        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
-        .to_string();
-    let last_snapshot_null_re = regex::Regex::new(r#""last_snapshot"\s*:\s*null"#).unwrap();
-    out = last_snapshot_null_re
-        .replace_all(&out, r#""last_snapshot": "[LIVE_SAMPLE]""#)
-        .to_string();
-
-    let last_reason_re = regex::Regex::new(r#""last_reason"\s*:\s*(null|"[^"]*")"#).unwrap();
-    out = last_reason_re
-        .replace_all(&out, r#""last_reason": "[LIVE_SAMPLE]""#)
-        .to_string();
+    // 8. `last_snapshot` / `last_reason` folding now lives in
+    //    `normalize_live_robot_values`, after its `response_schemas` /
+    //    JSON-schema guard. Doing it on the parsed JSON tree (rather than a
+    //    `[^}]*` text regex) preserves nested schema objects and cannot
+    //    corrupt the document.
 
     // Resource policy status reports include host-live CPU and memory budgets.
     // The shape is contractual; the sampled worker/byte counts are not.
@@ -831,6 +964,28 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
 /// Compare `actual` against the golden at `tests/golden/<name>`. Writes /
 /// overwrites the golden when `UPDATE_GOLDENS=1` is set in the env.
 fn assert_golden(name: &str, actual: &str) {
+    // The two full-contract JSON goldens must be a complete, single JSON
+    // object. Enforce that before any UPDATE_GOLDENS write or text compare, so
+    // a truncated or malformed capture can never be frozen to disk, and a
+    // corrupt golden can never be silently compared against a same-shaped
+    // corrupt capture.
+    if matches!(
+        name,
+        "robot/capabilities.json.golden" | "robot/introspect.json.golden"
+    ) {
+        match serde_json::from_str::<Value>(actual) {
+            Ok(Value::Object(_)) => {}
+            Ok(_) => panic!(
+                "GOLDEN CONTRACT VIOLATION: {} capture must be a single JSON object",
+                name
+            ),
+            Err(err) => panic!(
+                "GOLDEN CONTRACT VIOLATION: {} capture is not valid JSON: {err}",
+                name
+            ),
+        }
+    }
+
     let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("golden")
@@ -1635,11 +1790,33 @@ fn introspect_json_matches_golden() {
     // swapped for BTreeMap in the same commit that re-enabled this test;
     // byte-identical output is now verified across independent runs.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &["introspect", "--json"],
-        ExpectStatus::ExitOk,
+    let output = cass_cmd(test_home.path())
+        .args(["introspect", "--json"])
+        .output()
+        .unwrap_or_else(|err| panic!("run cass introspect --json: {err}"));
+    assert!(
+        output.status.success(),
+        "cass introspect --json exited non-zero: status={:?}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
     );
+    let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
+    let before: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|err| panic!("cass introspect --json stdout is not JSON: {err}"));
+    let canonical = serde_json::to_string_pretty(&before).expect("pretty-print JSON");
+    let scrubbed = scrub_robot_json(&canonical, test_home.path());
+
+    // Scrubbing normalizes live values but must not touch the machine
+    // contract: `response_schemas` stays semantically identical before and
+    // after, and the scrubbed capture stays a complete JSON object.
+    let after: Value =
+        serde_json::from_str(&scrubbed).expect("scrubbed introspect capture must be valid JSON");
+    assert_eq!(
+        before.get("response_schemas"),
+        after.get("response_schemas"),
+        "scrub_robot_json must preserve introspect response_schemas semantics",
+    );
+
     assert_golden("robot/introspect.json.golden", &scrubbed);
 }
 
@@ -1869,7 +2046,7 @@ fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
             "search",
             "hello",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "2",
             "--data-dir",
             data_dir.to_str().expect("utf8 path"),
@@ -1901,7 +2078,7 @@ fn search_robot_shape_matches_golden() -> Result<(), Box<dyn Error>> {
             "search",
             "hello",
             "--json",
-            "--limit",
+            "--rrf-limit",
             "2",
             "--data-dir",
             data_dir.to_str().expect("utf8 path"),

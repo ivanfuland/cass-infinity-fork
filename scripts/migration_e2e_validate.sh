@@ -313,7 +313,7 @@ results = []
 
 for i, b in enumerate(baseline):
     q = b["query"]
-    proc = subprocess.run([cass, "search", q, "--limit", "10", "--json"], capture_output=True, text=True)
+    proc = subprocess.run([cass, "search", q, "--rrf-limit", "10", "--json"], capture_output=True, text=True)
     if proc.returncode != 0:
         print(f"FAIL query_{i+1}: search returned error")
         all_ok = False
@@ -373,7 +373,7 @@ if [[ -f "$CASS_BINARY" ]]; then
 
     # Verify NormalizedConversation type compatibility by checking the cass search output
     # parses correctly (JSON serialization hasn't changed)
-    COMPAT_OUT=$("$CASS_BINARY" search "test" --limit 1 --json 2>/dev/null || true)
+    COMPAT_OUT=$("$CASS_BINARY" search "test" --rrf-limit 1 --json 2>/dev/null || true)
     if echo "$COMPAT_OUT" | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'hits' in d or 'count' in d" 2>/dev/null; then
         pass "JSON serialization: search output schema intact"
     else
