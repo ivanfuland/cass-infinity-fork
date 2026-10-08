@@ -136,6 +136,51 @@ impl RegressionIoContext {
             .map_err(|_| anyhow::anyhow!("regression_connection_poisoned"))
     }
 
+    /// Stream the physical input identity; a metadata stamp alone is insufficient.
+    pub(crate) fn database_digest(&self) -> Result<[u8; 32]> {
+        self.verify_input()?;
+        let mut input = File::open(&self.database)?;
+        let opened = input.metadata()?;
+        let current = fs::metadata(&self.database)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if (opened.dev(), opened.ino()) != (current.dev(), current.ino()) {
+                bail!("regression_input_changed");
+            }
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut bytes = 0u64;
+        loop {
+            let length = input.read(&mut buffer)?;
+            if length == 0 {
+                break;
+            }
+            digest.update(&buffer[..length]);
+            bytes = bytes
+                .checked_add(length as u64)
+                .context("regression_input_size_overflow")?;
+        }
+        let finished = input.metadata()?;
+        self.verify_input()?;
+        if bytes != self.input_stamp.size
+            || opened.len() != finished.len()
+            || opened.modified()? != finished.modified()?
+        {
+            bail!("regression_input_changed");
+        }
+        Ok(digest.finalize().into())
+    }
+
+    /// The expected value must come from the caller's separately approved binding.
+    pub(crate) fn verify_database_digest(&self, expected: &[u8; 32]) -> Result<()> {
+        if &self.database_digest()? != expected {
+            bail!("regression_database_digest_mismatch");
+        }
+        Ok(())
+    }
+
     pub(crate) fn lexical_statistics(&self) -> Result<LexicalCorpusStats> {
         self.verify_input()?;
         let connection = self.connection()?;
@@ -338,6 +383,44 @@ mod tests {
     }
 
     #[test]
+    fn physical_binding_refuses_wrong_external_digest() {
+        let (_root, db, run) = fixture("one");
+        let expected: [u8; 32] = Sha256::digest(fs::read(&db).unwrap()).into();
+        let context = RegressionIoContext::open(&db, &run).unwrap();
+        context.verify_database_digest(&expected).unwrap();
+        let mut wrong = expected;
+        wrong[0] ^= 1;
+        let error = context.verify_database_digest(&wrong).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("regression_database_digest_mismatch")
+        );
+        assert!(fs::read_dir(run).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn physical_binding_detects_content_change_with_identical_stamp() {
+        let (_root, db, run) = fixture("one");
+        let expected: [u8; 32] = Sha256::digest(fs::read(&db).unwrap()).into();
+        let modified = fs::metadata(&db).unwrap().modified().unwrap();
+        let context = RegressionIoContext::open(&db, &run).unwrap();
+        let mut changed = fs::read(&db).unwrap();
+        *changed.last_mut().unwrap() ^= 1;
+        fs::write(&db, changed).unwrap();
+        File::options()
+            .write(true)
+            .open(&db)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        // Size, inode and mtime are deliberately identical. Only the physical
+        // digest is allowed to establish the caller's expected content.
+        context.verify_input().unwrap();
+        assert!(context.verify_database_digest(&expected).is_err());
+    }
+
+    #[test]
     fn each_context_ignores_poisoned_input_stats_cache() {
         let (_a, a, arun) = fixture("one");
         let (_b, b, brun) = fixture("one two three four");
@@ -407,6 +490,8 @@ mod tests {
         let run = std::env::var_os("CASS_REGRESSION_IO_CHILD_RUN").unwrap();
         let context = RegressionIoContext::open(Path::new(&db), Path::new(&run)).unwrap();
         assert_eq!(context.lexical_statistics().unwrap().total_docs, 1);
+        let expected: [u8; 32] = Sha256::digest(fs::read(Path::new(&db)).unwrap()).into();
+        context.verify_database_digest(&expected).unwrap();
         assert!(
             context
                 .connection()
