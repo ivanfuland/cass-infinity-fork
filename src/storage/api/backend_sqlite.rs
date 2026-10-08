@@ -37,6 +37,23 @@ impl SqliteBackend {
         Ok(Self { conn: Some(conn) })
     }
 
+    /// Only for a frozen input whose maintenance lease and WAL=0 have
+    /// already been checked. Do not use this path for live databases.
+    pub(crate) fn open_frozen_read_only(path: &std::path::Path) -> Result<Self, StorageError> {
+        let mut uri = url::Url::from_file_path(path).map_err(|_| StorageError::Other {
+            code: None,
+            detail: "frozen database path must be absolute".into(),
+        })?;
+        uri.query_pairs_mut().append_pair("mode", "ro").append_pair("immutable", "1");
+        super::ensure_vec0_extension_registered();
+        let conn = rusqlite::Connection::open_with_flags(
+            uri.as_str(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ).map_err(map_sqlite_err)?;
+        apply_profile(&conn, Profile::ReadOnly)?;
+        Ok(Self { conn: Some(conn) })
+    }
+
     pub(crate) fn open_memory() -> Result<Self, StorageError> {
         super::ensure_vec0_extension_registered();
         let conn = rusqlite::Connection::open_in_memory().map_err(map_sqlite_err)?;

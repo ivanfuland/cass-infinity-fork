@@ -291,9 +291,9 @@ type TantivyContentExactKey = (i64, i64);
 /// W2-5 Task2: `lex_docs` corpus-wide stats the BM25F reranker needs
 /// (design doc ②). `total_docs` doubles as `N` in the IDF formula.
 #[derive(Clone, Copy)]
-struct LexicalCorpusStats {
-    total_docs: u64,
-    avgdl: FieldAvgdl,
+pub(crate) struct LexicalCorpusStats {
+    pub(crate) total_docs: u64,
+    pub(crate) avgdl: FieldAvgdl,
 }
 
 type SqliteFtsMessageRow = (
@@ -5618,7 +5618,7 @@ impl SearchClient {
     /// uses (`lexical_rerank::tokenize`), accumulating per-field token-count
     /// sums to compute avgdl. Genuinely a full-corpus operation -- there is
     /// no cheaper exact way to get avgdl in tokens (see design doc ②).
-    fn compute_lexical_corpus_stats(conn: &SendConnection) -> Result<LexicalCorpusStats> {
+    pub(crate) fn compute_lexical_corpus_stats(conn: &Connection) -> Result<LexicalCorpusStats> {
         const SCAN_CHUNK: i64 = 20_000;
         let mut total_docs: u64 = 0;
         let mut content_token_sum: u64 = 0;
