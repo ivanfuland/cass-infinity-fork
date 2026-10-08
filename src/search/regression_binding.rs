@@ -353,7 +353,7 @@ pub(crate) fn verify_expected(expected: &InputBinding, actual: &InputBinding) ->
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::storage::api::{Conn, Profile};
 
@@ -478,7 +478,7 @@ mod tests {
         verify_expected(&expected, &actual).unwrap();
     }
 
-    fn searchable_fixture() -> (
+    pub(crate) fn searchable_fixture() -> (
         tempfile::TempDir,
         std::path::PathBuf,
         std::path::PathBuf,
@@ -549,7 +549,11 @@ mod tests {
         (root, db, run, manifest)
     }
 
-    fn prepare_expected(root: &Path, db: &Path, manifest: &Path) -> (std::path::PathBuf, String) {
+    pub(crate) fn prepare_expected(
+        root: &Path,
+        db: &Path,
+        manifest: &Path,
+    ) -> (std::path::PathBuf, String) {
         use std::os::unix::fs::PermissionsExt;
         let inspection = root.join("inspection");
         fs::create_dir(&inspection).unwrap();
