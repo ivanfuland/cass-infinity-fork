@@ -114,6 +114,19 @@ impl RegressionIoContext {
         })
     }
 
+    pub(crate) fn database(&self) -> &Path {
+        &self.database
+    }
+
+    /// The caller must retain this context for the lifetime of the connection.
+    pub(crate) fn open_connection(&self) -> Result<Conn> {
+        self.verify_input()?;
+        let connection = Conn::open_frozen_read(&self.database)?;
+        ensure_readonly_schema_current(&connection)?;
+        self.verify_input()?;
+        Ok(connection)
+    }
+
     pub(crate) fn connection(&self) -> Result<MutexGuard<'_, SendFrankenConnection>> {
         self.verify_input()?;
         self.connection

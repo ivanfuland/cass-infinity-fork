@@ -2480,6 +2480,8 @@ pub struct SearchClient {
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
+    // Drop the search connection before releasing the frozen-input lease.
+    regression: Option<Arc<super::regression_io::RegressionIoContext>>,
 }
 
 /// Vector candidate strategy, independently of lexical/semantic/hybrid intent.
@@ -3278,11 +3280,26 @@ impl SearchClient {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics,
             cache_namespace,
             semantic: Mutex::new(None),
         }))
+    }
+
+    pub(crate) fn open_for_regression(
+        index_path: &Path,
+        context: Arc<super::regression_io::RegressionIoContext>,
+    ) -> Result<Self> {
+        context.verify_input()?;
+        let mut client = Self::open(index_path, Some(context.database()))?
+            .context("regression_database_unavailable")?;
+        client.regression = Some(context);
+        // Admission opens the actual search handle now; errors cannot become
+        // a missing backend on the first request.
+        drop(client.sqlite_guard()?);
+        Ok(client)
     }
 
     pub fn with_vector_search_mode(mut self, mode: VectorSearchMode) -> Self {
@@ -3295,6 +3312,14 @@ impl SearchClient {
             .sqlite
             .lock()
             .map_err(|_| anyhow!("sqlite lock poisoned"))?;
+
+        if let Some(context) = &self.regression {
+            context.verify_input()?;
+            if guard.is_none() {
+                *guard = Some(SendConnection(context.open_connection()?));
+            }
+            return Ok(guard);
+        }
 
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
@@ -3387,6 +3412,9 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        if let Some(context) = &self.regression {
+            context.verify_input()?;
+        }
         // NFC-normalize early so every downstream consumer (Tantivy query
         // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
         // matching the NFC-indexed content.
@@ -3401,7 +3429,9 @@ impl SearchClient {
             limit
         };
         let can_use_cache =
-            field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
+            self.regression.is_none()
+                && field_mask.allows_cache()
+                && (field_mask.needs_content() || field_mask.wants_snippet());
 
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
         // Only use cache for simple queries (no wildcards, no boolean operators) because
@@ -5563,6 +5593,9 @@ impl SearchClient {
     /// changes corpus composition should ideally refresh it; deleting the
     /// sidecar file forces a fresh computation until that wiring exists.
     fn lexical_corpus_stats(&self, conn: &SendConnection) -> Result<LexicalCorpusStats> {
+        if let Some(context) = &self.regression {
+            return context.lexical_statistics();
+        }
         static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<LexicalCorpusStats>>> =
             std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
@@ -6856,7 +6889,7 @@ impl SearchClient {
     }
 
     fn put_cache(&self, query: &str, filters: &SearchFilters, hits: &[SearchHit]) {
-        if query.is_empty() || hits.is_empty() {
+        if self.regression.is_some() || query.is_empty() || hits.is_empty() {
             return;
         }
         if let Ok(mut cache) = self.prefix_cache.lock() {
@@ -8067,6 +8100,125 @@ mod tests {
         Ok((dir, db_path))
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_search_isolated_child() -> Result<()> {
+        let Some(database) = std::env::var_os("CASS_REGRESSION_SEARCH_DB") else {
+            return Ok(());
+        };
+        let db = PathBuf::from(database);
+        let run = PathBuf::from(std::env::var_os("CASS_REGRESSION_SEARCH_RUN").unwrap());
+        // Populate the real ordinary-search OnceLock in this isolated process.
+        let other = PathBuf::from(std::env::var_os("CASS_REGRESSION_SEARCH_OTHER_DB").unwrap());
+        let ordinary = SearchClient::open(&run, Some(&other))?.unwrap();
+        let conn = SendConnection(Connection::open_frozen_read(&other)?);
+        assert_eq!(ordinary.lexical_corpus_stats(&conn)?.total_docs, 999);
+        let context = Arc::new(super::super::regression_io::RegressionIoContext::open(
+            &db, &run,
+        )?);
+        let client = SearchClient::open_for_regression(&run, context.clone())?;
+        let guard = client.sqlite_guard()?;
+        let stats = client.lexical_corpus_stats(guard.as_ref().unwrap())?;
+        assert_eq!(stats.total_docs, 1);
+        assert_eq!(stats.avgdl.content, 3.0);
+        drop(guard);
+        for _ in 0..2 {
+            let hits = client.search(
+                "regression",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )?;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].content, "regression search evidence");
+        }
+        assert_eq!(client.cache_stats().cache_hits, 0);
+        assert_eq!(ordinary.lexical_corpus_stats(&conn)?.total_docs, 999);
+        println!("REGRESSION_SEARCH_READONLY_VERIFIED");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_search_uses_frozen_handle_and_fresh_stats() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("evidence".into()),
+            workspace: None,
+            source_path: "synthetic.jsonl".into(),
+            started_at: Some(1),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1),
+                content: "regression search evidence".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: vec![],
+            }],
+        };
+        let (input, original) = seed_conversations_for_search_client(&[conv])?;
+        {
+            let writer = crate::storage::testing::open_writable_for_tests(
+                &original,
+                crate::storage::api::Profile::Production,
+            )?;
+            writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        }
+        let db = input.path().join("agent_search.db");
+        std::fs::rename(original, &db)?;
+        std::fs::create_dir_all(input.path().join("doctor/locks"))?;
+        std::fs::File::create(input.path().join("doctor/locks/doctor-repair.lock"))?;
+        let other = TempDir::new()?;
+        let other_db = other.path().join("agent_search.db");
+        std::fs::copy(&db, &other_db)?;
+        std::fs::write(
+            other.path().join(".lexical-avgdl-cache.json"),
+            r#"{"total_docs":999,"avgdl_content":999,"avgdl_title":999}"#,
+        )?;
+        std::fs::write(
+            input.path().join(".lexical-avgdl-cache.json"),
+            r#"{"total_docs":888,"avgdl_content":888,"avgdl_title":888}"#,
+        )?;
+        let run = TempDir::new()?;
+        std::fs::set_permissions(run.path(), std::fs::Permissions::from_mode(0o700))?;
+        let before = std::fs::read(&db)?;
+        let output = std::process::Command::new("/usr/bin/bwrap")
+            .args(["--ro-bind", "/", "/", "--bind"])
+            .arg(run.path())
+            .arg(run.path())
+            .args(["--unshare-net", "--proc", "/proc", "--dev", "/dev"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "search::query::tests::regression_search_isolated_child",
+                "--nocapture",
+            ])
+            .env("CASS_REGRESSION_SEARCH_DB", &db)
+            .env("CASS_REGRESSION_SEARCH_OTHER_DB", &other_db)
+            .env("CASS_REGRESSION_SEARCH_RUN", run.path())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("REGRESSION_SEARCH_READONLY_VERIFIED")
+        );
+        assert_eq!(std::fs::read(&db)?, before);
+        assert!(!input.path().join("agent_search.db-wal").exists());
+        assert!(!input.path().join("agent_search.db-shm").exists());
+        Ok(())
+    }
+
     // ==========================================================================
     // StringInterner Tests (Opt 2.3)
     // ==========================================================================
@@ -8627,6 +8779,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -8670,6 +8823,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9184,6 +9338,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9247,6 +9402,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9328,6 +9484,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9411,6 +9568,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9541,6 +9699,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9662,6 +9821,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9728,6 +9888,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9829,6 +9990,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9914,6 +10076,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10039,6 +10202,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10100,6 +10264,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10185,6 +10350,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10262,6 +10428,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10329,6 +10496,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10410,6 +10578,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10438,6 +10607,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10490,6 +10660,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10521,6 +10692,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10740,6 +10912,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -12096,6 +12269,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
@@ -12179,6 +12353,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
@@ -12216,6 +12391,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
@@ -13020,6 +13196,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -13859,6 +14036,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -13890,6 +14068,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
