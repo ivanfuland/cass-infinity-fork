@@ -60,6 +60,7 @@ pub(crate) struct RegressionIoContext {
     database: PathBuf,
     input_stamp: InputStamp,
     run_root: PathBuf,
+    index_run: Mutex<Option<IndexRunLease>>,
     _maintenance_lock: File,
 }
 
@@ -112,6 +113,7 @@ impl RegressionIoContext {
             database: database.to_path_buf(),
             input_stamp,
             run_root: run_root.to_path_buf(),
+            index_run: Mutex::new(None),
             _maintenance_lock: maintenance_lock,
         })
     }
@@ -223,11 +225,52 @@ impl RegressionIoContext {
         Ok(())
     }
 
+    /// Hold the existing index-run shared lock, without stale-record reaping.
+    /// Missing locks are observed as absent and never created here.
+    pub(crate) fn admit_index_run(&self) -> Result<()> {
+        let mut guard = self
+            .index_run
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INDEX_RUN_GUARD_POISONED"))?;
+        if guard.is_none() {
+            let path = super::asset_state::index_run_lock_path(
+                self.database.parent().context("regression_input_parent")?,
+            );
+            let file = match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.file_type().is_symlink() {
+                        bail!("INDEX_RUN_LOCK_NOT_REGULAR");
+                    }
+                    let file = File::open(&path)?;
+                    fs2::FileExt::try_lock_shared(&file).context("INDEX_RUN_MAINTENANCE_ACTIVE")?;
+                    Some(file)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).context("INDEX_RUN_LOCK_UNAVAILABLE"),
+            };
+            let lease = IndexRunLease { path, file };
+            lease.verify()?;
+            *guard = Some(lease);
+        }
+        guard
+            .as_ref()
+            .context("INDEX_RUN_GUARD_UNAVAILABLE")?
+            .verify()
+    }
+
     pub(crate) fn run_root(&self) -> &Path {
         &self.run_root
     }
 
     pub(crate) fn verify_input(&self) -> Result<()> {
+        if let Some(lease) = self
+            .index_run
+            .lock()
+            .map_err(|_| anyhow::anyhow!("INDEX_RUN_GUARD_POISONED"))?
+            .as_ref()
+        {
+            lease.verify()?;
+        }
         verify_lock_identity(
             &self._maintenance_lock,
             &self
@@ -239,6 +282,38 @@ impl RegressionIoContext {
         ensure_no_wal(&self.database)?;
         if InputStamp::capture(&self.database)? != self.input_stamp {
             bail!("regression_input_changed");
+        }
+        Ok(())
+    }
+}
+
+struct IndexRunLease {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl IndexRunLease {
+    fn verify(&self) -> Result<()> {
+        match &self.file {
+            Some(file) => {
+                verify_lock_identity(file, &self.path).context("INDEX_RUN_LOCK_CHANGED")?;
+                if file.metadata()?.len() != 0 {
+                    bail!("INDEX_RUN_STATE_REQUIRES_RECOVERY");
+                }
+            }
+            None => match fs::symlink_metadata(&self.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => bail!("INDEX_RUN_LOCK_CHANGED"),
+            },
+        }
+        let sidecar = super::asset_state::index_run_lock_metadata_sidecar_path(&self.path);
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() == 0 => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("INDEX_RUN_STATE_REQUIRES_RECOVERY"),
         }
         Ok(())
     }

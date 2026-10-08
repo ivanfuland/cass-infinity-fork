@@ -288,9 +288,16 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+pub use search::regression_input::RegressionInputCommand;
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
+    /// Inspect or verify frozen retrieval regression inputs without repair.
+    RegressionInput {
+        #[command(subcommand)]
+        action: RegressionInputCommand,
+    },
     /// Launch interactive TUI
     Tui {
         /// Render once and exit (headless-friendly)
@@ -6886,6 +6893,16 @@ async fn execute_cli(
     let filter = build_robot_aware_log_filter(robot_mode, cli.verbose, cli.quiet);
 
     match &command {
+        Commands::RegressionInput { action } => {
+            search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
+                .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+            let result = search::regression_input::run(action).map_err(|error| CliError {
+                code: 2, kind: CliErrorKind::Usage.kind_str(),
+                message: search::regression_input::error_code(&error).to_string(),
+                hint: None, retryable: false,
+            })?;
+            println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
+        }
         Commands::Tui { data_dir, .. } => {
             let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
             std::fs::create_dir_all(&log_dir).ok();
@@ -21082,6 +21099,7 @@ fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path)
 
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
+        Some(Commands::RegressionInput { .. }) => "regression-input".to_string(),
         Some(Commands::Tui { .. }) => "tui".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
         Some(Commands::Sync { .. }) => "sync".to_string(),
@@ -21405,6 +21423,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Expand { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::RegressionInput { .. } => true,
         Commands::Doctor { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Timeline { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()

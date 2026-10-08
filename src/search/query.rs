@@ -4037,6 +4037,20 @@ impl SearchClient {
         database_path: Option<&Path>,
         strategy: VectorSearchMode,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
+            fetch_limit, database_path, strategy, None)
+    }
+
+    fn search_db_vector_domain_with_context(
+        conn: &Connection,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        default_roles: Option<&HashSet<u8>>,
+        fetch_limit: usize,
+        database_path: Option<&Path>,
+        strategy: VectorSearchMode,
+        regression: Option<&super::regression_io::RegressionIoContext>,
+    ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         // R1-W3-B6/N1/B9 (inherited from the retired v4 path, still true
         // of this vec0 build): sqlite-vec's vec0 KNN implementation hard-
         // rejects `k > 4096` as a genuine `SQLITE_ERROR`, not a silent
@@ -4163,7 +4177,14 @@ impl SearchClient {
                 });
                 let query = vector_domain::quantize_unit_int8(conn, embedding)?;
                 let path = database_path.ok_or_else(|| StorageError::Other { code: None, detail: "fast vector search requires a file-backed database".into() })?;
-                match vector_domain::parallel_int8_candidates(path, &snapshot, &query, k)? {
+                let pool = if let Some(context) = regression {
+                    vector_domain::parallel_int8_candidates_with_connections(&snapshot, &query, k, || {
+                        context.open_connection().map_err(crate::storage::sqlite::anyhow_error_into_storage_error)
+                    })?
+                } else {
+                    vector_domain::parallel_int8_candidates(path, &snapshot, &query, k)?
+                };
+                match pool {
                     Int8Candidates::Matching { rows, corpus_rows } => {
                         if corpus_rows != row_count_usize {
                             return Err(StorageError::Other { code: None, detail: "vector mirror damaged: int8 corpus count mismatch".into() });
@@ -4499,17 +4520,17 @@ impl SearchClient {
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("db vector domain search requires a database connection"))?;
-        let result = if self.vector_search_mode == VectorSearchMode::Exact {
-            Self::search_db_vector_domain(
-            conn,
-            embedding,
-            filters,
-            default_roles,
-            fetch_limit,
-            )
+        if let Some(context) = &self.regression { context.verify_input()?; }
+        let result = if let Some(context) = self.regression.as_deref() {
+            Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
+                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode, Some(context))
+        } else if self.vector_search_mode == VectorSearchMode::Exact {
+            Self::search_db_vector_domain(conn, embedding, filters, default_roles, fetch_limit)
         } else {
-            Self::search_db_vector_domain_with_mode(conn, embedding, filters, default_roles, fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode)
+            Self::search_db_vector_domain_with_mode(conn, embedding, filters, default_roles,
+                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode)
         };
+        if let Some(context) = &self.regression { context.verify_input()?; }
         if result.as_ref().err().is_some_and(|e| e.to_string().contains("vector_database_changed")) {
             *sqlite_guard = None;
         }
@@ -6989,7 +7010,7 @@ impl SearchClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -8084,7 +8105,7 @@ mod tests {
     /// `fts_lex` (the new primary lexical backend `client.search()`
     /// actually reads, not the legacy `fts_messages` fallback) come out
     /// populated the same way a real index run would populate them.
-    fn seed_conversations_for_search_client(
+    pub(crate) fn seed_conversations_for_search_client(
         conversations: &[NormalizedConversation],
     ) -> Result<(TempDir, PathBuf)> {
         let dir = TempDir::new()?;

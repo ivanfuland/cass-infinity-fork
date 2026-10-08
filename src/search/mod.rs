@@ -65,6 +65,8 @@ pub(crate) mod regression_io;
 pub(crate) mod regression_inventory;
 pub(crate) mod regression_layout;
 pub(crate) mod regression_chunks;
+pub(crate) mod regression_binding;
+pub(crate) mod regression_input;
 pub mod rerank;
 pub mod reranker;
 pub mod reranker_registry;
