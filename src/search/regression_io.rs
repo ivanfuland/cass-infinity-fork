@@ -118,6 +118,18 @@ impl RegressionIoContext {
         })
     }
 
+    /// The runner supplies the actual package root before any output is made.
+    pub(crate) fn forbid_output_under(&self, protected_root: &Path) -> Result<()> {
+        let protected = protected_root.canonicalize()?;
+        if !protected.is_dir() {
+            bail!("regression_protected_root_not_directory");
+        }
+        if self.run_root.canonicalize()?.starts_with(protected) {
+            bail!("regression_output_inside_protected_input");
+        }
+        Ok(())
+    }
+
     pub(crate) fn database(&self) -> &Path {
         &self.database
     }
@@ -193,7 +205,7 @@ impl RegressionIoContext {
         if let Some(stats) = *cache {
             return Ok(stats);
         }
-        let stats = SearchClient::compute_lexical_corpus_stats(&connection)?;
+        let stats = SearchClient::compute_regression_lexical_corpus_stats(&connection)?;
         self.verify_input()?;
         self.write_statistics_evidence(stats)?;
         *cache = Some(stats);
@@ -458,6 +470,51 @@ mod tests {
     }
 
     #[test]
+    fn fresh_statistics_include_zero_and_negative_document_ids() {
+        let (_root, db, run) = fixture("one");
+        let writer =
+            crate::storage::testing::open_writable_for_tests(&db, Profile::Production).unwrap();
+        writer.execute_batch("INSERT INTO lex_docs VALUES(0,'one two','zero'); INSERT INTO lex_docs VALUES(-1,'one two three','negative'); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
+        drop(writer);
+        let context = RegressionIoContext::open(&db, &run).unwrap();
+        let stats = context.lexical_statistics().unwrap();
+        assert_eq!(stats.total_docs, 3);
+        assert_eq!(stats.avgdl.content, 2.0);
+        let normal =
+            SearchClient::compute_lexical_corpus_stats(&context.connection().unwrap()).unwrap();
+        assert_eq!(normal.total_docs, 1);
+    }
+
+    #[test]
+    fn rejects_repository_and_actual_package_output_roots_before_writing() {
+        let (root, db, run) = fixture("one");
+        let context = RegressionIoContext::open(&db, &run).unwrap();
+        let package = root.path().join("question-package");
+        fs::create_dir(&package).unwrap();
+        let nested = package.join("run");
+        fs::create_dir(&nested).unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        let package_context = RegressionIoContext::open(&db, &nested).unwrap();
+        assert!(package_context.forbid_output_under(&package).is_err());
+        assert!(fs::read_dir(&nested).unwrap().next().is_none());
+        context.forbid_output_under(&package).unwrap();
+        let repo = root.path().join("synthetic-repo");
+        fs::create_dir(&repo).unwrap();
+        File::create(repo.join(".git")).unwrap();
+        let output = repo.join("run");
+        fs::create_dir(&output).unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            RegressionIoContext::open(&db, &output)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("regression_output_inside_repository")
+        );
+        assert!(fs::read_dir(&output).unwrap().next().is_none());
+    }
+
+    #[test]
     fn physical_binding_refuses_wrong_external_digest() {
         let (_root, db, run) = fixture("one");
         let expected: [u8; 32] = Sha256::digest(fs::read(&db).unwrap()).into();
@@ -677,6 +734,13 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
 
 pub(crate) fn validate_private_run_root(path: &Path) -> Result<()> {
     reject_symlink_components(path)?;
+    for ancestor in path.ancestors() {
+        if fs::symlink_metadata(ancestor.join(".git")).is_ok()
+            || (ancestor.join("HEAD").is_file() && ancestor.join("objects").is_dir())
+        {
+            bail!("regression_output_inside_repository");
+        }
+    }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
         bail!("regression_run_root_not_directory");

@@ -17,6 +17,9 @@ pub struct FrozenInputArgs {
     pub run_root: PathBuf,
     #[arg(long, value_name = "FILE")]
     pub source_manifest: PathBuf,
+    /// Actual private question-package directory; output must be outside it.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub question_pack_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -43,6 +46,7 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<serde_json::Value>
         | RegressionInputCommand::Verify { input, .. } => input,
     };
     let context = Arc::new(RegressionIoContext::open(&input.database, &input.run_root)?);
+    context.forbid_output_under(&input.question_pack_root)?;
     match command {
         RegressionInputCommand::Inspect { .. } => {
             context.admit_index_run()?;
@@ -72,6 +76,11 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<serde_json::Value>
 /// Public CLI errors contain codes, never a query or an underlying SQL value.
 pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
     const CODES: &[&str] = &[
+        "EMPTY_MESSAGE_CORPUS",
+        "regression_output_inside_repository",
+        "regression_output_inside_protected_input",
+        "regression_protected_root_not_directory",
+        "regression_wal_not_finalized",
         "EXPECTED_BINDING_FILE_DIGEST_MISMATCH",
         "EXPECTED_INPUT_BINDING_MISMATCH",
         "EXPECTED_SOURCE_MANIFEST_MISMATCH",
@@ -164,6 +173,8 @@ mod tests {
                     "/private/run",
                     "--source-manifest",
                     "/input/sources.json",
+                    "--question-pack-root",
+                    "/private/question-pack",
                     "--expected-binding",
                     "/approved/input.json",
                     "--expected-sha256",

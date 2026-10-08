@@ -32,47 +32,64 @@ enum Entity {
     Chunk,
 }
 
+struct EntitySql {
+    table: &'static str,
+    id: &'static str,
+    stable_columns: &'static str,
+    select: &'static str,
+    order_name: &'static str,
+    layout_name: &'static str,
+    arity: usize,
+}
+
 impl Entity {
-    fn table(self) -> &'static str {
-        match self {
-            Self::Conversation => "conversations",
-            Self::Message | Self::Lexical => "message_rows",
-            Self::Chunk => "chunk_rows",
-        }
-    }
-    fn id(self) -> &'static str {
-        match self {
-            Self::Conversation => "cid",
-            Self::Message => "mid",
-            Self::Lexical => "lexical",
-            Self::Chunk => "chunk_id",
-        }
-    }
-    fn stable_columns(self) -> &'static str {
-        match self {
-            Self::Conversation => "host,agent,external",
-            Self::Message | Self::Lexical => "host,agent,external,idx",
-            Self::Chunk => "host,agent,external,idx,chunk_idx",
-        }
-    }
-    fn select(self) -> &'static str {
-        match self {
-            Self::Conversation => "host,agent,external,NULL,NULL,cid,NULL",
-            Self::Message => "host,agent,external,idx,NULL,mid,cid",
-            Self::Lexical => "host,agent,external,idx,NULL,lexical,NULL",
-            Self::Chunk => "host,agent,external,idx,chunk_idx,chunk_id,conversation_id",
-        }
-    }
-    fn name(self, layout: bool) -> &'static str {
-        match (self, layout) {
-            (Self::Conversation, false) => "conversation-id-order",
-            (Self::Message, false) => "message-id-order",
-            (Self::Lexical, false) => "lex-doc-order",
-            (Self::Chunk, false) => "chunk-id-order",
-            (Self::Conversation, true) => "conversation-map",
-            (Self::Message, true) => "message-map",
-            (Self::Lexical, true) => "lex-map",
-            (Self::Chunk, true) => "chunk-map",
+    fn sql(self) -> EntitySql {
+        let (table, id, stable_columns, select, order_name, layout_name, arity) = match self {
+            Self::Conversation => (
+                "conversations",
+                "cid",
+                "host,agent,external",
+                "host,agent,external,NULL,NULL,cid,NULL",
+                "conversation-id-order",
+                "conversation-map",
+                3,
+            ),
+            Self::Message => (
+                "message_rows",
+                "mid",
+                "host,agent,external,idx",
+                "host,agent,external,idx,NULL,mid,cid",
+                "message-id-order",
+                "message-map",
+                4,
+            ),
+            Self::Lexical => (
+                "message_rows",
+                "lexical",
+                "host,agent,external,idx",
+                "host,agent,external,idx,NULL,lexical,NULL",
+                "lex-doc-order",
+                "lex-map",
+                4,
+            ),
+            Self::Chunk => (
+                "chunk_rows",
+                "chunk_id",
+                "host,agent,external,idx,chunk_idx",
+                "host,agent,external,idx,chunk_idx,chunk_id,conversation_id",
+                "chunk-id-order",
+                "chunk-map",
+                5,
+            ),
+        };
+        EntitySql {
+            table,
+            id,
+            stable_columns,
+            select,
+            order_name,
+            layout_name,
+            arity,
         }
     }
 }
@@ -172,7 +189,8 @@ fn append_sequence(
     file: &mut File,
     hash: &mut Sha256,
 ) -> Result<u64> {
-    let table = entity.table();
+    let descriptor = entity.sql();
+    let table = descriptor.table;
     let filter = if matches!(entity, Entity::Lexical) {
         "lexical IS NOT NULL"
     } else {
@@ -185,24 +203,23 @@ fn append_sequence(
     )?;
     let count = u64::try_from(count)?;
     let mut header = Vec::new();
-    string(&mut header, entity.name(layout));
+    string(
+        &mut header,
+        if layout {
+            descriptor.layout_name
+        } else {
+            descriptor.order_name
+        },
+    );
     header.extend_from_slice(&count.to_be_bytes());
     append_bytes(file, hash, &header)?;
     let columns = if layout {
-        entity.stable_columns()
+        descriptor.stable_columns
     } else {
-        entity.id()
+        descriptor.id
     };
-    let select = entity.select();
-    let arity = if layout {
-        match entity {
-            Entity::Conversation => 3,
-            Entity::Message | Entity::Lexical => 4,
-            Entity::Chunk => 5,
-        }
-    } else {
-        1
-    };
+    let select = descriptor.select;
+    let arity = if layout { descriptor.arity } else { 1 };
     let placeholders = (1..=arity)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()

@@ -246,6 +246,9 @@ pub(crate) fn open_verified_search(
 }
 
 fn validate_search_admission(context: &RegressionIoContext, binding: &InputBinding) -> Result<()> {
+    if binding.message_count == 0 {
+        bail!("EMPTY_MESSAGE_CORPUS");
+    }
     if binding.generation.audit_status != "passed" {
         bail!("GENERATION_REQUIRES_RECOVERY");
     }
@@ -754,6 +757,37 @@ pub(crate) mod tests {
                 .contains("VERIFIED_FTS_EXACT_FAST_READONLY_SEARCH")
         );
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn empty_message_archive_cannot_receive_verified_search_admission() {
+        let (root, db, run, manifest) = searchable_fixture();
+        let writer = Conn::open_writable(&db, Profile::Production).unwrap();
+        writer
+            .execute_batch(
+                "DELETE FROM messages; DELETE FROM lex_docs; DELETE FROM message_chunks;",
+            )
+            .unwrap();
+        let generation: i64 = writer
+            .query_row_map(
+                "SELECT id FROM embedding_generations WHERE is_active=1",
+                &[],
+                |r| r.get_typed(0),
+            )
+            .unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(&writer, generation, 2)
+            .unwrap();
+        writer.execute_batch("UPDATE embedding_generations SET audit_status='passed'; UPDATE meta SET value='completed:1:0' WHERE key='lex_domain_rebuild_state'; PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
+        drop(writer);
+        let (expected, pin) = prepare_expected(root.path(), &db, &manifest);
+        let context = std::sync::Arc::new(RegressionIoContext::open(&db, &run).unwrap());
+        assert!(
+            open_verified_search(context, &expected, &pin, &manifest)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("EMPTY_MESSAGE_CORPUS")
+        );
     }
 
     #[test]

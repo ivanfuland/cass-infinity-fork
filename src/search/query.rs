@@ -5709,17 +5709,24 @@ impl SearchClient {
     /// sums to compute avgdl. Genuinely a full-corpus operation -- there is
     /// no cheaper exact way to get avgdl in tokens (see design doc ②).
     pub(crate) fn compute_lexical_corpus_stats(conn: &Connection) -> Result<LexicalCorpusStats> {
+        Self::scan_lexical_corpus_stats(conn, Some(0))
+    }
+
+    pub(crate) fn compute_regression_lexical_corpus_stats(conn: &Connection) -> Result<LexicalCorpusStats> {
+        Self::scan_lexical_corpus_stats(conn, None)
+    }
+
+    fn scan_lexical_corpus_stats(conn: &Connection, mut last_doc_id: Option<i64>) -> Result<LexicalCorpusStats> {
         const SCAN_CHUNK: i64 = 20_000;
         let mut total_docs: u64 = 0;
         let mut content_token_sum: u64 = 0;
         let mut title_token_sum: u64 = 0;
-        let mut last_doc_id: i64 = 0;
         loop {
-            let sql = "SELECT doc_id, content, title FROM lex_docs \
-                        WHERE doc_id > ?1 ORDER BY doc_id LIMIT ?2";
+            let predicate = if last_doc_id.is_some() { "doc_id > ?1" } else { "1" };
+            let sql = format!("SELECT doc_id, content, title FROM lex_docs WHERE {predicate} ORDER BY doc_id LIMIT ?2");
             let params = [ParamValue::from(last_doc_id), ParamValue::from(SCAN_CHUNK)];
             let rows: Vec<(i64, String, String)> =
-                franken_query_map_collect_retry(conn, sql, &params, |row| {
+                franken_query_map_collect_retry(conn, &sql, &params, |row| {
                     Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
                 })?;
             if rows.is_empty() {
@@ -5730,7 +5737,7 @@ impl SearchClient {
                 total_docs += 1;
                 content_token_sum += lexical_rerank::tokenize(&content).len() as u64;
                 title_token_sum += lexical_rerank::tokenize(&title).len() as u64;
-                last_doc_id = doc_id;
+                last_doc_id = Some(doc_id);
             }
             if fetched < SCAN_CHUNK as usize {
                 break;
