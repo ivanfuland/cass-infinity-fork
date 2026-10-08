@@ -55,6 +55,11 @@ pub struct OpenRouterBackend {
 }
 
 impl OpenRouterBackend {
+    pub(crate) fn with_request_trace(mut self, trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>) -> Self {
+        self.transport = self.transport.with_trace(trace);
+        self
+    }
+
     /// Build the production adapter for `provider` from the process environment.
     ///
     /// Only `OPENROUTER_API_KEY` is read; no other provider key and no

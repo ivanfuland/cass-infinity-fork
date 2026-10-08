@@ -78,6 +78,11 @@ pub struct BgeBackend {
 }
 
 impl BgeBackend {
+    pub(crate) fn with_request_trace(mut self, trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>) -> Self {
+        self.transport = self.transport.with_trace(trace);
+        self
+    }
+
     /// Validate `origin`, then build the fixed local-only transport.
     ///
     /// This sends no request. It proves `origin` is a bare origin that resolves
