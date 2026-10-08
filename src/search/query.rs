@@ -3414,6 +3414,8 @@ impl SearchClient {
     ) -> Result<Vec<SearchHit>> {
         if let Some(context) = &self.regression {
             context.verify_input()?;
+            // Compute and record corpus statistics before selecting candidates.
+            context.lexical_statistics()?;
         }
         // NFC-normalize early so every downstream consumer (Tantivy query
         // builder, sanitizer, FTS5 fallback) sees consistent Unicode form

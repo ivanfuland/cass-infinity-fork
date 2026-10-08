@@ -2,7 +2,9 @@
 //! Ordinary search keeps its existing connection and cache policies.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
+
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
@@ -146,8 +148,34 @@ impl RegressionIoContext {
         }
         let stats = SearchClient::compute_lexical_corpus_stats(&connection)?;
         self.verify_input()?;
+        self.write_statistics_evidence(stats)?;
         *cache = Some(stats);
         Ok(stats)
+    }
+
+    pub(crate) fn lexical_statistics_digest(&self) -> Result<String> {
+        statistics_digest(self.lexical_statistics()?)
+    }
+
+    fn write_statistics_evidence(&self, stats: LexicalCorpusStats) -> Result<()> {
+        validate_private_run_root(&self.run_root)?;
+        let sha256 = statistics_digest(stats)?;
+        let payload = serde_json::json!({
+            "policy": "regression-fresh-v1",
+            "encoding": "lexical-stats-v1",
+            "total_docs": stats.total_docs,
+            "avgdl_content": stats.avgdl.content,
+            "avgdl_title": stats.avgdl.title,
+            "sha256": sha256,
+        });
+        // NamedTempFile starts private. Never replace an existing evidence file.
+        let mut output = tempfile::NamedTempFile::new_in(&self.run_root)?;
+        serde_json::to_writer(&mut output, &payload)?;
+        output.write_all(b"\n")?;
+        output.as_file().sync_all()?;
+        validate_private_run_root(&self.run_root)?;
+        output.persist_noclobber(self.run_root.join("lexical-stats-v1.json"))?;
+        Ok(())
     }
 
     pub(crate) fn run_root(&self) -> &Path {
@@ -169,6 +197,24 @@ impl RegressionIoContext {
         }
         Ok(())
     }
+}
+
+fn statistics_digest(stats: LexicalCorpusStats) -> Result<String> {
+    if !stats.avgdl.content.is_finite()
+        || !stats.avgdl.title.is_finite()
+        || stats.avgdl.content < 0.0
+        || stats.avgdl.title < 0.0
+    {
+        bail!("regression_statistics_invalid");
+    }
+    let domain = b"lexical-stats-v1";
+    let mut hash = Sha256::new();
+    hash.update((domain.len() as u64).to_be_bytes());
+    hash.update(domain);
+    hash.update(stats.total_docs.to_be_bytes());
+    hash.update(stats.avgdl.content.to_bits().to_be_bytes());
+    hash.update(stats.avgdl.title.to_bits().to_be_bytes());
+    Ok(hex::encode(hash.finalize()))
 }
 
 fn verify_lock_identity(file: &File, path: &Path) -> Result<()> {
@@ -226,6 +272,25 @@ mod tests {
         assert_eq!(stats.total_docs, 1);
         assert_eq!(stats.avgdl.content, 3.0);
         assert_eq!(context.run_root(), run);
+        let evidence = run.join("lexical-stats-v1.json");
+        assert_eq!(
+            fs::metadata(&evidence).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(evidence).unwrap()).unwrap();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&16u64.to_be_bytes());
+        encoded.extend_from_slice(b"lexical-stats-v1");
+        encoded.extend_from_slice(&1u64.to_be_bytes());
+        encoded.extend_from_slice(&3f64.to_be_bytes());
+        encoded.extend_from_slice(&1f64.to_be_bytes());
+        assert_eq!(value["sha256"], hex::encode(Sha256::digest(&encoded)));
+        assert_eq!(
+            context.lexical_statistics_digest().unwrap(),
+            value["sha256"].as_str().unwrap()
+        );
+
         assert_eq!(fs::read(&db).unwrap(), before);
         let writer_lock = File::options()
             .read(true)
@@ -235,6 +300,41 @@ mod tests {
         assert!(fs2::FileExt::try_lock_exclusive(&writer_lock).is_err());
         drop(context);
         fs2::FileExt::try_lock_exclusive(&writer_lock).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_overwrite_statistics_evidence() {
+        let (_root, db, run) = fixture("one");
+        let context = RegressionIoContext::open(&db, &run).unwrap();
+        let evidence = run.join("lexical-stats-v1.json");
+        fs::write(&evidence, b"existing evidence").unwrap();
+        assert!(context.lexical_statistics().is_err());
+        assert_eq!(fs::read(&evidence).unwrap(), b"existing evidence");
+    }
+
+    #[test]
+    fn regression_client_rejects_changed_input_before_candidates() {
+        use std::sync::Arc;
+        let (_root, db, run) = fixture("one");
+        let context = Arc::new(RegressionIoContext::open(&db, &run).unwrap());
+        let client = SearchClient::open_for_regression(&run, context).unwrap();
+        let lock = db.parent().unwrap().join("doctor/locks/doctor-repair.lock");
+        fs::rename(&lock, lock.with_extension("old")).unwrap();
+        File::create(&lock).unwrap();
+        let error = client
+            .search(
+                "one",
+                super::super::query::SearchFilters::default(),
+                10,
+                0,
+                super::super::query::FieldMask::FULL,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("regression_maintenance_lock_changed")
+        );
     }
 
     #[test]
@@ -415,7 +515,7 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_run_root(path: &Path) -> Result<()> {
+fn validate_private_run_root(path: &Path) -> Result<()> {
     reject_symlink_components(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
@@ -432,6 +532,11 @@ fn validate_run_root(path: &Path) -> Result<()> {
     }
     #[cfg(not(target_os = "linux"))]
     bail!("regression_platform_not_verified");
+    Ok(())
+}
+
+fn validate_run_root(path: &Path) -> Result<()> {
+    validate_private_run_root(path)?;
     if fs::read_dir(path)?.next().is_some() {
         bail!("regression_run_root_not_empty");
     }
