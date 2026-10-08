@@ -248,11 +248,11 @@ pub(crate) fn export_chunks(context: &RegressionIoContext) -> Result<ChunkInvent
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
 
-    fn fixture(message_change: &str, chunk_change: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    pub(crate) fn fixture(message_change: &str, chunk_change: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let (root, db, run) = super::super::regression_inventory::tests::fixture(message_change);
         let writer = Conn::open_writable(&db, Profile::Production).unwrap();
         writer.execute_batch("CREATE TABLE embedding_generations(id INTEGER PRIMARY KEY,is_active INTEGER); INSERT INTO embedding_generations VALUES(1,1),(9,0); CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY,generation_id INTEGER,message_id INTEGER,conversation_id INTEGER,chunk_idx INTEGER,byte_start INTEGER,byte_end INTEGER,content_hash TEXT,embedding BLOB,norm REAL);").unwrap();

@@ -223,7 +223,7 @@ pub(crate) fn export_messages(context: &RegressionIoContext) -> Result<MessageIn
     let spool_path = context.run_root().join("message-inventory-spool.sqlite");
     spool_file.persist_noclobber(&spool_path)?;
     let spool = Conn::open_writable(&spool_path, Profile::Production)?;
-    spool.execute_batch("CREATE TABLE conversations(cid INTEGER UNIQUE NOT NULL, host TEXT NOT NULL, agent TEXT NOT NULL, external TEXT NOT NULL, PRIMARY KEY(host,agent,external)) WITHOUT ROWID; CREATE TABLE message_rows(mid INTEGER UNIQUE NOT NULL, host TEXT NOT NULL, agent TEXT NOT NULL, external TEXT NOT NULL, idx INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(host,agent,external,idx)) WITHOUT ROWID;")?;
+    spool.execute_batch("CREATE TABLE conversations(cid INTEGER UNIQUE NOT NULL, host TEXT NOT NULL, agent TEXT NOT NULL, external TEXT NOT NULL, PRIMARY KEY(host,agent,external)) WITHOUT ROWID; CREATE TABLE message_rows(mid INTEGER UNIQUE NOT NULL, cid INTEGER NOT NULL, lexical INTEGER UNIQUE, host TEXT NOT NULL, agent TEXT NOT NULL, external TEXT NOT NULL, idx INTEGER NOT NULL, payload BLOB NOT NULL, PRIMARY KEY(host,agent,external,idx)) WITHOUT ROWID;")?;
     let source = context.connection()?;
     let mut cursor: Option<i64> = None;
     let mut conversation_count = 0u64;
@@ -308,8 +308,17 @@ pub(crate) fn export_messages(context: &RegressionIoContext) -> Result<MessageIn
             )?;
             let payload = row.encode(&key)?;
             match tx.execute(
-                "INSERT INTO message_rows VALUES(?1,?2,?3,?4,?5,?6)",
-                &params![row.id, key.0, key.1, key.2, row.idx, payload],
+                "INSERT INTO message_rows VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                &params![
+                    row.id,
+                    row.conversation,
+                    row.lexical,
+                    key.0,
+                    key.1,
+                    key.2,
+                    row.idx,
+                    payload
+                ],
             ) {
                 Err(StorageError::Constraint { .. }) => bail!("DUPLICATE_STABLE_MESSAGE_KEY"),
                 value => {
