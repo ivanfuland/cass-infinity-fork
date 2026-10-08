@@ -254,6 +254,11 @@ pub(crate) struct WindowEvidence {
     pub(crate) schema: String,
     pub(crate) binding: crate::search::regression_binding::InputBinding,
     pub(crate) query: TextDigest,
+    pub(crate) request: Value,
+    /// Only rerank HTTP attempts are represented by `transport`.
+    pub(crate) transport_scope: String,
+    pub(crate) lexical_statistics_used: bool,
+    pub(crate) lexical_statistics_sha256: Option<String>,
     pub(crate) retrieval: Vec<RetrievalSlot>,
     pub(crate) final_slots: Vec<RetrievalSlot>,
     pub(crate) snippets: Vec<TextDigest>,
@@ -274,13 +279,27 @@ impl WindowEvidence {
         applied: bool,
     ) -> anyhow::Result<()> {
         use anyhow::bail;
-        if self.schema != "cass.regression-window-trace.v1"
+        if self.schema != "cass.regression-window-trace.v2"
+            || self.transport_scope != "rerank-http-v1"
+            || !self.request.is_object()
             || &self.binding != binding
             || self.query != TextDigest::of(query)
             || self.applied != applied
             || (applied && (!self.rerank_requested || self.failure_reason.is_some()))
         {
             bail!("TRACE_WINDOW_BINDING_MISMATCH");
+        }
+        match self.request.get("mode").and_then(Value::as_str) {
+            Some("semantic") if !self.lexical_statistics_used => {}
+            Some("lexical" | "hybrid") if self.lexical_statistics_used => {}
+            _ => bail!("TRACE_WINDOW_REQUEST_MISMATCH"),
+        }
+        if self.lexical_statistics_sha256.as_deref()
+            != self
+                .lexical_statistics_used
+                .then_some(self.binding.lexical_statistics_sha256.as_str())
+        {
+            bail!("TRACE_WINDOW_REQUEST_MISMATCH");
         }
         let actual = freeze_retrieval_slots(context, hits)?;
         let permutation: Vec<_> = self.final_slots.iter().map(|s| s.input_slot).collect();

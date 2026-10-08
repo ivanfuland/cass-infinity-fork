@@ -518,6 +518,19 @@ pub(crate) mod tests {
         std::path::PathBuf,
         std::path::PathBuf,
     ) {
+        searchable_fixture_with_embedding(count, "synthetic-embedder", 2)
+    }
+
+    pub(crate) fn searchable_fixture_with_embedding(
+        count: usize,
+        embedder_id: &str,
+        dimension: usize,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         use crate::connectors::{NormalizedConversation, NormalizedMessage};
         use crate::storage::sqlite::FrankenStorage;
         let conversation = NormalizedConversation {
@@ -572,19 +585,26 @@ pub(crate) mod tests {
                 |r| Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?)),
             )
             .unwrap();
+        let mut vector = vec![0.0; dimension];
+        vector[0] = 1.0;
+        let embedding = crate::storage::schema::f32_vector_to_le_blob(&vector);
         let generation = writer.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-            let id = crate::storage::schema::create_embedding_generation(tx,"synthetic-embedder",2,3,1,&[1,2,3],10)?;
+            let id = crate::storage::schema::create_embedding_generation(tx,embedder_id,dimension as i64,3,1,&[1,2,3],10)?;
             for (mid, cid, content) in &messages {
                 for chunk in super::super::eligibility::expected_chunks(*mid, *cid, "user", content) {
                     tx.execute("INSERT INTO message_chunks(generation_id,message_id,conversation_id,chunk_idx,byte_start,byte_end,content_hash,embedding,norm,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,10)",
-                        &params![id,*mid,*cid,i64::from(chunk.chunk_idx),chunk.byte_start as i64,chunk.byte_end as i64,chunk.content_hash.clone(),crate::storage::schema::f32_vector_to_le_blob(&[1.0,0.0])])?;
+                        &params![id,*mid,*cid,i64::from(chunk.chunk_idx),chunk.byte_start as i64,chunk.byte_end as i64,chunk.content_hash.clone(),embedding.clone()])?;
                 }
             }
             tx.execute("UPDATE embedding_generations SET is_active=1,audit_status='passed' WHERE id=?1",&params![id])?;
             Ok(id)
         }).unwrap();
-        crate::storage::vector_domain::rebuild_vec0_table_for_generation(&writer, generation, 2)
-            .unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(
+            &writer,
+            generation,
+            dimension as i64,
+        )
+        .unwrap();
         writer
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
             .unwrap();
@@ -845,7 +865,12 @@ pub(crate) mod tests {
             .ok()
             .map(|v| v.parse().unwrap())
             .unwrap_or(1);
-        let (root, db, run, manifest) = searchable_fixture_with_count(count);
+        let (root, db, run, manifest) =
+            if std::env::var_os("CASS_INPUT_CLI_FIXTURE_INFINITY").is_some() {
+                searchable_fixture_with_embedding(count, "bge-m3", 1024)
+            } else {
+                searchable_fixture_with_count(count)
+            };
         let (expected, pin) = prepare_expected(root.path(), &db, &manifest);
         let retained_root = root.keep();
         let value = serde_json::json!({"root":retained_root,"database":db,"run_root":run,"source_manifest":manifest,"expected_binding":expected,"expected_sha256":pin});

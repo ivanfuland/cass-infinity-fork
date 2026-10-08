@@ -33,6 +33,10 @@ pub enum RegressionInputCommand {
         #[arg(long)]
         expected_sha256: String,
         query: String,
+        #[arg(long, value_enum, default_value = "lexical")]
+        mode: super::query::SearchMode,
+        #[arg(long, value_enum)]
+        vector_search_mode: Option<super::query::VectorSearchMode>,
         #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
         rrf_limit: u32,
         #[arg(long)]
@@ -76,6 +80,8 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
             expected_binding,
             expected_sha256,
             query,
+            mode,
+            vector_search_mode,
             rrf_limit,
             rerank,
             rerank_limit,
@@ -86,6 +92,9 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
         } => {
             if *rerank && rerank_limit > rrf_limit {
                 bail!("REGRESSION_WINDOW_LIMIT_INVALID");
+            }
+            if *mode == super::query::SearchMode::Lexical && vector_search_mode.is_some() {
+                bail!("REGRESSION_VECTOR_MODE_REQUIRES_SEMANTIC");
             }
             let verified = open_verified_search(
                 context.clone(),
@@ -123,10 +132,10 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
                 false,
                 None,
                 None,
-                Some(super::query::SearchMode::Lexical),
-                None,
+                Some(*mode),
+                *vector_search_mode,
                 crate::SemanticSearchOptions {
-                    model: None,
+                    model: (*mode != super::query::SearchMode::Lexical).then(|| "bge-m3".into()),
                     rerank: *rerank,
                     reranker: None,
                     use_daemon: false,
@@ -179,6 +188,9 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
     const CODES: &[&str] = &[
         "REGRESSION_WINDOW_LIMIT_INVALID",
         "REGRESSION_SEMANTIC_NOT_INTEGRATED",
+        "REGRESSION_VECTOR_MODE_REQUIRES_SEMANTIC",
+        "REGRESSION_EMBEDDER_GENERATION_MISMATCH",
+        "REGRESSION_RETRIEVAL_DEGRADED",
         "REGRESSION_SEARCH_FAILED",
         "REGRESSION_RERANK_FAILED",
         "TRACE_FAILED_WINDOW",
@@ -188,6 +200,7 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
         "TRACE_MISSING_PAGES",
         "TRACE_PAGE_SEQUENCE_MISMATCH",
         "TRACE_WINDOW_BINDING_MISMATCH",
+        "TRACE_WINDOW_REQUEST_MISMATCH",
         "TRACE_WINDOW_SLOT_MAPPING_MISMATCH",
         "TRACE_WINDOW_SNIPPET_MISMATCH",
         "TRACE_SCORING_REQUEST_COUNT_MISMATCH",

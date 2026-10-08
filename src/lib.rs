@@ -24623,6 +24623,40 @@ fn verify_regression_run_end(run: &RegressionSearchExecution) -> CliResult<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn regression_request_evidence(
+    filters: &crate::search::query::SearchFilters,
+    mode: crate::search::query::SearchMode,
+    vector_mode: crate::search::query::VectorSearchMode,
+    limit: usize,
+    timeout_ms: Option<u64>,
+    semantic: &SemanticSearchOptions,
+    rerank: &RerankRequestContext,
+) -> CliResult<serde_json::Value> {
+    let mut filters = serde_json::to_value(filters).map_err(regression_search_error)?;
+    for key in ["agents", "workspaces", "roles", "session_paths"] {
+        if let Some(values) = filters
+            .get_mut(key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            values.sort_by_key(serde_json::Value::to_string);
+        }
+    }
+    Ok(serde_json::json!({
+        "mode": search_mode_canonical_str(mode),
+        "vector_search_mode": vector_search_mode_wire(vector_mode),
+        "resolved_filters": filters,
+        "rrf_limit": limit,
+        "timeout_ms": timeout_ms,
+        "embedding_model": semantic.model,
+        "rerank_limit": semantic.rerank_limit,
+        "rerank_provider": semantic.rerank_provider,
+        "time_selectors": rerank.time_selectors,
+        "daemon": rerank.daemon,
+        "no_daemon": rerank.no_daemon,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
     agents: &[String],
@@ -24674,7 +24708,13 @@ fn run_cli_search(
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
     if regression.is_some() && mode != Some(SearchMode::Lexical) {
+        #[cfg(not(feature = "infinity"))]
         return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
+        if !matches!(semantic_opts.model.as_deref(), Some("bge-m3" | "infinity"))
+            || semantic_opts.use_daemon
+        {
+            return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
+        }
     }
 
     let data_dir = regression
@@ -24926,6 +24966,19 @@ fn run_cli_search(
                     .ok_or_else(|| regression_search_error("TRACE_WINDOW_MISSING"))?,
             )
             .map_err(regression_search_error)?;
+            if evidence.request
+                != regression_request_evidence(
+                    &filters,
+                    mode.unwrap_or_default(),
+                    vector_search_mode.unwrap_or_default(),
+                    limit_val,
+                    timeout_ms,
+                    &semantic_opts,
+                    &rerank_ctx,
+                )?
+            {
+                return Err(regression_search_error("TRACE_WINDOW_REQUEST_MISMATCH"));
+            }
             evidence
                 .validate(
                     &run.context,
@@ -24935,7 +24988,9 @@ fn run_cli_search(
                     snapshot.rerank.applied,
                 )
                 .map_err(regression_search_error)?;
-            if evidence.failure_reason.is_some() || (!evidence.final_slots.is_empty() && !evidence.applied) {
+            if evidence.failure_reason.is_some()
+                || (!evidence.final_slots.is_empty() && !evidence.applied)
+            {
                 return Err(regression_search_error("TRACE_FAILED_WINDOW"));
             }
         }
@@ -25246,7 +25301,7 @@ fn run_cli_search(
     // If semantic assets are unavailable, hybrid searches fail open to lexical
     // while robot metadata reports the realized mode and fallback reason.
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
-    let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
+    let hybrid_fail_open = regression.is_none() && mode_meta.fail_open_on_semantic_unavailable();
 
     if matches!(
         mode_meta.requested,
@@ -25290,8 +25345,19 @@ fn run_cli_search(
         // M4-pre spike: route the bge-m3 / infinity embedder through the
         // Infinity HTTP context loader (no ONNX / model-file machinery).
         #[cfg(feature = "infinity")]
-        let setup_infinity = matches!(requested_model, Some("bge-m3") | Some("infinity"))
-            .then(|| load_infinity_semantic_context(&data_dir, &db_path));
+        let setup_infinity = if matches!(requested_model, Some("bge-m3") | Some("infinity")) {
+            Some(match regression.as_ref() {
+                Some(run) => {
+                    crate::search::model_manager::load_infinity_semantic_context_for_regression(
+                        &run.context,
+                    )
+                    .map_err(regression_search_error)?
+                }
+                None => load_infinity_semantic_context(&data_dir, &db_path),
+            })
+        } else {
+            None
+        };
         #[cfg(not(feature = "infinity"))]
         let setup_infinity: Option<crate::search::model_manager::SemanticSetup> = None;
 
@@ -25655,6 +25721,13 @@ fn run_cli_search(
         },
     };
     let search_ms = search_start.elapsed().as_millis() as u64;
+    if regression.is_some()
+        && (result.semantic_degraded
+            || mode_meta.realized != mode_meta.requested
+            || result.candidates.as_ref().is_some_and(|c| c.incomplete))
+    {
+        return Err(regression_search_error("REGRESSION_RETRIEVAL_DEGRADED"));
+    }
     if !rerank_on {
         if let Some(run) = regression.as_ref() {
             let hits = &result.hits[..limit_val.min(result.hits.len())];
@@ -25662,7 +25735,20 @@ fn run_cli_search(
                 crate::search::regression_trace::freeze_retrieval_slots(&run.context, hits)
                     .map_err(regression_search_error)?;
             let evidence = crate::search::regression_trace::WindowEvidence {
-                schema: "cass.regression-window-trace.v1".into(),
+                schema: "cass.regression-window-trace.v2".into(),
+                request: regression_request_evidence(
+                    &filters,
+                    mode_meta.requested,
+                    vector_search_mode.unwrap_or_default(),
+                    limit_val,
+                    timeout_ms,
+                    &semantic_opts,
+                    &rerank_ctx,
+                )?,
+                transport_scope: "rerank-http-v1".into(),
+                lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
+                lexical_statistics_sha256: (mode_meta.realized != SearchMode::Semantic)
+                    .then(|| run.binding.lexical_statistics_sha256.clone()),
                 binding: run.binding.clone(),
                 query: crate::search::regression_trace::TextDigest::of(query),
                 final_slots: retrieval.clone(),
@@ -25788,7 +25874,21 @@ fn run_cli_search(
                     &window_result.hits,
                 )?;
                 Ok::<_, anyhow::Error>(crate::search::regression_trace::WindowEvidence {
-                    schema: "cass.regression-window-trace.v1".into(),
+                    schema: "cass.regression-window-trace.v2".into(),
+                    request: regression_request_evidence(
+                        &filters,
+                        mode_meta.requested,
+                        vector_search_mode.unwrap_or_default(),
+                        limit_val,
+                        timeout_ms,
+                        &semantic_opts,
+                        &rerank_ctx,
+                    )
+                    .map_err(|e| anyhow::anyhow!(e.message))?,
+                    transport_scope: "rerank-http-v1".into(),
+                    lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
+                    lexical_statistics_sha256: (mode_meta.realized != SearchMode::Semantic)
+                        .then(|| run.binding.lexical_statistics_sha256.clone()),
                     binding: run.binding.clone(),
                     query: crate::search::regression_trace::TextDigest::of(query),
                     final_slots: retrieval.clone(),
@@ -25830,7 +25930,8 @@ fn run_cli_search(
             http_requests = Some(0);
             model_requests = Some(0);
             if regression.is_some() {
-                failure_reason = Some(crate::search::rerank::types::RerankFailureReason::InvalidInput);
+                failure_reason =
+                    Some(crate::search::rerank::types::RerankFailureReason::InvalidInput);
             }
         } else {
             let documents = match regression.as_ref() {
@@ -25993,7 +26094,9 @@ fn run_cli_search(
             };
             crate::search::regression_trace::persist_evidence(&run.context, evidence)
                 .map_err(regression_search_error)?;
-            if evidence.failure_reason.is_some() || (!evidence.final_slots.is_empty() && !evidence.applied) {
+            if evidence.failure_reason.is_some()
+                || (!evidence.final_slots.is_empty() && !evidence.applied)
+            {
                 verify_regression_run_end(run)?;
                 return Err(regression_search_error("REGRESSION_RERANK_FAILED"));
             }
@@ -107301,5 +107404,55 @@ mod regression_search_orchestration_tests {
         );
         assert_eq!(before, std::fs::read(db).unwrap());
         assert!(evidence(&run_root).applied); // Scoring succeeded; the run did not.
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "infinity"))]
+mod regression_semantic_pipeline_child {
+    use super::*;
+
+    #[test]
+    fn regression_semantic_search_readonly_child() -> anyhow::Result<()> {
+        let Some(marker) = std::env::var_os("CASS_REGRESSION_SEMANTIC_FIXTURE") else {
+            return Ok(());
+        };
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(marker)?)?;
+        let path = |key: &str| PathBuf::from(fixture[key].as_str().unwrap());
+        let mode = match std::env::var("CASS_REGRESSION_SEMANTIC_MODE")?.as_str() {
+            "hybrid" => crate::search::query::SearchMode::Hybrid,
+            "semantic" => crate::search::query::SearchMode::Semantic,
+            _ => anyhow::bail!("invalid synthetic mode"),
+        };
+        let vector_search_mode = match std::env::var("CASS_REGRESSION_VECTOR_MODE")?.as_str() {
+            "exact" => crate::search::query::VectorSearchMode::Exact,
+            "fast" => crate::search::query::VectorSearchMode::Fast,
+            _ => anyhow::bail!("invalid synthetic vector mode"),
+        };
+        let rerank = std::env::var_os("CASS_REGRESSION_SEMANTIC_RERANK").is_some();
+        let cursor = std::env::var("CASS_REGRESSION_SEMANTIC_CURSOR").ok();
+        let window_root =
+            std::env::var_os("CASS_REGRESSION_SEMANTIC_WINDOW_ROOT").map(PathBuf::from);
+        crate::search::regression_input::run(&crate::RegressionInputCommand::Search {
+            input: crate::search::regression_input::FrozenInputArgs {
+                database: path("database"),
+                run_root: path("run_root"),
+                source_manifest: path("source_manifest"),
+                question_pack_root: path("question_pack_root"),
+            },
+            expected_binding: path("expected_binding"),
+            expected_sha256: fixture["expected_sha256"].as_str().unwrap().into(),
+            query: "retrieval".into(),
+            mode,
+            vector_search_mode: Some(vector_search_mode),
+            rrf_limit: 7,
+            rerank,
+            rerank_limit: 3,
+            rerank_provider: rerank
+                .then_some(crate::search::rerank::types::ProviderChoice::BgeLocal),
+            cursor,
+            window_root,
+        })?;
+        println!("VERIFIED_EXISTING_SEMANTIC_PIPELINE_READONLY");
+        Ok(())
     }
 }
