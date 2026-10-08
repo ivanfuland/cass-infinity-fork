@@ -487,6 +487,17 @@ pub(crate) mod tests {
         std::path::PathBuf,
         std::path::PathBuf,
     ) {
+        searchable_fixture_with_count(1)
+    }
+
+    pub(crate) fn searchable_fixture_with_count(
+        count: usize,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         use crate::connectors::{NormalizedConversation, NormalizedMessage};
         use crate::storage::sqlite::FrankenStorage;
         let conversation = NormalizedConversation {
@@ -510,8 +521,21 @@ pub(crate) mod tests {
                 invocations: vec![],
             }],
         };
+        let conversations: Vec<_> = (0..count)
+            .map(|index| {
+                let mut item = conversation.clone();
+                if count > 1 {
+                    item.external_id = Some(format!("synthetic-session-{index}"));
+                    item.source_path = format!("synthetic-{index}.jsonl").into();
+                    item.messages[0]
+                        .content
+                        .push_str(&format!(" Synthetic case {index}."));
+                }
+                item
+            })
+            .collect();
         let (root, original) =
-            super::super::query::tests::seed_conversations_for_search_client(&[conversation])
+            super::super::query::tests::seed_conversations_for_search_client(&conversations)
                 .unwrap();
         let input = root.path().join("input");
         fs::create_dir(&input).unwrap();
@@ -521,19 +545,21 @@ pub(crate) mod tests {
         storage.rebuild_lex_domain_from_db(None).unwrap();
         drop(storage);
         let writer = Conn::open_writable(&db, Profile::Production).unwrap();
-        let (mid, cid, content): (i64, i64, String) = writer
-            .query_row_map(
-                "SELECT id,conversation_id,content FROM messages",
+        let messages: Vec<(i64, i64, String)> = writer
+            .query_all_map(
+                "SELECT id,conversation_id,content FROM messages ORDER BY id",
                 &[],
                 |r| Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?)),
             )
             .unwrap();
-        let chunk =
-            super::super::eligibility::expected_chunks(mid, cid, "user", &content).remove(0);
         let generation = writer.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
             let id = crate::storage::schema::create_embedding_generation(tx,"synthetic-embedder",2,3,1,&[1,2,3],10)?;
-            tx.execute("INSERT INTO message_chunks(generation_id,message_id,conversation_id,chunk_idx,byte_start,byte_end,content_hash,embedding,norm,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,10)",
-                &params![id,mid,cid,i64::from(chunk.chunk_idx),chunk.byte_start as i64,chunk.byte_end as i64,chunk.content_hash.clone(),crate::storage::schema::f32_vector_to_le_blob(&[1.0,0.0])])?;
+            for (mid, cid, content) in &messages {
+                for chunk in super::super::eligibility::expected_chunks(*mid, *cid, "user", content) {
+                    tx.execute("INSERT INTO message_chunks(generation_id,message_id,conversation_id,chunk_idx,byte_start,byte_end,content_hash,embedding,norm,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,10)",
+                        &params![id,*mid,*cid,i64::from(chunk.chunk_idx),chunk.byte_start as i64,chunk.byte_end as i64,chunk.content_hash.clone(),crate::storage::schema::f32_vector_to_le_blob(&[1.0,0.0])])?;
+                }
+            }
             tx.execute("UPDATE embedding_generations SET is_active=1,audit_status='passed' WHERE id=?1",&params![id])?;
             Ok(id)
         }).unwrap();
@@ -795,7 +821,11 @@ pub(crate) mod tests {
         let Some(marker) = std::env::var_os("CASS_INPUT_CLI_FIXTURE_MARKER") else {
             return;
         };
-        let (root, db, run, manifest) = searchable_fixture();
+        let count = std::env::var("CASS_INPUT_CLI_FIXTURE_COUNT")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(1);
+        let (root, db, run, manifest) = searchable_fixture_with_count(count);
         let (expected, pin) = prepare_expected(root.path(), &db, &manifest);
         let retained_root = root.keep();
         let value = serde_json::json!({"root":retained_root,"database":db,"run_root":run,"source_manifest":manifest,"expected_binding":expected,"expected_sha256":pin});

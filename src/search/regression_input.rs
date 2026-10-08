@@ -24,6 +24,29 @@ pub struct FrozenInputArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum RegressionInputCommand {
+    /// Search the verified frozen lexical domain through the existing pipeline.
+    Search {
+        #[command(flatten)]
+        input: FrozenInputArgs,
+        #[arg(long)]
+        expected_binding: PathBuf,
+        #[arg(long)]
+        expected_sha256: String,
+        query: String,
+        #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u32).range(1..))]
+        rrf_limit: u32,
+        #[arg(long)]
+        rerank: bool,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+        rerank_limit: u32,
+        #[arg(long, requires = "rerank")]
+        rerank_provider: Option<super::rerank::types::ProviderChoice>,
+        #[arg(long, requires_all = ["rerank", "window_root"])]
+        cursor: Option<String>,
+        /// Previous private run containing the frozen window; read only.
+        #[arg(long, requires = "cursor")]
+        window_root: Option<PathBuf>,
+    },
     /// Export an observed candidate; this does not register expected identity.
     Inspect {
         #[command(flatten)]
@@ -40,20 +63,97 @@ pub enum RegressionInputCommand {
     },
 }
 
-pub(crate) fn run(command: &RegressionInputCommand) -> Result<serde_json::Value> {
+pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json::Value>> {
     let input = match command {
         RegressionInputCommand::Inspect { input }
-        | RegressionInputCommand::Verify { input, .. } => input,
+        | RegressionInputCommand::Verify { input, .. }
+        | RegressionInputCommand::Search { input, .. } => input,
     };
     let context = Arc::new(RegressionIoContext::open(&input.database, &input.run_root)?);
     context.forbid_output_under(&input.question_pack_root)?;
     match command {
+        RegressionInputCommand::Search {
+            expected_binding,
+            expected_sha256,
+            query,
+            rrf_limit,
+            rerank,
+            rerank_limit,
+            rerank_provider,
+            cursor,
+            window_root,
+            ..
+        } => {
+            if *rerank && rerank_limit > rrf_limit {
+                bail!("REGRESSION_WINDOW_LIMIT_INVALID");
+            }
+            let verified = open_verified_search(
+                context.clone(),
+                expected_binding,
+                expected_sha256,
+                &input.source_manifest,
+            )?;
+            let binding = verified.binding.clone();
+            crate::run_cli_search(
+                query,
+                &[],
+                &[],
+                &[],
+                &(*rrf_limit as usize),
+                &0,
+                &true,
+                Some(crate::RobotFormat::Json),
+                false,
+                None,
+                None,
+                None,
+                None,
+                cursor.clone(),
+                None,
+                &None,
+                None,
+                crate::WrapConfig::new(None, true),
+                crate::ProgressResolved::None,
+                true,
+                crate::TimeFilter::new(None, false, false, false, None, None),
+                None,
+                false,
+                false,
+                None,
+                false,
+                None,
+                None,
+                Some(super::query::SearchMode::Lexical),
+                None,
+                crate::SemanticSearchOptions {
+                    model: None,
+                    rerank: *rerank,
+                    reranker: None,
+                    use_daemon: false,
+                    rerank_limit: rerank.then_some(*rerank_limit as usize),
+                    rerank_provider: rerank.then_some(
+                        rerank_provider.unwrap_or(super::rerank::types::ProviderChoice::Qwen3Local),
+                    ),
+                },
+                crate::RerankRequestContext::default(),
+                Some(crate::RegressionSearchExecution {
+                    context,
+                    verified: Some(verified),
+                    binding,
+                    trace: Default::default(),
+                    endpoint: None,
+                    window_root: window_root.clone(),
+                }),
+            )
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+            Ok(None)
+        }
         RegressionInputCommand::Inspect { .. } => {
             context.admit_index_run()?;
             let binding = inspect_input(&context, &input.source_manifest)?;
-            Ok(
+            Ok(Some(
                 serde_json::json!({"schema":"cass.regression-input-result.v1","stage":"observed-candidate","identity":binding,"quality":"NOT_EVALUATED"}),
-            )
+            ))
         }
         RegressionInputCommand::Verify {
             expected_binding,
@@ -66,9 +166,9 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<serde_json::Value>
                 expected_sha256,
                 &input.source_manifest,
             )?;
-            Ok(
+            Ok(Some(
                 serde_json::json!({"schema":"cass.regression-input-result.v1","stage":"identity-and-admission-verified","identity":verified.binding,"expected_file_sha256":verified.expected_file_sha256,"quality":"NOT_EVALUATED"}),
-            )
+            ))
         }
     }
 }
@@ -76,6 +176,28 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<serde_json::Value>
 /// Public CLI errors contain codes, never a query or an underlying SQL value.
 pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
     const CODES: &[&str] = &[
+        "REGRESSION_WINDOW_LIMIT_INVALID",
+        "REGRESSION_SEMANTIC_NOT_INTEGRATED",
+        "REGRESSION_SEARCH_FAILED",
+        "REGRESSION_SEARCH_EVIDENCE_FAILED",
+        "TRACE_WINDOW_MISSING",
+        "TRACE_INVALID_PAGE_RANGE",
+        "TRACE_MISSING_PAGES",
+        "TRACE_PAGE_SEQUENCE_MISMATCH",
+        "TRACE_WINDOW_BINDING_MISMATCH",
+        "TRACE_WINDOW_SLOT_MAPPING_MISMATCH",
+        "TRACE_WINDOW_SNIPPET_MISMATCH",
+        "TRACE_SCORING_REQUEST_COUNT_MISMATCH",
+        "TRACE_MISSING_SUBMITTED_TEXT",
+        "TRACE_SUBMITTED_TEXT_MISMATCH",
+        "TRACE_SCORING_RESPONSE_UNPROVEN",
+        "TRACE_MODEL_EXECUTION_UNPROVEN",
+        "TRACE_INCOMPLETE_SLOT_MAPPING",
+        "TRACE_INVALID_SLOT_MAPPING",
+        "TRACE_MISSING_MESSAGE_ID",
+        "TRACE_MISSING_STABLE_CANDIDATE",
+        "TRACE_MISSING_STABLE_CHUNK",
+        "TRACE_DUPLICATE_CANDIDATE_IDENTITY",
         "EMPTY_MESSAGE_CORPUS",
         "regression_output_inside_repository",
         "regression_output_inside_protected_input",

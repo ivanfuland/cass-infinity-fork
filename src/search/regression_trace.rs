@@ -247,6 +247,233 @@ pub(crate) fn verify_submitted_slots(
     Ok(())
 }
 
+/// Stored inside the private window. The existing hit wire format stays intact.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WindowEvidence {
+    pub(crate) schema: String,
+    pub(crate) binding: crate::search::regression_binding::InputBinding,
+    pub(crate) query: TextDigest,
+    pub(crate) retrieval: Vec<RetrievalSlot>,
+    pub(crate) final_slots: Vec<RetrievalSlot>,
+    pub(crate) snippets: Vec<TextDigest>,
+    pub(crate) prepared_documents: Option<Vec<TextDigest>>,
+    pub(crate) transport: RequestTrace,
+    pub(crate) rerank_requested: bool,
+    pub(crate) applied: bool,
+    pub(crate) failure_reason: Option<String>,
+}
+
+impl WindowEvidence {
+    pub(crate) fn validate(
+        &self,
+        context: &crate::search::regression_io::RegressionIoContext,
+        binding: &crate::search::regression_binding::InputBinding,
+        query: &str,
+        hits: &[crate::search::query::SearchHit],
+        applied: bool,
+    ) -> anyhow::Result<()> {
+        use anyhow::bail;
+        if self.schema != "cass.regression-window-trace.v1"
+            || &self.binding != binding
+            || self.query != TextDigest::of(query)
+            || self.applied != applied
+            || (applied && (!self.rerank_requested || self.failure_reason.is_some()))
+        {
+            bail!("TRACE_WINDOW_BINDING_MISMATCH");
+        }
+        let actual = freeze_retrieval_slots(context, hits)?;
+        let permutation: Vec<_> = self.final_slots.iter().map(|s| s.input_slot).collect();
+        if final_slot_mapping(&self.retrieval, &permutation)? != self.final_slots
+            || actual.len() != self.final_slots.len()
+            || self.snippets.len() != self.retrieval.len()
+            || self
+                .retrieval
+                .iter()
+                .enumerate()
+                .any(|(i, s)| s.input_slot != i || s.retrieval_rank != i + 1)
+            || actual
+                .iter()
+                .zip(&self.final_slots)
+                .any(|(a, s)| a.identity != s.identity || a.message_id != s.message_id)
+        {
+            bail!("TRACE_WINDOW_SLOT_MAPPING_MISMATCH");
+        }
+        if hits.iter().zip(&self.final_slots).any(|(hit, slot)| {
+            self.snippets.get(slot.input_slot) != Some(&TextDigest::of(&hit.content))
+        }) {
+            bail!("TRACE_WINDOW_SNIPPET_MISMATCH");
+        }
+        let posts: Vec<_> = self
+            .transport
+            .requests
+            .iter()
+            .filter(|r| r.method == "POST")
+            .collect();
+        if posts.len() > 1 || (applied && posts.len() != 1) {
+            bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
+        }
+        if let Some(post) = posts.first() {
+            let docs = post
+                .documents
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TRACE_MISSING_SUBMITTED_TEXT"))?;
+            let prepared = self
+                .prepared_documents
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TRACE_MISSING_SUBMITTED_TEXT"))?;
+            if post.query.as_ref() != Some(&self.query)
+                || docs.len() != self.retrieval.len()
+                || prepared.len() != docs.len()
+                || docs
+                    .iter()
+                    .zip(prepared)
+                    .enumerate()
+                    .any(|(i, (doc, expected))| doc.input_slot != i || &doc.text != expected)
+            {
+                bail!("TRACE_SUBMITTED_TEXT_MISMATCH");
+            }
+            if applied
+                && (post.state != "http-response-observed"
+                    || !post.http_status.is_some_and(|s| (200..300).contains(&s)))
+            {
+                bail!("TRACE_SCORING_RESPONSE_UNPROVEN");
+            }
+        }
+        if self.transport.model_requests.is_some() {
+            bail!("TRACE_MODEL_EXECUTION_UNPROVEN");
+        }
+        context.verify_input()?;
+        Ok(())
+    }
+}
+
+pub(crate) fn persist_evidence(
+    context: &crate::search::regression_io::RegressionIoContext,
+    evidence: &WindowEvidence,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write;
+    crate::search::regression_io::validate_private_run_root(context.run_root())?;
+    context.verify_input()?;
+    let mut file = tempfile::Builder::new()
+        .prefix("regression-search-")
+        .suffix(".json")
+        .tempfile_in(context.run_root())?;
+    serde_json::to_writer(file.as_file_mut(), evidence)?;
+    file.as_file_mut().write_all(b"\n")?;
+    file.as_file().sync_all()?;
+    let (_, path) = file.keep()?;
+    context.verify_input()?;
+    Ok(path)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PageEvidence {
+    pub(crate) schema: String,
+    pub(crate) window_id: String,
+    pub(crate) trace_sha256: String,
+    pub(crate) offset: usize,
+    pub(crate) total_slots: usize,
+    pub(crate) slots: Vec<RetrievalSlot>,
+    pub(crate) cache_reused: bool,
+    pub(crate) http_requests: usize,
+    pub(crate) model_requests: Option<usize>,
+}
+
+pub(crate) fn persist_page(
+    context: &crate::search::regression_io::RegressionIoContext,
+    evidence: &WindowEvidence,
+    window_id: &str,
+    offset: usize,
+    limit: usize,
+    cache_reused: bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write;
+    if offset >= evidence.final_slots.len() || limit == 0 {
+        anyhow::bail!("TRACE_INVALID_PAGE_RANGE");
+    }
+    let page = PageEvidence {
+        schema: "cass.regression-page.v1".into(),
+        window_id: window_id.into(),
+        trace_sha256: hex::encode(Sha256::digest(serde_json::to_vec(evidence)?)),
+        offset,
+        total_slots: evidence.final_slots.len(),
+        slots: evidence
+            .final_slots
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect(),
+        cache_reused,
+        http_requests: if cache_reused {
+            0
+        } else {
+            evidence.transport.requests.len()
+        },
+        model_requests: if cache_reused || evidence.transport.requests.is_empty() {
+            Some(0)
+        } else {
+            None
+        },
+    };
+    crate::search::regression_io::validate_private_run_root(context.run_root())?;
+    context.verify_input()?;
+    let mut file = tempfile::Builder::new()
+        .prefix("regression-page-")
+        .suffix(".json")
+        .tempfile_in(context.run_root())?;
+    serde_json::to_writer(file.as_file_mut(), &page)?;
+    file.as_file_mut().write_all(b"\n")?;
+    file.as_file().sync_all()?;
+    let (_, path) = file.keep()?;
+    context.verify_input()?;
+    Ok(path)
+}
+
+/// A quality runner must prove a complete page sequence, not just page one.
+pub(crate) fn validate_complete_pages(
+    pages: &[PageEvidence],
+    evidence: &WindowEvidence,
+) -> anyhow::Result<()> {
+    let mut offset: usize = 0;
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(evidence)?));
+    let first = pages
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("TRACE_MISSING_PAGES"))?;
+    for (index, page) in pages.iter().enumerate() {
+        let end = offset
+            .checked_add(page.slots.len())
+            .ok_or_else(|| anyhow::anyhow!("TRACE_PAGE_SEQUENCE_MISMATCH"))?;
+        if page.schema != "cass.regression-page.v1"
+            || page.window_id != first.window_id
+            || page.trace_sha256 != digest
+            || page.offset != offset
+            || page.total_slots != evidence.final_slots.len()
+            || page.slots.is_empty()
+            || evidence.final_slots.get(offset..end) != Some(page.slots.as_slice())
+            || page.cache_reused != (index > 0)
+            || (index == 0
+                && (page.http_requests != evidence.transport.requests.len()
+                    || page.model_requests
+                        != if evidence.transport.requests.is_empty() {
+                            Some(0)
+                        } else {
+                            None
+                        }))
+            || (index > 0 && (page.http_requests != 0 || page.model_requests != Some(0)))
+        {
+            anyhow::bail!("TRACE_PAGE_SEQUENCE_MISMATCH");
+        }
+        offset = end;
+    }
+    if offset != evidence.final_slots.len() {
+        anyhow::bail!("TRACE_MISSING_PAGES");
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

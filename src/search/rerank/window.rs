@@ -420,6 +420,21 @@ pub struct WindowStore {
 }
 
 impl WindowStore {
+    /// Regression continuations only read a previously created private cache.
+    pub(crate) fn open_existing(data_dir: &Path, policy: WindowPolicy) -> Result<Self, WindowError> {
+        policy.validate()?;
+        crate::search::regression_io::validate_private_run_root(data_dir)
+            .map_err(|_| WindowError::CacheUnavailable)?;
+        let cache = data_dir.join("cache");
+        let dir = cache.join("rerank-windows");
+        for path in [&cache, &dir] {
+            let meta = fs::symlink_metadata(path).map_err(|_| WindowError::CacheUnavailable)?;
+            if !meta.is_dir() { return Err(WindowError::CacheUnavailable); }
+        }
+        require_private_dir_mode(&fs::symlink_metadata(&dir).map_err(|_| WindowError::CacheUnavailable)?)?;
+        Ok(Self { dir, policy })
+    }
+
     /// Open (creating if needed) the private window directory under
     /// `data_dir`, refusing any unsafe existing path.
     pub fn new(data_dir: &Path, policy: WindowPolicy) -> Result<Self, WindowError> {
@@ -480,6 +495,28 @@ impl WindowStore {
         db_path: &Path,
         now_ms: i64,
     ) -> Result<(WindowSnapshot, usize), WindowError> {
+        self.load_with_stamp(cursor, expected, now_ms, || capture_index_stamp(db_path))
+    }
+
+    pub(crate) fn load_for_regression(
+        &self,
+        cursor: &str,
+        expected: &RequestBinding,
+        context: &crate::search::regression_io::RegressionIoContext,
+        now_ms: i64,
+    ) -> Result<(WindowSnapshot, usize), WindowError> {
+        self.load_with_stamp(cursor, expected, now_ms, || {
+            capture_index_stamp_for_regression(context)
+        })
+    }
+
+    fn load_with_stamp(
+        &self,
+        cursor: &str,
+        expected: &RequestBinding,
+        now_ms: i64,
+        stamp: impl FnOnce() -> Result<IndexStamp, WindowError>,
+    ) -> Result<(WindowSnapshot, usize), WindowError> {
         let (window_id, offset) = decode_cursor(cursor)?;
 
         let path = self.dir.join(format!("{window_id}.json"));
@@ -534,7 +571,7 @@ impl WindowStore {
             return Err(WindowError::BindingMismatch);
         }
 
-        if capture_index_stamp(db_path)? != snapshot.index_stamp {
+        if stamp()? != snapshot.index_stamp {
             return Err(WindowError::IndexChanged);
         }
 
