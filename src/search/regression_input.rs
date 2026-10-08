@@ -143,6 +143,7 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
                     trace: Default::default(),
                     endpoint: None,
                     window_root: window_root.clone(),
+                    source_manifest: input.source_manifest.clone(),
                 }),
             )
             .map_err(|error| anyhow::anyhow!(error.message))?;
@@ -179,6 +180,8 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
         "REGRESSION_WINDOW_LIMIT_INVALID",
         "REGRESSION_SEMANTIC_NOT_INTEGRATED",
         "REGRESSION_SEARCH_FAILED",
+        "REGRESSION_RERANK_FAILED",
+        "TRACE_FAILED_WINDOW",
         "REGRESSION_SEARCH_EVIDENCE_FAILED",
         "TRACE_WINDOW_MISSING",
         "TRACE_INVALID_PAGE_RANGE",

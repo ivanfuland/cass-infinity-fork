@@ -156,13 +156,33 @@ fn file_digest(path: &Path) -> Result<String> {
             .context("BINDING_FILE_SIZE_OVERFLOW")?;
     }
     let after = input.metadata()?;
+    let path_after = fs::symlink_metadata(path)?;
+    if !path_after.is_file() || path_after.file_type().is_symlink() {
+        bail!("BINDING_FILE_CHANGED");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != path_after.dev() || after.ino() != path_after.ino() {
+            bail!("BINDING_FILE_CHANGED");
+        }
+    }
     if size != before.len()
         || before.len() != after.len()
         || before.modified()? != after.modified()?
+        || after.len() != path_after.len()
+        || after.modified()? != path_after.modified()?
     {
         bail!("BINDING_FILE_CHANGED");
     }
     Ok(hex::encode(hash.finalize()))
+}
+
+pub(crate) fn verify_source_manifest(path: &Path, expected_sha256: &str) -> Result<()> {
+    if file_digest(path)? != expected_sha256 {
+        bail!("BINDING_SOURCE_CHANGED");
+    }
+    Ok(())
 }
 
 /// Load the expected bytes and verify their external pin before parsing them.

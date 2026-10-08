@@ -24595,6 +24595,7 @@ struct RegressionSearchExecution {
     trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>,
     endpoint: Option<String>,
     window_root: Option<PathBuf>,
+    source_manifest: PathBuf,
 }
 
 fn regression_search_error(error: impl std::fmt::Display) -> CliError {
@@ -24616,6 +24617,8 @@ fn verify_regression_run_end(run: &RegressionSearchExecution) -> CliResult<()> {
         .map_err(|_| regression_search_error("BINDING_DIGEST_INVALID"))?;
     run.context
         .verify_database_digest(&digest)
+        .map_err(regression_search_error)?;
+    crate::search::regression_binding::verify_source_manifest(&run.source_manifest, &run.binding.source_manifest_sha256)
         .map_err(regression_search_error)
 }
 
@@ -24932,6 +24935,9 @@ fn run_cli_search(
                     snapshot.rerank.applied,
                 )
                 .map_err(regression_search_error)?;
+            if evidence.failure_reason.is_some() || (!evidence.final_slots.is_empty() && !evidence.applied) {
+                return Err(regression_search_error("TRACE_FAILED_WINDOW"));
+            }
         }
         let resolved_window_id = crate::search::rerank::window::cursor_window_id(cursor_str)
             .map_err(cursor_window_cli_error)?;
@@ -25987,6 +25993,10 @@ fn run_cli_search(
             };
             crate::search::regression_trace::persist_evidence(&run.context, evidence)
                 .map_err(regression_search_error)?;
+            if evidence.failure_reason.is_some() || (!evidence.final_slots.is_empty() && !evidence.applied) {
+                verify_regression_run_end(run)?;
+                return Err(regression_search_error("REGRESSION_RERANK_FAILED"));
+            }
         }
 
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
@@ -106903,6 +106913,7 @@ mod regression_search_orchestration_tests {
             trace: Default::default(),
             endpoint,
             window_root: None,
+            source_manifest: manifest.to_path_buf(),
         }
     }
 
@@ -106913,6 +106924,13 @@ mod regression_search_orchestration_tests {
     }
 
     fn server(status: u16) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        server_with_manifest_change(status, None)
+    }
+
+    fn server_with_manifest_change(
+        status: u16,
+        manifest: Option<PathBuf>,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let worker = std::thread::spawn(move || {
@@ -106952,6 +106970,11 @@ mod regression_search_orchestration_tests {
                     let count = captured["documents"].as_array().unwrap().len();
                     serde_json::json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..count).map(|i| serde_json::json!({"index":i,"relevance_score":1.0})).collect::<Vec<_>>()})
                 }.to_string();
+                if step == 1 {
+                    if let Some(path) = manifest.as_ref() {
+                        std::fs::write(path, b"changed synthetic source manifest\n").unwrap();
+                    }
+                }
                 let response_status = if step == 0 { 200 } else { status };
                 if step == 1 && status == 0 {
                     continue;
@@ -107048,6 +107071,7 @@ mod regression_search_orchestration_tests {
                 trace: trace.clone(),
                 endpoint: Some(origin.clone()),
                 window_root: None,
+                source_manifest: manifest.to_path_buf(),
             },
             true,
             3,
@@ -107075,6 +107099,7 @@ mod regression_search_orchestration_tests {
                 trace: trace.clone(),
                 endpoint: Some(origin.clone()),
                 window_root: None,
+                source_manifest: manifest.to_path_buf(),
             },
             true,
             3,
@@ -107156,6 +107181,7 @@ mod regression_search_orchestration_tests {
                 trace: trace.clone(),
                 endpoint: Some(origin),
                 window_root: None,
+                source_manifest: manifest.to_path_buf(),
             },
             true,
             3,
@@ -107191,13 +107217,18 @@ mod regression_search_orchestration_tests {
             private_dir(&case_root);
             let context = Arc::new(RegressionIoContext::open(&db, &case_root).unwrap());
             let (origin, worker) = server(status);
-            search(
+            let result = search(
                 execution(context, &expected, &pin, &manifest, Some(origin)),
                 true,
                 5,
                 None,
-            )
-            .unwrap();
+            );
+            if status == 200 {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().message, "REGRESSION_RERANK_FAILED");
+                assert!(!case_root.join("cache/rerank-windows").exists());
+            }
             assert_eq!(
                 worker.join().unwrap()["documents"]
                     .as_array()
@@ -107237,11 +107268,38 @@ mod regression_search_orchestration_tests {
             5,
             None,
         )
-        .unwrap();
+        .unwrap_err();
         let proof = evidence(&invalid_root);
         assert!(!proof.applied);
         assert!(proof.failure_reason.is_some());
         assert!(proof.transport.requests.is_empty());
         assert_eq!(before, std::fs::read(db).unwrap());
+    }
+    #[test]
+    fn regression_pipeline_rejects_source_manifest_change_during_http() {
+        let (root, db, run_root, manifest) =
+            regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) =
+            regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let (origin, worker) = server_with_manifest_change(200, Some(manifest.clone()));
+        let error = search(
+            execution(context, &expected, &pin, &manifest, Some(origin)),
+            true,
+            3,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "BINDING_SOURCE_CHANGED");
+        assert_eq!(
+            worker.join().unwrap()["documents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(before, std::fs::read(db).unwrap());
+        assert!(evidence(&run_root).applied); // Scoring succeeded; the run did not.
     }
 }
