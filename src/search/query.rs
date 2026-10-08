@@ -3414,9 +3414,23 @@ impl SearchClient {
     ) -> Result<Vec<SearchHit>> {
         if let Some(context) = &self.regression {
             context.verify_input()?;
-            // Compute and record corpus statistics before selecting candidates.
             context.lexical_statistics()?;
         }
+        let result = self.search_inner(query, filters, limit, offset, field_mask);
+        if let Some(context) = &self.regression {
+            context.verify_input()?;
+        }
+        result
+    }
+
+    fn search_inner(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
         // NFC-normalize early so every downstream consumer (Tantivy query
         // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
         // matching the NFC-indexed content.
@@ -3513,7 +3527,15 @@ impl SearchClient {
         // dispatch that used to live here (plain + federated, gated behind
         // `CASS_LEXICAL_USE_TANTIVY=1`) is deleted along with the escape
         // hatch (W2-6 Task2).
-        if self.has_populated_fts_lex() {
+        let populated = if self.regression.is_some() {
+            let guard = self.sqlite_guard()?;
+            let conn = guard.as_ref().context("regression_database_unavailable")?;
+            conn.query_opt_map("SELECT 1 FROM lex_docs LIMIT 1", &[], |row| row.get_typed::<i64>(0))?
+                .is_some()
+        } else {
+            self.has_populated_fts_lex()
+        };
+        if populated {
             if unsupported_wildcards {
                 return Ok(Vec::new());
             }
@@ -3525,7 +3547,7 @@ impl SearchClient {
                 field_mask,
             )?;
             let (_, paged_hits) =
-                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
+                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset)?;
             if can_use_cache && offset == 0 {
                 self.put_cache(&sanitized, &filters, &paged_hits);
             }
@@ -4607,7 +4629,7 @@ impl SearchClient {
                 continue;
             }
             let hits = self.hydrate_semantic_hits(&results, field_mask)?;
-            let (available_hits, paged_hits) = self.postprocess_hits_page(hits, query, &filters, limit, offset);
+            let (available_hits, paged_hits) = self.postprocess_hits_page(hits, query, &filters, limit, offset)?;
 
             tracing::trace!(
                 query = canonical,
@@ -4886,17 +4908,17 @@ impl SearchClient {
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
-    ) -> (usize, Vec<SearchHit>) {
+    ) -> Result<(usize, Vec<SearchHit>)> {
         let mut hits = deduplicate_hits_with_query(hits, query);
         if !filters.session_paths.is_empty() {
             hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
         }
         if let Some(roles) = &filters.roles {
-            hits = self.filter_hits_by_role(hits, roles);
+            hits = self.filter_hits_by_role(hits, roles)?;
         }
         let available_hits = hits.len();
         let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
-        (available_hits, paged_hits)
+        Ok((available_hits, paged_hits))
     }
 
     /// Post-hoc `--role` filter applied uniformly across lexical (Tantivy +
@@ -4908,9 +4930,21 @@ impl SearchClient {
     /// Semantic hits are already role-filtered upstream by
     /// `search_semantic_candidates`, so this is a cheap, correctness-safety-net
     /// re-check for them, not their primary enforcement.
-    fn filter_hits_by_role(&self, mut hits: Vec<SearchHit>, roles: &HashSet<u8>) -> Vec<SearchHit> {
+    fn filter_hits_by_role(&self, mut hits: Vec<SearchHit>, roles: &HashSet<u8>) -> Result<Vec<SearchHit>> {
         let keys: Vec<TantivyContentExactKey> =
             hits.iter().filter_map(message_role_lookup_key).collect();
+
+        if self.regression.is_some() {
+            let guard = self.sqlite_guard()?;
+            let connection = guard.as_ref().context("regression_database_unavailable")?;
+            let roles_by_key = hydrate_message_roles_by_conversation(connection, &keys)?;
+            hits.retain(|hit| {
+                message_role_lookup_key(hit)
+                    .and_then(|key| roles_by_key.get(&key))
+                    .is_some_and(|code| roles.contains(code))
+            });
+            return Ok(hits);
+        }
 
         let role_map: HashMap<TantivyContentExactKey, u8> = if keys.is_empty() {
             HashMap::new()
@@ -4953,7 +4987,7 @@ impl SearchClient {
                 .and_then(|key| role_map.get(&key))
                 .is_some_and(|code| roles.contains(code))
         });
-        hits
+        Ok(hits)
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -8100,6 +8134,35 @@ mod tests {
             storage.insert_conversation_tree(agent_id, workspace_id, &internal)?;
         }
         Ok((dir, db_path))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_search_does_not_mask_role_lookup_errors() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new()?;
+        let input = root.path().join("input");
+        let run = root.path().join("run");
+        std::fs::create_dir_all(input.join("doctor/locks"))?;
+        std::fs::File::create(input.join("doctor/locks/doctor-repair.lock"))?;
+        std::fs::create_dir(&run)?;
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
+        let db = input.join("agent_search.db");
+        {
+            let writer = crate::storage::testing::open_writable_for_tests(&db, crate::storage::api::Profile::Production)?;
+            writer.execute_batch("PRAGMA user_version=8; CREATE TABLE lex_docs(doc_id INTEGER PRIMARY KEY, content TEXT, title TEXT); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        }
+        let context = Arc::new(super::super::regression_io::RegressionIoContext::open(&db, &run)?);
+        let regression = SearchClient::open_for_regression(&run, context)?;
+        let mut hit = projected_minimal_fields_search_hit("title", "synthetic.jsonl");
+        hit.conversation_id = Some(1);
+        hit.line_number = Some(1);
+        let roles = HashSet::from([role_code_from_str("user").unwrap()]);
+        assert!(regression.filter_hits_by_role(vec![hit.clone()], &roles).is_err());
+        let ordinary = SearchClient::open(&run, Some(&db))?.unwrap();
+        *ordinary.sqlite.lock().unwrap() = Some(SendConnection(Connection::open_frozen_read(&db)?));
+        assert!(ordinary.filter_hits_by_role(vec![hit], &roles)?.is_empty());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
