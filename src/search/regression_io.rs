@@ -600,7 +600,7 @@ fn reject_symlink_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_private_run_root(path: &Path) -> Result<()> {
+pub(crate) fn validate_private_run_root(path: &Path) -> Result<()> {
     reject_symlink_components(path)?;
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {

@@ -62,6 +62,8 @@ pub(crate) mod readiness_projection;
 pub(crate) mod recovery_journeys;
 pub(crate) mod regression_corpus;
 pub(crate) mod regression_io;
+pub(crate) mod regression_inventory;
+pub(crate) mod regression_chunks;
 pub mod rerank;
 pub mod reranker;
 pub mod reranker_registry;
