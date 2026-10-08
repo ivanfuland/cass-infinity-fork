@@ -660,8 +660,12 @@ mod tests {
         let pin = std::env::var("CASS_VERIFIED_PIN").unwrap();
         let context =
             std::sync::Arc::new(RegressionIoContext::open(Path::new(&db), Path::new(&run))?);
-        let verified =
-            open_verified_search(context, Path::new(&expected), &pin, Path::new(&manifest))?;
+        let verified = open_verified_search(
+            context.clone(),
+            Path::new(&expected),
+            &pin,
+            Path::new(&manifest),
+        )?;
         let filters = super::super::query::SearchFilters::default();
         assert_eq!(
             verified
@@ -675,6 +679,27 @@ mod tests {
                 )?
                 .len(),
             1
+        );
+        let hits = verified.client.search(
+            "retrieval",
+            filters.clone(),
+            10,
+            0,
+            super::super::query::FieldMask::FULL,
+        )?;
+        let documents = super::super::rerank::context::build_documents_for_regression(
+            &context,
+            "retrieval",
+            &hits,
+        )?;
+        assert_eq!(documents.len(), hits.len());
+        assert!(!documents[0].is_empty());
+        let stamp = super::super::rerank::window::capture_index_stamp_for_regression(&context)?;
+        assert_eq!(stamp.schema_version, 8);
+        assert!(stamp.wal.is_none());
+        assert_eq!(
+            stamp.vector.as_ref().unwrap().generation_id,
+            verified.binding.generation.generation_id
         );
         let (vectors, _) =
             verified
@@ -725,6 +750,19 @@ mod tests {
                 .contains("VERIFIED_FTS_EXACT_FAST_READONLY_SEARCH")
         );
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn cli_fixture_export() {
+        let Some(marker) = std::env::var_os("CASS_INPUT_CLI_FIXTURE_MARKER") else {
+            return;
+        };
+        let (root, db, run, manifest) = searchable_fixture();
+        let (expected, pin) = prepare_expected(root.path(), &db, &manifest);
+        let retained_root = root.keep();
+        let value = serde_json::json!({"root":retained_root,"database":db,"run_root":run,"source_manifest":manifest,"expected_binding":expected,"expected_sha256":pin});
+        fs::write(marker, serde_json::to_vec(&value).unwrap()).unwrap();
+        println!("RETAINED_SYNTHETIC_CLI_FIXTURE_READY");
     }
 
     #[test]

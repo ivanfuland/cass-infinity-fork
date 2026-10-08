@@ -787,6 +787,30 @@ pub fn capture_index_stamp(db_path: &Path) -> Result<IndexStamp, WindowError> {
     .map_err(|_| WindowError::Corrupt)?;
     crate::storage::sqlite::ensure_readonly_schema_current(&conn)
         .map_err(|_| WindowError::Corrupt)?;
+    let (schema_version, vector) = read_index_metadata(&conn)?;
+
+    let db_after = file_identity(db_path)?;
+    let wal_after = wal_identity(&wal_path)?;
+    if db_before != db_after || wal_before != wal_after {
+        return Err(WindowError::IndexChanged);
+    }
+
+    Ok(IndexStamp {
+        db_path: canonical.to_string_lossy().into_owned(),
+        schema_version,
+        db_file: db_before,
+        wal: wal_before,
+        vector: vector.map(|snapshot| VectorIdentity {
+            generation_id: snapshot.generation_id,
+            dim: snapshot.dim,
+            fingerprint: snapshot.fingerprint,
+            revision: snapshot.revision,
+            instance_id: snapshot.instance_id,
+        }),
+    })
+}
+
+fn read_index_metadata(conn: &crate::storage::api::Conn) -> Result<(i64, Option<crate::storage::vector_domain::VectorSnapshot>), WindowError> {
     let schema_version =
         crate::storage::schema::read_user_version(&conn).map_err(|_| WindowError::Corrupt)?;
 
@@ -806,23 +830,24 @@ pub fn capture_index_stamp(db_path: &Path) -> Result<IndexStamp, WindowError> {
         })
         .map_err(|_| WindowError::Corrupt)?;
 
-    let db_after = file_identity(db_path)?;
-    let wal_after = wal_identity(&wal_path)?;
-    if db_before != db_after || wal_before != wal_after {
-        return Err(WindowError::IndexChanged);
-    }
+    Ok((schema_version, vector))
+}
 
+pub(crate) fn capture_index_stamp_for_regression(
+    context: &crate::search::regression_io::RegressionIoContext,
+) -> Result<IndexStamp, WindowError> {
+    context.verify_input().map_err(|_| WindowError::IndexChanged)?;
+    let before = file_identity(context.database())?;
+    let conn = context.connection().map_err(|_| WindowError::Corrupt)?;
+    let (schema_version, vector) = read_index_metadata(&conn)?;
+    context.verify_input().map_err(|_| WindowError::IndexChanged)?;
+    if file_identity(context.database())? != before { return Err(WindowError::IndexChanged); }
     Ok(IndexStamp {
-        db_path: canonical.to_string_lossy().into_owned(),
-        schema_version,
-        db_file: db_before,
-        wal: wal_before,
+        db_path: fs::canonicalize(context.database()).map_err(|_| WindowError::CacheUnavailable)?.to_string_lossy().into_owned(),
+        schema_version, db_file: before, wal: None,
         vector: vector.map(|snapshot| VectorIdentity {
-            generation_id: snapshot.generation_id,
-            dim: snapshot.dim,
-            fingerprint: snapshot.fingerprint,
-            revision: snapshot.revision,
-            instance_id: snapshot.instance_id,
+            generation_id: snapshot.generation_id, dim: snapshot.dim,
+            fingerprint: snapshot.fingerprint, revision: snapshot.revision, instance_id: snapshot.instance_id,
         }),
     })
 }
