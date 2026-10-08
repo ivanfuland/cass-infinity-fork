@@ -24631,6 +24631,7 @@ fn regression_request_evidence(
     timeout_ms: Option<u64>,
     semantic: &SemanticSearchOptions,
     rerank: &RerankRequestContext,
+    embedding_binding: Option<&serde_json::Value>,
 ) -> CliResult<serde_json::Value> {
     let mut filters = serde_json::to_value(filters).map_err(regression_search_error)?;
     for key in ["agents", "workspaces", "roles", "session_paths"] {
@@ -24648,6 +24649,7 @@ fn regression_request_evidence(
         "rrf_limit": limit,
         "timeout_ms": timeout_ms,
         "embedding_model": semantic.model,
+        "embedding_http_configuration": embedding_binding,
         "rerank_limit": semantic.rerank_limit,
         "rerank_provider": semantic.rerank_provider,
         "time_selectors": rerank.time_selectors,
@@ -24716,6 +24718,28 @@ fn run_cli_search(
             return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
         }
     }
+    #[cfg(feature = "infinity")]
+    let regression_embedding_config = if regression.is_some() && mode != Some(SearchMode::Lexical) {
+        let config = crate::search::infinity::InfinityConfig::from_env();
+        if config.embed_model != "BAAI/bge-m3" {
+            return Err(regression_search_error(
+                "REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH",
+            ));
+        }
+        Some(config)
+    } else {
+        None
+    };
+    #[cfg(feature = "infinity")]
+    let regression_embedding_binding = regression_embedding_config.as_ref().map(|config| serde_json::json!({
+        "requested_model": config.embed_model,
+        "origin_sha256": crate::search::regression_trace::TextDigest::of(&config.base_url).sha256,
+        "dimension": config.expected_dim,
+        "timeout_ms": config.timeout.as_millis() as u64,
+        "max_batch": config.max_batch,
+    }));
+    #[cfg(not(feature = "infinity"))]
+    let regression_embedding_binding: Option<serde_json::Value> = None;
 
     let data_dir = regression
         .as_ref()
@@ -24975,6 +24999,7 @@ fn run_cli_search(
                     timeout_ms,
                     &semantic_opts,
                     &rerank_ctx,
+                    regression_embedding_binding.as_ref(),
                 )?
             {
                 return Err(regression_search_error("TRACE_WINDOW_REQUEST_MISMATCH"));
@@ -25350,6 +25375,9 @@ fn run_cli_search(
                 Some(run) => {
                     crate::search::model_manager::load_infinity_semantic_context_for_regression(
                         &run.context,
+                        regression_embedding_config
+                            .as_ref()
+                            .expect("regression semantic configuration frozen before search"),
                     )
                     .map_err(regression_search_error)?
                 }
@@ -25744,6 +25772,7 @@ fn run_cli_search(
                     timeout_ms,
                     &semantic_opts,
                     &rerank_ctx,
+                    regression_embedding_binding.as_ref(),
                 )?,
                 transport_scope: "rerank-http-v1".into(),
                 lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
@@ -25883,6 +25912,7 @@ fn run_cli_search(
                         timeout_ms,
                         &semantic_opts,
                         &rerank_ctx,
+                        regression_embedding_binding.as_ref(),
                     )
                     .map_err(|e| anyhow::anyhow!(e.message))?,
                     transport_scope: "rerank-http-v1".into(),

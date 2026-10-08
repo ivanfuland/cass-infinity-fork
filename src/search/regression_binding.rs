@@ -867,7 +867,7 @@ pub(crate) mod tests {
             .unwrap_or(1);
         let (root, db, run, manifest) =
             if std::env::var_os("CASS_INPUT_CLI_FIXTURE_INFINITY").is_some() {
-                searchable_fixture_with_embedding(count, "bge-m3", 1024)
+                searchable_fixture_with_embedding(count, "BAAI/bge-m3", 1024)
             } else {
                 searchable_fixture_with_count(count)
             };

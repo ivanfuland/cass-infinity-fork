@@ -36,6 +36,7 @@ pub const MAX_BATCH: usize = 64;
 
 // ---- centralized config -----------------------------------------------------
 
+#[derive(Clone)]
 pub struct InfinityConfig {
     pub base_url: String,
     pub embed_model: String,
@@ -501,6 +502,10 @@ pub struct InfinityEmbedder {
 impl InfinityEmbedder {
     pub fn new() -> EmbedderResult<Self> {
         let config = InfinityConfig::from_env();
+        Self::from_config(config)
+    }
+
+    pub(crate) fn from_config(config: InfinityConfig) -> EmbedderResult<Self> {
         let client = build_client(config.timeout).map_err(|msg| EmbedderError::SubsystemError {
             subsystem: "infinity-embedder",
             source: Box::new(io::Error::other(msg)),
