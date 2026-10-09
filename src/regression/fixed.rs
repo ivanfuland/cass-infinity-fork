@@ -1181,8 +1181,12 @@ pub(crate) fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use crate::search::rerank::types::{RerankFailureReason, RerankResponse};
 
@@ -1870,6 +1874,550 @@ mod tests {
                 expected_pools(&changed, &inputs).err().unwrap().to_string(),
                 "POOL_BINDING_MISMATCH"
             );
+        }
+    }
+
+    struct PackageFixture {
+        _root: tempfile::TempDir,
+        command: RegressionCommand,
+    }
+
+    fn fixture_file(path: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn package_fixture(fault: &str) -> PackageFixture {
+        use super::super::types::{InputOptions, OutputOptions};
+        let root = tempfile::tempdir().unwrap();
+        let suite = root.path().join("package");
+        let output = root.path().join("output");
+        std::fs::create_dir(&suite).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut assets = Vec::new();
+        let mut add = |path: &str, bytes: Vec<u8>, role: &str| -> Value {
+            fixture_file(&suite.join(path), &bytes);
+            let reference = format!("/synthetic-frozen/{path}");
+            assets.push(
+                json!({"source_path":reference,"path":path,"sha256":digest(&bytes),
+                "bytes":bytes.len(),"roles":[role]}),
+            );
+            json!({"path":reference,"sha256":digest(&bytes),"bytes":bytes.len()})
+        };
+        let mut texts = Vec::new();
+        for rank in 1..=POOL_SIZE {
+            let text = if fault == "empty" && rank == 42 {
+                String::new()
+            } else {
+                format!("Synthetic document {rank}. UTF8 合成😀\n\"quoted\"\\slash")
+            };
+            texts.push(add(
+                &format!("assets/text/{rank}.txt"),
+                text.into_bytes(),
+                "candidate_text",
+            ));
+        }
+        let policy = digest(b"synthetic-fixed-label-policy");
+        let mut raw = Vec::new();
+        let mut spans = Vec::new();
+        let mut rows = Vec::new();
+        let mut declared = Vec::new();
+        for qid in QIDS {
+            let query = format!("Synthetic HTTP query {qid} 合成");
+            let query_sha = digest(query.as_bytes());
+            let mut items = Vec::new();
+            let mut span_items = Vec::new();
+            let mut ordered = vec![b'['];
+            for rank in 1..=POOL_SIZE {
+                let reference = &texts[rank - 1];
+                let mid = typed_id(rank);
+                let conversation = if fault == "conversation_gap" {
+                    json!(u64::MAX)
+                } else {
+                    json!(17)
+                };
+                let token = if fault == "score_gap" {
+                    "18446744073709551616"
+                } else if rank == 1 {
+                    "18446744073709551615"
+                } else if rank == 3 {
+                    "-0.0"
+                } else {
+                    "1.25"
+                };
+                let scoreable = !(fault == "unscoreable" && qid == "N01" && rank == 50);
+                let mut item = serde_json::to_vec(&json!({"rank":rank,"message_id":mid,
+                    "conversation_id":conversation,"text_path":reference["path"],"text_sha256":reference["sha256"],
+                    "bytes":reference["bytes"],"source_sha256":digest(b"synthetic-source"),"scoreable":scoreable,
+                    "fallback_reason":if scoreable {Value::Null} else {json!("structural_unscoreable")}})).unwrap();
+                item.pop();
+                item.extend(format!(",\"original_score\":{token}}}").as_bytes());
+                items.push(item);
+                span_items.push(json!({"rank":rank,"message_id":mid}));
+                rows.push(json!({"qid":qid,"rank":rank,"message_id":mid,"query_sha256":query_sha,
+                    "text_sha256":reference["sha256"],"label":if scoreable {"direct"} else {"unsure"},
+                    "reason":"synthetic judgement","provenance":{"kind":if scoreable {"synthetic"} else {"structural_unscoreable"}}}));
+                let mut tuple = serde_json::to_vec(&(
+                    rank,
+                    &mid,
+                    &conversation,
+                    &reference["sha256"],
+                    &reference["bytes"],
+                    digest(b"synthetic-source"),
+                ))
+                .unwrap();
+                tuple.pop();
+                tuple.push(b',');
+                tuple.extend(token.as_bytes());
+                tuple.push(b']');
+                if rank != 1 {
+                    ordered.push(b',');
+                }
+                ordered.extend(tuple);
+            }
+            ordered.push(b']');
+            let mut window =
+                serde_json::to_vec(&json!({"qid":qid,"query":query,"query_sha256":query_sha}))
+                    .unwrap();
+            window.pop();
+            window.extend(b",\"items\":[");
+            for (index, item) in items.iter().enumerate() {
+                if index != 0 {
+                    window.push(b',');
+                }
+                window.extend(item);
+            }
+            window.extend(b"]}\n");
+            raw.extend(window);
+            spans.push(json!({"qid":qid,"items":span_items}));
+            declared.push(json!({"qid":qid,"query_sha256":query_sha,"count":POOL_SIZE,"ordered_pool_sha256":digest(&ordered)}));
+        }
+        let windows = add("assets/windows.jsonl", raw, "windows");
+        let span_bytes: Vec<u8> = spans
+            .iter()
+            .flat_map(|s| {
+                let mut b = serde_json::to_vec(s).unwrap();
+                b.push(b'\n');
+                b
+            })
+            .collect();
+        let spans = add("assets/spans.jsonl", span_bytes, "span_proofs");
+        let manifest = add("assets/INPUT-MANIFEST.json",serde_json::to_vec(&json!({"schema":"cass.pr3.default-input.v1",
+            "query_order":QIDS,"pool_limit":200,"source_query_manifest_sha256":digest(b"synthetic-history"),
+            "files":{"windows":windows,"span_proofs":spans}})).unwrap(),"input_manifest");
+        let labels = add(
+            "assets/LABELS.json",
+            serde_json::to_vec(&json!({"schema":"cass.pr3.default-labels.v1",
+            "input_manifest_sha256":manifest["sha256"],"label_policy_sha256":policy,"rows":rows}))
+            .unwrap(),
+            "labels",
+        );
+        let freeze = add("assets/LABELS-FREEZE-MANIFEST.json",serde_json::to_vec(&json!({"schema":"cass.pr3.default-labels-freeze-manifest.v1",
+            "labels_frozen":true,"labels_sha256":labels["sha256"],"labels_bytes":labels["bytes"],"labels_rows":1800,
+            "input_manifest_sha256":manifest["sha256"],"label_policy_sha256":policy,
+            "not_user_confirmed":true,"not_an_independent_test_set":true})).unwrap(),"labels_freeze");
+        drop(add);
+        let counts = if fault == "unscoreable" {
+            json!({"direct":1799,"partial":0,"none":0,"unsure":1})
+        } else {
+            json!({"direct":1800,"partial":0,"none":0,"unsure":0})
+        };
+        let inventory = serde_json::to_vec(&json!({"schema":"cass.regression.source-inventory.v1","suite_id":"synthetic-fixed-v1",
+            "mode":"synthetic","query_order":QIDS,"candidate_slots":1800,"labels":counts,"runtime_prefix_map":{},"files":assets,"limits":{}})).unwrap();
+        fixture_file(&suite.join("SOURCE-INVENTORY.json"), &inventory);
+        let suite_bytes = serde_json::to_vec(&json!({"schema":"cass.regression.suite-manifest.v1","suite_id":"synthetic-fixed-v1",
+            "stage":"assets_only","mode":"synthetic","query_order":QIDS,"candidate_slots":1800,"label_counts":counts,
+            "runtime_prefix_map":{},"files":assets,"limits":{},"source_inventory_sha256":digest(&inventory)})).unwrap();
+        fixture_file(&suite.join("SUITE-MANIFEST.json"), &suite_bytes);
+        let pool = root.path().join("pool.json");
+        let pool_bytes = serde_json::to_vec(&json!({"schema":"cass.regression-fixed-pool.v1","suite_sha256":digest(&suite_bytes),
+            "input_manifest_sha256":manifest["sha256"],"windows_file_sha256":windows["sha256"],"labels_sha256":labels["sha256"],
+            "label_freeze_sha256":freeze["sha256"],"label_policy_sha256":policy,"source_inventory_sha256":digest(&inventory),"windows":declared})).unwrap();
+        fixture_file(&pool, &pool_bytes);
+        PackageFixture {
+            command: RegressionCommand::FixedCandidate {
+                input: InputOptions {
+                    suite,
+                    suite_sha256: digest(&suite_bytes),
+                    labels: root.path().join("package/assets/LABELS.json"),
+                    labels_sha256: labels["sha256"].as_str().unwrap().into(),
+                    output: OutputOptions {
+                        output_root: output,
+                        run_id: "fixed-native".into(),
+                    },
+                },
+                pool_binding: pool,
+                pool_binding_sha256: digest(&pool_bytes),
+                rerank_provider: ProviderChoice::BgeLocal,
+                cutoffs: vec![5, 10, 20],
+            },
+            _root: root,
+        }
+    }
+
+    fn archive_fixture(from: &Path, to: &Path) {
+        std::fs::create_dir(to).unwrap();
+        std::fs::set_permissions(to, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let destination = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                archive_fixture(&entry.path(), &destination);
+            } else {
+                fixture_file(&destination, &std::fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_child() {
+        let Ok(case) = std::env::var("CASS_S2_06_OWNED_CASE") else {
+            return;
+        };
+        let package = package_fixture(&case);
+        let outcome = run(&package.command);
+        let RegressionCommand::FixedCandidate { input, .. } = &package.command else {
+            unreachable!();
+        };
+        let root = input.output.output_root.join(&input.output.run_id);
+        let gap = matches!(case.as_str(), "score_gap" | "conversation_gap");
+        if gap {
+            assert!(outcome.is_err());
+            assert!(!root.join("run.json").exists());
+            let failure: Value =
+                serde_json::from_slice(&std::fs::read(root.join("fixed-failure.json")).unwrap())
+                    .unwrap();
+            assert_eq!(failure["quality_status"], "FAILED");
+            assert_eq!(
+                failure["known_original_associations"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                9
+            );
+            assert_eq!(failure["counts"][0]["http_attempts"], 0);
+            assert_eq!(
+                failure["failure_code"],
+                if case == "score_gap" {
+                    "REGRESSION_FIXED_UNREPRESENTABLE_SCORE"
+                } else {
+                    "REGRESSION_FIXED_UNREPRESENTABLE_CONVERSATION"
+                }
+            );
+        } else {
+            let report: Value =
+                serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
+            let succeeds = matches!(case.as_str(), "tie" | "reverse" | "unknown_model");
+            assert_eq!(outcome.is_ok(), succeeds);
+            assert_eq!(
+                report["terminal"],
+                if succeeds { "SUCCESS" } else { "FAILED" }
+            );
+            assert_eq!(
+                report["quality_status"],
+                if succeeds { "NOT_EVALUATED" } else { "FAILED" }
+            );
+            assert_eq!(report["questions"].as_array().unwrap().len(), 9);
+            assert!(
+                report["expected_binding"].is_null()
+                    && report["observed_before"].is_null()
+                    && report["observed_after"].is_null()
+            );
+            let validated = super::super::input::validate_inputs(input).unwrap();
+            let pool = super::super::input::read_pinned_json(
+                match &package.command {
+                    RegressionCommand::FixedCandidate { pool_binding, .. } => pool_binding,
+                    _ => unreachable!(),
+                },
+                match &package.command {
+                    RegressionCommand::FixedCandidate {
+                        pool_binding_sha256,
+                        ..
+                    } => pool_binding_sha256,
+                    _ => unreachable!(),
+                },
+            )
+            .unwrap();
+            let pools = prepare_pools(
+                &validated,
+                &read_windows(&validated).unwrap(),
+                &expected_pools(&pool, &validated).unwrap(),
+            )
+            .unwrap();
+            for (index, (question, pool)) in report["questions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(&pools)
+                .enumerate()
+            {
+                let slots = question["slots"].as_array().unwrap();
+                assert_eq!(pool.verify_recovery(slots).unwrap().len(), 200);
+                assert_eq!(
+                    slots[if case == "reverse" { 199 } else { 0 }]["original_score"].as_u64(),
+                    Some(u64::MAX)
+                );
+                if case == "unscoreable" && index == 0 {
+                    assert_eq!(
+                        question["failure_code"],
+                        "REGRESSION_FIXED_UNSCOREABLE_POOL"
+                    );
+                    assert_eq!(question["cost"]["http"][0]["http_attempts"], 0);
+                    assert_eq!(slots[49]["label"], "unsure");
+                    assert!(
+                        !root
+                            .join(format!("label-subjects-{}.json", pool.window.qid))
+                            .exists()
+                    );
+                }
+                if question["terminal"] == "FAILED" {
+                    assert!(slots.iter().all(|s| s["rerank_score"].is_null()));
+                }
+                if question["rerank_applied"] == true {
+                    let subjects: Value = serde_json::from_slice(
+                        &std::fs::read(
+                            root.join(format!("label-subjects-{}.json", pool.window.qid)),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(subjects["schema"], "cass.regression-label-subjects.v1");
+                    assert_eq!(subjects["candidates"].as_array().unwrap().len(), 200);
+                    for candidate in subjects["candidates"].as_array().unwrap() {
+                        let text = candidate["text"]["utf8"].as_str().unwrap();
+                        assert_eq!(candidate["text"]["sha256"], digest(text.as_bytes()));
+                        let slot = slots
+                            .iter()
+                            .find(|s| {
+                                s["candidate_instance_key"] == candidate["candidate_instance_key"]
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            slot["sent_text"],
+                            json!({"sha256":digest(text.as_bytes()),"utf8_bytes":text.len()})
+                        );
+                        assert_eq!(candidate["label_key"], slot["label_key"]);
+                    }
+                }
+            }
+            if case == "unknown_model" {
+                assert!(report["backend_identity"]["actual_model"].is_null());
+            }
+            if case == "timeout" {
+                assert_eq!(report["questions"][0]["timed_out"], true);
+                assert_eq!(report["cost"]["counts"][0]["delivery_unknown"], 1);
+            }
+            if report["cost"]["counts"][0]["http_attempts"] != 0 {
+                assert!(report["cost"]["counts"][0]["model_executions"].is_null());
+            }
+        }
+        if let Ok(destination) = std::env::var("CASS_S2_06_CASE_ARTIFACT") {
+            archive_fixture(package._root.path(), Path::new(&destination));
+        }
+        println!("FIXED_NATIVE_CASE={case} library_entry_complete=true actual_model_cloud=false");
+    }
+
+    fn read_http(mut stream: &TcpStream) -> (String, String, Vec<u8>) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut block = [0; 4096];
+        let split = loop {
+            let n = stream.read(&mut block).unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&block[..n]);
+            if let Some(index) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break index + 4;
+            }
+            assert!(bytes.len() < 16384);
+        };
+        let header = std::str::from_utf8(&bytes[..split]).unwrap();
+        let first = header.lines().next().unwrap();
+        let mut parts = first.split_whitespace();
+        let method = parts.next().unwrap().to_string();
+        let path = parts.next().unwrap().to_string();
+        let len = header
+            .lines()
+            .find_map(|line| {
+                line.split_once(':')
+                    .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(len < 2_000_000);
+        while bytes.len() - split < len {
+            let n = stream.read(&mut block).unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&block[..n]);
+        }
+        (method, path, bytes[split..split + len].to_vec())
+    }
+
+    #[test]
+    fn owned_http_complete_200_failure_payloads_timeout_and_fresh_recovery() {
+        // No process-global env/static state is set. The only env window is an
+        // owned child, and the server listens solely on its owned loopback port.
+        for case in [
+            "tie",
+            "reverse",
+            "unscoreable",
+            "short",
+            "extra",
+            "duplicate",
+            "range",
+            "type",
+            "nonfinite",
+            "model",
+            "unknown_model",
+            "http500",
+            "disconnect",
+            "timeout",
+            "empty",
+            "score_gap",
+            "conversation_gap",
+            "tie",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let records = captured.clone();
+            let post_count = Arc::new(AtomicUsize::new(0));
+            let posts = post_count.clone();
+            let server = std::thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stopping.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let records = records.clone();
+                            let posts = posts.clone();
+                            handlers.push(std::thread::spawn(move || {
+                                let (method,path,bytes)=read_http(&stream);
+                                let body=if bytes.is_empty() {Value::Null} else {serde_json::from_slice(&bytes).unwrap()};
+                                records.lock().unwrap().push(json!({"method":method,"path":path,"body":body,"body_sha256":digest(&bytes)}));
+                                let (status,response)=if path=="/models" {(200,serde_json::to_vec(&json!({"data":[{"id":"BAAI/bge-reranker-v2-m3"}]})).unwrap())}
+                                else {assert_eq!(method,"POST");assert_eq!(path,"/rerank");
+                                    assert_eq!(body["documents"].as_array().unwrap().len(),200);
+                                    let ordinal=posts.fetch_add(1,Ordering::SeqCst);
+                                    if case=="disconnect" {return;}
+                                    if case=="timeout" && ordinal==0 {std::thread::sleep(Duration::from_secs(65));}
+                                    let mut rows:Vec<_>=(0..200).map(|i| json!({"index":i,"relevance_score":if case=="reverse" {i as f64} else {1.0}})).collect();
+                                    match case {"short"=>{rows.pop();},"extra"=>rows.push(json!({"index":200,"relevance_score":1.0})),
+                                        "duplicate"=>rows[199]["index"]=json!(0),"range"=>rows[199]["index"]=json!(200),
+                                        "type"=>rows[0]["index"]=json!("0"),_=>{}}
+                                    if case=="http500" {(500,b"{\"error\":\"SYNTHETIC_SERVER_BODY_NOT_FOR_STDOUT\"}".to_vec())}
+                                    else if case=="nonfinite" {(200,b"{\"results\":[{\"index\":0,\"relevance_score\":1e999}]}".to_vec())}
+                                    else {let mut response=json!({"results":rows});if case!="unknown_model" {
+                                        response["model"]=json!(if case=="model" {"synthetic-wrong-model"} else {"BAAI/bge-reranker-v2-m3"});}
+                                        (200,serde_json::to_vec(&response).unwrap())}
+                                };
+                                let header=format!("HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len());
+                                let _=stream.write_all(header.as_bytes());let _=stream.write_all(&response);
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(error) => panic!("owned listener failed: {error}"),
+                    }
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+            });
+            let case_root = tempfile::tempdir().unwrap();
+            let archive = case_root.path().join("case");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "regression::fixed::tests::owned_http_child",
+                    "--nocapture",
+                ])
+                .env("CASS_INFINITY_URL", &origin)
+                .env_remove("HTTP_PROXY")
+                .env_remove("HTTPS_PROXY")
+                .env_remove("ALL_PROXY")
+                .env_remove("http_proxy")
+                .env_remove("https_proxy")
+                .env_remove("all_proxy")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("CASS_S2_06_OWNED_CASE", case)
+                .env("CASS_S2_06_CASE_ARTIFACT", &archive)
+                .output()
+                .unwrap();
+            stop.store(true, Ordering::SeqCst);
+            server.join().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let records = captured.lock().unwrap().clone();
+            assert_eq!(
+                post_count.load(Ordering::SeqCst),
+                if case == "unscoreable" {
+                    8
+                } else if matches!(case, "empty" | "score_gap" | "conversation_gap") {
+                    0
+                } else {
+                    9
+                }
+            );
+            let run = archive.join("output/fixed-native/run.json");
+            if run.exists() {
+                let report: Value = serde_json::from_slice(&std::fs::read(&run).unwrap()).unwrap();
+                assert_eq!(report["cost"]["counts"][0]["http_attempts"], records.len());
+                for request in records.iter().filter(|r| r["method"] == "POST") {
+                    let query = request["body"]["query"].as_str().unwrap();
+                    let qid = QIDS.iter().find(|qid| query.contains(**qid)).unwrap();
+                    let trace: Value = serde_json::from_slice(
+                        &std::fs::read(
+                            archive.join(format!("output/fixed-native/fixed-trace-{qid}.json")),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let post = trace["transport"]["requests"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["method"] == "POST")
+                        .unwrap();
+                    assert_eq!(post["json_body_sha256"], request["body_sha256"]);
+                    assert_eq!(post["query"]["sha256"], digest(query.as_bytes()));
+                    for (index, text) in request["body"]["documents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                    {
+                        let text = text.as_str().unwrap();
+                        assert_eq!(post["documents"][index]["input_slot"], index);
+                        assert_eq!(
+                            post["documents"][index]["text"],
+                            json!({"sha256":digest(text.as_bytes()),"utf8_bytes":text.len()})
+                        );
+                    }
+                }
+            }
+            if let Ok(parent) = std::env::var("CASS_S2_06_ARTIFACT_ROOT") {
+                let parent = Path::new(&parent);
+                let suffix = std::fs::read_dir(parent).unwrap().count();
+                let destination = parent.join(format!("{case}-{suffix}"));
+                archive_fixture(&archive, &destination);
+                fixture_file(
+                    &destination.join("server-requests.json"),
+                    &serde_json::to_vec(&records).unwrap(),
+                );
+                fixture_file(&destination.join("child-stdout.txt"), &output.stdout);
+                fixture_file(&destination.join("child-stderr.txt"), &output.stderr);
+            }
         }
     }
 }

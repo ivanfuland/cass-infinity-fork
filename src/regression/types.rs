@@ -122,10 +122,6 @@ pub(crate) struct Asset {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "S2-06 consumes conversation identity and fallback provenance"
-)]
 pub(crate) struct InputSlot {
     pub(crate) rank: usize,
     pub(crate) message_id: MessageId,
@@ -161,7 +157,6 @@ pub(crate) struct LabelKey {
 }
 
 /// No canonical-object hash replaces an externally verified file hash.
-#[expect(dead_code, reason = "S2-04/S2-06 consume the verified asset registry")]
 pub(crate) struct ValidatedInputs {
     pub(crate) suite_root: PathBuf,
     pub(crate) suite_sha256: String,
