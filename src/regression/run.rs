@@ -302,6 +302,21 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
     if let Some(code) = CODES.iter().find(|code| text.contains(**code)) {
         return code;
     }
+    const WINDOW_CODES: &[&str] = &[
+        "invalid_input",
+        "cache_unavailable",
+        "not_found",
+        "invalid_cursor",
+        "corrupt",
+        "expired",
+        "binding_mismatch",
+        "index_changed",
+    ];
+    for cause in error.chain() {
+        if let Some(code) = WINDOW_CODES.iter().find(|code| cause.to_string() == **code) {
+            return code;
+        }
+    }
     let input = super::input::error_code(error);
     if input != "REGRESSION_INPUT_FAILED" {
         return input;

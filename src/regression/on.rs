@@ -63,6 +63,41 @@ fn validate_snapshot(
     Ok(())
 }
 
+fn load_verified_page(
+    run: &RegressionSearchRun,
+    query: &str,
+    store: &WindowStore,
+    cursor: &str,
+    binding: &window::RequestBinding,
+    evidence: &WindowEvidence,
+    expected_offset: usize,
+) -> Result<(WindowSnapshot, usize)> {
+    let (loaded, offset) = store
+        .load_for_regression(
+            cursor,
+            binding,
+            &run.context,
+            crate::storage::sqlite::FrankenStorage::now_millis(),
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e.as_str()))?;
+    if offset != expected_offset {
+        bail!("TRACE_PAGE_SEQUENCE_MISMATCH");
+    }
+    let raw = loaded
+        .retrieval_status
+        .get("regression")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("TRACE_WINDOW_MISSING"))?;
+    let actual: WindowEvidence = serde_json::from_value(raw)
+        .map_err(|_| anyhow::anyhow!("TRACE_WINDOW_BINDING_MISMATCH"))?;
+    if serde_json::to_vec(&actual)? != serde_json::to_vec(evidence)? {
+        bail!("TRACE_WINDOW_BINDING_MISMATCH");
+    }
+    validate_snapshot(run, query, &loaded, &actual)?;
+    Ok((loaded, offset))
+}
+
 fn score_question(
     run: &RegressionSearchRun,
     window: &super::types::InputWindow,
@@ -229,27 +264,15 @@ fn score_question(
             let Some(cursor) = cursor_out else {
                 break;
             };
-            let (loaded, loaded_offset) = store
-                .load_for_regression(
-                    &cursor,
-                    &snapshot.request_binding,
-                    &run.context,
-                    crate::storage::sqlite::FrankenStorage::now_millis(),
-                )
-                .map_err(|e| anyhow::anyhow!("{}", e.as_str()))?;
-            if loaded_offset != offset {
-                bail!("TRACE_PAGE_SEQUENCE_MISMATCH");
-            }
-            let loaded_evidence: WindowEvidence = serde_json::from_value(
-                loaded
-                    .retrieval_status
-                    .get("regression")
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("TRACE_WINDOW_MISSING"))?,
+            let (loaded, _) = load_verified_page(
+                run,
+                &window.query,
+                &store,
+                &cursor,
+                &snapshot.request_binding,
+                &evidence,
+                offset,
             )?;
-            if serde_json::to_vec(&loaded_evidence)? != serde_json::to_vec(&evidence)? {
-                bail!("TRACE_WINDOW_BINDING_MISMATCH");
-            }
             cursor_in = Some(cursor);
             current = loaded;
         }
@@ -642,6 +665,185 @@ mod tests {
         (f, data, cmd)
     }
 
+    fn check_actual_page_guards(run: &RegressionSearchRun, report: &Value) {
+        use base64::Engine;
+        let q = &report["questions"][0];
+        let root = &run.validated.paths.run_root;
+        let evidence: WindowEvidence = serde_json::from_slice(
+            &std::fs::read(root.join(q["window_evidence"]["relative_path"].as_str().unwrap()))
+                .unwrap(),
+        )
+        .unwrap();
+        let pages: Vec<PageEvidence> = q["pages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                serde_json::from_slice(
+                    &std::fs::read(
+                        root.join(p["page_evidence"]["relative_path"].as_str().unwrap()),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        for index in [0, 1, pages.len() - 1] {
+            let mut changed = pages.clone();
+            changed.remove(index);
+            assert!(regression_trace::validate_complete_pages(&changed, &evidence).is_err());
+        }
+        let mut changed = pages.clone();
+        changed.insert(1, pages[0].clone());
+        assert!(regression_trace::validate_complete_pages(&changed, &evidence).is_err());
+        changed = pages.clone();
+        changed.swap(0, 1);
+        assert!(regression_trace::validate_complete_pages(&changed, &evidence).is_err());
+        changed = pages.clone();
+        changed[1].offset += 1;
+        assert!(regression_trace::validate_complete_pages(&changed, &evidence).is_err());
+        let id = q["pages"][0]["window_id"].as_str().unwrap();
+        let cache = root.join("cache/rerank-windows").join(format!("{id}.json"));
+        let original = std::fs::read(&cache).unwrap();
+        let value: Value = serde_json::from_slice(&original).unwrap();
+        let binding: window::RequestBinding =
+            serde_json::from_value(value["request_binding"].clone()).unwrap();
+        let offset = q["pages"][1]["offset"].as_u64().unwrap() as usize;
+        let cursor = base64::prelude::BASE64_STANDARD.encode(
+            serde_json::to_vec(&json!({"version":2,"window_id":id,"offset":offset})).unwrap(),
+        );
+        let store = WindowStore::open_existing(root, WindowPolicy::default()).unwrap();
+        load_verified_page(
+            run,
+            "retrieval",
+            &store,
+            &cursor,
+            &binding,
+            &evidence,
+            offset,
+        )
+        .unwrap();
+        for field in ["K", "provider", "endpoint", "query", "mode"] {
+            let mut altered = serde_json::to_value(&binding).unwrap();
+            match field {
+                "K" => altered["rerank_limit"] = json!(2),
+                "provider" => altered["rerank_provider"] = json!("qwen3-local"),
+                "endpoint" => altered["endpoint"] = json!("http://127.0.0.1:1"),
+                "query" => altered["query"] = json!("changed synthetic query"),
+                _ => altered["mode"] = json!("hybrid"),
+            }
+            let altered: window::RequestBinding = serde_json::from_value(altered).unwrap();
+            assert!(
+                load_verified_page(
+                    run,
+                    "retrieval",
+                    &store,
+                    &cursor,
+                    &altered,
+                    &evidence,
+                    offset
+                )
+                .is_err(),
+                "{field}"
+            );
+        }
+        assert!(
+            load_verified_page(
+                run,
+                "retrieval",
+                &store,
+                &cursor,
+                &binding,
+                &evidence,
+                offset + 1
+            )
+            .is_err()
+        );
+        let (snapshot, _) = store
+            .load_for_regression(
+                &cursor,
+                &binding,
+                &run.context,
+                crate::storage::sqlite::FrankenStorage::now_millis(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .load_for_regression(&cursor, &binding, &run.context, snapshot.expires_at_ms + 1)
+                .is_err()
+        );
+        std::fs::write(&cache, b"corrupt synthetic cache").unwrap();
+        assert!(
+            load_verified_page(
+                run,
+                "retrieval",
+                &store,
+                &cursor,
+                &binding,
+                &evidence,
+                offset
+            )
+            .is_err()
+        );
+        std::fs::write(&cache, &original).unwrap();
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            load_verified_page(
+                run,
+                "retrieval",
+                &store,
+                &cursor,
+                &binding,
+                &evidence,
+                offset
+            )
+            .is_err()
+        );
+        std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for fault in ["missing-trace", "request", "failed"] {
+            let mut altered = value.clone();
+            match fault {
+                "missing-trace" => {
+                    altered["retrieval_status"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("regression");
+                }
+                "request" => {
+                    altered["retrieval_status"]["regression"]["request"]["rrf_limit"] = json!(999)
+                }
+                _ => {
+                    altered["retrieval_status"]["regression"]["failure_reason"] =
+                        json!("synthetic failure")
+                }
+            }
+            let bytes = serde_json::to_vec(&altered).unwrap();
+            let new_id = digest(&bytes);
+            std::fs::write(
+                root.join("cache/rerank-windows")
+                    .join(format!("{new_id}.json")),
+                &bytes,
+            )
+            .unwrap();
+            let cursor = base64::prelude::BASE64_STANDARD.encode(
+                serde_json::to_vec(&json!({"version":2,"window_id":new_id,"offset":offset}))
+                    .unwrap(),
+            );
+            assert!(
+                load_verified_page(
+                    run,
+                    "retrieval",
+                    &store,
+                    &cursor,
+                    &binding,
+                    &evidence,
+                    offset
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn on_window_child() {
         let Ok(marker) = dotenvy::var("CASS_S2_05_CHILD") else {
@@ -654,27 +856,37 @@ mod tests {
         let fault = config.get("fault").and_then(Value::as_str).unwrap_or("");
         let (f, _data, cmd) = command(n, k, count, fault);
         let started = Instant::now();
-        let result = if fault == "source-change" {
+        let result = if fault == "source-change" || fault == "page-guards" {
             let validated = super::super::input::prepare_full(&cmd).unwrap();
             let run = RegressionSearchRun::activate(validated, &cmd).unwrap();
-            std::fs::write(
-                run.validated.source_manifest.as_ref().unwrap(),
-                b"changed synthetic source during on aggregate",
-            )
-            .unwrap();
-            super::collect(
+            if fault == "source-change" {
+                std::fs::write(
+                    run.validated.source_manifest.as_ref().unwrap(),
+                    b"changed synthetic source during on aggregate",
+                )
+                .unwrap();
+            }
+            let outcome = super::collect(
                 &run,
                 &RunProvenance::capture().unwrap(),
                 started,
                 milliseconds(started),
-            )
+            );
+            if fault == "page-guards" {
+                let report: Value = serde_json::from_slice(
+                    &std::fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
+                )
+                .unwrap();
+                check_actual_page_guards(&run, &report);
+            }
+            outcome
         } else {
             super::run(&cmd)
         };
         let root = f.input.output.output_root.join(&f.input.output.run_id);
         let report: Value =
             serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
-        let failed = !fault.is_empty() && fault != "empty-query";
+        let failed = !fault.is_empty() && fault != "empty-query" && fault != "page-guards";
         if failed {
             let error = result.unwrap_err();
             assert_eq!(report["terminal"], "FAILED");
@@ -891,7 +1103,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stdout)
         );
-        let successful = fault.is_empty() || fault == "source-change";
+        let successful = fault.is_empty() || fault == "source-change" || fault == "page-guards";
         assert_eq!(
             gets,
             if fault == "empty-query" {
@@ -962,5 +1174,9 @@ mod tests {
     #[test]
     fn on_final_source_change_keeps_nine_windows_but_failed_run() {
         window_case_with_fault(7, 3, 9, "source-change");
+    }
+    #[test]
+    fn actual_page_closure_and_binding_cache_guards_refuse_tampering() {
+        window_case_with_fault(7, 3, 9, "page-guards");
     }
 }
