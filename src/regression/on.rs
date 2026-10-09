@@ -974,7 +974,18 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let mut readonly_directories = Vec::new();
         if fault == "os-readonly" {
+            let mut pending = sources.to_vec();
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    }
+                }
+                readonly_directories.push(directory);
+            }
             for root in &sources {
                 for rel in private_files(root).unwrap() {
                     std::fs::set_permissions(
@@ -983,7 +994,14 @@ mod tests {
                     )
                     .unwrap();
                 }
-                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            for directory in &readonly_directories {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555))
+                    .unwrap();
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
             }
         }
         if fault == "guard-only" {
@@ -1119,9 +1137,18 @@ mod tests {
                     .collect();
                 assert_eq!(keys.len(), actual);
                 for (i, slot) in slots.iter().enumerate() {
-                    assert_eq!(slot["retrieval_rank"], i + 1);
+                    if fault == "neighbour" {
+                        // Strictly increasing scores reverse the original input.
+                        // The durable subject must still use the original slot.
+                        let input_slot = actual - 1 - i;
+                        assert_eq!(slot["input_slot"], input_slot);
+                        assert_eq!(slot["retrieval_rank"], input_slot + 1);
+                        assert_eq!(slot["rerank_score"], input_slot as f64);
+                    } else {
+                        assert_eq!(slot["retrieval_rank"], i + 1);
+                        assert_eq!(slot["rerank_score"], 1.0);
+                    }
                     assert_eq!(slot["final_rank"], i + 1);
-                    assert_eq!(slot["rerank_score"], 1.0);
                     assert!(!slot["sent_text"].is_null());
                 }
                 for page in q["pages"].as_array().unwrap().iter().skip(1) {
@@ -1145,6 +1172,14 @@ mod tests {
             );
         }
         if fault == "os-readonly" {
+            for directory in &readonly_directories {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
             for (root, expected) in sources.iter().zip(&before) {
                 let after: Vec<_> = private_files(root)
                     .unwrap()
@@ -1286,7 +1321,7 @@ mod tests {
                         } else {
                             len
                         };
-                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":1.0})).collect::<Vec<_>>()}).to_string())
+                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":if server_fault=="neighbour" {i as f64} else {1.0}})).collect::<Vec<_>>()}).to_string())
                     }
                 };
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
