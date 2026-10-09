@@ -419,6 +419,7 @@ mod tests {
     use super::super::types::*;
     use super::*;
     use crate::search::regression_binding;
+    use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     const QIDS: [&str; 9] = [
@@ -799,5 +800,21 @@ mod tests {
     #[test]
     fn first_on_window_has_complete_pages_and_one_scoring_post_per_query() {
         window_case(7, 3, 9);
+    }
+    #[test]
+    fn full_n200_k5_collects_nine_complete_forty_page_windows() {
+        window_case(200, 5, 201);
+    }
+    #[test]
+    fn full_n200_k10_collects_nine_complete_twenty_page_windows() {
+        window_case(200, 10, 201);
+    }
+    #[test]
+    fn short_n200_k5_preserves_actual_seven_and_two_pages() {
+        window_case(200, 5, 7);
+    }
+    #[test]
+    fn full_n7_k5_delivers_five_then_two() {
+        window_case(7, 5, 9);
     }
 }
