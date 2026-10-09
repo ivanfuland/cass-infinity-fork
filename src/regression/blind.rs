@@ -23,7 +23,7 @@ const QIDS: [&str; 9] = [
 
 pub(crate) struct VerifiedLabelRun {
     pin: FilePin,
-    run: RunWire,
+    capture: VerifiedRunCapture,
     root: PathBuf,
     subjects: Vec<SubjectFile>,
 }
@@ -34,20 +34,27 @@ struct SubjectFile {
 }
 
 impl VerifiedLabelRun {
+    pub(crate) fn observed_file_sha256(&self) -> &str {
+        self.pin.expected_sha256()
+    }
+    pub(crate) fn capture(&self) -> &VerifiedRunCapture {
+        &self.capture
+    }
     pub(super) fn suite_sha256(&self) -> &str {
-        &self.run.suite_sha256
+        &self.capture.wire.suite_sha256
     }
     pub(super) fn policy_sha256(&self) -> &str {
-        &self.run.label_policy_sha256
+        &self.capture.wire.label_policy_sha256
     }
     pub(super) fn capture_labels_sha256(&self) -> &str {
-        &self.run.labels_sha256
+        &self.capture.wire.labels_sha256
     }
     pub(super) fn capture_slots(&self) -> impl Iterator<Item = (&LabelKey, SlotLabel)> {
-        self.run
-            .questions
-            .iter()
-            .flat_map(|q| q.slots.iter().map(|s| (&s.key, s.label.resolved())))
+        self.capture.questions.iter().flat_map(|q| {
+            q.slots
+                .iter()
+                .map(|s| (&s.wire.key, s.wire.label.resolved()))
+        })
     }
 
     fn unknown_text(&self, key: &LabelKey) -> Result<(String, String)> {
@@ -186,12 +193,40 @@ pub(crate) fn load_run_subjects(pin: &FilePin) -> Result<VerifiedLabelRun> {
         )?;
         require(request.is_object(), "LABEL_RUN_INVALID")?;
     }
+    let provenance = CaptureProvenance {
+        source_commit: run.source_commit.clone(),
+        binary_sha256: run.binary_sha256.clone(),
+        argv_sha256: run.argv_sha256.clone(),
+    };
+    let questions = std::mem::take(&mut run.questions)
+        .into_iter()
+        .map(|mut wire| {
+            let slots = std::mem::take(&mut wire.slots)
+                .into_iter()
+                .map(|wire| VerifiedSlotCapture { wire })
+                .collect();
+            VerifiedQuestionCapture { wire, slots }
+        })
+        .collect();
     Ok(VerifiedLabelRun {
         pin: pin.clone(),
-        run,
+        capture: VerifiedRunCapture {
+            wire: run,
+            provenance,
+            questions,
+        },
         root,
         subjects,
     })
+}
+
+pub(crate) fn load_run_subjects_with_capture(
+    run: &FilePin,
+    capture: &LegacyBaseValidated,
+) -> Result<VerifiedLabelRun> {
+    let run = load_run_subjects(run)?;
+    capture.check_run(&run)?;
+    Ok(run)
 }
 
 pub(crate) fn export_blind(
@@ -684,7 +719,7 @@ struct ArtifactWire {
 }
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DigestWire {
+pub(crate) struct DigestWire {
     sha256: String,
     utf8_bytes: u64,
 }
@@ -729,22 +764,22 @@ struct SubjectItem {
     text: TextWire,
 }
 
-#[derive(PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum RunMode {
+pub(crate) enum RunMode {
     FullSearch,
     FixedCandidate,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum Terminal {
+pub(crate) enum Terminal {
     Success,
     ShortWindow,
     Failed,
 }
-#[derive(PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum Quality {
+pub(crate) enum Quality {
     NotEvaluated,
     Eligible,
     IncompleteLabels,
@@ -772,7 +807,7 @@ impl CapturedLabel {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct IdentityWire {
+pub(crate) struct IdentityWire {
     identity_host: String,
     agent_slug: String,
     external_id: String,
@@ -863,7 +898,7 @@ struct QuestionWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CountWire {
+pub(crate) struct CountWire {
     scope: String,
     #[serde(deserialize_with = "present_nullable")]
     http_attempts: Option<u64>,
@@ -877,7 +912,7 @@ struct CountWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResourceWire {
+pub(crate) struct ResourceWire {
     name: String,
     #[serde(deserialize_with = "present_nullable")]
     value: Option<f64>,
@@ -887,7 +922,7 @@ struct ResourceWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct QuestionCostWire {
+pub(crate) struct QuestionCostWire {
     identity_before_ms: f64,
     identity_after_ms: f64,
     retrieval_ms: f64,
@@ -902,7 +937,7 @@ struct QuestionCostWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunCostWire {
+pub(crate) struct RunCostWire {
     all_run_ms: f64,
     identity_before_ms: f64,
     identity_after_ms: f64,
@@ -918,7 +953,7 @@ struct RunCostWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SourceWire {
+pub(crate) struct SourceWire {
     #[serde(deserialize_with = "present_nullable")]
     source_manifest_sha256: Option<String>,
     #[serde(deserialize_with = "present_nullable")]
@@ -938,7 +973,7 @@ struct SourceWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct BackendWire {
+pub(crate) struct BackendWire {
     #[serde(deserialize_with = "present_nullable")]
     provider: Option<String>,
     #[serde(deserialize_with = "present_nullable")]
@@ -956,7 +991,7 @@ struct BackendWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RequestWire {
+pub(crate) struct RequestWire {
     #[serde(deserialize_with = "present_nullable")]
     search_mode: Option<String>,
     #[serde(deserialize_with = "present_nullable")]
@@ -984,7 +1019,7 @@ struct OutputWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ClaimsWire {
+pub(crate) struct ClaimsWire {
     dataset: String,
     attribution: String,
     fts_vec_correctness: String,
@@ -992,7 +1027,7 @@ struct ClaimsWire {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AfterWire {
+pub(crate) struct AfterWire {
     basis: String,
     inventory_digests: String,
     database_sha256: String,
@@ -1042,6 +1077,451 @@ struct RunWire {
     claims: ClaimsWire,
     #[serde(deserialize_with = "present_nullable")]
     after_verification: Option<AfterWire>,
+}
+
+// Only the loaders above can construct these proof views. Their wire objects
+// remain private; 08 consumes named readonly fields, never a raw JSON fallback.
+pub(crate) struct VerifiedRunCapture {
+    wire: RunWire,
+    provenance: CaptureProvenance,
+    questions: Vec<VerifiedQuestionCapture>,
+}
+pub(crate) struct CaptureProvenance {
+    source_commit: String,
+    binary_sha256: String,
+    argv_sha256: String,
+}
+pub(crate) struct VerifiedQuestionCapture {
+    wire: QuestionWire,
+    slots: Vec<VerifiedSlotCapture>,
+}
+pub(crate) struct VerifiedSlotCapture {
+    wire: SlotWire,
+}
+pub(crate) type RunTerminal = Terminal;
+pub(crate) type RunQualityStatus = Quality;
+pub(crate) type CaptureSourceIdentity = SourceWire;
+pub(crate) type CaptureRequest = RequestWire;
+pub(crate) type CaptureBackendIdentity = BackendWire;
+pub(crate) type CaptureRunCost = RunCostWire;
+pub(crate) type CaptureQuestionCost = QuestionCostWire;
+pub(crate) type CaptureCounts = CountWire;
+pub(crate) type CaptureResourceMeasurement = ResourceWire;
+pub(crate) type CaptureClaims = ClaimsWire;
+pub(crate) type CaptureAfterVerification = AfterWire;
+pub(crate) type CaptureIdentity = IdentityWire;
+pub(crate) type CaptureTextDigest = DigestWire;
+
+impl VerifiedRunCapture {
+    pub(crate) fn mode(&self) -> RunMode {
+        self.wire.mode
+    }
+    pub(crate) fn terminal(&self) -> RunTerminal {
+        self.wire.terminal
+    }
+    pub(crate) fn quality_status(&self) -> RunQualityStatus {
+        self.wire.quality_status
+    }
+    pub(crate) fn failure_code(&self) -> Option<&str> {
+        self.wire.failure_code.as_deref()
+    }
+    pub(crate) fn provenance(&self) -> &CaptureProvenance {
+        &self.provenance
+    }
+    pub(crate) fn suite_sha256(&self) -> &str {
+        &self.wire.suite_sha256
+    }
+    pub(crate) fn query_manifest_sha256(&self) -> &str {
+        &self.wire.query_manifest_sha256
+    }
+    pub(crate) fn capture_labels_sha256(&self) -> &str {
+        &self.wire.labels_sha256
+    }
+    pub(crate) fn label_policy_sha256(&self) -> &str {
+        &self.wire.label_policy_sha256
+    }
+    pub(crate) fn source_identity(&self) -> &CaptureSourceIdentity {
+        &self.wire.source_identity
+    }
+    pub(crate) fn request(&self) -> &CaptureRequest {
+        &self.wire.request
+    }
+    pub(crate) fn backend_identity(&self) -> &CaptureBackendIdentity {
+        &self.wire.backend_identity
+    }
+    pub(crate) fn expected_binding(&self) -> Option<&InputBinding> {
+        self.wire.expected_binding.as_ref()
+    }
+    pub(crate) fn observed_before(&self) -> Option<&InputBinding> {
+        self.wire.observed_before.as_ref()
+    }
+    pub(crate) fn observed_after(&self) -> Option<&InputBinding> {
+        self.wire.observed_after.as_ref()
+    }
+    pub(crate) fn expected_binding_file_sha256(&self) -> Option<&str> {
+        self.wire.expected_binding_file_sha256.as_deref()
+    }
+    pub(crate) fn after_verification(&self) -> Option<&CaptureAfterVerification> {
+        self.wire.after_verification.as_ref()
+    }
+    pub(crate) fn fixed_input_manifest_sha256(&self) -> Option<&str> {
+        self.wire.fixed_input_manifest_sha256.as_deref()
+    }
+    pub(crate) fn fixed_windows_file_sha256(&self) -> Option<&str> {
+        self.wire.fixed_windows_file_sha256.as_deref()
+    }
+    pub(crate) fn questions(&self) -> &[VerifiedQuestionCapture] {
+        &self.questions
+    }
+    pub(crate) fn cost(&self) -> &CaptureRunCost {
+        &self.wire.cost
+    }
+    pub(crate) fn claims(&self) -> &CaptureClaims {
+        &self.wire.claims
+    }
+}
+impl CaptureProvenance {
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.source_commit
+    }
+    pub(crate) fn binary_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+    pub(crate) fn argv_sha256(&self) -> &str {
+        &self.argv_sha256
+    }
+}
+impl VerifiedQuestionCapture {
+    pub(crate) fn qid(&self) -> &str {
+        &self.wire.qid
+    }
+    pub(crate) fn query_sha256(&self) -> &str {
+        &self.wire.query_sha256
+    }
+    pub(crate) fn requested_n(&self) -> usize {
+        self.wire.requested_n
+    }
+    pub(crate) fn actual_n(&self) -> usize {
+        self.wire.actual_n
+    }
+    pub(crate) fn pool_complete(&self) -> bool {
+        self.wire.pool_complete
+    }
+    pub(crate) fn terminal(&self) -> RunTerminal {
+        self.wire.terminal
+    }
+    pub(crate) fn full_requested_n_claim(&self) -> bool {
+        self.wire.full_requested_n_claim
+    }
+    pub(crate) fn rerank_applied(&self) -> bool {
+        self.wire.rerank_applied
+    }
+    pub(crate) fn ordered_pool_sha256(&self) -> Option<&str> {
+        self.wire.ordered_pool_sha256.as_deref()
+    }
+    pub(crate) fn slots(&self) -> &[VerifiedSlotCapture] {
+        &self.slots
+    }
+    pub(crate) fn pages_complete(&self) -> bool {
+        true
+    }
+    pub(crate) fn page_count(&self) -> usize {
+        self.wire.pages.len()
+    }
+    pub(crate) fn partial(&self) -> bool {
+        self.wire.partial
+    }
+    pub(crate) fn timed_out(&self) -> bool {
+        self.wire.timed_out
+    }
+    pub(crate) fn failure_code(&self) -> Option<&str> {
+        self.wire.failure_code.as_deref()
+    }
+    pub(crate) fn lexical_statistics_status(&self) -> &str {
+        &self.wire.lexical_statistics_status
+    }
+    pub(crate) fn lexical_statistics_sha256(&self) -> Option<&str> {
+        self.wire.lexical_statistics_sha256.as_deref()
+    }
+    pub(crate) fn cost(&self) -> &CaptureQuestionCost {
+        &self.wire.cost
+    }
+}
+impl VerifiedSlotCapture {
+    pub(crate) fn candidate_instance_key(&self) -> &str {
+        &self.wire.candidate_instance_key
+    }
+    pub(crate) fn label_key(&self) -> &LabelKey {
+        &self.wire.key
+    }
+    pub(crate) fn input_slot(&self) -> usize {
+        self.wire.input_slot
+    }
+    pub(crate) fn retrieval_rank(&self) -> usize {
+        self.wire.retrieval_rank
+    }
+    pub(crate) fn final_rank(&self) -> usize {
+        self.wire.final_rank
+    }
+    pub(crate) fn identity(&self) -> Option<&CaptureIdentity> {
+        self.wire.identity.as_ref()
+    }
+    pub(crate) fn message_id(&self) -> Option<i64> {
+        self.wire.message_id
+    }
+    pub(crate) fn conversation_id(&self) -> Option<i64> {
+        self.wire.conversation_id
+    }
+    pub(crate) fn candidate_text(&self) -> &CaptureTextDigest {
+        &self.wire.candidate_text
+    }
+    pub(crate) fn sent_text(&self) -> Option<&CaptureTextDigest> {
+        self.wire.sent_text.as_ref()
+    }
+    pub(crate) fn source_sha256(&self) -> Option<&str> {
+        self.wire.source_sha256.as_deref()
+    }
+    pub(crate) fn original_score(&self) -> f64 {
+        self.wire.original_score
+    }
+    pub(crate) fn rerank_score(&self) -> Option<f64> {
+        self.wire.rerank_score
+    }
+    pub(crate) fn capture_label(&self) -> SlotLabel {
+        self.wire.label.resolved()
+    }
+}
+impl CaptureIdentity {
+    pub(crate) fn identity_host(&self) -> &str {
+        &self.identity_host
+    }
+    pub(crate) fn agent_slug(&self) -> &str {
+        &self.agent_slug
+    }
+    pub(crate) fn external_id(&self) -> &str {
+        &self.external_id
+    }
+    pub(crate) fn message_idx(&self) -> i64 {
+        self.message_idx
+    }
+    pub(crate) fn chunk_idx(&self) -> Option<i64> {
+        self.chunk_idx
+    }
+}
+impl CaptureTextDigest {
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+    pub(crate) fn utf8_bytes(&self) -> u64 {
+        self.utf8_bytes
+    }
+}
+impl CaptureSourceIdentity {
+    pub(crate) fn source_manifest_sha256(&self) -> Option<&str> {
+        self.source_manifest_sha256.as_deref()
+    }
+    pub(crate) fn source_checked(&self) -> Option<u64> {
+        self.source_checked
+    }
+    pub(crate) fn source_producer_receipt_sha256(&self) -> Option<&str> {
+        self.source_producer_receipt_sha256.as_deref()
+    }
+    pub(crate) fn message_text_sha256(&self) -> Option<&str> {
+        self.message_text_sha256.as_deref()
+    }
+    pub(crate) fn chunk_text_sha256(&self) -> Option<&str> {
+        self.chunk_text_sha256.as_deref()
+    }
+    pub(crate) fn canonicalize_version(&self) -> Option<u64> {
+        self.canonicalize_version
+    }
+    pub(crate) fn chunking_policy_version(&self) -> Option<u64> {
+        self.chunking_policy_version
+    }
+    pub(crate) fn statistics_policy(&self) -> Option<&str> {
+        self.statistics_policy.as_deref()
+    }
+}
+impl CaptureRequest {
+    pub(crate) fn search_mode(&self) -> Option<&str> {
+        self.search_mode.as_deref()
+    }
+    pub(crate) fn vector_search_mode(&self) -> Option<&str> {
+        self.vector_search_mode.as_deref()
+    }
+    pub(crate) fn rerank(&self) -> bool {
+        self.rerank
+    }
+    pub(crate) fn n(&self) -> usize {
+        self.n
+    }
+    pub(crate) fn page_k(&self) -> Option<usize> {
+        self.page_k
+    }
+    pub(crate) fn request_profile(&self) -> &str {
+        &self.request_profile
+    }
+    pub(crate) fn request_evidence_sha256(&self) -> Option<&str> {
+        self.request_evidence_sha256.as_deref()
+    }
+    pub(crate) fn resolved_filters_sha256(&self) -> Result<String> {
+        Ok(digest(&serde_json::to_vec(&self.resolved_filters)?))
+    }
+}
+impl CaptureBackendIdentity {
+    pub(crate) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+    pub(crate) fn actual_model(&self) -> Option<&str> {
+        self.actual_model.as_deref()
+    }
+    pub(crate) fn model_revision(&self) -> Option<&str> {
+        self.model_revision.as_deref()
+    }
+    pub(crate) fn endpoint_origin_sha256(&self) -> Option<&str> {
+        self.endpoint_origin_sha256.as_deref()
+    }
+    pub(crate) fn server_template_policy(&self) -> Option<&str> {
+        self.server_template_policy.as_deref()
+    }
+    pub(crate) fn document_assembly_policy(&self) -> Option<&str> {
+        self.document_assembly_policy.as_deref()
+    }
+    pub(crate) fn client_submission_policy(&self) -> Option<&str> {
+        self.client_submission_policy.as_deref()
+    }
+}
+impl CaptureCounts {
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+    pub(crate) fn http_attempts(&self) -> Option<u64> {
+        self.http_attempts
+    }
+    pub(crate) fn http_response_observed(&self) -> Option<u64> {
+        self.http_response_observed
+    }
+    pub(crate) fn delivery_unknown(&self) -> Option<u64> {
+        self.delivery_unknown
+    }
+    pub(crate) fn model_executions(&self) -> Option<u64> {
+        self.model_executions
+    }
+    pub(crate) fn basis(&self) -> &str {
+        &self.basis
+    }
+}
+impl CaptureQuestionCost {
+    pub(crate) fn identity_before_ms(&self) -> f64 {
+        self.identity_before_ms
+    }
+    pub(crate) fn identity_after_ms(&self) -> f64 {
+        self.identity_after_ms
+    }
+    pub(crate) fn retrieval_ms(&self) -> f64 {
+        self.retrieval_ms
+    }
+    pub(crate) fn rerank_client_ms(&self) -> Option<f64> {
+        self.rerank_client_ms
+    }
+    pub(crate) fn model_execution_ms(&self) -> Option<f64> {
+        self.model_execution_ms
+    }
+    pub(crate) fn paging_ms(&self) -> f64 {
+        self.paging_ms
+    }
+    pub(crate) fn question_total_ms(&self) -> f64 {
+        self.question_total_ms
+    }
+    pub(crate) fn http(&self) -> &[CaptureCounts] {
+        &self.http
+    }
+    pub(crate) fn resource_measurements(&self) -> &[CaptureResourceMeasurement] {
+        &self.resource_measurements
+    }
+}
+impl CaptureRunCost {
+    pub(crate) fn all_run_ms(&self) -> f64 {
+        self.all_run_ms
+    }
+    pub(crate) fn identity_before_ms(&self) -> f64 {
+        self.identity_before_ms
+    }
+    pub(crate) fn identity_after_ms(&self) -> f64 {
+        self.identity_after_ms
+    }
+    pub(crate) fn sample_count(&self) -> u64 {
+        self.sample_count
+    }
+    pub(crate) fn mean_question_ms(&self) -> Option<f64> {
+        self.mean_question_ms
+    }
+    pub(crate) fn p50_question_ms(&self) -> Option<f64> {
+        self.p50_question_ms
+    }
+    pub(crate) fn p95_question_ms(&self) -> Option<f64> {
+        self.p95_question_ms
+    }
+    pub(crate) fn quantile_method(&self) -> &str {
+        &self.quantile_method
+    }
+    pub(crate) fn counts(&self) -> &[CaptureCounts] {
+        &self.counts
+    }
+}
+impl CaptureResourceMeasurement {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+    pub(crate) fn value(&self) -> Option<f64> {
+        self.value
+    }
+    pub(crate) fn unit(&self) -> &str {
+        &self.unit
+    }
+    pub(crate) fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+}
+impl CaptureClaims {
+    pub(crate) fn dataset(&self) -> &str {
+        &self.dataset
+    }
+    pub(crate) fn attribution(&self) -> &str {
+        &self.attribution
+    }
+    pub(crate) fn fts_vec_correctness(&self) -> &str {
+        &self.fts_vec_correctness
+    }
+    pub(crate) fn pure_engine(&self) -> bool {
+        self.pure_engine
+    }
+}
+impl CaptureAfterVerification {
+    pub(crate) fn basis(&self) -> &str {
+        &self.basis
+    }
+    pub(crate) fn inventory_digests(&self) -> &str {
+        &self.inventory_digests
+    }
+    pub(crate) fn database_sha256(&self) -> &str {
+        &self.database_sha256
+    }
+    pub(crate) fn source_manifest_sha256(&self) -> &str {
+        &self.source_manifest_sha256
+    }
+    pub(crate) fn wal_bytes(&self) -> u64 {
+        self.wal_bytes
+    }
+    pub(crate) fn generation_unchanged(&self) -> bool {
+        self.generation_unchanged
+    }
+    pub(crate) fn policies_unchanged(&self) -> bool {
+        self.policies_unchanged
+    }
+    pub(crate) fn shared_maintenance_lease_held(&self) -> bool {
+        self.shared_maintenance_lease_held
+    }
 }
 
 fn deserialize_key<'de, D: serde::Deserializer<'de>>(

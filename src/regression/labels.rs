@@ -10,7 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::blind::VerifiedLabelRun;
-use super::types::{InputOptions, LabelKey};
+use super::types::{InputOptions, LabelKey, OutputOptions};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FilePin {
@@ -64,6 +64,75 @@ pub(crate) struct LegacyBaseValidated {
     suite_sha256: String,
     policy_sha256: String,
     labels: HashMap<LabelKey, HumanLabel>,
+    query_bindings: Vec<(String, String)>,
+}
+
+impl LegacyBaseValidated {
+    pub(super) fn check_run(&self, run: &VerifiedLabelRun) -> Result<()> {
+        require(
+            run.suite_sha256() == self.suite_sha256,
+            "LABEL_SUITE_MISMATCH",
+        )?;
+        require(
+            run.policy_sha256() == self.policy_sha256,
+            "LABEL_POLICY_MISMATCH",
+        )?;
+        require(
+            run.capture()
+                .questions()
+                .iter()
+                .map(|q| (q.qid().to_string(), q.query_sha256().to_string()))
+                .eq(self.query_bindings.iter().cloned()),
+            "LABEL_CAPTURE_MISMATCH",
+        )
+    }
+}
+
+pub(crate) fn load_capture_base(
+    suite: &Path,
+    expected_suite_sha256: &str,
+    available_labels: &[FilePin],
+    output: &OutputOptions,
+) -> Result<LegacyBaseValidated> {
+    let suite_file = read_pin(&FilePin::new(
+        suite.join("SUITE-MANIFEST.json"),
+        expected_suite_sha256.into(),
+    )?)?;
+    let inventory_sha = suite_file.value["source_inventory_sha256"]
+        .as_str()
+        .context("LABEL_PARENT_MISMATCH")?;
+    let inventory = read_pin(&FilePin::new(
+        suite.join("SOURCE-INVENTORY.json"),
+        inventory_sha.into(),
+    )?)?;
+    let registry = inventory.value["files"]
+        .as_array()
+        .context("LABEL_PARENT_MISMATCH")?;
+    let candidates: Vec<_> = registry
+        .iter()
+        .filter(|asset| {
+            asset["roles"]
+                .as_array()
+                .is_some_and(|roles| roles.iter().any(|r| r == "labels"))
+        })
+        .collect();
+    require(candidates.len() == 1, "LABEL_PARENT_MISMATCH")?;
+    let expected_base_sha = candidates[0]["sha256"]
+        .as_str()
+        .context("LABEL_PARENT_MISMATCH")?;
+    let matching: Vec<_> = available_labels
+        .iter()
+        .filter(|pin| pin.expected_sha256() == expected_base_sha)
+        .collect();
+    require(matching.len() == 1, "LABEL_PARENT_MISMATCH")?;
+    read_pin(matching[0])?;
+    load_legacy_base(&InputOptions {
+        suite: suite.to_path_buf(),
+        suite_sha256: expected_suite_sha256.into(),
+        labels: matching[0].path().to_path_buf(),
+        labels_sha256: matching[0].expected_sha256().into(),
+        output: output.clone(),
+    })
 }
 
 pub(crate) struct VerifiedLabelSet {
@@ -238,6 +307,11 @@ pub(crate) fn load_legacy_base(base_input: &InputOptions) -> Result<LegacyBaseVa
         suite_sha256: inputs.suite_sha256,
         policy_sha256: inputs.label_policy_sha256,
         labels,
+        query_bindings: inputs
+            .windows
+            .iter()
+            .map(|w| (w.qid.clone(), w.query_sha256.clone()))
+            .collect(),
     })
 }
 
@@ -251,6 +325,8 @@ pub(crate) fn load_label_set(
     // Re-run the 03 proof. A retained wrapper is not permission to trust changed
     // parent files, suite assets, or their declared fields.
     let base_now = load_legacy_base(&base.input)?;
+    base_now.check_run(left)?;
+    base_now.check_run(right)?;
     require(
         base_now.pin.expected_sha256() == base.pin.expected_sha256(),
         "LABEL_PARENT_MISMATCH",
