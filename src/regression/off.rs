@@ -18,7 +18,7 @@ pub(crate) fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn file_digest(path: &Path) -> Result<String> {
+pub(crate) fn file_digest(path: &Path) -> Result<String> {
     let mut reader = fs::File::open(path)?;
     let mut hash = Sha256::new();
     let mut buffer = [0; 65536];
@@ -63,7 +63,7 @@ pub(crate) struct RunProvenance {
 }
 
 impl RunProvenance {
-    fn capture() -> Result<Self> {
+    pub(crate) fn capture() -> Result<Self> {
         let source_commit = option_env!("CASS_BUILD_SOURCE_COMMIT").unwrap_or("");
         if option_env!("CASS_BUILD_SOURCE_CLEAN") != Some("true")
             || source_commit.len() != 40
@@ -105,7 +105,7 @@ pub(crate) fn write_private(root: &Path, relative: &str, value: &Value) -> Resul
     Ok(json!({"relative_path":relative,"sha256":digest(&bytes)}))
 }
 
-fn private_files(root: &Path) -> Result<Vec<String>> {
+pub(crate) fn private_files(root: &Path) -> Result<Vec<String>> {
     fn walk(root: &Path, directory: &Path, files: &mut Vec<String>) -> Result<()> {
         for entry in fs::read_dir(directory)? {
             let entry = entry?;

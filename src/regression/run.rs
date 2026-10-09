@@ -23,6 +23,16 @@ pub(crate) struct RegressionSearchRun {
     pub(crate) vector_mode: Option<VectorSearchMode>,
     pub(crate) n: usize,
     pub(crate) request: Value,
+    pub(crate) rerank: Option<(usize, crate::search::rerank::types::ProviderChoice)>,
+    pub(crate) endpoint: Option<String>,
+}
+
+pub(crate) struct RawSearchWindow {
+    pub(crate) result: SearchResult,
+    pub(crate) stamp: crate::search::rerank::window::IndexStamp,
+    pub(crate) identity_before_ms: f64,
+    pub(crate) identity_after_ms: f64,
+    pub(crate) retrieval_ms: f64,
 }
 
 pub(crate) struct RecordedSearch {
@@ -44,6 +54,9 @@ impl RegressionSearchRun {
             search_mode,
             vector_search_mode,
             rrf_limit,
+            rerank,
+            page_size,
+            rerank_provider,
             ..
         } = command
         else {
@@ -102,6 +115,14 @@ impl RegressionSearchRun {
                 }));
             }
         }
+        let rerank = match rerank {
+            RerankSwitch::Off => None,
+            RerankSwitch::On => Some((
+                page_size.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))? as usize,
+                rerank_provider.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?,
+            )),
+        };
+        let endpoint = rerank.map(|(_, provider)| crate::rerank_endpoint_origin(provider));
         let request = crate::regression_request_evidence(
             &SearchFilters::default(),
             *search_mode,
@@ -110,11 +131,11 @@ impl RegressionSearchRun {
             None,
             &crate::SemanticSearchOptions {
                 model: (*search_mode != SearchMode::Lexical).then(|| "bge-m3".into()),
-                rerank: false,
+                rerank: rerank.is_some(),
                 reranker: None,
                 use_daemon: false,
-                rerank_limit: None,
-                rerank_provider: None,
+                rerank_limit: rerank.map(|(k, _)| k),
+                rerank_provider: rerank.map(|(_, p)| p),
             },
             &crate::RerankRequestContext::default(),
             embedding_binding.as_ref(),
@@ -129,17 +150,19 @@ impl RegressionSearchRun {
             vector_mode: *vector_search_mode,
             n: *rrf_limit as usize,
             request,
+            rerank,
+            endpoint,
         })
     }
 
-    pub(crate) fn search_off(&self, query: &str) -> Result<RecordedSearch> {
+    pub(crate) fn search_window(&self, query: &str) -> Result<RawSearchWindow> {
         let identity_start = Instant::now();
         let before =
             crate::search::rerank::window::capture_index_stamp_for_regression(&self.context)?;
         let identity_before_ms = milliseconds(identity_start);
         let start = Instant::now();
         let mut mode = crate::SearchModeMeta::new(self.mode, false);
-        let mut result = crate::execute_search_retrieval(
+        let result = crate::execute_search_retrieval(
             &self.client,
             query,
             &SearchFilters::default(),
@@ -153,6 +176,30 @@ impl RegressionSearchRun {
         .map_err(|error| anyhow::anyhow!("REGRESSION_SEARCH_FAILED: {}", error.message))?;
         let retrieval_ms = milliseconds(start);
         validate_retrieval(&result, mode.realized == mode.requested, false)?;
+        let identity_start = Instant::now();
+        let after =
+            crate::search::rerank::window::capture_index_stamp_for_regression(&self.context)?;
+        if before != after {
+            bail!("AGGREGATE_QUERY_IDENTITY_CHANGED");
+        }
+        let identity_after_ms = milliseconds(identity_start);
+        Ok(RawSearchWindow {
+            result,
+            stamp: before,
+            identity_before_ms,
+            identity_after_ms,
+            retrieval_ms,
+        })
+    }
+
+    pub(crate) fn search_off(&self, query: &str) -> Result<RecordedSearch> {
+        let RawSearchWindow {
+            mut result,
+            stamp: before,
+            identity_before_ms,
+            identity_after_ms: raw_after_ms,
+            retrieval_ms,
+        } = self.search_window(query)?;
         result.hits.truncate(self.n);
         let evidence = regression_trace::off_evidence(
             &self.context,
@@ -169,7 +216,7 @@ impl RegressionSearchRun {
         if before != after {
             bail!("AGGREGATE_QUERY_IDENTITY_CHANGED");
         }
-        let identity_after_ms = milliseconds(identity_start);
+        let identity_after_ms = raw_after_ms + milliseconds(identity_start);
         Ok(RecordedSearch {
             result,
             evidence,
@@ -225,6 +272,14 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
         }
     ) {
         super::off::run(command)
+    } else if matches!(
+        command,
+        RegressionCommand::FullSearch {
+            rerank: RerankSwitch::On,
+            ..
+        }
+    ) {
+        super::on::run(command)
     } else {
         super::input::run(command)
     }
@@ -246,6 +301,21 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
     let text = format!("{error:#}");
     if let Some(code) = CODES.iter().find(|code| text.contains(**code)) {
         return code;
+    }
+    const WINDOW_CODES: &[&str] = &[
+        "invalid_input",
+        "cache_unavailable",
+        "not_found",
+        "invalid_cursor",
+        "corrupt",
+        "expired",
+        "binding_mismatch",
+        "index_changed",
+    ];
+    for cause in error.chain() {
+        if let Some(code) = WINDOW_CODES.iter().find(|code| cause.to_string() == **code) {
+            return code;
+        }
     }
     let input = super::input::error_code(error);
     if input != "REGRESSION_INPUT_FAILED" {
