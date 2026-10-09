@@ -227,7 +227,7 @@ fn emit_regression_source_metadata(manifest_dir: &Path) {
     let Ok(top) = git_output(&root, &["rev-parse", "--show-toplevel"]) else { return; };
     if Path::new(top.trim()).canonicalize().ok().as_ref() != Some(&root) { return; }
     // Include the root to notice new untracked source files. Cargo scans its
-    // timestamps; dependency and build-output trees are outside managed roots.
+    // timestamps as well as the explicitly registered source and Git files.
     println!("cargo:rerun-if-changed={}", root.display());
     for name in ["HEAD", "index"] {
         if let Ok(path) = git_output(&root, &["rev-parse", "--path-format=absolute", "--git-path", name]) {

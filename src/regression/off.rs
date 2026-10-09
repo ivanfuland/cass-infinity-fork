@@ -417,9 +417,22 @@ mod tests {
     }
 
     fn full_fixture(n: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionCommand) {
+        full_fixture_mode(n, count, SearchMode::Lexical, None)
+    }
+
+    fn full_fixture_mode(
+        n: u32,
+        count: usize,
+        mode: SearchMode,
+        vector: Option<crate::search::query::VectorSearchMode>,
+    ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
         let f = fixture("");
-        let (data, database, _, source_manifest) =
-            regression_binding::tests::searchable_fixture_with_count(count);
+        assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
+        let (data, database, _, source_manifest) = if mode == SearchMode::Lexical {
+            regression_binding::tests::searchable_fixture_with_count(count)
+        } else {
+            regression_binding::tests::searchable_fixture_with_embedding(count, "BAAI/bge-m3", 1024)
+        };
         let (expected_binding, expected_binding_sha256) =
             regression_binding::tests::prepare_expected(data.path(), &database, &source_manifest);
         let manifest_sha = file_digest(&source_manifest).unwrap();
@@ -434,8 +447,8 @@ mod tests {
             source_manifest,
             source_producer_receipt,
             source_producer_receipt_sha256: digest(&bytes),
-            search_mode: SearchMode::Lexical,
-            vector_search_mode: None,
+            search_mode: mode,
+            vector_search_mode: vector,
             rrf_limit: n,
             rerank: RerankSwitch::Off,
             page_size: None,
@@ -491,11 +504,7 @@ mod tests {
                 .filter(|e| e.file_name() == "input-binding-candidate.json")
                 .count();
             assert_eq!(inventory_files, 1);
-            let provenance = RunProvenance {
-                source_commit: "3abf5e838dc5413bd62e35a18680cc065d4ac99b".into(),
-                binary_sha256: file_digest(&std::env::current_exe().unwrap()).unwrap(),
-                argv: std::env::args().collect(),
-            };
+            let provenance = RunProvenance::capture().unwrap();
             let started = Instant::now();
             collect(&run, &provenance, started, 0.0).unwrap();
             let report: Value = serde_json::from_slice(
@@ -527,11 +536,7 @@ mod tests {
     #[test]
     fn short_complete_pool_is_short_window_and_not_evaluated() {
         let (_f, _data, run) = prepared(10, 3);
-        let provenance = RunProvenance {
-            source_commit: "3abf5e838dc5413bd62e35a18680cc065d4ac99b".into(),
-            binary_sha256: file_digest(&std::env::current_exe().unwrap()).unwrap(),
-            argv: std::env::args().collect(),
-        };
+        let provenance = RunProvenance::capture().unwrap();
         let result = collect(&run, &provenance, Instant::now(), 0.0).unwrap();
         assert_eq!(result["terminal"], "SHORT_WINDOW");
         assert_eq!(result["quality_status"], "NOT_EVALUATED");
@@ -563,7 +568,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             super::super::run::error_code(&run.verify_end().unwrap_err()),
-            "EXPECTED_SOURCE_MANIFEST_MISMATCH"
+            "BINDING_SOURCE_CHANGED"
         );
     }
 
@@ -696,5 +701,200 @@ mod tests {
         changed = windows.clone();
         changed.pop();
         assert!(query_manifest_bytes(&changed).is_err());
+    }
+    #[test]
+    fn aggregate_rejects_runtime_database_and_wal_changes() {
+        for wal in [false, true] {
+            let (_f, _data, run) = prepared(5, 12);
+            run.search_off("retrieval").unwrap();
+            if wal {
+                let path =
+                    std::path::PathBuf::from(format!("{}-wal", run.context.database().display()));
+                fs::write(path, b"synthetic non-empty WAL").unwrap();
+            } else {
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(run.context.database())
+                    .unwrap();
+                file.write_all(b"synthetic database mutation").unwrap();
+                file.sync_all().unwrap();
+            }
+            let error = run.verify_end().unwrap_err();
+            assert!(matches!(
+                super::super::run::error_code(&error),
+                "regression_database_digest_mismatch"
+                    | "regression_input_changed"
+                    | "regression_wal_not_finalized"
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_rejects_wrong_expected_generation_and_policy() {
+        for field in ["generation", "statistics_policy"] {
+            let (_f, _data, mut cmd) = full_fixture(5, 12);
+            let RegressionCommand::FullSearch {
+                expected_binding,
+                expected_binding_sha256,
+                ..
+            } = &mut cmd
+            else {
+                unreachable!()
+            };
+            let mut value: Value =
+                serde_json::from_slice(&fs::read(&expected_binding).unwrap()).unwrap();
+            if field == "generation" {
+                value["generation"]["generation_id"] = json!(99);
+            } else {
+                value["statistics_policy"] = json!("wrong-policy");
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&expected_binding, &bytes).unwrap();
+            *expected_binding_sha256 = digest(&bytes);
+            let result = crate::regression::input::prepare_full(&cmd)
+                .and_then(|validated| RegressionSearchRun::activate(validated, &cmd));
+            let error = result.err().unwrap();
+            assert!(matches!(
+                super::super::run::error_code(&error),
+                "EXPECTED_INPUT_BINDING_MISMATCH" | "INPUT_BINDING_POLICY_MISMATCH"
+            ));
+        }
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn semantic_fake_http_child() {
+        let Ok(mode) = dotenvy::var("CASS_S2_04_SEMANTIC_CHILD") else {
+            return;
+        };
+        let mode = if mode == "semantic" {
+            SearchMode::Semantic
+        } else {
+            SearchMode::Hybrid
+        };
+        let vector = if dotenvy::var("CASS_S2_04_VECTOR_CHILD").unwrap() == "fast" {
+            crate::search::query::VectorSearchMode::Fast
+        } else {
+            crate::search::query::VectorSearchMode::Exact
+        };
+        let (_f, _data, cmd) = full_fixture_mode(5, 12, mode, Some(vector));
+        let validated = crate::regression::input::prepare_full(&cmd).unwrap();
+        let run = RegressionSearchRun::activate(validated, &cmd).unwrap();
+        let result = collect(
+            &run,
+            &RunProvenance::capture().unwrap(),
+            Instant::now(),
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(result["terminal"], "SUCCESS");
+        let report: Value = serde_json::from_slice(
+            &fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
+        assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
+        assert!(report["questions"][0]["cost"]["model_execution_ms"].is_null());
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn semantic_and_hybrid_off_use_only_isolated_fake_embedding_http() {
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        for mode in ["semantic", "hybrid"] {
+            for vector_mode in ["exact", "fast"] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let stop = Arc::new(AtomicBool::new(false));
+                let done = stop.clone();
+                let worker = std::thread::spawn(move || {
+                    let mut paths = vec![];
+                    while !done.load(Ordering::Acquire) {
+                        let (mut stream, _) = match listener.accept() {
+                            Ok(value) => value,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(e) => panic!("{e}"),
+                        };
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let mut buffer = [0; 4096];
+                        let body = loop {
+                            let n = stream.read(&mut buffer).unwrap();
+                            assert!(n > 0);
+                            bytes.extend_from_slice(&buffer[..n]);
+                            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let header = String::from_utf8_lossy(&bytes[..end]);
+                                let length = header
+                                    .lines()
+                                    .filter_map(|l| l.split_once(':'))
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                    .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                                    .unwrap_or(0);
+                                if bytes.len() >= end + 4 + length {
+                                    let path = header
+                                        .lines()
+                                        .next()
+                                        .unwrap()
+                                        .split_whitespace()
+                                        .nth(1)
+                                        .unwrap()
+                                        .to_string();
+                                    paths.push(path);
+                                    break serde_json::from_slice::<Value>(
+                                        &bytes[end + 4..end + 4 + length],
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                        };
+                        assert_eq!(paths.last().unwrap(), "/embeddings");
+                        assert_eq!(body["model"], "BAAI/bge-m3");
+                        let mut embedding = vec![0.0; 1024];
+                        embedding[0] = 1.0;
+                        let body=json!({"data":body["input"].as_array().unwrap().iter().enumerate().map(|(i,_)|json!({"index":i,"embedding":embedding})).collect::<Vec<_>>()}).to_string();
+                        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    }
+                    paths
+                });
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "regression::off::tests::semantic_fake_http_child",
+                        "--nocapture",
+                    ])
+                    .env("CASS_S2_04_SEMANTIC_CHILD", mode)
+                    .env("CASS_S2_04_VECTOR_CHILD", vector_mode)
+                    .env("CASS_INFINITY_URL", &origin)
+                    .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .env("no_proxy", "127.0.0.1,localhost")
+                    .output()
+                    .unwrap();
+                stop.store(true, Ordering::Release);
+                let paths = worker.join().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(!paths.is_empty());
+                assert!(paths.iter().all(|p| p == "/embeddings"));
+                println!(
+                    "FAKE_HTTP mode={mode} vector={vector_mode} observed_embedding_requests={} observed_rerank_requests=0",
+                    paths.len()
+                );
+            }
+        }
     }
 }

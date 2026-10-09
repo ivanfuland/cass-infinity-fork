@@ -192,10 +192,6 @@ pub(crate) struct RunPaths {
 }
 
 /// Retains the readonly connection and its shared maintenance lease.
-#[expect(
-    dead_code,
-    reason = "S2-04 consumes the retained context, expected identity and manifest"
-)]
 pub(crate) struct ValidatedRun {
     pub(crate) inputs: ValidatedInputs,
     pub(crate) paths: RunPaths,
