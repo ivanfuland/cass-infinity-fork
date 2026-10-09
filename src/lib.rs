@@ -24650,6 +24650,11 @@ fn regression_request_evidence(
         "timeout_ms": timeout_ms,
         "embedding_model": semantic.model,
         "embedding_http_configuration": embedding_binding,
+        "document_assembly_policy": semantic.rerank.then(
+            crate::search::rerank::context::document_assembly_policy
+        ),
+        "client_submission_policy": semantic.rerank.then_some("verbatim-query-documents-v1"),
+        "server_template_policy": serde_json::Value::Null,
         "rerank_limit": semantic.rerank_limit,
         "rerank_provider": semantic.rerank_provider,
         "time_selectors": rerank.time_selectors,
@@ -26292,6 +26297,10 @@ fn run_cli_search(
                         Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
                 }
             }
+        }
+
+        if regression.is_some() && !window_continuable {
+            return Err(regression_search_error("REGRESSION_WINDOW_UNAVAILABLE"));
         }
 
         window_display_state = Some(frozen_display);
@@ -107064,6 +107073,14 @@ mod regression_search_orchestration_tests {
         status: u16,
         manifest: Option<PathBuf>,
     ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        server_with_output_change(status, manifest, None)
+    }
+
+    fn server_with_output_change(
+        status: u16,
+        manifest: Option<PathBuf>,
+        blocked_cache_root: Option<PathBuf>,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let worker = std::thread::spawn(move || {
@@ -107106,6 +107123,9 @@ mod regression_search_orchestration_tests {
                 if step == 1 {
                     if let Some(path) = manifest.as_ref() {
                         std::fs::write(path, b"changed synthetic source manifest\n").unwrap();
+                    }
+                    if let Some(path) = blocked_cache_root.as_ref() {
+                        std::fs::write(path.join("cache"), b"blocked").unwrap();
                     }
                 }
                 let response_status = if step == 0 { 200 } else { status };
@@ -107408,6 +107428,37 @@ mod regression_search_orchestration_tests {
         assert!(proof.transport.requests.is_empty());
         assert_eq!(before, std::fs::read(db).unwrap());
     }
+    #[test]
+    fn regression_pipeline_rejects_window_persistence_failure_after_scoring() {
+        let (root, db, run_root, manifest) =
+            regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) =
+            regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let (origin, worker) = server_with_output_change(200, None, Some(run_root.clone()));
+        let result = search(
+            execution(context, &expected, &pin, &manifest, Some(origin)),
+            true,
+            3,
+            None,
+        );
+        assert_eq!(
+            worker.join().unwrap()["documents"].as_array().unwrap().len(),
+            7
+        );
+        let proof = evidence(&run_root);
+        assert!(proof.applied); // Scoring succeeded; persistence did not.
+        assert_eq!(proof.retrieval.len(), 7);
+        assert_eq!(proof.final_slots.len(), 7);
+        assert_eq!(before, std::fs::read(&db).unwrap());
+        assert_eq!(result.unwrap_err().message, "REGRESSION_WINDOW_UNAVAILABLE");
+        assert!(!run_root.join("cache/rerank-windows").exists());
+        assert!(!std::fs::read_dir(&run_root).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().starts_with("regression-page-")
+        }));
+    }
+
     #[test]
     fn regression_pipeline_rejects_source_manifest_change_during_http() {
         let (root, db, run_root, manifest) =

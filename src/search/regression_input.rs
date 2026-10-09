@@ -194,6 +194,7 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
         "REGRESSION_RETRIEVAL_DEGRADED",
         "REGRESSION_SEARCH_FAILED",
         "REGRESSION_RERANK_FAILED",
+        "REGRESSION_WINDOW_UNAVAILABLE",
         "TRACE_FAILED_WINDOW",
         "REGRESSION_SEARCH_EVIDENCE_FAILED",
         "TRACE_WINDOW_MISSING",

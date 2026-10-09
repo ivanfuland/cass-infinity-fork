@@ -61,6 +61,19 @@ const LOCATOR_CANDIDATE_CAP: usize = 100;
 /// metadata operation, so this is generous rather than tuned.
 const READ_ONLY_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Client-known assembly policy. Server-side templates remain outside this policy.
+pub(crate) fn document_assembly_policy() -> serde_json::Value {
+    serde_json::json!({
+        "id": "verified-anchor-neighbours-v1",
+        "canonicalize_version": CANONICALIZE_PIPELINE_VERSION,
+        "chunking_policy_version": CHUNKING_POLICY_VERSION,
+        "locator_candidate_cap": LOCATOR_CANDIDATE_CAP,
+        "neighbour_radius": 1,
+        "join_separator": JOIN_SEPARATOR,
+        "truncation": "none",
+    })
+}
+
 fn unscoreable() -> RerankError {
     RerankError::new(RerankFailureReason::UnscoreableInput)
 }
