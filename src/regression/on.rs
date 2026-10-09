@@ -631,6 +631,103 @@ mod tests {
         }
     }
 
+    fn long_search_fixture(
+        count: usize,
+        embedder_id: &str,
+        dimension: usize,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::storage::api::{Conn, Profile, params};
+        use crate::storage::sqlite::FrankenStorage;
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("synthetic-session".into()),
+            title: Some("retrieval".into()),
+            workspace: None,
+            source_path: "synthetic.jsonl".into(),
+            started_at: Some(10),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(20),
+                content: format!("retrieval 初始锚点。\n{}", "后续中文合成段落 ".repeat(8000)),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: vec![],
+            }],
+        };
+        let conversations: Vec<_> = (0..count)
+            .map(|index| {
+                let mut item = conversation.clone();
+                if count > 1 {
+                    item.external_id = Some(format!("synthetic-session-{index}"));
+                    item.source_path = format!("synthetic-{index}.jsonl").into();
+                    item.messages[0]
+                        .content
+                        .push_str(&format!(" Synthetic case {index}."));
+                }
+                item
+            })
+            .collect();
+        let (root, original) =
+            crate::search::query::tests::seed_conversations_for_search_client(&conversations)
+                .unwrap();
+        let input = root.path().join("input");
+        fs::create_dir(&input).unwrap();
+        let db = input.join("agent_search.db");
+        fs::rename(original, &db).unwrap();
+        let storage = FrankenStorage::open(&db).unwrap();
+        storage.rebuild_lex_domain_from_db(None).unwrap();
+        drop(storage);
+        let writer = Conn::open_writable(&db, Profile::Production).unwrap();
+        let messages: Vec<(i64, i64, String)> = writer
+            .query_all_map(
+                "SELECT id,conversation_id,content FROM messages ORDER BY id",
+                &[],
+                |r| Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?)),
+            )
+            .unwrap();
+        let mut vector = vec![0.0; dimension];
+        vector[0] = 1.0;
+        let embedding = crate::storage::schema::f32_vector_to_le_blob(&vector);
+        let generation = writer.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
+            let id = crate::storage::schema::create_embedding_generation(tx,embedder_id,dimension as i64,3,1,&[1,2,3],10)?;
+            for (mid, cid, content) in &messages {
+                for chunk in crate::search::eligibility::expected_chunks(*mid, *cid, "user", content) {
+                    tx.execute("INSERT INTO message_chunks(generation_id,message_id,conversation_id,chunk_idx,byte_start,byte_end,content_hash,embedding,norm,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,10)",
+                        &params![id,*mid,*cid,i64::from(chunk.chunk_idx),chunk.byte_start as i64,chunk.byte_end as i64,chunk.content_hash.clone(),embedding.clone()])?;
+                }
+            }
+            tx.execute("UPDATE embedding_generations SET is_active=1,audit_status='passed' WHERE id=?1",&params![id])?;
+            Ok(id)
+        }).unwrap();
+        crate::storage::vector_domain::rebuild_vec0_table_for_generation(
+            &writer,
+            generation,
+            dimension as i64,
+        )
+        .unwrap();
+        writer
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(writer);
+        let run = root.path().join("run");
+        fs::create_dir(&run).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = root.path().join("source-manifest.txt");
+        fs::write(&manifest, b"synthetic source-content manifest\n").unwrap();
+        (root, db, run, manifest)
+    }
+
     fn command(
         n: u32,
         k: u32,
@@ -639,8 +736,11 @@ mod tests {
     ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
         let f = fixture(if fault == "empty-query" { fault } else { "" });
         assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
-        let (data, database, _, source_manifest) =
-            regression_binding::tests::searchable_fixture_with_count(count);
+        let (data, database, _, source_manifest) = if fault == "neighbour" {
+            long_search_fixture(count, "BAAI/bge-m3", 1024)
+        } else {
+            regression_binding::tests::searchable_fixture_with_count(count)
+        };
         let (expected_binding, expected_binding_sha256) =
             regression_binding::tests::prepare_expected(data.path(), &database, &source_manifest);
         let source_producer_receipt = data.path().join("source-receipt.json");
@@ -654,8 +754,13 @@ mod tests {
             source_manifest,
             source_producer_receipt,
             source_producer_receipt_sha256: digest(&bytes),
-            search_mode: SearchMode::Lexical,
-            vector_search_mode: None,
+            search_mode: if fault == "neighbour" {
+                SearchMode::Semantic
+            } else {
+                SearchMode::Lexical
+            },
+            vector_search_mode: (fault == "neighbour")
+                .then_some(crate::search::query::VectorSearchMode::Exact),
             rrf_limit: n,
             rerank: RerankSwitch::On,
             page_size: Some(k),
@@ -727,7 +832,7 @@ mod tests {
             let mut altered = serde_json::to_value(&binding).unwrap();
             match field {
                 "K" => altered["rerank_limit"] = json!(2),
-                "provider" => altered["rerank_provider"] = json!("qwen3-local"),
+                "provider" => altered["provider"] = json!("qwen3-local"),
                 "endpoint" => altered["endpoint"] = json!("http://127.0.0.1:1"),
                 "query" => altered["query"] = json!("changed synthetic query"),
                 _ => altered["mode"] = json!("hybrid"),
@@ -855,6 +960,32 @@ mod tests {
         let count = config["count"].as_u64().unwrap() as usize;
         let fault = config.get("fault").and_then(Value::as_str).unwrap_or("");
         let (f, _data, cmd) = command(n, k, count, fault);
+        let sources = [f.input.suite.clone(), _data.path().to_path_buf()];
+        let before: Vec<_> = sources
+            .iter()
+            .map(|root| {
+                private_files(root)
+                    .unwrap()
+                    .into_iter()
+                    .map(|rel| {
+                        let path = root.join(&rel);
+                        (rel, file_digest(&path).unwrap())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if fault == "os-readonly" {
+            for root in &sources {
+                for rel in private_files(root).unwrap() {
+                    std::fs::set_permissions(
+                        root.join(rel),
+                        std::fs::Permissions::from_mode(0o444),
+                    )
+                    .unwrap();
+                }
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+        }
         let started = Instant::now();
         let result = if fault == "source-change" || fault == "page-guards" {
             let validated = super::super::input::prepare_full(&cmd).unwrap();
@@ -886,7 +1017,11 @@ mod tests {
         let root = f.input.output.output_root.join(&f.input.output.run_id);
         let report: Value =
             serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
-        let failed = !fault.is_empty() && fault != "empty-query" && fault != "page-guards";
+        let failed = !fault.is_empty()
+            && fault != "empty-query"
+            && fault != "page-guards"
+            && fault != "neighbour"
+            && fault != "os-readonly";
         if failed {
             let error = result.unwrap_err();
             assert_eq!(report["terminal"], "FAILED");
@@ -949,6 +1084,37 @@ mod tests {
                 if actual == 0 {
                     assert_eq!(q["rerank_applied"], false);
                     assert_eq!(q["full_requested_n_claim"], false);
+                }
+            }
+        }
+        if fault == "neighbour" {
+            assert!(
+                report["questions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|q| q["slots"].as_array().unwrap())
+                    .all(|slot| slot["candidate_text"] != slot["sent_text"])
+            );
+        }
+        if fault == "os-readonly" {
+            for (root, expected) in sources.iter().zip(&before) {
+                let after: Vec<_> = private_files(root)
+                    .unwrap()
+                    .into_iter()
+                    .map(|rel| {
+                        let path = root.join(&rel);
+                        (rel, file_digest(&path).unwrap())
+                    })
+                    .collect();
+                assert_eq!(&after, expected);
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+                for rel in private_files(root).unwrap() {
+                    std::fs::set_permissions(
+                        root.join(rel),
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
                 }
             }
         }
@@ -1033,6 +1199,13 @@ mod tests {
                         }
                     }
                 };
+                if path == "/embeddings" {
+                    let mut embedding = vec![0.0; 1024];
+                    embedding[0] = 1.0;
+                    let response=json!({"data":body["input"].as_array().unwrap().iter().enumerate().map(|(i,_)|json!({"index":i,"embedding":embedding})).collect::<Vec<_>>()}).to_string();
+                    write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                    continue;
+                }
                 let (status, response) = if path == "/models" {
                     gets += 1;
                     if server_fault == "model-mismatch" {
@@ -1103,7 +1276,11 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stdout)
         );
-        let successful = fault.is_empty() || fault == "source-change" || fault == "page-guards";
+        let successful = fault.is_empty()
+            || fault == "source-change"
+            || fault == "page-guards"
+            || fault == "neighbour"
+            || fault == "os-readonly";
         assert_eq!(
             gets,
             if fault == "empty-query" {
@@ -1178,5 +1355,13 @@ mod tests {
     #[test]
     fn actual_page_closure_and_binding_cache_guards_refuse_tampering() {
         window_case_with_fault(7, 3, 9, "page-guards");
+    }
+    #[test]
+    fn actual_neighbour_documents_differ_from_full_content_and_keep_slot_binding() {
+        window_case_with_fault(7, 3, 9, "neighbour");
+    }
+    #[test]
+    fn readonly_input_files_keep_hashes_and_zero_new_paths() {
+        window_case_with_fault(7, 3, 9, "os-readonly");
     }
 }
