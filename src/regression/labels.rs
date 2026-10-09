@@ -1,7 +1,6 @@
 //! Immutable label versions. A file pin is a request, never a validation proof.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -10,7 +9,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::blind::VerifiedLabelRun;
-use super::types::{InputOptions, LabelKey, OutputOptions};
+use super::input::WirePinned;
+use super::types::{InputOptions, LabelKey, OutputOptions, ValidatedInputs};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FilePin {
@@ -65,9 +65,27 @@ pub(crate) struct LegacyBaseValidated {
     policy_sha256: String,
     labels: HashMap<LabelKey, HumanLabel>,
     query_bindings: Vec<(String, String)>,
+    inputs: ValidatedInputs,
+    windows_bytes: Vec<u8>,
 }
 
 impl LegacyBaseValidated {
+    pub(super) fn reload(&self) -> Result<Self> {
+        let current = load_legacy_base(&self.input)?;
+        require(
+            current.pin.expected_sha256() == self.pin.expected_sha256()
+                && current.suite_sha256 == self.suite_sha256
+                && current.policy_sha256 == self.policy_sha256,
+            "LABEL_PARENT_MISMATCH",
+        )?;
+        Ok(current)
+    }
+    pub(super) fn inputs(&self) -> &ValidatedInputs {
+        &self.inputs
+    }
+    pub(super) fn windows_bytes(&self) -> &[u8] {
+        &self.windows_bytes
+    }
     pub(super) fn check_run(&self, run: &VerifiedLabelRun) -> Result<()> {
         require(
             run.suite_sha256() == self.suite_sha256,
@@ -98,14 +116,14 @@ pub(crate) fn load_capture_base(
         suite.join("SUITE-MANIFEST.json"),
         expected_suite_sha256.into(),
     )?)?;
-    let inventory_sha = suite_file.value["source_inventory_sha256"]
+    let inventory_sha = suite_file.value()["source_inventory_sha256"]
         .as_str()
         .context("LABEL_PARENT_MISMATCH")?;
     let inventory = read_pin(&FilePin::new(
         suite.join("SOURCE-INVENTORY.json"),
         inventory_sha.into(),
     )?)?;
-    let registry = inventory.value["files"]
+    let registry = inventory.value()["files"]
         .as_array()
         .context("LABEL_PARENT_MISMATCH")?;
     let candidates: Vec<_> = registry
@@ -137,6 +155,7 @@ pub(crate) fn load_capture_base(
 
 pub(crate) struct VerifiedLabelSet {
     active: FilePin,
+    active_observed_sha256: String,
     ancestor_pins: Vec<FilePin>,
     base_input: InputOptions,
     suite_sha256: String,
@@ -149,7 +168,7 @@ pub(crate) struct VerifiedLabelSet {
 
 impl VerifiedLabelSet {
     pub(crate) fn observed_file_sha256(&self) -> &str {
-        self.active.expected_sha256()
+        &self.active_observed_sha256
     }
     pub(crate) fn suite_sha256(&self) -> &str {
         &self.suite_sha256
@@ -210,6 +229,10 @@ impl VerifiedLabelSet {
     ) -> Result<Self> {
         let base = load_legacy_base(&self.base_input)?;
         load_label_set(&self.active, &self.ancestor_pins, &base, left, right)
+    }
+
+    pub(super) fn reload_base(&self) -> Result<LegacyBaseValidated> {
+        load_legacy_base(&self.base_input)
     }
 
     pub(super) fn protected_roots(&self) -> Vec<&Path> {
@@ -287,6 +310,21 @@ impl LabelCoverage {
 
 pub(crate) fn load_legacy_base(base_input: &InputOptions) -> Result<LegacyBaseValidated> {
     let inputs = super::input::validate_inputs(base_input)?;
+    let mut windows_assets = inputs
+        .assets
+        .iter()
+        .filter(|a| a.roles.iter().any(|r| r == "windows"));
+    let windows_asset = windows_assets.next().context("INPUT_ROLE_MISSING")?;
+    require(windows_assets.next().is_none(), "INPUT_ROLE_AMBIGUOUS")?;
+    require(
+        windows_asset.sha256 == inputs.windows_file_sha256,
+        "INPUT_ASSET_DIGEST_MISMATCH",
+    )?;
+    let windows_bytes = super::input::read_registered_asset(&inputs, &windows_asset.source_path)?;
+    require(
+        digest(&windows_bytes) == inputs.windows_file_sha256,
+        "INPUT_ASSET_DIGEST_MISMATCH",
+    )?;
     let mut labels = HashMap::new();
     for record in &inputs.labels {
         let value: HumanLabel = serde_json::from_value(Value::String(record.value.clone()))
@@ -303,15 +341,17 @@ pub(crate) fn load_legacy_base(base_input: &InputOptions) -> Result<LegacyBaseVa
     )?;
     Ok(LegacyBaseValidated {
         input: base_input.clone(),
-        pin: FilePin::new(base_input.labels.clone(), inputs.labels_sha256)?,
-        suite_sha256: inputs.suite_sha256,
-        policy_sha256: inputs.label_policy_sha256,
+        pin: FilePin::new(base_input.labels.clone(), inputs.labels_sha256.clone())?,
+        suite_sha256: inputs.suite_sha256.clone(),
+        policy_sha256: inputs.label_policy_sha256.clone(),
         labels,
         query_bindings: inputs
             .windows
             .iter()
             .map(|w| (w.qid.clone(), w.query_sha256.clone()))
             .collect(),
+        inputs,
+        windows_bytes,
     })
 }
 
@@ -345,19 +385,23 @@ pub(crate) fn load_label_set(
     let mut seen = HashSet::new();
     let mut modern = Vec::new();
     let mut ancestor_sha256s = Vec::new();
+    let mut active_observed_sha256 = None;
     loop {
         require(seen.insert(cursor.clone()), "LABEL_PARENT_MISMATCH")?;
         let pin = pins.get(&cursor).context("LABEL_PARENT_MISMATCH")?;
         let wire = read_pin(pin)?;
+        if cursor == active.expected_sha256() {
+            active_observed_sha256 = Some(wire.observed_file_sha256().to_string());
+        }
         if cursor == base_now.pin.expected_sha256() {
             require(
-                wire.value["schema"] == "cass.pr3.default-labels.v1",
+                wire.value()["schema"] == "cass.pr3.default-labels.v1",
                 "LABEL_PARENT_MISMATCH",
             )?;
             break;
         }
         let labels: ModernLabels =
-            serde_json::from_value(wire.value).context("LABEL_SCHEMA_INVALID")?;
+            serde_json::from_value(wire.value().clone()).context("LABEL_SCHEMA_INVALID")?;
         labels.validate(&base_now.suite_sha256, &base_now.policy_sha256)?;
         let parent = labels
             .parent_labels_sha256
@@ -386,6 +430,7 @@ pub(crate) fn load_label_set(
     }
     let set = VerifiedLabelSet {
         active: active.clone(),
+        active_observed_sha256: active_observed_sha256.context("LABEL_PARENT_MISMATCH")?,
         ancestor_pins: ancestors.to_vec(),
         base_input: base.input.clone(),
         suite_sha256: base_now.suite_sha256,
@@ -558,57 +603,16 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-pub(super) struct WirePinned {
-    pub(super) value: Value,
-    pub(super) sha256: String,
-}
-
 pub(super) fn read_pin(pin: &FilePin) -> Result<WirePinned> {
-    private_file(pin.path())?;
-    // Phase B exposes the existing 03 byte readers/strict decoder narrowly.
-    // No parallel reader or unverified fallback is implemented here.
-    let bytes = super::input::pinned(
+    super::input::read_private_pinned_json(
         pin.path(),
         pin.expected_sha256(),
         "LABEL_FILE_IDENTITY_MISMATCH",
-        false,
-    )?;
-    private_file(pin.path())?;
-    let value = super::input::strict_json(&bytes)?;
-    Ok(WirePinned {
-        sha256: digest(&bytes),
-        value,
-    })
+    )
 }
 
 pub(super) fn read_subject(path: &Path) -> Result<WirePinned> {
-    private_file(path)?;
-    let bytes = super::input::read_file(path, false)?;
-    private_file(path)?;
-    Ok(WirePinned {
-        value: super::input::strict_json(&bytes)?,
-        sha256: digest(&bytes),
-    })
-}
-
-fn private_file(path: &Path) -> Result<()> {
-    crate::search::regression_io::validate_private_run_root(
-        path.parent().context("LABEL_SCHEMA_INVALID")?,
-    )?;
-    let metadata = fs::symlink_metadata(path)?;
-    require(
-        metadata.is_file() && !metadata.file_type().is_symlink(),
-        "INPUT_FILE_NOT_REGULAR",
-    )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        require(
-            metadata.mode() & 0o777 == 0o600 && metadata.uid() == fs::metadata("/proc/self")?.uid(),
-            "LABEL_RUN_INVALID",
-        )?;
-    }
-    Ok(())
+    super::input::read_private_json(path)
 }
 
 pub(super) fn digest(bytes: &[u8]) -> String {

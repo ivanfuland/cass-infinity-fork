@@ -2,18 +2,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rand::TryRng;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Number, Value};
+
+use super::fixed::{ExpectedPool, PreparedPool};
+use super::fixed_encoding::{NumericValue, encode_numeric};
+use super::input::WirePinned;
 
 use super::labels::{
     self, FilePin, HumanLabel, KeyWire, LegacyBaseValidated, SlotLabel, VerifiedLabelSet, digest,
     is_hex, present_nullable, require,
 };
-use super::types::{LabelKey, RunPaths};
+use super::types::{LabelKey, MessageId, RunPaths};
 use crate::search::regression_binding::InputBinding;
 use crate::search::regression_trace::{self, CandidateIdentity, PageEvidence, WindowEvidence};
 
@@ -23,6 +28,7 @@ const QIDS: [&str; 9] = [
 
 pub(crate) struct VerifiedLabelRun {
     pin: FilePin,
+    observed_sha256: String,
     capture: VerifiedRunCapture,
     root: PathBuf,
     subjects: Vec<SubjectFile>,
@@ -35,7 +41,7 @@ struct SubjectFile {
 
 impl VerifiedLabelRun {
     pub(crate) fn observed_file_sha256(&self) -> &str {
-        self.pin.expected_sha256()
+        &self.observed_sha256
     }
     pub(crate) fn capture(&self) -> &VerifiedRunCapture {
         &self.capture
@@ -102,12 +108,56 @@ impl LabelsArtifact {
 }
 
 pub(crate) fn load_run_subjects(pin: &FilePin) -> Result<VerifiedLabelRun> {
+    load_subjects(pin, None)
+}
+
+fn load_subjects(pin: &FilePin, capture: Option<&LegacyBaseValidated>) -> Result<VerifiedLabelRun> {
     let wire = labels::read_pin(pin)?;
-    let mut run: RunWire = serde_json::from_value(wire.value).context("LABEL_RUN_INVALID")?;
+    let observed_sha256 = wire.observed_file_sha256().to_string();
+    let value = restore_run_scores(&wire)?;
+    let mut run: RunWire = serde_json::from_value(value.clone()).context("LABEL_RUN_INVALID")?;
     run.validate()?;
-    // Typed-ID recovery from the original pinned pool is a separate fixed
-    // consumer seam. No fabricated full CandidateIdentity is accepted here.
-    require(run.mode == RunMode::FullSearch, "LABEL_RUN_INVALID")?;
+    let pools = match run.mode {
+        RunMode::FullSearch => None,
+        RunMode::FixedCandidate => {
+            let capture = capture.context("LABEL_RUN_INVALID")?;
+            let inputs = capture.inputs();
+            require(
+                inputs
+                    .windows
+                    .iter()
+                    .all(|w| w.items.iter().all(|s| s.scoreable)),
+                "LABEL_RUN_INVALID",
+            )?;
+            require(
+                run.suite_sha256 == inputs.suite_sha256
+                    && run.label_policy_sha256 == inputs.label_policy_sha256
+                    && run.fixed_input_manifest_sha256.as_deref()
+                        == Some(inputs.input_manifest_sha256.as_str())
+                    && run.fixed_windows_file_sha256.as_deref()
+                        == Some(inputs.windows_file_sha256.as_str()),
+                "LABEL_CAPTURE_MISMATCH",
+            )?;
+            let expected: Vec<_> = run
+                .questions
+                .iter()
+                .map(|q| {
+                    Ok(ExpectedPool {
+                        qid: q.qid.clone(),
+                        ordered_pool_sha256: q
+                            .ordered_pool_sha256
+                            .clone()
+                            .context("LABEL_RUN_INVALID")?,
+                    })
+                })
+                .collect::<Result<_>>()?;
+            Some(super::fixed::prepare_pools(
+                inputs,
+                capture.windows_bytes(),
+                &expected,
+            )?)
+        }
+    };
     let root = pin
         .path()
         .parent()
@@ -128,30 +178,57 @@ pub(crate) fn load_run_subjects(pin: &FilePin) -> Result<VerifiedLabelRun> {
     )?;
     validate_listing(&root, &run.output.writes_relative_paths)?;
     let mut subjects = Vec::new();
-    for question in &mut run.questions {
+    for (question_index, question) in run.questions.iter_mut().enumerate() {
         let relative = format!("label-subjects-{}.json", question.qid);
         listed(&run.output, &relative)?;
         let wire = labels::read_subject(&root.join(&relative))?;
         let body: SubjectBody =
-            serde_json::from_value(wire.value).context("LABEL_SUBJECT_INVALID")?;
+            serde_json::from_value(wire.value().clone()).context("LABEL_SUBJECT_INVALID")?;
         validate_subject(
             &body,
             question,
             &run.label_policy_sha256,
             run.request.rerank,
         )?;
-        validate_question_evidence(
-            &root,
-            &run.output,
-            question,
-            &body,
-            &run.request,
-            run.observed_before.as_ref().context("LABEL_RUN_INVALID")?,
-        )?;
+        if let Some(pools) = &pools {
+            let slots = value["questions"][question_index]["slots"]
+                .as_array()
+                .context("LABEL_RUN_INVALID")?;
+            pools[question_index].verify_recovery(slots)?;
+            let copy = read_listed(
+                &root,
+                &run.output,
+                &format!("question-{}.json", question.qid),
+            )?;
+            let copy = restore_fixed_question_scores(&copy)?;
+            let _: QuestionWire =
+                serde_json::from_value(copy.clone()).context("LABEL_RUN_INVALID")?;
+            require(
+                copy == value["questions"][question_index],
+                "LABEL_RUN_INVALID",
+            )?;
+            validate_fixed_evidence(
+                &root,
+                &run.output,
+                question,
+                &body,
+                &pools[question_index],
+                &run.backend_identity,
+            )?;
+        } else {
+            validate_question_evidence(
+                &root,
+                &run.output,
+                question,
+                &body,
+                &run.request,
+                run.observed_before.as_ref().context("LABEL_RUN_INVALID")?,
+            )?;
+        }
         subjects.push(SubjectFile {
             reference: ArtifactWire {
                 relative_path: relative,
-                sha256: wire.sha256,
+                sha256: wire.observed_file_sha256().to_string(),
             },
             body,
         });
@@ -203,13 +280,19 @@ pub(crate) fn load_run_subjects(pin: &FilePin) -> Result<VerifiedLabelRun> {
         .map(|mut wire| {
             let slots = std::mem::take(&mut wire.slots)
                 .into_iter()
-                .map(|wire| VerifiedSlotCapture { wire })
-                .collect();
-            VerifiedQuestionCapture { wire, slots }
+                .map(|wire| {
+                    Ok(VerifiedSlotCapture {
+                        original_score: numeric_value(&wire.original_score)?,
+                        wire,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(VerifiedQuestionCapture { wire, slots })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(VerifiedLabelRun {
         pin: pin.clone(),
+        observed_sha256,
         capture: VerifiedRunCapture {
             wire: run,
             provenance,
@@ -224,9 +307,288 @@ pub(crate) fn load_run_subjects_with_capture(
     run: &FilePin,
     capture: &LegacyBaseValidated,
 ) -> Result<VerifiedLabelRun> {
-    let run = load_run_subjects(run)?;
-    capture.check_run(&run)?;
+    let current_capture = capture.reload()?;
+    let run = load_subjects(run, Some(&current_capture))?;
+    current_capture.check_run(&run)?;
     Ok(run)
+}
+
+fn numeric_value(number: &Number) -> Result<NumericValue> {
+    if let Some(value) = number.as_i64() {
+        Ok(NumericValue::I64(value))
+    } else if let Some(value) = number.as_u64() {
+        Ok(NumericValue::U64(value))
+    } else {
+        let value = number.as_f64().context("LABEL_RUN_INVALID")?;
+        require(value.is_finite(), "LABEL_RUN_INVALID")?;
+        Ok(NumericValue::F64(value))
+    }
+}
+
+fn restored_number(token: &[u8]) -> Result<Number> {
+    match encode_numeric(token)
+        .map_err(|_| anyhow::anyhow!("LABEL_RUN_INVALID"))?
+        .value
+        .map_err(|_| anyhow::anyhow!("LABEL_RUN_INVALID"))?
+    {
+        NumericValue::I64(value) => Ok(Number::from(value)),
+        NumericValue::U64(value) => Ok(Number::from(value)),
+        NumericValue::F64(value) => Number::from_f64(value).context("LABEL_RUN_INVALID"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ScorePath {
+    Root,
+    Questions,
+    Question(usize),
+    Slots(usize),
+    Slot(usize, usize),
+    Original(usize, usize),
+    Rerank(usize, usize),
+    Other,
+}
+
+#[derive(Default)]
+struct ScoreSpans {
+    original: Option<Range<usize>>,
+    // Outer Option records field presence. Inner None is explicit JSON null.
+    rerank: Option<Option<Range<usize>>>,
+}
+
+struct RunScoreWalk<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    spans: Vec<Vec<ScoreSpans>>,
+}
+
+impl RunScoreWalk<'_> {
+    fn advance(&mut self) -> Result<()> {
+        self.pos = self.pos.checked_add(1).context("LABEL_RUN_INVALID")?;
+        require(self.pos <= self.bytes.len(), "LABEL_RUN_INVALID")
+    }
+    fn space(&mut self) -> Result<()> {
+        while self
+            .bytes
+            .get(self.pos)
+            .is_some_and(|b| b" \t\r\n".contains(b))
+        {
+            self.advance()?;
+        }
+        Ok(())
+    }
+    fn take(&mut self, byte: u8) -> Result<bool> {
+        self.space()?;
+        if self.bytes.get(self.pos) == Some(&byte) {
+            self.advance()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    fn expect(&mut self, byte: u8) -> Result<()> {
+        require(self.take(byte)?, "LABEL_RUN_INVALID")
+    }
+    fn string(&mut self) -> Result<Range<usize>> {
+        self.space()?;
+        let start = self.pos;
+        self.expect(b'"')?;
+        while let Some(byte) = self.bytes.get(self.pos).copied() {
+            self.advance()?;
+            match byte {
+                b'"' => return Ok(start..self.pos),
+                b'\\' => {
+                    require(self.pos < self.bytes.len(), "LABEL_RUN_INVALID")?;
+                    self.advance()?;
+                }
+                _ => {}
+            }
+        }
+        bail!("LABEL_RUN_INVALID")
+    }
+    fn scalar(&mut self) -> Result<Range<usize>> {
+        self.space()?;
+        let start = self.pos;
+        while self
+            .bytes
+            .get(self.pos)
+            .is_some_and(|b| !b" \t\r\n,]}".contains(b))
+        {
+            self.advance()?;
+        }
+        require(start < self.pos, "LABEL_RUN_INVALID")?;
+        Ok(start..self.pos)
+    }
+    fn value(&mut self, path: ScorePath, depth: usize) -> Result<()> {
+        require(depth < 128, "LABEL_RUN_INVALID")?;
+        self.space()?;
+        if let ScorePath::Original(q, s) | ScorePath::Rerank(q, s) = path {
+            let span = self.scalar()?;
+            let token = self.bytes.get(span.clone()).context("LABEL_RUN_INVALID")?;
+            let target = self
+                .spans
+                .get_mut(q)
+                .and_then(|v| v.get_mut(s))
+                .context("LABEL_RUN_INVALID")?;
+            match path {
+                ScorePath::Original(_, _) => {
+                    require(
+                        target.original.is_none()
+                            && token
+                                .first()
+                                .is_some_and(|b| b.is_ascii_digit() || *b == b'-'),
+                        "LABEL_RUN_INVALID",
+                    )?;
+                    target.original = Some(span);
+                }
+                ScorePath::Rerank(_, _) => {
+                    require(target.rerank.is_none(), "LABEL_RUN_INVALID")?;
+                    require(
+                        token == b"null"
+                            || token
+                                .first()
+                                .is_some_and(|b| b.is_ascii_digit() || *b == b'-'),
+                        "LABEL_RUN_INVALID",
+                    )?;
+                    target.rerank = Some(if token == b"null" { None } else { Some(span) });
+                }
+                _ => bail!("LABEL_RUN_INVALID"),
+            }
+            return Ok(());
+        }
+        match self.bytes.get(self.pos) {
+            Some(b'{') => {
+                self.advance()?;
+                if !self.take(b'}')? {
+                    loop {
+                        let span = self.string()?;
+                        let key: String = serde_json::from_slice(&self.bytes[span])
+                            .context("LABEL_RUN_INVALID")?;
+                        self.expect(b':')?;
+                        let child = match (path, key.as_str()) {
+                            (ScorePath::Root, "questions") => ScorePath::Questions,
+                            (ScorePath::Question(q), "slots") => ScorePath::Slots(q),
+                            (ScorePath::Slot(q, s), "original_score") => ScorePath::Original(q, s),
+                            (ScorePath::Slot(q, s), "rerank_score") => ScorePath::Rerank(q, s),
+                            _ => ScorePath::Other,
+                        };
+                        self.value(child, depth.checked_add(1).context("LABEL_RUN_INVALID")?)?;
+                        if self.take(b'}')? {
+                            break;
+                        }
+                        self.expect(b',')?;
+                    }
+                }
+            }
+            Some(b'[') => {
+                self.advance()?;
+                let mut index = 0usize;
+                if !self.take(b']')? {
+                    loop {
+                        let child = match path {
+                            ScorePath::Questions => ScorePath::Question(index),
+                            ScorePath::Slots(q) => ScorePath::Slot(q, index),
+                            _ => ScorePath::Other,
+                        };
+                        self.value(child, depth.checked_add(1).context("LABEL_RUN_INVALID")?)?;
+                        index = index.checked_add(1).context("LABEL_RUN_INVALID")?;
+                        if self.take(b']')? {
+                            break;
+                        }
+                        self.expect(b',')?;
+                    }
+                }
+            }
+            Some(b'"') => {
+                self.string()?;
+            }
+            Some(_) => {
+                self.scalar()?;
+            }
+            None => bail!("LABEL_RUN_INVALID"),
+        }
+        Ok(())
+    }
+}
+
+// The production entry accepts only the input reader's same-buffer proof.
+fn restore_run_scores(wire: &WirePinned) -> Result<Value> {
+    restore_score_leaves(wire.bytes(), wire.value(), false)
+}
+
+fn restore_fixed_question_scores(wire: &WirePinned) -> Result<Value> {
+    restore_score_leaves(wire.bytes(), wire.value(), true)
+}
+
+fn restore_score_leaves(bytes: &[u8], strict_value: &Value, fixed_question: bool) -> Result<Value> {
+    let questions: Vec<_> = if fixed_question {
+        vec![strict_value]
+    } else {
+        strict_value["questions"]
+            .as_array()
+            .context("LABEL_RUN_INVALID")?
+            .iter()
+            .collect()
+    };
+    let mut count = 0usize;
+    let spans = questions
+        .iter()
+        .map(|q| {
+            require(
+                q["qid"].as_str().is_some_and(|s| !s.is_empty()),
+                "LABEL_RUN_INVALID",
+            )?;
+            let slots = q["slots"].as_array().context("LABEL_RUN_INVALID")?;
+            count = count
+                .checked_add(slots.len())
+                .context("LABEL_RUN_INVALID")?;
+            require(count <= bytes.len() / 2, "LABEL_RUN_INVALID")?;
+            slots
+                .iter()
+                .map(|slot| {
+                    require(slot["input_slot"].as_u64().is_some(), "LABEL_RUN_INVALID")?;
+                    Ok(ScoreSpans::default())
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut walk = RunScoreWalk {
+        bytes,
+        pos: 0,
+        spans,
+    };
+    walk.value(
+        if fixed_question {
+            ScorePath::Question(0)
+        } else {
+            ScorePath::Root
+        },
+        0,
+    )?;
+    walk.space()?;
+    require(walk.pos == bytes.len(), "LABEL_RUN_INVALID")?;
+    let mut value = strict_value.clone();
+    for (q, slots) in walk.spans.into_iter().enumerate() {
+        for (s, spans) in slots.into_iter().enumerate() {
+            let original = spans.original.context("LABEL_RUN_INVALID")?;
+            let rerank = spans.rerank.context("LABEL_RUN_INVALID")?;
+            let question = if fixed_question {
+                &mut value
+            } else {
+                &mut value["questions"][q]
+            };
+            question["slots"][s]["original_score"] = Value::Number(restored_number(
+                bytes.get(original).context("LABEL_RUN_INVALID")?,
+            )?);
+            question["slots"][s]["rerank_score"] = match rerank {
+                Some(span) => Value::Number(restored_number(
+                    bytes.get(span).context("LABEL_RUN_INVALID")?,
+                )?),
+                None => Value::Null,
+            };
+        }
+    }
+    Ok(value)
 }
 
 pub(crate) fn export_blind(
@@ -236,8 +598,9 @@ pub(crate) fn export_blind(
     output: &RunPaths,
 ) -> Result<BlindArtifacts> {
     // Re-read immutable source pins even when callers retained a prior proof.
-    let left = load_run_subjects(&left.pin)?;
-    let right = load_run_subjects(&right.pin)?;
+    let base = parent.reload_base()?;
+    let left = load_run_subjects_with_capture(&left.pin, &base)?;
+    let right = load_run_subjects_with_capture(&right.pin, &base)?;
     let parent = parent.refresh_for_export(&left, &right)?;
     let coverage = labels::cover_slots(&left, &right, &parent)?;
     let mut protected = parent.protected_roots();
@@ -284,8 +647,8 @@ pub(crate) fn export_blind(
         capture_suite_sha256: parent.suite_sha256().into(),
         label_policy_sha256: parent.policy_sha256().into(),
         parent_labels_file_sha256: parent.observed_file_sha256().into(),
-        left_run_sha256: left.pin.expected_sha256().into(),
-        right_run_sha256: right.pin.expected_sha256().into(),
+        left_run_sha256: left.observed_file_sha256().into(),
+        right_run_sha256: right.observed_file_sha256().into(),
         bundle: ArtifactWire {
             relative_path: "blind-bundle.json".into(),
             sha256: bundle_pin.expected_sha256().into(),
@@ -314,12 +677,12 @@ pub(crate) fn import_blind(
     new_version: &str,
     output: &RunPaths,
 ) -> Result<LabelsArtifact> {
-    let left = load_run_subjects(&left.pin)?;
-    let right = load_run_subjects(&right.pin)?;
+    let left = load_run_subjects_with_capture(&left.pin, base)?;
+    let right = load_run_subjects_with_capture(&right.pin, base)?;
     let current_parent = parent.refresh(base, &left, &right)?;
     let manifest_wire = labels::read_pin(manifest)?;
     let manifest_body: BlindManifest =
-        serde_json::from_value(manifest_wire.value).context("BLIND_MANIFEST_INVALID")?;
+        serde_json::from_value(manifest_wire.value().clone()).context("BLIND_MANIFEST_INVALID")?;
     require(
         manifest_body.schema == "cass.regression-blind-manifest.v1",
         "BLIND_MANIFEST_INVALID",
@@ -335,8 +698,8 @@ pub(crate) fn import_blind(
     )?;
     require(
         manifest_body.parent_labels_file_sha256 == current_parent.observed_file_sha256()
-            && manifest_body.left_run_sha256 == left.pin.expected_sha256()
-            && manifest_body.right_run_sha256 == right.pin.expected_sha256(),
+            && manifest_body.left_run_sha256 == left.observed_file_sha256()
+            && manifest_body.right_run_sha256 == right.observed_file_sha256(),
         "BLIND_BINDING_MISMATCH",
     )?;
     require(
@@ -354,10 +717,10 @@ pub(crate) fn import_blind(
     )?;
     let bundle_wire = labels::read_pin(&bundle_pin)?;
     let bundle: BlindBundle =
-        serde_json::from_value(bundle_wire.value).context("BLIND_BUNDLE_INVALID")?;
+        serde_json::from_value(bundle_wire.value().clone()).context("BLIND_BUNDLE_INVALID")?;
     let answers_wire = labels::read_pin(answers)?;
     let answers_body: BlindAnswers =
-        serde_json::from_value(answers_wire.value).context("BLIND_ANSWERS_INVALID")?;
+        serde_json::from_value(answers_wire.value().clone()).context("BLIND_ANSWERS_INVALID")?;
     let coverage = labels::cover_slots(&left, &right, &current_parent)?;
     let additions = validate_submission(
         &bundle,
@@ -380,7 +743,7 @@ pub(crate) fn import_blind(
     // Readback occurs before the complete receipt; partial output is not success.
     let readback = labels::read_pin(&label_pin)?;
     require(
-        readback.value == new_labels
+        readback.value() == &new_labels
             && label_pin.expected_sha256() != current_parent.observed_file_sha256(),
         "BLIND_OUTPUT_WRITE_FAILED",
     )?;
@@ -388,12 +751,12 @@ pub(crate) fn import_blind(
         schema: "cass.regression-label-import-receipt.v1".into(),
         status: "LABEL_COVERAGE_COMPLETE".into(),
         parent_labels_file_sha256: current_parent.observed_file_sha256().into(),
-        new_labels_file_sha256: label_pin.expected_sha256().into(),
-        manifest_sha256: manifest_wire.sha256,
-        answers_sha256: answers_wire.sha256,
-        bundle_sha256: bundle_wire.sha256,
-        left_run_sha256: left.pin.expected_sha256().into(),
-        right_run_sha256: right.pin.expected_sha256().into(),
+        new_labels_file_sha256: readback.observed_file_sha256().into(),
+        manifest_sha256: manifest_wire.observed_file_sha256().to_string(),
+        answers_sha256: answers_wire.observed_file_sha256().to_string(),
+        bundle_sha256: bundle_wire.observed_file_sha256().to_string(),
+        left_run_sha256: left.observed_file_sha256().into(),
+        right_run_sha256: right.observed_file_sha256().into(),
         verified_ancestor_sha256s: current_parent.verified_ancestor_sha256s().to_vec(),
         version: new_version.into(),
         suite_sha256: current_parent.suite_sha256().into(),
@@ -580,7 +943,8 @@ fn read_reference(root: &Path, output: &OutputWire, reference: &ArtifactWire) ->
         root.join(&reference.relative_path),
         reference.sha256.clone(),
     )?)?
-    .value)
+    .value()
+    .clone())
 }
 
 fn output_boundary(output: &RunPaths, inputs: &[&Path]) -> Result<()> {
@@ -610,7 +974,7 @@ fn write_artifact(output: &RunPaths, relative: &str, value: &Value) -> Result<Fi
             .into(),
     )?;
     require(
-        labels::read_pin(&pin)?.value == *value,
+        labels::read_pin(&pin)?.value() == value,
         "BLIND_OUTPUT_WRITE_FAILED",
     )?;
     Ok(pin)
@@ -846,7 +1210,7 @@ struct SlotWire {
     sent_text: Option<DigestWire>,
     #[serde(deserialize_with = "present_nullable")]
     source_sha256: Option<String>,
-    original_score: f64,
+    original_score: Number,
     #[serde(deserialize_with = "present_nullable")]
     rerank_score: Option<f64>,
     label: CapturedLabel,
@@ -1097,6 +1461,7 @@ pub(crate) struct VerifiedQuestionCapture {
 }
 pub(crate) struct VerifiedSlotCapture {
     wire: SlotWire,
+    original_score: NumericValue,
 }
 pub(crate) type RunTerminal = Terminal;
 pub(crate) type RunQualityStatus = Quality;
@@ -1281,8 +1646,8 @@ impl VerifiedSlotCapture {
     pub(crate) fn source_sha256(&self) -> Option<&str> {
         self.wire.source_sha256.as_deref()
     }
-    pub(crate) fn original_score(&self) -> f64 {
-        self.wire.original_score
+    pub(crate) fn original_score(&self) -> NumericValue {
+        self.original_score
     }
     pub(crate) fn rerank_score(&self) -> Option<f64> {
         self.wire.rerank_score
@@ -1677,6 +2042,7 @@ impl RunWire {
                 )?;
             }
             RunMode::FixedCandidate => {
+                let source = &self.source_identity;
                 require(
                     self.request.request_profile == "fixed-package-v1"
                         && self.request.rerank
@@ -1688,7 +2054,21 @@ impl RunWire {
                         && self.expected_binding_file_sha256.is_none()
                         && self.observed_before.is_none()
                         && self.observed_after.is_none()
-                        && self.after_verification.is_none(),
+                        && self.after_verification.is_none()
+                        && self.request.request_evidence_sha256.is_some()
+                        && self
+                            .request
+                            .resolved_filters
+                            .as_object()
+                            .is_some_and(|v| v.is_empty())
+                        && source.source_manifest_sha256.is_none()
+                        && source.source_checked.is_none()
+                        && source.source_producer_receipt_sha256.is_none()
+                        && source.message_text_sha256.is_none()
+                        && source.chunk_text_sha256.is_none()
+                        && source.canonicalize_version.is_none()
+                        && source.chunking_policy_version.is_none()
+                        && source.statistics_policy.is_none(),
                     "LABEL_RUN_INVALID",
                 )?;
             }
@@ -1762,7 +2142,8 @@ impl RunWire {
                 slot.candidate_text.validate()?;
                 optional_sha(&slot.source_sha256)?;
                 require(
-                    slot.original_score.is_finite() && slot.rerank_score.is_none_or(f64::is_finite),
+                    slot.original_score.as_f64().is_some_and(f64::is_finite)
+                        && slot.rerank_score.is_none_or(f64::is_finite),
                     "LABEL_RUN_INVALID",
                 )?;
                 if let Some(text) = &slot.sent_text {
@@ -1912,6 +2293,273 @@ fn validate_subject(
     require(seen.len() == slots.len(), "LABEL_SUBJECT_INVALID")
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedTraceWire {
+    qid: String,
+    query_sha256: String,
+    ordered_pool_sha256: String,
+    transport: FixedTransportWire,
+    #[serde(deserialize_with = "present_nullable")]
+    identity: Option<FixedCallWire>,
+    terminal: Terminal,
+    #[serde(deserialize_with = "present_nullable")]
+    failure_code: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedCallWire {
+    #[serde(deserialize_with = "present_nullable")]
+    actual_provider: Option<crate::search::rerank::types::ProviderChoice>,
+    #[serde(deserialize_with = "present_nullable")]
+    actual_model: Option<String>,
+    #[serde(rename = "serving_provider", deserialize_with = "present_nullable")]
+    _serving_provider: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedTransportWire {
+    requests: Vec<FixedHttpWire>,
+    #[serde(deserialize_with = "present_nullable")]
+    model_requests: Option<usize>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedHttpWire {
+    method: String,
+    path: String,
+    state: String,
+    #[serde(deserialize_with = "present_nullable")]
+    query: Option<DigestWire>,
+    #[serde(deserialize_with = "present_nullable")]
+    documents: Option<Vec<FixedSubmittedWire>>,
+    #[serde(deserialize_with = "present_nullable")]
+    json_body_sha256: Option<String>,
+    #[serde(deserialize_with = "present_nullable")]
+    http_status: Option<u16>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedSubmittedWire {
+    input_slot: usize,
+    text: DigestWire,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedOrderedWire {
+    qid: String,
+    ordered_pool_sha256: String,
+    canonical_utf8: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedRecoveryWire {
+    suite_sha256: String,
+    input_manifest_sha256: String,
+    windows_file_sha256: String,
+    qid: String,
+    ordered_pool_sha256: String,
+    slots: Vec<FixedRecoveredSlotWire>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FixedRecoveredSlotWire {
+    input_slot: usize,
+    retrieval_rank: usize,
+    candidate_instance_key: String,
+    typed_message_id: MessageId,
+    scoreable: bool,
+    fallback_reason: Value,
+}
+
+fn read_listed(root: &Path, output: &OutputWire, relative: &str) -> Result<WirePinned> {
+    listed(output, relative)?;
+    labels::read_subject(&root.join(relative))
+}
+
+fn validate_fixed_evidence(
+    root: &Path,
+    output: &OutputWire,
+    question: &QuestionWire,
+    body: &SubjectBody,
+    pool: &PreparedPool,
+    backend: &BackendWire,
+) -> Result<()> {
+    require(
+        question.actual_n == 200
+            && question.requested_n == 200
+            && question.pages.is_empty()
+            && question.window_evidence.is_none()
+            && question.terminal == Terminal::Success
+            && question.rerank_applied
+            && question.lexical_statistics_status == "NOT_USED"
+            && question.lexical_statistics_sha256.is_none(),
+        "LABEL_RUN_INVALID",
+    )?;
+    let ordered = read_listed(
+        root,
+        output,
+        &format!("fixed-ordered-pool-{}.json", question.qid),
+    )?;
+    let ordered: FixedOrderedWire =
+        serde_json::from_value(ordered.value().clone()).context("LABEL_RUN_INVALID")?;
+    require(
+        ordered.qid == question.qid
+            && Some(ordered.ordered_pool_sha256.as_str())
+                == question.ordered_pool_sha256.as_deref()
+            && ordered.canonical_utf8.as_bytes() == pool.ordered_bytes(),
+        "LABEL_RUN_INVALID",
+    )?;
+    let recovery = read_listed(
+        root,
+        output,
+        &format!("fixed-recovery-{}.json", question.qid),
+    )?;
+    // Diagnostic metadata is checked against the independently prepared pool;
+    // it does not construct or replace that pool's original-byte proof.
+    let checked: FixedRecoveryWire =
+        serde_json::from_value(recovery.value().clone()).context("LABEL_RUN_INVALID")?;
+    let expected = pool.recovery_evidence();
+    require(recovery.value() == &expected, "LABEL_RUN_INVALID")?;
+    require(
+        is_hex(&checked.suite_sha256, 64)
+            && is_hex(&checked.input_manifest_sha256, 64)
+            && is_hex(&checked.windows_file_sha256, 64)
+            && checked.qid == question.qid
+            && Some(checked.ordered_pool_sha256.as_str())
+                == question.ordered_pool_sha256.as_deref()
+            && checked.slots.len() == 200,
+        "LABEL_RUN_INVALID",
+    )?;
+    for (index, slot) in checked.slots.iter().enumerate() {
+        require(
+            slot.input_slot == index
+                && slot.retrieval_rank == index + 1
+                && is_hex(&slot.candidate_instance_key, 64)
+                && slot.scoreable
+                && !matches!(&slot.typed_message_id, MessageId::Text(id) if id.is_empty()),
+            "LABEL_RUN_INVALID",
+        )?;
+        require(
+            slot.fallback_reason == expected["slots"][index]["fallback_reason"],
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    let trace = read_listed(root, output, &format!("fixed-trace-{}.json", question.qid))?;
+    let trace: FixedTraceWire =
+        serde_json::from_value(trace.value().clone()).context("LABEL_RUN_INVALID")?;
+    require(
+        trace.qid == question.qid
+            && trace.query_sha256 == question.query_sha256
+            && Some(trace.ordered_pool_sha256.as_str()) == question.ordered_pool_sha256.as_deref()
+            && trace.terminal == Terminal::Success
+            && trace.failure_code.is_none(),
+        "LABEL_RUN_INVALID",
+    )?;
+    if let Some(identity) = &trace.identity {
+        if let Some(provider) = &backend.provider {
+            require(
+                identity
+                    .actual_provider
+                    .is_some_and(|p| p.to_string() == *provider),
+                "LABEL_RUN_INVALID",
+            )?;
+        }
+        if let Some(model) = &backend.actual_model {
+            require(
+                identity.actual_model.as_ref() == Some(model),
+                "LABEL_RUN_INVALID",
+            )?;
+        }
+    } else {
+        require(
+            backend.provider.is_none() && backend.actual_model.is_none(),
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    require(
+        trace.transport.model_requests.is_none(),
+        "LABEL_RUN_INVALID",
+    )?;
+    let posts: Vec<_> = trace
+        .transport
+        .requests
+        .iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    require(posts.len() == 1, "LABEL_RUN_INVALID")?;
+    let post = posts[0];
+    require(
+        post.http_status.is_some_and(|s| (200..300).contains(&s))
+            && post.state == "http-response-observed"
+            && post
+                .query
+                .as_ref()
+                .is_some_and(|q| q.matches(&body.query.utf8))
+            && post
+                .json_body_sha256
+                .as_deref()
+                .is_some_and(|s| is_hex(s, 64)),
+        "LABEL_RUN_INVALID",
+    )?;
+    let submitted = post.documents.as_ref().context("LABEL_RUN_INVALID")?;
+    require(submitted.len() == 200, "LABEL_RUN_INVALID")?;
+    let mut by_input: Vec<_> = question.slots.iter().collect();
+    by_input.sort_by_key(|s| s.input_slot);
+    for (index, (sent, slot)) in submitted.iter().zip(by_input).enumerate() {
+        require(
+            sent.input_slot == index
+                && slot.input_slot == index
+                && sent.text.sha256 == slot.candidate_text.sha256
+                && sent.text.utf8_bytes == slot.candidate_text.utf8_bytes
+                && slot.sent_text.as_ref().is_some_and(|d| {
+                    d.sha256 == sent.text.sha256 && d.utf8_bytes == sent.text.utf8_bytes
+                })
+                && slot.rerank_score.is_some(),
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    for request in &trace.transport.requests {
+        require(
+            !request.path.is_empty()
+                && matches!(request.method.as_str(), "GET" | "POST")
+                && request.state
+                    == if request.http_status.is_some() {
+                        "http-response-observed"
+                    } else {
+                        "attempted-delivery-unknown"
+                    },
+            "LABEL_RUN_INVALID",
+        )?;
+        if request.method == "GET" {
+            require(
+                request.query.is_none()
+                    && request.documents.is_none()
+                    && request.json_body_sha256.is_none(),
+                "LABEL_RUN_INVALID",
+            )?;
+        }
+    }
+    let responses = trace
+        .transport
+        .requests
+        .iter()
+        .filter(|r| r.http_status.is_some())
+        .count();
+    require(question.cost.http.len() == 1, "LABEL_RUN_INVALID")?;
+    let counts = &question.cost.http[0];
+    require(
+        counts.scope == "rerank-http-v1"
+            && counts.basis == "observed-client"
+            && counts.http_attempts == Some(trace.transport.requests.len() as u64)
+            && counts.http_response_observed == Some(responses as u64)
+            && counts.delivery_unknown == Some((trace.transport.requests.len() - responses) as u64)
+            && counts.model_executions.is_none(),
+        "LABEL_RUN_INVALID",
+    )?;
+    Ok(())
+}
+
 fn validate_question_evidence(
     root: &Path,
     output: &OutputWire,
@@ -2049,6 +2697,164 @@ fn validate_question_evidence(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Each test owns all files. No env/static/global counters or shared roots.
+    #[cfg(unix)]
+    fn synthetic_wire(bytes: &[u8]) -> Result<(tempfile::TempDir, WirePinned)> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+        let path = root.path().join("synthetic.json");
+        fs::write(&path, bytes)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let wire = labels::read_subject(&path)?;
+        Ok((root, wire))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_scores_preserve_u64_negative_zero_and_exact_float_bits() {
+        let bytes = br#"{"questions":[{"qid":"N01","slots":[{"input_slot":0,"original_score":18446744073709551615,"rerank_score":0.24473430858228182},{"input_slot":1,"original_score":-0.0,"rerank_score":null},{"input_slot":2,"original_score":0.24473430858228182,"rerank_score":-1.9799289335064246e+301}]}]}"#;
+        let (root, wire) = synthetic_wire(bytes).unwrap();
+        let value = restore_run_scores(&wire).unwrap();
+        let slots = value["questions"][0]["slots"].as_array().unwrap();
+        assert_eq!(slots[0]["original_score"].as_u64(), Some(u64::MAX));
+        assert_eq!(
+            slots[0]["rerank_score"].as_f64().unwrap().to_bits(),
+            0x3fcf53742dc8f823
+        );
+        assert_eq!(
+            slots[1]["original_score"].as_f64().unwrap().to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert!(slots[1]["rerank_score"].is_null());
+        assert_eq!(
+            slots[2]["original_score"].as_f64().unwrap().to_bits(),
+            0x3fcf53742dc8f823
+        );
+        assert_eq!(
+            slots[2]["rerank_score"].as_f64().unwrap().to_bits(),
+            0xfe7d909229733243
+        );
+        assert_eq!(wire.observed_file_sha256(), digest(bytes));
+        assert_eq!(fs::read(root.path().join("synthetic.json")).unwrap(), bytes);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_score_keys_field_order_and_false_nested_targets() {
+        let bytes = br#"{"note":"fake \"original_score\":9","unknown":{"questions":[{"slots":[{"original_score":77,"rerank_score":88}]}]},"questions":[{"slots":[{"rerank_\u0073core":0.24473430858228182,"unused":{"original_score":99},"input_slot":0,"original_\u0073core":-0.0}],"qid":"N01"}]}"#;
+        let (_root, wire) = synthetic_wire(bytes).unwrap();
+        let value = restore_run_scores(&wire).unwrap();
+        assert_eq!(
+            value["questions"][0]["slots"][0]["original_score"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(
+            value["questions"][0]["slots"][0]["rerank_score"]
+                .as_f64()
+                .unwrap()
+                .to_bits(),
+            0x3fcf53742dc8f823
+        );
+        assert_eq!(value["unknown"], wire.value()["unknown"]);
+        assert_eq!(
+            value["questions"][0]["slots"][0]["unused"],
+            wire.value()["questions"][0]["slots"][0]["unused"]
+        );
+        // The locator does not grant schema admission to the unknown fields.
+        assert!(serde_json::from_value::<RunWire>(value).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_nullable_scores_null_original_and_wrong_types_are_rejected() {
+        for fields in [
+            "\"original_score\":1.0",
+            "\"rerank_score\":null",
+            "\"original_score\":null,\"rerank_score\":null",
+            "\"original_score\":\"1\",\"rerank_score\":null",
+            "\"original_score\":1,\"rerank_score\":[]",
+            "\"original_score\":1,\"rerank_score\":false",
+        ] {
+            let bytes = format!(
+                "{{\"questions\":[{{\"qid\":\"N01\",\"slots\":[{{\"input_slot\":0,{fields}}}]}}]}}"
+            );
+            let (_root, wire) = synthetic_wire(bytes.as_bytes()).unwrap();
+            assert!(restore_run_scores(&wire).is_err(), "{fields}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn strict_reader_rejects_duplicate_escaped_keys_and_nonfinite_before_spans() {
+        for fields in [
+            "\"original_score\":1,\"original_\\u0073core\":2,\"rerank_score\":null",
+            "\"original_score\":NaN,\"rerank_score\":null",
+            "\"original_score\":1e309,\"rerank_score\":null",
+            "\"original_score\":1,\"rerank_score\":Infinity",
+        ] {
+            let bytes = format!(
+                "{{\"questions\":[{{\"qid\":\"N01\",\"slots\":[{{\"input_slot\":0,{fields}}}]}}]}}"
+            );
+            assert!(synthetic_wire(bytes.as_bytes()).is_err(), "{fields}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn span_walk_obeys_strict_depth_and_does_not_apply_fixed_size_to_full() {
+        for (depth, accepted) in [(126, true), (127, false)] {
+            let bytes = format!(
+                "{{\"questions\":[],\"unknown\":{}0{}}}",
+                "[".repeat(depth),
+                "]".repeat(depth)
+            );
+            if accepted {
+                let (_root, wire) = synthetic_wire(bytes.as_bytes()).unwrap();
+                assert!(restore_run_scores(&wire).is_ok());
+            } else {
+                assert!(synthetic_wire(bytes.as_bytes()).is_err());
+            }
+        }
+        let slots: Vec<_> = (0..1801)
+            .map(|i| {
+                format!("{{\"input_slot\":{i},\"original_score\":-0.0,\"rerank_score\":null}}")
+            })
+            .collect();
+        let bytes = format!(
+            "{{\"questions\":[{{\"qid\":\"N01\",\"slots\":[{}]}}]}}",
+            slots.join(",")
+        );
+        let (_root, wire) = synthetic_wire(bytes.as_bytes()).unwrap();
+        let restored = restore_run_scores(&wire).unwrap();
+        assert_eq!(
+            restored["questions"][0]["slots"].as_array().unwrap().len(),
+            1801
+        );
+        assert!(restored_number(b"18446744073709551616").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fixed_question_copy_restores_only_score_leaves_and_preserves_file_sha() {
+        let question = br#"{"qid":"N01","cost":{"question_total_ms":0.24473430858228182},"slots":[{"input_slot":0,"original_score":0.24473430858228182,"rerank_score":-0.0}]}"#;
+        let mut run = b"{\"questions\":[".to_vec();
+        run.extend(question);
+        run.extend(b"]}");
+        let (_run_root, run_wire) = synthetic_wire(&run).unwrap();
+        let (_question_root, question_wire) = synthetic_wire(question).unwrap();
+        let restored = restore_fixed_question_scores(&question_wire).unwrap();
+        assert_eq!(
+            restored,
+            restore_run_scores(&run_wire).unwrap()["questions"][0]
+        );
+        assert_eq!(restored["cost"], question_wire.value()["cost"]);
+        assert_eq!(question_wire.observed_file_sha256(), digest(question));
+    }
 
     #[test]
     fn human_wire_excludes_engine_rank_and_unknown_answers() {
