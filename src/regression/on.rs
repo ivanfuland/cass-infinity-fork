@@ -313,7 +313,7 @@ fn summary_identity(values: &[crate::search::rerank::types::CallIdentity]) -> Va
             first
         }
     };
-    json!({"provider":known(|v|v.actual_provider.and_then(|p|serde_json::to_value(p).ok())),"actual_model":known(|v|v.actual_model.as_ref().map(|s|json!(s))),"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":crate::search::rerank::context::document_assembly_policy(),"client_submission_policy":"verbatim-query-documents-v1"})
+    json!({"provider":known(|v|v.actual_provider.and_then(|p|serde_json::to_value(p).ok())),"actual_model":known(|v|v.actual_model.as_ref().map(|s|json!(s))),"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":crate::search::rerank::context::document_assembly_policy().get("id").cloned().unwrap_or(Value::Null),"client_submission_policy":"verbatim-query-documents-v1"})
 }
 
 pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
@@ -466,7 +466,11 @@ mod tests {
         let mut rows = Vec::new();
         let mut pool_windows = Vec::new();
         for (qindex, qid) in QIDS.iter().enumerate() {
-            let query = "retrieval".to_string();
+            let query = if fault == "empty-query" {
+                "synthetic_no_match_token_7429".to_string()
+            } else {
+                "retrieval".to_string()
+            };
             let query_sha = digest(query.as_bytes());
             let mut items = Vec::new();
             let mut span_items = Vec::new();
@@ -604,8 +608,13 @@ mod tests {
         }
     }
 
-    fn command(n: u32, k: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionCommand) {
-        let f = fixture("");
+    fn command(
+        n: u32,
+        k: u32,
+        count: usize,
+        fault: &str,
+    ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
+        let f = fixture(if fault == "empty-query" { fault } else { "" });
         assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
         let (data, database, _, source_manifest) =
             regression_binding::tests::searchable_fixture_with_count(count);
@@ -642,42 +651,93 @@ mod tests {
         let n = config["n"].as_u64().unwrap() as u32;
         let k = config["k"].as_u64().unwrap() as u32;
         let count = config["count"].as_u64().unwrap() as usize;
-        let (f, _data, cmd) = command(n, k, count);
-        let result = super::run(&cmd).unwrap();
-        assert_eq!(
-            result["terminal"],
-            if count < n as usize {
-                "SHORT_WINDOW"
-            } else {
-                "SUCCESS"
-            }
-        );
+        let fault = config.get("fault").and_then(Value::as_str).unwrap_or("");
+        let (f, _data, cmd) = command(n, k, count, fault);
+        let started = Instant::now();
+        let result = if fault == "source-change" {
+            let validated = super::super::input::prepare_full(&cmd).unwrap();
+            let run = RegressionSearchRun::activate(validated, &cmd).unwrap();
+            std::fs::write(
+                run.validated.source_manifest.as_ref().unwrap(),
+                b"changed synthetic source during on aggregate",
+            )
+            .unwrap();
+            super::collect(
+                &run,
+                &RunProvenance::capture().unwrap(),
+                started,
+                milliseconds(started),
+            )
+        } else {
+            super::run(&cmd)
+        };
         let root = f.input.output.output_root.join(&f.input.output.run_id);
         let report: Value =
             serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
-        assert_eq!(report["questions"].as_array().unwrap().len(), 9);
-        for q in report["questions"].as_array().unwrap() {
-            assert_eq!(q["actual_n"], n.min(count as u32));
-            let actual = q["actual_n"].as_u64().unwrap() as usize;
+        let failed = !fault.is_empty() && fault != "empty-query";
+        if failed {
+            let error = result.unwrap_err();
+            assert_eq!(report["terminal"], "FAILED");
+            assert_eq!(report["quality_status"], "FAILED");
             assert_eq!(
-                q["pages"].as_array().unwrap().len(),
-                actual.div_ceil(k as usize)
+                report["failure_code"],
+                super::super::run::error_code(&error)
             );
-            let slots = q["slots"].as_array().unwrap();
-            let keys: std::collections::HashSet<_> = slots
-                .iter()
-                .map(|s| s["candidate_instance_key"].as_str().unwrap())
-                .collect();
-            assert_eq!(keys.len(), actual);
-            for (i, slot) in slots.iter().enumerate() {
-                assert_eq!(slot["retrieval_rank"], i + 1);
-                assert_eq!(slot["final_rank"], i + 1);
-                assert_eq!(slot["rerank_score"], 1.0);
-                assert!(!slot["sent_text"].is_null());
+            if fault == "source-change" {
+                assert_eq!(report["questions"].as_array().unwrap().len(), 9);
+                assert_eq!(report["failure_code"], "BINDING_SOURCE_CHANGED");
+            } else {
+                assert_eq!(report["questions"].as_array().unwrap().len(), 0);
+                assert!(
+                    report["cost"]["counts"][0]["http_attempts"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+                assert!(report["cost"]["counts"][0]["model_executions"].is_null());
             }
-            for page in q["pages"].as_array().unwrap().iter().skip(1) {
-                assert_eq!(page["http_requests"], 0);
-                assert_eq!(page["model_requests"], 0);
+        } else {
+            let result = result.unwrap();
+            let actual = if fault == "empty-query" {
+                0
+            } else {
+                n.min(count as u32) as usize
+            };
+            assert_eq!(
+                result["terminal"],
+                if actual < n as usize {
+                    "SHORT_WINDOW"
+                } else {
+                    "SUCCESS"
+                }
+            );
+            assert_eq!(report["questions"].as_array().unwrap().len(), 9);
+            for q in report["questions"].as_array().unwrap() {
+                assert_eq!(q["actual_n"], actual);
+                assert_eq!(
+                    q["pages"].as_array().unwrap().len(),
+                    actual.div_ceil(k as usize)
+                );
+                let slots = q["slots"].as_array().unwrap();
+                let keys: std::collections::HashSet<_> = slots
+                    .iter()
+                    .map(|s| s["candidate_instance_key"].as_str().unwrap())
+                    .collect();
+                assert_eq!(keys.len(), actual);
+                for (i, slot) in slots.iter().enumerate() {
+                    assert_eq!(slot["retrieval_rank"], i + 1);
+                    assert_eq!(slot["final_rank"], i + 1);
+                    assert_eq!(slot["rerank_score"], 1.0);
+                    assert!(!slot["sent_text"].is_null());
+                }
+                for page in q["pages"].as_array().unwrap().iter().skip(1) {
+                    assert_eq!(page["http_requests"], 0);
+                    assert_eq!(page["model_requests"], 0);
+                }
+                if actual == 0 {
+                    assert_eq!(q["rerank_applied"], false);
+                    assert_eq!(q["full_requested_n_claim"], false);
+                }
             }
         }
         let output = PathBuf::from(config["output"].as_str().unwrap());
@@ -695,6 +755,9 @@ mod tests {
     }
 
     fn window_case(n: u32, k: u32, count: usize) {
+        window_case_with_fault(n, k, count, "");
+    }
+    fn window_case_with_fault(n: u32, k: u32, count: usize, fault: &str) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::{
@@ -707,6 +770,7 @@ mod tests {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let stop = Arc::new(AtomicBool::new(false));
         let done = stop.clone();
+        let server_fault = fault.to_string();
         let worker = std::thread::spawn(move || {
             let mut posts = vec![];
             let mut gets = 0;
@@ -757,8 +821,43 @@ mod tests {
                         }
                     }
                 };
-                let response=if path=="/models" {gets+=1;json!({"data":[{"id":"BAAI/bge-reranker-v2-m3"}]})} else {assert_eq!(path,"/rerank");let len=body["documents"].as_array().unwrap().len();posts.push(body);json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..len).map(|i|json!({"index":i,"relevance_score":1.0})).collect::<Vec<_>>()})}.to_string();
-                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
+                let (status, response) = if path == "/models" {
+                    gets += 1;
+                    if server_fault == "model-mismatch" {
+                        (
+                            "200 OK",
+                            json!({"data":[{"id":"synthetic-other-model"}]}).to_string(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            json!({"data":[{"id":"BAAI/bge-reranker-v2-m3"}]}).to_string(),
+                        )
+                    }
+                } else {
+                    assert_eq!(path, "/rerank");
+                    let len = body["documents"].as_array().unwrap().len();
+                    posts.push(body);
+                    if server_fault == "disconnect" {
+                        drop(stream);
+                        continue;
+                    }
+                    if server_fault == "http500" {
+                        ("500 Synthetic Failure", "{}".into())
+                    } else if server_fault == "invalid-json" {
+                        ("200 OK", "synthetic invalid JSON".into())
+                    } else if server_fault == "nan" {
+                        ("200 OK","{\"model\":\"BAAI/bge-reranker-v2-m3\",\"results\":[{\"index\":0,\"relevance_score\":NaN}]}".into())
+                    } else {
+                        let total = if server_fault == "wrong-count" {
+                            len - 1
+                        } else {
+                            len
+                        };
+                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":1.0})).collect::<Vec<_>>()}).to_string())
+                    }
+                };
+                write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
             }
             (gets, posts)
         });
@@ -766,7 +865,12 @@ mod tests {
         let evidence = dotenvy::var("CASS_S2_05_EVIDENCE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| temporary.path().to_path_buf());
-        let output = evidence.join(format!("n{n}-k{k}-count{count}"));
+        let suffix = if fault.is_empty() {
+            String::new()
+        } else {
+            format!("-{fault}")
+        };
+        let output = evidence.join(format!("n{n}-k{k}-count{count}{suffix}"));
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -775,7 +879,7 @@ mod tests {
             ])
             .env(
                 "CASS_S2_05_CHILD",
-                json!({"n":n,"k":k,"count":count,"output":output}).to_string(),
+                json!({"n":n,"k":k,"count":count,"output":output,"fault":fault}).to_string(),
             )
             .env("CASS_INFINITY_URL", origin)
             .output()
@@ -787,14 +891,33 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&result.stdout)
         );
-        assert_eq!(gets, 9);
-        assert_eq!(posts.len(), 9);
+        let successful = fault.is_empty() || fault == "source-change";
+        assert_eq!(
+            gets,
+            if fault == "empty-query" {
+                0
+            } else if successful {
+                9
+            } else {
+                1
+            }
+        );
+        assert_eq!(
+            posts.len(),
+            if fault == "empty-query" || fault == "model-mismatch" {
+                0
+            } else if successful {
+                9
+            } else {
+                1
+            }
+        );
         assert!(
             posts
                 .iter()
                 .all(|p| p["documents"].as_array().unwrap().len() == n.min(count as u32) as usize)
         );
-        write_private(&evidence,&format!("http-n{n}-k{k}-count{count}.json"),&json!({"gets":gets,"posts":posts.iter().map(|p|json!({"query":TextDigest::of(p["query"].as_str().unwrap()),"documents":p["documents"].as_array().unwrap().iter().map(|d|TextDigest::of(d.as_str().unwrap())).collect::<Vec<_>>() })).collect::<Vec<_>>(),"child_rc":result.status.code()})).unwrap();
+        write_private(&evidence,&format!("http-n{n}-k{k}-count{count}{suffix}.json"),&json!({"gets":gets,"posts":posts.iter().map(|p|json!({"query":TextDigest::of(p["query"].as_str().unwrap()),"documents":p["documents"].as_array().unwrap().iter().map(|d|TextDigest::of(d.as_str().unwrap())).collect::<Vec<_>>() })).collect::<Vec<_>>(),"child_rc":result.status.code()})).unwrap();
     }
 
     #[test]
@@ -816,5 +939,28 @@ mod tests {
     #[test]
     fn full_n7_k5_delivers_five_then_two() {
         window_case(7, 5, 9);
+    }
+    #[test]
+    fn complete_empty_window_has_zero_coverage_and_no_http() {
+        window_case_with_fault(7, 3, 9, "empty-query");
+    }
+    #[test]
+    fn actual_backend_failure_response_matrix_is_failed_with_observed_attempts() {
+        for fault in [
+            "http500",
+            "invalid-json",
+            "disconnect",
+            "wrong-count",
+            "duplicate",
+            "out-of-range",
+            "nan",
+            "model-mismatch",
+        ] {
+            window_case_with_fault(7, 3, 9, fault);
+        }
+    }
+    #[test]
+    fn on_final_source_change_keeps_nine_windows_but_failed_run() {
+        window_case_with_fault(7, 3, 9, "source-change");
     }
 }
