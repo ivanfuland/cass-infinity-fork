@@ -76,14 +76,14 @@ fn guarded_path(path: &Path) -> Result<PathBuf> {
 }
 
 /// Reads one descriptor, verifies its identity, and hashes exactly those bytes.
-fn read_file(path: &Path) -> Result<Vec<u8>> {
+fn read_file(path: &Path, bundle_file: bool) -> Result<Vec<u8>> {
     let path = guarded_path(path)?;
     let before = fs::symlink_metadata(&path).context("INPUT_FILE_UNAVAILABLE")?;
     require(before.is_file(), "INPUT_FILE_NOT_REGULAR")?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        require(before.nlink() == 1, "INPUT_FILE_HARDLINK")?;
+        require(!bundle_file || before.nlink() == 1, "INPUT_FILE_HARDLINK")?;
     }
     let mut options = OpenOptions::new();
     options.read(true);
@@ -129,9 +129,9 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn pinned(path: &Path, sha: &str, code: &'static str) -> Result<Vec<u8>> {
+fn pinned(path: &Path, sha: &str, code: &'static str, bundle_file: bool) -> Result<Vec<u8>> {
     require(valid_digest(sha), code)?;
-    let bytes = read_file(path)?;
+    let bytes = read_file(path, bundle_file)?;
     require(digest(&bytes) == sha, code)?;
     Ok(bytes)
 }
@@ -258,6 +258,7 @@ pub(crate) fn validate_inputs(options: &InputOptions) -> Result<ValidatedInputs>
         &root.join("SUITE-MANIFEST.json"),
         &options.suite_sha256,
         "SUITE_DIGEST_MISMATCH",
+        true,
     )?;
     let suite = strict_json(&suite_bytes)?;
     schema(&suite, "cass.regression.suite-manifest.v1")?;
@@ -291,6 +292,7 @@ pub(crate) fn validate_inputs(options: &InputOptions) -> Result<ValidatedInputs>
         &root.join("SOURCE-INVENTORY.json"),
         inventory_sha,
         "SOURCE_INVENTORY_DIGEST_MISMATCH",
+        true,
     )?)?;
     schema(&inventory, "cass.regression.source-inventory.v1")?;
     for (key, suite_key) in [
@@ -342,6 +344,7 @@ pub(crate) fn validate_inputs(options: &InputOptions) -> Result<ValidatedInputs>
             &root.join(&asset.path),
             &asset.sha256,
             "INPUT_ASSET_DIGEST_MISMATCH",
+            true,
         )?;
         require(
             bytes.len() as u64 == asset.bytes,
@@ -725,7 +728,7 @@ fn validate_cutoffs(cutoffs: &[u32]) -> Result<()> {
 }
 
 fn validate_pool(path: &Path, sha: &str, inputs: &ValidatedInputs) -> Result<()> {
-    let pool = strict_json(&pinned(path, sha, "POOL_BINDING_MISMATCH")?)?;
+    let pool = strict_json(&pinned(path, sha, "POOL_BINDING_MISMATCH", false)?)?;
     schema(&pool, "cass.regression-fixed-pool.v1")?;
     for (key, expected) in [
         ("suite_sha256", &inputs.suite_sha256),
@@ -822,7 +825,7 @@ struct SourceReceipt {
 }
 
 fn validate_receipt(path: &Path, sha: &str, manifest_sha: &str) -> Result<()> {
-    let bytes = pinned(path, sha, "SOURCE_RECEIPT_DIGEST_MISMATCH")?;
+    let bytes = pinned(path, sha, "SOURCE_RECEIPT_DIGEST_MISMATCH", false)?;
     let value = strict_json(&bytes).map_err(|_| anyhow::anyhow!("SOURCE_RECEIPT_INVALID"))?;
     let receipt: SourceReceipt =
         serde_json::from_value(value).map_err(|_| anyhow::anyhow!("SOURCE_RECEIPT_INVALID"))?;
@@ -879,7 +882,7 @@ pub(crate) fn prepare_full(command: &RegressionCommand) -> Result<ValidatedRun> 
     ];
     output_admission(&input.output, &protected)?;
     let inputs = validate_inputs(input)?;
-    let manifest_bytes = read_file(source_manifest)?;
+    let manifest_bytes = read_file(source_manifest, false)?;
     let manifest_sha = digest(&manifest_bytes);
     validate_receipt(
         source_producer_receipt,
@@ -892,6 +895,7 @@ pub(crate) fn prepare_full(command: &RegressionCommand) -> Result<ValidatedRun> 
         expected_binding,
         expected_binding_sha256,
         "EXPECTED_BINDING_FILE_DIGEST_MISMATCH",
+        false,
     )?;
     let expected_value = strict_json(&expected_bytes)?;
     require(
@@ -1012,8 +1016,13 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
             validate_cutoffs(cutoffs)?;
             let protected = vec![left.clone(), right.clone(), labels.clone()];
             output_admission(output, &protected)?;
-            let left = strict_json(&pinned(left, left_sha256, "COMPARE_INPUT_INVALID")?)?;
-            let right = strict_json(&pinned(right, right_sha256, "COMPARE_INPUT_INVALID")?)?;
+            let left = strict_json(&pinned(left, left_sha256, "COMPARE_INPUT_INVALID", false)?)?;
+            let right = strict_json(&pinned(
+                right,
+                right_sha256,
+                "COMPARE_INPUT_INVALID",
+                false,
+            )?)?;
             schema(&left, "cass.regression-run.v1")?;
             schema(&right, "cass.regression-run.v1")?;
             require(
@@ -1027,6 +1036,7 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
                 labels,
                 labels_sha256,
                 "LABEL_FILE_IDENTITY_MISMATCH",
+                false,
             )?)?;
             require(
                 matches!(
@@ -1665,6 +1675,59 @@ mod tests {
         assert_eq!(
             error_code(&run(&command(&f)).unwrap_err()),
             "INPUT_FILE_HARDLINK"
+        );
+    }
+
+    #[test]
+    fn external_hardlinks_preserve_approved_bytes_without_bundle_restrictions() {
+        let f = fixture("");
+        let cmd = full_command(&f, "");
+        let RegressionCommand::FullSearch {
+            expected_binding,
+            source_manifest,
+            source_producer_receipt,
+            ..
+        } = &cmd
+        else {
+            unreachable!();
+        };
+        for (index, path) in [expected_binding, source_manifest, source_producer_receipt]
+            .iter()
+            .enumerate()
+        {
+            fs::hard_link(path, f._root.path().join(format!("external-alias-{index}"))).unwrap();
+            assert_eq!(fs::metadata(path).unwrap().nlink(), 2);
+        }
+        assert_eq!(run(&cmd).unwrap()["stage"], "INPUT_VALIDATED");
+
+        let f = fixture("");
+        fs::hard_link(&f.pool, f._root.path().join("pool-alias.json")).unwrap();
+        assert_eq!(run(&command(&f)).unwrap()["stage"], "INPUT_VALIDATED");
+        let left = f.pool.parent().unwrap().join("left.json");
+        let right = f.pool.parent().unwrap().join("right.json");
+        let labels = f.pool.parent().unwrap().join("external-labels.json");
+        let bytes = serde_json::to_vec(&json!({"schema":"cass.regression-run.v1","mode":"fixed-candidate","labels_sha256":f.input.labels_sha256})).unwrap();
+        fs::write(&left, &bytes).unwrap();
+        fs::write(&right, &bytes).unwrap();
+        fs::copy(&f.input.labels, &labels).unwrap();
+        for (index, path) in [&left, &right, &labels].iter().enumerate() {
+            fs::hard_link(path, f._root.path().join(format!("compare-alias-{index}"))).unwrap();
+        }
+        let mut output = f.input.output.clone();
+        output.run_id = "external-hardlink-compare".into();
+        let compare = RegressionCommand::Compare {
+            left,
+            left_sha256: digest(&bytes),
+            right,
+            right_sha256: digest(&bytes),
+            labels,
+            labels_sha256: f.input.labels_sha256.clone(),
+            output,
+            cutoffs: vec![5, 10, 20],
+        };
+        assert_eq!(run(&compare).unwrap()["stage"], "INPUT_VALIDATED");
+        println!(
+            "EXTERNAL_HARDLINKS full_expected/source/receipt fixed_pool compare_left/right/labels accepted; bundle_hardlink_rejection_kept"
         );
     }
 
