@@ -49,6 +49,7 @@ pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
+pub mod regression;
 pub(crate) mod recipes_robot_docs;
 pub(crate) mod recovery_support_bundle;
 pub mod release_verify;
@@ -293,6 +294,11 @@ pub use search::regression_input::RegressionInputCommand;
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
+    /// Validate pinned regression inputs without retrieval or evaluation.
+    Regression {
+        #[command(subcommand)]
+        action: regression::RegressionCommand,
+    },
     /// Inspect or verify frozen retrieval regression inputs without repair.
     RegressionInput {
         #[command(subcommand)]
@@ -6672,6 +6678,14 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         heuristic_note,
     } = parsed;
 
+    if matches!(
+        &cli.command,
+        Some(Commands::Regression { .. } | Commands::RegressionInput { .. })
+    ) {
+        search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
+            .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+    }
+
     let stdout_is_tty = io::stdout().is_terminal();
     let stderr_is_tty = io::stderr().is_terminal();
     configure_color(cli.color, stdout_is_tty, stderr_is_tty);
@@ -6893,6 +6907,16 @@ async fn execute_cli(
     let filter = build_robot_aware_log_filter(robot_mode, cli.verbose, cli.quiet);
 
     match &command {
+        Commands::Regression { action } => {
+            search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
+                .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+            let result = regression::input::run(action).map_err(|error| CliError {
+                code: 2, kind: CliErrorKind::Usage.kind_str(),
+                message: regression::input::error_code(&error).to_string(),
+                hint: None, retryable: false,
+            })?;
+            println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
+        }
         Commands::RegressionInput { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
@@ -21102,6 +21126,7 @@ fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path)
 
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
+        Some(Commands::Regression { .. }) => "regression".to_string(),
         Some(Commands::RegressionInput { .. }) => "regression-input".to_string(),
         Some(Commands::Tui { .. }) => "tui".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
@@ -21426,7 +21451,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Expand { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::RegressionInput { .. } => true,
+        Commands::RegressionInput { .. } | Commands::Regression { .. } => true,
         Commands::Doctor { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Timeline { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
