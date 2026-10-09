@@ -105,6 +105,37 @@ pub(crate) fn write_private(root: &Path, relative: &str, value: &Value) -> Resul
     Ok(json!({"relative_path":relative,"sha256":digest(&bytes)}))
 }
 
+fn private_files(root: &Path) -> Result<Vec<String>> {
+    fn walk(root: &Path, directory: &Path, files: &mut Vec<String>) -> Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_symlink() {
+                bail!("REGRESSION_REPORT_WRITE_FAILED");
+            }
+            if kind.is_dir() {
+                walk(root, &entry.path(), files)?;
+            } else if kind.is_file() {
+                files.push(
+                    entry
+                        .path()
+                        .strip_prefix(root)?
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?
+                        .to_string(),
+                );
+            } else {
+                bail!("REGRESSION_REPORT_WRITE_FAILED");
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
 fn counts(mode: SearchMode) -> Vec<Value> {
     let mut values = vec![
         json!({"scope":"rerank-http-v1","http_attempts":0,"http_response_observed":0,"delivery_unknown":0,"model_executions":0,"basis":"not-called"}),
@@ -155,6 +186,7 @@ pub(crate) fn collect(
         match run.search_off(&window.query) {
             Ok(search) => {
                 let mut slots = Vec::new();
+                let mut subjects = Vec::new();
                 for (hit, slot) in search.result.hits.iter().zip(&search.evidence.final_slots) {
                     let text = TextDigest::of(&hit.content);
                     let key = LabelKey {
@@ -170,8 +202,18 @@ pub(crate) fn collect(
                         .find(|row| row.key == key)
                         .map(|row| row.value.as_str())
                         .unwrap_or("unknown");
-                    slots.push(json!({"candidate_instance_key":candidate_instance_key(&slot.identity)?,"label_key":key,"input_slot":slot.input_slot,"retrieval_rank":slot.retrieval_rank,"final_rank":slot.retrieval_rank,"identity":slot.identity,"message_id":hit.message_id,"conversation_id":hit.conversation_id,"candidate_text":text,"sent_text":null,"source_sha256":null,"original_score":hit.score,"rerank_score":null,"label":label}));
+                    let instance_key = candidate_instance_key(&slot.identity)?;
+                    subjects.push(json!({"candidate_instance_key":instance_key,"label_key":key,"text":{"utf8":hit.content,"sha256":text.sha256,"utf8_bytes":text.utf8_bytes}}));
+                    slots.push(json!({"candidate_instance_key":instance_key,"label_key":key,"input_slot":slot.input_slot,"retrieval_rank":slot.retrieval_rank,"final_rank":slot.retrieval_rank,"identity":slot.identity,"message_id":hit.message_id,"conversation_id":hit.conversation_id,"candidate_text":text,"sent_text":null,"source_sha256":null,"original_score":hit.score,"rerank_score":null,"label":label}));
                 }
+                let query_digest = TextDigest::of(&window.query);
+                let subjects_relative = format!("label-subjects-{}.json", window.qid);
+                write_private(
+                    root,
+                    &subjects_relative,
+                    &json!({"schema":"cass.regression-label-subjects.v1","qid":window.qid,"query":{"utf8":window.query,"sha256":query_digest.sha256,"utf8_bytes":query_digest.utf8_bytes},"label_policy_sha256":run.validated.inputs.label_policy_sha256,"candidates":subjects}),
+                )?;
+                writes.push(subjects_relative);
                 let evidence_relative = search
                     .evidence_path
                     .strip_prefix(root)?
@@ -215,6 +257,7 @@ pub(crate) fn collect(
     let quantile = |p: f64| {
         (!sorted.is_empty()).then(|| sorted[(p * sorted.len() as f64).ceil() as usize - 1])
     };
+    writes = private_files(root)?;
     writes.push("run.json".into());
     let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":"NOT_EVALUATED","failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
     write_private(root, "run.json", &output)?;
@@ -504,13 +547,11 @@ mod tests {
                 .filter(|e| e.file_name() == "input-binding-candidate.json")
                 .count();
             assert_eq!(inventory_files, 1);
-            let provenance = RunProvenance::capture().unwrap();
-            let started = Instant::now();
-            collect(&run, &provenance, started, 0.0).unwrap();
-            let report: Value = serde_json::from_slice(
-                &fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
-            )
-            .unwrap();
+            let (f, _fresh_data, command) = full_fixture(n, 12);
+            super::run(&command).unwrap();
+            let run_root = f.input.output.output_root.join(&f.input.output.run_id);
+            let report: Value =
+                serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
             assert_eq!(report["questions"].as_array().unwrap().len(), 9);
             assert_eq!(report["terminal"], "SUCCESS");
             assert_eq!(report["cost"]["sample_count"], 9);
@@ -525,25 +566,34 @@ mod tests {
                     .iter()
                     .all(|slot| slot["label"] == "unknown" && slot["sent_text"].is_null())
             );
+            check_subjects(&run_root, &report);
             if let Ok(root) = dotenvy::var("CASS_S2_04_TEST_EVIDENCE") {
-                let output = Path::new(&root).join(format!("module-n{n}-run.json"));
-                fs::copy(run.validated.paths.run_root.join("run.json"), &output).unwrap();
-                fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+                let output = Path::new(&root).join(format!("module-n{n}"));
+                fs::create_dir(&output).unwrap();
+                fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+                for relative in private_files(&run_root).unwrap() {
+                    let source = run_root.join(&relative);
+                    let destination = output.join(&relative);
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent).unwrap();
+                        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+                    }
+                    fs::copy(source, &destination).unwrap();
+                    fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).unwrap();
+                }
             }
         }
     }
 
     #[test]
     fn short_complete_pool_is_short_window_and_not_evaluated() {
-        let (_f, _data, run) = prepared(10, 3);
-        let provenance = RunProvenance::capture().unwrap();
-        let result = collect(&run, &provenance, Instant::now(), 0.0).unwrap();
+        let (f, _data, command) = full_fixture(10, 3);
+        let result = super::run(&command).unwrap();
+        let run_root = f.input.output.output_root.join(&f.input.output.run_id);
         assert_eq!(result["terminal"], "SHORT_WINDOW");
         assert_eq!(result["quality_status"], "NOT_EVALUATED");
-        let report: Value = serde_json::from_slice(
-            &fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
-        )
-        .unwrap();
+        let report: Value =
+            serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
         for q in report["questions"].as_array().unwrap() {
             assert_eq!(q["actual_n"], 3);
             assert_eq!(q["pool_complete"], true);
@@ -778,20 +828,11 @@ mod tests {
             crate::search::query::VectorSearchMode::Exact
         };
         let (_f, _data, cmd) = full_fixture_mode(5, 12, mode, Some(vector));
-        let validated = crate::regression::input::prepare_full(&cmd).unwrap();
-        let run = RegressionSearchRun::activate(validated, &cmd).unwrap();
-        let result = collect(
-            &run,
-            &RunProvenance::capture().unwrap(),
-            Instant::now(),
-            0.0,
-        )
-        .unwrap();
+        let result = super::run(&cmd).unwrap();
+        let run_root = _f.input.output.output_root.join(&_f.input.output.run_id);
         assert_eq!(result["terminal"], "SUCCESS");
-        let report: Value = serde_json::from_slice(
-            &fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
-        )
-        .unwrap();
+        let report: Value =
+            serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
         assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
         assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
         assert!(report["questions"][0]["cost"]["model_execution_ms"].is_null());
@@ -896,5 +937,161 @@ mod tests {
                 );
             }
         }
+    }
+    fn check_subjects(root: &Path, report: &Value) {
+        assert_eq!(
+            fs::metadata(root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for q in report["questions"].as_array().unwrap() {
+            let relative = format!("label-subjects-{}.json", q["qid"].as_str().unwrap());
+            assert!(
+                report["output"]["writes_relative_paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p == &relative)
+            );
+            let path = root.join(&relative);
+            assert!(
+                !fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let body: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(body["schema"], "cass.regression-label-subjects.v1");
+            assert_eq!(body["qid"], q["qid"]);
+            assert_eq!(body["label_policy_sha256"], report["label_policy_sha256"]);
+            let query = body["query"]["utf8"].as_str().unwrap();
+            assert_eq!(body["query"]["sha256"], digest(query.as_bytes()));
+            assert_eq!(body["query"]["sha256"], q["query_sha256"]);
+            assert_eq!(body["query"]["utf8_bytes"], query.len());
+            let candidates = body["candidates"].as_array().unwrap();
+            let slots = q["slots"].as_array().unwrap();
+            assert_eq!(candidates.len(), slots.len());
+            let mut keys = std::collections::HashSet::new();
+            for (subject, slot) in candidates.iter().zip(slots) {
+                assert!(keys.insert(subject["candidate_instance_key"].as_str().unwrap()));
+                assert_eq!(
+                    subject["candidate_instance_key"],
+                    slot["candidate_instance_key"]
+                );
+                assert_eq!(subject["label_key"], slot["label_key"]);
+                let text = subject["text"]["utf8"].as_str().unwrap();
+                assert_eq!(subject["text"]["sha256"], digest(text.as_bytes()));
+                assert_eq!(subject["text"]["sha256"], slot["candidate_text"]["sha256"]);
+                assert_eq!(subject["text"]["utf8_bytes"], text.len());
+                assert_eq!(
+                    subject["text"]["utf8_bytes"],
+                    slot["candidate_text"]["utf8_bytes"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_label_body_stdout_child() {
+        if dotenvy::var("CASS_S2_04_STDOUT_CHILD").is_err() {
+            return;
+        }
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use std::future::Future;
+                use std::task::{Context, Poll, Waker};
+                let (_f, _data, command) = full_fixture(5, 12);
+                let RegressionCommand::FullSearch {
+                    input,
+                    database,
+                    expected_binding,
+                    expected_binding_sha256,
+                    source_manifest,
+                    source_producer_receipt,
+                    source_producer_receipt_sha256,
+                    ..
+                } = &command
+                else {
+                    unreachable!()
+                };
+                let argv = vec![
+                    "cass".into(),
+                    "regression".into(),
+                    "full-search".into(),
+                    "--suite".into(),
+                    input.suite.display().to_string(),
+                    "--suite-sha256".into(),
+                    input.suite_sha256.clone(),
+                    "--labels".into(),
+                    input.labels.display().to_string(),
+                    "--labels-sha256".into(),
+                    input.labels_sha256.clone(),
+                    "--output-root".into(),
+                    input.output.output_root.display().to_string(),
+                    "--run-id".into(),
+                    input.output.run_id.clone(),
+                    "--database".into(),
+                    database.display().to_string(),
+                    "--expected-binding".into(),
+                    expected_binding.display().to_string(),
+                    "--expected-binding-sha256".into(),
+                    expected_binding_sha256.clone(),
+                    "--source-manifest".into(),
+                    source_manifest.display().to_string(),
+                    "--source-producer-receipt".into(),
+                    source_producer_receipt.display().to_string(),
+                    "--source-producer-receipt-sha256".into(),
+                    source_producer_receipt_sha256.clone(),
+                    "--search-mode".into(),
+                    "lexical".into(),
+                    "--rrf-limit".into(),
+                    "5".into(),
+                    "--rerank".into(),
+                    "off".into(),
+                ];
+                let parsed = crate::parse_cli(argv).unwrap();
+                let mut future = std::pin::pin!(crate::run_with_parsed(parsed));
+                let Poll::Ready(result) = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("synchronous regression must complete");
+                };
+                result.unwrap();
+                let run_root = input.output.output_root.join(&input.output.run_id);
+                let report: Value =
+                    serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
+                check_subjects(&run_root, &report);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn top_level_off_summary_does_not_print_query_or_candidate_bodies() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "regression::off::tests::private_label_body_stdout_child",
+                "--nocapture",
+            ])
+            .env("CASS_S2_04_STDOUT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("cass.regression-run-summary.v1"));
+        assert!(!stdout.contains("retrieval"));
+        assert!(!stdout.contains("Investigate retrieval ranking"));
+        assert!(!stdout.contains("Synthetic candidate"));
     }
 }
