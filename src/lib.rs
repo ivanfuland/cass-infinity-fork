@@ -6910,9 +6910,9 @@ async fn execute_cli(
         Commands::Regression { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
-            let result = regression::input::run(action).map_err(|error| CliError {
+            let result = regression::run::run(action).map_err(|error| CliError {
                 code: 2, kind: CliErrorKind::Usage.kind_str(),
-                message: regression::input::error_code(&error).to_string(),
+                message: regression::run::error_code(&error).to_string(),
                 hint: None, retryable: false,
             })?;
             println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
@@ -24688,6 +24688,194 @@ fn regression_request_evidence(
     }))
 }
 
+/// Shared retrieval dispatch. CLI rendering and aggregate recording consume
+/// the same structured result, without changing candidate selection.
+#[allow(clippy::too_many_arguments)]
+fn execute_search_retrieval(
+    client: &crate::search::query::SearchClient,
+    query: &str,
+    filters: &crate::search::query::SearchFilters,
+    search_limit: usize,
+    search_offset: usize,
+    search_sparse_threshold: usize,
+    search_field_mask: crate::search::query::FieldMask,
+    mode_meta: &mut SearchModeMeta,
+    hybrid_fail_open: bool,
+) -> CliResult<crate::search::query::SearchResult> {
+    use crate::search::query::SearchMode;
+    Ok(match mode_meta.realized {
+        SearchMode::Lexical => client
+            .search_with_fallback(
+                query,
+                filters.clone(),
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                search_field_mask,
+            )
+            .map_err(|e| {
+                let chain = format!("{e:#}");
+                if error_chain_indicates_lexical_index_building(&chain) {
+                    search_lexical_index_building_cli_error(&chain)
+                } else if error_chain_indicates_lexical_index_absent(&chain) {
+                    search_lexical_index_absent_cli_error(&chain)
+                } else {
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        hint: None,
+                        retryable: true,
+                    }
+                }
+            })?,
+        SearchMode::Semantic => {
+            // cass#256: in the `-baseline` build (the `semantic` Cargo
+            // feature is disabled), `--mode semantic` returns a clear
+            // CLI envelope rather than reaching code that would expect a
+            // working ORT runtime. Hybrid degrades to lexical via the
+            // existing fail-open path; lexical-only mode is unaffected.
+            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
+            {
+                // Suppress unused-binding warnings in the baseline arm:
+                // every input is consumed by the documented error envelope.
+                let _ = (
+                    &filters,
+                    query,
+                    search_limit,
+                    search_offset,
+                );
+                let _ = client;
+                Err::<crate::search::query::SearchResult, CliError>(CliError {
+                    code: 15,
+                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message:
+                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
+                            .to_string(),
+                    hint: Some(
+                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                })?
+            }
+            #[cfg(any(feature = "semantic", feature = "infinity"))]
+            {
+                let (hits, candidate_meta) = client
+                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
+                    .map_err(|e| {
+                        let err_str = e.to_string();
+                        if err_str.contains("unavailable")
+                            || err_str.contains("no embedder")
+                        {
+                            CliError {
+                                code: 15,
+                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                                message: "Semantic search not available".to_string(),
+                                hint: Some(
+                                    "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
+                                        .to_string(),
+                                ),
+                                retryable: false,
+                            }
+                        } else {
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!("semantic search failed: {e}"),
+                                hint: Some(
+                                    "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                        .to_string(),
+                                ),
+                                retryable: true,
+                            }
+                        }
+                    })?;
+                crate::search::query::SearchResult {
+                    hits,
+                    wildcard_fallback: false,
+                    cache_stats: crate::search::query::CacheStats::default(),
+                    suggestions: Vec::new(),
+                    total_count: None,
+                    candidates: Some(candidate_meta),
+                    semantic_degraded: false,
+                }
+            }
+        }
+        SearchMode::Hybrid => match client.search_hybrid(
+            query,
+            query,
+            filters.clone(),
+            search_limit,
+            search_offset,
+            search_sparse_threshold,
+            search_field_mask,
+        ) {
+            Ok(result) => {
+                sync_search_mode_meta_after_hybrid(mode_meta, &result);
+                result
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if hybrid_fail_open
+                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
+                {
+                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
+                    client
+                        .search_with_fallback(
+                            query,
+                            filters.clone(),
+                            search_limit,
+                            search_offset,
+                            search_sparse_threshold,
+                            search_field_mask,
+                        )
+                        .map_err(|fallback_err| {
+                            let chain = format!("{fallback_err:#}");
+                            if error_chain_indicates_lexical_index_building(&chain) {
+                                search_lexical_index_building_cli_error(&chain)
+                            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                                search_lexical_index_absent_cli_error(&chain)
+                            } else {
+                                CliError {
+                                    code: 9,
+                                    kind: CliErrorKind::Search.kind_str(),
+                                    message: format!(
+                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                    ),
+                                    hint: None,
+                                    retryable: true,
+                                }
+                            }
+                        })?
+                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
+                    return Err(CliError {
+                        code: 15,
+                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                        message: "Hybrid search not available (requires semantic search)".to_string(),
+                        hint: Some(
+                            "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode hybrid when lexical evidence is acceptable"
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    });
+                } else {
+                    return Err(CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("hybrid search failed: {e}"),
+                        hint: Some(
+                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    });
+                }
+            }
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -25605,179 +25793,10 @@ fn run_cli_search(
 
     // Track search timing breakdown (T7.4)
     let search_start = Instant::now();
-    let result = match mode_meta.realized {
-        SearchMode::Lexical => client
-            .search_with_fallback(
-                query,
-                filters.clone(),
-                search_limit,
-                search_offset,
-                search_sparse_threshold,
-                search_field_mask,
-            )
-            .map_err(|e| {
-                let chain = format!("{e:#}");
-                if error_chain_indicates_lexical_index_building(&chain) {
-                    search_lexical_index_building_cli_error(&chain)
-                } else if error_chain_indicates_lexical_index_absent(&chain) {
-                    search_lexical_index_absent_cli_error(&chain)
-                } else {
-                    CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("search failed: {e}"),
-                        hint: None,
-                        retryable: true,
-                    }
-                }
-            })?,
-        SearchMode::Semantic => {
-            // cass#256: in the `-baseline` build (the `semantic` Cargo
-            // feature is disabled), `--mode semantic` returns a clear
-            // CLI envelope rather than reaching code that would expect a
-            // working ORT runtime. Hybrid degrades to lexical via the
-            // existing fail-open path; lexical-only mode is unaffected.
-            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
-            {
-                // Suppress unused-binding warnings in the baseline arm:
-                // every input is consumed by the documented error envelope.
-                let _ = (
-                    &semantic_opts,
-                    &filters,
-                    &field_mask,
-                    query,
-                    search_limit,
-                    search_offset,
-                );
-                let _ = client;
-                Err::<crate::search::query::SearchResult, CliError>(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message:
-                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
-                            .to_string(),
-                    hint: Some(
-                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
-                            .to_string(),
-                    ),
-                    retryable: false,
-                })?
-            }
-            #[cfg(any(feature = "semantic", feature = "infinity"))]
-            {
-                let (hits, candidate_meta) = client
-                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
-                    .map_err(|e| {
-                        let err_str = e.to_string();
-                        if err_str.contains("unavailable")
-                            || err_str.contains("no embedder")
-                        {
-                            CliError {
-                                code: 15,
-                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                                message: "Semantic search not available".to_string(),
-                                hint: Some(
-                                    "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
-                                        .to_string(),
-                                ),
-                                retryable: false,
-                            }
-                        } else {
-                            CliError {
-                                code: 9,
-                                kind: CliErrorKind::Search.kind_str(),
-                                message: format!("semantic search failed: {e}"),
-                                hint: Some(
-                                    "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                        .to_string(),
-                                ),
-                                retryable: true,
-                            }
-                        }
-                    })?;
-                crate::search::query::SearchResult {
-                    hits,
-                    wildcard_fallback: false,
-                    cache_stats: crate::search::query::CacheStats::default(),
-                    suggestions: Vec::new(),
-                    total_count: None,
-                    candidates: Some(candidate_meta),
-                    semantic_degraded: false,
-                }
-            }
-        }
-        SearchMode::Hybrid => match client.search_hybrid(
-            query,
-            query,
-            filters.clone(),
-            search_limit,
-            search_offset,
-            search_sparse_threshold,
-            search_field_mask,
-        ) {
-            Ok(result) => {
-                sync_search_mode_meta_after_hybrid(&mut mode_meta, &result);
-                result
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if hybrid_fail_open
-                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
-                {
-                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
-                    client
-                        .search_with_fallback(
-                            query,
-                            filters.clone(),
-                            search_limit,
-                            search_offset,
-                            search_sparse_threshold,
-                            search_field_mask,
-                        )
-                        .map_err(|fallback_err| {
-                            let chain = format!("{fallback_err:#}");
-                            if error_chain_indicates_lexical_index_building(&chain) {
-                                search_lexical_index_building_cli_error(&chain)
-                            } else if error_chain_indicates_lexical_index_absent(&chain) {
-                                search_lexical_index_absent_cli_error(&chain)
-                            } else {
-                                CliError {
-                                    code: 9,
-                                    kind: CliErrorKind::Search.kind_str(),
-                                    message: format!(
-                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                                    ),
-                                    hint: None,
-                                    retryable: true,
-                                }
-                            }
-                        })?
-                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
-                    return Err(CliError {
-                        code: 15,
-                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                        message: "Hybrid search not available (requires semantic search)".to_string(),
-                        hint: Some(
-                            "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode hybrid when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: false,
-                    });
-                } else {
-                    return Err(CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("hybrid search failed: {e}"),
-                        hint: Some(
-                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: true,
-                    });
-                }
-            }
-        },
-    };
+    let result = execute_search_retrieval(
+        &client, query, &filters, search_limit, search_offset,
+        search_sparse_threshold, search_field_mask, &mut mode_meta, hybrid_fail_open,
+    )?;
     let search_ms = search_start.elapsed().as_millis() as u64;
     if regression.is_some()
         && (result.semantic_degraded
@@ -25789,42 +25808,15 @@ fn run_cli_search(
     if !rerank_on {
         if let Some(run) = regression.as_ref() {
             let hits = &result.hits[..limit_val.min(result.hits.len())];
-            let retrieval =
-                crate::search::regression_trace::freeze_retrieval_slots(&run.context, hits)
-                    .map_err(regression_search_error)?;
-            let evidence = crate::search::regression_trace::WindowEvidence {
-                schema: "cass.regression-window-trace.v2".into(),
-                request: regression_request_evidence(
-                    &filters,
-                    mode_meta.requested,
-                    vector_search_mode.unwrap_or_default(),
-                    limit_val,
-                    timeout_ms,
-                    &semantic_opts,
-                    &rerank_ctx,
+            let evidence = crate::search::regression_trace::off_evidence(
+                &run.context, &run.binding, query, hits,
+                regression_request_evidence(
+                    &filters, mode_meta.requested, vector_search_mode.unwrap_or_default(),
+                    limit_val, timeout_ms, &semantic_opts, &rerank_ctx,
                     regression_embedding_binding.as_ref(),
                 )?,
-                transport_scope: "rerank-http-v1".into(),
-                lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
-                lexical_statistics_sha256: (mode_meta.realized != SearchMode::Semantic)
-                    .then(|| run.binding.lexical_statistics_sha256.clone()),
-                binding: run.binding.clone(),
-                query: crate::search::regression_trace::TextDigest::of(query),
-                final_slots: retrieval.clone(),
-                retrieval,
-                snippets: hits
-                    .iter()
-                    .map(|h| crate::search::regression_trace::TextDigest::of(&h.content))
-                    .collect(),
-                prepared_documents: None,
-                transport: Default::default(),
-                rerank_requested: false,
-                applied: false,
-                failure_reason: None,
-            };
-            evidence
-                .validate(&run.context, &run.binding, query, hits, false)
-                .map_err(regression_search_error)?;
+                mode_meta.realized != SearchMode::Semantic,
+            ).map_err(regression_search_error)?;
             crate::search::regression_trace::persist_evidence(&run.context, &evidence)
                 .map_err(regression_search_error)?;
         }

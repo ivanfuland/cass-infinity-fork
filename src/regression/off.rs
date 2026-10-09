@@ -1,0 +1,700 @@
+//! Full-search/off capture. Quality evaluation belongs to a later runner.
+
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::time::Instant;
+
+use anyhow::{Result, bail};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use super::run::{RegressionSearchRun, milliseconds};
+use super::types::{InputWindow, LabelKey, RegressionCommand};
+use crate::search::query::SearchMode;
+use crate::search::regression_trace::{TextDigest, candidate_instance_key};
+
+pub(crate) fn digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn file_digest(path: &Path) -> Result<String> {
+    let mut reader = fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 65536];
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buffer[..n]);
+    }
+    Ok(hex::encode(hash.finalize()))
+}
+
+pub(crate) fn query_manifest_bytes(windows: &[InputWindow]) -> Result<Vec<u8>> {
+    const QIDS: [&str; 9] = [
+        "N01", "N02", "N03", "N04", "N05", "N06", "N07", "N08", "N12",
+    ];
+    if windows.len() != 9
+        || windows.iter().zip(QIDS).any(|(w, q)| {
+            w.qid != q
+                || w.query_sha256.len() != 64
+                || !w
+                    .query_sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        })
+    {
+        bail!("QUERY_MANIFEST_INVALID");
+    }
+    let rows: Vec<_> = windows.iter().map(|w| (&w.qid, &w.query_sha256)).collect();
+    let mut bytes = b"cass.regression-query-manifest.v1\0".to_vec();
+    bytes.extend(serde_json::to_vec(&rows)?);
+    Ok(bytes)
+}
+
+/// Captures the running file and actual process arguments. A missing compile-time
+/// source pin is rejected; a checkout HEAD cannot identify a built executable.
+pub(crate) struct RunProvenance {
+    pub(crate) source_commit: String,
+    pub(crate) binary_sha256: String,
+    pub(crate) argv: Vec<String>,
+}
+
+impl RunProvenance {
+    fn capture() -> Result<Self> {
+        let source_commit = option_env!("CASS_BUILD_SOURCE_COMMIT").unwrap_or("");
+        if option_env!("CASS_BUILD_SOURCE_CLEAN") != Some("true")
+            || source_commit.len() != 40
+            || !source_commit
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            bail!("REGRESSION_PROVENANCE_UNAVAILABLE");
+        }
+        let argv = std::env::args_os()
+            .map(|s| {
+                s.into_string()
+                    .map_err(|_| anyhow::anyhow!("REGRESSION_PROVENANCE_UNAVAILABLE"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            source_commit: source_commit.into(),
+            binary_sha256: file_digest(&std::env::current_exe()?)?,
+            argv,
+        })
+    }
+}
+
+pub(crate) fn write_private(root: &Path, relative: &str, value: &Value) -> Result<Value> {
+    crate::search::regression_io::validate_private_run_root(root)?;
+    let path = root.join(relative);
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(&path)?;
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    output.write_all(&bytes)?;
+    output.sync_all()?;
+    Ok(json!({"relative_path":relative,"sha256":digest(&bytes)}))
+}
+
+fn counts(mode: SearchMode) -> Vec<Value> {
+    let mut values = vec![
+        json!({"scope":"rerank-http-v1","http_attempts":0,"http_response_observed":0,"delivery_unknown":0,"model_executions":0,"basis":"not-called"}),
+    ];
+    if mode != SearchMode::Lexical {
+        values.push(json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"}));
+    }
+    values
+}
+
+pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
+    let started = Instant::now();
+    let provenance = RunProvenance::capture()?;
+    let validated = super::input::prepare_full(command)?;
+    let root = validated.paths.run_root.clone();
+    let activation = RegressionSearchRun::activate(validated, command);
+    let run = match activation {
+        Ok(run) => run,
+        Err(error) => {
+            write_private(
+                &root,
+                "search-failure.json",
+                &json!({"terminal":"FAILED","quality_status":"NOT_EVALUATED","failure_code":super::run::error_code(&error),"stage":"ACTIVATION"}),
+            )?;
+            return Err(error);
+        }
+    };
+    collect(&run, &provenance, started, milliseconds(started))
+}
+
+/// Also used by synthetic module tests. Production always enters through prepare_full.
+pub(crate) fn collect(
+    run: &RegressionSearchRun,
+    provenance: &RunProvenance,
+    started: Instant,
+    identity_before_ms: f64,
+) -> Result<Value> {
+    let root = &run.validated.paths.run_root;
+    let argv_value = serde_json::to_value(&provenance.argv)?;
+    let argv_ref = write_private(root, "argv.json", &argv_value)?;
+    let request_ref = write_private(root, "request.json", &run.request)?;
+    let mut writes = vec!["argv.json".to_string(), "request.json".to_string()];
+    let mut questions = Vec::new();
+    let mut times = Vec::new();
+    let mut failure = None;
+    for window in &run.validated.inputs.windows {
+        let start = Instant::now();
+        match run.search_off(&window.query) {
+            Ok(search) => {
+                let mut slots = Vec::new();
+                for (hit, slot) in search.result.hits.iter().zip(&search.evidence.final_slots) {
+                    let text = TextDigest::of(&hit.content);
+                    let key = LabelKey {
+                        query_sha256: window.query_sha256.clone(),
+                        label_text_sha256: text.sha256.clone(),
+                        label_policy_sha256: run.validated.inputs.label_policy_sha256.clone(),
+                    };
+                    let label = run
+                        .validated
+                        .inputs
+                        .labels
+                        .iter()
+                        .find(|row| row.key == key)
+                        .map(|row| row.value.as_str())
+                        .unwrap_or("unknown");
+                    slots.push(json!({"candidate_instance_key":candidate_instance_key(&slot.identity)?,"label_key":key,"input_slot":slot.input_slot,"retrieval_rank":slot.retrieval_rank,"final_rank":slot.retrieval_rank,"identity":slot.identity,"message_id":hit.message_id,"conversation_id":hit.conversation_id,"candidate_text":text,"sent_text":null,"source_sha256":null,"original_score":hit.score,"rerank_score":null,"label":label}));
+                }
+                let evidence_relative = search
+                    .evidence_path
+                    .strip_prefix(root)?
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?
+                    .to_string();
+                writes.push(evidence_relative.clone());
+                let total = milliseconds(start);
+                times.push(total);
+                let actual_n = slots.len();
+                let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n < run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n == run.n,"rerank_applied":false,"ordered_pool_sha256":null,"slots":slots,"pages":[],"window_evidence":{"relative_path":evidence_relative,"sha256":file_digest(&search.evidence_path)?},"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode == SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":search.evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":search.identity_before_ms,"identity_after_ms":search.identity_after_ms,"retrieval_ms":search.retrieval_ms,"rerank_client_ms":0.0,"model_execution_ms":null,"paging_ms":0.0,"question_total_ms":total,"http":counts(run.mode),"resource_measurements":[]}});
+                let relative = format!("question-{}.json", window.qid);
+                write_private(root, &relative, &question)?;
+                writes.push(relative);
+                questions.push(question);
+            }
+            Err(error) => {
+                failure = Some(super::run::error_code(&error).to_string());
+                break;
+            }
+        }
+    }
+    let identity_after_start = Instant::now();
+    let verified = run.verify_end();
+    let identity_after_ms = milliseconds(identity_after_start);
+    if let Err(error) = verified {
+        failure = Some(super::run::error_code(&error).to_string());
+    }
+    let succeeded = failure.is_none();
+    let terminal = if !succeeded {
+        "FAILED"
+    } else if questions.iter().any(|q| q["terminal"] == "SHORT_WINDOW") {
+        "SHORT_WINDOW"
+    } else {
+        "SUCCESS"
+    };
+    let after = succeeded.then(|| json!({"basis":"equal-physical-db-and-source-generation-policy","inventory_digests":"reused-initial-not-independently-reexported","database_sha256":run.binding.database_sha256,"source_manifest_sha256":run.binding.source_manifest_sha256,"wal_bytes":0,"generation_unchanged":true,"policies_unchanged":true,"shared_maintenance_lease_held":true}));
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mean = (!times.is_empty()).then(|| times.iter().sum::<f64>() / times.len() as f64);
+    let quantile = |p: f64| {
+        (!sorted.is_empty()).then(|| sorted[(p * sorted.len() as f64).ceil() as usize - 1])
+    };
+    writes.push("run.json".into());
+    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":"NOT_EVALUATED","failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
+    write_private(root, "run.json", &output)?;
+    if let Some(code) = failure {
+        bail!("{code}");
+    }
+    // Public stdout contains only non-sensitive terminal facts. Full evidence is private.
+    Ok(
+        json!({"schema":"cass.regression-run-summary.v1","mode":"full-search","terminal":terminal,"quality_status":"NOT_EVALUATED","question_count":questions.len()}),
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::regression::types::*;
+    use crate::search::{regression_binding, regression_trace};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    const QIDS: [&str; 9] = [
+        "N01", "N02", "N03", "N04", "N05", "N06", "N07", "N08", "N12",
+    ];
+    struct Fixture {
+        _root: tempfile::TempDir,
+        input: InputOptions,
+        pool: PathBuf,
+        pool_sha: String,
+    }
+
+    fn fixture(fault: &str) -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let suite = root.path().join("package");
+        let output = root.path().join("output");
+        let bindings = root.path().join("bindings");
+        for path in [&suite, &output, &bindings] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut registry = Vec::new();
+        let mut add = |relative: &str, bytes: Vec<u8>, roles: &[&str]| -> Value {
+            let path = suite.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let source = format!("/synthetic-frozen/{relative}");
+            registry.push(json!({"source_path":source,"path":relative,"sha256":digest(&bytes),"bytes":bytes.len(),"roles":roles}));
+            json!({"path":source,"sha256":digest(&bytes)})
+        };
+        let mut text_refs = Vec::new();
+        for index in 1..=200 {
+            let text = format!("Synthetic candidate {index}. No private content.");
+            let reference = add(
+                &format!("assets/pr3/task-18/text/{index}.txt"),
+                text.as_bytes().to_vec(),
+                &["candidate_text"],
+            );
+            text_refs.push((reference, text.len()));
+        }
+        let policy = digest(b"synthetic-label-policy-v1");
+        let mut windows = Vec::new();
+        let mut spans = Vec::new();
+        let mut rows = Vec::new();
+        let mut pool_windows = Vec::new();
+        for (qindex, qid) in QIDS.iter().enumerate() {
+            let query = "retrieval".to_string();
+            let query_sha = digest(query.as_bytes());
+            let mut items = Vec::new();
+            let mut span_items = Vec::new();
+            for index in 1..=200 {
+                let mid = if index % 2 == 0 {
+                    json!(format!("synthetic-{index}"))
+                } else {
+                    json!(index)
+                };
+                let (reference, bytes) = &text_refs[index - 1];
+                let item = json!({"rank":index,"message_id":mid,"conversation_id":qindex as i64,"text_path":reference["path"],"text_sha256":reference["sha256"],"bytes":bytes,"source_sha256":digest(b"synthetic-source"),"original_score":1.25,"scoreable":true,"fallback_reason":null});
+                items.push(item);
+                span_items.push(json!({"rank":index,"message_id":mid}));
+                rows.push(json!({"qid":qid,"rank":index,"message_id":mid,"query_sha256":query_sha,"text_sha256":reference["sha256"],"label":"direct","reason":"synthetic judgement","provenance":{"kind":"synthetic"}}));
+            }
+            if qindex == 0 {
+                match fault {
+                    "missing_slot" => {
+                        items.pop();
+                    }
+                    "duplicate_rank" => items[1]["rank"] = json!(1),
+                    "duplicate_mid" => items[1]["message_id"] = items[0]["message_id"].clone(),
+                    "unregistered_text" => {
+                        items[0]["text_path"] = json!("/synthetic-frozen/unregistered.txt")
+                    }
+                    "wrong_query" => items[0]["text_sha256"] = json!(digest(b"unrelated")),
+                    "wrong_span" => span_items[0]["message_id"] = json!(999999),
+                    "unsure_required" => items[0]["scoreable"] = json!(false),
+                    "valid_categories" => items[0]["scoreable"] = json!(false),
+                    "missing_fallback" => {
+                        items[0].as_object_mut().unwrap().remove("fallback_reason");
+                    }
+                    _ => {}
+                }
+            }
+            windows.push(json!({"qid":qid,"query":query,"query_sha256":query_sha,"items":items}));
+            spans.push(json!({"qid":qid,"items":span_items}));
+            pool_windows.push(json!({"qid":qid,"query_sha256":query_sha,"count":200,"ordered_pool_sha256":digest(b"synthetic-pool-not-yet-evaluated")}));
+        }
+        if fault == "duplicate_qid" {
+            windows[1]["qid"] = windows[0]["qid"].clone();
+        }
+        if fault == "wrong_label" {
+            rows[0]["message_id"] = json!(999999);
+        }
+        if fault == "duplicate_label" {
+            rows[1] = rows[0].clone();
+        }
+        if fault == "valid_categories" {
+            rows[0]["label"] = json!("unsure");
+            rows[0]["provenance"] = json!({"kind":"structural_unscoreable"});
+            rows[1]["label"] = json!("partial");
+            rows[2]["label"] = json!("none");
+        }
+        let encode_lines = |values: &[Value]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|v| {
+                    let mut bytes = serde_json::to_vec(v).unwrap();
+                    bytes.push(b'\n');
+                    bytes
+                })
+                .collect()
+        };
+        let window_ref = add(
+            "assets/pr3/task-18/out/windows.jsonl",
+            encode_lines(&windows),
+            &["windows"],
+        );
+        let span_ref = add(
+            "assets/pr3/task-18/out/span_proofs.jsonl",
+            encode_lines(&spans),
+            &["span_proofs"],
+        );
+        let manifest = json!({"schema":"cass.pr3.default-input.v1","query_order":QIDS,"pool_limit":200,"source_query_manifest_sha256":digest(b"synthetic-historical-identity"),"files":{"windows":window_ref,"span_proofs":span_ref}});
+        let input_ref = add(
+            "assets/pr3/task-18/out/INPUT-MANIFEST.json",
+            serde_json::to_vec(&manifest).unwrap(),
+            &["input_manifest"],
+        );
+        let input_sha = input_ref["sha256"].as_str().unwrap();
+        let labels = json!({"schema":"cass.pr3.default-labels.v1","input_manifest_sha256":if fault == "wrong_input_identity" { digest(b"wrong") } else { input_sha.to_string() },"label_policy_sha256":policy,"rows":rows});
+        let label_bytes = serde_json::to_vec(&labels).unwrap();
+        let label_sha = digest(&label_bytes);
+        add(
+            "assets/pr3/task-19m/LABELS.json",
+            label_bytes.clone(),
+            &["labels"],
+        );
+        let freeze = json!({"schema":"cass.pr3.default-labels-freeze-manifest.v1","labels_frozen":true,"labels_sha256":label_sha,"labels_bytes":label_bytes.len(),"labels_rows":1800,"input_manifest_sha256":input_sha,"label_policy_sha256":if fault == "wrong_freeze" { digest(b"wrong") } else { policy.clone() },"not_user_confirmed":true,"not_an_independent_test_set":true});
+        let freeze_ref = add(
+            "assets/pr3/task-19m/LABELS-FREEZE-MANIFEST.json",
+            serde_json::to_vec(&freeze).unwrap(),
+            &["labels_freeze"],
+        );
+        drop(add);
+        if fault == "asset_escape" {
+            registry[0]["path"] = json!("../outside.txt");
+        }
+        if fault == "asset_alias" {
+            let mut alias = registry[0].clone();
+            alias["source_path"] = json!("/synthetic-frozen/alternate-source.txt");
+            alias["roles"] = json!([]);
+            registry.push(alias);
+        }
+        let counts = if fault == "valid_categories" {
+            json!({"direct":1797,"partial":1,"none":1,"unsure":1})
+        } else {
+            json!({"direct":1800,"partial":0,"none":0,"unsure":0})
+        };
+        let inventory = json!({"schema":"cass.regression.source-inventory.v1","suite_id":"synthetic-suite-v1","mode":"synthetic","query_order":QIDS,"candidate_slots":1800,"labels":counts,"runtime_prefix_map":{},"files":registry,"limits":{}});
+        let inventory_bytes = serde_json::to_vec(&inventory).unwrap();
+        let inventory_sha = digest(&inventory_bytes);
+        fs::write(suite.join("SOURCE-INVENTORY.json"), inventory_bytes).unwrap();
+        let suite_value = json!({"schema":"cass.regression.suite-manifest.v1","suite_id":"synthetic-suite-v1","stage":"assets_only","mode":"synthetic","query_order":QIDS,"candidate_slots":1800,"label_counts":counts,"runtime_prefix_map":{},"files":registry,"limits":{},"source_inventory_sha256":inventory_sha});
+        let suite_bytes = serde_json::to_vec(&suite_value).unwrap();
+        fs::write(suite.join("SUITE-MANIFEST.json"), &suite_bytes).unwrap();
+        let pool = bindings.join("pool.json");
+        let pool_bytes = serde_json::to_vec(&json!({"schema":"cass.regression-fixed-pool.v1","suite_sha256":digest(&suite_bytes),"input_manifest_sha256":input_sha,"windows_file_sha256":window_ref["sha256"],"labels_sha256":label_sha,"label_freeze_sha256":freeze_ref["sha256"],"label_policy_sha256":policy,"source_inventory_sha256":inventory_sha,"windows":pool_windows})).unwrap();
+        fs::write(&pool, &pool_bytes).unwrap();
+        Fixture {
+            input: InputOptions {
+                suite: suite.clone(),
+                suite_sha256: digest(&suite_bytes),
+                labels: suite.join("assets/pr3/task-19m/LABELS.json"),
+                labels_sha256: label_sha,
+                output: OutputOptions {
+                    output_root: output,
+                    run_id: "synthetic-run".into(),
+                },
+            },
+            pool,
+            pool_sha: digest(&pool_bytes),
+            _root: root,
+        }
+    }
+
+    fn full_fixture(n: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionCommand) {
+        let f = fixture("");
+        let (data, database, _, source_manifest) =
+            regression_binding::tests::searchable_fixture_with_count(count);
+        let (expected_binding, expected_binding_sha256) =
+            regression_binding::tests::prepare_expected(data.path(), &database, &source_manifest);
+        let manifest_sha = file_digest(&source_manifest).unwrap();
+        let source_producer_receipt = data.path().join("source-receipt.json");
+        let bytes = serde_json::to_vec(&json!({"schema":"cass.regression-source-receipt.v1","producer_id":"cass.pr9.verify-corpus","verification_policy":"cass.pr9.corpus-content-stable-file-v1","producer_source_sha256":digest(b"synthetic-producer"),"source_manifest_sha256":manifest_sha,"expected_file_count":5049,"checked":5049,"passed":true,"exit_code":0,"failure_count":0,"raw_evidence_sha256":digest(b"synthetic-evidence")})).unwrap();
+        fs::write(&source_producer_receipt, &bytes).unwrap();
+        let cmd = RegressionCommand::FullSearch {
+            input: f.input.clone(),
+            database,
+            expected_binding,
+            expected_binding_sha256,
+            source_manifest,
+            source_producer_receipt,
+            source_producer_receipt_sha256: digest(&bytes),
+            search_mode: SearchMode::Lexical,
+            vector_search_mode: None,
+            rrf_limit: n,
+            rerank: RerankSwitch::Off,
+            page_size: None,
+            rerank_provider: None,
+            cutoffs: vec![5, 10, 20],
+        };
+        (f, data, cmd)
+    }
+
+    fn prepared(n: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionSearchRun) {
+        let (f, data, cmd) = full_fixture(n, count);
+        let validated = crate::regression::input::prepare_full(&cmd).unwrap();
+        let run = RegressionSearchRun::activate(validated, &cmd).unwrap();
+        (f, data, run)
+    }
+
+    #[test]
+    fn full_off_n5_n10_preserves_complete_same_parameter_ids_order_scores() {
+        for n in [5, 10] {
+            let (_f, _data, run) = prepared(n, 12);
+            let original = run
+                .client
+                .search_with_fallback(
+                    "retrieval",
+                    Default::default(),
+                    n as usize + 1,
+                    0,
+                    crate::sparse_threshold_for_visible_limit(3, n as usize, false),
+                    crate::search::query::FieldMask::FULL,
+                )
+                .unwrap();
+            assert!(original.hits.len() >= n as usize + 1);
+            for _ in QIDS {
+                let search = run.search_off("retrieval").unwrap();
+                assert_eq!(search.result.hits.len(), n as usize);
+                for (actual, expected) in search.result.hits.iter().zip(&original.hits) {
+                    assert_eq!(
+                        (actual.message_id, actual.conversation_id, actual.score),
+                        (
+                            expected.message_id,
+                            expected.conversation_id,
+                            expected.score
+                        )
+                    );
+                }
+                assert!(search.evidence.transport.requests.is_empty());
+                assert_eq!(search.evidence.final_slots, search.evidence.retrieval);
+            }
+            run.verify_end().unwrap();
+            let inventory_files = fs::read_dir(&run.validated.paths.run_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name() == "input-binding-candidate.json")
+                .count();
+            assert_eq!(inventory_files, 1);
+            let provenance = RunProvenance {
+                source_commit: "3abf5e838dc5413bd62e35a18680cc065d4ac99b".into(),
+                binary_sha256: file_digest(&std::env::current_exe().unwrap()).unwrap(),
+                argv: std::env::args().collect(),
+            };
+            let started = Instant::now();
+            collect(&run, &provenance, started, 0.0).unwrap();
+            let report: Value = serde_json::from_slice(
+                &fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(report["questions"].as_array().unwrap().len(), 9);
+            assert_eq!(report["terminal"], "SUCCESS");
+            assert_eq!(report["cost"]["sample_count"], 9);
+            assert_eq!(
+                report["after_verification"]["inventory_digests"],
+                "reused-initial-not-independently-reexported"
+            );
+            assert!(
+                report["questions"][0]["slots"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|slot| slot["label"] == "unknown" && slot["sent_text"].is_null())
+            );
+            if let Ok(root) = dotenvy::var("CASS_S2_04_TEST_EVIDENCE") {
+                let output = Path::new(&root).join(format!("module-n{n}-run.json"));
+                fs::copy(run.validated.paths.run_root.join("run.json"), &output).unwrap();
+                fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn short_complete_pool_is_short_window_and_not_evaluated() {
+        let (_f, _data, run) = prepared(10, 3);
+        let provenance = RunProvenance {
+            source_commit: "3abf5e838dc5413bd62e35a18680cc065d4ac99b".into(),
+            binary_sha256: file_digest(&std::env::current_exe().unwrap()).unwrap(),
+            argv: std::env::args().collect(),
+        };
+        let result = collect(&run, &provenance, Instant::now(), 0.0).unwrap();
+        assert_eq!(result["terminal"], "SHORT_WINDOW");
+        assert_eq!(result["quality_status"], "NOT_EVALUATED");
+        let report: Value = serde_json::from_slice(
+            &fs::read(run.validated.paths.run_root.join("run.json")).unwrap(),
+        )
+        .unwrap();
+        for q in report["questions"].as_array().unwrap() {
+            assert_eq!(q["actual_n"], 3);
+            assert_eq!(q["pool_complete"], true);
+            assert_eq!(q["full_requested_n_claim"], false);
+        }
+    }
+
+    #[test]
+    fn aggregate_end_rejects_policy_and_source_changes() {
+        let (_f, _data, mut run) = prepared(5, 12);
+        run.search_off("retrieval").unwrap();
+        run.binding.statistics_policy = "wrong-policy".into();
+        assert_eq!(
+            super::super::run::error_code(&run.verify_end().unwrap_err()),
+            "AGGREGATE_POLICY_CHANGED"
+        );
+        run.binding.statistics_policy = "regression-fresh-v1".into();
+        fs::write(
+            run.validated.source_manifest.as_ref().unwrap(),
+            b"changed synthetic manifest",
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::run::error_code(&run.verify_end().unwrap_err()),
+            "EXPECTED_SOURCE_MANIFEST_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn missing_slots_are_rejected_by_product_complete_mapping_guard() {
+        let (_f, _data, run) = prepared(5, 12);
+        let evidence = run.search_off("retrieval").unwrap().evidence;
+        assert!(regression_trace::final_slot_mapping(&evidence.retrieval, &[0, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn partial_degraded_timeout_are_named_failures() {
+        let (_f, _data, run) = prepared(5, 12);
+        let mut result = run.search_off("retrieval").unwrap().result;
+        assert_eq!(
+            super::super::run::error_code(
+                &super::super::run::validate_retrieval(&result, true, true).unwrap_err()
+            ),
+            "REGRESSION_SEARCH_TIMEOUT"
+        );
+        result.semantic_degraded = true;
+        assert_eq!(
+            super::super::run::error_code(
+                &super::super::run::validate_retrieval(&result, true, false).unwrap_err()
+            ),
+            "REGRESSION_RETRIEVAL_DEGRADED"
+        );
+        result.semantic_degraded = false;
+        assert_eq!(
+            super::super::run::error_code(
+                &super::super::run::validate_retrieval(&result, false, false).unwrap_err()
+            ),
+            "REGRESSION_RETRIEVAL_DEGRADED"
+        );
+        result.candidates = Some(serde_json::from_value(json!({"mode":"exact","k":0,"first_round_rows":0,"unique_messages":5,"incomplete":true,"reason":null,"approximate":false})).unwrap());
+        assert_eq!(
+            super::super::run::error_code(
+                &super::super::run::validate_retrieval(&result, true, false).unwrap_err()
+            ),
+            "REGRESSION_PARTIAL_RESULTS"
+        );
+    }
+
+    #[test]
+    fn full_identity_golden_bytes_hashes_and_i64_boundaries() {
+        let identity: regression_trace::CandidateIdentity = serde_json::from_str(r###"{"identity_host":"SYNTHETIC_HOST","agent_slug":"synthetic-agent","external_id":"synthetic-session","message_idx":3,"chunk_idx":null}"###).unwrap();
+        assert_eq!(
+            hex::encode(serde_json::to_vec(&identity).unwrap()),
+            "7b226964656e746974795f686f7374223a2253594e5448455449435f484f5354222c226167656e745f736c7567223a2273796e7468657469632d6167656e74222c2265787465726e616c5f6964223a2273796e7468657469632d73657373696f6e222c226d6573736167655f696478223a332c226368756e6b5f696478223a6e756c6c7d"
+        );
+        assert_eq!(
+            candidate_instance_key(&identity).unwrap(),
+            "59d417d9d84056b8fa9eb2d4baf4d00ad6ef7a1bfdfca228a048806abcf08c61"
+        );
+        let identity: regression_trace::CandidateIdentity = serde_json::from_str(r###"{"identity_host":"SYNTHETIC_HOST","agent_slug":"synthetic-agent","external_id":"synthetic-session","message_idx":3,"chunk_idx":0}"###).unwrap();
+        assert_eq!(
+            hex::encode(serde_json::to_vec(&identity).unwrap()),
+            "7b226964656e746974795f686f7374223a2253594e5448455449435f484f5354222c226167656e745f736c7567223a2273796e7468657469632d6167656e74222c2265787465726e616c5f6964223a2273796e7468657469632d73657373696f6e222c226d6573736167655f696478223a332c226368756e6b5f696478223a307d"
+        );
+        assert_eq!(
+            candidate_instance_key(&identity).unwrap(),
+            "00f2dd566ebb4a21d9db7bd5d5072460173b4af37dd63811b38009b410c83e8a"
+        );
+        let identity: regression_trace::CandidateIdentity = serde_json::from_str(r###"{"identity_host":"SYNTHETIC_示例","agent_slug":"synthetic-agent","external_id":"synthetic-\\\"\n","message_idx":3,"chunk_idx":null}"###).unwrap();
+        assert_eq!(
+            hex::encode(serde_json::to_vec(&identity).unwrap()),
+            "7b226964656e746974795f686f7374223a2253594e5448455449435fe7a4bae4be8b222c226167656e745f736c7567223a2273796e7468657469632d6167656e74222c2265787465726e616c5f6964223a2273796e7468657469632d5c5c5c225c6e222c226d6573736167655f696478223a332c226368756e6b5f696478223a6e756c6c7d"
+        );
+        assert_eq!(
+            candidate_instance_key(&identity).unwrap(),
+            "b3cd7d718546dac4e1aaa7eb90ac6058d1bb16a0ab60b9058ebc0de0cf675f14"
+        );
+        let mut identity = identity;
+        identity.message_idx = i64::MIN;
+        identity.chunk_idx = Some(i64::MAX);
+        let bytes = serde_json::to_vec(&identity).unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("-9223372036854775808")
+        );
+        let key = candidate_instance_key(&identity).unwrap();
+        let slot = regression_trace::RetrievalSlot {
+            input_slot: 0,
+            retrieval_rank: 1,
+            identity: identity.clone(),
+            message_id: 1,
+        };
+        let mut reordered = slot.clone();
+        reordered.input_slot = 4;
+        reordered.retrieval_rank = 5;
+        reordered.message_id = 99;
+        assert_eq!(key, candidate_instance_key(&reordered.identity).unwrap());
+        identity.chunk_idx = None;
+        assert_ne!(key, candidate_instance_key(&identity).unwrap());
+    }
+
+    #[test]
+    fn query_manifest_golden_bytes_and_order_digest_guard() {
+        let rows: Vec<(String,String)> = serde_json::from_str(r###"[["N01","b1ff87f436a4f5c4e0aba3ccfd9b6585c4e5f801875baa338d2772e046a7874c"],["N02","fe8cd4f65a88c3d95106571782dfe00d7590cc3018fdcda8c0f898749680625a"],["N03","8c00694d0a9957131f32765ddc0be78834abb8ee2a3a70402fe833ed067efbd2"],["N04","5ab0e0180d72d0b4b7fe6a7d1842a008a728650f27170dfd46b261352ff46635"],["N05","145b98bd5690315c03a0bc17f87b37f4e30ac63f0951e3d9011d65c651d6c897"],["N06","e809f738b8744362772d97fd8f2e9addd52d2bcb2aa3328da7b57f08b841c3fb"],["N07","7abd20756d5133873b7cccaf2e4ec828c4c26b9410723c416cbccc1b1d60f8db"],["N08","597e70fe7a76189f381d78f834e366b64de898cb26ecfb0ec706a69e43b32ffb"],["N12","e109e00189bc127bc6f50eb1238cb09d11a56399d1b96ed51eca9e42995668c0"]]"###).unwrap();
+        let windows: Vec<_> = rows
+            .into_iter()
+            .map(|(qid, query_sha256)| InputWindow {
+                qid,
+                query: String::new(),
+                query_sha256,
+                items: vec![],
+            })
+            .collect();
+        let bytes = query_manifest_bytes(&windows).unwrap();
+        assert_eq!(
+            hex::encode(&bytes),
+            "636173732e72656772657373696f6e2d71756572792d6d616e69666573742e7631005b5b224e3031222c2262316666383766343336613466356334653061626133636366643962363538356334653566383031383735626161333338643237373265303436613738373463225d2c5b224e3032222c2266653863643466363561383863336439353130363537313738326466653030643735393063633330313866646364613863306638393837343936383036323561225d2c5b224e3033222c2238633030363934643061393935373133316633323736356464633062653738383334616262386565326133613730343032666538333365643036376566626432225d2c5b224e3034222c2235616230653031383064373264306234623766653661376431383432613030386137323836353066323731373064666434366232363133353266663436363335225d2c5b224e3035222c2231343562393862643536393033313563303361306263313766383762333766346533306163363366303935316533643930313164363563363531643663383937225d2c5b224e3036222c2265383039663733386238373434333632373732643937666438663265396164646435326432626362326161333332386461376235376630386238343163336662225d2c5b224e3037222c2237616264323037353664353133333837336237636363616632653465633832386334633236623934313037323363343136636263636331623164363066386462225d2c5b224e3038222c2235393765373066653761373631383966333831643738663833346533363662363464653839386362323665636662306563373036613639653433623332666662225d2c5b224e3132222c2265313039653030313839626331323762633666353065623132333863623039643131613536333939643162393665643531656361396534323939353636386330225d5d"
+        );
+        assert_eq!(
+            digest(&bytes),
+            "bd6ea1d32e88d456b63c3dd10ac21509e96727de6f0b30359973d00962605649"
+        );
+        let mut changed = windows.clone();
+        changed.swap(0, 1);
+        assert!(query_manifest_bytes(&changed).is_err());
+        changed = windows.clone();
+        changed[0].query_sha256 = "00".repeat(32);
+        assert_ne!(
+            digest(&bytes),
+            digest(&query_manifest_bytes(&changed).unwrap())
+        );
+        changed[0].query_sha256 = "AA".repeat(32);
+        assert!(query_manifest_bytes(&changed).is_err());
+        changed = windows.clone();
+        changed.pop();
+        assert!(query_manifest_bytes(&changed).is_err());
+    }
+}

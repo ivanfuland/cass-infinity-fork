@@ -199,6 +199,7 @@ fn main() {
             "CARGO_MANIFEST_DIR should be set by Cargo before running build.rs: {err}"
         )),
     };
+    emit_regression_source_metadata(&manifest_dir);
     let manifest_path = manifest_dir.join("Cargo.toml");
     let manifest_text = match fs::read_to_string(&manifest_path) {
         Ok(text) => text,
@@ -215,6 +216,40 @@ fn main() {
     let packaged_manifest = manifest_dir.join("Cargo.toml.orig").is_file();
     validate_path_dependency_contracts(&manifest_dir, &manifest, packaged_manifest);
     emit_vergen_metadata();
+}
+
+/// Regression provenance describes the actual build checkout. Unknown/dirty
+/// sources still compile normally, but cannot claim a pinned regression run.
+fn emit_regression_source_metadata(manifest_dir: &Path) {
+    println!("cargo:rustc-env=CASS_BUILD_SOURCE_COMMIT=");
+    println!("cargo:rustc-env=CASS_BUILD_SOURCE_CLEAN=false");
+    let Ok(root) = manifest_dir.canonicalize() else { return; };
+    let Ok(top) = git_output(&root, &["rev-parse", "--show-toplevel"]) else { return; };
+    if Path::new(top.trim()).canonicalize().ok().as_ref() != Some(&root) { return; }
+    // Include the root to notice new untracked source files. Cargo scans its
+    // timestamps; dependency and build-output trees are outside managed roots.
+    println!("cargo:rerun-if-changed={}", root.display());
+    for name in ["HEAD", "index"] {
+        if let Ok(path) = git_output(&root, &["rev-parse", "--path-format=absolute", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={}", path.trim());
+        }
+    }
+    if let Ok(reference) = git_output(&root, &["symbolic-ref", "-q", "HEAD"]) {
+        if let Ok(path) = git_output(&root, &["rev-parse", "--path-format=absolute", "--git-path", reference.trim()]) {
+            println!("cargo:rerun-if-changed={}", path.trim());
+        }
+    }
+    if let Ok(paths) = git_output(&root, &["ls-files", "-z"]) {
+        for path in paths.split('\0').filter(|p| !p.is_empty()) {
+            println!("cargo:rerun-if-changed={}", root.join(path).display());
+        }
+    }
+    let Ok(head) = git_output(&root, &["rev-parse", "HEAD"]) else { return; };
+    let head = head.trim();
+    if head.len() != 40 || !head.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) { return; }
+    let Ok(status) = git_output(&root, &["status", "--porcelain", "--untracked-files=normal"]) else { return; };
+    println!("cargo:rustc-env=CASS_BUILD_SOURCE_COMMIT={head}");
+    println!("cargo:rustc-env=CASS_BUILD_SOURCE_CLEAN={}", status.trim().is_empty());
 }
 
 fn emit_platform_link_hints() {

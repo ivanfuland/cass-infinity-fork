@@ -253,8 +253,21 @@ pub(crate) fn open_verified_search(
     if file_digest(source_manifest)? != expected.source_manifest_sha256 {
         bail!("EXPECTED_SOURCE_MANIFEST_MISMATCH");
     }
+    activate_prepared_search(context, &expected, expected_file_sha256, source_manifest)
+}
+
+/// The input runner has already verified the external pins and initial physical
+/// database hash. Keep the inventory's own strong checks and all admission gates.
+pub(crate) fn activate_prepared_search(
+    context: std::sync::Arc<RegressionIoContext>,
+    expected: &InputBinding,
+    expected_file_sha256: &str,
+    source_manifest: &Path,
+) -> Result<VerifiedSearch> {
+    context.verify_input()?;
+    verify_source_manifest(source_manifest, &expected.source_manifest_sha256)?;
     let actual = inspect_input(&context, source_manifest)?;
-    verify_expected(&expected, &actual)?;
+    verify_expected(expected, &actual)?;
     validate_search_admission(&context, &actual)?;
     let client =
         super::query::SearchClient::open_for_regression(context.run_root(), context.clone())?;
@@ -263,6 +276,30 @@ pub(crate) fn open_verified_search(
         binding: actual,
         expected_file_sha256: hex::encode(digest32(expected_file_sha256)?),
     })
+}
+
+/// Strong aggregate end check. Equal physical bytes prove the initial inventory
+/// still applies; no inventory is independently exported a second time.
+pub(crate) fn verify_aggregate_end(
+    context: &RegressionIoContext,
+    binding: &InputBinding,
+    source_manifest: &Path,
+) -> Result<()> {
+    context.verify_database_digest(&digest32(&binding.database_sha256)?)?;
+    verify_source_manifest(source_manifest, &binding.source_manifest_sha256)?;
+    if capture_generation(context)? != binding.generation {
+        bail!("AGGREGATE_GENERATION_CHANGED");
+    }
+    if binding.canonicalize_version != CANONICALIZE_PIPELINE_VERSION
+        || binding.chunking_policy_version != CHUNKING_POLICY_VERSION
+        || binding.statistics_policy != "regression-fresh-v1"
+        || binding.statistics_encoding != "lexical-stats-v1"
+        || binding.consumed_domains != consumed_domains()
+    {
+        bail!("AGGREGATE_POLICY_CHANGED");
+    }
+    context.verify_input()?;
+    Ok(())
 }
 
 fn validate_search_admission(context: &RegressionIoContext, binding: &InputBinding) -> Result<()> {

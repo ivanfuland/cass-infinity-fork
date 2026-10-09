@@ -2,5 +2,7 @@
 
 pub(crate) mod input;
 pub mod types;
+pub(crate) mod run;
+pub(crate) mod off;
 
 pub use types::RegressionCommand;

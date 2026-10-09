@@ -125,6 +125,34 @@ pub(crate) struct RetrievalSlot {
     pub(crate) message_id: i64,
 }
 
+pub(crate) fn candidate_instance_key(identity: &CandidateIdentity) -> anyhow::Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(identity)?)))
+}
+
+/// Shared off evidence for the normal regression-input search and aggregate.
+pub(crate) fn off_evidence(
+    context: &crate::search::regression_io::RegressionIoContext,
+    binding: &crate::search::regression_binding::InputBinding,
+    query: &str,
+    hits: &[crate::search::query::SearchHit],
+    request: Value,
+    lexical_statistics_used: bool,
+) -> anyhow::Result<WindowEvidence> {
+    let retrieval = freeze_retrieval_slots(context, hits)?;
+    let evidence = WindowEvidence {
+        schema: "cass.regression-window-trace.v2".into(),
+        binding: binding.clone(), query: TextDigest::of(query), request,
+        transport_scope: "rerank-http-v1".into(), lexical_statistics_used,
+        lexical_statistics_sha256: lexical_statistics_used.then(|| binding.lexical_statistics_sha256.clone()),
+        final_slots: retrieval.clone(), retrieval,
+        snippets: hits.iter().map(|h| TextDigest::of(&h.content)).collect(),
+        prepared_documents: None, transport: Default::default(),
+        rerank_requested: false, applied: false, failure_reason: None,
+    };
+    evidence.validate(context, binding, query, hits, false)?;
+    Ok(evidence)
+}
+
 pub(crate) fn freeze_retrieval_slots(
     context: &crate::search::regression_io::RegressionIoContext,
     hits: &[crate::search::query::SearchHit],
