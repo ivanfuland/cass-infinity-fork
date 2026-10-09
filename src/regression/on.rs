@@ -986,6 +986,53 @@ mod tests {
                 std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
             }
         }
+        if fault == "guard-only" {
+            let owner = RegressionSearchRun::activate(
+                super::super::input::prepare_full(&cmd).unwrap(),
+                &cmd,
+            )
+            .unwrap();
+            let outcome = score_question(&owner, &owner.validated.inputs.windows[0]).unwrap();
+            let question = &outcome.question;
+            let root = &owner.validated.paths.run_root;
+            let evidence: WindowEvidence = serde_json::from_slice(
+                &std::fs::read(
+                    root.join(
+                        question["window_evidence"]["relative_path"]
+                            .as_str()
+                            .unwrap(),
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let mut pages: Vec<PageEvidence> = question["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| {
+                    serde_json::from_slice(
+                        &std::fs::read(
+                            root.join(p["page_evidence"]["relative_path"].as_str().unwrap()),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            pages.pop();
+            assert!(
+                regression_trace::validate_complete_pages(&pages, &evidence).is_err(),
+                "known tail page omitted must fail product complete-pages guard"
+            );
+            std::fs::create_dir(config["output"].as_str().unwrap()).unwrap();
+            std::fs::set_permissions(
+                config["output"].as_str().unwrap(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            return;
+        }
         let started = Instant::now();
         let result = if fault == "source-change" || fault == "page-guards" {
             let validated = super::super::input::prepare_full(&cmd).unwrap();
@@ -1363,5 +1410,9 @@ mod tests {
     #[test]
     fn readonly_input_files_keep_hashes_and_zero_new_paths() {
         window_case_with_fault(7, 3, 9, "os-readonly");
+    }
+    #[test]
+    fn actual_product_complete_pages_tail_guard_is_load_bearing() {
+        window_case_with_fault(7, 3, 9, "guard-only");
     }
 }
