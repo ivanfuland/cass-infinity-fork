@@ -1,11 +1,10 @@
 //! Frozen fixed-candidate pool preparation and one-window execution.
 //!
-//! Phase A: this module is deliberately not declared or dispatched yet. The
-//! integration caller must obtain raw windows and documents through the trusted
-//! registered-asset facade, and must externally pin the pool-binding file. No
-//! function here opens a path, a database, or a second scoring transport.
+//! The input module supplies pinned descriptor bytes. Fixed execution never
+//! opens a database, uses a search window, or constructs another transport.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -14,7 +13,11 @@ use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
 
 use super::fixed_encoding::{NumericValue, WindowScores, original_score_sideview};
-use super::types::{InputSlot, InputWindow, LabelKey, LabelRecord, MessageId, ValidatedInputs};
+use super::off::{RunProvenance, private_files, query_manifest_bytes, write_private};
+use super::types::{
+    InputSlot, InputWindow, LabelKey, LabelRecord, MessageId, RegressionCommand, ValidatedInputs,
+    ValidatedRun,
+};
 use crate::search::regression_trace::{RequestTrace, TextDigest};
 use crate::search::rerank::types::{
     CallIdentity, ProviderChoice, RerankBackend, RerankError, stable_rank_order,
@@ -310,7 +313,8 @@ impl PreparedPool {
             "ordered_pool_sha256":self.ordered_pool_sha256,
             "slots":self.slots.iter().enumerate().map(|(i,s)| json!({
                 "input_slot":i,"retrieval_rank":s.input.rank,
-                "candidate_instance_key":s.instance_key,"typed_message_id":s.input.message_id
+                "candidate_instance_key":s.instance_key,"typed_message_id":s.input.message_id,
+                "scoreable":s.input.scoreable,"fallback_reason":s.input.fallback_reason
             })).collect::<Vec<_>>()})
     }
 
@@ -472,6 +476,14 @@ fn failure_code(error: &anyhow::Error) -> String {
     if input_code != "REGRESSION_INPUT_FAILED" {
         return input_code.into();
     }
+    named_error_code(error)
+        .unwrap_or("REGRESSION_FIXED_BACKEND_FAILED")
+        .into()
+}
+
+/// Only fixed-specific named causes change the shared dispatch error mapping.
+/// Existing full-search/on/off errors keep their previous mapping.
+pub(crate) fn named_error_code(error: &anyhow::Error) -> Option<&'static str> {
     const CODES: &[&str] = &[
         "REGRESSION_FIXED_BACKEND_FAILED",
         "REGRESSION_FIXED_BACKEND_IDENTITY_MISMATCH",
@@ -494,16 +506,12 @@ fn failure_code(error: &anyhow::Error) -> String {
         "REGRESSION_FIXED_UNSCOREABLE_POOL",
         "REGRESSION_FIXED_WINDOW_PIN_MISMATCH",
     ];
-    error
-        .chain()
-        .find_map(|cause| {
-            CODES
-                .iter()
-                .copied()
-                .find(|code| cause.to_string() == *code)
-        })
-        .unwrap_or("REGRESSION_FIXED_BACKEND_FAILED")
-        .into()
+    error.chain().find_map(|cause| {
+        CODES
+            .iter()
+            .copied()
+            .find(|code| cause.to_string() == *code)
+    })
 }
 
 fn http_counts(trace: &RequestTrace) -> Value {
@@ -512,7 +520,7 @@ fn http_counts(trace: &RequestTrace) -> Value {
         .iter()
         .filter(|r| r.http_status.is_some())
         .count();
-    json!({"scope":"rerank-client","http_attempts":trace.requests.len(),
+    json!({"scope":"rerank-http-v1","http_attempts":trace.requests.len(),
         "http_response_observed":responses,"delivery_unknown":trace.requests.len()-responses,
         "model_executions":if trace.requests.is_empty() {Some(0)} else {None::<usize>},
         "basis":if trace.requests.is_empty() {"not-called"} else {"observed-client"}})
@@ -738,44 +746,56 @@ pub(crate) fn collect_prepared(
     pools
         .iter()
         .map(|pool| {
-            let started = Instant::now();
-            let document_started = Instant::now();
-            let documents = if pool.slots.iter().any(|s| !s.input.scoreable) {
-                Ok(Vec::new())
-            } else {
-                pool.documents(&mut read_registered)
-            };
-            let document_ms = milliseconds(document_started);
-            let mut result = match documents {
-                Ok(documents) => score_window(
-                    pool,
-                    &inputs.labels,
-                    &inputs.label_policy_sha256,
-                    &documents,
-                    provider,
-                    |trace| factory(provider, trace),
-                )?,
-                Err(error) => {
-                    let mut failed = score_window(
-                        pool,
-                        &inputs.labels,
-                        &inputs.label_policy_sha256,
-                        &[],
-                        provider,
-                        |_| anyhow::bail!("REGRESSION_FIXED_DOCUMENT_IDENTITY_MISMATCH"),
-                    )?;
-                    failed.question["failure_code"] = json!(failure_code(&error));
-                    failed
-                }
-            };
-            let checked = result.question["cost"]["identity_before_ms"]
-                .as_f64()
-                .ok_or_else(|| anyhow::anyhow!("REGRESSION_FIXED_REPORT_FAILED"))?;
-            result.question["cost"]["identity_before_ms"] = json!(checked + document_ms);
-            result.question["cost"]["question_total_ms"] = json!(milliseconds(started));
-            Ok(result)
+            execute_prepared(pool, inputs, provider, &mut read_registered, |trace| {
+                factory(provider, trace)
+            })
         })
         .collect()
+}
+
+fn execute_prepared(
+    pool: &PreparedPool,
+    inputs: &ValidatedInputs,
+    provider: ProviderChoice,
+    read_registered: impl FnMut(&str) -> Result<Vec<u8>>,
+    factory: impl FnOnce(Arc<Mutex<RequestTrace>>) -> Result<Box<dyn RerankBackend>>,
+) -> Result<WindowResult> {
+    let started = Instant::now();
+    let document_started = Instant::now();
+    let documents = if pool.slots.iter().any(|s| !s.input.scoreable) {
+        Ok(Vec::new())
+    } else {
+        pool.documents(read_registered)
+    };
+    let document_ms = milliseconds(document_started);
+    let mut result = match documents {
+        Ok(documents) => score_window(
+            pool,
+            &inputs.labels,
+            &inputs.label_policy_sha256,
+            &documents,
+            provider,
+            factory,
+        )?,
+        Err(error) => {
+            let mut failed = score_window(
+                pool,
+                &inputs.labels,
+                &inputs.label_policy_sha256,
+                &[],
+                provider,
+                |_| anyhow::bail!("REGRESSION_FIXED_DOCUMENT_IDENTITY_MISMATCH"),
+            )?;
+            failed.question["failure_code"] = json!(failure_code(&error));
+            failed
+        }
+    };
+    let checked = result.question["cost"]["identity_before_ms"]
+        .as_f64()
+        .ok_or_else(|| anyhow::anyhow!("REGRESSION_FIXED_REPORT_FAILED"))?;
+    result.question["cost"]["identity_before_ms"] = json!(checked + document_ms);
+    result.question["cost"]["question_total_ms"] = json!(milliseconds(started));
+    Ok(result)
 }
 
 /// Summary fields may only come from facts known and equal in every question.
@@ -849,6 +869,313 @@ pub(crate) fn aggregate_outcome(
     } else {
         ("SUCCESS", "NOT_EVALUATED", None)
     })
+}
+
+fn expected_pools(value: &Value, inputs: &ValidatedInputs) -> Result<Vec<ExpectedPool>> {
+    const FIELDS: [&str; 9] = [
+        "schema",
+        "suite_sha256",
+        "input_manifest_sha256",
+        "windows_file_sha256",
+        "labels_sha256",
+        "label_freeze_sha256",
+        "label_policy_sha256",
+        "source_inventory_sha256",
+        "windows",
+    ];
+    ensure!(
+        value.as_object().is_some_and(
+            |v| v.len() == FIELDS.len() && FIELDS.iter().all(|name| v.contains_key(*name))
+        ) && value["schema"] == "cass.regression-fixed-pool.v1",
+        "POOL_BINDING_MISMATCH"
+    );
+    for (name, expected) in [
+        ("suite_sha256", &inputs.suite_sha256),
+        ("input_manifest_sha256", &inputs.input_manifest_sha256),
+        ("windows_file_sha256", &inputs.windows_file_sha256),
+        ("labels_sha256", &inputs.labels_sha256),
+        ("label_freeze_sha256", &inputs.label_freeze_sha256),
+        ("label_policy_sha256", &inputs.label_policy_sha256),
+        ("source_inventory_sha256", &inputs.source_inventory_sha256),
+    ] {
+        ensure!(
+            is_sha(expected) && value[name] == *expected,
+            "POOL_BINDING_MISMATCH"
+        );
+    }
+    let windows = value["windows"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("POOL_BINDING_MISMATCH"))?;
+    ensure!(
+        windows.len() == QIDS.len() && inputs.windows.len() == QIDS.len(),
+        "POOL_BINDING_MISMATCH"
+    );
+    windows
+        .iter()
+        .zip(&inputs.windows)
+        .enumerate()
+        .map(|(index, (declared, window))| {
+            ensure!(
+                declared.as_object().is_some_and(|v| v.len() == 4
+                    && ["qid", "query_sha256", "count", "ordered_pool_sha256"]
+                        .iter()
+                        .all(|name| v.contains_key(*name)))
+                    && declared["qid"] == QIDS[index]
+                    && window.qid == QIDS[index]
+                    && declared["query_sha256"] == window.query_sha256
+                    && declared["count"] == POOL_SIZE,
+                "POOL_BINDING_MISMATCH"
+            );
+            let sha = declared["ordered_pool_sha256"]
+                .as_str()
+                .filter(|v| is_sha(v))
+                .ok_or_else(|| anyhow::anyhow!("POOL_BINDING_MISMATCH"))?;
+            Ok(ExpectedPool {
+                qid: window.qid.clone(),
+                ordered_pool_sha256: sha.into(),
+            })
+        })
+        .collect()
+}
+
+fn read_windows(inputs: &ValidatedInputs) -> Result<Vec<u8>> {
+    let mut assets = inputs
+        .assets
+        .iter()
+        .filter(|a| a.roles.iter().any(|r| r == "windows"));
+    let asset = assets
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("INPUT_ROLE_MISSING"))?;
+    ensure!(assets.next().is_none(), "INPUT_ROLE_AMBIGUOUS");
+    ensure!(
+        asset.sha256 == inputs.windows_file_sha256,
+        "REGRESSION_FIXED_WINDOW_PIN_MISMATCH"
+    );
+    // Use the unique admitted source name as a registry reference, not as a path.
+    super::input::read_registered_asset(inputs, &asset.source_path)
+}
+
+fn preparation_failure(
+    validated: &ValidatedRun,
+    pool_sha: &str,
+    error: &anyhow::Error,
+    results: &[WindowResult],
+) -> Result<()> {
+    let inputs = &validated.inputs;
+    let mut trace = RequestTrace::default();
+    for result in results {
+        trace.requests.extend(result.trace.requests.clone());
+    }
+    let known = inputs.windows.iter().map(|w| json!({"qid":w.qid,"query_sha256":w.query_sha256,
+        "slots":w.items.iter().enumerate().map(|(index,s)| json!({"input_slot":index,
+            "retrieval_rank":s.rank,"typed_message_id":s.message_id,
+            "scoreable":s.scoreable,"fallback_reason":s.fallback_reason})).collect::<Vec<_>>()
+    })).collect::<Vec<_>>();
+    // A carrier GAP cannot produce a legal Slot.original_score. Keep the pin
+    // chain and typed recovery association as diagnostics instead of inventing
+    // a value or publishing an invalid complete Run.
+    write_private(
+        &validated.paths.run_root,
+        "fixed-failure.json",
+        &json!({"terminal":"FAILED","quality_status":"FAILED","failure_code":failure_code(error),
+            "mode":"fixed-candidate","suite_sha256":inputs.suite_sha256,
+            "input_manifest_sha256":inputs.input_manifest_sha256,
+            "windows_file_sha256":inputs.windows_file_sha256,"pool_binding_file_sha256":pool_sha,
+            "original_score_recovery":"original-pinned-windows-required",
+            "known_original_associations":known,"completed_questions":results.len(),
+            "transport":trace,"counts":[http_counts(&trace)]}),
+    )?;
+    Ok(())
+}
+
+/// Production entry: input admission owns all filesystem reads and run-root
+/// creation. Provenance identifies this clean built executable, never git HEAD.
+pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
+    let RegressionCommand::FixedCandidate {
+        input,
+        pool_binding,
+        pool_binding_sha256,
+        rerank_provider,
+        cutoffs,
+    } = command
+    else {
+        anyhow::bail!("REQUEST_PROFILE_INVALID");
+    };
+    ensure!(
+        !cutoffs.is_empty()
+            && cutoffs.iter().all(|n| *n > 0)
+            && cutoffs.iter().collect::<HashSet<_>>().len() == cutoffs.len(),
+        "REQUEST_PROFILE_INVALID"
+    );
+    let started = Instant::now();
+    let provenance = RunProvenance::capture()?;
+    let validated = super::input::prepare_fixed(input, pool_binding, pool_binding_sha256)?;
+    collect(
+        &validated,
+        pool_binding,
+        pool_binding_sha256,
+        *rerank_provider,
+        cutoffs,
+        &provenance,
+        started,
+        milliseconds(started),
+    )
+}
+
+/// Persist each completed question before proceeding to the next one. A later
+/// failure cannot overwrite an earlier trace or imply that its requests were 0.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Explicit pinned inputs and observed provenance must stay distinct"
+)]
+pub(crate) fn collect(
+    validated: &ValidatedRun,
+    pool_path: &Path,
+    pool_sha: &str,
+    provider: ProviderChoice,
+    cutoffs: &[u32],
+    provenance: &RunProvenance,
+    started: Instant,
+    admitted_ms: f64,
+) -> Result<Value> {
+    ensure!(
+        validated.context.is_none()
+            && validated.expected_binding.is_none()
+            && validated.expected_binding_file_sha256.is_none()
+            && validated.source_manifest.is_none()
+            && validated.source_receipt_sha256.is_none(),
+        "REGRESSION_FIXED_INPUT_PIN_MISMATCH"
+    );
+    let root = &validated.paths.run_root;
+    let inputs = &validated.inputs;
+    let endpoint = crate::rerank_endpoint_origin(provider);
+    let argv_ref = write_private(root, "argv.json", &serde_json::to_value(&provenance.argv)?)?;
+    let request = json!({"mode":"fixed-candidate","request_profile":"fixed-package-v1",
+        "rerank":true,"requested_provider":provider,"n":POOL_SIZE,"page_k":null,
+        "search_mode":null,"vector_search_mode":null,"resolved_filters":{},"cutoffs":cutoffs,
+        "configured_origin_sha256":digest(endpoint.as_bytes()),"pool_binding_file_sha256":pool_sha,
+        "suite_sha256":inputs.suite_sha256,"input_manifest_sha256":inputs.input_manifest_sha256,
+        "windows_file_sha256":inputs.windows_file_sha256,"labels_sha256":inputs.labels_sha256,
+        "label_policy_sha256":inputs.label_policy_sha256});
+    let request_ref = write_private(root, "request.json", &request)?;
+    let preparation_started = Instant::now();
+    let prepared = (|| -> Result<Vec<PreparedPool>> {
+        let declaration = super::input::read_pinned_json(pool_path, pool_sha)?;
+        let pins = expected_pools(&declaration, inputs)?;
+        let bytes = read_windows(inputs)?;
+        prepare_pools(inputs, &bytes, &pins)
+    })();
+    let preparation_ms = milliseconds(preparation_started);
+    let pools = match prepared {
+        Ok(pools) => pools,
+        Err(error) => {
+            preparation_failure(validated, pool_sha, &error, &[])?;
+            return Err(error);
+        }
+    };
+    let mut results = Vec::with_capacity(QIDS.len());
+    for pool in &pools {
+        let question_started = Instant::now();
+        let result = execute_prepared(
+            pool,
+            inputs,
+            provider,
+            |reference| super::input::read_registered_asset(inputs, reference),
+            |trace| {
+                crate::build_rerank_backend_with_trace(provider, &endpoint, Some(trace))
+                    .map_err(anyhow::Error::new)
+            },
+        );
+        let mut result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                preparation_failure(validated, pool_sha, &error, &results)?;
+                return Err(error);
+            }
+        };
+        let qid = &pool.window.qid;
+        write_private(
+            root,
+            &format!("fixed-ordered-pool-{qid}.json"),
+            &json!({"qid":qid,"ordered_pool_sha256":pool.ordered_pool_sha256,
+                "canonical_utf8":std::str::from_utf8(pool.ordered_bytes())?}),
+        )?;
+        write_private(
+            root,
+            &format!("fixed-recovery-{qid}.json"),
+            &result.recovery,
+        )?;
+        write_private(
+            root,
+            &format!("fixed-trace-{qid}.json"),
+            &json!({"qid":qid,"query_sha256":pool.window.query_sha256,
+                "ordered_pool_sha256":pool.ordered_pool_sha256,"transport":result.trace,
+                "identity":result.identity,"terminal":result.question["terminal"],
+                "failure_code":result.question["failure_code"]}),
+        )?;
+        if let Some(subjects) = result.label_subject_cache(pool)? {
+            write_private(root, &format!("label-subjects-{qid}.json"), &subjects)?;
+        }
+        result.question["cost"]["question_total_ms"] = json!(milliseconds(question_started));
+        write_private(root, &format!("question-{qid}.json"), &result.question)?;
+        results.push(result);
+    }
+    let (terminal, quality_status, failure) = aggregate_outcome(&results)?;
+    let (actual_provider, actual_model) = common_identity(&results);
+    let mut totals = RequestTrace::default();
+    let mut times = Vec::with_capacity(results.len());
+    for result in &results {
+        totals.requests.extend(result.trace.requests.clone());
+        times.push(
+            result.question["cost"]["question_total_ms"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("REGRESSION_FIXED_REPORT_FAILED"))?,
+        );
+    }
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    let quantile = |fraction: f64| {
+        sorted[((sorted.len() as f64 * fraction).ceil() as usize).saturating_sub(1)]
+    };
+    let mut writes = private_files(root)?;
+    writes.push("run.json".into());
+    writes.sort();
+    let output = json!({"schema":"cass.regression-run.v1",
+        "run_id":root.file_name().and_then(|s| s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,
+        "mode":"fixed-candidate","terminal":terminal,"quality_status":quality_status,"failure_code":failure,
+        "source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],
+        "suite_sha256":inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&inputs.windows)?),
+        "labels_sha256":inputs.labels_sha256,"label_policy_sha256":inputs.label_policy_sha256,
+        "question_count":9,"suite_candidate_slots":1800,
+        "source_identity":{"source_manifest_sha256":null,"source_checked":null,"source_producer_receipt_sha256":null,
+            "message_text_sha256":null,"chunk_text_sha256":null,"canonicalize_version":null,
+            "chunking_policy_version":null,"statistics_policy":null},
+        "expected_binding_file_sha256":null,"expected_binding":null,"observed_before":null,"observed_after":null,
+        "fixed_input_manifest_sha256":inputs.input_manifest_sha256,"fixed_windows_file_sha256":inputs.windows_file_sha256,
+        "backend_identity":{"provider":actual_provider,"actual_model":actual_model,"model_revision":null,
+            "endpoint_origin_sha256":null,"server_template_policy":null,
+            "document_assembly_policy":"frozen-package-verbatim-v1","client_submission_policy":"verbatim-query-documents-v1"},
+        "request":{"search_mode":null,"vector_search_mode":null,"rerank":true,"n":POOL_SIZE,"page_k":null,
+            "resolved_filters":{},"request_profile":"fixed-package-v1","request_evidence_sha256":request_ref["sha256"]},
+        "output":{"private_root":root.parent().and_then(|p|p.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,
+            "run_relative_path":root.file_name().and_then(|p|p.to_str()),"root_mode":"0700","file_mode":"0600",
+            "symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},
+        "questions":results.iter().map(|r| &r.question).collect::<Vec<_>>(),
+        "cost":{"all_run_ms":milliseconds(started),"identity_before_ms":admitted_ms+preparation_ms,
+            "identity_after_ms":0.0,"sample_count":times.len(),"mean_question_ms":mean,
+            "p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank",
+            "counts":[http_counts(&totals)]},
+        "claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison",
+            "fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":null});
+    write_private(root, "run.json", &output)?;
+    if let Some(code) = failure {
+        return Err(anyhow::anyhow!("REGRESSION_FIXED_BACKEND_FAILED").context(code));
+    }
+    Ok(
+        json!({"schema":"cass.regression-run-summary.v1","mode":"fixed-candidate",
+        "terminal":terminal,"quality_status":quality_status,"question_count":results.len()}),
+    )
 }
 
 #[cfg(test)]
@@ -1505,5 +1832,44 @@ mod tests {
                 .iter()
                 .all(|r| r.question["terminal"] == "SUCCESS")
         );
+    }
+
+    #[test]
+    fn pinned_pool_declarations_are_closed_and_match_every_metadata_and_query_identity() {
+        let (inputs, _, pins, _) = fixture(true, None, json!(17), false);
+        let value = json!({"schema":"cass.regression-fixed-pool.v1",
+            "suite_sha256":inputs.suite_sha256,"input_manifest_sha256":inputs.input_manifest_sha256,
+            "windows_file_sha256":inputs.windows_file_sha256,"labels_sha256":inputs.labels_sha256,
+            "label_freeze_sha256":inputs.label_freeze_sha256,"label_policy_sha256":inputs.label_policy_sha256,
+            "source_inventory_sha256":inputs.source_inventory_sha256,
+            "windows":inputs.windows.iter().zip(&pins).map(|(window,pin)| json!({"qid":window.qid,
+                "query_sha256":window.query_sha256,"count":200,"ordered_pool_sha256":pin.ordered_pool_sha256})).collect::<Vec<_>>()});
+        assert_eq!(expected_pools(&value, &inputs).unwrap().len(), 9);
+        for fault in [
+            "suite",
+            "labels",
+            "source",
+            "qid",
+            "query",
+            "count",
+            "unknown_root",
+            "unknown_window",
+        ] {
+            let mut changed = value.clone();
+            match fault {
+                "suite" => changed["suite_sha256"] = json!(digest(b"wrong")),
+                "labels" => changed["labels_sha256"] = json!(digest(b"wrong")),
+                "source" => changed["source_inventory_sha256"] = json!(digest(b"wrong")),
+                "qid" => changed["windows"][0]["qid"] = json!("N12"),
+                "query" => changed["windows"][0]["query_sha256"] = json!(digest(b"wrong")),
+                "count" => changed["windows"][0]["count"] = json!(199),
+                "unknown_root" => changed["new_field"] = json!(true),
+                _ => changed["windows"][0]["new_field"] = json!(true),
+            }
+            assert_eq!(
+                expected_pools(&changed, &inputs).err().unwrap().to_string(),
+                "POOL_BINDING_MISMATCH"
+            );
+        }
     }
 }

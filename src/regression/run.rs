@@ -280,12 +280,17 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
         }
     ) {
         super::on::run(command)
+    } else if matches!(command, RegressionCommand::FixedCandidate { .. }) {
+        super::fixed::run(command)
     } else {
         super::input::run(command)
     }
 }
 
 pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
+    if let Some(code) = super::fixed::named_error_code(error) {
+        return code;
+    }
     const CODES: &[&str] = &[
         "AGGREGATE_INPUT_MISSING",
         "AGGREGATE_GENERATION_CHANGED",
