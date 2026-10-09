@@ -1389,4 +1389,176 @@ mod tests {
             }
         }
     }
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn exact_partial_aggregate_child() {
+        if dotenvy::var("CASS_S2_04_PARTIAL_CHILD").is_err() {
+            return;
+        }
+        struct ResetBudget;
+        impl Drop for ResetBudget {
+            fn drop(&mut self) {
+                crate::search::query::reset_exact_scan_row_budget_for_test();
+            }
+        }
+        let _reset = ResetBudget;
+        crate::search::query::set_exact_scan_row_budget_for_test(10);
+        let started = Instant::now();
+        let (_f, _data, command) = full_fixture_mode(
+            5000,
+            4200,
+            SearchMode::Semantic,
+            Some(crate::search::query::VectorSearchMode::Exact),
+        );
+        let validated = crate::regression::input::prepare_full(&command).unwrap();
+        let run = RegressionSearchRun::activate(validated, &command).unwrap();
+        let identity_ms = milliseconds(started);
+        let (hits, metadata) = run
+            .client
+            .search_semantic_with_meta(
+                "retrieval",
+                Default::default(),
+                5001,
+                0,
+                crate::search::query::FieldMask::FULL,
+            )
+            .unwrap();
+        assert_eq!(metadata.mode, crate::search::query::CandidateMode::Exact);
+        assert!(metadata.incomplete);
+        assert_eq!(metadata.reason.as_deref(), Some("exact_scan_row_budget"));
+        assert_eq!(metadata.unique_messages, 10);
+        assert_eq!(hits.len(), 10);
+        let root = &run.validated.paths.run_root;
+        write_private(
+            root,
+            "actual-partial-metadata.json",
+            &serde_json::to_value(&metadata).unwrap(),
+        )
+        .unwrap();
+        let error = collect(
+            &run,
+            &RunProvenance::capture().unwrap(),
+            started,
+            identity_ms,
+        )
+        .unwrap_err();
+        assert_eq!(
+            super::super::run::error_code(&error),
+            "REGRESSION_PARTIAL_RESULTS"
+        );
+        let report: Value =
+            serde_json::from_slice(&fs::read(root.join("run.json")).unwrap()).unwrap();
+        assert_eq!(report["terminal"], "FAILED");
+        assert_eq!(report["quality_status"], "FAILED");
+        assert_eq!(report["failure_code"], "REGRESSION_PARTIAL_RESULTS");
+        assert_eq!(report["questions"].as_array().unwrap().len(), 0);
+        archive_run(
+            root,
+            &PathBuf::from(dotenvy::var("CASS_S2_04_PARTIAL_EVIDENCE").unwrap())
+                .join("run-artifacts"),
+        );
+        println!("REAL_PARTIAL_AGGREGATE_REJECTED_CODE=REGRESSION_PARTIAL_RESULTS");
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn aggregate_exact_budget_partial_is_rejected_in_isolated_child() {
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let worker = std::thread::spawn(move || {
+            let mut requests = 0;
+            while !done.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = vec![];
+                let mut buffer = [0; 4096];
+                let input = loop {
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            assert_eq!(
+                                header.lines().next().unwrap().split_whitespace().nth(1),
+                                Some("/embeddings")
+                            );
+                            break serde_json::from_slice::<Value>(
+                                &bytes[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                assert_eq!(input["model"], "BAAI/bge-m3");
+                requests += 1;
+                let mut embedding = vec![0.0; 1024];
+                embedding[0] = 1.0;
+                let body=json!({"data":input["input"].as_array().unwrap().iter().enumerate().map(|(i,_)|json!({"index":i,"embedding":embedding})).collect::<Vec<_>>()}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+            requests
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let case = if let Ok(directory) = dotenvy::var("CASS_S2_04_TEST_EVIDENCE") {
+            PathBuf::from(directory).join("failure-exact-partial")
+        } else {
+            temporary.path().join("case")
+        };
+        fs::create_dir(&case).unwrap();
+        fs::set_permissions(&case, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "regression::off::tests::exact_partial_aggregate_child",
+                "--nocapture",
+            ])
+            .env("CASS_S2_04_PARTIAL_CHILD", "1")
+            .env("CASS_S2_04_PARTIAL_EVIDENCE", &case)
+            .env("CASS_INFINITY_URL", origin)
+            .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .output()
+            .unwrap();
+        stop.store(true, Ordering::Release);
+        let count = worker.join().unwrap();
+        fs::write(case.join("stdout.log"), &output.stdout).unwrap();
+        fs::write(case.join("stderr.log"), &output.stderr).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(count > 0);
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("REAL_PARTIAL_AGGREGATE_REJECTED_CODE=REGRESSION_PARTIAL_RESULTS")
+        );
+        write_private(&case,"transport.json",&json!({"observed_embedding_requests":count,"observed_rerank_requests":0,"child_exit_code":output.status.code(),"timeout_deadline_tested":false})).unwrap();
+    }
 }

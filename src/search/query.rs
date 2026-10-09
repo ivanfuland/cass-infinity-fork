@@ -2403,12 +2403,12 @@ static EXACT_SCAN_ROW_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
-fn set_exact_scan_row_budget_for_test(n: usize) {
+pub(crate) fn set_exact_scan_row_budget_for_test(n: usize) {
     EXACT_SCAN_ROW_BUDGET_OVERRIDE.store(n, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
-fn reset_exact_scan_row_budget_for_test() {
+pub(crate) fn reset_exact_scan_row_budget_for_test() {
     EXACT_SCAN_ROW_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
