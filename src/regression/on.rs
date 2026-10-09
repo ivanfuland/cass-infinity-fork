@@ -1119,9 +1119,18 @@ mod tests {
                     .collect();
                 assert_eq!(keys.len(), actual);
                 for (i, slot) in slots.iter().enumerate() {
-                    assert_eq!(slot["retrieval_rank"], i + 1);
+                    if fault == "neighbour" {
+                        // Strictly increasing scores reverse the original input.
+                        // The durable subject must still use the original slot.
+                        let input_slot = actual - 1 - i;
+                        assert_eq!(slot["input_slot"], input_slot);
+                        assert_eq!(slot["retrieval_rank"], input_slot + 1);
+                        assert_eq!(slot["rerank_score"], input_slot as f64);
+                    } else {
+                        assert_eq!(slot["retrieval_rank"], i + 1);
+                        assert_eq!(slot["rerank_score"], 1.0);
+                    }
                     assert_eq!(slot["final_rank"], i + 1);
-                    assert_eq!(slot["rerank_score"], 1.0);
                     assert!(!slot["sent_text"].is_null());
                 }
                 for page in q["pages"].as_array().unwrap().iter().skip(1) {
@@ -1286,7 +1295,7 @@ mod tests {
                         } else {
                             len
                         };
-                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":1.0})).collect::<Vec<_>>()}).to_string())
+                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":if server_fault=="neighbour" {i as f64} else {1.0}})).collect::<Vec<_>>()}).to_string())
                     }
                 };
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
