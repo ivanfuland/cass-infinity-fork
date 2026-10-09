@@ -2031,7 +2031,7 @@ mod tests {
             "stage":"assets_only","mode":"synthetic","query_order":QIDS,"candidate_slots":1800,"label_counts":counts,
             "runtime_prefix_map":{},"files":assets,"limits":{},"source_inventory_sha256":digest(&inventory)})).unwrap();
         fixture_file(&suite.join("SUITE-MANIFEST.json"), &suite_bytes);
-        let pool = root.path().join("pool.json");
+        let pool = root.path().join("bindings/pool.json");
         let pool_bytes = serde_json::to_vec(&json!({"schema":"cass.regression-fixed-pool.v1","suite_sha256":digest(&suite_bytes),
             "input_manifest_sha256":manifest["sha256"],"windows_file_sha256":windows["sha256"],"labels_sha256":labels["sha256"],
             "label_freeze_sha256":freeze["sha256"],"label_policy_sha256":policy,"source_inventory_sha256":digest(&inventory),"windows":declared})).unwrap();
@@ -2082,6 +2082,9 @@ mod tests {
             unreachable!();
         };
         let root = input.output.output_root.join(&input.output.run_id);
+        if let Ok(destination) = std::env::var("CASS_S2_06_CASE_ARTIFACT") {
+            archive_fixture(package._root.path(), Path::new(&destination));
+        }
         let gap = matches!(case.as_str(), "score_gap" | "conversation_gap");
         if gap {
             assert!(outcome.is_err());
@@ -2107,6 +2110,14 @@ mod tests {
                 }
             );
         } else {
+            assert!(
+                root.join("run.json").exists(),
+                "case {case}: {}",
+                outcome
+                    .as_ref()
+                    .err()
+                    .map_or("success-without-run".into(), failure_code)
+            );
             let report: Value =
                 serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
             let succeeds = matches!(case.as_str(), "tie" | "reverse" | "unknown_model");
@@ -2212,9 +2223,6 @@ mod tests {
             if report["cost"]["counts"][0]["http_attempts"] != 0 {
                 assert!(report["cost"]["counts"][0]["model_executions"].is_null());
             }
-        }
-        if let Ok(destination) = std::env::var("CASS_S2_06_CASE_ARTIFACT") {
-            archive_fixture(package._root.path(), Path::new(&destination));
         }
         println!("FIXED_NATIVE_CASE={case} library_entry_complete=true actual_model_cloud=false");
     }
