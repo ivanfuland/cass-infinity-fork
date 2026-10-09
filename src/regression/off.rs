@@ -158,7 +158,7 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
             write_private(
                 &root,
                 "search-failure.json",
-                &json!({"terminal":"FAILED","quality_status":"NOT_EVALUATED","failure_code":super::run::error_code(&error),"stage":"ACTIVATION"}),
+                &json!({"terminal":"FAILED","quality_status":"FAILED","failure_code":super::run::error_code(&error),"stage":"ACTIVATION"}),
             )?;
             return Err(error);
         }
@@ -259,7 +259,7 @@ pub(crate) fn collect(
     };
     writes = private_files(root)?;
     writes.push("run.json".into());
-    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":"NOT_EVALUATED","failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
+    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
     write_private(root, "run.json", &output)?;
     if let Some(code) = failure {
         bail!("{code}");
@@ -994,6 +994,92 @@ mod tests {
         }
     }
 
+    fn full_cli(command: &RegressionCommand) -> crate::CliResult<()> {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let RegressionCommand::FullSearch {
+            input,
+            database,
+            expected_binding,
+            expected_binding_sha256,
+            source_manifest,
+            source_producer_receipt,
+            source_producer_receipt_sha256,
+            search_mode,
+            vector_search_mode,
+            rrf_limit,
+            ..
+        } = command
+        else {
+            unreachable!()
+        };
+        let mut argv = vec![
+            "cass".into(),
+            "regression".into(),
+            "full-search".into(),
+            "--suite".into(),
+            input.suite.display().to_string(),
+            "--suite-sha256".into(),
+            input.suite_sha256.clone(),
+            "--labels".into(),
+            input.labels.display().to_string(),
+            "--labels-sha256".into(),
+            input.labels_sha256.clone(),
+            "--output-root".into(),
+            input.output.output_root.display().to_string(),
+            "--run-id".into(),
+            input.output.run_id.clone(),
+            "--database".into(),
+            database.display().to_string(),
+            "--expected-binding".into(),
+            expected_binding.display().to_string(),
+            "--expected-binding-sha256".into(),
+            expected_binding_sha256.clone(),
+            "--source-manifest".into(),
+            source_manifest.display().to_string(),
+            "--source-producer-receipt".into(),
+            source_producer_receipt.display().to_string(),
+            "--source-producer-receipt-sha256".into(),
+            source_producer_receipt_sha256.clone(),
+            "--search-mode".into(),
+            crate::search_mode_canonical_str(*search_mode).into(),
+            "--rrf-limit".into(),
+            rrf_limit.to_string(),
+            "--rerank".into(),
+            "off".into(),
+        ];
+
+        if let Some(vector) = vector_search_mode {
+            argv.extend([
+                "--vector-search-mode".into(),
+                crate::vector_search_mode_wire(*vector).into(),
+            ]);
+        }
+        let parsed = crate::parse_cli(argv)?;
+        let mut future = std::pin::pin!(crate::run_with_parsed(parsed));
+        let Poll::Ready(result) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("synchronous regression must complete");
+        };
+        result
+    }
+
+    fn archive_run(root: &Path, destination: &Path) {
+        fs::create_dir(destination).unwrap();
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700)).unwrap();
+        for relative in private_files(root).unwrap() {
+            let target = destination.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).unwrap();
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::copy(root.join(relative), &target).unwrap();
+            fs::set_permissions(target, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn private_label_body_stdout_child() {
         if dotenvy::var("CASS_S2_04_STDOUT_CHILD").is_err() {
@@ -1002,66 +1088,9 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
             .spawn(|| {
-                use std::future::Future;
-                use std::task::{Context, Poll, Waker};
                 let (_f, _data, command) = full_fixture(5, 12);
-                let RegressionCommand::FullSearch {
-                    input,
-                    database,
-                    expected_binding,
-                    expected_binding_sha256,
-                    source_manifest,
-                    source_producer_receipt,
-                    source_producer_receipt_sha256,
-                    ..
-                } = &command
-                else {
-                    unreachable!()
-                };
-                let argv = vec![
-                    "cass".into(),
-                    "regression".into(),
-                    "full-search".into(),
-                    "--suite".into(),
-                    input.suite.display().to_string(),
-                    "--suite-sha256".into(),
-                    input.suite_sha256.clone(),
-                    "--labels".into(),
-                    input.labels.display().to_string(),
-                    "--labels-sha256".into(),
-                    input.labels_sha256.clone(),
-                    "--output-root".into(),
-                    input.output.output_root.display().to_string(),
-                    "--run-id".into(),
-                    input.output.run_id.clone(),
-                    "--database".into(),
-                    database.display().to_string(),
-                    "--expected-binding".into(),
-                    expected_binding.display().to_string(),
-                    "--expected-binding-sha256".into(),
-                    expected_binding_sha256.clone(),
-                    "--source-manifest".into(),
-                    source_manifest.display().to_string(),
-                    "--source-producer-receipt".into(),
-                    source_producer_receipt.display().to_string(),
-                    "--source-producer-receipt-sha256".into(),
-                    source_producer_receipt_sha256.clone(),
-                    "--search-mode".into(),
-                    "lexical".into(),
-                    "--rrf-limit".into(),
-                    "5".into(),
-                    "--rerank".into(),
-                    "off".into(),
-                ];
-                let parsed = crate::parse_cli(argv).unwrap();
-                let mut future = std::pin::pin!(crate::run_with_parsed(parsed));
-                let Poll::Ready(result) = future
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop()))
-                else {
-                    panic!("synchronous regression must complete");
-                };
-                result.unwrap();
+                full_cli(&command).unwrap();
+                let input = &_f.input;
                 let run_root = input.output.output_root.join(&input.output.run_id);
                 let report: Value =
                     serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
@@ -1093,5 +1122,271 @@ mod tests {
         assert!(!stdout.contains("retrieval"));
         assert!(!stdout.contains("Investigate retrieval ranking"));
         assert!(!stdout.contains("Synthetic candidate"));
+    }
+    #[test]
+    fn failed_activation_preserves_failed_terminal_quality_and_named_error() {
+        let (f, _data, mut command) = full_fixture(5, 12);
+        let RegressionCommand::FullSearch {
+            expected_binding,
+            expected_binding_sha256,
+            ..
+        } = &mut command
+        else {
+            unreachable!()
+        };
+        let mut expected: Value =
+            serde_json::from_slice(&fs::read(&expected_binding).unwrap()).unwrap();
+        expected["generation"]["generation_id"] = json!(99);
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        fs::write(&expected_binding, &bytes).unwrap();
+        *expected_binding_sha256 = digest(&bytes);
+        let error = super::run(&command).unwrap_err();
+        assert_eq!(
+            super::super::run::error_code(&error),
+            "EXPECTED_INPUT_BINDING_MISMATCH"
+        );
+        let root = f.input.output.output_root.join(&f.input.output.run_id);
+        let report: Value =
+            serde_json::from_slice(&fs::read(root.join("search-failure.json")).unwrap()).unwrap();
+        assert_eq!(report["terminal"], "FAILED");
+        assert_eq!(report["quality_status"], "FAILED");
+        assert_eq!(report["failure_code"], "EXPECTED_INPUT_BINDING_MISMATCH");
+        assert_eq!(report["stage"], "ACTIVATION");
+        assert!(root.join("input-binding-candidate.json").is_file());
+        assert!(!root.join("run.json").exists());
+        if let Ok(directory) = dotenvy::var("CASS_S2_04_TEST_EVIDENCE") {
+            archive_run(&root, &Path::new(&directory).join("failure-activation"));
+        }
+    }
+
+    #[test]
+    fn failed_final_source_verification_keeps_nine_questions_and_original_scores() {
+        let started = Instant::now();
+        let (_f, _data, run) = prepared(5, 12);
+        let initial_ms = milliseconds(started);
+        let original = run
+            .client
+            .search_with_fallback(
+                "retrieval",
+                Default::default(),
+                6,
+                0,
+                3,
+                crate::search::query::FieldMask::FULL,
+            )
+            .unwrap();
+        fs::write(
+            run.validated.source_manifest.as_ref().unwrap(),
+            b"changed synthetic manifest inside aggregate lifetime",
+        )
+        .unwrap();
+        let error = collect(
+            &run,
+            &RunProvenance::capture().unwrap(),
+            started,
+            initial_ms,
+        )
+        .unwrap_err();
+        assert_eq!(
+            super::super::run::error_code(&error),
+            "BINDING_SOURCE_CHANGED"
+        );
+        let root = &run.validated.paths.run_root;
+        let report: Value =
+            serde_json::from_slice(&fs::read(root.join("run.json")).unwrap()).unwrap();
+        assert_eq!(report["terminal"], "FAILED");
+        assert_eq!(report["quality_status"], "FAILED");
+        assert_eq!(report["failure_code"], "BINDING_SOURCE_CHANGED");
+        assert!(report["observed_after"].is_null());
+        assert!(report["after_verification"].is_null());
+        assert_eq!(report["questions"].as_array().unwrap().len(), 9);
+        for question in report["questions"].as_array().unwrap() {
+            assert_eq!(question["terminal"], "SUCCESS");
+            assert_eq!(question["actual_n"], 5);
+            for (slot, hit) in question["slots"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(&original.hits)
+            {
+                assert_eq!(slot["message_id"], json!(hit.message_id));
+                assert_eq!(slot["original_score"], json!(hit.score));
+                assert!(slot["rerank_score"].is_null());
+            }
+        }
+        check_subjects(root, &report);
+        if let Ok(directory) = dotenvy::var("CASS_S2_04_TEST_EVIDENCE") {
+            archive_run(root, &Path::new(&directory).join("failure-final-source"));
+        }
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn embedding_transport_failure_child() {
+        let Ok(mode) = dotenvy::var("CASS_S2_04_FAILURE_CHILD") else {
+            return;
+        };
+        let rc = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let mode = if mode == "semantic" {
+                    SearchMode::Semantic
+                } else {
+                    SearchMode::Hybrid
+                };
+                let (f, _data, command) = full_fixture_mode(
+                    5,
+                    12,
+                    mode,
+                    Some(crate::search::query::VectorSearchMode::Exact),
+                );
+                let error = full_cli(&command).unwrap_err();
+                assert_eq!(error.code, 2);
+                let root = f.input.output.output_root.join(&f.input.output.run_id);
+                let report: Value =
+                    serde_json::from_slice(&fs::read(root.join("run.json")).unwrap()).unwrap();
+                assert_eq!(report["terminal"], "FAILED");
+                assert_eq!(report["quality_status"], "FAILED");
+                assert_eq!(report["failure_code"], error.message);
+                assert_eq!(report["questions"].as_array().unwrap().len(), 0);
+                assert!(report["observed_after"].is_null());
+                assert!(report["after_verification"].is_null());
+                assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
+                assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
+                archive_run(
+                    &root,
+                    &PathBuf::from(dotenvy::var("CASS_S2_04_FAILURE_EVIDENCE").unwrap())
+                        .join("run-artifacts"),
+                );
+                println!("FAILED_CLI_RC={} CODE={}", error.code, error.message);
+                error.code
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        std::process::exit(rc);
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn aggregate_semantic_hybrid_http500_invalid_response_disconnect_are_failed() {
+        use std::net::TcpListener;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+        for mode in ["semantic", "hybrid"] {
+            for fault in ["http500", "invalid-response", "disconnect"] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let stop = Arc::new(AtomicBool::new(false));
+                let done = stop.clone();
+                let worker = std::thread::spawn(move || {
+                    let mut paths = vec![];
+                    while !done.load(Ordering::Acquire) {
+                        let (mut stream, _) = match listener.accept() {
+                            Ok(v) => v,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                            Err(e) => panic!("{e}"),
+                        };
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        let mut bytes = Vec::new();
+                        let mut buffer = [0; 4096];
+                        loop {
+                            let n = stream.read(&mut buffer).unwrap();
+                            assert!(n > 0);
+                            bytes.extend_from_slice(&buffer[..n]);
+                            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let header = String::from_utf8_lossy(&bytes[..end]);
+                                let length = header
+                                    .lines()
+                                    .filter_map(|l| l.split_once(':'))
+                                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                                    .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                                    .unwrap_or(0);
+                                if bytes.len() >= end + 4 + length {
+                                    let path = header
+                                        .lines()
+                                        .next()
+                                        .unwrap()
+                                        .split_whitespace()
+                                        .nth(1)
+                                        .unwrap()
+                                        .to_string();
+                                    assert_eq!(path, "/embeddings");
+                                    paths.push(path);
+                                    let body: Value =
+                                        serde_json::from_slice(&bytes[end + 4..end + 4 + length])
+                                            .unwrap();
+                                    assert_eq!(body["model"], "BAAI/bge-m3");
+                                    break;
+                                }
+                            }
+                        }
+                        if fault == "disconnect" {
+                            drop(stream);
+                            continue;
+                        }
+                        let (status, body) = if fault == "http500" {
+                            (
+                                "500 Internal Server Error",
+                                "{\"error\":\"synthetic server failure\"}",
+                            )
+                        } else {
+                            ("200 OK", "synthetic invalid JSON")
+                        };
+                        write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                    }
+                    paths
+                });
+                let temporary = tempfile::tempdir().unwrap();
+                let case = if let Ok(directory) = dotenvy::var("CASS_S2_04_TEST_EVIDENCE") {
+                    PathBuf::from(directory).join(format!("failure-{mode}-{fault}"))
+                } else {
+                    temporary.path().join("case")
+                };
+                fs::create_dir(&case).unwrap();
+                fs::set_permissions(&case, fs::Permissions::from_mode(0o700)).unwrap();
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "regression::off::tests::embedding_transport_failure_child",
+                        "--nocapture",
+                    ])
+                    .env("CASS_S2_04_FAILURE_CHILD", mode)
+                    .env("CASS_S2_04_FAILURE_EVIDENCE", &case)
+                    .env("CASS_INFINITY_URL", origin)
+                    .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+                    .env("NO_PROXY", "127.0.0.1,localhost")
+                    .env("no_proxy", "127.0.0.1,localhost")
+                    .output()
+                    .unwrap();
+                stop.store(true, Ordering::Release);
+                let paths = worker.join().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(2),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(!paths.is_empty());
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(stdout.contains("FAILED_CLI_RC=2"));
+                assert!(!stdout.contains("retrieval"));
+                assert!(!stdout.contains("Investigate retrieval ranking"));
+                assert!(!stdout.contains("SUCCESS"));
+                fs::write(case.join("stdout.log"), &output.stdout).unwrap();
+                fs::write(case.join("stderr.log"), &output.stderr).unwrap();
+                write_private(&case,"transport.json",&json!({"mode":mode,"fault":fault,"observed_paths":paths,"observed_rerank_requests":0,"child_exit_code":output.status.code(),"cli_rc":2,"timeout_deadline_tested":false})).unwrap();
+                println!("REAL_AGGREGATE_FAILURE mode={mode} fault={fault} cli_rc=2");
+            }
+        }
     }
 }
