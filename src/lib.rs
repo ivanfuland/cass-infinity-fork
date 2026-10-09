@@ -25852,20 +25852,42 @@ fn run_cli_search(
     let result = if !rerank_on {
         result
     } else {
-        let outcome = score_search_first_window(FirstWindowInput {
-            query, result, regression: regression.as_ref(), filters: &filters,
-            semantic_opts: &semantic_opts, rerank_ctx: &rerank_ctx, mode, vector_search_mode,
-            effective_model: effective_model.clone(), limit_val, aggregate: &aggregate,
-            has_aggregation, agg_fields: &agg_fields, explain, timeout_ms, timeout_duration,
-            start_time, robot_meta, data_dir: &data_dir, db_path: &db_path,
-            mode_meta: &mode_meta, search_ms, rerank_stamp_before,
-            regression_embedding_binding: regression_embedding_binding.clone(),
-        }, None);
+        let outcome = score_search_first_window(
+            FirstWindowInput {
+                query,
+                result,
+                regression: regression.as_ref(),
+                filters: &filters,
+                semantic_opts: &semantic_opts,
+                rerank_ctx: &rerank_ctx,
+                mode,
+                vector_search_mode,
+                effective_model: effective_model.clone(),
+                limit_val,
+                aggregate: &aggregate,
+                has_aggregation,
+                agg_fields: &agg_fields,
+                explain,
+                timeout_ms,
+                timeout_duration,
+                start_time,
+                robot_meta,
+                data_dir: &data_dir,
+                db_path: &db_path,
+                mode_meta: &mode_meta,
+                search_ms,
+                rerank_stamp_before,
+                regression_embedding_binding: regression_embedding_binding.clone(),
+            },
+            None,
+        );
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 if error.message == "REGRESSION_RERANK_FAILED" {
-                    if let Some(run) = regression.as_ref() { verify_regression_run_end(run)?; }
+                    if let Some(run) = regression.as_ref() {
+                        verify_regression_run_end(run)?;
+                    }
                 }
                 return Err(error);
             }
@@ -26101,520 +26123,551 @@ struct FirstWindowInput<'a> {
 }
 
 /// The existing P09 first-window implementation, shared by CLI and aggregate.
-fn score_search_first_window(input: FirstWindowInput<'_>, mut capture: Option<&mut FirstWindowCapture>) -> CliResult<ScoredSearchWindow> {
-    use crate::search::query::{SearchMode, QueryExplanation};
-    let FirstWindowInput { query, result, regression, filters, semantic_opts, rerank_ctx,
-        mode, vector_search_mode, effective_model, limit_val, aggregate, has_aggregation,
-        agg_fields, explain, timeout_ms, timeout_duration, start_time, robot_meta,
-        data_dir, db_path, mode_meta, search_ms, rerank_stamp_before,
-        regression_embedding_binding } = input;
+fn score_search_first_window(
+    input: FirstWindowInput<'_>,
+    mut capture: Option<&mut FirstWindowCapture>,
+) -> CliResult<ScoredSearchWindow> {
+    use crate::search::query::{QueryExplanation, SearchMode};
+    let FirstWindowInput {
+        query,
+        result,
+        regression,
+        filters,
+        semantic_opts,
+        rerank_ctx,
+        mode,
+        vector_search_mode,
+        effective_model,
+        limit_val,
+        aggregate,
+        has_aggregation,
+        agg_fields,
+        explain,
+        timeout_ms,
+        timeout_duration,
+        start_time,
+        robot_meta,
+        data_dir,
+        db_path,
+        mode_meta,
+        search_ms,
+        rerank_stamp_before,
+        regression_embedding_binding,
+    } = input;
     let mut rerank_applied = false;
     let mut window_snapshot = None;
     let mut window_id = None;
     let mut window_continuable = false;
     let mut window_unavailable: Option<&'static str> = None;
-        let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-        let provider = semantic_opts
-            .rerank_provider
-            .expect("rerank_window_enabled guarantees a provider");
-        let endpoint = regression
-            .as_ref()
-            .and_then(|run| run.endpoint.clone())
-            .unwrap_or_else(|| rerank_endpoint_origin(provider));
-        let binding = build_request_binding(
-            query,
-            &filters,
-            &rerank_ctx.time_selectors,
-            search_mode_canonical_str(mode.unwrap_or_default()),
-            vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
-            effective_model.as_deref(),
-            limit_val,
-            rerank_k,
-            provider,
-            &endpoint,
-            aggregate.as_deref(),
-            explain,
-            timeout_ms,
-            rerank_ctx.daemon,
-            rerank_ctx.no_daemon,
-        )
-        .ok();
-        // A request that cannot even be frozen (a bad local endpoint, a limit
-        // the binding rejects) must not drop the page: it degrades to
-        // "no rerank, no cursor" exactly like any other optional-stage failure.
-        if binding.is_none() {
-            window_unavailable =
-                Some(crate::search::rerank::window::WindowError::InvalidInput.as_str());
-        }
+    let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
+    let provider = semantic_opts
+        .rerank_provider
+        .expect("rerank_window_enabled guarantees a provider");
+    let endpoint = regression
+        .as_ref()
+        .and_then(|run| run.endpoint.clone())
+        .unwrap_or_else(|| rerank_endpoint_origin(provider));
+    let binding = build_request_binding(
+        query,
+        &filters,
+        &rerank_ctx.time_selectors,
+        search_mode_canonical_str(mode.unwrap_or_default()),
+        vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
+        effective_model.as_deref(),
+        limit_val,
+        rerank_k,
+        provider,
+        &endpoint,
+        aggregate.as_deref(),
+        explain,
+        timeout_ms,
+        rerank_ctx.daemon,
+        rerank_ctx.no_daemon,
+    )
+    .ok();
+    // A request that cannot even be frozen (a bad local endpoint, a limit
+    // the binding rejects) must not drop the page: it degrades to
+    // "no rerank, no cursor" exactly like any other optional-stage failure.
+    if binding.is_none() {
+        window_unavailable =
+            Some(crate::search::rerank::window::WindowError::InvalidInput.as_str());
+    }
 
-        let crate::search::query::SearchResult {
-            hits: mut fetched_hits,
-            wildcard_fallback,
-            cache_stats,
-            suggestions,
-            total_count,
-            candidates,
-            semantic_degraded,
-        } = result;
+    let crate::search::query::SearchResult {
+        hits: mut fetched_hits,
+        wildcard_fallback,
+        cache_stats,
+        suggestions,
+        total_count,
+        candidates,
+        semantic_degraded,
+    } = result;
 
-        // The window is the first `N` hits; the sentinel/aggregate over-fetch
-        // never reaches the model. The *whole* fetched pool (window + overflow)
-        // is what the aggregate/explain scope must be measured over, to match
-        // the closed-state path's scope exactly.
-        let window_len = limit_val.min(fetched_hits.len());
-        let overflow = fetched_hits.split_off(window_len);
-        let window_count = fetched_hits.len();
-        let mut scope_pool = fetched_hits.clone();
-        scope_pool.extend(overflow);
-        let rerank_prefetch_hits = Some(scope_pool);
+    // The window is the first `N` hits; the sentinel/aggregate over-fetch
+    // never reaches the model. The *whole* fetched pool (window + overflow)
+    // is what the aggregate/explain scope must be measured over, to match
+    // the closed-state path's scope exactly.
+    let window_len = limit_val.min(fetched_hits.len());
+    let overflow = fetched_hits.split_off(window_len);
+    let window_count = fetched_hits.len();
+    let mut scope_pool = fetched_hits.clone();
+    scope_pool.extend(overflow);
+    let rerank_prefetch_hits = Some(scope_pool);
 
-        let mut window_result = crate::search::query::SearchResult {
-            hits: fetched_hits,
-            wildcard_fallback,
-            cache_stats,
-            suggestions,
-            total_count,
-            candidates,
-            semantic_degraded,
-        };
-        if let Some(capture) = capture.as_deref_mut() { capture.result = Some(window_result.clone()); }
-        let mut regression_evidence = regression
-            .as_ref()
-            .map(|run| {
-                let retrieval = crate::search::regression_trace::freeze_retrieval_slots(
-                    &run.context,
-                    &window_result.hits,
-                )?;
-                Ok::<_, anyhow::Error>(crate::search::regression_trace::WindowEvidence {
-                    schema: "cass.regression-window-trace.v2".into(),
-                    request: regression_request_evidence(
-                        &filters,
-                        mode_meta.requested,
-                        vector_search_mode.unwrap_or_default(),
-                        limit_val,
-                        timeout_ms,
-                        &semantic_opts,
-                        &rerank_ctx,
-                        regression_embedding_binding.as_ref(),
-                    )
-                    .map_err(|e| anyhow::anyhow!(e.message))?,
-                    transport_scope: "rerank-http-v1".into(),
-                    lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
-                    lexical_statistics_sha256: (mode_meta.realized != SearchMode::Semantic)
-                        .then(|| run.binding.lexical_statistics_sha256.clone()),
-                    binding: run.binding.clone(),
-                    query: crate::search::regression_trace::TextDigest::of(query),
-                    final_slots: retrieval.clone(),
-                    retrieval,
-                    snippets: window_result
-                        .hits
-                        .iter()
-                        .map(|h| crate::search::regression_trace::TextDigest::of(&h.content))
-                        .collect(),
-                    prepared_documents: None,
-                    transport: Default::default(),
-                    rerank_requested: true,
-                    applied: false,
-                    failure_reason: None,
-                })
+    let mut window_result = crate::search::query::SearchResult {
+        hits: fetched_hits,
+        wildcard_fallback,
+        cache_stats,
+        suggestions,
+        total_count,
+        candidates,
+        semantic_degraded,
+    };
+    if let Some(capture) = capture.as_deref_mut() {
+        capture.result = Some(window_result.clone());
+    }
+    let mut regression_evidence = regression
+        .as_ref()
+        .map(|run| {
+            let retrieval = crate::search::regression_trace::freeze_retrieval_slots(
+                &run.context,
+                &window_result.hits,
+            )?;
+            Ok::<_, anyhow::Error>(crate::search::regression_trace::WindowEvidence {
+                schema: "cass.regression-window-trace.v2".into(),
+                request: regression_request_evidence(
+                    &filters,
+                    mode_meta.requested,
+                    vector_search_mode.unwrap_or_default(),
+                    limit_val,
+                    timeout_ms,
+                    &semantic_opts,
+                    &rerank_ctx,
+                    regression_embedding_binding.as_ref(),
+                )
+                .map_err(|e| anyhow::anyhow!(e.message))?,
+                transport_scope: "rerank-http-v1".into(),
+                lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
+                lexical_statistics_sha256: (mode_meta.realized != SearchMode::Semantic)
+                    .then(|| run.binding.lexical_statistics_sha256.clone()),
+                binding: run.binding.clone(),
+                query: crate::search::regression_trace::TextDigest::of(query),
+                final_slots: retrieval.clone(),
+                retrieval,
+                snippets: window_result
+                    .hits
+                    .iter()
+                    .map(|h| crate::search::regression_trace::TextDigest::of(&h.content))
+                    .collect(),
+                prepared_documents: None,
+                transport: Default::default(),
+                rerank_requested: true,
+                applied: false,
+                failure_reason: None,
             })
-            .transpose()
-            .map_err(regression_search_error)?;
+        })
+        .transpose()
+        .map_err(regression_search_error)?;
 
-        let mut identity = crate::search::rerank::types::CallIdentity {
-            actual_provider: None,
-            actual_model: None,
-            serving_provider: None,
+    let mut identity = crate::search::rerank::types::CallIdentity {
+        actual_provider: None,
+        actual_model: None,
+        serving_provider: None,
+    };
+    let mut scored_count = 0usize;
+    let mut http_requests: Option<usize> = None;
+    let mut model_requests: Option<usize> = None;
+    let mut duration_ms = 0u64;
+    let mut failure_reason: Option<crate::search::rerank::types::RerankFailureReason> = None;
+    let mut http_status: Option<u16> = None;
+
+    if window_result.hits.is_empty() {
+        // Empty window: no model call at all.
+        http_requests = Some(0);
+        model_requests = Some(0);
+    } else if binding.is_none() {
+        // The request could not be frozen, so nothing may be sent to the
+        // model; the page is delivered unranked and without a cursor.
+        http_requests = Some(0);
+        model_requests = Some(0);
+        if regression.is_some() {
+            failure_reason = Some(crate::search::rerank::types::RerankFailureReason::InvalidInput);
+        }
+    } else {
+        let documents = match regression.as_ref() {
+            Some(run) => crate::search::rerank::context::build_documents_for_regression(
+                &run.context,
+                query,
+                &window_result.hits,
+            ),
+            None => crate::search::rerank::context::build_documents(
+                &db_path,
+                query,
+                &window_result.hits,
+            ),
         };
-        let mut scored_count = 0usize;
-        let mut http_requests: Option<usize> = None;
-        let mut model_requests: Option<usize> = None;
-        let mut duration_ms = 0u64;
-        let mut failure_reason: Option<crate::search::rerank::types::RerankFailureReason> = None;
-        let mut http_status: Option<u16> = None;
-
-        if window_result.hits.is_empty() {
-            // Empty window: no model call at all.
-            http_requests = Some(0);
-            model_requests = Some(0);
-        } else if binding.is_none() {
-            // The request could not be frozen, so nothing may be sent to the
-            // model; the page is delivered unranked and without a cursor.
-            http_requests = Some(0);
-            model_requests = Some(0);
-            if regression.is_some() {
-                failure_reason =
-                    Some(crate::search::rerank::types::RerankFailureReason::InvalidInput);
-            }
-        } else {
-            let documents = match regression.as_ref() {
-                Some(run) => crate::search::rerank::context::build_documents_for_regression(
-                    &run.context,
-                    query,
-                    &window_result.hits,
-                ),
-                None => crate::search::rerank::context::build_documents(
-                    &db_path,
-                    query,
-                    &window_result.hits,
-                ),
-            };
-            match documents {
-                Ok(documents) if !documents.is_empty() => {
-                    if let Some(capture) = capture.as_deref_mut() {
-                        capture.prepared_documents = Some(documents.clone());
-                    }
-                    if let Some(evidence) = regression_evidence.as_mut() {
-                        evidence.prepared_documents = Some(
-                            documents
-                                .iter()
-                                .map(|d| crate::search::regression_trace::TextDigest::of(d))
-                                .collect(),
-                        );
-                    }
-                    let backend = match regression.as_ref() {
-                        Some(run) => build_rerank_backend_with_trace(
-                            provider,
-                            &endpoint,
-                            Some(run.trace.clone()),
-                        ),
-                        None => build_rerank_backend(provider, &endpoint),
-                    };
-                    match backend {
-                        Ok(backend) => {
-                            let call_started = Instant::now();
-                            match backend.rerank(query, &documents) {
-                                Ok(response) => {
-                                    duration_ms = response.duration_ms;
-                                    // The call layer re-proves the completeness
-                                    // the adapter promises: the score set must be
-                                    // exactly the window length and a valid
-                                    // permutation of it. Only then is the window
-                                    // replaced -- in one step, so a short,
-                                    // duplicated or out-of-range set can never
-                                    // drop a candidate or half-apply scores.
-                                    let expected_len = window_result.hits.len();
-                                    let order = (response.scores.len() == expected_len)
-                                        .then(|| {
-                                            crate::search::rerank::types::stable_rank_order(
-                                                &response.scores,
-                                            )
-                                            .ok()
-                                        })
-                                        .flatten()
-                                        .filter(|order| {
-                                            let mut seen = vec![false; expected_len];
-                                            order.len() == expected_len
-                                                && order.iter().all(|&index| {
-                                                    index < expected_len
-                                                        && !std::mem::replace(
-                                                            &mut seen[index],
-                                                            true,
-                                                        )
-                                                })
-                                        });
-                                    match order {
-                                        Some(order) => {
-                                            if let Some(evidence) = regression_evidence.as_mut() {
-                                                evidence.final_slots = crate::search::regression_trace::final_slot_mapping(&evidence.retrieval, &order)
+        match documents {
+            Ok(documents) if !documents.is_empty() => {
+                if let Some(capture) = capture.as_deref_mut() {
+                    capture.prepared_documents = Some(documents.clone());
+                }
+                if let Some(evidence) = regression_evidence.as_mut() {
+                    evidence.prepared_documents = Some(
+                        documents
+                            .iter()
+                            .map(|d| crate::search::regression_trace::TextDigest::of(d))
+                            .collect(),
+                    );
+                }
+                let backend = match regression.as_ref() {
+                    Some(run) => build_rerank_backend_with_trace(
+                        provider,
+                        &endpoint,
+                        Some(run.trace.clone()),
+                    ),
+                    None => build_rerank_backend(provider, &endpoint),
+                };
+                match backend {
+                    Ok(backend) => {
+                        let call_started = Instant::now();
+                        match backend.rerank(query, &documents) {
+                            Ok(response) => {
+                                duration_ms = response.duration_ms;
+                                // The call layer re-proves the completeness
+                                // the adapter promises: the score set must be
+                                // exactly the window length and a valid
+                                // permutation of it. Only then is the window
+                                // replaced -- in one step, so a short,
+                                // duplicated or out-of-range set can never
+                                // drop a candidate or half-apply scores.
+                                let expected_len = window_result.hits.len();
+                                let order = (response.scores.len() == expected_len)
+                                    .then(|| {
+                                        crate::search::rerank::types::stable_rank_order(
+                                            &response.scores,
+                                        )
+                                        .ok()
+                                    })
+                                    .flatten()
+                                    .filter(|order| {
+                                        let mut seen = vec![false; expected_len];
+                                        order.len() == expected_len
+                                            && order.iter().all(|&index| {
+                                                index < expected_len
+                                                    && !std::mem::replace(&mut seen[index], true)
+                                            })
+                                    });
+                                match order {
+                                    Some(order) => {
+                                        if let Some(evidence) = regression_evidence.as_mut() {
+                                            evidence.final_slots = crate::search::regression_trace::final_slot_mapping(&evidence.retrieval, &order)
                                                     .map_err(regression_search_error)?;
-                                            }
-                                            let hits = std::mem::take(&mut window_result.hits);
-                                            let mut slots: Vec<
-                                                Option<crate::search::query::SearchHit>,
-                                            > = hits.into_iter().map(Some).collect();
-                                            let mut reordered = Vec::with_capacity(slots.len());
-                                            for &index in &order {
-                                                if let Some(mut hit) = slots[index].take() {
-                                                    hit.rerank_score = Some(response.scores[index]);
-                                                    reordered.push(hit);
-                                                }
-                                            }
-                                            debug_assert_eq!(reordered.len(), expected_len);
-                                            window_result.hits = reordered;
-                                            rerank_applied = true;
-                                            scored_count = expected_len;
-                                            http_requests = Some(response.http_requests);
-                                            model_requests = Some(1);
-                                            identity = response.identity;
                                         }
-                                        None => {
-                                            // Not a complete, valid permutation:
-                                            // every original hit and score is
-                                            // kept exactly as it was.
-                                            failure_reason = Some(
+                                        let hits = std::mem::take(&mut window_result.hits);
+                                        let mut slots: Vec<
+                                            Option<crate::search::query::SearchHit>,
+                                        > = hits.into_iter().map(Some).collect();
+                                        let mut reordered = Vec::with_capacity(slots.len());
+                                        for &index in &order {
+                                            if let Some(mut hit) = slots[index].take() {
+                                                hit.rerank_score = Some(response.scores[index]);
+                                                reordered.push(hit);
+                                            }
+                                        }
+                                        debug_assert_eq!(reordered.len(), expected_len);
+                                        window_result.hits = reordered;
+                                        rerank_applied = true;
+                                        scored_count = expected_len;
+                                        http_requests = Some(response.http_requests);
+                                        model_requests = Some(1);
+                                        identity = response.identity;
+                                    }
+                                    None => {
+                                        // Not a complete, valid permutation:
+                                        // every original hit and score is
+                                        // kept exactly as it was.
+                                        failure_reason = Some(
                                                 crate::search::rerank::types::RerankFailureReason::InvalidResponse,
                                             );
-                                            duration_ms = call_started.elapsed().as_millis() as u64;
-                                        }
+                                        duration_ms = call_started.elapsed().as_millis() as u64;
                                     }
                                 }
-                                Err(error) => {
-                                    // The call really ran and really waited, so
-                                    // its duration is the measured one -- not 0,
-                                    // which is reserved for "no call". Its
-                                    // request count is not provable, so it stays
-                                    // null rather than guessed 0.
-                                    duration_ms = call_started.elapsed().as_millis() as u64;
-                                    failure_reason = Some(error.reason);
-                                    http_status = error.http_status;
-                                }
+                            }
+                            Err(error) => {
+                                // The call really ran and really waited, so
+                                // its duration is the measured one -- not 0,
+                                // which is reserved for "no call". Its
+                                // request count is not provable, so it stays
+                                // null rather than guessed 0.
+                                duration_ms = call_started.elapsed().as_millis() as u64;
+                                failure_reason = Some(error.reason);
+                                http_status = error.http_status;
                             }
                         }
-                        Err(error) => {
-                            // Construction sent no request, so both counts are a
-                            // provable 0 and no time was spent calling.
-                            http_requests = Some(0);
-                            model_requests = Some(0);
-                            failure_reason = Some(error.reason);
-                            http_status = error.http_status;
-                        }
+                    }
+                    Err(error) => {
+                        // Construction sent no request, so both counts are a
+                        // provable 0 and no time was spent calling.
+                        http_requests = Some(0);
+                        model_requests = Some(0);
+                        failure_reason = Some(error.reason);
+                        http_status = error.http_status;
                     }
                 }
-                Ok(_) => {
-                    // Empty document list (a candidate could not be proven):
-                    // the whole window is returned unranked, no request made.
-                    http_requests = Some(0);
-                    model_requests = Some(0);
-                    failure_reason =
-                        Some(crate::search::rerank::types::RerankFailureReason::UnscoreableInput);
-                }
-                Err(error) => {
-                    // Document assembly failed before any request.
-                    http_requests = Some(0);
-                    model_requests = Some(0);
-                    failure_reason = Some(error.reason);
-                    http_status = error.http_status;
-                }
+            }
+            Ok(_) => {
+                // Empty document list (a candidate could not be proven):
+                // the whole window is returned unranked, no request made.
+                http_requests = Some(0);
+                model_requests = Some(0);
+                failure_reason =
+                    Some(crate::search::rerank::types::RerankFailureReason::UnscoreableInput);
+            }
+            Err(error) => {
+                // Document assembly failed before any request.
+                http_requests = Some(0);
+                model_requests = Some(0);
+                failure_reason = Some(error.reason);
+                http_status = error.http_status;
             }
         }
+    }
 
-        if let (Some(run), Some(evidence)) = (regression.as_ref(), regression_evidence.as_mut()) {
-            evidence.transport = run.trace.lock().map_err(regression_search_error)?.clone();
-            evidence.applied = rerank_applied;
-            evidence.failure_reason = failure_reason.map(|reason| reason.as_str().to_string());
-            evidence
-                .validate(
-                    &run.context,
-                    &run.binding,
-                    query,
-                    &window_result.hits,
-                    rerank_applied,
-                )
+    if let (Some(run), Some(evidence)) = (regression.as_ref(), regression_evidence.as_mut()) {
+        evidence.transport = run.trace.lock().map_err(regression_search_error)?.clone();
+        evidence.applied = rerank_applied;
+        evidence.failure_reason = failure_reason.map(|reason| reason.as_str().to_string());
+        evidence
+            .validate(
+                &run.context,
+                &run.binding,
+                query,
+                &window_result.hits,
+                rerank_applied,
+            )
+            .map_err(regression_search_error)?;
+        http_requests = Some(evidence.transport.requests.len());
+        model_requests = if evidence.transport.requests.is_empty() {
+            Some(0)
+        } else {
+            None
+        };
+        let evidence_path =
+            crate::search::regression_trace::persist_evidence(&run.context, evidence)
                 .map_err(regression_search_error)?;
-            http_requests = Some(evidence.transport.requests.len());
-            model_requests = if evidence.transport.requests.is_empty() {
-                Some(0)
+        if let Some(capture) = capture.as_deref_mut() {
+            capture.evidence = Some(evidence.clone());
+            capture.evidence_path = Some(evidence_path);
+            capture.result = Some(window_result.clone());
+            capture.identity = Some(identity.clone());
+        }
+        if evidence.failure_reason.is_some()
+            || (!evidence.final_slots.is_empty() && !evidence.applied)
+        {
+            return Err(regression_search_error("REGRESSION_RERANK_FAILED"));
+        }
+    }
+
+    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+    let policy = crate::search::rerank::window::WindowPolicy::default();
+    let expires_at_ms = now_ms.saturating_add(policy.ttl_ms as i64);
+
+    // Aggregate/explain facts for the window, computed over the *original*
+    // prefetch scope, before the display projection.
+    let aggregate_scope: &[crate::search::query::SearchHit] = rerank_prefetch_hits
+        .as_deref()
+        .unwrap_or(&window_result.hits);
+    let (frozen_total_matches, frozen_total_matches_exact) = if has_aggregation {
+        (aggregate_scope.len(), false)
+    } else {
+        (
+            window_result.total_count.unwrap_or(window_count),
+            window_result.total_count.is_some(),
+        )
+    };
+    let aggregates_value = if has_aggregation {
+        serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
+    } else {
+        None
+    };
+    let explanation_value = if explain {
+        serde_json::to_value(
+            QueryExplanation::analyze(query, &filters)
+                .with_wildcard_fallback(window_result.wildcard_fallback),
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let timed_out_now = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
+    // The first lookup's single index-state collection. The partial-index
+    // decision reads it directly, and the frozen display facts are built
+    // from this same value, so a first lookup reads the index state once --
+    // not once for `partial` and again for `--robot-meta`.
+    let state_meta_value = if regression.is_some() {
+        // Admission already proved the frozen domain is complete. Live
+        // health collectors use ordinary connections and cannot run here.
+        serde_json::json!({"index":{"partial":false},"regression_frozen_input":true})
+    } else {
+        state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true)
+    };
+    // Partial indexes and incomplete candidate scans both block a cursor,
+    // independent of the caller's `--robot-meta` projection.
+    let partial_now = window_result
+        .candidates
+        .as_ref()
+        .is_some_and(|candidates| candidates.incomplete)
+        || state_meta_value
+            .get("index")
+            .and_then(|index| index.get("partial"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+    // The robot-meta display facts, built from the one collection above and
+    // frozen into the window so a continuation renders exactly these. This
+    // still reads filesystem state (index existence, quarantine summary), so
+    // it runs *before* the final index check below to stay covered by it.
+    let frozen_display = if regression.is_some() {
+        FrozenDisplayState::default()
+    } else {
+        collect_display_state(
+            &data_dir,
+            &db_path,
+            if robot_meta {
+                Some(state_meta_value)
             } else {
                 None
-            };
-            let evidence_path = crate::search::regression_trace::persist_evidence(&run.context, evidence)
-                .map_err(regression_search_error)?;
-            if let Some(capture) = capture.as_deref_mut() {
-                capture.evidence = Some(evidence.clone()); capture.evidence_path = Some(evidence_path);
-                capture.result = Some(window_result.clone()); capture.identity = Some(identity.clone());
+            },
+        )
+    };
+
+    // The after-stamp is the last read of this lookup: every assembly,
+    // scoring and state collection above has finished by now, so a change
+    // made by any of them is caught rather than ordered behind the check.
+    let index_stamp_ok = rerank_stamp_before.as_ref().is_some_and(|before| {
+        match regression.as_ref() {
+            Some(run) => {
+                crate::search::rerank::window::capture_index_stamp_for_regression(&run.context)
             }
-            if evidence.failure_reason.is_some()
-                || (!evidence.final_slots.is_empty() && !evidence.applied)
-            {
-                return Err(regression_search_error("REGRESSION_RERANK_FAILED"));
-            }
+            None => crate::search::rerank::window::capture_index_stamp(&db_path),
         }
+        .map(|after| &after == before)
+        .unwrap_or(false)
+    });
+    if window_unavailable.is_none() {
+        if rerank_stamp_before.is_none() || !index_stamp_ok {
+            window_unavailable = Some("index_changed");
+        } else if timed_out_now {
+            window_unavailable = Some("search_timeout");
+        } else if partial_now {
+            window_unavailable = Some("partial_results");
+        }
+    }
 
-        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let policy = crate::search::rerank::window::WindowPolicy::default();
-        let expires_at_ms = now_ms.saturating_add(policy.ttl_ms as i64);
-
-        // Aggregate/explain facts for the window, computed over the *original*
-        // prefetch scope, before the display projection.
-        let aggregate_scope: &[crate::search::query::SearchHit] = rerank_prefetch_hits
-            .as_deref()
-            .unwrap_or(&window_result.hits);
-        let (frozen_total_matches, frozen_total_matches_exact) = if has_aggregation {
-            (aggregate_scope.len(), false)
-        } else {
-            (
-                window_result.total_count.unwrap_or(window_count),
-                window_result.total_count.is_some(),
-            )
+    // A window is only continuable when the first lookup is a clean, frozen
+    // success and the snapshot saves. Otherwise the current page is still
+    // delivered but carries no cursor and a short reason.
+    if window_unavailable.is_none() {
+        let mut snapshot = crate::search::rerank::window::WindowSnapshot {
+            created_at_ms: now_ms,
+            expires_at_ms,
+            request_binding: binding
+                .clone()
+                .expect("a continuable window always has a binding"),
+            index_stamp: rerank_stamp_before.clone().expect("checked continuable"),
+            resolved_filters: filters.clone(),
+            result: window_result.clone(),
+            aggregates: aggregates_value.clone(),
+            explanation: explanation_value.clone(),
+            retrieval_status: serde_json::json!({
+                "search_mode": search_mode_canonical_str(mode_meta.realized),
+                "requested_search_mode": search_mode_canonical_str(mode_meta.requested),
+                "mode_defaulted": mode_meta.defaulted,
+                "fallback_tier": mode_meta.fallback_tier,
+                "fallback_reason": mode_meta.fallback_reason.clone(),
+                "search_ms": search_ms,
+                "timed_out": timed_out_now,
+                "total_matches": frozen_total_matches,
+                "total_matches_exact": frozen_total_matches_exact,
+                "robot_meta": robot_meta,
+                "display": frozen_display.to_json(),
+            }),
+            rerank: crate::search::rerank::window::WindowRerankMeta {
+                requested_provider: provider,
+                requested_model: provider.request_model().to_string(),
+                identity: identity.clone(),
+                applied: rerank_applied,
+                failure_reason,
+                http_status,
+                scored_count,
+                http_requests,
+                model_requests,
+                duration_ms,
+            },
         };
-        let aggregates_value = if has_aggregation {
-            serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
-        } else {
-            None
-        };
-        let explanation_value = if explain {
-            serde_json::to_value(
-                QueryExplanation::analyze(query, &filters)
-                    .with_wildcard_fallback(window_result.wildcard_fallback),
-            )
-            .ok()
-        } else {
-            None
-        };
-
-        let timed_out_now = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
-        // The first lookup's single index-state collection. The partial-index
-        // decision reads it directly, and the frozen display facts are built
-        // from this same value, so a first lookup reads the index state once --
-        // not once for `partial` and again for `--robot-meta`.
-        let state_meta_value = if regression.is_some() {
-            // Admission already proved the frozen domain is complete. Live
-            // health collectors use ordinary connections and cannot run here.
-            serde_json::json!({"index":{"partial":false},"regression_frozen_input":true})
-        } else {
-            state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true)
-        };
-        // Partial indexes and incomplete candidate scans both block a cursor,
-        // independent of the caller's `--robot-meta` projection.
-        let partial_now = window_result
-            .candidates
-            .as_ref()
-            .is_some_and(|candidates| candidates.incomplete)
-            || state_meta_value
-                .get("index")
-                .and_then(|index| index.get("partial"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-
-        // The robot-meta display facts, built from the one collection above and
-        // frozen into the window so a continuation renders exactly these. This
-        // still reads filesystem state (index existence, quarantine summary), so
-        // it runs *before* the final index check below to stay covered by it.
-        let frozen_display = if regression.is_some() {
-            FrozenDisplayState::default()
-        } else {
-            collect_display_state(
-                &data_dir,
-                &db_path,
-                if robot_meta {
-                    Some(state_meta_value)
-                } else {
-                    None
-                },
-            )
-        };
-
-        // The after-stamp is the last read of this lookup: every assembly,
-        // scoring and state collection above has finished by now, so a change
-        // made by any of them is caught rather than ordered behind the check.
-        let index_stamp_ok = rerank_stamp_before.as_ref().is_some_and(|before| {
-            match regression.as_ref() {
-                Some(run) => {
-                    crate::search::rerank::window::capture_index_stamp_for_regression(&run.context)
+        if let Some(evidence) = regression_evidence {
+            snapshot.retrieval_status["regression"] =
+                serde_json::to_value(evidence).map_err(regression_search_error)?;
+        }
+        match crate::search::rerank::window::WindowStore::new(&data_dir, policy) {
+            Ok(store) => match store.save(&snapshot, now_ms) {
+                Ok(id) => {
+                    window_id = Some(id);
+                    window_snapshot = Some(snapshot);
+                    window_continuable = true;
                 }
-                None => crate::search::rerank::window::capture_index_stamp(&db_path),
-            }
-            .map(|after| &after == before)
-            .unwrap_or(false)
-        });
-        if window_unavailable.is_none() {
-            if rerank_stamp_before.is_none() || !index_stamp_ok {
-                window_unavailable = Some("index_changed");
-            } else if timed_out_now {
-                window_unavailable = Some("search_timeout");
-            } else if partial_now {
-                window_unavailable = Some("partial_results");
-            }
-        }
-
-        // A window is only continuable when the first lookup is a clean, frozen
-        // success and the snapshot saves. Otherwise the current page is still
-        // delivered but carries no cursor and a short reason.
-        if window_unavailable.is_none() {
-            let mut snapshot = crate::search::rerank::window::WindowSnapshot {
-                created_at_ms: now_ms,
-                expires_at_ms,
-                request_binding: binding
-                    .clone()
-                    .expect("a continuable window always has a binding"),
-                index_stamp: rerank_stamp_before.clone().expect("checked continuable"),
-                resolved_filters: filters.clone(),
-                result: window_result.clone(),
-                aggregates: aggregates_value.clone(),
-                explanation: explanation_value.clone(),
-                retrieval_status: serde_json::json!({
-                    "search_mode": search_mode_canonical_str(mode_meta.realized),
-                    "requested_search_mode": search_mode_canonical_str(mode_meta.requested),
-                    "mode_defaulted": mode_meta.defaulted,
-                    "fallback_tier": mode_meta.fallback_tier,
-                    "fallback_reason": mode_meta.fallback_reason.clone(),
-                    "search_ms": search_ms,
-                    "timed_out": timed_out_now,
-                    "total_matches": frozen_total_matches,
-                    "total_matches_exact": frozen_total_matches_exact,
-                    "robot_meta": robot_meta,
-                    "display": frozen_display.to_json(),
-                }),
-                rerank: crate::search::rerank::window::WindowRerankMeta {
-                    requested_provider: provider,
-                    requested_model: provider.request_model().to_string(),
-                    identity: identity.clone(),
-                    applied: rerank_applied,
-                    failure_reason,
-                    http_status,
-                    scored_count,
-                    http_requests,
-                    model_requests,
-                    duration_ms,
-                },
-            };
-            if let Some(evidence) = regression_evidence {
-                snapshot.retrieval_status["regression"] =
-                    serde_json::to_value(evidence).map_err(regression_search_error)?;
-            }
-            match crate::search::rerank::window::WindowStore::new(&data_dir, policy) {
-                Ok(store) => match store.save(&snapshot, now_ms) {
-                    Ok(id) => {
-                        window_id = Some(id);
-                        window_snapshot = Some(snapshot);
-                        window_continuable = true;
-                    }
-                    Err(_) => {
-                        window_unavailable = Some(
-                            crate::search::rerank::window::WindowError::CacheUnavailable.as_str(),
-                        );
-                    }
-                },
                 Err(_) => {
                     window_unavailable =
                         Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
                 }
+            },
+            Err(_) => {
+                window_unavailable =
+                    Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
             }
         }
+    }
 
-        if regression.is_some() && !window_continuable {
-            return Err(regression_search_error("REGRESSION_WINDOW_UNAVAILABLE"));
-        }
+    if regression.is_some() && !window_continuable {
+        return Err(regression_search_error("REGRESSION_WINDOW_UNAVAILABLE"));
+    }
 
-        let window_display_state = Some(frozen_display);
-        let window_meta = Some(RerankWindowMeta {
-            requested_provider: provider,
-            requested_model: provider.request_model(),
-            actual_provider: identity.actual_provider,
-            actual_model: identity.actual_model.clone(),
-            serving_provider: identity.serving_provider.clone(),
-            rrf_limit: limit_val,
-            window_count,
-            scored_count,
-            rerank_limit: rerank_k,
-            offset: 0,
-            applied: rerank_applied,
-            cache_reused: false,
-            first_http_requests: http_requests,
-            http_requests,
-            first_model_requests: model_requests,
-            model_requests,
-            first_duration_ms: duration_ms,
-            duration_ms,
-            failure_reason: failure_reason.map(|reason| reason.as_str()),
-            http_status,
-            pagination_unavailable_reason: window_unavailable.map(str::to_string),
-        });
+    let window_display_state = Some(frozen_display);
+    let window_meta = Some(RerankWindowMeta {
+        requested_provider: provider,
+        requested_model: provider.request_model(),
+        actual_provider: identity.actual_provider,
+        actual_model: identity.actual_model.clone(),
+        serving_provider: identity.serving_provider.clone(),
+        rrf_limit: limit_val,
+        window_count,
+        scored_count,
+        rerank_limit: rerank_k,
+        offset: 0,
+        applied: rerank_applied,
+        cache_reused: false,
+        first_http_requests: http_requests,
+        http_requests,
+        first_model_requests: model_requests,
+        model_requests,
+        first_duration_ms: duration_ms,
+        duration_ms,
+        failure_reason: failure_reason.map(|reason| reason.as_str()),
+        http_status,
+        pagination_unavailable_reason: window_unavailable.map(str::to_string),
+    });
 
-    Ok(ScoredSearchWindow { result: window_result, applied: rerank_applied,
-        snapshot: window_snapshot, window_id, continuable: window_continuable,
-        meta: window_meta, display_state: window_display_state, prefetch_hits: rerank_prefetch_hits })
+    Ok(ScoredSearchWindow {
+        result: window_result,
+        applied: rerank_applied,
+        snapshot: window_snapshot,
+        window_id,
+        continuable: window_continuable,
+        meta: window_meta,
+        display_state: window_display_state,
+        prefetch_hits: rerank_prefetch_hits,
+    })
 }
 
 /// P09: the shared search renderer -- everything from the display budget down.
