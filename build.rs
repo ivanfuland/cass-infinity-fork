@@ -248,6 +248,9 @@ fn emit_regression_source_metadata(manifest_dir: &Path) {
     let head = head.trim();
     if head.len() != 40 || !head.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) { return; }
     let Ok(status) = git_output(&root, &["status", "--porcelain", "--untracked-files=normal"]) else { return; };
+    // Refuse the pin if HEAD changed while the status was checked.
+    let Ok(head_after) = git_output(&root, &["rev-parse", "HEAD"]) else { return; };
+    if head_after.trim() != head { return; }
     println!("cargo:rustc-env=CASS_BUILD_SOURCE_COMMIT={head}");
     println!("cargo:rustc-env=CASS_BUILD_SOURCE_CLEAN={}", status.trim().is_empty());
 }
