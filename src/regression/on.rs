@@ -974,7 +974,18 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let mut readonly_directories = Vec::new();
         if fault == "os-readonly" {
+            let mut pending = sources.to_vec();
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(&directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    }
+                }
+                readonly_directories.push(directory);
+            }
             for root in &sources {
                 for rel in private_files(root).unwrap() {
                     std::fs::set_permissions(
@@ -983,7 +994,14 @@ mod tests {
                     )
                     .unwrap();
                 }
-                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            for directory in &readonly_directories {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555))
+                    .unwrap();
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
             }
         }
         if fault == "guard-only" {
@@ -1154,6 +1172,14 @@ mod tests {
             );
         }
         if fault == "os-readonly" {
+            for directory in &readonly_directories {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                    0o555
+                );
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
             for (root, expected) in sources.iter().zip(&before) {
                 let after: Vec<_> = private_files(root)
                     .unwrap()
