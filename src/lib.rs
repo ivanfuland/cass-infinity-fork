@@ -93755,7 +93755,9 @@ mod export_timestamp_tests {
 #[cfg(test)]
 mod legacy_source_filter_tests {
     use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::sources::provenance::SourceFilter;
+    use crate::sources::provenance::{Source, SourceKind};
     use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -93767,13 +93769,18 @@ mod legacy_source_filter_tests {
 
         with_frankensqlite_connection(&db_path, "legacy source test", |conn| {
             conn.execute("PRAGMA journal_mode = WAL;", &[])?;
-            conn.execute("CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);", &[])?;
+            conn.execute(
+                "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);",
+                &[],
+            )?;
             conn.execute(
                 "CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT, display_name TEXT);",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT, host_label TEXT);",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "CREATE TABLE conversations (
                     id INTEGER PRIMARY KEY,
@@ -93790,7 +93797,8 @@ mod legacy_source_filter_tests {
                     metadata_json TEXT,
                     metadata_bin BLOB
                 );",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "CREATE TABLE messages (
                     id INTEGER PRIMARY KEY,
@@ -93800,11 +93808,13 @@ mod legacy_source_filter_tests {
                     created_at INTEGER,
                     content TEXT
                 );",
-            &[])?;
+                &[],
+            )?;
             conn.execute("INSERT INTO agents(id, slug) VALUES (1, 'codex')", &[])?;
             conn.execute(
                 "INSERT INTO sources(id, kind, host_label) VALUES ('laptop', 'ssh', 'user@laptop')",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "INSERT INTO conversations(
                     id, agent_id, workspace_id, source_id, origin_host, title,
@@ -93815,7 +93825,8 @@ mod legacy_source_filter_tests {
                     '/legacy/shared/session.jsonl', 1700000000000, NULL, 10,
                     'legacy-local', '{}', NULL
                 )",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "INSERT INTO conversations(
                     id, agent_id, workspace_id, source_id, origin_host, title,
@@ -93826,15 +93837,18 @@ mod legacy_source_filter_tests {
                     '/legacy/shared/session.jsonl', 1700000100000, NULL, 10,
                     'remote-shared', '{}', NULL
                 )",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
                  VALUES (1, 1, 0, 'user', 1700000000100, 'local body')",
-            &[])?;
+                &[],
+            )?;
             conn.execute(
                 "INSERT INTO messages(id, conversation_id, idx, role, created_at, content)
                  VALUES (2, 2, 0, 'user', 1700000100100, 'remote body')",
-            &[])?;
+                &[],
+            )?;
             Ok(())
         })
         .expect("create legacy db");
@@ -93842,9 +93856,84 @@ mod legacy_source_filter_tests {
         (tmp, db_path, shared_path)
     }
 
+    fn make_current_source_db() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("agent_search.db");
+        let shared_path = PathBuf::from("/current/shared/session.jsonl");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&db_path)
+            .expect("create current schema db");
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".to_string(),
+                name: "Codex".to_string(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure agent");
+        storage
+            .upsert_source(&Source {
+                id: "laptop".to_string(),
+                kind: SourceKind::Ssh,
+                host_label: Some("user@laptop".to_string()),
+                machine_id: None,
+                platform: None,
+                config_json: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .expect("ensure remote source");
+        for (source_id, title, timestamp, origin_host) in [
+            ("local", "Local Session", 1_700_000_000_000_i64, None),
+            (
+                "laptop",
+                "Remote Session",
+                1_700_000_100_000_i64,
+                Some("user@laptop"),
+            ),
+        ] {
+            storage
+                .insert_conversation_tree(
+                    agent_id,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "codex".to_string(),
+                        workspace: None,
+                        external_id: Some(format!("current-{source_id}")),
+                        title: Some(title.to_string()),
+                        source_path: shared_path.clone(),
+                        started_at: Some(timestamp),
+                        ended_at: None,
+                        approx_tokens: Some(10),
+                        metadata_json: serde_json::json!({}),
+                        source_id: source_id.to_string(),
+                        origin_host: origin_host.map(str::to_string),
+                        messages: vec![Message {
+                            excluded: None,
+                            id: None,
+                            idx: 0,
+                            role: MessageRole::User,
+                            author: None,
+                            created_at: Some(timestamp + 100),
+                            content: format!("{source_id} body"),
+                            extra_json: serde_json::json!({}),
+                            snippets: Vec::new(),
+                        }],
+                    },
+                )
+                .expect("insert source conversation");
+        }
+        storage.close().expect("close current schema writer");
+        (tmp, db_path, shared_path)
+    }
+
     fn open_legacy_local_db_for_update(db_path: &Path) -> FrankenConnection {
-        FrankenConnection::open_writable(std::path::Path::new(&(db_path.to_string_lossy().to_string())), crate::storage::api::Profile::Production)
-            .expect("open writable legacy source test db")
+        FrankenConnection::open_writable(
+            std::path::Path::new(&(db_path.to_string_lossy().to_string())),
+            crate::storage::api::Profile::Production,
+        )
+        .expect("open writable legacy source test db")
     }
 
     #[test]
@@ -93915,8 +94004,11 @@ mod legacy_source_filter_tests {
     fn source_filter_helpers_match_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
-            .expect("blank remote source_id");
+        conn.execute(
+            "UPDATE conversations SET source_id = '   ' WHERE id = 2",
+            &[],
+        )
+        .expect("blank remote source_id");
 
         let (where_sql, param) =
             source_filter_where_clause(Some(&SourceFilter::SourceId("user@laptop".to_string())));
@@ -93942,8 +94034,11 @@ mod legacy_source_filter_tests {
     fn source_filter_helpers_match_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
-            .expect("update legacy local source_id");
+        conn.execute(
+            "UPDATE conversations SET source_id = '  local  ' WHERE id = 1",
+            &[],
+        )
+        .expect("update legacy local source_id");
 
         let (where_sql, param) =
             source_filter_where_clause(Some(&SourceFilter::SourceId("local".to_string())));
@@ -93968,7 +94063,8 @@ mod legacy_source_filter_tests {
     #[test]
     fn find_context_source_conversation_treats_null_source_as_local() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        // Exercise legacy SQL compatibility only; production rejects this schema.
+        let conn = open_legacy_local_db_for_update(&db_path);
 
         let row =
             find_context_source_conversation(&conn, &shared_path.to_string_lossy(), Some("local"))
@@ -93976,12 +94072,12 @@ mod legacy_source_filter_tests {
         assert_eq!(row.4, "Local Session");
         assert_eq!(row.6, "local");
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close legacy SQL test db");
     }
 
     #[test]
     fn find_context_source_conversation_normalizes_trimmed_source_id() {
-        let (_tmp, db_path, shared_path) = make_legacy_local_db();
+        let (_tmp, db_path, shared_path) = make_current_source_db();
         let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
 
         let row = find_context_source_conversation(
@@ -94000,8 +94096,11 @@ mod legacy_source_filter_tests {
     fn find_context_source_conversation_matches_blank_remote_source_id_via_origin_host() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
-            .expect("blank remote source_id");
+        conn.execute(
+            "UPDATE conversations SET source_id = '   ' WHERE id = 2",
+            &[],
+        )
+        .expect("blank remote source_id");
 
         let row = find_context_source_conversation(
             &conn,
@@ -94019,8 +94118,11 @@ mod legacy_source_filter_tests {
     fn find_context_source_conversation_matches_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
-            .expect("update legacy local source_id");
+        conn.execute(
+            "UPDATE conversations SET source_id = '  local  ' WHERE id = 1",
+            &[],
+        )
+        .expect("update legacy local source_id");
 
         let row =
             find_context_source_conversation(&conn, &shared_path.to_string_lossy(), Some("local"))
@@ -94040,7 +94142,8 @@ mod legacy_source_filter_tests {
     #[test]
     fn context_and_stats_queries_surface_null_source_id_as_local() {
         let (_tmp, db_path, shared_path) = make_legacy_local_db();
-        let conn = open_franken_analytics_db(&None, Some(&db_path)).expect("open analytics db");
+        // Exercise legacy SQL compatibility only; production rejects this schema.
+        let conn = open_legacy_local_db_for_update(&db_path);
 
         let selected =
             find_context_source_conversation(&conn, &shared_path.to_string_lossy(), None)
@@ -94086,15 +94189,134 @@ mod legacy_source_filter_tests {
             .expect("query timeline rows");
         assert!(timeline_rows.iter().any(|source_id| source_id == "local"));
 
-        close_franken_cli_read_db(conn, &db_path, "legacy source test").expect("close db");
+        conn.close().expect("close legacy SQL test db");
+    }
+
+    #[test]
+    fn current_schema_context_and_stats_keep_local_and_remote_distinct() {
+        let (_tmp, db_path, shared_path) = make_current_source_db();
+        let conn =
+            open_franken_analytics_db(&None, Some(&db_path)).expect("open current analytics db");
+        assert_eq!(
+            crate::storage::schema::read_user_version(&conn).expect("read schema version"),
+            crate::storage::schema::CURRENT_SCHEMA_VERSION,
+        );
+        for (filter, expected_title, expected_source) in [
+            (None, "Local Session", "local"),
+            (Some("local"), "Local Session", "local"),
+            (Some("laptop"), "Remote Session", "laptop"),
+        ] {
+            let row =
+                find_context_source_conversation(&conn, &shared_path.to_string_lossy(), filter)
+                    .expect("resolve current source");
+            assert_eq!(row.4, expected_title);
+            assert_eq!(row.6, expected_source);
+        }
+
+        let normalized_source_sql = normalized_source_id_sql_expr("c.source_id");
+        let source_rows: Vec<(String, i64)> = conn
+            .query_all_map(
+                &format!(
+                    "SELECT {normalized_source_sql} AS source_id, COUNT(DISTINCT c.id)
+                      FROM conversations c GROUP BY {normalized_source_sql} ORDER BY source_id"
+                ),
+                &[],
+                |r: &FrankenRow| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+            )
+            .expect("query current source counts");
+        assert_eq!(
+            source_rows,
+            vec![("laptop".to_string(), 1), ("local".to_string(), 1)]
+        );
+        for filter in [SourceFilter::Local, SourceFilter::Remote] {
+            let (where_sql, param) = source_filter_where_clause(Some(&filter));
+            assert!(param.is_none());
+            let count: i64 = conn
+                .query_row_map(
+                    &stats_message_count_sql(&where_sql),
+                    &[],
+                    |r: &FrankenRow| r.get_typed(0),
+                )
+                .expect("count current source messages");
+            assert_eq!(count, 1);
+        }
+        let timeline_rows: Vec<String> = conn
+            .query_all_map(
+                "SELECT COALESCE(c.source_id, 'local') FROM conversations c
+             JOIN agents a ON c.agent_id = a.id
+             LEFT JOIN messages m ON m.conversation_id = c.id
+             WHERE c.started_at >= ?1 AND c.started_at <= ?2
+             GROUP BY c.id ORDER BY c.started_at DESC",
+                &[1_699_999_999_000_i64.into(), 1_700_000_200_000_i64.into()],
+                |r: &FrankenRow| r.get_typed(0),
+            )
+            .expect("query current timeline");
+        assert_eq!(
+            timeline_rows,
+            vec!["laptop".to_string(), "local".to_string()]
+        );
+        close_franken_cli_read_db(conn, &db_path, "current source test").expect("close db");
+    }
+
+    #[test]
+    fn analytics_readonly_rejects_legacy_schema_zero() {
+        let (_tmp, db_path, _shared_path) = make_legacy_local_db();
+        let conn = open_legacy_local_db_for_update(&db_path);
+        assert_eq!(
+            crate::storage::schema::read_user_version(&conn).expect("read legacy version"),
+            0
+        );
+        let count: i64 = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations",
+                &[],
+                |r: &FrankenRow| r.get_typed(0),
+            )
+            .expect("count legacy conversations");
+        assert_eq!(count, 2);
+        conn.close().expect("close legacy SQL test db");
+
+        let err = match open_franken_analytics_db(&None, Some(&db_path)) {
+            Err(err) => err,
+            Ok(conn) => {
+                conn.close().expect("close unexpectedly accepted legacy db");
+                panic!("production analytics must reject schema zero");
+            }
+        };
+        assert_eq!(err.code, 9);
+        assert_eq!(err.kind, CliErrorKind::DbOpen.kind_str());
+        assert!(!err.retryable);
+        assert!(err.message.contains("schema version 0"), "{}", err.message);
+        assert!(
+            err.message.contains(&format!(
+                "predates version {}'s",
+                crate::storage::schema::CURRENT_SCHEMA_VERSION
+            )),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("rebuild-only shape"),
+            "{}",
+            err.message
+        );
+        let conn = open_legacy_local_db_for_update(&db_path);
+        assert_eq!(
+            crate::storage::schema::read_user_version(&conn).expect("reread legacy version"),
+            0
+        );
+        conn.close().expect("close legacy SQL test db");
     }
 
     #[test]
     fn stats_source_grouping_uses_origin_host_when_remote_source_id_blank() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '   ' WHERE id = 2", &[])
-            .expect("blank remote source_id");
+        conn.execute(
+            "UPDATE conversations SET source_id = '   ' WHERE id = 2",
+            &[],
+        )
+        .expect("blank remote source_id");
 
         let normalized_source_sql =
             normalized_source_identity_sql_expr("c.source_id", "c.origin_host");
@@ -94124,8 +94346,11 @@ mod legacy_source_filter_tests {
     fn stats_source_grouping_normalizes_trimmed_local_source_id_in_db() {
         let (_tmp, db_path, _shared_path) = make_legacy_local_db();
         let conn = open_legacy_local_db_for_update(&db_path);
-        conn.execute("UPDATE conversations SET source_id = '  local  ' WHERE id = 1", &[])
-            .expect("update legacy local source_id");
+        conn.execute(
+            "UPDATE conversations SET source_id = '  local  ' WHERE id = 1",
+            &[],
+        )
+        .expect("update legacy local source_id");
 
         let normalized_source_sql = normalized_source_id_sql_expr("c.source_id");
         let source_sql = format!(
