@@ -2560,6 +2560,100 @@ fn validate_fixed_evidence(
     Ok(())
 }
 
+// This is the submission-only CPU slice of WindowEvidence::validate. It does
+// not call the context/DB-dependent validation or construct a verified Run.
+fn validate_full_submission(
+    transport: &regression_trace::RequestTrace,
+    query: &regression_trace::TextDigest,
+    prepared: Option<&[regression_trace::TextDigest]>,
+    retrieval_count: usize,
+    rerank_requested: bool,
+    applied: bool,
+) -> Result<()> {
+    require(transport.model_requests.is_none(), "LABEL_RUN_INVALID")?;
+    require(
+        applied == (rerank_requested && retrieval_count > 0),
+        "LABEL_RUN_INVALID",
+    )?;
+    let posts: Vec<_> = transport
+        .requests
+        .iter()
+        .filter(|r| r.method == "POST")
+        .collect();
+    require(
+        posts.len() <= 1 && (!applied || posts.len() == 1),
+        "LABEL_RUN_INVALID",
+    )?;
+    if !rerank_requested || retrieval_count == 0 {
+        require(transport.requests.is_empty(), "LABEL_RUN_INVALID")?;
+        return Ok(());
+    }
+    if let Some(post) = posts.first() {
+        let submitted = post.documents.as_ref().context("LABEL_RUN_INVALID")?;
+        let prepared = prepared.context("LABEL_RUN_INVALID")?;
+        require(
+            post.query.as_ref() == Some(query)
+                && submitted.len() == retrieval_count
+                && prepared.len() == submitted.len()
+                && submitted
+                    .iter()
+                    .zip(prepared)
+                    .enumerate()
+                    .all(|(i, (doc, expected))| doc.input_slot == i && &doc.text == expected),
+            "LABEL_RUN_INVALID",
+        )?;
+        require(
+            post.state == "http-response-observed"
+                && post.http_status.is_some_and(|s| (200..300).contains(&s))
+                && post
+                    .json_body_sha256
+                    .as_deref()
+                    .is_some_and(|s| is_hex(s, 64)),
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    for request in &transport.requests {
+        require(
+            request.state
+                == if request.http_status.is_some() {
+                    "http-response-observed"
+                } else {
+                    "attempted-delivery-unknown"
+                },
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_full_http_counts(
+    transport: &regression_trace::RequestTrace,
+    counts: &[CountWire],
+) -> Result<()> {
+    let mut matches = counts.iter().filter(|c| c.scope == "rerank-http-v1");
+    let count = matches.next().context("LABEL_RUN_INVALID")?;
+    require(matches.next().is_none(), "LABEL_RUN_INVALID")?;
+    let responses = transport
+        .requests
+        .iter()
+        .filter(|r| r.http_status.is_some())
+        .count();
+    let absent = transport.requests.is_empty();
+    require(
+        count.http_attempts == Some(transport.requests.len() as u64)
+            && count.http_response_observed == Some(responses as u64)
+            && count.delivery_unknown == Some((transport.requests.len() - responses) as u64)
+            && count.model_executions == if absent { Some(0) } else { None }
+            && count.basis
+                == if absent {
+                    "not-called"
+                } else {
+                    "observed-client"
+                },
+        "LABEL_RUN_INVALID",
+    )
+}
+
 fn validate_question_evidence(
     root: &Path,
     output: &OutputWire,
@@ -2582,6 +2676,10 @@ fn validate_question_evidence(
     ] {
         require(value.get(field).is_some(), "LABEL_RUN_INVALID")?;
     }
+    // Reuse the closed transport DTO to reject omitted nullable fields and
+    // extras before the existing RequestTrace decoder defaults Options.
+    let _: FixedTransportWire =
+        serde_json::from_value(value["transport"].clone()).context("LABEL_RUN_INVALID")?;
     let evidence: WindowEvidence = serde_json::from_value(value).context("LABEL_RUN_INVALID")?;
     require(
         evidence.schema == "cass.regression-window-trace.v2"
@@ -2597,6 +2695,15 @@ fn validate_question_evidence(
             && evidence.snippets.len() == question.actual_n,
         "LABEL_RUN_INVALID",
     )?;
+    validate_full_submission(
+        &evidence.transport,
+        &evidence.query,
+        evidence.prepared_documents.as_deref(),
+        evidence.retrieval.len(),
+        evidence.rerank_requested,
+        evidence.applied,
+    )?;
+    validate_full_http_counts(&evidence.transport, &question.cost.http)?;
     for (rank, slot) in question.slots.iter().enumerate() {
         let frozen = evidence
             .final_slots
@@ -2697,6 +2804,141 @@ fn validate_question_evidence(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn full_submission_fixture(
+        count: usize,
+    ) -> (
+        regression_trace::RequestTrace,
+        regression_trace::TextDigest,
+        Vec<regression_trace::TextDigest>,
+    ) {
+        let query = "Synthetic full query";
+        let documents: Vec<_> = (0..count)
+            .map(|i| format!("Synthetic submitted document {i}"))
+            .collect();
+        let prepared = documents
+            .iter()
+            .map(|s| regression_trace::TextDigest::of(s))
+            .collect();
+        let mut trace = regression_trace::RequestTrace::default();
+        let id = trace
+            .begin(
+                "POST",
+                "/synthetic-rerank",
+                Some(&json!({"query":query,"documents":documents})),
+            )
+            .unwrap();
+        trace.response(id, 200).unwrap();
+        (trace, regression_trace::TextDigest::of(query), prepared)
+    }
+
+    #[test]
+    fn full_submission_requires_actual_post_query_documents_indices_and_response() {
+        let (valid, query, prepared) = full_submission_fixture(7);
+        // Seven real slots remain a legal SHORT sample; no requested-N padding.
+        assert!(validate_full_submission(&valid, &query, Some(&prepared), 7, true, true).is_ok());
+        for fault in [
+            "no-post",
+            "duplicate-post",
+            "query",
+            "digest",
+            "input-slot",
+            "short-docs",
+            "non-2xx",
+            "no-response",
+            "unobserved-state",
+            "model-count",
+        ] {
+            let mut trace = valid.clone();
+            match fault {
+                "no-post" => trace.requests.clear(),
+                "duplicate-post" => trace.requests.push(trace.requests[0].clone()),
+                "query" => {
+                    trace.requests[0].query = Some(regression_trace::TextDigest::of(
+                        "Synthetic different query",
+                    ))
+                }
+                "digest" => {
+                    trace.requests[0].documents.as_mut().unwrap()[0].text =
+                        regression_trace::TextDigest::of("Synthetic changed document")
+                }
+                "input-slot" => trace.requests[0].documents.as_mut().unwrap()[1].input_slot = 0,
+                "short-docs" => {
+                    trace.requests[0].documents.as_mut().unwrap().pop();
+                }
+                "non-2xx" => trace.requests[0].http_status = Some(500),
+                "no-response" => {
+                    trace.requests[0].http_status = None;
+                    trace.requests[0].state = "attempted-delivery-unknown".into();
+                }
+                "unobserved-state" => trace.requests[0].state = "attempted-delivery-unknown".into(),
+                "model-count" => trace.model_requests = Some(0),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_full_submission(&trace, &query, Some(&prepared), 7, true, true).is_err(),
+                "{fault}"
+            );
+        }
+        assert!(validate_full_submission(&valid, &query, None, 7, true, true).is_err());
+        assert!(
+            validate_full_submission(&valid, &query, Some(&prepared[..6]), 7, true, true).is_err()
+        );
+    }
+
+    #[test]
+    fn full_off_and_empty_on_keep_zero_requests_and_unknown_transport_model_count() {
+        let empty = regression_trace::RequestTrace::default();
+        let query = regression_trace::TextDigest::of("Synthetic empty query");
+        assert!(validate_full_submission(&empty, &query, None, 7, false, false).is_ok());
+        assert!(validate_full_submission(&empty, &query, None, 0, true, false).is_ok());
+        let mut requested = empty;
+        requested.begin("GET", "/synthetic-models", None).unwrap();
+        assert!(validate_full_submission(&requested, &query, None, 7, false, false).is_err());
+        assert!(validate_full_submission(&requested, &query, None, 0, true, false).is_err());
+        assert!(serde_json::from_value::<FixedTransportWire>(json!({"requests":[]})).is_err());
+        assert!(
+            serde_json::from_value::<FixedTransportWire>(
+                json!({"requests":[],"model_requests":null})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn full_http_costs_close_over_actual_attempt_response_and_unknown_counts() {
+        let (trace, _query, _prepared) = full_submission_fixture(2);
+        let good = json!({"scope":"rerank-http-v1","http_attempts":1,"http_response_observed":1,"delivery_unknown":0,"model_executions":null,"basis":"observed-client"});
+        let counts = vec![serde_json::from_value::<CountWire>(good.clone()).unwrap()];
+        assert!(validate_full_http_counts(&trace, &counts).is_ok());
+        for field in [
+            "http_attempts",
+            "http_response_observed",
+            "delivery_unknown",
+            "model_executions",
+        ] {
+            let mut bad = good.clone();
+            bad[field] = json!(42);
+            assert!(
+                validate_full_http_counts(&trace, &[serde_json::from_value(bad).unwrap()]).is_err()
+            );
+        }
+        assert!(validate_full_http_counts(&trace, &[]).is_err());
+        assert!(
+            validate_full_http_counts(
+                &trace,
+                &[
+                    serde_json::from_value(good.clone()).unwrap(),
+                    serde_json::from_value(good).unwrap()
+                ]
+            )
+            .is_err()
+        );
+        let zero: CountWire = serde_json::from_value(json!({"scope":"rerank-http-v1","http_attempts":0,"http_response_observed":0,"delivery_unknown":0,"model_executions":0,"basis":"not-called"})).unwrap();
+        assert!(
+            validate_full_http_counts(&regression_trace::RequestTrace::default(), &[zero]).is_ok()
+        );
+    }
 
     // Each test owns all files. No env/static/global counters or shared roots.
     #[cfg(unix)]
