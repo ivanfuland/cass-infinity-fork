@@ -68,6 +68,7 @@ mod tests {
             .join("tests/fixtures/models/xenova-paraphrase-minilm-l3-v2-int8")
     }
 
+    #[cfg(feature = "semantic")]
     fn load_fastembed_fixture() -> FastEmbedder {
         FastEmbedder::load_from_dir(&fastembed_fixture_dir())
             .expect("fastembed fixture should load")
@@ -82,6 +83,7 @@ mod tests {
         assert!(!embedder.is_semantic());
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn test_embedder_trait_semantic() {
         let embedder = load_fastembed_fixture();
@@ -90,6 +92,7 @@ mod tests {
         assert!(embedder.is_semantic());
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn test_embedder_batch() {
         let embedder = load_fastembed_fixture();
@@ -102,6 +105,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn test_embedder_empty_input_error() {
         let embedder = load_fastembed_fixture();
@@ -109,6 +113,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(feature = "semantic")]
     #[test]
     fn test_embedder_info() {
         let embedder = load_fastembed_fixture();
@@ -124,6 +129,63 @@ mod tests {
                 "display {display:?} should contain {expected:?}"
             );
         }
+    }
+
+    #[cfg(not(feature = "semantic"))]
+    #[test]
+    fn test_fastembed_unavailable_without_semantic() {
+        let error = match FastEmbedder::load_from_dir(&fastembed_fixture_dir()) {
+            Ok(_) => panic!("ORT-free builds must not load an ONNX model"),
+            Err(error) => error,
+        };
+        match error {
+            EmbedderError::EmbedderUnavailable { model, reason } => {
+                assert_eq!(model, FastEmbedder::embedder_id_static());
+                assert!(reason.contains("without the `semantic` feature"));
+            }
+            other => panic!("expected disabled semantic support, got {other:?}"),
+        }
+    }
+
+    // These exercise the real lexical implementation, not an ML model.
+    #[test]
+    fn test_hash_embedder_trait_batch_preserves_order() {
+        let embedder = HashEmbedder::new(256);
+        let texts = ["hello", "world", "test"];
+        let embeddings = embedder.embed_batch_sync(&texts).unwrap();
+        assert_eq!(embeddings.len(), 3);
+        for (embedding, text) in embeddings.iter().zip(texts) {
+            assert_eq!(embedding.len(), 256);
+            assert_eq!(*embedding, embedder.embed_sync(text).unwrap());
+        }
+        assert_ne!(embeddings[0], embeddings[1]);
+    }
+
+    #[test]
+    fn test_hash_embedder_trait_empty_input_error() {
+        let error = HashEmbedder::new(256).embed_sync("").unwrap_err();
+        match error {
+            EmbedderError::InvalidConfig {
+                field,
+                value,
+                reason,
+            } => {
+                assert_eq!(field, "input_text");
+                assert_eq!(value, "(empty)");
+                assert_eq!(reason, "empty text");
+            }
+            other => panic!("expected empty input error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_hash_embedder_info_is_lexical() {
+        let embedder = HashEmbedder::new(256);
+        let info = EmbedderInfo::from_embedder(&embedder);
+        assert_eq!(info.id, "fnv1a-256");
+        assert_eq!(info.dimension, 256);
+        assert!(!info.is_semantic);
+        assert_eq!(info.to_string(), "fnv1a-256 (lexical, 256 dims)");
     }
 
     #[test]
