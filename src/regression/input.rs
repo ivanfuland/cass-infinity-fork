@@ -37,7 +37,7 @@ fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn safe_relative(value: &str) -> Result<()> {
+pub(super) fn safe_relative(value: &str) -> Result<()> {
     require(
         !value.is_empty()
             && !value.contains('\\')
@@ -75,8 +75,16 @@ fn guarded_path(path: &Path) -> Result<PathBuf> {
     absolute.canonicalize().context("INPUT_PATH_UNAVAILABLE")
 }
 
-/// Reads one descriptor, verifies its identity, and hashes exactly those bytes.
-fn read_file(path: &Path, bundle_file: bool) -> Result<Vec<u8>> {
+struct FileRead {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    before: fs::Metadata,
+    opened: fs::Metadata,
+    after: fs::Metadata,
+}
+
+/// The only descriptor reader. Legacy callers retain their original policy.
+fn read_file_with_evidence(path: &Path, bundle_file: bool) -> Result<FileRead> {
     let path = guarded_path(path)?;
     let before = fs::symlink_metadata(&path).context("INPUT_FILE_UNAVAILABLE")?;
     require(before.is_file(), "INPUT_FILE_NOT_REGULAR")?;
@@ -126,7 +134,17 @@ fn read_file(path: &Path, bundle_file: bool) -> Result<Vec<u8>> {
         "INPUT_FILE_CHANGED",
     )?;
     guarded_path(&path)?;
-    Ok(bytes)
+    Ok(FileRead {
+        path,
+        bytes,
+        before,
+        opened,
+        after,
+    })
+}
+
+fn read_file(path: &Path, bundle_file: bool) -> Result<Vec<u8>> {
+    Ok(read_file_with_evidence(path, bundle_file)?.bytes)
 }
 
 fn pinned(path: &Path, sha: &str, code: &'static str, bundle_file: bool) -> Result<Vec<u8>> {
@@ -200,6 +218,89 @@ fn strict_json(bytes: &[u8]) -> Result<Value> {
     serde_json::from_slice::<StrictValue>(bytes)
         .map(|v| v.0)
         .map_err(|_| anyhow::anyhow!("INPUT_JSON_INVALID"))
+}
+
+/// An observed private file, not a request or a caller-constructible proof.
+pub(super) struct WirePinned {
+    bytes: Vec<u8>,
+    value: Value,
+    observed_sha256: String,
+    _identity: (fs::Metadata, fs::Metadata, fs::Metadata),
+}
+
+impl WirePinned {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(super) fn value(&self) -> &Value {
+        &self.value
+    }
+    pub(super) fn observed_file_sha256(&self) -> &str {
+        &self.observed_sha256
+    }
+}
+
+fn private_json(path: &Path, expected: Option<(&str, &'static str)>) -> Result<WirePinned> {
+    let parent = path.parent().context("LABEL_RUN_INVALID")?;
+    validate_private_run_root(parent)?;
+    if let Some((sha, code)) = expected {
+        require(valid_digest(sha), code)?;
+    }
+    let observed = read_file_with_evidence(path, false)?;
+    validate_private_run_root(observed.path.parent().context("LABEL_RUN_INVALID")?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = fs::metadata("/proc/self")?.uid();
+        let identity = |m: &fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.uid(),
+                m.mode(),
+                m.nlink(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        require(
+            [&observed.before, &observed.opened, &observed.after]
+                .iter()
+                .all(|m| m.is_file() && m.uid() == owner && m.mode() & 0o777 == 0o600),
+            "LABEL_RUN_INVALID",
+        )?;
+        require(
+            identity(&observed.before) == identity(&observed.opened)
+                && identity(&observed.opened) == identity(&observed.after),
+            "INPUT_FILE_CHANGED",
+        )?;
+    }
+    let observed_sha256 = digest(&observed.bytes);
+    if let Some((sha, code)) = expected {
+        require(observed_sha256 == sha, code)?;
+    }
+    let value = strict_json(&observed.bytes)?;
+    Ok(WirePinned {
+        bytes: observed.bytes,
+        value,
+        observed_sha256,
+        _identity: (observed.before, observed.opened, observed.after),
+    })
+}
+
+pub(super) fn read_private_pinned_json(
+    path: &Path,
+    expected_sha256: &str,
+    mismatch_code: &'static str,
+) -> Result<WirePinned> {
+    private_json(path, Some((expected_sha256, mismatch_code)))
+}
+
+pub(super) fn read_private_json(path: &Path) -> Result<WirePinned> {
+    private_json(path, None)
 }
 
 fn json_lines(bytes: &[u8]) -> Result<Vec<Value>> {
@@ -2125,5 +2226,52 @@ mod tests {
             error_code(&read_pinned_json(&duplicate, &digest(bytes)).unwrap_err()),
             "INPUT_JSON_INVALID"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_json_proof_retains_actual_bytes_sha_and_descriptor_identity() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("synthetic-private.json");
+        let bytes = b"{\"value\":18446744073709551615}\n";
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let sha = digest(bytes);
+        let wire = read_private_pinned_json(&path, &sha, "LABEL_FILE_IDENTITY_MISMATCH").unwrap();
+        assert_eq!(wire.bytes(), bytes);
+        assert_eq!(wire.observed_file_sha256(), sha);
+        assert_eq!(wire.value()["value"].as_u64(), Some(u64::MAX));
+        assert_eq!(wire._identity.0.ino(), wire._identity.1.ino());
+        assert_eq!(wire._identity.1.ino(), wire._identity.2.ino());
+        assert_eq!(wire._identity.1.mode() & 0o777, 0o600);
+        assert!(
+            read_private_pinned_json(&path, &digest(b"wrong"), "LABEL_FILE_IDENTITY_MISMATCH")
+                .is_err()
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_private_json(&path).is_err());
+        // The new private requirement does not change legacy external reads.
+        assert!(read_pinned_json(&path, &sha).is_ok());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_json_keeps_strict_and_symlink_guards_without_relaxing_bundle_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("synthetic-private.json");
+        fs::write(&path, b"{\"value\":1,\"v\\u0061lue\":2}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_private_json(&path).is_err());
+        let link = root.path().join("synthetic-link.json");
+        symlink(&path, &link).unwrap();
+        assert!(read_private_json(&link).is_err());
+        fs::write(&path, b"{\"value\":1}").unwrap();
+        fs::hard_link(&path, root.path().join("synthetic-hardlink.json")).unwrap();
+        assert!(read_file(&path, true).is_err());
+        assert!(read_private_json(&path).is_ok());
     }
 }
