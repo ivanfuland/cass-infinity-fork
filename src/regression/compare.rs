@@ -1770,6 +1770,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     fn native_archive(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir(to)?;
@@ -1846,67 +1847,6 @@ mod tests {
                 serde_json::json!(labels::digest(&std::fs::read(&source_manifest)?));
             std::fs::write(&receipt, serde_json::to_vec(&receipt_value)?)?;
             if count == 12 {
-                let source_root = profile.join("alternate-source-input");
-                std::fs::create_dir(&source_root)?;
-                let alternate_manifest = source_root.join("source-manifest.txt");
-                std::fs::write(
-                    &alternate_manifest,
-                    b"alternate owned synthetic source manifest\n",
-                )?;
-                let mut alternate_receipt: Value =
-                    serde_json::from_slice(&std::fs::read(&receipt)?)?;
-                alternate_receipt["source_manifest_sha256"] =
-                    serde_json::json!(labels::digest(&std::fs::read(&alternate_manifest)?));
-                let alternate_receipt_path = source_root.join("receipt.json");
-                std::fs::write(
-                    &alternate_receipt_path,
-                    serde_json::to_vec(&alternate_receipt)?,
-                )?;
-                let alternate_binding = profile.join("alternate-binding");
-                std::fs::create_dir(&alternate_binding)?;
-                let RegressionCommand::FullSearch { database, .. } = &command else {
-                    unreachable!()
-                };
-                let (alternate_expected, alternate_expected_sha) =
-                    crate::search::regression_binding::tests::prepare_expected(
-                        &alternate_binding,
-                        database,
-                        &alternate_manifest,
-                    );
-                let mut alternate_command = command.clone();
-                if let RegressionCommand::FullSearch {
-                    input,
-                    source_manifest,
-                    source_producer_receipt,
-                    source_producer_receipt_sha256,
-                    expected_binding,
-                    expected_binding_sha256,
-                    ..
-                } = &mut alternate_command
-                {
-                    input.output.run_id = "full-other-source".into();
-                    *source_manifest = alternate_manifest;
-                    *source_producer_receipt = alternate_receipt_path.clone();
-                    *source_producer_receipt_sha256 =
-                        labels::digest(&std::fs::read(&alternate_receipt_path)?);
-                    *expected_binding = alternate_expected;
-                    *expected_binding_sha256 = alternate_expected_sha;
-                }
-                super::super::off::run(&alternate_command)?;
-                let alternate_path = input.output.output_root.join("full-other-source/run.json");
-                let mut different_source = request.clone();
-                different_source.right = FilePin::new(
-                    alternate_path.clone(),
-                    labels::digest(&std::fs::read(&alternate_path)?),
-                )?;
-                different_source.output.run_id = "different-source".into();
-                let outcome = run(&different_source)?;
-                assert!(
-                    matches!(outcome.exit(),CompareExit::Two(code) if code.as_str()=="NON_COMPARABLE_SOURCE")
-                );
-                let source_report = native_report(&compare_root, &different_source, &outcome)?;
-                assert_eq!(source_report["error"]["stage"], "SOURCE");
-                assert!(source_report["success_summary"].is_null());
                 let writer = crate::storage::testing::open_writable_for_tests(
                     &database,
                     Profile::Production,
@@ -2016,6 +1956,67 @@ mod tests {
             assert_eq!(cuts[2]["supported_count"], 8);
             assert_eq!(report["success_summary"]["overall_complete_quality"], false);
             if count == 12 {
+                let source_root = profile.join("alternate-source-input");
+                std::fs::create_dir(&source_root)?;
+                let alternate_manifest = source_root.join("source-manifest.txt");
+                std::fs::write(
+                    &alternate_manifest,
+                    b"alternate owned synthetic source manifest\n",
+                )?;
+                let mut alternate_receipt: Value =
+                    serde_json::from_slice(&std::fs::read(&receipt)?)?;
+                alternate_receipt["source_manifest_sha256"] =
+                    serde_json::json!(labels::digest(&std::fs::read(&alternate_manifest)?));
+                let alternate_receipt_path = source_root.join("receipt.json");
+                std::fs::write(
+                    &alternate_receipt_path,
+                    serde_json::to_vec(&alternate_receipt)?,
+                )?;
+                let alternate_binding = profile.join("alternate-binding");
+                std::fs::create_dir(&alternate_binding)?;
+                let RegressionCommand::FullSearch { database, .. } = &command else {
+                    unreachable!()
+                };
+                let (alternate_expected, alternate_expected_sha) =
+                    crate::search::regression_binding::tests::prepare_expected(
+                        &alternate_binding,
+                        database,
+                        &alternate_manifest,
+                    );
+                let mut alternate_command = command.clone();
+                if let RegressionCommand::FullSearch {
+                    input,
+                    source_manifest,
+                    source_producer_receipt,
+                    source_producer_receipt_sha256,
+                    expected_binding,
+                    expected_binding_sha256,
+                    ..
+                } = &mut alternate_command
+                {
+                    input.output.run_id = "full-other-source".into();
+                    *source_manifest = alternate_manifest;
+                    *source_producer_receipt = alternate_receipt_path.clone();
+                    *source_producer_receipt_sha256 =
+                        labels::digest(&std::fs::read(&alternate_receipt_path)?);
+                    *expected_binding = alternate_expected;
+                    *expected_binding_sha256 = alternate_expected_sha;
+                }
+                super::super::off::run(&alternate_command)?;
+                let alternate_path = input.output.output_root.join("full-other-source/run.json");
+                let mut different_source = request.clone();
+                different_source.right = FilePin::new(
+                    alternate_path.clone(),
+                    labels::digest(&std::fs::read(&alternate_path)?),
+                )?;
+                different_source.output.run_id = "different-source".into();
+                let outcome = run(&different_source)?;
+                assert!(
+                    matches!(outcome.exit(),CompareExit::Two(code) if code.as_str()=="NON_COMPARABLE_SOURCE")
+                );
+                let source_report = native_report(&compare_root, &different_source, &outcome)?;
+                assert_eq!(source_report["error"]["stage"], "SOURCE");
+                assert!(source_report["success_summary"].is_null());
                 let fixed_output = profile.join("fixed-output");
                 std::fs::create_dir(&fixed_output)?;
                 #[cfg(unix)]
