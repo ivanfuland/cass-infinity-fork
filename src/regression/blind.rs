@@ -2716,15 +2716,6 @@ fn validate_run_request_evidence(run: &RunWire, actual: &Value) -> Result<()> {
             require(
                 backend.model_revision.is_none()
                     && backend.endpoint_origin_sha256.is_none()
-                    && actual["server_template_policy"]
-                        == serde_json::to_value(&backend.server_template_policy)?
-                    && actual["client_submission_policy"]
-                        == serde_json::to_value(&backend.client_submission_policy)?
-                    && actual["document_assembly_policy"]
-                        .get("id")
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                        == serde_json::to_value(&backend.document_assembly_policy)?
                     && backend
                         .provider
                         .as_ref()
@@ -2735,6 +2726,29 @@ fn validate_run_request_evidence(run: &RunWire, actual: &Value) -> Result<()> {
                             && backend.actual_model.is_none())),
                 "LABEL_RUN_INVALID",
             )?;
+            if request.rerank {
+                require(
+                    actual["server_template_policy"]
+                        == serde_json::to_value(&backend.server_template_policy)?
+                        && actual["client_submission_policy"]
+                            == serde_json::to_value(&backend.client_submission_policy)?
+                        && actual["document_assembly_policy"]
+                            .get("id")
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                            == serde_json::to_value(&backend.document_assembly_policy)?,
+                    "LABEL_RUN_INVALID",
+                )?;
+            } else {
+                // Off does not report an executed backend or its policies.
+                // Request policies still close over the pinned per-question request.
+                require(
+                    backend.server_template_policy.is_none()
+                        && backend.client_submission_policy.is_none()
+                        && backend.document_assembly_policy.is_none(),
+                    "LABEL_RUN_INVALID",
+                )?;
+            }
         }
         RunMode::FixedCandidate => {
             for (field, expected) in [
@@ -2756,6 +2770,11 @@ fn validate_run_request_evidence(run: &RunWire, actual: &Value) -> Result<()> {
                     Value::Object(request.resolved_filters.clone()),
                 ),
                 ("suite_sha256", Value::String(run.suite_sha256.clone())),
+                ("labels_sha256", Value::String(run.labels_sha256.clone())),
+                (
+                    "label_policy_sha256",
+                    Value::String(run.label_policy_sha256.clone()),
+                ),
                 (
                     "input_manifest_sha256",
                     serde_json::to_value(&run.fixed_input_manifest_sha256)?,
@@ -2767,6 +2786,14 @@ fn validate_run_request_evidence(run: &RunWire, actual: &Value) -> Result<()> {
             ] {
                 require(actual.get(field) == Some(&expected), "LABEL_RUN_INVALID")?;
             }
+            require(
+                actual["requested_provider"].is_string()
+                    && backend
+                        .provider
+                        .as_ref()
+                        .is_none_or(|p| actual["requested_provider"].as_str() == Some(p.as_str())),
+                "LABEL_RUN_INVALID",
+            )?;
         }
     }
     Ok(())
@@ -2780,8 +2807,19 @@ fn validate_full_backend_evidence(
     request: &Value,
     backend: &BackendWire,
 ) -> Result<()> {
+    if question.actual_n == 0 {
+        // Empty on has no scoring call and no strongly pinned page to bind a
+        // native snapshot. Its pinned WindowEvidence already closes the request.
+        return require(
+            question.pages.is_empty()
+                && backend.provider.is_none()
+                && backend.actual_model.is_none(),
+            "LABEL_RUN_INVALID",
+        );
+    }
     let snapshot = read_listed(root, output, &format!("window-{}.json", question.qid))
         .context("LABEL_RUN_INVALID")?;
+    require(!question.pages.is_empty(), "LABEL_RUN_INVALID")?;
     // The native snapshot's bytes are named by the strongly pinned pages.
     for page in &question.pages {
         require(
@@ -3097,6 +3135,43 @@ mod tests {
         bytes.push(b'\n');
         fs::write(path, &bytes)?;
         Ok(digest(&bytes))
+    }
+
+    #[test]
+    #[ignore = "requires explicitly pinned approved full Run profile"]
+    fn native_full_filepin_preserves_empty_and_off_profiles() -> Result<()> {
+        let spec: Value =
+            serde_json::from_slice(&fs::read(dotenvy::var("CASS_S2_07_NATIVE_INPUTS")?)?)?;
+        let pin = FilePin::new(
+            PathBuf::from(spec["left"].as_str().context("NATIVE_RUN_PATH")?),
+            spec["left_sha256"]
+                .as_str()
+                .context("NATIVE_RUN_SHA")?
+                .into(),
+        )?;
+        let loaded = load_run_subjects(&pin)?;
+        let slots: usize = loaded.capture.questions.iter().map(|q| q.slots.len()).sum();
+        assert_eq!(
+            slots as u64,
+            spec["expected_slots"]
+                .as_u64()
+                .context("NATIVE_EXPECTED_SLOTS")?
+        );
+        assert_eq!(
+            loaded.capture.wire.request.rerank,
+            spec["expected_rerank"]
+                .as_bool()
+                .context("NATIVE_EXPECTED_RERANK")?
+        );
+        assert!(loaded.capture.wire.backend_identity.provider.is_none());
+        assert!(loaded.capture.wire.backend_identity.actual_model.is_none());
+        println!(
+            "NATIVE_PROFILE {}",
+            serde_json::to_string(
+                &json!({"run_sha256":pin.expected_sha256(),"slots":slots,"rerank":loaded.capture.wire.request.rerank,"terminal":format!("{:?}",loaded.capture.wire.terminal),"provider":null,"actual_model":null})
+            )?
+        );
+        Ok(())
     }
 
     #[test]
