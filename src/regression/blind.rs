@@ -3168,7 +3168,7 @@ mod tests {
         println!(
             "NATIVE_PROFILE {}",
             serde_json::to_string(
-                &json!({"run_sha256":pin.expected_sha256(),"slots":slots,"rerank":loaded.capture.wire.request.rerank,"terminal":format!("{:?}",loaded.capture.wire.terminal),"provider":null,"actual_model":null})
+                &json!({"run_sha256":pin.expected_sha256(),"slots":slots,"rerank":loaded.capture.wire.request.rerank,"short_window":loaded.capture.wire.terminal == Terminal::ShortWindow,"provider":null,"actual_model":null})
             )?
         );
         Ok(())
