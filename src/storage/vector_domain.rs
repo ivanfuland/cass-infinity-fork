@@ -167,10 +167,22 @@ pub enum Int8Candidates {
 pub fn parallel_int8_candidates(
     path: &std::path::Path, snapshot: &VectorSnapshot, query: &[u8], k: usize,
 ) -> Result<Int8Candidates, StorageError> {
+    parallel_int8_candidates_with_connections(snapshot, query, k, || {
+        crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, std::time::Duration::from_secs(1))
+            .map_err(|e| reject(e.to_string()))
+    })
+}
+
+/// Used by frozen regression runs to retain their readonly admission policy
+/// on every worker connection, while preserving the existing shard algorithm.
+pub(crate) fn parallel_int8_candidates_with_connections(
+    snapshot: &VectorSnapshot, query: &[u8], k: usize,
+    open: impl Fn() -> Result<Conn, StorageError> + Sync,
+) -> Result<Int8Candidates, StorageError> {
+    let open = &open;
     let workers = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..INT8_SHARDS).map(|shard| scope.spawn(move || {
-            let conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(path, std::time::Duration::from_secs(1))
-                .map_err(|e| reject(e.to_string()))?;
+            let conn = open()?;
             crate::storage::sqlite::ensure_readonly_schema_current(&conn).map_err(|e| reject(e.to_string()))?;
             conn.with_tx_no_replay(TxMode::Deferred, |tx| {
                 let Some(observed) = vector_snapshot_in_tx(tx, snapshot.generation_id)? else {

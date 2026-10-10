@@ -326,7 +326,13 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
             };
         }
     };
-    let conn = storage.raw();
+    probe_db_vector_domain_availability_with_connection(storage.raw(), db_path)
+}
+
+fn probe_db_vector_domain_availability_with_connection(
+    conn: &crate::storage::api::Conn,
+    db_path: &Path,
+) -> SemanticAvailability {
     // R1-N7: a genuine SQL error here (corrupted table, malformed schema
     // after a botched migration, etc.) previously fell through
     // `.unwrap_or(None)`/`.unwrap_or(0)` as if it meant "no active
@@ -363,15 +369,18 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
         };
     }
 
-    let any_generation: i64 = match conn.query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| row.get_typed(0)) {
-        Ok(count) => count,
-        Err(err) => {
-            return SemanticAvailability::DatabaseUnavailable {
-                db_path: db_path.to_path_buf(),
-                error: err.to_string(),
-            };
-        }
-    };
+    let any_generation: i64 =
+        match conn.query_row_map("SELECT COUNT(*) FROM embedding_generations", &[], |row| {
+            row.get_typed(0)
+        }) {
+            Ok(count) => count,
+            Err(err) => {
+                return SemanticAvailability::DatabaseUnavailable {
+                    db_path: db_path.to_path_buf(),
+                    error: err.to_string(),
+                };
+            }
+        };
     if any_generation > 0 {
         return SemanticAvailability::IndexBuilding {
             embedder_id: String::new(),
@@ -381,7 +390,9 @@ fn probe_db_vector_domain_availability(db_path: &Path) -> SemanticAvailability {
         };
     }
 
-    SemanticAvailability::IndexMissing { index_path: db_path.to_path_buf() }
+    SemanticAvailability::IndexMissing {
+        index_path: db_path.to_path_buf(),
+    }
 }
 
 /// Richer DB-vector-domain snapshot for `cass status`'s dedicated section
@@ -596,7 +607,18 @@ pub fn load_hash_semantic_context(data_dir: &Path, _db_path: &Path) -> SemanticS
 #[cfg(feature = "infinity")]
 pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
     let _ = data_dir;
-    let embedder = match crate::search::infinity::InfinityEmbedder::new() {
+    load_infinity_semantic_context_with_probe(
+        crate::search::infinity::InfinityEmbedder::new(),
+        || probe_db_vector_domain_availability(db_path),
+    )
+}
+
+#[cfg(feature = "infinity")]
+fn load_infinity_semantic_context_with_probe(
+    embedder: crate::search::embedder::EmbedderResult<crate::search::infinity::InfinityEmbedder>,
+    probe: impl FnOnce() -> SemanticAvailability,
+) -> SemanticSetup {
+    let embedder = match embedder {
         Ok(e) => e,
         Err(err) => {
             return SemanticSetup {
@@ -608,7 +630,7 @@ pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> Semant
         }
     };
 
-    match probe_db_vector_domain_availability(db_path) {
+    match probe() {
         SemanticAvailability::Ready { embedder_id } => {
             let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
             SemanticSetup {
@@ -624,6 +646,43 @@ pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> Semant
             context: None,
         },
     }
+}
+
+/// Build the existing HTTP embedder while all generation reads use the lease.
+/// Construction sends no request. A model/dimension mismatch fails before a
+/// private query can be embedded.
+#[cfg(feature = "infinity")]
+pub(crate) fn load_infinity_semantic_context_for_regression(
+    context: &crate::search::regression_io::RegressionIoContext,
+    config: &crate::search::infinity::InfinityConfig,
+) -> anyhow::Result<SemanticSetup> {
+    anyhow::ensure!(
+        config.embed_model == "BAAI/bge-m3",
+        "REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH"
+    );
+    context.verify_input()?;
+    let setup = {
+        let connection = context.connection()?;
+        let setup = load_infinity_semantic_context_with_probe(
+            crate::search::infinity::InfinityEmbedder::from_config(config.clone()),
+            || probe_db_vector_domain_availability_with_connection(&connection, context.database()),
+        );
+        if let Some(semantic) = setup.context.as_ref() {
+            let (id, dimension): (String, i64) = connection.query_row_map(
+                "SELECT embedder_id,dim FROM embedding_generations WHERE is_active=1",
+                &[],
+                |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
+            )?;
+            anyhow::ensure!(
+                id == semantic.embedder.model_name()
+                    && dimension == semantic.embedder.dimension() as i64,
+                "REGRESSION_EMBEDDER_GENERATION_MISMATCH"
+            );
+        }
+        setup
+    };
+    context.verify_input()?;
+    Ok(setup)
 }
 
 /// Load semantic context without version checking.
@@ -1213,5 +1272,102 @@ mod tests {
             "expected IndexMissing (absent), got {:?}",
             setup.availability
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "infinity"))]
+mod regression_semantic_loader_tests {
+    use super::*;
+    use crate::search::{regression_binding, regression_io::RegressionIoContext};
+
+    #[test]
+    fn regression_semantic_loader_rejects_mismatched_generation_without_requests() {
+        let (_root, database, run_root, _) = regression_binding::tests::searchable_fixture();
+        let context = RegressionIoContext::open(&database, &run_root).unwrap();
+        assert!(
+            load_infinity_semantic_context_for_regression(
+                &context,
+                &crate::search::infinity::InfinityConfig::from_env_with(|_| None)
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("REGRESSION_EMBEDDER_GENERATION_MISMATCH")
+        );
+        assert!(std::fs::read_dir(run_root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn regression_semantic_loader_rejects_alias_generation_and_same_dimension_other_model() {
+        let (_root, database, run_root, _) =
+            regression_binding::tests::searchable_fixture_with_embedding(7, "bge-m3", 1024);
+        let context = RegressionIoContext::open(&database, &run_root).unwrap();
+        let mut config = crate::search::infinity::InfinityConfig::from_env_with(|_| None);
+        assert!(
+            load_infinity_semantic_context_for_regression(&context, &config)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("REGRESSION_EMBEDDER_GENERATION_MISMATCH")
+        );
+        config.embed_model = "synthetic-other-model-1024".into();
+        assert!(
+            load_infinity_semantic_context_for_regression(&context, &config)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH")
+        );
+        assert!(std::fs::read_dir(run_root).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn regression_semantic_loader_readonly_child() -> anyhow::Result<()> {
+        let Some(database) = std::env::var_os("CASS_REGRESSION_LOADER_DATABASE") else {
+            return Ok(());
+        };
+        let run_root = std::env::var_os("CASS_REGRESSION_LOADER_RUN").unwrap();
+        let context = RegressionIoContext::open(Path::new(&database), Path::new(&run_root))?;
+        context.admit_index_run()?;
+        let setup = load_infinity_semantic_context_for_regression(
+            &context,
+            &crate::search::infinity::InfinityConfig::from_env(),
+        )?;
+        let semantic = setup.context.unwrap();
+        assert_eq!(semantic.embedder.id(), "bge-m3");
+        assert_eq!(semantic.embedder.dimension(), 1024);
+        assert_eq!(
+            semantic.roles,
+            Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]))
+        );
+        assert!(std::fs::read_dir(run_root)?.next().is_none());
+        println!("READONLY_SEMANTIC_LOADER_NO_REQUESTS");
+        Ok(())
+    }
+
+    #[test]
+    fn regression_semantic_loader_uses_existing_connection_on_os_readonly_input() {
+        let (_root, database, run_root, _) =
+            regression_binding::tests::searchable_fixture_with_embedding(7, "BAAI/bge-m3", 1024);
+        let before = std::fs::read(&database).unwrap();
+        let output = std::process::Command::new("/usr/bin/bwrap")
+            .args(["--ro-bind", "/", "/", "--bind"]).arg(&run_root).arg(&run_root)
+            .args(["--unshare-net", "--proc", "/proc", "--dev", "/dev"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "search::model_manager::regression_semantic_loader_tests::regression_semantic_loader_readonly_child", "--nocapture"])
+            .env("CASS_REGRESSION_LOADER_DATABASE", &database).env("CASS_REGRESSION_LOADER_RUN", &run_root)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("READONLY_SEMANTIC_LOADER_NO_REQUESTS")
+        );
+        assert_eq!(before, std::fs::read(database).unwrap());
+        assert!(std::fs::read_dir(run_root).unwrap().next().is_none());
     }
 }
