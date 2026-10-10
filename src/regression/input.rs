@@ -250,6 +250,31 @@ fn reference<'a>(manifest: &Value, assets: &'a [Asset], name: &str) -> Result<&'
     Ok(asset)
 }
 
+/// Re-read an admitted registry reference through the same guarded descriptor
+/// and bundle pin as input admission. A historical absolute name is only a
+/// registry lookup key. It never becomes a filesystem path.
+pub(crate) fn read_registered_asset(inputs: &ValidatedInputs, reference: &str) -> Result<Vec<u8>> {
+    let asset = resolve(&inputs.assets, reference)?;
+    safe_relative(&asset.path)?;
+    let bytes = pinned(
+        &inputs.suite_root.join(&asset.path),
+        &asset.sha256,
+        "INPUT_ASSET_DIGEST_MISMATCH",
+        true,
+    )?;
+    require(
+        bytes.len() as u64 == asset.bytes,
+        "INPUT_ASSET_BYTES_MISMATCH",
+    )?;
+    Ok(bytes)
+}
+
+/// An explicitly selected external pool-binding file is independently pinned.
+/// Parse exactly the descriptor bytes that supplied the verified file hash.
+pub(crate) fn read_pinned_json(path: &Path, sha: &str) -> Result<Value> {
+    strict_json(&pinned(path, sha, "POOL_BINDING_MISMATCH", false)?)
+}
+
 /// Verify old physical file SHA values before constructing a readonly view.
 pub(crate) fn validate_inputs(options: &InputOptions) -> Result<ValidatedInputs> {
     let root = guarded_path(&options.suite)?;
@@ -2013,5 +2038,92 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn registered_facade_maps_historical_names_and_rejects_unregistered_physical_bait() {
+        let f = fixture("");
+        let inputs = validate_inputs(&f.input).unwrap();
+        let slot = &inputs.windows[0].items[0];
+        let bytes = read_registered_asset(&inputs, &slot.text_path).unwrap();
+        assert_eq!(digest(&bytes), slot.text_sha256);
+        assert_eq!(bytes.len() as u64, slot.bytes);
+        let bait = f._root.path().join("unregistered-absolute-bait.txt");
+        fs::write(&bait, b"synthetic bait is never a registry asset").unwrap();
+        assert_eq!(
+            error_code(&read_registered_asset(&inputs, bait.to_str().unwrap()).unwrap_err()),
+            "INPUT_ASSET_UNREGISTERED"
+        );
+        let asset = resolve(&inputs.assets, &slot.text_path).unwrap();
+        let path = inputs.suite_root.join(&asset.path);
+        let mut changed = bytes;
+        changed[0] ^= 1;
+        fs::write(&path, &changed).unwrap();
+        assert_eq!(
+            error_code(&read_registered_asset(&inputs, &slot.text_path).unwrap_err()),
+            "INPUT_ASSET_DIGEST_MISMATCH"
+        );
+    }
+
+    #[test]
+    fn registered_facade_retains_escape_symlink_and_bundle_hardlink_guards() {
+        let f = fixture("");
+        let mut inputs = validate_inputs(&f.input).unwrap();
+        let reference = inputs.windows[0].items[0].text_path.clone();
+        let index = inputs
+            .assets
+            .iter()
+            .position(|a| a.source_path == reference)
+            .unwrap();
+        inputs.assets[index].path = "../escape.txt".into();
+        assert_eq!(
+            error_code(&read_registered_asset(&inputs, &reference).unwrap_err()),
+            "INPUT_PATH_ESCAPE"
+        );
+
+        let f = fixture("");
+        let inputs = validate_inputs(&f.input).unwrap();
+        let reference = &inputs.windows[0].items[0].text_path;
+        let path = inputs
+            .suite_root
+            .join(&resolve(&inputs.assets, reference).unwrap().path);
+        let saved = path.with_extension("saved");
+        fs::rename(&path, &saved).unwrap();
+        symlink(&saved, &path).unwrap();
+        assert_eq!(
+            error_code(&read_registered_asset(&inputs, reference).unwrap_err()),
+            "INPUT_PATH_SYMLINK"
+        );
+
+        let f = fixture("");
+        let inputs = validate_inputs(&f.input).unwrap();
+        let reference = &inputs.windows[0].items[0].text_path;
+        let path = inputs
+            .suite_root
+            .join(&resolve(&inputs.assets, reference).unwrap().path);
+        fs::hard_link(&path, f._root.path().join("bundle-link.txt")).unwrap();
+        assert_eq!(
+            error_code(&read_registered_asset(&inputs, reference).unwrap_err()),
+            "INPUT_FILE_HARDLINK"
+        );
+    }
+
+    #[test]
+    fn explicit_pool_facade_pins_same_buffer_strict_json_and_allows_external_hardlinks() {
+        let f = fixture("");
+        fs::hard_link(&f.pool, f._root.path().join("external-pool-link.json")).unwrap();
+        let pool = read_pinned_json(&f.pool, &f.pool_sha).unwrap();
+        assert_eq!(pool["schema"], "cass.regression-fixed-pool.v1");
+        assert_eq!(
+            error_code(&read_pinned_json(&f.pool, &digest(b"wrong pin")).unwrap_err()),
+            "POOL_BINDING_MISMATCH"
+        );
+        let duplicate = f._root.path().join("duplicate-pool.json");
+        let bytes = br#"{"schema":"one","schema":"two"}"#;
+        fs::write(&duplicate, bytes).unwrap();
+        assert_eq!(
+            error_code(&read_pinned_json(&duplicate, &digest(bytes)).unwrap_err()),
+            "INPUT_JSON_INVALID"
+        );
     }
 }
