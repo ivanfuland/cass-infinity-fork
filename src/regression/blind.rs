@@ -2056,11 +2056,7 @@ impl RunWire {
                         && self.observed_after.is_none()
                         && self.after_verification.is_none()
                         && self.request.request_evidence_sha256.is_some()
-                        && self
-                            .request
-                            .resolved_filters
-                            .as_object()
-                            .is_some_and(|v| v.is_empty())
+                        && self.request.resolved_filters.is_empty()
                         && source.source_manifest_sha256.is_none()
                         && source.source_checked.is_none()
                         && source.source_producer_receipt_sha256.is_none()
