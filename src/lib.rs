@@ -6912,21 +6912,27 @@ async fn execute_cli(
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
             if matches!(action, regression::RegressionCommand::Compare { .. }) {
                 let outcome = regression::run::run_compare(action).map_err(|error| CliError {
-                    code: 2, kind: CliErrorKind::Usage.kind_str(),
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
                     message: regression::compare::error_code(&error).as_str().to_string(),
-                    hint: None, retryable: false,
+                    hint: None,
+                    retryable: false,
                 })?;
                 let payload = serde_json::to_string(outcome.stdout()).map_err(|_| CliError {
-                    code: 2, kind: CliErrorKind::Usage.kind_str(),
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
                     message: "REGRESSION_INPUT_ENCODING_FAILED".to_string(),
-                    hint: None, retryable: false,
+                    hint: None,
+                    retryable: false,
                 })?;
                 println!("{payload}");
                 if let regression::compare::CompareExit::Two(error_code) = outcome.exit() {
                     return Err(CliError {
-                        code: 2, kind: CliErrorKind::Usage.kind_str(),
+                        code: 2,
+                        kind: CliErrorKind::Usage.kind_str(),
                         message: error_code.as_str().to_string(),
-                        hint: None, retryable: false,
+                        hint: None,
+                        retryable: false,
                     });
                 }
             } else {

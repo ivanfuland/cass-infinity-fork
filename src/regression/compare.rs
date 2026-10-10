@@ -1850,7 +1850,9 @@ mod tests {
         duplicate_ancestor
             .ancestors
             .push(duplicate_ancestor.ancestors[0].clone());
-        cases.push(("duplicate-ancestor", duplicate_ancestor));
+        duplicate_ancestor.output.run_id = "duplicate-ancestor".into();
+        assert!(run(&duplicate_ancestor).is_err());
+        assert!(!root.join("duplicate-ancestor").exists());
         let mut wrong_active = request.clone();
         wrong_active.labels = FilePin::new(request.labels.path().to_path_buf(), "0".repeat(64))?;
         cases.push(("wrong-active", wrong_active));
