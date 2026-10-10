@@ -166,6 +166,10 @@ pub(crate) fn export_chunks(context: &RegressionIoContext) -> Result<ChunkInvent
     if u64::try_from(actual_count)? != chunk_count {
         bail!("CHUNK_INVENTORY_COUNT_MISMATCH");
     }
+    // Build after bulk insertion for the trace validator's per-candidate lookup.
+    spool.execute_batch(
+        "CREATE INDEX chunk_rows_message_chunk ON chunk_rows(message_id,chunk_idx);",
+    )?;
     let mut output = tempfile::NamedTempFile::new_in(context.run_root())?;
     let mut hash = Sha256::new();
     let mut header = Vec::new();
@@ -252,7 +256,10 @@ pub(crate) mod tests {
     use super::*;
     use std::fs;
 
-    pub(crate) fn fixture(message_change: &str, chunk_change: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    pub(crate) fn fixture(
+        message_change: &str,
+        chunk_change: &str,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf) {
         let (root, db, run) = super::super::regression_inventory::tests::fixture(message_change);
         let writer = Conn::open_writable(&db, Profile::Production).unwrap();
         writer.execute_batch("CREATE TABLE embedding_generations(id INTEGER PRIMARY KEY,is_active INTEGER); INSERT INTO embedding_generations VALUES(1,1),(9,0); CREATE TABLE message_chunks(chunk_id INTEGER PRIMARY KEY,generation_id INTEGER,message_id INTEGER,conversation_id INTEGER,chunk_idx INTEGER,byte_start INTEGER,byte_end INTEGER,content_hash TEXT,embedding BLOB,norm REAL);").unwrap();
@@ -317,6 +324,81 @@ pub(crate) mod tests {
         assert_eq!(&bytes[..8], &13u64.to_be_bytes());
         assert_eq!(&bytes[8..21], b"chunk-text-v1");
         assert_eq!(fs::read(&db).unwrap(), before);
+    }
+
+    #[test]
+    fn spool_lookup_index_preserves_results_and_canonical_export() {
+        let (_root, db, run) = fixture("", "");
+        let context = RegressionIoContext::open(&db, &run).unwrap();
+        let inventory = export_chunks(&context).unwrap();
+        let spool = Conn::open_writable(
+            &run.join("chunk-inventory-spool.sqlite"),
+            Profile::Production,
+        )
+        .unwrap();
+        let lookup = "SELECT 1 FROM chunk_rows WHERE message_id=?1 AND chunk_idx=?2";
+        let plan_sql = format!("EXPLAIN QUERY PLAN {lookup}");
+        let plan = || {
+            spool
+                .query_all_map(&plan_sql, &params![1i64, 0i64], |r| {
+                    r.get_typed::<String>(3)
+                })
+                .unwrap()
+                .join("\n")
+        };
+        let results = || {
+            [(1i64, 0i64), (1, 999), (999, 0)].map(|(message, chunk)| {
+                spool
+                    .query_all_map(lookup, &params![message, chunk], |r| r.get_typed::<i64>(0))
+                    .unwrap()
+            })
+        };
+        let canonical = || {
+            let payloads = spool
+                .query_all_map(
+                    "SELECT payload FROM chunk_rows ORDER BY host,agent,external,idx,chunk_idx",
+                    &[],
+                    |r| r.get_typed::<Vec<u8>>(0),
+                )
+                .unwrap();
+            let mut bytes = Vec::new();
+            string(&mut bytes, "chunk-text-v1");
+            bytes.extend_from_slice(&CANONICALIZE_PIPELINE_VERSION.to_be_bytes());
+            bytes.extend_from_slice(&CHUNKING_POLICY_VERSION.to_be_bytes());
+            for payload in &payloads {
+                bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+                bytes.extend_from_slice(payload);
+            }
+            bytes.extend_from_slice(&(payloads.len() as u64).to_be_bytes());
+            bytes
+        };
+        let indexed_plan = plan();
+        assert!(indexed_plan.contains("USING COVERING INDEX chunk_rows_message_chunk"));
+        let indexed_results = results();
+        assert_eq!(indexed_results, [vec![1], vec![], vec![]]);
+        let bytes = fs::read(&inventory.rows_path).unwrap();
+        assert_eq!(canonical(), bytes);
+        let non_unique: i64 = spool
+            .query_row_map(
+                "SELECT \"unique\" FROM pragma_index_list('chunk_rows') WHERE name='chunk_rows_message_chunk'",
+                &[],
+                |r| r.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(non_unique, 0);
+        spool
+            .execute_batch("DROP INDEX chunk_rows_message_chunk;")
+            .unwrap();
+        let unindexed_plan = plan();
+        assert!(unindexed_plan.contains("SCAN chunk_rows"));
+        assert_eq!(results(), indexed_results);
+        assert_eq!(canonical(), bytes);
+        assert_eq!(hex::encode(Sha256::digest(canonical())), inventory.sha256);
+        assert_eq!(inventory.chunk_count, 1);
+        println!(
+            "unindexed_plan={unindexed_plan}; indexed_plan={indexed_plan}; canonical_sha256={}; chunk_count={}",
+            inventory.sha256, inventory.chunk_count
+        );
     }
 
     #[test]
