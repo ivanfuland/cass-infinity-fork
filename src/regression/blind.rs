@@ -770,13 +770,17 @@ pub(crate) fn import_blind(
         "import-receipt.pending.json",
         &serde_json::to_value(receipt)?,
     )?;
-    let final_path = output.run_root.join("import-receipt.json");
-    fs::hard_link(pending.path(), &final_path).context("BLIND_OUTPUT_WRITE_FAILED")?;
-    let receipt_pin = FilePin::new(final_path, pending.expected_sha256().into())?;
+    let receipt_pin = publish_receipt(&pending, output)?;
     Ok(LabelsArtifact {
         labels: label_pin,
         receipt: receipt_pin,
     })
+}
+
+fn publish_receipt(pending: &FilePin, output: &RunPaths) -> Result<FilePin> {
+    let final_path = output.run_root.join("import-receipt.json");
+    fs::hard_link(pending.path(), &final_path).context("BLIND_OUTPUT_WRITE_FAILED")?;
+    FilePin::new(final_path, pending.expected_sha256().into())
 }
 
 fn validate_submission(
@@ -864,11 +868,20 @@ fn validate_submission(
 }
 
 fn random_id(used: &mut HashSet<String>) -> Result<String> {
+    random_id_with_fill(used, |bytes| {
+        rand::rngs::SysRng
+            .try_fill_bytes(bytes)
+            .map_err(|_| anyhow::anyhow!("BLIND_RANDOM_UNAVAILABLE"))
+    })
+}
+
+fn random_id_with_fill(
+    used: &mut HashSet<String>,
+    mut fill: impl FnMut(&mut [u8; 16]) -> Result<()>,
+) -> Result<String> {
     loop {
         let mut bytes = [0u8; 16];
-        rand::rngs::SysRng
-            .try_fill_bytes(&mut bytes)
-            .map_err(|_| anyhow::anyhow!("BLIND_RANDOM_UNAVAILABLE"))?;
+        fill(&mut bytes)?;
         bytes[6] = (bytes[6] & 0x0f) | 0x40;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
         let id = hex::encode(bytes);
@@ -2801,6 +2814,79 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn random_helper_retries_collision_and_propagates_fill_failure() {
+        let mut used = HashSet::from(["00000000000040008000000000000000".to_string()]);
+        let mut calls = 0usize;
+        let id = random_id_with_fill(&mut used, |bytes| {
+            calls += 1;
+            *bytes = [0; 16];
+            if calls == 2 {
+                bytes[15] = 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(id, "00000000000040008000000000000001");
+        assert_eq!(used.len(), 2);
+        assert!(valid_id(&id));
+        let before = used.clone();
+        let err = random_id_with_fill(&mut used, |_| {
+            Err(anyhow::anyhow!("BLIND_RANDOM_UNAVAILABLE"))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "BLIND_RANDOM_UNAVAILABLE");
+        assert_eq!(used, before);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn receipt_publish_eexist_preserves_existing_sentinel_without_new_complete() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir()?;
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+        let paths = super::super::input::create_run_paths(
+            &super::super::types::OutputOptions {
+                output_root: root.path().into(),
+                run_id: "receipt-late-failure".into(),
+            },
+            &[],
+        )?;
+        let receipt = ImportReceipt {
+            schema: "cass.regression-label-import-receipt.v1".into(),
+            status: "LABEL_COVERAGE_COMPLETE".into(),
+            parent_labels_file_sha256: digest(b"synthetic-parent"),
+            new_labels_file_sha256: digest(b"synthetic-new"),
+            manifest_sha256: digest(b"synthetic-manifest"),
+            answers_sha256: digest(b"synthetic-answers"),
+            bundle_sha256: digest(b"synthetic-bundle"),
+            left_run_sha256: digest(b"synthetic-left"),
+            right_run_sha256: digest(b"synthetic-right"),
+            verified_ancestor_sha256s: vec![],
+            version: "synthetic-v2".into(),
+            suite_sha256: digest(b"synthetic-suite"),
+            label_policy_sha256: digest(b"synthetic-policy"),
+        };
+        let pending = write_artifact(
+            &paths,
+            "import-receipt.pending.json",
+            &serde_json::to_value(receipt)?,
+        )?;
+        let sentinel = json!({"fixture":"occupied","complete":false});
+        let existing = write_artifact(&paths, "import-receipt.json", &sentinel)?;
+        let before = fs::read(existing.path())?;
+        assert!(publish_receipt(&pending, &paths).is_err());
+        assert_eq!(fs::read(existing.path())?, before);
+        assert_eq!(labels::read_pin(&existing)?.value(), &sentinel);
+        assert!(labels::read_pin(&existing)?.value().get("status").is_none());
+        assert_eq!(
+            labels::read_pin(&pending)?.observed_file_sha256(),
+            pending.expected_sha256()
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn copy_native_snapshot(source: &Path, destination: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
@@ -3231,6 +3317,89 @@ mod tests {
             summary["answers_sha256"] = json!(answers_pin.expected_sha256());
             summary["labels_sha256"] = json!(imported.labels().expected_sha256());
             summary["receipt_sha256"] = json!(imported.receipt().expected_sha256());
+            let pending = FilePin::new(
+                imported
+                    .receipt()
+                    .path()
+                    .parent()
+                    .context("NATIVE_RECEIPT_PARENT")?
+                    .join("import-receipt.pending.json"),
+                imported.receipt().expected_sha256().into(),
+            )?;
+            labels::read_pin(&pending)?;
+            let collision = paths("late-receipt-collision")?;
+            let occupied = write_artifact(
+                &collision,
+                "import-receipt.json",
+                &json!({"native_sentinel":"occupied","complete":false}),
+            )?;
+            let sentinel_before = fs::read(occupied.path())?;
+            assert!(publish_receipt(&pending, &collision).is_err());
+            assert_eq!(fs::read(occupied.path())?, sentinel_before);
+            assert!(labels::read_pin(&occupied)?.value().get("status").is_none());
+            summary["late_publish_eexist"] = json!({"pending_actual_sha256":pending.expected_sha256(),"sentinel_actual_sha256":occupied.expected_sha256(),"sentinel_overwrites":0,"new_complete_receipts":0});
+            let valid_answers = labels::read_pin(&answers_pin)?.value().clone();
+            for fault in ["missing", "duplicate", "extra", "unknown", "bundle"] {
+                let mut bad_answers = valid_answers.clone();
+                match fault {
+                    "missing" => {
+                        bad_answers["records"]
+                            .as_array_mut()
+                            .context("NATIVE_ANSWERS")?
+                            .pop();
+                    }
+                    "duplicate" => {
+                        let row = bad_answers["records"][0].clone();
+                        bad_answers["records"]
+                            .as_array_mut()
+                            .context("NATIVE_ANSWERS")?
+                            .push(row);
+                    }
+                    "extra" => {
+                        bad_answers["records"].as_array_mut().context("NATIVE_ANSWERS")?.push(json!({"opaque_id":"ffffffffffff4fff8fffffffffffffff","value":"direct"}));
+                    }
+                    "unknown" => bad_answers["records"][0]["value"] = json!("unknown"),
+                    "bundle" => {
+                        bad_answers["bundle_id"] = json!("ffffffffffff4fff8fffffffffffffff")
+                    }
+                    _ => unreachable!(),
+                }
+                let bad_pin = write_artifact(
+                    &paths(&format!("bad-answers-{fault}"))?,
+                    "answers.json",
+                    &bad_answers,
+                )?;
+                let destination = paths(&format!("bad-import-{fault}"))?;
+                assert!(
+                    import_blind(
+                        &left,
+                        &right,
+                        &active2,
+                        &base,
+                        exported.manifest(),
+                        &bad_pin,
+                        "native-invalid",
+                        &destination
+                    )
+                    .is_err()
+                );
+                assert!(!destination.run_root.join("import-receipt.json").exists());
+                assert!(!destination.run_root.join("labels-new.json").exists());
+            }
+            assert!(
+                super::super::labels::load_label_set(
+                    imported.labels(),
+                    std::slice::from_ref(&version2),
+                    &base,
+                    &left,
+                    &right
+                )
+                .is_err()
+            );
+            let mut bootstrap = labels::read_pin(imported.labels())?.value().clone();
+            bootstrap["parent_labels_sha256"] = Value::Null;
+            let bad = write_artifact(&paths("bad-modern-bootstrap")?, "labels.json", &bootstrap)?;
+            assert!(super::super::labels::load_label_set(&bad, &[], &base, &left, &right).is_err());
             let mut changed = labels::read_pin(imported.labels())?.value().clone();
             let key = KeyWire::from(&unused);
             let index = changed["records"]
