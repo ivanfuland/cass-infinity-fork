@@ -177,6 +177,20 @@ fn load_subjects(pin: &FilePin, capture: Option<&LegacyBaseValidated>) -> Result
         "LABEL_RUN_INVALID",
     )?;
     validate_listing(&root, &run.output.writes_relative_paths)?;
+    let request_evidence = read_reference(
+        &root,
+        &run.output,
+        &ArtifactWire {
+            relative_path: "request.json".into(),
+            sha256: run
+                .request
+                .request_evidence_sha256
+                .clone()
+                .context("LABEL_RUN_INVALID")?,
+        },
+    )
+    .context("LABEL_RUN_INVALID")?;
+    validate_run_request_evidence(&run, &request_evidence)?;
     let mut subjects = Vec::new();
     for (question_index, question) in run.questions.iter_mut().enumerate() {
         let relative = format!("label-subjects-{}.json", question.qid);
@@ -222,6 +236,8 @@ fn load_subjects(pin: &FilePin, capture: Option<&LegacyBaseValidated>) -> Result
                 question,
                 &body,
                 &run.request,
+                &request_evidence,
+                &run.backend_identity,
                 run.observed_before.as_ref().context("LABEL_RUN_INVALID")?,
             )?;
         }
@@ -259,17 +275,6 @@ fn load_subjects(pin: &FilePin, capture: Option<&LegacyBaseValidated>) -> Result
                 .is_some_and(|a| a.iter().all(Value::is_string)),
         "LABEL_RUN_INVALID",
     )?;
-    if let Some(sha) = &run.request.request_evidence_sha256 {
-        let request = read_reference(
-            &root,
-            &run.output,
-            &ArtifactWire {
-                relative_path: "request.json".into(),
-                sha256: sha.clone(),
-            },
-        )?;
-        require(request.is_object(), "LABEL_RUN_INVALID")?;
-    }
     let provenance = CaptureProvenance {
         source_commit: run.source_commit.clone(),
         binary_sha256: run.binary_sha256.clone(),
@@ -2663,12 +2668,179 @@ fn validate_full_http_counts(
     )
 }
 
+const FULL_REQUEST_FIELDS: [&str; 15] = [
+    "mode",
+    "vector_search_mode",
+    "resolved_filters",
+    "rrf_limit",
+    "timeout_ms",
+    "embedding_model",
+    "embedding_http_configuration",
+    "document_assembly_policy",
+    "client_submission_policy",
+    "server_template_policy",
+    "rerank_limit",
+    "rerank_provider",
+    "time_selectors",
+    "daemon",
+    "no_daemon",
+];
+
+fn validate_run_request_evidence(run: &RunWire, actual: &Value) -> Result<()> {
+    let request = &run.request;
+    let backend = &run.backend_identity;
+    require(actual.is_object(), "LABEL_RUN_INVALID")?;
+    match run.mode {
+        RunMode::FullSearch => {
+            for field in FULL_REQUEST_FIELDS {
+                require(actual.get(field).is_some(), "LABEL_RUN_INVALID")?;
+            }
+            let lexical = request.search_mode.as_deref() == Some("lexical");
+            require(
+                actual["mode"] == serde_json::to_value(&request.search_mode)?
+                    && lexical == request.vector_search_mode.is_none()
+                    && actual["vector_search_mode"]
+                        == if lexical {
+                            Value::String("exact".into())
+                        } else {
+                            serde_json::to_value(&request.vector_search_mode)?
+                        }
+                    && actual["resolved_filters"]
+                        == Value::Object(request.resolved_filters.clone())
+                    && actual["rrf_limit"] == serde_json::to_value(request.n)?
+                    && actual["rerank_limit"] == serde_json::to_value(request.page_k)?
+                    && request.page_k.is_none_or(|k| k <= request.n)
+                    && actual["rerank_provider"].is_string() == request.rerank,
+                "LABEL_RUN_INVALID",
+            )?;
+            require(
+                backend.model_revision.is_none()
+                    && backend.endpoint_origin_sha256.is_none()
+                    && actual["server_template_policy"]
+                        == serde_json::to_value(&backend.server_template_policy)?
+                    && actual["client_submission_policy"]
+                        == serde_json::to_value(&backend.client_submission_policy)?
+                    && actual["document_assembly_policy"]
+                        .get("id")
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                        == serde_json::to_value(&backend.document_assembly_policy)?
+                    && backend
+                        .provider
+                        .as_ref()
+                        .is_none_or(|p| actual["rerank_provider"].as_str() == Some(p.as_str()))
+                    && (request.rerank
+                        || (actual["rerank_provider"].is_null()
+                            && backend.provider.is_none()
+                            && backend.actual_model.is_none())),
+                "LABEL_RUN_INVALID",
+            )?;
+        }
+        RunMode::FixedCandidate => {
+            for (field, expected) in [
+                ("mode", Value::String("fixed-candidate".into())),
+                (
+                    "request_profile",
+                    Value::String(request.request_profile.clone()),
+                ),
+                ("rerank", Value::Bool(request.rerank)),
+                ("n", serde_json::to_value(request.n)?),
+                ("page_k", serde_json::to_value(request.page_k)?),
+                ("search_mode", serde_json::to_value(&request.search_mode)?),
+                (
+                    "vector_search_mode",
+                    serde_json::to_value(&request.vector_search_mode)?,
+                ),
+                (
+                    "resolved_filters",
+                    Value::Object(request.resolved_filters.clone()),
+                ),
+                ("suite_sha256", Value::String(run.suite_sha256.clone())),
+                (
+                    "input_manifest_sha256",
+                    serde_json::to_value(&run.fixed_input_manifest_sha256)?,
+                ),
+                (
+                    "windows_file_sha256",
+                    serde_json::to_value(&run.fixed_windows_file_sha256)?,
+                ),
+            ] {
+                require(actual.get(field) == Some(&expected), "LABEL_RUN_INVALID")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_full_backend_evidence(
+    root: &Path,
+    output: &OutputWire,
+    question: &QuestionWire,
+    body: &SubjectBody,
+    request: &Value,
+    backend: &BackendWire,
+) -> Result<()> {
+    let snapshot = read_listed(root, output, &format!("window-{}.json", question.qid))
+        .context("LABEL_RUN_INVALID")?;
+    // The native snapshot's bytes are named by the strongly pinned pages.
+    for page in &question.pages {
+        require(
+            page.window_id == snapshot.observed_file_sha256(),
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    let value = snapshot.value();
+    require(
+        value["schema"] == "cass.rerank-window.v1"
+            && value["request_binding"]["query"] == body.query.utf8
+            && value["resolved_filters"] == request["resolved_filters"]
+            && value["rerank"]["applied"] == question.rerank_applied
+            && value["rerank"]["requested_provider"] == request["rerank_provider"],
+        "LABEL_RUN_INVALID",
+    )?;
+    for (field, actual_field) in [
+        ("mode", "mode"),
+        ("vector_search_mode", "vector_search_mode"),
+        ("rrf_limit", "rrf_limit"),
+        ("rerank_limit", "rerank_limit"),
+        ("provider", "rerank_provider"),
+        ("embedding_model", "embedding_model"),
+        ("timeout_ms", "timeout_ms"),
+        ("time", "time_selectors"),
+        ("daemon", "daemon"),
+        ("no_daemon", "no_daemon"),
+    ] {
+        require(
+            value["request_binding"].get(field) == request.get(actual_field),
+            "LABEL_RUN_INVALID",
+        )?;
+    }
+    for (field, recorded) in [
+        ("actual_provider", &backend.provider),
+        ("actual_model", &backend.actual_model),
+    ] {
+        require(
+            value["rerank"]["identity"].get(field).is_some(),
+            "LABEL_RUN_INVALID",
+        )?;
+        if let Some(recorded) = recorded {
+            require(
+                value["rerank"]["identity"][field].as_str() == Some(recorded.as_str()),
+                "LABEL_RUN_INVALID",
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_question_evidence(
     root: &Path,
     output: &OutputWire,
     question: &QuestionWire,
     body: &SubjectBody,
     request: &RequestWire,
+    request_evidence: &Value,
+    backend: &BackendWire,
     binding: &InputBinding,
 ) -> Result<()> {
     let reference = question
@@ -2690,6 +2862,15 @@ fn validate_question_evidence(
     let _: FixedTransportWire =
         serde_json::from_value(value["transport"].clone()).context("LABEL_RUN_INVALID")?;
     let evidence: WindowEvidence = serde_json::from_value(value).context("LABEL_RUN_INVALID")?;
+    // Compare the actual request contract, not the differently shaped Run
+    // projection. Every required nullable field must be present on both sides.
+    for field in FULL_REQUEST_FIELDS {
+        require(
+            evidence.request.get(field).is_some()
+                && evidence.request.get(field) == request_evidence.get(field),
+            "LABEL_RUN_INVALID",
+        )?;
+    }
     require(
         evidence.schema == "cass.regression-window-trace.v2"
             && evidence.binding == *binding
@@ -2713,6 +2894,9 @@ fn validate_question_evidence(
         evidence.applied,
     )?;
     validate_full_http_counts(&evidence.transport, &question.cost.http)?;
+    if request.rerank {
+        validate_full_backend_evidence(root, output, question, body, request_evidence, backend)?;
+    }
     for (rank, slot) in question.slots.iter().enumerate() {
         let frozen = evidence
             .final_slots
@@ -2913,6 +3097,60 @@ mod tests {
         bytes.push(b'\n');
         fs::write(path, &bytes)?;
         Ok(digest(&bytes))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires explicitly pinned approved full Run and owned request forgery root"]
+    fn native_full_loader_rejects_strongly_pinned_request_mismatch() -> Result<()> {
+        let spec: Value =
+            serde_json::from_slice(&fs::read(dotenvy::var("CASS_S2_07_NATIVE_INPUTS")?)?)?;
+        let text = |field: &str| spec[field].as_str().context("NATIVE_INPUT_MISSING");
+        let output = PathBuf::from(text("output_root")?);
+        let original = FilePin::new(PathBuf::from(text("left")?), text("left_sha256")?.into())?;
+        let base_pin = FilePin::new(
+            PathBuf::from(text("labels")?),
+            text("labels_sha256")?.into(),
+        )?;
+        let base = super::super::labels::load_capture_base(
+            Path::new(text("suite")?),
+            text("suite_sha256")?,
+            std::slice::from_ref(&base_pin),
+            &super::super::types::OutputOptions {
+                output_root: output.clone(),
+                run_id: "not-created".into(),
+            },
+        )?;
+        let verified = load_run_subjects_with_capture(&original, &base)?;
+        let copied = output.join(&verified.capture.wire.run_id);
+        copy_native_snapshot(&verified.root, &copied)?;
+        let copied_run = copied.join("run.json");
+        let mut baseline = labels::read_pin(&original)?.value().clone();
+        baseline["output"]["private_root"] = json!(output.to_str().context("NATIVE_PATH_UTF8")?);
+        let baseline_sha = overwrite_owned_fixture(&copied_run, &baseline)?;
+        load_run_subjects_with_capture(
+            &FilePin::new(copied_run.clone(), baseline_sha.clone())?,
+            &base,
+        )?;
+        let mut forged = baseline.clone();
+        forged["request"]["search_mode"] = json!("semantic");
+        let forged_sha = overwrite_owned_fixture(&copied_run, &forged)?;
+        let result = load_run_subjects_with_capture(
+            &FilePin::new(copied_run.clone(), forged_sha.clone())?,
+            &base,
+        );
+        let rejected = result.is_err();
+        let summary = json!({"original_run_sha256":original.expected_sha256(),"baseline_run_sha256":baseline_sha,"forged_run_sha256":forged_sha,"mutation":"Run.request.search_mode lexical to semantic; request.json and trace unchanged","rejected":rejected,"error":result.err().map(|e|e.to_string())});
+        fs::write(
+            output.join("request-proof.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+        println!("NATIVE_REQUEST_PROOF {}", serde_json::to_string(&summary)?);
+        assert!(
+            rejected,
+            "strongly pinned Run request must match actual request evidence"
+        );
+        Ok(())
     }
 
     #[test]
