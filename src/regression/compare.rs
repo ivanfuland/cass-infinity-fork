@@ -1649,6 +1649,88 @@ fn changed_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct NativeFixture {
+        suite: PathBuf,
+        suite_sha256: String,
+        labels: PathBuf,
+        labels_sha256: String,
+        left: PathBuf,
+        left_sha256: String,
+        right: PathBuf,
+        right_sha256: String,
+        ancestors: Vec<(PathBuf, String)>,
+        artifact_root: PathBuf,
+        expected_rc: u8,
+    }
+
+    #[test]
+    #[ignore = "Needs explicitly pinned private synthetic FilePin fixture"]
+    fn owned_filepin_evaluate_report_end() -> Result<()> {
+        let path =
+            dotenvy::var("CASS_S2_08_NATIVE_INPUTS").context("S208_NATIVE_INPUTS_REQUIRED")?;
+        let fixture: NativeFixture = serde_json::from_slice(&std::fs::read(path)?)?;
+        let root = tempfile::Builder::new()
+            .prefix("s208-eval-")
+            .tempdir_in(&fixture.artifact_root)?
+            .keep();
+        let request = CompareRequest {
+            left: FilePin::new(fixture.left, fixture.left_sha256)?,
+            right: FilePin::new(fixture.right, fixture.right_sha256)?,
+            labels: FilePin::new(fixture.labels, fixture.labels_sha256)?,
+            ancestors: fixture
+                .ancestors
+                .into_iter()
+                .map(|(p, h)| FilePin::new(p, h))
+                .collect::<Result<_>>()?,
+            capture_suite: fixture.suite,
+            capture_suite_sha256: fixture.suite_sha256,
+            output: OutputOptions {
+                output_root: root.clone(),
+                run_id: "evaluate".into(),
+            },
+            cutoffs: vec![5],
+            action: LabelAction::Evaluate,
+            import: None,
+        };
+        let outcome = run(&request)?;
+        assert_eq!(outcome.stdout().rc, fixture.expected_rc);
+        assert_eq!(
+            matches!(outcome.exit(), CompareExit::Two(_)),
+            fixture.expected_rc == 2
+        );
+        let report = std::fs::read(
+            root.join("evaluate")
+                .join(&outcome.stdout().report.relative_path),
+        )?;
+        assert_eq!(labels::digest(&report), outcome.stdout().report.sha256);
+        let report: Value = serde_json::from_slice(&report)?;
+        assert_eq!(
+            report["questions"]
+                .as_array()
+                .context("missing questions")?
+                .len(),
+            9
+        );
+        assert_eq!(report["rc"], fixture.expected_rc);
+        assert_eq!(report["claims"]["process_wall_status"], "NOT_VERIFIED");
+        assert!(report["cost"]["left"]["process_wall_ms"].is_null());
+        super::super::off::write_private(
+            &root,
+            "stdout-summary.json",
+            &serde_json::to_value(outcome.stdout())?,
+        )?;
+        super::super::off::write_private(
+            &root,
+            "native-summary.json",
+            &serde_json::json!({
+                "artifact_root":root,"metadata":outcome.stdout(),"cass_process_exit_verified":false
+            }),
+        )?;
+        println!("S208_NATIVE_EVALUATE_ARTIFACT={}", root.display());
+        Ok(())
+    }
     #[test]
     fn nearest_rank_nine_and_unknown_sample_are_distinct() {
         let values: Vec<_> = [9., 1., 8., 2., 7., 3., 6., 4., 5.]
