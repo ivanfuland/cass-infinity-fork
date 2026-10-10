@@ -1747,7 +1747,12 @@ mod tests {
             serde_json::from_slice(&std::fs::read(root.join("export/blind-bundle.json"))?)?;
         let answers = serde_json::json!({"schema":"cass.regression-blind-answers.v1","bundle_id":bundle["bundle_id"],
             "records":bundle["items"].as_array().context("bundle items")?.iter().map(|item|serde_json::json!({"opaque_id":item["opaque_id"],"value":"direct"})).collect::<Vec<_>>()});
-        let answer_ref = super::super::off::write_private(&root, "answers.json", &answers)?;
+        // Answers are an input to import. Their parent cannot be output_root.
+        let answer_root = tempfile::Builder::new()
+            .prefix("answer-input-")
+            .tempdir_in(&root)?
+            .keep();
+        let answer_ref = super::super::off::write_private(&answer_root, "answers.json", &answers)?;
         request.action = LabelAction::ImportBlind;
         request.output.run_id = "import".into();
         request.import = Some(ImportRequest {
@@ -1759,7 +1764,7 @@ mod tests {
                     .into(),
             )?,
             answers: FilePin::new(
-                root.join("answers.json"),
+                answer_root.join("answers.json"),
                 answer_ref["sha256"]
                     .as_str()
                     .context("answers hash")?
