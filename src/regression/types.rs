@@ -32,6 +32,30 @@ pub struct OutputOptions {
     pub run_id: String,
 }
 
+#[derive(Clone, Debug, Default, Args)]
+pub struct CompareLabelOptions {
+    #[arg(long, value_enum, default_value = "evaluate")]
+    pub(crate) label_action: super::compare::LabelAction,
+    #[arg(long)]
+    pub(crate) capture_suite: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) capture_suite_sha256: Option<String>,
+    #[arg(long)]
+    pub(crate) label_ancestor: Vec<PathBuf>,
+    #[arg(long)]
+    pub(crate) label_ancestor_sha256: Vec<String>,
+    #[arg(long)]
+    pub(crate) blind_manifest: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) blind_manifest_sha256: Option<String>,
+    #[arg(long)]
+    pub(crate) blind_answers: Option<PathBuf>,
+    #[arg(long)]
+    pub(crate) blind_answers_sha256: Option<String>,
+    #[arg(long)]
+    pub(crate) new_label_version: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum RerankSwitch {
     Off,
@@ -102,6 +126,8 @@ pub enum RegressionCommand {
         output: OutputOptions,
         #[arg(long, value_delimiter = ',', default_value = "5,10,20")]
         cutoffs: Vec<u32>,
+        #[command(flatten)]
+        label: CompareLabelOptions,
     },
 }
 

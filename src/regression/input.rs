@@ -844,7 +844,7 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
         .unwrap_or("REGRESSION_INPUT_FAILED")
 }
 
-fn validate_cutoffs(cutoffs: &[u32]) -> Result<()> {
+pub(crate) fn validate_cutoffs(cutoffs: &[u32]) -> Result<()> {
     require(
         !cutoffs.is_empty()
             && cutoffs.iter().all(|c| *c > 0)
@@ -1138,6 +1138,7 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
             labels_sha256,
             output,
             cutoffs,
+            ..
         } => {
             validate_cutoffs(cutoffs)?;
             let protected = vec![left.clone(), right.clone(), labels.clone()];
@@ -1636,6 +1637,7 @@ mod tests {
             labels_sha256: f.input.labels_sha256.clone(),
             output: f.input.output.clone(),
             cutoffs: vec![5, 10, 20],
+            label: Default::default(),
         };
         let mut other = strict_json(&bytes).unwrap();
         other["mode"] = json!("full-search");
@@ -1850,6 +1852,7 @@ mod tests {
             labels_sha256: f.input.labels_sha256.clone(),
             output,
             cutoffs: vec![5, 10, 20],
+            label: Default::default(),
         };
         assert_eq!(run(&compare).unwrap()["stage"], "INPUT_VALIDATED");
         println!(

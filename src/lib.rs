@@ -6910,12 +6910,39 @@ async fn execute_cli(
         Commands::Regression { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
-            let result = regression::run::run(action).map_err(|error| CliError {
-                code: 2, kind: CliErrorKind::Usage.kind_str(),
-                message: regression::run::error_code(&error).to_string(),
-                hint: None, retryable: false,
-            })?;
-            println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
+            if matches!(action, regression::RegressionCommand::Compare { .. }) {
+                let outcome = regression::run::run_compare(action).map_err(|error| CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: regression::compare::error_code(&error).as_str().to_string(),
+                    hint: None,
+                    retryable: false,
+                })?;
+                let payload = serde_json::to_string(outcome.stdout()).map_err(|_| CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: "REGRESSION_INPUT_ENCODING_FAILED".to_string(),
+                    hint: None,
+                    retryable: false,
+                })?;
+                println!("{payload}");
+                if let regression::compare::CompareExit::Two(error_code) = outcome.exit() {
+                    return Err(CliError {
+                        code: 2,
+                        kind: CliErrorKind::Usage.kind_str(),
+                        message: error_code.as_str().to_string(),
+                        hint: None,
+                        retryable: false,
+                    });
+                }
+            } else {
+                let result = regression::run::run(action).map_err(|error| CliError {
+                    code: 2, kind: CliErrorKind::Usage.kind_str(),
+                    message: regression::run::error_code(&error).to_string(),
+                    hint: None, retryable: false,
+                })?;
+                println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
+            }
         }
         Commands::RegressionInput { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())

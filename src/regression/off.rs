@@ -271,7 +271,7 @@ pub(crate) fn collect(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::regression::types::*;
     use crate::search::{regression_binding, regression_trace};
@@ -280,7 +280,7 @@ mod tests {
     const QIDS: [&str; 9] = [
         "N01", "N02", "N03", "N04", "N05", "N06", "N07", "N08", "N12",
     ];
-    struct Fixture {
+    pub(in crate::regression) struct Fixture {
         _root: tempfile::TempDir,
         input: InputOptions,
         pool: PathBuf,
@@ -463,7 +463,7 @@ mod tests {
         full_fixture_mode(n, count, SearchMode::Lexical, None)
     }
 
-    fn full_fixture_mode(
+    pub(in crate::regression) fn full_fixture_mode(
         n: u32,
         count: usize,
         mode: SearchMode,

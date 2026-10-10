@@ -1,6 +1,7 @@
 //! Trusted regression inputs. No retrieval or quality evaluation runs here.
 
 pub(crate) mod blind;
+pub(crate) mod compare;
 pub(crate) mod fixed;
 pub(crate) mod fixed_encoding;
 pub(crate) mod input;

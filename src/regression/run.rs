@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 
 use super::types::{RegressionCommand, RerankSwitch, ValidatedRun};
@@ -282,9 +282,96 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
         super::on::run(command)
     } else if matches!(command, RegressionCommand::FixedCandidate { .. }) {
         super::fixed::run(command)
+    } else if matches!(command, RegressionCommand::Compare { .. }) {
+        run_compare(command)?.into_stdout_value()
     } else {
         super::input::run(command)
     }
+}
+
+pub(crate) fn run_compare(command: &RegressionCommand) -> Result<super::compare::CompareOutcome> {
+    use super::compare::{CompareRequest, ImportRequest, LabelAction};
+    use super::labels::FilePin;
+    let RegressionCommand::Compare {
+        left,
+        left_sha256,
+        right,
+        right_sha256,
+        labels,
+        labels_sha256,
+        output,
+        cutoffs,
+        label,
+    } = command
+    else {
+        anyhow::bail!("REQUEST_PROFILE_INVALID");
+    };
+    ensure!(
+        label.label_ancestor.len() == label.label_ancestor_sha256.len(),
+        "LABEL_PARENT_MISMATCH"
+    );
+    let import = if label.label_action == LabelAction::ImportBlind {
+        Some(ImportRequest {
+            manifest: FilePin::new(
+                label
+                    .blind_manifest
+                    .clone()
+                    .context("REQUEST_PROFILE_INVALID")?,
+                label
+                    .blind_manifest_sha256
+                    .clone()
+                    .context("REQUEST_PROFILE_INVALID")?,
+            )?,
+            answers: FilePin::new(
+                label
+                    .blind_answers
+                    .clone()
+                    .context("REQUEST_PROFILE_INVALID")?,
+                label
+                    .blind_answers_sha256
+                    .clone()
+                    .context("REQUEST_PROFILE_INVALID")?,
+            )?,
+            version: label
+                .new_label_version
+                .clone()
+                .context("REQUEST_PROFILE_INVALID")?,
+        })
+    } else {
+        ensure!(
+            label.blind_manifest.is_none()
+                && label.blind_manifest_sha256.is_none()
+                && label.blind_answers.is_none()
+                && label.blind_answers_sha256.is_none()
+                && label.new_label_version.is_none(),
+            "REQUEST_PROFILE_INVALID"
+        );
+        None
+    };
+    let request = CompareRequest {
+        left: FilePin::new(left.clone(), left_sha256.clone())?,
+        right: FilePin::new(right.clone(), right_sha256.clone())?,
+        labels: FilePin::new(labels.clone(), labels_sha256.clone())?,
+        ancestors: label
+            .label_ancestor
+            .iter()
+            .zip(&label.label_ancestor_sha256)
+            .map(|(p, h)| FilePin::new(p.clone(), h.clone()))
+            .collect::<Result<_>>()?,
+        capture_suite: label
+            .capture_suite
+            .clone()
+            .context("REQUEST_PROFILE_INVALID")?,
+        capture_suite_sha256: label
+            .capture_suite_sha256
+            .clone()
+            .context("REQUEST_PROFILE_INVALID")?,
+        output: output.clone(),
+        cutoffs: cutoffs.clone(),
+        action: label.label_action,
+        import,
+    };
+    super::compare::run(&request)
 }
 
 pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
