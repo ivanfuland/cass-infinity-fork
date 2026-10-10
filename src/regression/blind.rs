@@ -2801,6 +2801,220 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    #[ignore = "requires explicitly pinned approved synthetic Runs and fresh artifact root"]
+    fn approved_native_filepin_consumer() -> Result<()> {
+        let spec_path = dotenvy::var("CASS_S2_07_NATIVE_INPUTS")?;
+        let spec: Value = serde_json::from_slice(&fs::read(spec_path)?)?;
+        let text = |field: &str| spec[field].as_str().context("NATIVE_INPUT_MISSING");
+        let root = PathBuf::from(text("output_root")?);
+        let suite = PathBuf::from(text("suite")?);
+        let base_pin = FilePin::new(
+            PathBuf::from(text("labels")?),
+            text("labels_sha256")?.into(),
+        )?;
+        let left_pin = FilePin::new(PathBuf::from(text("left")?), text("left_sha256")?.into())?;
+        let right_pin = FilePin::new(PathBuf::from(text("right")?), text("right_sha256")?.into())?;
+        let options = super::super::types::OutputOptions {
+            output_root: root.clone(),
+            run_id: "capture-admission".into(),
+        };
+        let base = super::super::labels::load_capture_base(
+            &suite,
+            text("suite_sha256")?,
+            std::slice::from_ref(&base_pin),
+            &options,
+        )
+        .context("native capture-base loader")?;
+        let left =
+            load_run_subjects_with_capture(&left_pin, &base).context("native left loader")?;
+        let right =
+            load_run_subjects_with_capture(&right_pin, &base).context("native right loader")?;
+        let initial = super::super::labels::load_label_set(&base_pin, &[], &base, &left, &right)?;
+        let original = super::super::labels::cover_slots(&left, &right, &initial)?;
+        let original_left = original.left_slot_labels().len();
+        let original_right = original.right_slot_labels().len();
+        let paths = |id: &str| {
+            super::super::input::create_run_paths(
+                &super::super::types::OutputOptions {
+                    output_root: root.clone(),
+                    run_id: id.into(),
+                },
+                &[suite.clone(), left.root.clone(), right.root.clone()],
+            )
+        };
+        let mut summary = json!({"left_run_sha256":left.observed_file_sha256(),"right_run_sha256":right.observed_file_sha256(),"left_total_slots":original_left,"right_total_slots":original_right,"initial_unknown_keys":original.unknown_keys().len(),"mode":text("mode")?});
+        if original.unknown_keys().len() >= 3 {
+            // Only add previously absent keys. All legacy keys and values stay.
+            let mut additions: Vec<_> = original
+                .unknown_keys()
+                .iter()
+                .skip(3)
+                .map(|k| (k.clone(), HumanLabel::Partial))
+                .collect();
+            let unused = LabelKey {
+                query_sha256: digest(b"native-unused-query"),
+                label_text_sha256: digest(b"native-unused-text"),
+                label_policy_sha256: initial.policy_sha256().into(),
+            };
+            require(
+                initial.lookup(&unused).is_none(),
+                "NATIVE_FIXTURE_COLLISION",
+            )?;
+            additions.push((unused.clone(), HumanLabel::Unsure));
+            let version1 = write_artifact(
+                &paths("version1")?,
+                "labels.json",
+                &initial.new_version(&additions, "native-v1")?,
+            )?;
+            let active1 = super::super::labels::load_label_set(
+                &version1,
+                std::slice::from_ref(&base_pin),
+                &base,
+                &left,
+                &right,
+            )?;
+            let version2 = write_artifact(
+                &paths("version2")?,
+                "labels.json",
+                &active1.new_version(&[], "native-v2")?,
+            )?;
+            let ancestry2 = vec![version1.clone(), base_pin.clone()];
+            let active2 =
+                super::super::labels::load_label_set(&version2, &ancestry2, &base, &left, &right)?;
+            let coverage = super::super::labels::cover_slots(&left, &right, &active2)?;
+            assert_eq!(coverage.unknown_keys().len(), 3);
+            assert_eq!(coverage.left_slot_labels().len(), original_left);
+            assert_eq!(coverage.right_slot_labels().len(), original_right);
+            summary["left_unknown_slots"] = json!(
+                coverage
+                    .left_slot_labels()
+                    .iter()
+                    .filter(|l| **l == SlotLabel::Unknown)
+                    .count()
+            );
+            summary["right_unknown_slots"] = json!(
+                coverage
+                    .right_slot_labels()
+                    .iter()
+                    .filter(|l| **l == SlotLabel::Unknown)
+                    .count()
+            );
+            let exported = export_blind(&left, &right, &active2, &paths("export")?)?;
+            let bundle_wire = labels::read_pin(exported.bundle())?;
+            let bundle: BlindBundle = serde_json::from_value(bundle_wire.value().clone())?;
+            assert_eq!(bundle.items.len(), 3);
+            assert!(valid_id(&bundle.bundle_id));
+            assert!(bundle.items.iter().all(|item| valid_id(&item.opaque_id)));
+            let values = [HumanLabel::Direct, HumanLabel::None, HumanLabel::Unsure];
+            let answers = BlindAnswers {
+                schema: "cass.regression-blind-answers.v1".into(),
+                bundle_id: bundle.bundle_id,
+                records: bundle
+                    .items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, item)| BlindAnswer {
+                        opaque_id: item.opaque_id,
+                        value: values[i],
+                    })
+                    .collect(),
+            };
+            let answers_pin = write_artifact(
+                &paths("answers")?,
+                "answers.json",
+                &serde_json::to_value(answers)?,
+            )?;
+            let imported = import_blind(
+                &left,
+                &right,
+                &active2,
+                &base,
+                exported.manifest(),
+                &answers_pin,
+                "native-v3",
+                &paths("import")?,
+            )?;
+            let ancestry3 = vec![version2.clone(), version1.clone(), base_pin.clone()];
+            let active3 = super::super::labels::load_label_set(
+                imported.labels(),
+                &ancestry3,
+                &base,
+                &left,
+                &right,
+            )?;
+            let complete = super::super::labels::cover_slots(&left, &right, &active3)?;
+            assert_eq!(
+                complete.state(),
+                super::super::labels::LabelCoverageState::Complete
+            );
+            assert_eq!(complete.unknown_keys().len(), 0);
+            assert_eq!(complete.left_slot_labels().len(), original_left);
+            assert_eq!(complete.right_slot_labels().len(), original_right);
+            assert_eq!(active3.lookup(&unused), Some(HumanLabel::Unsure));
+            let receipt = labels::read_pin(imported.receipt())?;
+            assert_eq!(receipt.value()["status"], "LABEL_COVERAGE_COMPLETE");
+            assert_eq!(
+                receipt.value()["new_labels_file_sha256"],
+                active3.observed_file_sha256()
+            );
+            summary["final_unknown_keys"] = json!(complete.unknown_keys().len());
+            summary["verified_ancestor_sha256s"] = json!(active3.verified_ancestor_sha256s());
+            summary["bundle_sha256"] = json!(exported.bundle().expected_sha256());
+            summary["manifest_sha256"] = json!(exported.manifest().expected_sha256());
+            summary["answers_sha256"] = json!(answers_pin.expected_sha256());
+            summary["labels_sha256"] = json!(imported.labels().expected_sha256());
+            summary["receipt_sha256"] = json!(imported.receipt().expected_sha256());
+            let mut changed = labels::read_pin(imported.labels())?.value().clone();
+            let key = KeyWire::from(&unused);
+            let index = changed["records"]
+                .as_array()
+                .context("NATIVE_RECORDS_MISSING")?
+                .iter()
+                .position(|r| r["key"] == serde_json::to_value(&key).unwrap())
+                .context("NATIVE_UNUSED_MISSING")?;
+            changed["records"][index]["value"] = json!("none");
+            let bad = write_artifact(&paths("bad-unused-change")?, "labels.json", &changed)?;
+            assert!(
+                super::super::labels::load_label_set(&bad, &ancestry3, &base, &left, &right)
+                    .is_err()
+            );
+            changed["records"]
+                .as_array_mut()
+                .context("NATIVE_RECORDS_MISSING")?
+                .remove(index);
+            let bad = write_artifact(&paths("bad-unused-drop")?, "labels.json", &changed)?;
+            assert!(
+                super::super::labels::load_label_set(&bad, &ancestry3, &base, &left, &right)
+                    .is_err()
+            );
+            let mut extra = ancestry3;
+            extra.push(base_pin.clone());
+            assert!(
+                super::super::labels::load_label_set(
+                    imported.labels(),
+                    &extra,
+                    &base,
+                    &left,
+                    &right
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            labels::read_pin(&left_pin)?.observed_file_sha256(),
+            left.observed_file_sha256()
+        );
+        assert_eq!(
+            labels::read_pin(&right_pin)?.observed_file_sha256(),
+            right.observed_file_sha256()
+        );
+        let result = paths("summary")?;
+        write_artifact(&result, "native-consumer-result.json", &summary)?;
+        println!("NATIVE_CONSUMER {}", serde_json::to_string(&summary)?);
+        Ok(())
+    }
+
     fn full_submission_fixture(
         count: usize,
     ) -> (
