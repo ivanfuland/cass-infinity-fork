@@ -65,6 +65,7 @@ pub(crate) struct PreparedPool {
     suite_sha256: String,
     input_manifest_sha256: String,
     windows_file_sha256: String,
+    #[cfg(test)]
     labels_sha256: String,
     label_policy_sha256: String,
 }
@@ -253,6 +254,7 @@ fn prepare_pool(
         suite_sha256: inputs.suite_sha256.clone(),
         input_manifest_sha256: inputs.input_manifest_sha256.clone(),
         windows_file_sha256: inputs.windows_file_sha256.clone(),
+        #[cfg(test)]
         labels_sha256: inputs.labels_sha256.clone(),
         label_policy_sha256: inputs.label_policy_sha256.clone(),
     })
@@ -716,6 +718,7 @@ pub(crate) fn score_window(
 /// later persists these results under the admitted fresh private run root.
 /// Reading one window's documents unsuccessfully preserves that window's 200
 /// original slots and does not erase earlier or later windows' actual requests.
+#[cfg(test)]
 pub(crate) fn collect_prepared(
     pools: &[PreparedPool],
     inputs: &ValidatedInputs,
