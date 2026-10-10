@@ -291,9 +291,9 @@ type TantivyContentExactKey = (i64, i64);
 /// W2-5 Task2: `lex_docs` corpus-wide stats the BM25F reranker needs
 /// (design doc ②). `total_docs` doubles as `N` in the IDF formula.
 #[derive(Clone, Copy)]
-struct LexicalCorpusStats {
-    total_docs: u64,
-    avgdl: FieldAvgdl,
+pub(crate) struct LexicalCorpusStats {
+    pub(crate) total_docs: u64,
+    pub(crate) avgdl: FieldAvgdl,
 }
 
 type SqliteFtsMessageRow = (
@@ -2403,12 +2403,12 @@ static EXACT_SCAN_ROW_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
-fn set_exact_scan_row_budget_for_test(n: usize) {
+pub(crate) fn set_exact_scan_row_budget_for_test(n: usize) {
     EXACT_SCAN_ROW_BUDGET_OVERRIDE.store(n, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(test)]
-fn reset_exact_scan_row_budget_for_test() {
+pub(crate) fn reset_exact_scan_row_budget_for_test() {
     EXACT_SCAN_ROW_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
@@ -2480,6 +2480,8 @@ pub struct SearchClient {
     metrics: Metrics,
     cache_namespace: String,
     semantic: Mutex<Option<SemanticSearchState>>,
+    // Drop the search connection before releasing the frozen-input lease.
+    regression: Option<Arc<super::regression_io::RegressionIoContext>>,
 }
 
 /// Vector candidate strategy, independently of lexical/semantic/hybrid intent.
@@ -3278,11 +3280,26 @@ impl SearchClient {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics,
             cache_namespace,
             semantic: Mutex::new(None),
         }))
+    }
+
+    pub(crate) fn open_for_regression(
+        index_path: &Path,
+        context: Arc<super::regression_io::RegressionIoContext>,
+    ) -> Result<Self> {
+        context.verify_input()?;
+        let mut client = Self::open(index_path, Some(context.database()))?
+            .context("regression_database_unavailable")?;
+        client.regression = Some(context);
+        // Admission opens the actual search handle now; errors cannot become
+        // a missing backend on the first request.
+        drop(client.sqlite_guard()?);
+        Ok(client)
     }
 
     pub fn with_vector_search_mode(mut self, mode: VectorSearchMode) -> Self {
@@ -3295,6 +3312,14 @@ impl SearchClient {
             .sqlite
             .lock()
             .map_err(|_| anyhow!("sqlite lock poisoned"))?;
+
+        if let Some(context) = &self.regression {
+            context.verify_input()?;
+            if guard.is_none() {
+                *guard = Some(SendConnection(context.open_connection()?));
+            }
+            return Ok(guard);
+        }
 
         if guard.is_none()
             && let Some(path) = &self.sqlite_path
@@ -3387,6 +3412,25 @@ impl SearchClient {
         offset: usize,
         field_mask: FieldMask,
     ) -> Result<Vec<SearchHit>> {
+        if let Some(context) = &self.regression {
+            context.verify_input()?;
+            context.lexical_statistics()?;
+        }
+        let result = self.search_inner(query, filters, limit, offset, field_mask);
+        if let Some(context) = &self.regression {
+            context.verify_input()?;
+        }
+        result
+    }
+
+    fn search_inner(
+        &self,
+        query: &str,
+        filters: SearchFilters,
+        limit: usize,
+        offset: usize,
+        field_mask: FieldMask,
+    ) -> Result<Vec<SearchHit>> {
         // NFC-normalize early so every downstream consumer (Tantivy query
         // builder, sanitizer, FTS5 fallback) sees consistent Unicode form
         // matching the NFC-indexed content.
@@ -3401,7 +3445,9 @@ impl SearchClient {
             limit
         };
         let can_use_cache =
-            field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
+            self.regression.is_none()
+                && field_mask.allows_cache()
+                && (field_mask.needs_content() || field_mask.wants_snippet());
 
         // Fast path: reuse cached prefix when user is typing forward (offset 0 only).
         // Only use cache for simple queries (no wildcards, no boolean operators) because
@@ -3481,7 +3527,15 @@ impl SearchClient {
         // dispatch that used to live here (plain + federated, gated behind
         // `CASS_LEXICAL_USE_TANTIVY=1`) is deleted along with the escape
         // hatch (W2-6 Task2).
-        if self.has_populated_fts_lex() {
+        let populated = if self.regression.is_some() {
+            let guard = self.sqlite_guard()?;
+            let conn = guard.as_ref().context("regression_database_unavailable")?;
+            conn.query_opt_map("SELECT 1 FROM lex_docs LIMIT 1", &[], |row| row.get_typed::<i64>(0))?
+                .is_some()
+        } else {
+            self.has_populated_fts_lex()
+        };
+        if populated {
             if unsupported_wildcards {
                 return Ok(Vec::new());
             }
@@ -3493,7 +3547,7 @@ impl SearchClient {
                 field_mask,
             )?;
             let (_, paged_hits) =
-                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset);
+                self.postprocess_hits_page(hits, &sanitized, &filters, limit, offset)?;
             if can_use_cache && offset == 0 {
                 self.put_cache(&sanitized, &filters, &paged_hits);
             }
@@ -3983,6 +4037,20 @@ impl SearchClient {
         database_path: Option<&Path>,
         strategy: VectorSearchMode,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
+            fetch_limit, database_path, strategy, None)
+    }
+
+    fn search_db_vector_domain_with_context(
+        conn: &Connection,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        default_roles: Option<&HashSet<u8>>,
+        fetch_limit: usize,
+        database_path: Option<&Path>,
+        strategy: VectorSearchMode,
+        regression: Option<&super::regression_io::RegressionIoContext>,
+    ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         // R1-W3-B6/N1/B9 (inherited from the retired v4 path, still true
         // of this vec0 build): sqlite-vec's vec0 KNN implementation hard-
         // rejects `k > 4096` as a genuine `SQLITE_ERROR`, not a silent
@@ -4109,7 +4177,14 @@ impl SearchClient {
                 });
                 let query = vector_domain::quantize_unit_int8(conn, embedding)?;
                 let path = database_path.ok_or_else(|| StorageError::Other { code: None, detail: "fast vector search requires a file-backed database".into() })?;
-                match vector_domain::parallel_int8_candidates(path, &snapshot, &query, k)? {
+                let pool = if let Some(context) = regression {
+                    vector_domain::parallel_int8_candidates_with_connections(&snapshot, &query, k, || {
+                        context.open_connection().map_err(crate::storage::sqlite::anyhow_error_into_storage_error)
+                    })?
+                } else {
+                    vector_domain::parallel_int8_candidates(path, &snapshot, &query, k)?
+                };
+                match pool {
                     Int8Candidates::Matching { rows, corpus_rows } => {
                         if corpus_rows != row_count_usize {
                             return Err(StorageError::Other { code: None, detail: "vector mirror damaged: int8 corpus count mismatch".into() });
@@ -4445,17 +4520,17 @@ impl SearchClient {
         let conn = sqlite_guard
             .as_ref()
             .ok_or_else(|| anyhow!("db vector domain search requires a database connection"))?;
-        let result = if self.vector_search_mode == VectorSearchMode::Exact {
-            Self::search_db_vector_domain(
-            conn,
-            embedding,
-            filters,
-            default_roles,
-            fetch_limit,
-            )
+        if let Some(context) = &self.regression { context.verify_input()?; }
+        let result = if let Some(context) = self.regression.as_deref() {
+            Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
+                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode, Some(context))
+        } else if self.vector_search_mode == VectorSearchMode::Exact {
+            Self::search_db_vector_domain(conn, embedding, filters, default_roles, fetch_limit)
         } else {
-            Self::search_db_vector_domain_with_mode(conn, embedding, filters, default_roles, fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode)
+            Self::search_db_vector_domain_with_mode(conn, embedding, filters, default_roles,
+                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode)
         };
+        if let Some(context) = &self.regression { context.verify_input()?; }
         if result.as_ref().err().is_some_and(|e| e.to_string().contains("vector_database_changed")) {
             *sqlite_guard = None;
         }
@@ -4575,7 +4650,7 @@ impl SearchClient {
                 continue;
             }
             let hits = self.hydrate_semantic_hits(&results, field_mask)?;
-            let (available_hits, paged_hits) = self.postprocess_hits_page(hits, query, &filters, limit, offset);
+            let (available_hits, paged_hits) = self.postprocess_hits_page(hits, query, &filters, limit, offset)?;
 
             tracing::trace!(
                 query = canonical,
@@ -4854,17 +4929,17 @@ impl SearchClient {
         filters: &SearchFilters,
         limit: usize,
         offset: usize,
-    ) -> (usize, Vec<SearchHit>) {
+    ) -> Result<(usize, Vec<SearchHit>)> {
         let mut hits = deduplicate_hits_with_query(hits, query);
         if !filters.session_paths.is_empty() {
             hits.retain(|hit| filters.session_paths.contains(&hit.source_path));
         }
         if let Some(roles) = &filters.roles {
-            hits = self.filter_hits_by_role(hits, roles);
+            hits = self.filter_hits_by_role(hits, roles)?;
         }
         let available_hits = hits.len();
         let paged_hits = hits.into_iter().skip(offset).take(limit).collect();
-        (available_hits, paged_hits)
+        Ok((available_hits, paged_hits))
     }
 
     /// Post-hoc `--role` filter applied uniformly across lexical (Tantivy +
@@ -4876,9 +4951,21 @@ impl SearchClient {
     /// Semantic hits are already role-filtered upstream by
     /// `search_semantic_candidates`, so this is a cheap, correctness-safety-net
     /// re-check for them, not their primary enforcement.
-    fn filter_hits_by_role(&self, mut hits: Vec<SearchHit>, roles: &HashSet<u8>) -> Vec<SearchHit> {
+    fn filter_hits_by_role(&self, mut hits: Vec<SearchHit>, roles: &HashSet<u8>) -> Result<Vec<SearchHit>> {
         let keys: Vec<TantivyContentExactKey> =
             hits.iter().filter_map(message_role_lookup_key).collect();
+
+        if self.regression.is_some() {
+            let guard = self.sqlite_guard()?;
+            let connection = guard.as_ref().context("regression_database_unavailable")?;
+            let roles_by_key = hydrate_message_roles_by_conversation(connection, &keys)?;
+            hits.retain(|hit| {
+                message_role_lookup_key(hit)
+                    .and_then(|key| roles_by_key.get(&key))
+                    .is_some_and(|code| roles.contains(code))
+            });
+            return Ok(hits);
+        }
 
         let role_map: HashMap<TantivyContentExactKey, u8> = if keys.is_empty() {
             HashMap::new()
@@ -4921,7 +5008,7 @@ impl SearchClient {
                 .and_then(|key| role_map.get(&key))
                 .is_some_and(|code| roles.contains(code))
         });
-        hits
+        Ok(hits)
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -5563,6 +5650,9 @@ impl SearchClient {
     /// changes corpus composition should ideally refresh it; deleting the
     /// sidecar file forces a fresh computation until that wiring exists.
     fn lexical_corpus_stats(&self, conn: &SendConnection) -> Result<LexicalCorpusStats> {
+        if let Some(context) = &self.regression {
+            return context.lexical_statistics();
+        }
         static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<LexicalCorpusStats>>> =
             std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
@@ -5618,18 +5708,25 @@ impl SearchClient {
     /// uses (`lexical_rerank::tokenize`), accumulating per-field token-count
     /// sums to compute avgdl. Genuinely a full-corpus operation -- there is
     /// no cheaper exact way to get avgdl in tokens (see design doc ②).
-    fn compute_lexical_corpus_stats(conn: &SendConnection) -> Result<LexicalCorpusStats> {
+    pub(crate) fn compute_lexical_corpus_stats(conn: &Connection) -> Result<LexicalCorpusStats> {
+        Self::scan_lexical_corpus_stats(conn, Some(0))
+    }
+
+    pub(crate) fn compute_regression_lexical_corpus_stats(conn: &Connection) -> Result<LexicalCorpusStats> {
+        Self::scan_lexical_corpus_stats(conn, None)
+    }
+
+    fn scan_lexical_corpus_stats(conn: &Connection, mut last_doc_id: Option<i64>) -> Result<LexicalCorpusStats> {
         const SCAN_CHUNK: i64 = 20_000;
         let mut total_docs: u64 = 0;
         let mut content_token_sum: u64 = 0;
         let mut title_token_sum: u64 = 0;
-        let mut last_doc_id: i64 = 0;
         loop {
-            let sql = "SELECT doc_id, content, title FROM lex_docs \
-                        WHERE doc_id > ?1 ORDER BY doc_id LIMIT ?2";
+            let predicate = if last_doc_id.is_some() { "doc_id > ?1" } else { "1" };
+            let sql = format!("SELECT doc_id, content, title FROM lex_docs WHERE {predicate} ORDER BY doc_id LIMIT ?2");
             let params = [ParamValue::from(last_doc_id), ParamValue::from(SCAN_CHUNK)];
             let rows: Vec<(i64, String, String)> =
-                franken_query_map_collect_retry(conn, sql, &params, |row| {
+                franken_query_map_collect_retry(conn, &sql, &params, |row| {
                     Ok((row.get_typed(0)?, row.get_typed(1)?, row.get_typed(2)?))
                 })?;
             if rows.is_empty() {
@@ -5640,7 +5737,7 @@ impl SearchClient {
                 total_docs += 1;
                 content_token_sum += lexical_rerank::tokenize(&content).len() as u64;
                 title_token_sum += lexical_rerank::tokenize(&title).len() as u64;
-                last_doc_id = doc_id;
+                last_doc_id = Some(doc_id);
             }
             if fetched < SCAN_CHUNK as usize {
                 break;
@@ -6856,7 +6953,7 @@ impl SearchClient {
     }
 
     fn put_cache(&self, query: &str, filters: &SearchFilters, hits: &[SearchHit]) {
-        if query.is_empty() || hits.is_empty() {
+        if self.regression.is_some() || query.is_empty() || hits.is_empty() {
             return;
         }
         if let Ok(mut cache) = self.prefix_cache.lock() {
@@ -6920,7 +7017,7 @@ impl SearchClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::connectors::{NormalizedConversation, NormalizedMessage, NormalizedSnippet};
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
@@ -8015,7 +8112,7 @@ mod tests {
     /// `fts_lex` (the new primary lexical backend `client.search()`
     /// actually reads, not the legacy `fts_messages` fallback) come out
     /// populated the same way a real index run would populate them.
-    fn seed_conversations_for_search_client(
+    pub(crate) fn seed_conversations_for_search_client(
         conversations: &[NormalizedConversation],
     ) -> Result<(TempDir, PathBuf)> {
         let dir = TempDir::new()?;
@@ -8065,6 +8162,154 @@ mod tests {
             storage.insert_conversation_tree(agent_id, workspace_id, &internal)?;
         }
         Ok((dir, db_path))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_search_does_not_mask_role_lookup_errors() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new()?;
+        let input = root.path().join("input");
+        let run = root.path().join("run");
+        std::fs::create_dir_all(input.join("doctor/locks"))?;
+        std::fs::File::create(input.join("doctor/locks/doctor-repair.lock"))?;
+        std::fs::create_dir(&run)?;
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700))?;
+        let db = input.join("agent_search.db");
+        {
+            let writer = crate::storage::testing::open_writable_for_tests(&db, crate::storage::api::Profile::Production)?;
+            writer.execute_batch("PRAGMA user_version=8; CREATE TABLE lex_docs(doc_id INTEGER PRIMARY KEY, content TEXT, title TEXT); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        }
+        let context = Arc::new(super::super::regression_io::RegressionIoContext::open(&db, &run)?);
+        let regression = SearchClient::open_for_regression(&run, context)?;
+        let mut hit = projected_minimal_fields_search_hit("title", "synthetic.jsonl");
+        hit.conversation_id = Some(1);
+        hit.line_number = Some(1);
+        let roles = HashSet::from([role_code_from_str("user").unwrap()]);
+        assert!(regression.filter_hits_by_role(vec![hit.clone()], &roles).is_err());
+        let ordinary = SearchClient::open(&run, Some(&db))?.unwrap();
+        *ordinary.sqlite.lock().unwrap() = Some(SendConnection(Connection::open_frozen_read(&db)?));
+        assert!(ordinary.filter_hits_by_role(vec![hit], &roles)?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_search_isolated_child() -> Result<()> {
+        let Some(database) = std::env::var_os("CASS_REGRESSION_SEARCH_DB") else {
+            return Ok(());
+        };
+        let db = PathBuf::from(database);
+        let run = PathBuf::from(std::env::var_os("CASS_REGRESSION_SEARCH_RUN").unwrap());
+        // Populate the real ordinary-search OnceLock in this isolated process.
+        let other = PathBuf::from(std::env::var_os("CASS_REGRESSION_SEARCH_OTHER_DB").unwrap());
+        let ordinary = SearchClient::open(&run, Some(&other))?.unwrap();
+        let conn = SendConnection(Connection::open_frozen_read(&other)?);
+        assert_eq!(ordinary.lexical_corpus_stats(&conn)?.total_docs, 999);
+        let context = Arc::new(super::super::regression_io::RegressionIoContext::open(
+            &db, &run,
+        )?);
+        let client = SearchClient::open_for_regression(&run, context.clone())?;
+        let guard = client.sqlite_guard()?;
+        let stats = client.lexical_corpus_stats(guard.as_ref().unwrap())?;
+        assert_eq!(stats.total_docs, 1);
+        assert_eq!(stats.avgdl.content, 3.0);
+        drop(guard);
+        for _ in 0..2 {
+            let hits = client.search(
+                "regression",
+                SearchFilters::default(),
+                10,
+                0,
+                FieldMask::FULL,
+            )?;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].content, "regression search evidence");
+        }
+        assert_eq!(client.cache_stats().cache_hits, 0);
+        assert_eq!(ordinary.lexical_corpus_stats(&conn)?.total_docs, 999);
+        println!("REGRESSION_SEARCH_READONLY_VERIFIED");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_search_uses_frozen_handle_and_fresh_stats() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let conv = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: None,
+            title: Some("evidence".into()),
+            workspace: None,
+            source_path: "synthetic.jsonl".into(),
+            started_at: Some(1),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1),
+                content: "regression search evidence".into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: vec![],
+            }],
+        };
+        let (input, original) = seed_conversations_for_search_client(&[conv])?;
+        {
+            let writer = crate::storage::testing::open_writable_for_tests(
+                &original,
+                crate::storage::api::Profile::Production,
+            )?;
+            writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        }
+        let db = input.path().join("agent_search.db");
+        std::fs::rename(original, &db)?;
+        std::fs::create_dir_all(input.path().join("doctor/locks"))?;
+        std::fs::File::create(input.path().join("doctor/locks/doctor-repair.lock"))?;
+        let other = TempDir::new()?;
+        let other_db = other.path().join("agent_search.db");
+        std::fs::copy(&db, &other_db)?;
+        std::fs::write(
+            other.path().join(".lexical-avgdl-cache.json"),
+            r#"{"total_docs":999,"avgdl_content":999,"avgdl_title":999}"#,
+        )?;
+        std::fs::write(
+            input.path().join(".lexical-avgdl-cache.json"),
+            r#"{"total_docs":888,"avgdl_content":888,"avgdl_title":888}"#,
+        )?;
+        let run = TempDir::new()?;
+        std::fs::set_permissions(run.path(), std::fs::Permissions::from_mode(0o700))?;
+        let before = std::fs::read(&db)?;
+        let output = std::process::Command::new("/usr/bin/bwrap")
+            .args(["--ro-bind", "/", "/", "--bind"])
+            .arg(run.path())
+            .arg(run.path())
+            .args(["--unshare-net", "--proc", "/proc", "--dev", "/dev"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "search::query::tests::regression_search_isolated_child",
+                "--nocapture",
+            ])
+            .env("CASS_REGRESSION_SEARCH_DB", &db)
+            .env("CASS_REGRESSION_SEARCH_OTHER_DB", &other_db)
+            .env("CASS_REGRESSION_SEARCH_RUN", run.path())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("REGRESSION_SEARCH_READONLY_VERIFIED")
+        );
+        assert_eq!(std::fs::read(&db)?, before);
+        assert!(!input.path().join("agent_search.db-wal").exists());
+        assert!(!input.path().join("agent_search.db-shm").exists());
+        Ok(())
     }
 
     // ==========================================================================
@@ -8627,6 +8872,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -8670,6 +8916,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9184,6 +9431,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9247,6 +9495,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9328,6 +9577,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9411,6 +9661,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path.clone()),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9541,6 +9792,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9662,6 +9914,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9728,6 +9981,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9829,6 +10083,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -9914,6 +10169,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10039,6 +10295,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: Some(db_path),
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10100,6 +10357,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10185,6 +10443,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10262,6 +10521,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10329,6 +10589,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10410,6 +10671,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(Some(SendConnection(conn))),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10438,6 +10700,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)), // tiny entry cap, no byte cap
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10490,6 +10753,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10521,6 +10785,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(2, 0)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -10740,6 +11005,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(1000, 100)), // byte cap of 100
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -12096,6 +12362,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
@@ -12179,6 +12446,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
@@ -12216,6 +12484,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: "vtest|schema:none".into(),
@@ -13020,6 +13289,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -13859,6 +14129,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
@@ -13890,6 +14161,7 @@ mod tests {
             vector_search_mode: VectorSearchMode::Exact,
             sqlite: Mutex::new(None),
             sqlite_path: None,
+            regression: None,
             prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
             metrics: Metrics::default(),
             cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),

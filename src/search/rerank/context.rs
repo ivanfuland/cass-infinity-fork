@@ -61,6 +61,19 @@ const LOCATOR_CANDIDATE_CAP: usize = 100;
 /// metadata operation, so this is generous rather than tuned.
 const READ_ONLY_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Client-known assembly policy. Server-side templates remain outside this policy.
+pub(crate) fn document_assembly_policy() -> serde_json::Value {
+    serde_json::json!({
+        "id": "verified-anchor-neighbours-v1",
+        "canonicalize_version": CANONICALIZE_PIPELINE_VERSION,
+        "chunking_policy_version": CHUNKING_POLICY_VERSION,
+        "locator_candidate_cap": LOCATOR_CANDIDATE_CAP,
+        "neighbour_radius": 1,
+        "join_separator": JOIN_SEPARATOR,
+        "truncation": "none",
+    })
+}
+
 fn unscoreable() -> RerankError {
     RerankError::new(RerankFailureReason::UnscoreableInput)
 }
@@ -141,6 +154,29 @@ pub fn build_documents(
     .map_err(|_| identity_mismatch())?;
     crate::storage::sqlite::ensure_readonly_schema_current(&conn).map_err(|_| identity_mismatch())?;
 
+    build_documents_with_connection(&conn, query, hits)
+}
+
+/// Frozen runs keep the existing assembly policy and use their admitted
+/// connection; opening another ordinary connection would recreate sidecars.
+pub(crate) fn build_documents_for_regression(
+    context: &crate::search::regression_io::RegressionIoContext,
+    query: &str,
+    hits: &[SearchHit],
+) -> Result<Vec<String>, RerankError> {
+    context.verify_input().map_err(|_| identity_mismatch())?;
+    if hits.is_empty() { return Ok(Vec::new()); }
+    let conn = context.connection().map_err(|_| identity_mismatch())?;
+    let result = build_documents_with_connection(&conn, query, hits);
+    context.verify_input().map_err(|_| identity_mismatch())?;
+    result
+}
+
+fn build_documents_with_connection(
+    conn: &crate::storage::api::Conn,
+    query: &str,
+    hits: &[SearchHit],
+) -> Result<Vec<String>, RerankError> {
     let (generation, facts) = conn
         .with_tx_no_replay(TxMode::Deferred, |tx| {
             let generation = tx.query_opt_map(

@@ -68,6 +68,7 @@ pub struct HttpTransport {
     client: reqwest::blocking::Client,
     auth: Option<HeaderValue>,
     max_response_bytes: usize,
+    trace: Option<std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>>,
 }
 
 impl HttpTransport {
@@ -119,7 +120,19 @@ impl HttpTransport {
             client,
             auth,
             max_response_bytes: config.max_response_bytes,
+            trace: None,
         })
+    }
+
+    pub(crate) fn with_trace(mut self, trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
+    fn record_attempt(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Option<usize>, RerankError> {
+        self.trace.as_ref().map(|trace| {
+            trace.lock().map_err(|_| invalid_input())?.begin(method, path, body)
+        }).transpose()
     }
 
     /// Send one `GET` to `path` (a rooted, same-origin request path).
@@ -129,8 +142,9 @@ impl HttpTransport {
         if let Some(auth) = &self.auth {
             req = req.header(AUTHORIZATION, auth.clone());
         }
+        let trace_index = self.record_attempt("GET", path, None)?;
         let resp = req.send().map_err(classify_send_error)?;
-        self.finish(resp)
+        self.finish(resp, trace_index)
     }
 
     /// Send one `POST` to `path` with `body` as a JSON payload.
@@ -140,8 +154,9 @@ impl HttpTransport {
         if let Some(auth) = &self.auth {
             req = req.header(AUTHORIZATION, auth.clone());
         }
+        let trace_index = self.record_attempt("POST", path, Some(body))?;
         let resp = req.send().map_err(classify_send_error)?;
-        self.finish(resp)
+        self.finish(resp, trace_index)
     }
 
     /// Validate `path` and join it onto the base origin, proving the result is
@@ -162,8 +177,11 @@ impl HttpTransport {
     }
 
     /// Classify a sent response: status gate, then a bounded streaming read.
-    fn finish(&self, resp: reqwest::blocking::Response) -> Result<HttpJson, RerankError> {
+    fn finish(&self, resp: reqwest::blocking::Response, trace_index: Option<usize>) -> Result<HttpJson, RerankError> {
         let status = resp.status();
+        if let (Some(trace), Some(index)) = (&self.trace, trace_index) {
+            trace.lock().map_err(|_| invalid_input())?.response(index, status.as_u16())?;
+        }
         if !status.is_success() {
             // The body is intentionally not read: only the status is exposed.
             return Err(RerankError::with_status(
@@ -589,6 +607,72 @@ mod tests {
         let server = Server::ipv6(Behavior::Fixed(ok_json("{\"v\":6}")));
         let t = transport(&server.base(), true);
         assert_eq!(t.get_json("/").unwrap().status, 200);
+    }
+
+    #[test]
+    fn regression_request_trace_matches_bytes_received_by_http_server() {
+        use crate::search::regression_trace::RequestTrace;
+        use sha2::{Digest, Sha256};
+        let server = Server::ipv4(Behavior::Fixed(ok_json("{\"scored\":2}")));
+        let trace = Arc::new(Mutex::new(RequestTrace::default()));
+        let transport = transport(&server.base(), true).with_trace(trace.clone());
+        let body = json!({"model":"synthetic", "query":"组合字符 e\u{301}", "documents":["甲\n乙", "different document"], "top_n":2});
+        transport.post_json("/rerank", &body).unwrap();
+        let requests = server.requests();
+        let request = &requests[0];
+        let split = request.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+        let wire: Value = serde_json::from_slice(&request[split..]).unwrap();
+        let trace = trace.lock().unwrap();
+        let evidence = &trace.requests[0];
+        assert_eq!(evidence.json_body_sha256.as_ref().unwrap(), &hex::encode(Sha256::digest(&request[split..])));
+        let query = wire["query"].as_str().unwrap();
+        assert_eq!(evidence.query.as_ref().unwrap().utf8_bytes, query.len() as u64);
+        assert_eq!(evidence.query.as_ref().unwrap().sha256, hex::encode(Sha256::digest(query.as_bytes())));
+        for (slot,value) in wire["documents"].as_array().unwrap().iter().enumerate() {
+            let text = value.as_str().unwrap();
+            let actual = &evidence.documents.as_ref().unwrap()[slot];
+            assert_eq!(actual.input_slot, slot);
+            assert_eq!(actual.text.sha256, hex::encode(Sha256::digest(text.as_bytes())));
+            assert_eq!(actual.text.utf8_bytes, text.len() as u64);
+        }
+        assert_eq!(evidence.http_status, Some(200));
+        assert_eq!(evidence.state, "http-response-observed");
+        assert_eq!(trace.model_requests, None);
+        let serialized = serde_json::to_string(&*trace).unwrap();
+        assert!(!serialized.contains("different document"));
+        assert!(!serialized.contains("组合字符"));
+    }
+
+    #[test]
+    fn regression_request_trace_distinguishes_http_failure_from_delivery_unknown() {
+        use crate::search::regression_trace::RequestTrace;
+        let server = Server::ipv4(Behavior::Fixed(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()));
+        let trace = Arc::new(Mutex::new(RequestTrace::default()));
+        let transport = transport(&server.base(),true).with_trace(trace.clone());
+        let body = json!({"query":"synthetic", "documents":["one"]});
+        assert!(transport.post_json("/rerank",&body).is_err());
+        assert_eq!(trace.lock().unwrap().requests[0].http_status,Some(500));
+        assert_eq!(trace.lock().unwrap().model_requests,None);
+        let trace = Arc::new(Mutex::new(RequestTrace::default()));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST,0)).unwrap();
+        let unused = listener.local_addr().unwrap(); drop(listener);
+        let transport = super::HttpTransport::new(config(&format!("http://{unused}"),true),None).unwrap().with_trace(trace.clone());
+        assert!(transport.post_json("/rerank",&body).is_err());
+        let trace = trace.lock().unwrap();
+        assert_eq!(trace.requests.len(),1);
+        assert_eq!(trace.requests[0].state,"attempted-delivery-unknown");
+        assert_eq!(trace.requests[0].http_status,None);
+    }
+
+    #[test]
+    fn regression_request_trace_records_nothing_when_path_is_rejected() {
+        use crate::search::regression_trace::RequestTrace;
+        let server = Server::ipv4(Behavior::Fixed(ok_json("{}")));
+        let trace = Arc::new(Mutex::new(RequestTrace::default()));
+        let transport = transport(&server.base(),true).with_trace(trace.clone());
+        assert!(transport.post_json("http://invalid.example/rerank",&json!({"query":"q","documents":["d"]})).is_err());
+        assert!(trace.lock().unwrap().requests.is_empty());
+        assert_eq!(server.hits(),0);
     }
 
     #[test]

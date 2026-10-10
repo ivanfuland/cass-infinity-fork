@@ -298,6 +298,17 @@ impl std::fmt::Debug for Conn {
 }
 
 impl Conn {
+    /// The regression caller must hold the existing maintenance lock,
+    /// reject a nonempty WAL, and check the frozen input stamp around reads.
+    pub(crate) fn open_frozen_read(path: &Path) -> Result<Conn, StorageError> {
+        let backend = super::backend_sqlite::SqliteBackend::open_frozen_read_only(path)?;
+        Ok(Conn {
+            inner: Box::new(backend),
+            path: Some(path.to_path_buf()),
+            _writer_open_guard: None,
+        })
+    }
+
     pub fn open_read(path: &Path) -> Result<Conn, StorageError> {
         let backend = super::backend_sqlite::SqliteBackend::open_read_only(path_to_str(path)?)?;
         Ok(Conn { inner: Box::new(backend), path: Some(path.to_path_buf()), _writer_open_guard: None })
