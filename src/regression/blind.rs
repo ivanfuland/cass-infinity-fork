@@ -2801,6 +2801,277 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(unix)]
+    fn copy_native_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir(destination)?;
+        fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            require(!kind.is_symlink(), "NATIVE_SOURCE_SYMLINK")?;
+            let target = destination.join(entry.file_name());
+            if kind.is_dir() {
+                copy_native_snapshot(&entry.path(), &target)?;
+            } else {
+                require(kind.is_file(), "NATIVE_SOURCE_NOT_FILE")?;
+                fs::copy(entry.path(), &target)?;
+                fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn overwrite_owned_fixture(path: &Path, value: &Value) -> Result<String> {
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        fs::write(path, &bytes)?;
+        Ok(digest(&bytes))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires explicitly pinned approved full Run and owned forgery root"]
+    fn native_full_loader_rejects_strongly_pinned_fake_post() -> Result<()> {
+        let spec: Value =
+            serde_json::from_slice(&fs::read(dotenvy::var("CASS_S2_07_NATIVE_INPUTS")?)?)?;
+        let text = |field: &str| spec[field].as_str().context("NATIVE_INPUT_MISSING");
+        let output = PathBuf::from(text("output_root")?);
+        let original = FilePin::new(PathBuf::from(text("left")?), text("left_sha256")?.into())?;
+        let base_pin = FilePin::new(
+            PathBuf::from(text("labels")?),
+            text("labels_sha256")?.into(),
+        )?;
+        let base = super::super::labels::load_capture_base(
+            Path::new(text("suite")?),
+            text("suite_sha256")?,
+            std::slice::from_ref(&base_pin),
+            &super::super::types::OutputOptions {
+                output_root: output.clone(),
+                run_id: "not-created".into(),
+            },
+        )?;
+        let verified = load_run_subjects_with_capture(&original, &base)?;
+        let run_id = verified.capture.wire.run_id.clone();
+        let copied = output.join(&run_id);
+        copy_native_snapshot(&verified.root, &copied)?;
+        let copied_run = copied.join("run.json");
+        let mut run = labels::read_pin(&original)?.value().clone();
+        run["output"]["private_root"] = json!(output.to_str().context("NATIVE_PATH_UTF8")?);
+        let baseline_sha = overwrite_owned_fixture(&copied_run, &run)?;
+        let baseline_pin = FilePin::new(copied_run.clone(), baseline_sha.clone())?;
+        load_run_subjects_with_capture(&baseline_pin, &base)
+            .context("rebased negative-fixture baseline")?;
+        let evidence_relative = run["questions"][0]["window_evidence"]["relative_path"]
+            .as_str()
+            .context("NATIVE_EVIDENCE_MISSING")?
+            .to_string();
+        let evidence_path = copied.join(&evidence_relative);
+        let wire = labels::read_subject(&evidence_path)?;
+        let mut evidence: WindowEvidence = serde_json::from_value(wire.value().clone())?;
+        evidence.transport.requests.clear();
+        evidence.transport.model_requests = None;
+        let canonical_trace_sha = digest(&serde_json::to_vec(&evidence)?);
+        let evidence_sha =
+            overwrite_owned_fixture(&evidence_path, &serde_json::to_value(&evidence)?)?;
+        run["questions"][0]["window_evidence"]["sha256"] = json!(evidence_sha);
+        for page in run["questions"][0]["pages"]
+            .as_array_mut()
+            .context("NATIVE_PAGES_MISSING")?
+        {
+            let relative = page["page_evidence"]["relative_path"]
+                .as_str()
+                .context("NATIVE_PAGE_MISSING")?
+                .to_string();
+            let page_path = copied.join(relative);
+            let wire = labels::read_subject(&page_path)?;
+            let mut raw = wire.value().clone();
+            raw["trace_sha256"] = json!(canonical_trace_sha);
+            raw["http_requests"] = json!(0);
+            raw["model_requests"] = json!(0);
+            let sha = overwrite_owned_fixture(&page_path, &raw)?;
+            page["trace_sha256"] = json!(canonical_trace_sha);
+            page["http_requests"] = json!(0);
+            page["model_requests"] = json!(0);
+            page["page_evidence"]["sha256"] = json!(sha);
+        }
+        for count in run["questions"][0]["cost"]["http"]
+            .as_array_mut()
+            .context("NATIVE_COUNTS_MISSING")?
+        {
+            if count["scope"] == "rerank-http-v1" {
+                *count = json!({"scope":"rerank-http-v1","http_attempts":0,"http_response_observed":0,"delivery_unknown":0,"model_executions":0,"basis":"not-called"});
+            }
+        }
+        let forged_sha = overwrite_owned_fixture(&copied_run, &run)?;
+        let forged_pin = FilePin::new(copied_run, forged_sha.clone())?;
+        let rejected = load_run_subjects_with_capture(&forged_pin, &base);
+        assert!(
+            rejected.is_err(),
+            "forged actual-file Run with applied=true and no POST must be rejected"
+        );
+        let error = rejected
+            .err()
+            .context("NATIVE_EXPECTED_REJECTION")?
+            .to_string();
+        assert_eq!(
+            labels::read_pin(&original)?.observed_file_sha256(),
+            original.expected_sha256()
+        );
+        let summary = json!({"original_run_sha256":original.expected_sha256(),"rebased_negative_baseline_sha256":baseline_sha,"forged_run_sha256":forged_sha,"forged_evidence_file_sha256":evidence_sha,"canonical_trace_sha256":canonical_trace_sha,"rejection":error,"original_unchanged":true});
+        fs::write(
+            output.join("negative-proof.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+        println!("NATIVE_FORGERY {}", serde_json::to_string(&summary)?);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires owned synthetic fixed package and local HTTP peer"]
+    fn native_fixed_precision_producer_and_loader() -> Result<()> {
+        let spec: Value =
+            serde_json::from_slice(&fs::read(dotenvy::var("CASS_S2_07_NATIVE_INPUTS")?)?)?;
+        let text = |field: &str| spec[field].as_str().context("NATIVE_INPUT_MISSING");
+        let output = PathBuf::from(text("output_root")?);
+        let input = super::super::types::InputOptions {
+            suite: PathBuf::from(text("suite")?),
+            suite_sha256: text("suite_sha256")?.into(),
+            labels: PathBuf::from(text("labels")?),
+            labels_sha256: text("labels_sha256")?.into(),
+            output: super::super::types::OutputOptions {
+                output_root: output.clone(),
+                run_id: "fixed-precision".into(),
+            },
+        };
+        let command = super::super::types::RegressionCommand::FixedCandidate {
+            input: input.clone(),
+            pool_binding: PathBuf::from(text("pool")?),
+            pool_binding_sha256: text("pool_sha256")?.into(),
+            rerank_provider: crate::search::rerank::types::ProviderChoice::BgeLocal,
+            cutoffs: vec![5, 10, 20],
+        };
+        let produced = super::super::fixed::run(&command)?;
+        let run_path = output.join("fixed-precision/run.json");
+        let pin = FilePin::new(
+            run_path,
+            digest(&fs::read(output.join("fixed-precision/run.json"))?),
+        )?;
+        let base_pin = FilePin::new(input.labels.clone(), input.labels_sha256.clone())?;
+        let base = super::super::labels::load_capture_base(
+            &input.suite,
+            &input.suite_sha256,
+            &[base_pin],
+            &input.output,
+        )?;
+        let loaded = load_run_subjects_with_capture(&pin, &base)?;
+        assert_eq!(loaded.capture.questions().len(), 9);
+        assert!(
+            loaded
+                .capture
+                .questions()
+                .iter()
+                .all(|q| q.slots().len() == 200)
+        );
+        let sideview = super::super::fixed_encoding::original_score_sideview(base.windows_bytes())
+            .map_err(|_| anyhow::anyhow!("NATIVE_SCORE_SPANS"))?;
+        let original_token =
+            std::str::from_utf8(&base.windows_bytes()[sideview[0].scores[1].number_span.clone()])?;
+        let original_std: f64 = original_token.parse()?;
+        let original_codec =
+            super::super::fixed_encoding::encode_numeric(original_token.as_bytes())
+                .map_err(|_| anyhow::anyhow!("NATIVE_CODEC"))?;
+        assert_eq!(original_std.to_bits(), 0x3fcf53742dc8f823);
+        assert!(
+            matches!(original_codec.value,Ok(NumericValue::F64(v)) if v.to_bits()==original_std.to_bits())
+        );
+        let first = &loaded.capture.questions()[0];
+        let target = first
+            .slots()
+            .iter()
+            .find(|s| s.input_slot() == 1)
+            .context("NATIVE_SLOT_MISSING")?;
+        assert!(
+            matches!(target.original_score(),NumericValue::F64(v) if v.to_bits()==original_std.to_bits())
+        );
+        let wire = labels::read_pin(&pin)?;
+        let spans = wire.value()["questions"]
+            .as_array()
+            .context("NATIVE_QUESTIONS")?
+            .iter()
+            .map(|q| {
+                q["slots"]
+                    .as_array()
+                    .context("NATIVE_SLOTS")
+                    .map(|s| s.iter().map(|_| ScoreSpans::default()).collect())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut walk = RunScoreWalk {
+            bytes: wire.bytes(),
+            pos: 0,
+            spans,
+        };
+        walk.value(ScorePath::Root, 0)?;
+        let rank = target.final_rank() - 1;
+        let original_run_token = std::str::from_utf8(
+            wire.bytes()
+                .get(
+                    walk.spans[0][rank]
+                        .original
+                        .clone()
+                        .context("NATIVE_ORIGINAL_TOKEN")?,
+                )
+                .context("NATIVE_ORIGINAL_TOKEN")?,
+        )?;
+        let rerank_run_token = std::str::from_utf8(
+            wire.bytes()
+                .get(
+                    walk.spans[0][rank]
+                        .rerank
+                        .clone()
+                        .flatten()
+                        .context("NATIVE_RERANK_TOKEN")?,
+                )
+                .context("NATIVE_RERANK_TOKEN")?,
+        )?;
+        let rerank_std: f64 = rerank_run_token.parse()?;
+        assert_eq!(
+            target
+                .rerank_score()
+                .context("NATIVE_RERANK_MISSING")?
+                .to_bits(),
+            rerank_std.to_bits()
+        );
+        assert_eq!(
+            target.rerank_score().unwrap().to_bits(),
+            produced["questions"][0]["slots"][rank]["rerank_score"]
+                .as_f64()
+                .context("NATIVE_PRODUCED_SCORE")?
+                .to_bits()
+        );
+        let first_original = first
+            .slots()
+            .iter()
+            .find(|s| s.input_slot() == 0)
+            .context("NATIVE_U64_SLOT")?;
+        assert_eq!(first_original.original_score(), NumericValue::U64(u64::MAX));
+        let negative = first
+            .slots()
+            .iter()
+            .find(|s| s.input_slot() == 2)
+            .context("NATIVE_ZERO_SLOT")?;
+        assert!(
+            matches!(negative.original_score(),NumericValue::F64(v) if v.to_bits()==(-0.0f64).to_bits())
+        );
+        let summary = json!({"run_file_sha256":loaded.observed_file_sha256(),"total_slots":1800,"windows_original_token":original_token,"original_codec_bits":format!("{:016x}",original_std.to_bits()),"run_original_token":original_run_token,"getter_original_bits":format!("{:016x}",match target.original_score(){NumericValue::F64(v)=>v.to_bits(),_=>0}),"run_rerank_token":rerank_run_token,"getter_rerank_bits":format!("{:016x}",target.rerank_score().unwrap().to_bits()),"peer_response_parser":"unchanged default serde; not used as expected raw peer token","model_executions":"NOT_VERIFIED","quality_status":produced["quality_status"]});
+        fs::write(
+            output.join("precision-proof.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+        println!("NATIVE_PRECISION {}", serde_json::to_string(&summary)?);
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires explicitly pinned approved synthetic Runs and fresh artifact root"]
     fn approved_native_filepin_consumer() -> Result<()> {
