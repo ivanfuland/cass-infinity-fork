@@ -28,6 +28,7 @@ pub(crate) enum LabelAction {
 }
 
 /// Request pins are not proofs. The engine always invokes the 07 loaders.
+#[derive(Clone)]
 pub(crate) struct CompareRequest {
     pub(crate) left: FilePin,
     pub(crate) right: FilePin,
@@ -41,6 +42,7 @@ pub(crate) struct CompareRequest {
     pub(crate) import: Option<ImportRequest>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ImportRequest {
     pub(crate) manifest: FilePin,
     pub(crate) answers: FilePin,
@@ -1663,6 +1665,155 @@ mod tests {
         ancestors: Vec<(PathBuf, String)>,
         artifact_root: PathBuf,
         expected_rc: u8,
+    }
+
+    fn native_request() -> Result<(CompareRequest, PathBuf, u8)> {
+        let path =
+            dotenvy::var("CASS_S2_08_NATIVE_INPUTS").context("S208_NATIVE_INPUTS_REQUIRED")?;
+        let fixture: NativeFixture = serde_json::from_slice(&std::fs::read(path)?)?;
+        let root = tempfile::Builder::new()
+            .prefix("s208-cycle-")
+            .tempdir_in(&fixture.artifact_root)?
+            .keep();
+        let request = CompareRequest {
+            left: FilePin::new(fixture.left, fixture.left_sha256)?,
+            right: FilePin::new(fixture.right, fixture.right_sha256)?,
+            labels: FilePin::new(fixture.labels, fixture.labels_sha256)?,
+            ancestors: fixture
+                .ancestors
+                .into_iter()
+                .map(|(p, h)| FilePin::new(p, h))
+                .collect::<Result<_>>()?,
+            capture_suite: fixture.suite,
+            capture_suite_sha256: fixture.suite_sha256,
+            output: OutputOptions {
+                output_root: root.clone(),
+                run_id: "before".into(),
+            },
+            cutoffs: vec![5, 10, 20],
+            action: LabelAction::Evaluate,
+            import: None,
+        };
+        Ok((request, root, fixture.expected_rc))
+    }
+
+    fn native_report(
+        root: &std::path::Path,
+        request: &CompareRequest,
+        outcome: &CompareOutcome,
+    ) -> Result<Value> {
+        let directory = root.join(&request.output.run_id);
+        let bytes = std::fs::read(directory.join(&outcome.stdout.report.relative_path))?;
+        assert_eq!(labels::digest(&bytes), outcome.stdout.report.sha256);
+        super::super::off::write_private(
+            root,
+            &format!("stdout-{}.json", request.output.run_id),
+            &serde_json::to_value(outcome.stdout())?,
+        )?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    #[test]
+    #[ignore = "Uses pinned private synthetic Runs and owned persistent output"]
+    fn owned_filepin_three_action_lifecycle() -> Result<()> {
+        let (mut request, root, expected) = native_request()?;
+        let original: Vec<_> = std::iter::once(&request.left)
+            .chain(std::iter::once(&request.right))
+            .chain(std::iter::once(&request.labels))
+            .chain(&request.ancestors)
+            .map(|p| {
+                Ok((
+                    p.path().to_path_buf(),
+                    labels::digest(&std::fs::read(p.path())?),
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let before = run(&request)?;
+        assert_eq!(before.stdout.rc, expected);
+        let before_report = native_report(&root, &request, &before)?;
+        if expected == 2 {
+            assert!(
+                matches!(before.exit(),CompareExit::Two(code) if code.as_str()=="INCOMPLETE_LABELS")
+            );
+        }
+        request.action = LabelAction::ExportBlind;
+        request.output.run_id = "export".into();
+        let exported = run(&request)?;
+        assert!(matches!(exported.exit(), CompareExit::Zero));
+        let export_report = native_report(&root, &request, &exported)?;
+        assert_eq!(export_report["quality_status"], "NOT_EVALUATED");
+        assert!(export_report["success_summary"].is_null());
+        let bundle: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/blind-bundle.json"))?)?;
+        let answers = serde_json::json!({"schema":"cass.regression-blind-answers.v1","bundle_id":bundle["bundle_id"],
+            "records":bundle["items"].as_array().context("bundle items")?.iter().map(|item|serde_json::json!({"opaque_id":item["opaque_id"],"value":"direct"})).collect::<Vec<_>>()});
+        let answer_ref = super::super::off::write_private(&root, "answers.json", &answers)?;
+        request.action = LabelAction::ImportBlind;
+        request.output.run_id = "import".into();
+        request.import = Some(ImportRequest {
+            manifest: FilePin::new(
+                root.join("export/blind-manifest.json"),
+                export_report["annotation_artifacts"]["manifest"]["sha256"]
+                    .as_str()
+                    .context("manifest hash")?
+                    .into(),
+            )?,
+            answers: FilePin::new(
+                root.join("answers.json"),
+                answer_ref["sha256"]
+                    .as_str()
+                    .context("answers hash")?
+                    .into(),
+            )?,
+            version: "s208-native-import".into(),
+        });
+        let imported = run(&request)?;
+        assert!(matches!(imported.exit(), CompareExit::Zero));
+        let imported_report = native_report(&root, &request, &imported)?;
+        assert_eq!(imported_report["quality_status"], "NOT_EVALUATED");
+        assert!(imported_report["success_summary"].is_null());
+        let old = request.labels.clone();
+        request.labels = FilePin::new(
+            root.join("import/labels-new.json"),
+            imported_report["annotation_artifacts"]["labels"]["sha256"]
+                .as_str()
+                .context("new labels hash")?
+                .into(),
+        )?;
+        request.ancestors.insert(0, old);
+        request.action = LabelAction::Evaluate;
+        request.import = None;
+        request.output.run_id = "after".into();
+        let after = run(&request)?;
+        assert!(matches!(after.exit(), CompareExit::Zero));
+        let after_report = native_report(&root, &request, &after)?;
+        assert_eq!(after_report["diagnostics"]["unknown_union_keys"], 0);
+        let mut bad = request.clone();
+        bad.output.run_id = "bad-pin".into();
+        bad.left = FilePin::new(bad.left.path().to_path_buf(), "0".repeat(64))?;
+        let rejected = run(&bad)?;
+        assert!(matches!(rejected.exit(), CompareExit::Two(_)));
+        let rejected_report = native_report(&root, &bad, &rejected)?;
+        assert_eq!(rejected_report["terminal"], "FAILED");
+        let mut invalid = request.clone();
+        invalid.output.run_id = "bad-flags".into();
+        invalid.import = Some(ImportRequest {
+            manifest: bad.left.clone(),
+            answers: bad.right.clone(),
+            version: "invalid".into(),
+        });
+        assert!(run(&invalid).is_err());
+        assert!(!root.join("bad-flags").exists());
+        for (p, hash) in &original {
+            assert_eq!(&labels::digest(&std::fs::read(p)?), hash);
+        }
+        super::super::off::write_private(
+            &root,
+            "native-lifecycle.json",
+            &serde_json::json!({"before":before_report["rc"],"after":after_report["rc"],"unknown_before":before_report["diagnostics"]["unknown_union_keys"],"unknown_after":0,"old_inputs_unchanged":true,"cass_process_exit_verified":false}),
+        )?;
+        println!("S208_NATIVE_LIFECYCLE_ARTIFACT={}", root.display());
+        Ok(())
     }
 
     #[test]
