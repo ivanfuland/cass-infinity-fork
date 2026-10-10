@@ -94286,6 +94286,20 @@ mod legacy_source_filter_tests {
         assert_eq!(err.code, 9);
         assert_eq!(err.kind, CliErrorKind::DbOpen.kind_str());
         assert!(!err.retryable);
+        assert!(err.message.contains("schema version 0"), "{}", err.message);
+        assert!(
+            err.message.contains(&format!(
+                "predates version {}'s",
+                crate::storage::schema::CURRENT_SCHEMA_VERSION
+            )),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("rebuild-only shape"),
+            "{}",
+            err.message
+        );
         let conn = open_legacy_local_db_for_update(&db_path);
         assert_eq!(
             crate::storage::schema::read_user_version(&conn).expect("reread legacy version"),
