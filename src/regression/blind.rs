@@ -3228,6 +3228,7 @@ mod tests {
         let request_path = copied.join("request.json");
         let actual = labels::read_subject(&request_path)?.value().clone();
         let mut cases = vec![
+            ("run-rerank", "/request/rerank", json!(false)),
             ("run-vector", "/request/vector_search_mode", json!("fast")),
             (
                 "run-filter",
@@ -3334,6 +3335,7 @@ mod tests {
             ),
             ("trace-n", "rrf_limit", json!(6)),
             ("trace-k", "rerank_limit", json!(2)),
+            ("trace-rerank-off", "rerank_limit", Value::Null),
             ("trace-provider", "rerank_provider", json!("qwen3-local")),
             ("trace-embedding", "embedding_model", json!("other-model")),
             (
