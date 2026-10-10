@@ -43,12 +43,12 @@ const CLAUDE_CODE_NORMALIZATION_SPEC: &[ConnectorRequirement] = &[
     ConnectorRequirement {
         id: "CC-MUST-005",
         level: RequirementLevel::Must,
-        description: "message roles are non-empty members of the normalized role enum",
+        description: "message roles belong to the six-role connector vocabulary",
     },
     ConnectorRequirement {
         id: "CC-MUST-006",
         level: RequirementLevel::Must,
-        description: "message content is non-empty after connector filtering",
+        description: "messages in these non-empty fixtures retain non-empty content",
     },
     ConnectorRequirement {
         id: "CC-MUST-007",
@@ -117,7 +117,7 @@ fn assert_valid_role(message: &NormalizedMessage, requirement: &ConnectorRequire
     assert!(
         matches!(
             message.role.as_str(),
-            "user" | "assistant" | "system" | "tool"
+            "user" | "assistant" | "system" | "tool_call" | "tool_result" | "reasoning"
         ),
         "{} {}: invalid role {:?}",
         requirement.id,
@@ -244,7 +244,22 @@ fn claude_code_connector_output_conforms_to_normalized_contract() {
     }
 
     let alpha = conversation_by_external_id(&conversations, "projects/org/team/alpha.jsonl");
-    assert_eq!(alpha.messages.len(), 3);
+    assert_eq!(
+        alpha
+            .messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "tool_call", "user"]
+    );
+    let beta = conversation_by_external_id(&conversations, "projects/org/team/beta.jsonl");
+    assert_eq!(
+        beta.messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "assistant"]
+    );
     assert!(
         alpha
             .messages
@@ -296,20 +311,19 @@ fn claude_code_connector_output_conforms_to_normalized_contract() {
         assistant_requirement.id,
         assistant_requirement.description
     );
-    assert!(
-        assistant.content.contains("[Tool: Read"),
-        "{} {}",
-        assistant_requirement.id,
-        assistant_requirement.description
-    );
-    assert_eq!(
-        assistant.invocations.len(),
-        1,
-        "{} {}",
-        assistant_requirement.id,
-        assistant_requirement.description
-    );
-    let invocation = &assistant.invocations[0];
+    assert_eq!(assistant.content, "I will inspect the fixture.");
+    assert!(!assistant.content.contains("[Tool:"));
+    assert!(assistant.invocations.is_empty());
+    let tool_call = &alpha.messages[2];
+    assert_eq!(tool_call.author.as_deref(), Some("claude-sonnet-4"));
+    assert!(tool_call.content.contains("Read"));
+    assert!(tool_call.content.contains("/workspace/alpha/session.jsonl"));
+    assert_eq!(tool_call.extra["tool_call_id"], "toolu_1");
+    let expected_args = serde_json::json!({"file_path": "/workspace/alpha/session.jsonl"});
+    assert_eq!(tool_call.extra["tool_call_args"], expected_args);
+    assert_eq!(tool_call.invocations.len(), 1);
+    let invocation = &tool_call.invocations[0];
+    assert_eq!(invocation.arguments.as_ref(), Some(&expected_args));
     assert_eq!(invocation.kind, "tool");
     assert_eq!(invocation.name, "Read");
     assert_eq!(invocation.call_id.as_deref(), Some("toolu_1"));

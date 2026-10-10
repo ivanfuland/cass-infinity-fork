@@ -209,10 +209,27 @@ fn scan_flattens_text_and_tool_content_blocks() {
     let convs = connector.scan(&ctx).unwrap();
 
     assert_eq!(convs.len(), 1);
-    let content = &convs[0].messages[0].content;
-    assert!(content.contains("Let me check."));
-    assert!(content.contains("[tool: read_file]"));
-    assert!(content.contains("Done."));
+    let messages = &convs[0].messages;
+    assert_eq!(
+        messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+        ["assistant", "tool_call"]
+    );
+    for (idx, message) in messages.iter().enumerate() {
+        assert_eq!(message.idx, idx as i64);
+        assert_eq!(message.created_at, Some(1749981600000));
+    }
+    let assistant = &messages[0];
+    assert_eq!(assistant.content, "Let me check.\nDone.");
+    assert!(!assistant.content.contains("[tool:"));
+    assert!(assistant.invocations.is_empty());
+    let tool_call = &messages[1];
+    assert_eq!(tool_call.content, "read_file");
+    assert_eq!(tool_call.invocations.len(), 1);
+    let invocation = &tool_call.invocations[0];
+    assert_eq!(invocation.kind, "tool");
+    assert_eq!(invocation.name, "read_file");
+    assert_eq!(invocation.arguments, None);
+    assert_eq!(invocation.call_id, None);
 }
 
 #[test]

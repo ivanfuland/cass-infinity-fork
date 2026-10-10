@@ -98,18 +98,20 @@ fn codex_connector_includes_agent_reasoning() {
     // (token_count does not create a synthetic message)
     assert_eq!(c.messages.len(), 3);
 
-    // Check reasoning is included with correct author tag
-    let reasoning = c
-        .messages
-        .iter()
-        .find(|m| m.author.as_deref() == Some("reasoning"));
-    assert!(reasoning.is_some());
-    assert!(
-        reasoning
-            .unwrap()
-            .content
-            .contains("think about this carefully")
+    assert_eq!(
+        c.messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "reasoning", "assistant"]
     );
+    for (idx, message) in c.messages.iter().enumerate() {
+        assert_eq!(message.idx, idx as i64);
+    }
+    // Role carries the semantic type; this fixture supplies no model author.
+    let reasoning = c.messages.iter().find(|m| m.role == "reasoning").unwrap();
+    assert_eq!(reasoning.author, None);
+    assert_eq!(reasoning.content, "Let me think about this carefully...");
 
     let assistant = c.messages.iter().find(|m| {
         m.role == "assistant" && m.author.is_none() && m.content.contains("here is solution")
@@ -171,13 +173,24 @@ fn codex_connector_parses_real_tool_call_fixture() {
 
     let tool_msg = &conv.messages[1];
     assert_eq!(tool_msg.idx, 1);
-    assert_eq!(tool_msg.role, "assistant");
+    assert_eq!(conv.messages[0].role, "user");
+    assert_eq!(conv.messages[0].idx, 0);
+    assert_eq!(tool_msg.role, "tool_call");
     assert_eq!(tool_msg.author, None);
-    assert_eq!(tool_msg.content, "[Tool: bash]");
+    assert!(tool_msg.content.contains("bash"));
+    assert!(
+        tool_msg
+            .content
+            .contains("rg -n tool_call src/connectors/codex.rs")
+    );
+    assert_eq!(tool_msg.extra["tool_call_id"], "call_codex_tool_001");
+    let expected_args = serde_json::json!({"cmd": "rg -n tool_call src/connectors/codex.rs", "cwd": "/test/soldier/project"});
+    assert_eq!(tool_msg.extra["tool_call_args"], expected_args);
     assert_eq!(tool_msg.invocations.len(), 1);
     assert!(tool_msg.extra.get("payload").is_some());
 
     let invocation = &tool_msg.invocations[0];
+    assert_eq!(invocation.arguments.as_ref(), Some(&expected_args));
     assert_eq!(invocation.kind, "tool");
     assert_eq!(invocation.name, "bash");
     assert_eq!(invocation.call_id.as_deref(), Some("call_codex_tool_001"));
@@ -245,17 +258,37 @@ fn codex_connector_indexes_modern_response_items() {
     assert_eq!(convs.len(), 1);
 
     let conv = &convs[0];
-    assert!(
+    assert_eq!(
         conv.messages
             .iter()
-            .any(|message| message.content.contains("git log --grep='bd-2mb03'")),
-        "function_call arguments should be searchable"
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "tool_call", "tool_result", "assistant"]
     );
-    assert!(
-        conv.messages
-            .iter()
-            .any(|message| message.role == "tool" && message.content.contains("bd-2mb03.6.5")),
-        "function_call_output text should be searchable"
+    for (idx, message) in conv.messages.iter().enumerate() {
+        assert_eq!(message.idx, idx as i64);
+    }
+    let tool_call = &conv.messages[1];
+    assert!(tool_call.content.contains("exec_command"));
+    assert!(tool_call.content.contains("git log --grep='bd-2mb03'"));
+    let expected_args = serde_json::json!({"cmd": "git log --grep='bd-2mb03'"});
+    assert_eq!(tool_call.extra["tool_call_args"], expected_args);
+    assert_eq!(tool_call.extra["tool_call_id"], "call-modern-1");
+    assert_eq!(tool_call.invocations.len(), 1);
+    let invocation = &tool_call.invocations[0];
+    assert_eq!(invocation.kind, "tool");
+    assert_eq!(invocation.name, "exec_command");
+    assert_eq!(invocation.call_id.as_deref(), Some("call-modern-1"));
+    assert_eq!(invocation.arguments.as_ref(), Some(&expected_args));
+    let tool_result = &conv.messages[2];
+    assert_eq!(
+        tool_result.extra["tool_call_id"],
+        tool_call.extra["tool_call_id"]
+    );
+    assert_eq!(
+        tool_result.content,
+        "Output:\ncommit abc123 bd-2mb03.6.5 add CASS-backed handoff context enrichment\n",
+        "the normalized tool result must retain the complete output"
     );
     assert_eq!(
         conv.messages
