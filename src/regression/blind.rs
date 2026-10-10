@@ -3150,6 +3150,164 @@ mod tests {
             rejected,
             "strongly pinned Run request must match actual request evidence"
         );
+        let request_path = copied.join("request.json");
+        let actual = labels::read_subject(&request_path)?.value().clone();
+        let mut cases = vec![
+            ("run-vector", "/request/vector_search_mode", json!("fast")),
+            (
+                "run-filter",
+                "/request/resolved_filters/agents",
+                json!(["other"]),
+            ),
+            ("run-page-k", "/request/page_k", json!(2)),
+            (
+                "run-provider",
+                "/backend_identity/provider",
+                json!("qwen3-local"),
+            ),
+            (
+                "run-model",
+                "/backend_identity/actual_model",
+                json!("other-model"),
+            ),
+            (
+                "run-document-policy",
+                "/backend_identity/document_assembly_policy",
+                json!("other-policy"),
+            ),
+            (
+                "run-client-policy",
+                "/backend_identity/client_submission_policy",
+                json!("other-policy"),
+            ),
+            (
+                "run-server-policy",
+                "/backend_identity/server_template_policy",
+                json!("other-policy"),
+            ),
+            (
+                "missing-request-ref",
+                "/request/request_evidence_sha256",
+                Value::Null,
+            ),
+            (
+                "missing-window-ref",
+                "/questions/0/window_evidence",
+                Value::Null,
+            ),
+            ("run-n", "/request/n", json!(6)),
+        ];
+        let mut outcomes = vec![];
+        for (name, pointer, changed) in cases.drain(..) {
+            let mut candidate = baseline.clone();
+            *candidate
+                .pointer_mut(pointer)
+                .context("NATIVE_MUTATION_PATH")? = changed;
+            if name == "run-n" {
+                candidate["terminal"] = json!("SHORT_WINDOW");
+                for question in candidate["questions"]
+                    .as_array_mut()
+                    .context("NATIVE_QUESTIONS")?
+                {
+                    question["requested_n"] = json!(6);
+                    question["terminal"] = json!("SHORT_WINDOW");
+                    question["full_requested_n_claim"] = json!(false);
+                }
+            }
+            let sha = overwrite_owned_fixture(&copied_run, &candidate)?;
+            let result = load_run_subjects_with_capture(
+                &FilePin::new(copied_run.clone(), sha.clone())?,
+                &base,
+            );
+            outcomes.push(json!({"case":name,"run_sha256":sha,"rejected":result.is_err(),"error":result.err().map(|e|e.to_string())}));
+        }
+        // Remove each required nullable or non-nullable actual request field,
+        // then strongly re-pin the modified file through Run.
+        for field in FULL_REQUEST_FIELDS {
+            let mut changed = actual.clone();
+            changed
+                .as_object_mut()
+                .context("NATIVE_REQUEST_OBJECT")?
+                .remove(field);
+            let sha = overwrite_owned_fixture(&request_path, &changed)?;
+            let mut candidate = baseline.clone();
+            candidate["request"]["request_evidence_sha256"] = json!(sha);
+            let run_sha = overwrite_owned_fixture(&copied_run, &candidate)?;
+            let result = load_run_subjects_with_capture(
+                &FilePin::new(copied_run.clone(), run_sha.clone())?,
+                &base,
+            );
+            outcomes.push(json!({"case":format!("request-missing-{field}"),"run_sha256":run_sha,"request_sha256":sha,"rejected":result.is_err(),"error":result.err().map(|e|e.to_string())}));
+        }
+        overwrite_owned_fixture(&request_path, &actual)?;
+        // Both declarations can agree while contradicting the pinned request.
+        // Repair the dependent page trace hashes so only the request closure
+        // can reject this mutation before all other existing checks pass.
+        let evidence_path = copied.join(
+            baseline["questions"][0]["window_evidence"]["relative_path"]
+                .as_str()
+                .context("NATIVE_EVIDENCE_PATH")?,
+        );
+        let evidence = labels::read_subject(&evidence_path)?.value().clone();
+        for (name, field, changed) in [
+            ("trace-mode", "mode", json!("hybrid")),
+            ("trace-vector", "vector_search_mode", json!("fast")),
+            (
+                "trace-filter",
+                "resolved_filters",
+                json!({"agents":["other"]}),
+            ),
+            ("trace-n", "rrf_limit", json!(6)),
+            ("trace-k", "rerank_limit", json!(2)),
+            ("trace-provider", "rerank_provider", json!("qwen3-local")),
+            ("trace-embedding", "embedding_model", json!("other-model")),
+            (
+                "trace-policy",
+                "client_submission_policy",
+                json!("other-policy"),
+            ),
+            ("both-mode", "mode", json!("hybrid")),
+        ] {
+            let mut changed_evidence = evidence.clone();
+            changed_evidence["request"][field] = changed;
+            let decoded: WindowEvidence = serde_json::from_value(changed_evidence.clone())?;
+            let trace_sha = digest(&serde_json::to_vec(&decoded)?);
+            let evidence_sha = overwrite_owned_fixture(&evidence_path, &changed_evidence)?;
+            let mut candidate = baseline.clone();
+            candidate["questions"][0]["window_evidence"]["sha256"] = json!(evidence_sha);
+            if name == "both-mode" {
+                candidate["request"]["search_mode"] = json!("hybrid");
+                candidate["request"]["vector_search_mode"] = json!("exact");
+            }
+            for page in candidate["questions"][0]["pages"]
+                .as_array_mut()
+                .context("NATIVE_PAGES")?
+            {
+                let path = copied.join(
+                    page["page_evidence"]["relative_path"]
+                        .as_str()
+                        .context("NATIVE_PAGE_PATH")?,
+                );
+                let mut value = labels::read_subject(&path)?.value().clone();
+                value["trace_sha256"] = json!(trace_sha);
+                page["trace_sha256"] = json!(trace_sha);
+                page["page_evidence"]["sha256"] = json!(overwrite_owned_fixture(&path, &value)?);
+            }
+            let sha = overwrite_owned_fixture(&copied_run, &candidate)?;
+            let result = load_run_subjects_with_capture(
+                &FilePin::new(copied_run.clone(), sha.clone())?,
+                &base,
+            );
+            outcomes.push(json!({"case":name,"run_sha256":sha,"rejected":result.is_err(),"error":result.err().map(|e|e.to_string())}));
+        }
+        fs::write(
+            output.join("request-matrix.json"),
+            serde_json::to_vec_pretty(&outcomes)?,
+        )?;
+        assert!(
+            outcomes.iter().all(|row| row["rejected"] == true),
+            "all real FilePin request mutations must reject: {outcomes:?}"
+        );
         Ok(())
     }
 
