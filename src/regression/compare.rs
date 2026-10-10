@@ -1822,6 +1822,71 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Uses pinned private synthetic inputs and persistent rejection reports"]
+    fn owned_filepin_rejection_boundaries() -> Result<()> {
+        // The runner owns this environment value; this test only reads it.
+        // Every action uses a distinct output name and never changes input bytes.
+        let (request, root, _) = native_request()?;
+        for (name, cutoffs) in [
+            ("empty-cutoffs", vec![]),
+            ("zero-cutoff", vec![0]),
+            ("duplicate-cutoffs", vec![5, 5]),
+        ] {
+            let mut invalid = request.clone();
+            invalid.output.run_id = name.into();
+            invalid.cutoffs = cutoffs;
+            assert!(run(&invalid).is_err());
+            assert!(!root.join(name).exists());
+        }
+        let mut cases = Vec::new();
+        let mut wrong_suite = request.clone();
+        wrong_suite.capture_suite_sha256 = "0".repeat(64);
+        cases.push(("wrong-suite", wrong_suite));
+        let mut missing_ancestor = request.clone();
+        assert!(!missing_ancestor.ancestors.is_empty());
+        missing_ancestor.ancestors.remove(0);
+        cases.push(("missing-ancestor", missing_ancestor));
+        let mut duplicate_ancestor = request.clone();
+        duplicate_ancestor
+            .ancestors
+            .push(duplicate_ancestor.ancestors[0].clone());
+        cases.push(("duplicate-ancestor", duplicate_ancestor));
+        let mut wrong_active = request.clone();
+        wrong_active.labels = FilePin::new(request.labels.path().to_path_buf(), "0".repeat(64))?;
+        cases.push(("wrong-active", wrong_active));
+        let mut wrong_manifest = request.clone();
+        wrong_manifest.action = LabelAction::ImportBlind;
+        wrong_manifest.import = Some(ImportRequest {
+            manifest: FilePin::new(request.left.path().to_path_buf(), "0".repeat(64))?,
+            answers: request.right.clone(),
+            version: "rejected-import".into(),
+        });
+        cases.push(("wrong-manifest", wrong_manifest));
+        for (name, mut invalid) in cases {
+            invalid.output.run_id = name.into();
+            let outcome = run(&invalid)?;
+            assert!(matches!(outcome.exit(), CompareExit::Two(_)), "{name}");
+            let report = native_report(&root, &invalid, &outcome)?;
+            assert_eq!(report["terminal"], "FAILED", "{name}");
+            assert!(report["success_summary"].is_null(), "{name}");
+            assert!(!root.join(name).join("labels-new.json").exists());
+        }
+        let mut protected = request.clone();
+        protected.output.output_root = request.left.path().parent().context("Run parent")?.into();
+        protected.output.run_id = "s208-protected-rejection".into();
+        assert!(run(&protected).is_err());
+        assert!(
+            !protected
+                .output
+                .output_root
+                .join(&protected.output.run_id)
+                .exists()
+        );
+        println!("S208_NATIVE_REJECTIONS_ARTIFACT={}", root.display());
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "Needs explicitly pinned private synthetic FilePin fixture"]
     fn owned_filepin_evaluate_report_end() -> Result<()> {
         let path =
