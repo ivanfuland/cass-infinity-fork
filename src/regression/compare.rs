@@ -1713,6 +1713,269 @@ mod tests {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    fn native_label_extension(
+        request: &mut CompareRequest,
+        root: &std::path::Path,
+        name: &str,
+    ) -> Result<()> {
+        request.action = LabelAction::ExportBlind;
+        request.output.run_id = format!("{name}-export");
+        let outcome = run(request)?;
+        assert!(matches!(outcome.exit(), CompareExit::Zero));
+        let exported = native_report(root, request, &outcome)?;
+        assert!(exported["success_summary"].is_null());
+        let bundle: Value = serde_json::from_slice(&std::fs::read(
+            root.join(&request.output.run_id).join("blind-bundle.json"),
+        )?)?;
+        let answers = serde_json::json!({"schema":"cass.regression-blind-answers.v1","bundle_id":bundle["bundle_id"],"records":bundle["items"].as_array().context("items")?.iter().map(|i|serde_json::json!({"opaque_id":i["opaque_id"],"value":"direct"})).collect::<Vec<_>>()});
+        let answer_root = tempfile::Builder::new()
+            .prefix("answers-")
+            .tempdir_in(root)?
+            .keep();
+        let ar = super::super::off::write_private(&answer_root, "answers.json", &answers)?;
+        let manifest = root
+            .join(&request.output.run_id)
+            .join("blind-manifest.json");
+        request.action = LabelAction::ImportBlind;
+        request.output.run_id = format!("{name}-import");
+        request.import = Some(ImportRequest {
+            manifest: FilePin::new(
+                manifest,
+                exported["annotation_artifacts"]["manifest"]["sha256"]
+                    .as_str()
+                    .context("manifest")?
+                    .into(),
+            )?,
+            answers: FilePin::new(
+                answer_root.join("answers.json"),
+                ar["sha256"].as_str().context("answers")?.into(),
+            )?,
+            version: format!("{name}-labels"),
+        });
+        let outcome = run(request)?;
+        assert!(matches!(outcome.exit(), CompareExit::Zero));
+        let imported = native_report(root, request, &outcome)?;
+        assert!(imported["success_summary"].is_null());
+        let old = request.labels.clone();
+        request.labels = FilePin::new(
+            root.join(&request.output.run_id).join("labels-new.json"),
+            imported["annotation_artifacts"]["labels"]["sha256"]
+                .as_str()
+                .context("labels")?
+                .into(),
+        )?;
+        request.ancestors.insert(0, old);
+        request.action = LabelAction::Evaluate;
+        request.import = None;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "Actually collects owned synthetic full/fixed Runs and preserves their reports"]
+    fn owned_producer_short_and_cross_mode_reports() -> Result<()> {
+        use super::super::types::{InputOptions, RegressionCommand};
+        use crate::search::query::SearchMode;
+        use crate::storage::api::Profile;
+        let path = dotenvy::var("CASS_S2_08_NATIVE_INPUTS")?;
+        let fixture: NativeFixture = serde_json::from_slice(&std::fs::read(path)?)?;
+        let root = tempfile::Builder::new()
+            .prefix("s208-producer-")
+            .tempdir_in(&fixture.artifact_root)?
+            .keep();
+        for count in [12, 0] {
+            let (_package, data, command) =
+                super::super::off::tests::full_fixture_mode(20, 20, SearchMode::Lexical, None);
+            let RegressionCommand::FullSearch {
+                input: original,
+                database,
+                source_manifest,
+                source_producer_receipt,
+                ..
+            } = command
+            else {
+                unreachable!()
+            };
+            let data_path = data.keep();
+            let profile = root.join(format!("short-{count}"));
+            let query = if count == 12 {
+                "shortmatch"
+            } else {
+                "absentmatch"
+            };
+            let tool = std::process::Command::new("python3")
+                .arg(fixture.artifact_root.join("prepare-owned-package.py"))
+                .arg(&original.suite)
+                .arg(&profile)
+                .arg(query)
+                .output()?;
+            ensure!(tool.status.success(), "OWNED_PACKAGE_PREPARATION_FAILED");
+            let prepared: Value = serde_json::from_slice(&tool.stdout)?;
+            let owned_data = profile.join("data");
+            let db_rel = database.strip_prefix(&data_path)?.to_path_buf();
+            let manifest_rel = source_manifest.strip_prefix(&data_path)?.to_path_buf();
+            let receipt_rel = source_producer_receipt
+                .strip_prefix(&data_path)?
+                .to_path_buf();
+            std::fs::rename(&data_path, &owned_data)?;
+            let database = owned_data.join(db_rel);
+            let source_manifest = owned_data.join(manifest_rel);
+            let receipt = owned_data.join(receipt_rel);
+            if count == 12 {
+                let writer = crate::storage::testing::open_writable_for_tests(
+                    &database,
+                    Profile::Production,
+                )?;
+                writer.execute_batch("UPDATE conversations SET title='retrieval shortmatch' WHERE id IN (SELECT id FROM conversations ORDER BY id LIMIT 12); PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+                drop(writer);
+                let storage = crate::storage::testing::open_franken_storage_for_tests(
+                    &database,
+                    Profile::Production,
+                )?;
+                storage.rebuild_lex_domain_from_db(None)?;
+                drop(storage);
+            }
+            let binding_root = profile.join("binding");
+            std::fs::create_dir(&binding_root)?;
+            let (expected, expected_sha) =
+                crate::search::regression_binding::tests::prepare_expected(
+                    &binding_root,
+                    &database,
+                    &source_manifest,
+                );
+            let output = profile.join("full-output");
+            std::fs::create_dir(&output)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let input = InputOptions {
+                suite: prepared["suite"].as_str().context("suite")?.into(),
+                suite_sha256: prepared["suite_sha256"]
+                    .as_str()
+                    .context("suite SHA")?
+                    .into(),
+                labels: prepared["labels"].as_str().context("labels")?.into(),
+                labels_sha256: prepared["labels_sha256"]
+                    .as_str()
+                    .context("labels SHA")?
+                    .into(),
+                output: OutputOptions {
+                    output_root: output,
+                    run_id: "full-short".into(),
+                },
+            };
+            let command = RegressionCommand::FullSearch {
+                input: input.clone(),
+                database,
+                expected_binding: expected,
+                expected_binding_sha256: expected_sha,
+                source_manifest,
+                source_producer_receipt: receipt.clone(),
+                source_producer_receipt_sha256: labels::digest(&std::fs::read(&receipt)?),
+                search_mode: SearchMode::Lexical,
+                vector_search_mode: None,
+                rrf_limit: 20,
+                rerank: super::super::types::RerankSwitch::Off,
+                page_size: None,
+                rerank_provider: None,
+                cutoffs: vec![5, 10, 20],
+            };
+            super::super::off::run(&command)?;
+            let full_path = input.output.output_root.join("full-short/run.json");
+            let full = FilePin::new(
+                full_path.clone(),
+                labels::digest(&std::fs::read(&full_path)?),
+            )?;
+            let compare_root = profile.join("compare");
+            std::fs::create_dir(&compare_root)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&compare_root, std::fs::Permissions::from_mode(0o700))?;
+            }
+            let mut request = CompareRequest {
+                left: full.clone(),
+                right: full.clone(),
+                labels: FilePin::new(input.labels.clone(), input.labels_sha256.clone())?,
+                ancestors: vec![],
+                capture_suite: input.suite.clone(),
+                capture_suite_sha256: input.suite_sha256.clone(),
+                output: OutputOptions {
+                    output_root: compare_root.clone(),
+                    run_id: "short-evaluate".into(),
+                },
+                cutoffs: vec![5, 10, 20],
+                action: LabelAction::Evaluate,
+                import: None,
+            };
+            native_label_extension(&mut request, &compare_root, "short")?;
+            request.output.run_id = "short-evaluate".into();
+            let outcome = run(&request)?;
+            assert!(matches!(outcome.exit(), CompareExit::Zero));
+            let report = native_report(&compare_root, &request, &outcome)?;
+            assert_eq!(report["terminal"], "SHORT_WINDOW");
+            assert_eq!(report["diagnostics"]["unknown_union_keys"], 0);
+            assert_eq!(report["questions"][8]["left"]["actual_n"], count);
+            assert!(
+                report["questions"].as_array().unwrap()[..8]
+                    .iter()
+                    .all(|q| q["left"]["actual_n"] == 20)
+            );
+            let cuts = report["aggregate_metrics"]["cutoffs"]
+                .as_array()
+                .context("cutoffs")?;
+            assert_eq!(cuts[0]["supported_count"], if count == 12 { 9 } else { 8 });
+            assert_eq!(cuts[1]["supported_count"], if count == 12 { 9 } else { 8 });
+            assert_eq!(cuts[2]["supported_count"], 8);
+            assert_eq!(report["success_summary"]["overall_complete_quality"], false);
+            if count == 12 {
+                let fixed_output = profile.join("fixed-output");
+                std::fs::create_dir(&fixed_output)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(
+                        &fixed_output,
+                        std::fs::Permissions::from_mode(0o700),
+                    )?;
+                }
+                let mut fixed_input = input.clone();
+                fixed_input.output = OutputOptions {
+                    output_root: fixed_output,
+                    run_id: "fixed".into(),
+                };
+                let fixed_command = RegressionCommand::FixedCandidate {
+                    input: fixed_input.clone(),
+                    pool_binding: prepared["pool"].as_str().context("pool")?.into(),
+                    pool_binding_sha256: prepared["pool_sha256"]
+                        .as_str()
+                        .context("pool SHA")?
+                        .into(),
+                    rerank_provider: crate::search::rerank::types::ProviderChoice::BgeLocal,
+                    cutoffs: vec![5, 10, 20],
+                };
+                super::super::fixed::run(&fixed_command)?;
+                let fixed_path = fixed_input.output.output_root.join("fixed/run.json");
+                request.right = FilePin::new(
+                    fixed_path.clone(),
+                    labels::digest(&std::fs::read(&fixed_path)?),
+                )?;
+                native_label_extension(&mut request, &compare_root, "cross-mode")?;
+                request.output.run_id = "cross-mode-evaluate".into();
+                let outcome = run(&request)?;
+                assert!(
+                    matches!(outcome.exit(),CompareExit::Two(code) if code.as_str()=="NON_COMPARABLE_MODE")
+                );
+                let report = native_report(&compare_root, &request, &outcome)?;
+                assert_eq!(report["terminal"], "NON_COMPARABLE_MODE");
+                assert!(report["success_summary"].is_null());
+            }
+        }
+        println!("S208_NATIVE_PRODUCER_ARTIFACT={}", root.display());
+        Ok(())
+    }
+
     #[test]
     #[ignore = "Uses pinned private synthetic Runs and owned persistent output"]
     fn owned_filepin_three_action_lifecycle() -> Result<()> {
