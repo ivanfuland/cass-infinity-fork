@@ -49,6 +49,7 @@ pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
+pub mod regression;
 pub(crate) mod recipes_robot_docs;
 pub(crate) mod recovery_support_bundle;
 pub mod release_verify;
@@ -288,9 +289,21 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+pub use search::regression_input::RegressionInputCommand;
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
+    /// Validate pinned regression inputs without retrieval or evaluation.
+    Regression {
+        #[command(subcommand)]
+        action: regression::RegressionCommand,
+    },
+    /// Inspect or verify frozen retrieval regression inputs without repair.
+    RegressionInput {
+        #[command(subcommand)]
+        action: RegressionInputCommand,
+    },
     /// Launch interactive TUI
     Tui {
         /// Render once and exit (headless-friendly)
@@ -6665,6 +6678,14 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
         heuristic_note,
     } = parsed;
 
+    if matches!(
+        &cli.command,
+        Some(Commands::Regression { .. } | Commands::RegressionInput { .. })
+    ) {
+        search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
+            .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+    }
+
     let stdout_is_tty = io::stdout().is_terminal();
     let stderr_is_tty = io::stderr().is_terminal();
     configure_color(cli.color, stdout_is_tty, stderr_is_tty);
@@ -6886,6 +6907,55 @@ async fn execute_cli(
     let filter = build_robot_aware_log_filter(robot_mode, cli.verbose, cli.quiet);
 
     match &command {
+        Commands::Regression { action } => {
+            search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
+                .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+            if matches!(action, regression::RegressionCommand::Compare { .. }) {
+                let outcome = regression::run::run_compare(action).map_err(|error| CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: regression::compare::error_code(&error).as_str().to_string(),
+                    hint: None,
+                    retryable: false,
+                })?;
+                let payload = serde_json::to_string(outcome.stdout()).map_err(|_| CliError {
+                    code: 2,
+                    kind: CliErrorKind::Usage.kind_str(),
+                    message: "REGRESSION_INPUT_ENCODING_FAILED".to_string(),
+                    hint: None,
+                    retryable: false,
+                })?;
+                println!("{payload}");
+                if let regression::compare::CompareExit::Two(error_code) = outcome.exit() {
+                    return Err(CliError {
+                        code: 2,
+                        kind: CliErrorKind::Usage.kind_str(),
+                        message: error_code.as_str().to_string(),
+                        hint: None,
+                        retryable: false,
+                    });
+                }
+            } else {
+                let result = regression::run::run(action).map_err(|error| CliError {
+                    code: 2, kind: CliErrorKind::Usage.kind_str(),
+                    message: regression::run::error_code(&error).to_string(),
+                    hint: None, retryable: false,
+                })?;
+                println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
+            }
+        }
+        Commands::RegressionInput { action } => {
+            search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
+                .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+            let result = search::regression_input::run(action).map_err(|error| CliError {
+                code: 2, kind: CliErrorKind::Usage.kind_str(),
+                message: search::regression_input::error_code(&error).to_string(),
+                hint: None, retryable: false,
+            })?;
+            if let Some(result) = result {
+                println!("{}", serde_json::to_string(&result).map_err(|_| CliError::unknown("REGRESSION_INPUT_ENCODING_FAILED"))?);
+            }
+        }
         Commands::Tui { data_dir, .. } => {
             let log_dir = data_dir.clone().unwrap_or_else(default_data_dir);
             std::fs::create_dir_all(&log_dir).ok();
@@ -7334,6 +7404,7 @@ async fn execute_cli(
                         vector_search_mode,
                         semantic_opts,
                         rerank_ctx,
+                        None,
                     )?;
                 }
                 Commands::Pack {
@@ -21082,6 +21153,8 @@ fn default_w1_marker_path(explicit: Option<&PathBuf>, db_path: &std::path::Path)
 
 fn describe_command(cli: &Cli) -> String {
     match &cli.command {
+        Some(Commands::Regression { .. }) => "regression".to_string(),
+        Some(Commands::RegressionInput { .. }) => "regression-input".to_string(),
         Some(Commands::Tui { .. }) => "tui".to_string(),
         Some(Commands::Index { .. }) => "index".to_string(),
         Some(Commands::Sync { .. }) => "sync".to_string(),
@@ -21405,6 +21478,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Expand { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::RegressionInput { .. } | Commands::Regression { .. } => true,
         Commands::Doctor { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Timeline { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
@@ -24159,21 +24233,46 @@ fn effective_embedding_model(cli_model: Option<&str>) -> Option<String> {
 fn build_rerank_backend(
     provider: crate::search::rerank::types::ProviderChoice,
     origin: &str,
-) -> Result<Box<dyn crate::search::rerank::types::RerankBackend>, crate::search::rerank::types::RerankError>
-{
+) -> Result<
+    Box<dyn crate::search::rerank::types::RerankBackend>,
+    crate::search::rerank::types::RerankError,
+> {
+    build_rerank_backend_with_trace(provider, origin, None)
+}
+
+fn build_rerank_backend_with_trace(
+    provider: crate::search::rerank::types::ProviderChoice,
+    origin: &str,
+    trace: Option<std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>>,
+) -> Result<
+    Box<dyn crate::search::rerank::types::RerankBackend>,
+    crate::search::rerank::types::RerankError,
+> {
     use crate::search::rerank::types::ProviderChoice;
     match provider {
-        ProviderChoice::Qwen3Local => Ok(Box::new(
-            crate::search::rerank::qwen::QwenBackend::new(origin)?,
-        )),
-        ProviderChoice::BgeLocal => Ok(Box::new(
-            crate::search::rerank::bge::BgeBackend::new(origin)?,
-        )),
+        ProviderChoice::Qwen3Local => {
+            let backend = crate::search::rerank::qwen::QwenBackend::new(origin)?;
+            Ok(Box::new(match trace {
+                Some(trace) => backend.with_request_trace(trace),
+                None => backend,
+            }))
+        }
+        ProviderChoice::BgeLocal => {
+            let backend = crate::search::rerank::bge::BgeBackend::new(origin)?;
+            Ok(Box::new(match trace {
+                Some(trace) => backend.with_request_trace(trace),
+                None => backend,
+            }))
+        }
         ProviderChoice::OpenrouterQwen38b
         | ProviderChoice::OpenrouterCohere4Fast
-        | ProviderChoice::OpenrouterVoyage25Lite => Ok(Box::new(
-            crate::search::rerank::openrouter::OpenRouterBackend::from_env(provider)?,
-        )),
+        | ProviderChoice::OpenrouterVoyage25Lite => {
+            let backend = crate::search::rerank::openrouter::OpenRouterBackend::from_env(provider)?;
+            Ok(Box::new(match trace {
+                Some(trace) => backend.with_request_trace(trace),
+                None => backend,
+            }))
+        }
     }
 }
 
@@ -24541,6 +24640,269 @@ struct SearchRenderInput {
     highlight: bool,
 }
 
+struct RegressionSearchExecution {
+    context: std::sync::Arc<crate::search::regression_io::RegressionIoContext>,
+    verified: Option<crate::search::regression_binding::VerifiedSearch>,
+    binding: crate::search::regression_binding::InputBinding,
+    trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>,
+    endpoint: Option<String>,
+    window_root: Option<PathBuf>,
+    source_manifest: PathBuf,
+}
+
+fn regression_search_error(error: impl std::fmt::Display) -> CliError {
+    let code = crate::search::regression_input::error_code(&anyhow::anyhow!(error.to_string()));
+    CliError::usage(
+        if code == "REGRESSION_INPUT_FAILED" {
+            "REGRESSION_SEARCH_EVIDENCE_FAILED"
+        } else {
+            code
+        },
+        None,
+    )
+}
+
+fn verify_regression_run_end(run: &RegressionSearchExecution) -> CliResult<()> {
+    let digest: [u8; 32] = hex::decode(&run.binding.database_sha256)
+        .map_err(regression_search_error)?
+        .try_into()
+        .map_err(|_| regression_search_error("BINDING_DIGEST_INVALID"))?;
+    run.context
+        .verify_database_digest(&digest)
+        .map_err(regression_search_error)?;
+    crate::search::regression_binding::verify_source_manifest(&run.source_manifest, &run.binding.source_manifest_sha256)
+        .map_err(regression_search_error)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn regression_request_evidence(
+    filters: &crate::search::query::SearchFilters,
+    mode: crate::search::query::SearchMode,
+    vector_mode: crate::search::query::VectorSearchMode,
+    limit: usize,
+    timeout_ms: Option<u64>,
+    semantic: &SemanticSearchOptions,
+    rerank: &RerankRequestContext,
+    embedding_binding: Option<&serde_json::Value>,
+) -> CliResult<serde_json::Value> {
+    let mut filters = serde_json::to_value(filters).map_err(regression_search_error)?;
+    for key in ["agents", "workspaces", "roles", "session_paths"] {
+        if let Some(values) = filters
+            .get_mut(key)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            values.sort_by_key(serde_json::Value::to_string);
+        }
+    }
+    Ok(serde_json::json!({
+        "mode": search_mode_canonical_str(mode),
+        "vector_search_mode": vector_search_mode_wire(vector_mode),
+        "resolved_filters": filters,
+        "rrf_limit": limit,
+        "timeout_ms": timeout_ms,
+        "embedding_model": semantic.model,
+        "embedding_http_configuration": embedding_binding,
+        "document_assembly_policy": semantic.rerank.then(
+            crate::search::rerank::context::document_assembly_policy
+        ),
+        "client_submission_policy": semantic.rerank.then_some("verbatim-query-documents-v1"),
+        "server_template_policy": serde_json::Value::Null,
+        "rerank_limit": semantic.rerank_limit,
+        "rerank_provider": semantic.rerank_provider,
+        "time_selectors": rerank.time_selectors,
+        "daemon": rerank.daemon,
+        "no_daemon": rerank.no_daemon,
+    }))
+}
+
+/// Shared retrieval dispatch. CLI rendering and aggregate recording consume
+/// the same structured result, without changing candidate selection.
+#[allow(clippy::too_many_arguments)]
+fn execute_search_retrieval(
+    client: &crate::search::query::SearchClient,
+    query: &str,
+    filters: &crate::search::query::SearchFilters,
+    search_limit: usize,
+    search_offset: usize,
+    search_sparse_threshold: usize,
+    search_field_mask: crate::search::query::FieldMask,
+    mode_meta: &mut SearchModeMeta,
+    hybrid_fail_open: bool,
+) -> CliResult<crate::search::query::SearchResult> {
+    use crate::search::query::SearchMode;
+    Ok(match mode_meta.realized {
+        SearchMode::Lexical => client
+            .search_with_fallback(
+                query,
+                filters.clone(),
+                search_limit,
+                search_offset,
+                search_sparse_threshold,
+                search_field_mask,
+            )
+            .map_err(|e| {
+                let chain = format!("{e:#}");
+                if error_chain_indicates_lexical_index_building(&chain) {
+                    search_lexical_index_building_cli_error(&chain)
+                } else if error_chain_indicates_lexical_index_absent(&chain) {
+                    search_lexical_index_absent_cli_error(&chain)
+                } else {
+                    CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("search failed: {e}"),
+                        hint: None,
+                        retryable: true,
+                    }
+                }
+            })?,
+        SearchMode::Semantic => {
+            // cass#256: in the `-baseline` build (the `semantic` Cargo
+            // feature is disabled), `--mode semantic` returns a clear
+            // CLI envelope rather than reaching code that would expect a
+            // working ORT runtime. Hybrid degrades to lexical via the
+            // existing fail-open path; lexical-only mode is unaffected.
+            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
+            {
+                // Suppress unused-binding warnings in the baseline arm:
+                // every input is consumed by the documented error envelope.
+                let _ = (
+                    &filters,
+                    query,
+                    search_limit,
+                    search_offset,
+                );
+                let _ = client;
+                Err::<crate::search::query::SearchResult, CliError>(CliError {
+                    code: 15,
+                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message:
+                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
+                            .to_string(),
+                    hint: Some(
+                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
+                            .to_string(),
+                    ),
+                    retryable: false,
+                })?
+            }
+            #[cfg(any(feature = "semantic", feature = "infinity"))]
+            {
+                let (hits, candidate_meta) = client
+                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
+                    .map_err(|e| {
+                        let err_str = e.to_string();
+                        if err_str.contains("unavailable")
+                            || err_str.contains("no embedder")
+                        {
+                            CliError {
+                                code: 15,
+                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                                message: "Semantic search not available".to_string(),
+                                hint: Some(
+                                    "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
+                                        .to_string(),
+                                ),
+                                retryable: false,
+                            }
+                        } else {
+                            CliError {
+                                code: 9,
+                                kind: CliErrorKind::Search.kind_str(),
+                                message: format!("semantic search failed: {e}"),
+                                hint: Some(
+                                    "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                        .to_string(),
+                                ),
+                                retryable: true,
+                            }
+                        }
+                    })?;
+                crate::search::query::SearchResult {
+                    hits,
+                    wildcard_fallback: false,
+                    cache_stats: crate::search::query::CacheStats::default(),
+                    suggestions: Vec::new(),
+                    total_count: None,
+                    candidates: Some(candidate_meta),
+                    semantic_degraded: false,
+                }
+            }
+        }
+        SearchMode::Hybrid => match client.search_hybrid(
+            query,
+            query,
+            filters.clone(),
+            search_limit,
+            search_offset,
+            search_sparse_threshold,
+            search_field_mask,
+        ) {
+            Ok(result) => {
+                sync_search_mode_meta_after_hybrid(mode_meta, &result);
+                result
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if hybrid_fail_open
+                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
+                {
+                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
+                    client
+                        .search_with_fallback(
+                            query,
+                            filters.clone(),
+                            search_limit,
+                            search_offset,
+                            search_sparse_threshold,
+                            search_field_mask,
+                        )
+                        .map_err(|fallback_err| {
+                            let chain = format!("{fallback_err:#}");
+                            if error_chain_indicates_lexical_index_building(&chain) {
+                                search_lexical_index_building_cli_error(&chain)
+                            } else if error_chain_indicates_lexical_index_absent(&chain) {
+                                search_lexical_index_absent_cli_error(&chain)
+                            } else {
+                                CliError {
+                                    code: 9,
+                                    kind: CliErrorKind::Search.kind_str(),
+                                    message: format!(
+                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
+                                    ),
+                                    hint: None,
+                                    retryable: true,
+                                }
+                            }
+                        })?
+                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
+                    return Err(CliError {
+                        code: 15,
+                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                        message: "Hybrid search not available (requires semantic search)".to_string(),
+                        hint: Some(
+                            "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode hybrid when lexical evidence is acceptable"
+                                .to_string(),
+                        ),
+                        retryable: false,
+                    });
+                } else {
+                    return Err(CliError {
+                        code: 9,
+                        kind: CliErrorKind::Search.kind_str(),
+                        message: format!("hybrid search failed: {e}"),
+                        hint: Some(
+                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
+                                .to_string(),
+                        ),
+                        retryable: true,
+                    });
+                }
+            }
+        },
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -24575,6 +24937,7 @@ fn run_cli_search(
     vector_search_mode: Option<crate::search::query::VectorSearchMode>,
     semantic_opts: SemanticSearchOptions,
     rerank_ctx: RerankRequestContext,
+    mut regression: Option<RegressionSearchExecution>,
 ) -> CliResult<()> {
     #[cfg(feature = "infinity")]
     use crate::search::model_manager::load_infinity_semantic_context;
@@ -24591,10 +24954,47 @@ fn run_cli_search(
 
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
+    if regression.is_some() && mode != Some(SearchMode::Lexical) {
+        #[cfg(not(feature = "infinity"))]
+        return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
+        if !matches!(semantic_opts.model.as_deref(), Some("bge-m3" | "infinity"))
+            || semantic_opts.use_daemon
+        {
+            return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
+        }
+    }
+    #[cfg(feature = "infinity")]
+    let regression_embedding_config = if regression.is_some() && mode != Some(SearchMode::Lexical) {
+        let config = crate::search::infinity::InfinityConfig::from_env();
+        if config.embed_model != "BAAI/bge-m3" {
+            return Err(regression_search_error(
+                "REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH",
+            ));
+        }
+        Some(config)
+    } else {
+        None
+    };
+    #[cfg(feature = "infinity")]
+    let regression_embedding_binding = regression_embedding_config.as_ref().map(|config| serde_json::json!({
+        "requested_model": config.embed_model,
+        "origin_sha256": crate::search::regression_trace::TextDigest::of(&config.base_url).sha256,
+        "dimension": config.expected_dim,
+        "timeout_ms": config.timeout.as_millis() as u64,
+        "max_batch": config.max_batch,
+    }));
+    #[cfg(not(feature = "infinity"))]
+    let regression_embedding_binding: Option<serde_json::Value> = None;
 
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let data_dir = regression
+        .as_ref()
+        .map(|run| run.context.run_root().to_path_buf())
+        .unwrap_or_else(|| data_dir_override.clone().unwrap_or_else(default_data_dir));
     let index_path = crate::indexer::expected_index_dir(&data_dir);
-    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let db_path = regression
+        .as_ref()
+        .map(|run| run.context.database().to_path_buf())
+        .unwrap_or_else(|| db_override.unwrap_or_else(|| data_dir.join("agent_search.db")));
     let db_exists = db_path.exists();
 
     let mut filters = SearchFilters::default();
@@ -24786,7 +25186,10 @@ fn run_cli_search(
         let provider = semantic_opts
             .rerank_provider
             .expect("rerank_window_enabled guarantees a provider");
-        let endpoint = rerank_endpoint_origin(provider);
+        let endpoint = regression
+            .as_ref()
+            .and_then(|run| run.endpoint.clone())
+            .unwrap_or_else(|| rerank_endpoint_origin(provider));
         let binding = build_request_binding(
             query,
             &filters,
@@ -24806,19 +25209,79 @@ fn run_cli_search(
         )
         .map_err(cursor_window_cli_error)?;
 
-        let store = crate::search::rerank::window::WindowStore::new(
-            &data_dir,
-            crate::search::rerank::window::WindowPolicy::default(),
-        )
+        let store = match regression.as_ref() {
+            Some(run) => crate::search::rerank::window::WindowStore::open_existing(
+                run.window_root.as_deref().unwrap_or(&data_dir),
+                crate::search::rerank::window::WindowPolicy::default(),
+            ),
+            None => crate::search::rerank::window::WindowStore::new(
+                &data_dir,
+                crate::search::rerank::window::WindowPolicy::default(),
+            ),
+        }
         .map_err(cursor_window_cli_error)?;
         let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let (snapshot, page_offset) = store
-            .load(cursor_str, &binding, &db_path, now_ms)
-            .map_err(cursor_window_cli_error)?;
+        let (snapshot, page_offset) = match regression.as_ref() {
+            Some(run) => store.load_for_regression(cursor_str, &binding, &run.context, now_ms),
+            None => store.load(cursor_str, &binding, &db_path, now_ms),
+        }
+        .map_err(cursor_window_cli_error)?;
+        if let Some(run) = regression.as_ref() {
+            let evidence: crate::search::regression_trace::WindowEvidence = serde_json::from_value(
+                snapshot
+                    .retrieval_status
+                    .get("regression")
+                    .cloned()
+                    .ok_or_else(|| regression_search_error("TRACE_WINDOW_MISSING"))?,
+            )
+            .map_err(regression_search_error)?;
+            if evidence.request
+                != regression_request_evidence(
+                    &filters,
+                    mode.unwrap_or_default(),
+                    vector_search_mode.unwrap_or_default(),
+                    limit_val,
+                    timeout_ms,
+                    &semantic_opts,
+                    &rerank_ctx,
+                    regression_embedding_binding.as_ref(),
+                )?
+            {
+                return Err(regression_search_error("TRACE_WINDOW_REQUEST_MISMATCH"));
+            }
+            evidence
+                .validate(
+                    &run.context,
+                    &run.binding,
+                    query,
+                    &snapshot.result.hits,
+                    snapshot.rerank.applied,
+                )
+                .map_err(regression_search_error)?;
+            if evidence.failure_reason.is_some()
+                || (!evidence.final_slots.is_empty() && !evidence.applied)
+            {
+                return Err(regression_search_error("TRACE_FAILED_WINDOW"));
+            }
+        }
         let resolved_window_id = crate::search::rerank::window::cursor_window_id(cursor_str)
             .map_err(cursor_window_cli_error)?;
         let page_hits = crate::search::rerank::window::page_hits(&snapshot, page_offset)
             .map_err(cursor_window_cli_error)?;
+        if let Some(run) = regression.as_ref() {
+            let evidence: crate::search::regression_trace::WindowEvidence =
+                serde_json::from_value(snapshot.retrieval_status["regression"].clone())
+                    .map_err(regression_search_error)?;
+            crate::search::regression_trace::persist_page(
+                &run.context,
+                &evidence,
+                &resolved_window_id,
+                page_offset,
+                page_hits.len(),
+                true,
+            )
+            .map_err(regression_search_error)?;
+        }
 
         // Restore the frozen first-lookup facts; never recompute them against
         // the current data (that would let a later page fabricate aggregates
@@ -24900,19 +25363,15 @@ fn run_cli_search(
             None => Aggregations::default(),
         };
         let explanation = match snapshot.explanation.clone() {
-            Some(value) => {
-                Some(
-                    serde_json::from_value::<QueryExplanation>(value).map_err(|_| CliError {
-                        code: 2,
-                        kind: CliErrorKind::CursorDecode.kind_str(),
-                        message: "rerank window explanation could not be restored".to_string(),
-                        hint: Some(
-                            "Re-run the search to start a new page sequence.".to_string(),
-                        ),
-                        retryable: false,
-                    })?,
-                )
-            }
+            Some(value) => Some(serde_json::from_value::<QueryExplanation>(value).map_err(
+                |_| CliError {
+                    code: 2,
+                    kind: CliErrorKind::CursorDecode.kind_str(),
+                    message: "rerank window explanation could not be restored".to_string(),
+                    hint: Some("Re-run the search to start a new page sequence.".to_string()),
+                    retryable: false,
+                },
+            )?),
             None => None,
         };
 
@@ -24947,6 +25406,10 @@ fn run_cli_search(
             continuable: true,
             meta,
         });
+
+        if let Some(run) = regression.as_ref() {
+            verify_regression_run_end(run)?;
+        }
 
         return render_search_output(SearchRenderInput {
             query: query.to_string(),
@@ -24988,30 +25451,37 @@ fn run_cli_search(
         });
     }
 
-    let search_self_heal = ensure_lexical_assets_for_search(
-        &data_dir,
-        &db_path,
-        &index_path,
-        timeout_ms,
-        start_time,
-        dry_run,
-        // #287: robot callers get a bounded degraded refusal (stable reason
-        // code) instead of a silent multi-minute inline lexical rebuild.
-        effective_robot.is_some(),
-    )?;
-    if search_self_heal.action != "skipped" {
-        tracing::info!(
-            action = search_self_heal.action,
-            reason = search_self_heal.reason.as_deref(),
-            indexed_docs = search_self_heal.indexed_docs,
-            "search lexical self-heal completed"
-        );
-    }
-    // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
-    let tantivy_index_initialized = crate::search::lexical_index_health::searchable_index_exists(&db_path);
-    let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
+    let client = if let Some(run) = regression.as_mut() {
+        run.verified
+            .take()
+            .expect("verified regression client consumed once")
+            .client
+    } else {
+        let search_self_heal = ensure_lexical_assets_for_search(
+            &data_dir,
+            &db_path,
+            &index_path,
+            timeout_ms,
+            start_time,
+            dry_run,
+            // #287: robot callers get a bounded degraded refusal (stable reason
+            // code) instead of a silent multi-minute inline lexical rebuild.
+            effective_robot.is_some(),
+        )?;
+        if search_self_heal.action != "skipped" {
+            tracing::info!(
+                action = search_self_heal.action,
+                reason = search_self_heal.reason.as_deref(),
+                indexed_docs = search_self_heal.indexed_docs,
+                "search lexical self-heal completed"
+            );
+        }
+        // W2-6 Task1: reseated onto the lex_docs/fts_lex SQLite domain.
+        let tantivy_index_initialized =
+            crate::search::lexical_index_health::searchable_index_exists(&db_path);
+        let rebuild_active = probe_index_run_lock(&data_dir, &db_path).active;
 
-    let client = SearchClient::open_with_options(
+        let client = SearchClient::open_with_options(
         &index_path,
         Some(&db_path),
         SearchClientOptions {
@@ -25080,6 +25550,8 @@ fn run_cli_search(
             retryable: true,
         }
     })?;
+        client
+    };
 
     // PR9 09a: the CLI flag is `Option<..>` so "absent" stays distinguishable
     // from "explicitly exact"; both run exact, but only an explicit value can
@@ -25099,7 +25571,7 @@ fn run_cli_search(
     // If semantic assets are unavailable, hybrid searches fail open to lexical
     // while robot metadata reports the realized mode and fallback reason.
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
-    let hybrid_fail_open = mode_meta.fail_open_on_semantic_unavailable();
+    let hybrid_fail_open = regression.is_none() && mode_meta.fail_open_on_semantic_unavailable();
 
     if matches!(
         mode_meta.requested,
@@ -25143,8 +25615,22 @@ fn run_cli_search(
         // M4-pre spike: route the bge-m3 / infinity embedder through the
         // Infinity HTTP context loader (no ONNX / model-file machinery).
         #[cfg(feature = "infinity")]
-        let setup_infinity = matches!(requested_model, Some("bge-m3") | Some("infinity"))
-            .then(|| load_infinity_semantic_context(&data_dir, &db_path));
+        let setup_infinity = if matches!(requested_model, Some("bge-m3") | Some("infinity")) {
+            Some(match regression.as_ref() {
+                Some(run) => {
+                    crate::search::model_manager::load_infinity_semantic_context_for_regression(
+                        &run.context,
+                        regression_embedding_config
+                            .as_ref()
+                            .expect("regression semantic configuration frozen before search"),
+                    )
+                    .map_err(regression_search_error)?
+                }
+                None => load_infinity_semantic_context(&data_dir, &db_path),
+            })
+        } else {
+            None
+        };
         #[cfg(not(feature = "infinity"))]
         let setup_infinity: Option<crate::search::model_manager::SemanticSetup> = None;
 
@@ -25253,7 +25739,12 @@ fn run_cli_search(
     // the two reads agree; reading before this point would mistake an allowed
     // first-lookup repair for a concurrent change.
     let rerank_stamp_before = if rerank_on {
-        crate::search::rerank::window::capture_index_stamp(&db_path).ok()
+        match regression.as_ref() {
+            Some(run) => {
+                crate::search::rerank::window::capture_index_stamp_for_regression(&run.context).ok()
+            }
+            None => crate::search::rerank::window::capture_index_stamp(&db_path).ok(),
+        }
     } else {
         None
     };
@@ -25329,173 +25820,34 @@ fn run_cli_search(
 
     // Track search timing breakdown (T7.4)
     let search_start = Instant::now();
-    let result = match mode_meta.realized {
-        SearchMode::Lexical => client
-            .search_with_fallback(
-                query,
-                filters.clone(),
-                search_limit,
-                search_offset,
-                search_sparse_threshold,
-                search_field_mask,
-            )
-            .map_err(|e| {
-                let chain = format!("{e:#}");
-                if error_chain_indicates_lexical_index_building(&chain) {
-                    search_lexical_index_building_cli_error(&chain)
-                } else if error_chain_indicates_lexical_index_absent(&chain) {
-                    search_lexical_index_absent_cli_error(&chain)
-                } else {
-                    CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("search failed: {e}"),
-                        hint: None,
-                        retryable: true,
-                    }
-                }
-            })?,
-        SearchMode::Semantic => {
-            // cass#256: in the `-baseline` build (the `semantic` Cargo
-            // feature is disabled), `--mode semantic` returns a clear
-            // CLI envelope rather than reaching code that would expect a
-            // working ORT runtime. Hybrid degrades to lexical via the
-            // existing fail-open path; lexical-only mode is unaffected.
-            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
-            {
-                // Suppress unused-binding warnings in the baseline arm:
-                // every input is consumed by the documented error envelope.
-                let _ = (&semantic_opts, &filters, &field_mask, query, search_limit, search_offset);
-                let _ = client;
-                Err::<crate::search::query::SearchResult, CliError>(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message:
-                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
-                            .to_string(),
-                    hint: Some(
-                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
-                            .to_string(),
-                    ),
-                    retryable: false,
-                })?
-            }
-            #[cfg(any(feature = "semantic", feature = "infinity"))]
-            {
-                let (hits, candidate_meta) = client
-                    .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
-                    .map_err(|e| {
-                        let err_str = e.to_string();
-                        if err_str.contains("unavailable")
-                            || err_str.contains("no embedder")
-                        {
-                            CliError {
-                                code: 15,
-                                kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                                message: "Semantic search not available".to_string(),
-                                hint: Some(
-                                    "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode semantic when lexical evidence is acceptable"
-                                        .to_string(),
-                                ),
-                                retryable: false,
-                            }
-                        } else {
-                            CliError {
-                                code: 9,
-                                kind: CliErrorKind::Search.kind_str(),
-                                message: format!("semantic search failed: {e}"),
-                                hint: Some(
-                                    "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                        .to_string(),
-                                ),
-                                retryable: true,
-                            }
-                        }
-                    })?;
-                crate::search::query::SearchResult {
-                    hits,
-                    wildcard_fallback: false,
-                    cache_stats: crate::search::query::CacheStats::default(),
-                    suggestions: Vec::new(),
-                    total_count: None,
-                    candidates: Some(candidate_meta),
-                    semantic_degraded: false,
-                }
-            }
-        }
-        SearchMode::Hybrid => match client.search_hybrid(
-            query,
-            query,
-            filters.clone(),
-            search_limit,
-            search_offset,
-            search_sparse_threshold,
-            search_field_mask,
-        ) {
-            Ok(result) => {
-                sync_search_mode_meta_after_hybrid(&mut mode_meta, &result);
-                result
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                if hybrid_fail_open
-                    && (err_str.contains("unavailable") || err_str.contains("no embedder"))
-                {
-                    mode_meta.fall_back_to_lexical(format!("hybrid execution unavailable: {e}"));
-                    client
-                        .search_with_fallback(
-                            query,
-                            filters.clone(),
-                            search_limit,
-                            search_offset,
-                            search_sparse_threshold,
-                            search_field_mask,
-                        )
-                        .map_err(|fallback_err| {
-                            let chain = format!("{fallback_err:#}");
-                            if error_chain_indicates_lexical_index_building(&chain) {
-                                search_lexical_index_building_cli_error(&chain)
-                            } else if error_chain_indicates_lexical_index_absent(&chain) {
-                                search_lexical_index_absent_cli_error(&chain)
-                            } else {
-                                CliError {
-                                    code: 9,
-                                    kind: CliErrorKind::Search.kind_str(),
-                                    message: format!(
-                                        "hybrid search failed ({e}); lexical fallback failed: {fallback_err}"
-                                    ),
-                                    hint: None,
-                                    retryable: true,
-                                }
-                            }
-                        })?
-                } else if err_str.contains("unavailable") || err_str.contains("no embedder") {
-                    return Err(CliError {
-                        code: 15,
-                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                        message: "Hybrid search not available (requires semantic search)".to_string(),
-                        hint: Some(
-                            "Run 'cass tui' and press Alt+S to set up semantic search, or omit --mode hybrid when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: false,
-                    });
-                } else {
-                    return Err(CliError {
-                        code: 9,
-                        kind: CliErrorKind::Search.kind_str(),
-                        message: format!("hybrid search failed: {e}"),
-                        hint: Some(
-                            "Retry with the default hybrid-preferred mode when lexical evidence is acceptable"
-                                .to_string(),
-                        ),
-                        retryable: true,
-                    });
-                }
-            }
-        },
-    };
+    let result = execute_search_retrieval(
+        &client, query, &filters, search_limit, search_offset,
+        search_sparse_threshold, search_field_mask, &mut mode_meta, hybrid_fail_open,
+    )?;
     let search_ms = search_start.elapsed().as_millis() as u64;
+    if regression.is_some()
+        && (result.semantic_degraded
+            || mode_meta.realized != mode_meta.requested
+            || result.candidates.as_ref().is_some_and(|c| c.incomplete))
+    {
+        return Err(regression_search_error("REGRESSION_RETRIEVAL_DEGRADED"));
+    }
+    if !rerank_on {
+        if let Some(run) = regression.as_ref() {
+            let hits = &result.hits[..limit_val.min(result.hits.len())];
+            let evidence = crate::search::regression_trace::off_evidence(
+                &run.context, &run.binding, query, hits,
+                regression_request_evidence(
+                    &filters, mode_meta.requested, vector_search_mode.unwrap_or_default(),
+                    limit_val, timeout_ms, &semantic_opts, &rerank_ctx,
+                    regression_embedding_binding.as_ref(),
+                )?,
+                mode_meta.realized != SearchMode::Semantic,
+            ).map_err(regression_search_error)?;
+            crate::search::regression_trace::persist_evidence(&run.context, &evidence)
+                .map_err(regression_search_error)?;
+        }
+    }
 
     // ------------------------------------------------------------------
     // P09 rerank window: first lookup.
@@ -25518,7 +25870,6 @@ fn run_cli_search(
     let mut window_snapshot: Option<crate::search::rerank::window::WindowSnapshot> = None;
     let mut window_id: Option<String> = None;
     let mut window_continuable = false;
-    let mut window_unavailable: Option<&'static str> = None;
     let mut window_meta: Option<RerankWindowMeta> = None;
     let mut window_display_state: Option<FrozenDisplayState> = None;
     // The over-fetch beyond the window (the N+1 sentinel and any aggregate
@@ -25528,372 +25879,54 @@ fn run_cli_search(
     let result = if !rerank_on {
         result
     } else {
-        let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-        let provider = semantic_opts
-            .rerank_provider
-            .expect("rerank_window_enabled guarantees a provider");
-        let endpoint = rerank_endpoint_origin(provider);
-        let binding = build_request_binding(
-            query,
-            &filters,
-            &rerank_ctx.time_selectors,
-            search_mode_canonical_str(mode.unwrap_or_default()),
-            vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
-            effective_model.as_deref(),
-            limit_val,
-            rerank_k,
-            provider,
-            &endpoint,
-            aggregate.as_deref(),
-            explain,
-            timeout_ms,
-            rerank_ctx.daemon,
-            rerank_ctx.no_daemon,
-        )
-        .ok();
-        // A request that cannot even be frozen (a bad local endpoint, a limit
-        // the binding rejects) must not drop the page: it degrades to
-        // "no rerank, no cursor" exactly like any other optional-stage failure.
-        if binding.is_none() {
-            window_unavailable =
-                Some(crate::search::rerank::window::WindowError::InvalidInput.as_str());
-        }
-
-        let crate::search::query::SearchResult {
-            hits: mut fetched_hits,
-            wildcard_fallback,
-            cache_stats,
-            suggestions,
-            total_count,
-            candidates,
-            semantic_degraded,
-        } = result;
-
-        // The window is the first `N` hits; the sentinel/aggregate over-fetch
-        // never reaches the model. The *whole* fetched pool (window + overflow)
-        // is what the aggregate/explain scope must be measured over, to match
-        // the closed-state path's scope exactly.
-        let window_len = limit_val.min(fetched_hits.len());
-        let overflow = fetched_hits.split_off(window_len);
-        let window_count = fetched_hits.len();
-        let mut scope_pool = fetched_hits.clone();
-        scope_pool.extend(overflow);
-        rerank_prefetch_hits = Some(scope_pool);
-
-        let mut window_result = crate::search::query::SearchResult {
-            hits: fetched_hits,
-            wildcard_fallback,
-            cache_stats,
-            suggestions,
-            total_count,
-            candidates,
-            semantic_degraded,
-        };
-
-        let mut identity = crate::search::rerank::types::CallIdentity {
-            actual_provider: None,
-            actual_model: None,
-            serving_provider: None,
-        };
-        let mut scored_count = 0usize;
-        let mut http_requests: Option<usize> = None;
-        let mut model_requests: Option<usize> = None;
-        let mut duration_ms = 0u64;
-        let mut failure_reason: Option<crate::search::rerank::types::RerankFailureReason> = None;
-        let mut http_status: Option<u16> = None;
-
-        if window_result.hits.is_empty() {
-            // Empty window: no model call at all.
-            http_requests = Some(0);
-            model_requests = Some(0);
-        } else if binding.is_none() {
-            // The request could not be frozen, so nothing may be sent to the
-            // model; the page is delivered unranked and without a cursor.
-            http_requests = Some(0);
-            model_requests = Some(0);
-        } else {
-            match crate::search::rerank::context::build_documents(
-                &db_path,
+        let outcome = score_search_first_window(
+            FirstWindowInput {
                 query,
-                &window_result.hits,
-            ) {
-                Ok(documents) if !documents.is_empty() => {
-                    match build_rerank_backend(provider, &endpoint) {
-                        Ok(backend) => {
-                            let call_started = Instant::now();
-                            match backend.rerank(query, &documents) {
-                                Ok(response) => {
-                                    duration_ms = response.duration_ms;
-                                    // The call layer re-proves the completeness
-                                    // the adapter promises: the score set must be
-                                    // exactly the window length and a valid
-                                    // permutation of it. Only then is the window
-                                    // replaced -- in one step, so a short,
-                                    // duplicated or out-of-range set can never
-                                    // drop a candidate or half-apply scores.
-                                    let expected_len = window_result.hits.len();
-                                    let order = (response.scores.len() == expected_len)
-                                        .then(|| {
-                                            crate::search::rerank::types::stable_rank_order(
-                                                &response.scores,
-                                            )
-                                            .ok()
-                                        })
-                                        .flatten()
-                                        .filter(|order| {
-                                            let mut seen = vec![false; expected_len];
-                                            order.len() == expected_len
-                                                && order.iter().all(|&index| {
-                                                    index < expected_len
-                                                        && !std::mem::replace(
-                                                            &mut seen[index],
-                                                            true,
-                                                        )
-                                                })
-                                        });
-                                    match order {
-                                        Some(order) => {
-                                            let hits =
-                                                std::mem::take(&mut window_result.hits);
-                                            let mut slots: Vec<
-                                                Option<crate::search::query::SearchHit>,
-                                            > = hits.into_iter().map(Some).collect();
-                                            let mut reordered =
-                                                Vec::with_capacity(slots.len());
-                                            for &index in &order {
-                                                if let Some(mut hit) = slots[index].take() {
-                                                    hit.rerank_score =
-                                                        Some(response.scores[index]);
-                                                    reordered.push(hit);
-                                                }
-                                            }
-                                            debug_assert_eq!(reordered.len(), expected_len);
-                                            window_result.hits = reordered;
-                                            rerank_applied = true;
-                                            scored_count = expected_len;
-                                            http_requests = Some(response.http_requests);
-                                            model_requests = Some(1);
-                                            identity = response.identity;
-                                        }
-                                        None => {
-                                            // Not a complete, valid permutation:
-                                            // every original hit and score is
-                                            // kept exactly as it was.
-                                            failure_reason = Some(
-                                                crate::search::rerank::types::RerankFailureReason::InvalidResponse,
-                                            );
-                                            duration_ms =
-                                                call_started.elapsed().as_millis() as u64;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    // The call really ran and really waited, so
-                                    // its duration is the measured one -- not 0,
-                                    // which is reserved for "no call". Its
-                                    // request count is not provable, so it stays
-                                    // null rather than guessed 0.
-                                    duration_ms = call_started.elapsed().as_millis() as u64;
-                                    failure_reason = Some(error.reason);
-                                    http_status = error.http_status;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            // Construction sent no request, so both counts are a
-                            // provable 0 and no time was spent calling.
-                            http_requests = Some(0);
-                            model_requests = Some(0);
-                            failure_reason = Some(error.reason);
-                            http_status = error.http_status;
-                        }
-                    }
-                }
-                Ok(_) => {
-                    // Empty document list (a candidate could not be proven):
-                    // the whole window is returned unranked, no request made.
-                    http_requests = Some(0);
-                    model_requests = Some(0);
-                    failure_reason = Some(
-                        crate::search::rerank::types::RerankFailureReason::UnscoreableInput,
-                    );
-                }
-                Err(error) => {
-                    // Document assembly failed before any request.
-                    http_requests = Some(0);
-                    model_requests = Some(0);
-                    failure_reason = Some(error.reason);
-                    http_status = error.http_status;
-                }
-            }
-        }
-
-        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
-        let policy = crate::search::rerank::window::WindowPolicy::default();
-        let expires_at_ms = now_ms.saturating_add(policy.ttl_ms as i64);
-
-        // Aggregate/explain facts for the window, computed over the *original*
-        // prefetch scope, before the display projection.
-        let aggregate_scope: &[crate::search::query::SearchHit] =
-            rerank_prefetch_hits.as_deref().unwrap_or(&window_result.hits);
-        let (frozen_total_matches, frozen_total_matches_exact) = if has_aggregation {
-            (aggregate_scope.len(), false)
-        } else {
-            (
-                window_result.total_count.unwrap_or(window_count),
-                window_result.total_count.is_some(),
-            )
-        };
-        let aggregates_value = if has_aggregation {
-            serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
-        } else {
-            None
-        };
-        let explanation_value = if explain {
-            serde_json::to_value(
-                QueryExplanation::analyze(query, &filters)
-                    .with_wildcard_fallback(window_result.wildcard_fallback),
-            )
-            .ok()
-        } else {
-            None
-        };
-
-        let timed_out_now = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
-        // The first lookup's single index-state collection. The partial-index
-        // decision reads it directly, and the frozen display facts are built
-        // from this same value, so a first lookup reads the index state once --
-        // not once for `partial` and again for `--robot-meta`.
-        let state_meta_value =
-            state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true);
-        // Partial indexes and incomplete candidate scans both block a cursor,
-        // independent of the caller's `--robot-meta` projection.
-        let partial_now = window_result
-            .candidates
-            .as_ref()
-            .is_some_and(|candidates| candidates.incomplete)
-            || state_meta_value
-                .get("index")
-                .and_then(|index| index.get("partial"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-
-        // The robot-meta display facts, built from the one collection above and
-        // frozen into the window so a continuation renders exactly these. This
-        // still reads filesystem state (index existence, quarantine summary), so
-        // it runs *before* the final index check below to stay covered by it.
-        let frozen_display = collect_display_state(
-            &data_dir,
-            &db_path,
-            if robot_meta { Some(state_meta_value) } else { None },
+                result,
+                regression: regression.as_ref(),
+                filters: &filters,
+                semantic_opts: &semantic_opts,
+                rerank_ctx: &rerank_ctx,
+                mode,
+                vector_search_mode,
+                effective_model: effective_model.clone(),
+                limit_val,
+                aggregate: &aggregate,
+                has_aggregation,
+                agg_fields: &agg_fields,
+                explain,
+                timeout_ms,
+                timeout_duration,
+                start_time,
+                robot_meta,
+                data_dir: &data_dir,
+                db_path: &db_path,
+                mode_meta: &mode_meta,
+                search_ms,
+                rerank_stamp_before,
+                regression_embedding_binding: regression_embedding_binding.clone(),
+            },
+            None,
         );
-
-        // The after-stamp is the last read of this lookup: every assembly,
-        // scoring and state collection above has finished by now, so a change
-        // made by any of them is caught rather than ordered behind the check.
-        let index_stamp_ok = rerank_stamp_before.as_ref().is_some_and(|before| {
-            crate::search::rerank::window::capture_index_stamp(&db_path)
-                .map(|after| &after == before)
-                .unwrap_or(false)
-        });
-        if window_unavailable.is_none() {
-            if rerank_stamp_before.is_none() || !index_stamp_ok {
-                window_unavailable = Some("index_changed");
-            } else if timed_out_now {
-                window_unavailable = Some("search_timeout");
-            } else if partial_now {
-                window_unavailable = Some("partial_results");
-            }
-        }
-
-        // A window is only continuable when the first lookup is a clean, frozen
-        // success and the snapshot saves. Otherwise the current page is still
-        // delivered but carries no cursor and a short reason.
-        if window_unavailable.is_none() {
-            let snapshot = crate::search::rerank::window::WindowSnapshot {
-                created_at_ms: now_ms,
-                expires_at_ms,
-                request_binding: binding
-                    .clone()
-                    .expect("a continuable window always has a binding"),
-                index_stamp: rerank_stamp_before
-                    .clone()
-                    .expect("checked continuable"),
-                resolved_filters: filters.clone(),
-                result: window_result.clone(),
-                aggregates: aggregates_value.clone(),
-                explanation: explanation_value.clone(),
-                retrieval_status: serde_json::json!({
-                    "search_mode": search_mode_canonical_str(mode_meta.realized),
-                    "requested_search_mode": search_mode_canonical_str(mode_meta.requested),
-                    "mode_defaulted": mode_meta.defaulted,
-                    "fallback_tier": mode_meta.fallback_tier,
-                    "fallback_reason": mode_meta.fallback_reason.clone(),
-                    "search_ms": search_ms,
-                    "timed_out": timed_out_now,
-                    "total_matches": frozen_total_matches,
-                    "total_matches_exact": frozen_total_matches_exact,
-                    "robot_meta": robot_meta,
-                    "display": frozen_display.to_json(),
-                }),
-                rerank: crate::search::rerank::window::WindowRerankMeta {
-                    requested_provider: provider,
-                    requested_model: provider.request_model().to_string(),
-                    identity: identity.clone(),
-                    applied: rerank_applied,
-                    failure_reason,
-                    http_status,
-                    scored_count,
-                    http_requests,
-                    model_requests,
-                    duration_ms,
-                },
-            };
-            match crate::search::rerank::window::WindowStore::new(&data_dir, policy) {
-                Ok(store) => match store.save(&snapshot, now_ms) {
-                    Ok(id) => {
-                        window_id = Some(id);
-                        window_snapshot = Some(snapshot);
-                        window_continuable = true;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if error.message == "REGRESSION_RERANK_FAILED" {
+                    if let Some(run) = regression.as_ref() {
+                        verify_regression_run_end(run)?;
                     }
-                    Err(_) => {
-                        window_unavailable =
-                            Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
-                    }
-                },
-                Err(_) => {
-                    window_unavailable =
-                        Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
                 }
+                return Err(error);
             }
-        }
-
-        window_display_state = Some(frozen_display);
-        window_meta = Some(RerankWindowMeta {
-            requested_provider: provider,
-            requested_model: provider.request_model(),
-            actual_provider: identity.actual_provider,
-            actual_model: identity.actual_model.clone(),
-            serving_provider: identity.serving_provider.clone(),
-            rrf_limit: limit_val,
-            window_count,
-            scored_count,
-            rerank_limit: rerank_k,
-            offset: 0,
-            applied: rerank_applied,
-            cache_reused: false,
-            first_http_requests: http_requests,
-            http_requests,
-            first_model_requests: model_requests,
-            model_requests,
-            first_duration_ms: duration_ms,
-            duration_ms,
-            failure_reason: failure_reason.map(|reason| reason.as_str()),
-            http_status,
-            pagination_unavailable_reason: window_unavailable.map(str::to_string),
-        });
-
-        window_result
+        };
+        rerank_applied = outcome.applied;
+        window_snapshot = outcome.snapshot;
+        window_id = outcome.window_id;
+        window_continuable = outcome.continuable;
+        window_meta = outcome.meta;
+        window_display_state = outcome.display_state;
+        rerank_prefetch_hits = outcome.prefetch_hits;
+        outcome.result
     };
     // Track reranking time (0 if not applied) (T7.4)
     let rerank_ms = if rerank_on {
@@ -26010,6 +26043,27 @@ fn run_cli_search(
         window_continuable,
         window_meta,
     );
+    if let (Some(run), Some(window)) = (regression.as_ref(), window_render.as_ref()) {
+        if let (Some(id), Some(snapshot)) = (window.window_id.as_ref(), window.snapshot.as_ref()) {
+            let evidence: crate::search::regression_trace::WindowEvidence =
+                serde_json::from_value(snapshot.retrieval_status["regression"].clone())
+                    .map_err(regression_search_error)?;
+            if !evidence.final_slots.is_empty() {
+                crate::search::regression_trace::persist_page(
+                    &run.context,
+                    &evidence,
+                    id,
+                    0,
+                    display_result.hits.len(),
+                    false,
+                )
+                .map_err(regression_search_error)?;
+            }
+        }
+    }
+    if let Some(run) = regression.as_ref() {
+        verify_regression_run_end(run)?;
+    }
     render_search_output(SearchRenderInput {
         query: query.to_string(),
         limit: limit_val,
@@ -26037,12 +26091,609 @@ fn run_cli_search(
         rerank_applied,
         rerank_requested: semantic_opts.rerank,
         window: window_render,
-        display_state: window_display_state,
+        display_state: window_display_state
+            .or_else(|| regression.as_ref().map(|_| FrozenDisplayState::default())),
         data_dir,
         db_path,
         display_format,
         wrap,
         highlight,
+    })
+}
+
+/// Observed first-window facts retained for aggregate failure diagnostics.
+#[derive(Default)]
+struct FirstWindowCapture {
+    result: Option<crate::search::query::SearchResult>,
+    prepared_documents: Option<Vec<String>>,
+    evidence: Option<crate::search::regression_trace::WindowEvidence>,
+    evidence_path: Option<PathBuf>,
+    identity: Option<crate::search::rerank::types::CallIdentity>,
+}
+
+struct ScoredSearchWindow {
+    result: crate::search::query::SearchResult,
+    applied: bool,
+    snapshot: Option<crate::search::rerank::window::WindowSnapshot>,
+    window_id: Option<String>,
+    continuable: bool,
+    meta: Option<RerankWindowMeta>,
+    display_state: Option<FrozenDisplayState>,
+    prefetch_hits: Option<Vec<crate::search::query::SearchHit>>,
+}
+
+struct FirstWindowInput<'a> {
+    query: &'a str,
+    result: crate::search::query::SearchResult,
+    regression: Option<&'a RegressionSearchExecution>,
+    filters: &'a crate::search::query::SearchFilters,
+    semantic_opts: &'a SemanticSearchOptions,
+    rerank_ctx: &'a RerankRequestContext,
+    mode: Option<crate::search::query::SearchMode>,
+    vector_search_mode: Option<crate::search::query::VectorSearchMode>,
+    effective_model: Option<String>,
+    limit_val: usize,
+    aggregate: &'a Option<Vec<String>>,
+    has_aggregation: bool,
+    agg_fields: &'a [AggregateField],
+    explain: bool,
+    timeout_ms: Option<u64>,
+    timeout_duration: Option<Duration>,
+    start_time: Instant,
+    robot_meta: bool,
+    data_dir: &'a PathBuf,
+    db_path: &'a PathBuf,
+    mode_meta: &'a SearchModeMeta,
+    search_ms: u64,
+    rerank_stamp_before: Option<crate::search::rerank::window::IndexStamp>,
+    regression_embedding_binding: Option<serde_json::Value>,
+}
+
+/// The existing P09 first-window implementation, shared by CLI and aggregate.
+fn score_search_first_window(
+    input: FirstWindowInput<'_>,
+    mut capture: Option<&mut FirstWindowCapture>,
+) -> CliResult<ScoredSearchWindow> {
+    use crate::search::query::{QueryExplanation, SearchMode};
+    let FirstWindowInput {
+        query,
+        result,
+        regression,
+        filters,
+        semantic_opts,
+        rerank_ctx,
+        mode,
+        vector_search_mode,
+        effective_model,
+        limit_val,
+        aggregate,
+        has_aggregation,
+        agg_fields,
+        explain,
+        timeout_ms,
+        timeout_duration,
+        start_time,
+        robot_meta,
+        data_dir,
+        db_path,
+        mode_meta,
+        search_ms,
+        rerank_stamp_before,
+        regression_embedding_binding,
+    } = input;
+    let mut rerank_applied = false;
+    let mut window_snapshot = None;
+    let mut window_id = None;
+    let mut window_continuable = false;
+    let mut window_unavailable: Option<&'static str> = None;
+    let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
+    let provider = semantic_opts
+        .rerank_provider
+        .expect("rerank_window_enabled guarantees a provider");
+    let endpoint = regression
+        .as_ref()
+        .and_then(|run| run.endpoint.clone())
+        .unwrap_or_else(|| rerank_endpoint_origin(provider));
+    let binding = build_request_binding(
+        query,
+        &filters,
+        &rerank_ctx.time_selectors,
+        search_mode_canonical_str(mode.unwrap_or_default()),
+        vector_search_mode_wire(vector_search_mode.unwrap_or_default()),
+        effective_model.as_deref(),
+        limit_val,
+        rerank_k,
+        provider,
+        &endpoint,
+        aggregate.as_deref(),
+        explain,
+        timeout_ms,
+        rerank_ctx.daemon,
+        rerank_ctx.no_daemon,
+    )
+    .ok();
+    // A request that cannot even be frozen (a bad local endpoint, a limit
+    // the binding rejects) must not drop the page: it degrades to
+    // "no rerank, no cursor" exactly like any other optional-stage failure.
+    if binding.is_none() {
+        window_unavailable =
+            Some(crate::search::rerank::window::WindowError::InvalidInput.as_str());
+    }
+
+    let crate::search::query::SearchResult {
+        hits: mut fetched_hits,
+        wildcard_fallback,
+        cache_stats,
+        suggestions,
+        total_count,
+        candidates,
+        semantic_degraded,
+    } = result;
+
+    // The window is the first `N` hits; the sentinel/aggregate over-fetch
+    // never reaches the model. The *whole* fetched pool (window + overflow)
+    // is what the aggregate/explain scope must be measured over, to match
+    // the closed-state path's scope exactly.
+    let window_len = limit_val.min(fetched_hits.len());
+    let overflow = fetched_hits.split_off(window_len);
+    let window_count = fetched_hits.len();
+    let mut scope_pool = fetched_hits.clone();
+    scope_pool.extend(overflow);
+    let rerank_prefetch_hits = Some(scope_pool);
+
+    let mut window_result = crate::search::query::SearchResult {
+        hits: fetched_hits,
+        wildcard_fallback,
+        cache_stats,
+        suggestions,
+        total_count,
+        candidates,
+        semantic_degraded,
+    };
+    if let Some(capture) = capture.as_deref_mut() {
+        capture.result = Some(window_result.clone());
+    }
+    let mut regression_evidence = regression
+        .as_ref()
+        .map(|run| {
+            let retrieval = crate::search::regression_trace::freeze_retrieval_slots(
+                &run.context,
+                &window_result.hits,
+            )?;
+            Ok::<_, anyhow::Error>(crate::search::regression_trace::WindowEvidence {
+                schema: "cass.regression-window-trace.v2".into(),
+                request: regression_request_evidence(
+                    &filters,
+                    mode_meta.requested,
+                    vector_search_mode.unwrap_or_default(),
+                    limit_val,
+                    timeout_ms,
+                    &semantic_opts,
+                    &rerank_ctx,
+                    regression_embedding_binding.as_ref(),
+                )
+                .map_err(|e| anyhow::anyhow!(e.message))?,
+                transport_scope: "rerank-http-v1".into(),
+                lexical_statistics_used: mode_meta.realized != SearchMode::Semantic,
+                lexical_statistics_sha256: (mode_meta.realized != SearchMode::Semantic)
+                    .then(|| run.binding.lexical_statistics_sha256.clone()),
+                binding: run.binding.clone(),
+                query: crate::search::regression_trace::TextDigest::of(query),
+                final_slots: retrieval.clone(),
+                retrieval,
+                snippets: window_result
+                    .hits
+                    .iter()
+                    .map(|h| crate::search::regression_trace::TextDigest::of(&h.content))
+                    .collect(),
+                prepared_documents: None,
+                transport: Default::default(),
+                rerank_requested: true,
+                applied: false,
+                failure_reason: None,
+            })
+        })
+        .transpose()
+        .map_err(regression_search_error)?;
+
+    let mut identity = crate::search::rerank::types::CallIdentity {
+        actual_provider: None,
+        actual_model: None,
+        serving_provider: None,
+    };
+    let mut scored_count = 0usize;
+    let mut http_requests: Option<usize> = None;
+    let mut model_requests: Option<usize> = None;
+    let mut duration_ms = 0u64;
+    let mut failure_reason: Option<crate::search::rerank::types::RerankFailureReason> = None;
+    let mut http_status: Option<u16> = None;
+
+    if window_result.hits.is_empty() {
+        // Empty window: no model call at all.
+        http_requests = Some(0);
+        model_requests = Some(0);
+    } else if binding.is_none() {
+        // The request could not be frozen, so nothing may be sent to the
+        // model; the page is delivered unranked and without a cursor.
+        http_requests = Some(0);
+        model_requests = Some(0);
+        if regression.is_some() {
+            failure_reason = Some(crate::search::rerank::types::RerankFailureReason::InvalidInput);
+        }
+    } else {
+        let documents = match regression.as_ref() {
+            Some(run) => crate::search::rerank::context::build_documents_for_regression(
+                &run.context,
+                query,
+                &window_result.hits,
+            ),
+            None => crate::search::rerank::context::build_documents(
+                &db_path,
+                query,
+                &window_result.hits,
+            ),
+        };
+        match documents {
+            Ok(documents) if !documents.is_empty() => {
+                if let Some(capture) = capture.as_deref_mut() {
+                    capture.prepared_documents = Some(documents.clone());
+                }
+                if let Some(evidence) = regression_evidence.as_mut() {
+                    evidence.prepared_documents = Some(
+                        documents
+                            .iter()
+                            .map(|d| crate::search::regression_trace::TextDigest::of(d))
+                            .collect(),
+                    );
+                }
+                let backend = match regression.as_ref() {
+                    Some(run) => build_rerank_backend_with_trace(
+                        provider,
+                        &endpoint,
+                        Some(run.trace.clone()),
+                    ),
+                    None => build_rerank_backend(provider, &endpoint),
+                };
+                match backend {
+                    Ok(backend) => {
+                        let call_started = Instant::now();
+                        match backend.rerank(query, &documents) {
+                            Ok(response) => {
+                                duration_ms = response.duration_ms;
+                                // The call layer re-proves the completeness
+                                // the adapter promises: the score set must be
+                                // exactly the window length and a valid
+                                // permutation of it. Only then is the window
+                                // replaced -- in one step, so a short,
+                                // duplicated or out-of-range set can never
+                                // drop a candidate or half-apply scores.
+                                let expected_len = window_result.hits.len();
+                                let order = (response.scores.len() == expected_len)
+                                    .then(|| {
+                                        crate::search::rerank::types::stable_rank_order(
+                                            &response.scores,
+                                        )
+                                        .ok()
+                                    })
+                                    .flatten()
+                                    .filter(|order| {
+                                        let mut seen = vec![false; expected_len];
+                                        order.len() == expected_len
+                                            && order.iter().all(|&index| {
+                                                index < expected_len
+                                                    && !std::mem::replace(&mut seen[index], true)
+                                            })
+                                    });
+                                match order {
+                                    Some(order) => {
+                                        if let Some(evidence) = regression_evidence.as_mut() {
+                                            evidence.final_slots = crate::search::regression_trace::final_slot_mapping(&evidence.retrieval, &order)
+                                                    .map_err(regression_search_error)?;
+                                        }
+                                        let hits = std::mem::take(&mut window_result.hits);
+                                        let mut slots: Vec<
+                                            Option<crate::search::query::SearchHit>,
+                                        > = hits.into_iter().map(Some).collect();
+                                        let mut reordered = Vec::with_capacity(slots.len());
+                                        for &index in &order {
+                                            if let Some(mut hit) = slots[index].take() {
+                                                hit.rerank_score = Some(response.scores[index]);
+                                                reordered.push(hit);
+                                            }
+                                        }
+                                        debug_assert_eq!(reordered.len(), expected_len);
+                                        window_result.hits = reordered;
+                                        rerank_applied = true;
+                                        scored_count = expected_len;
+                                        http_requests = Some(response.http_requests);
+                                        model_requests = Some(1);
+                                        identity = response.identity;
+                                    }
+                                    None => {
+                                        // Not a complete, valid permutation:
+                                        // every original hit and score is
+                                        // kept exactly as it was.
+                                        failure_reason = Some(
+                                                crate::search::rerank::types::RerankFailureReason::InvalidResponse,
+                                            );
+                                        duration_ms = call_started.elapsed().as_millis() as u64;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                // The call really ran and really waited, so
+                                // its duration is the measured one -- not 0,
+                                // which is reserved for "no call". Its
+                                // request count is not provable, so it stays
+                                // null rather than guessed 0.
+                                duration_ms = call_started.elapsed().as_millis() as u64;
+                                failure_reason = Some(error.reason);
+                                http_status = error.http_status;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        // Construction sent no request, so both counts are a
+                        // provable 0 and no time was spent calling.
+                        http_requests = Some(0);
+                        model_requests = Some(0);
+                        failure_reason = Some(error.reason);
+                        http_status = error.http_status;
+                    }
+                }
+            }
+            Ok(_) => {
+                // Empty document list (a candidate could not be proven):
+                // the whole window is returned unranked, no request made.
+                http_requests = Some(0);
+                model_requests = Some(0);
+                failure_reason =
+                    Some(crate::search::rerank::types::RerankFailureReason::UnscoreableInput);
+            }
+            Err(error) => {
+                // Document assembly failed before any request.
+                http_requests = Some(0);
+                model_requests = Some(0);
+                failure_reason = Some(error.reason);
+                http_status = error.http_status;
+            }
+        }
+    }
+
+    if let (Some(run), Some(evidence)) = (regression.as_ref(), regression_evidence.as_mut()) {
+        evidence.transport = run.trace.lock().map_err(regression_search_error)?.clone();
+        evidence.applied = rerank_applied;
+        evidence.failure_reason = failure_reason.map(|reason| reason.as_str().to_string());
+        evidence
+            .validate(
+                &run.context,
+                &run.binding,
+                query,
+                &window_result.hits,
+                rerank_applied,
+            )
+            .map_err(regression_search_error)?;
+        http_requests = Some(evidence.transport.requests.len());
+        model_requests = if evidence.transport.requests.is_empty() {
+            Some(0)
+        } else {
+            None
+        };
+        let evidence_path =
+            crate::search::regression_trace::persist_evidence(&run.context, evidence)
+                .map_err(regression_search_error)?;
+        if let Some(capture) = capture.as_deref_mut() {
+            capture.evidence = Some(evidence.clone());
+            capture.evidence_path = Some(evidence_path);
+            capture.result = Some(window_result.clone());
+            capture.identity = Some(identity.clone());
+        }
+        if evidence.failure_reason.is_some()
+            || (!evidence.final_slots.is_empty() && !evidence.applied)
+        {
+            return Err(regression_search_error("REGRESSION_RERANK_FAILED"));
+        }
+    }
+
+    let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+    let policy = crate::search::rerank::window::WindowPolicy::default();
+    let expires_at_ms = now_ms.saturating_add(policy.ttl_ms as i64);
+
+    // Aggregate/explain facts for the window, computed over the *original*
+    // prefetch scope, before the display projection.
+    let aggregate_scope: &[crate::search::query::SearchHit] = rerank_prefetch_hits
+        .as_deref()
+        .unwrap_or(&window_result.hits);
+    let (frozen_total_matches, frozen_total_matches_exact) = if has_aggregation {
+        (aggregate_scope.len(), false)
+    } else {
+        (
+            window_result.total_count.unwrap_or(window_count),
+            window_result.total_count.is_some(),
+        )
+    };
+    let aggregates_value = if has_aggregation {
+        serde_json::to_value(compute_aggregations(aggregate_scope, &agg_fields)).ok()
+    } else {
+        None
+    };
+    let explanation_value = if explain {
+        serde_json::to_value(
+            QueryExplanation::analyze(query, &filters)
+                .with_wildcard_fallback(window_result.wildcard_fallback),
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let timed_out_now = timeout_duration.is_some_and(|t| start_time.elapsed() > t);
+    // The first lookup's single index-state collection. The partial-index
+    // decision reads it directly, and the frozen display facts are built
+    // from this same value, so a first lookup reads the index state once --
+    // not once for `partial` and again for `--robot-meta`.
+    let state_meta_value = if regression.is_some() {
+        // Admission already proved the frozen domain is complete. Live
+        // health collectors use ordinary connections and cannot run here.
+        serde_json::json!({"index":{"partial":false},"regression_frozen_input":true})
+    } else {
+        state_meta_json(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS, true)
+    };
+    // Partial indexes and incomplete candidate scans both block a cursor,
+    // independent of the caller's `--robot-meta` projection.
+    let partial_now = window_result
+        .candidates
+        .as_ref()
+        .is_some_and(|candidates| candidates.incomplete)
+        || state_meta_value
+            .get("index")
+            .and_then(|index| index.get("partial"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+    // The robot-meta display facts, built from the one collection above and
+    // frozen into the window so a continuation renders exactly these. This
+    // still reads filesystem state (index existence, quarantine summary), so
+    // it runs *before* the final index check below to stay covered by it.
+    let frozen_display = if regression.is_some() {
+        FrozenDisplayState::default()
+    } else {
+        collect_display_state(
+            &data_dir,
+            &db_path,
+            if robot_meta {
+                Some(state_meta_value)
+            } else {
+                None
+            },
+        )
+    };
+
+    // The after-stamp is the last read of this lookup: every assembly,
+    // scoring and state collection above has finished by now, so a change
+    // made by any of them is caught rather than ordered behind the check.
+    let index_stamp_ok = rerank_stamp_before.as_ref().is_some_and(|before| {
+        match regression.as_ref() {
+            Some(run) => {
+                crate::search::rerank::window::capture_index_stamp_for_regression(&run.context)
+            }
+            None => crate::search::rerank::window::capture_index_stamp(&db_path),
+        }
+        .map(|after| &after == before)
+        .unwrap_or(false)
+    });
+    if window_unavailable.is_none() {
+        if rerank_stamp_before.is_none() || !index_stamp_ok {
+            window_unavailable = Some("index_changed");
+        } else if timed_out_now {
+            window_unavailable = Some("search_timeout");
+        } else if partial_now {
+            window_unavailable = Some("partial_results");
+        }
+    }
+
+    // A window is only continuable when the first lookup is a clean, frozen
+    // success and the snapshot saves. Otherwise the current page is still
+    // delivered but carries no cursor and a short reason.
+    if window_unavailable.is_none() {
+        let mut snapshot = crate::search::rerank::window::WindowSnapshot {
+            created_at_ms: now_ms,
+            expires_at_ms,
+            request_binding: binding
+                .clone()
+                .expect("a continuable window always has a binding"),
+            index_stamp: rerank_stamp_before.clone().expect("checked continuable"),
+            resolved_filters: filters.clone(),
+            result: window_result.clone(),
+            aggregates: aggregates_value.clone(),
+            explanation: explanation_value.clone(),
+            retrieval_status: serde_json::json!({
+                "search_mode": search_mode_canonical_str(mode_meta.realized),
+                "requested_search_mode": search_mode_canonical_str(mode_meta.requested),
+                "mode_defaulted": mode_meta.defaulted,
+                "fallback_tier": mode_meta.fallback_tier,
+                "fallback_reason": mode_meta.fallback_reason.clone(),
+                "search_ms": search_ms,
+                "timed_out": timed_out_now,
+                "total_matches": frozen_total_matches,
+                "total_matches_exact": frozen_total_matches_exact,
+                "robot_meta": robot_meta,
+                "display": frozen_display.to_json(),
+            }),
+            rerank: crate::search::rerank::window::WindowRerankMeta {
+                requested_provider: provider,
+                requested_model: provider.request_model().to_string(),
+                identity: identity.clone(),
+                applied: rerank_applied,
+                failure_reason,
+                http_status,
+                scored_count,
+                http_requests,
+                model_requests,
+                duration_ms,
+            },
+        };
+        if let Some(evidence) = regression_evidence {
+            snapshot.retrieval_status["regression"] =
+                serde_json::to_value(evidence).map_err(regression_search_error)?;
+        }
+        match crate::search::rerank::window::WindowStore::new(&data_dir, policy) {
+            Ok(store) => match store.save(&snapshot, now_ms) {
+                Ok(id) => {
+                    window_id = Some(id);
+                    window_snapshot = Some(snapshot);
+                    window_continuable = true;
+                }
+                Err(_) => {
+                    window_unavailable =
+                        Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
+                }
+            },
+            Err(_) => {
+                window_unavailable =
+                    Some(crate::search::rerank::window::WindowError::CacheUnavailable.as_str());
+            }
+        }
+    }
+
+    if regression.is_some() && !window_continuable {
+        return Err(regression_search_error("REGRESSION_WINDOW_UNAVAILABLE"));
+    }
+
+    let window_display_state = Some(frozen_display);
+    let window_meta = Some(RerankWindowMeta {
+        requested_provider: provider,
+        requested_model: provider.request_model(),
+        actual_provider: identity.actual_provider,
+        actual_model: identity.actual_model.clone(),
+        serving_provider: identity.serving_provider.clone(),
+        rrf_limit: limit_val,
+        window_count,
+        scored_count,
+        rerank_limit: rerank_k,
+        offset: 0,
+        applied: rerank_applied,
+        cache_reused: false,
+        first_http_requests: http_requests,
+        http_requests,
+        first_model_requests: model_requests,
+        model_requests,
+        first_duration_ms: duration_ms,
+        duration_ms,
+        failure_reason: failure_reason.map(|reason| reason.as_str()),
+        http_status,
+        pagination_unavailable_reason: window_unavailable.map(str::to_string),
+    });
+
+    Ok(ScoredSearchWindow {
+        result: window_result,
+        applied: rerank_applied,
+        snapshot: window_snapshot,
+        window_id,
+        continuable: window_continuable,
+        meta: window_meta,
+        display_state: window_display_state,
+        prefetch_hits: rerank_prefetch_hits,
     })
 }
 
@@ -106742,5 +107393,566 @@ mod mirror_relink_tests {
         let second = run(&data_dir, true);
         assert!(second.changes.is_empty(), "第二遍不该还有待重建项");
         assert_eq!(second.manifests_written, 0, "已收敛就不得重复写盘");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod regression_search_orchestration_tests {
+    use super::*;
+    use crate::search::{
+        regression_binding, regression_io::RegressionIoContext, regression_trace::WindowEvidence,
+    };
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    fn search(
+        run: RegressionSearchExecution,
+        rerank: bool,
+        k: usize,
+        cursor: Option<String>,
+    ) -> CliResult<()> {
+        run_cli_search(
+            "retrieval",
+            &[],
+            &[],
+            &[],
+            &7,
+            &0,
+            &true,
+            Some(RobotFormat::Json),
+            false,
+            None,
+            None,
+            None,
+            None,
+            cursor,
+            None,
+            &None,
+            None,
+            WrapConfig::new(None, true),
+            ProgressResolved::None,
+            true,
+            TimeFilter::new(None, false, false, false, None, None),
+            None,
+            false,
+            false,
+            None,
+            false,
+            None,
+            None,
+            Some(crate::search::query::SearchMode::Lexical),
+            None,
+            SemanticSearchOptions {
+                model: None,
+                rerank,
+                reranker: None,
+                use_daemon: false,
+                rerank_limit: rerank.then_some(k),
+                rerank_provider: rerank
+                    .then_some(crate::search::rerank::types::ProviderChoice::BgeLocal),
+            },
+            RerankRequestContext::default(),
+            Some(run),
+        )
+    }
+
+    fn execution(
+        context: Arc<RegressionIoContext>,
+        expected: &std::path::Path,
+        pin: &str,
+        manifest: &std::path::Path,
+        endpoint: Option<String>,
+    ) -> RegressionSearchExecution {
+        let verified =
+            regression_binding::open_verified_search(context.clone(), expected, pin, manifest)
+                .unwrap();
+        RegressionSearchExecution {
+            context,
+            binding: verified.binding.clone(),
+            verified: Some(verified),
+            trace: Default::default(),
+            endpoint,
+            window_root: None,
+            source_manifest: manifest.to_path_buf(),
+        }
+    }
+
+    fn private_dir(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn server(status: u16) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        server_with_manifest_change(status, None)
+    }
+
+    fn server_with_manifest_change(
+        status: u16,
+        manifest: Option<PathBuf>,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        server_with_output_change(status, manifest, None)
+    }
+
+    fn server_with_output_change(
+        status: u16,
+        manifest: Option<PathBuf>,
+        blocked_cache_root: Option<PathBuf>,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut captured = serde_json::Value::Null;
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut part = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut part).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&part[..n]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            if step == 1 {
+                                captured =
+                                    serde_json::from_slice(&bytes[end + 4..end + 4 + length])
+                                        .unwrap();
+                            }
+                            break;
+                        }
+                    }
+                }
+                let body = if step == 0 {
+                    serde_json::json!({"data":[{"id":"BAAI/bge-reranker-v2-m3"}]})
+                } else {
+                    let count = captured["documents"].as_array().unwrap().len();
+                    serde_json::json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..count).map(|i| serde_json::json!({"index":i,"relevance_score":1.0})).collect::<Vec<_>>()})
+                }.to_string();
+                if step == 1 {
+                    if let Some(path) = manifest.as_ref() {
+                        std::fs::write(path, b"changed synthetic source manifest\n").unwrap();
+                    }
+                    if let Some(path) = blocked_cache_root.as_ref() {
+                        std::fs::write(path.join("cache"), b"blocked").unwrap();
+                    }
+                }
+                let response_status = if step == 0 { 200 } else { status };
+                if step == 1 && status == 0 {
+                    continue;
+                }
+                write!(stream, "HTTP/1.1 {response_status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            captured
+        });
+        (origin, worker)
+    }
+
+    fn evidence(root: &std::path::Path) -> WindowEvidence {
+        let path = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("regression-search-")
+            })
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn regression_existing_pipeline_preserves_seven_slots_and_cursor_without_second_http_call() {
+        let (root, db, run_root, manifest) =
+            regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) =
+            regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let (origin, worker) = server(200);
+        let run = execution(
+            context.clone(),
+            &expected,
+            &pin,
+            &manifest,
+            Some(origin.clone()),
+        );
+        let binding = run.binding.clone();
+        search(run, true, 3, None).unwrap();
+        let received = worker.join().unwrap();
+        let proof = evidence(&run_root);
+        assert_eq!(proof.retrieval.len(), 7);
+        assert_eq!(proof.final_slots, proof.retrieval); // All model scores tie.
+        assert_eq!(proof.transport.requests.len(), 2);
+        assert_eq!(proof.transport.model_requests, None);
+        assert_eq!(
+            proof.transport.requests[1].query.as_ref(),
+            Some(&crate::search::regression_trace::TextDigest::of(
+                received["query"].as_str().unwrap()
+            ))
+        );
+        for (actual, document) in proof.transport.requests[1]
+            .documents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(received["documents"].as_array().unwrap())
+        {
+            assert_eq!(
+                actual.text,
+                crate::search::regression_trace::TextDigest::of(document.as_str().unwrap())
+            );
+        }
+        let windows = run_root.join("cache/rerank-windows");
+        let path = std::fs::read_dir(windows)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .unwrap();
+        let id = path.file_stem().unwrap().to_str().unwrap();
+        let cursor = BASE64_STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":3}))
+                .unwrap(),
+        );
+        let client = crate::search::query::SearchClient::open_for_regression(
+            &run_root.join("unused-index"),
+            context.clone(),
+        )
+        .unwrap();
+        let trace = Arc::new(Mutex::new(Default::default()));
+        search(
+            RegressionSearchExecution {
+                context: context.clone(),
+                verified: Some(regression_binding::VerifiedSearch {
+                    client,
+                    binding: binding.clone(),
+                    expected_file_sha256: pin.clone(),
+                }),
+                binding: binding.clone(),
+                trace: trace.clone(),
+                endpoint: Some(origin.clone()),
+                window_root: None,
+                source_manifest: manifest.to_path_buf(),
+            },
+            true,
+            3,
+            Some(cursor),
+        )
+        .unwrap();
+        let cursor = BASE64_STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":6}))
+                .unwrap(),
+        );
+        let client = crate::search::query::SearchClient::open_for_regression(
+            &run_root.join("unused-index"),
+            context.clone(),
+        )
+        .unwrap();
+        search(
+            RegressionSearchExecution {
+                context: context.clone(),
+                verified: Some(regression_binding::VerifiedSearch {
+                    client,
+                    binding: binding.clone(),
+                    expected_file_sha256: pin.clone(),
+                }),
+                binding: binding.clone(),
+                trace: trace.clone(),
+                endpoint: Some(origin.clone()),
+                window_root: None,
+                source_manifest: manifest.to_path_buf(),
+            },
+            true,
+            3,
+            Some(cursor),
+        )
+        .unwrap();
+        assert!(trace.lock().unwrap().requests.is_empty());
+        let mut pages: Vec<crate::search::regression_trace::PageEvidence> =
+            std::fs::read_dir(&run_root)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| {
+                    p.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with("regression-page-")
+                })
+                .map(|p| serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap())
+                .collect();
+        pages.sort_by_key(|p| p.offset);
+        crate::search::regression_trace::validate_complete_pages(&pages, &proof).unwrap();
+        assert_eq!(
+            pages.iter().map(|p| p.slots.len()).collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
+        assert!(
+            crate::search::regression_trace::validate_complete_pages(&pages[..2], &proof)
+                .unwrap_err()
+                .to_string()
+                .contains("TRACE_MISSING_PAGES")
+        );
+        let store = crate::search::rerank::window::WindowStore::open_existing(
+            &run_root,
+            Default::default(),
+        )
+        .unwrap();
+        let cursor = BASE64_STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":3}))
+                .unwrap(),
+        );
+        let (mut old, _) = store
+            .load_for_regression(
+                &cursor,
+                &serde_json::from_value::<crate::search::rerank::window::RequestBinding>(
+                    serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                        .unwrap()["request_binding"]
+                        .clone(),
+                )
+                .unwrap(),
+                &context,
+                crate::storage::sqlite::FrankenStorage::now_millis(),
+            )
+            .unwrap();
+        old.retrieval_status
+            .as_object_mut()
+            .unwrap()
+            .remove("regression");
+        let legacy_id = store
+            .save(&old, crate::storage::sqlite::FrankenStorage::now_millis())
+            .unwrap();
+        let legacy_cursor = BASE64_STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":legacy_id,"offset":3}))
+                .unwrap(),
+        );
+        let client = crate::search::query::SearchClient::open_for_regression(
+            &run_root.join("unused-index"),
+            context.clone(),
+        )
+        .unwrap();
+        let error = search(
+            RegressionSearchExecution {
+                context,
+                verified: Some(regression_binding::VerifiedSearch {
+                    client,
+                    binding: binding.clone(),
+                    expected_file_sha256: pin,
+                }),
+                binding,
+                trace: trace.clone(),
+                endpoint: Some(origin),
+                window_root: None,
+                source_manifest: manifest.to_path_buf(),
+            },
+            true,
+            3,
+            Some(legacy_cursor),
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "TRACE_WINDOW_MISSING");
+        assert!(trace.lock().unwrap().requests.is_empty());
+        assert_eq!(before, std::fs::read(db).unwrap());
+    }
+
+    #[test]
+    fn regression_existing_pipeline_records_sent_http_failure_and_off_is_readonly() {
+        let (root, db, run_root, manifest) =
+            regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) =
+            regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let off_context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        search(
+            execution(off_context, &expected, &pin, &manifest, None),
+            false,
+            3,
+            None,
+        )
+        .unwrap();
+        let off = evidence(&run_root);
+        assert_eq!(off.retrieval.len(), 7);
+        assert!(!off.rerank_requested);
+        assert!(off.transport.requests.is_empty());
+        for status in [500, 200, 0] {
+            let case_root = root.path().join(format!("http-{status}-run"));
+            private_dir(&case_root);
+            let context = Arc::new(RegressionIoContext::open(&db, &case_root).unwrap());
+            let (origin, worker) = server(status);
+            let result = search(
+                execution(context, &expected, &pin, &manifest, Some(origin)),
+                true,
+                5,
+                None,
+            );
+            if status == 200 {
+                result.unwrap();
+            } else {
+                assert_eq!(result.unwrap_err().message, "REGRESSION_RERANK_FAILED");
+                assert!(!case_root.join("cache/rerank-windows").exists());
+            }
+            assert_eq!(
+                worker.join().unwrap()["documents"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                7
+            );
+            let proof = evidence(&case_root);
+            assert_eq!(proof.applied, status == 200);
+            assert_eq!(
+                proof.transport.requests[1].http_status,
+                if status == 0 { None } else { Some(status) }
+            );
+            assert_eq!(
+                proof.transport.requests[1].state,
+                if status == 0 {
+                    "attempted-delivery-unknown"
+                } else {
+                    "http-response-observed"
+                }
+            );
+            assert_eq!(proof.final_slots, proof.retrieval);
+            assert_eq!(proof.transport.model_requests, None);
+        }
+        let invalid_root = root.path().join("not-sent-run");
+        private_dir(&invalid_root);
+        let context = Arc::new(RegressionIoContext::open(&db, &invalid_root).unwrap());
+        search(
+            execution(
+                context,
+                &expected,
+                &pin,
+                &manifest,
+                Some("invalid-origin".into()),
+            ),
+            true,
+            5,
+            None,
+        )
+        .unwrap_err();
+        let proof = evidence(&invalid_root);
+        assert!(!proof.applied);
+        assert!(proof.failure_reason.is_some());
+        assert!(proof.transport.requests.is_empty());
+        assert_eq!(before, std::fs::read(db).unwrap());
+    }
+    #[test]
+    fn regression_pipeline_rejects_window_persistence_failure_after_scoring() {
+        let (root, db, run_root, manifest) =
+            regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) =
+            regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let (origin, worker) = server_with_output_change(200, None, Some(run_root.clone()));
+        let result = search(
+            execution(context, &expected, &pin, &manifest, Some(origin)),
+            true,
+            3,
+            None,
+        );
+        assert_eq!(
+            worker.join().unwrap()["documents"].as_array().unwrap().len(),
+            7
+        );
+        let proof = evidence(&run_root);
+        assert!(proof.applied); // Scoring succeeded; persistence did not.
+        assert_eq!(proof.retrieval.len(), 7);
+        assert_eq!(proof.final_slots.len(), 7);
+        assert_eq!(before, std::fs::read(&db).unwrap());
+        assert_eq!(result.unwrap_err().message, "REGRESSION_WINDOW_UNAVAILABLE");
+        assert!(!run_root.join("cache/rerank-windows").exists());
+        assert!(!std::fs::read_dir(&run_root).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().starts_with("regression-page-")
+        }));
+    }
+
+    #[test]
+    fn regression_pipeline_rejects_source_manifest_change_during_http() {
+        let (root, db, run_root, manifest) =
+            regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) =
+            regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let (origin, worker) = server_with_manifest_change(200, Some(manifest.clone()));
+        let error = search(
+            execution(context, &expected, &pin, &manifest, Some(origin)),
+            true,
+            3,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.message, "BINDING_SOURCE_CHANGED");
+        assert_eq!(
+            worker.join().unwrap()["documents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        assert_eq!(before, std::fs::read(db).unwrap());
+        assert!(evidence(&run_root).applied); // Scoring succeeded; the run did not.
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "infinity"))]
+mod regression_semantic_pipeline_child {
+    use super::*;
+
+    #[test]
+    fn regression_semantic_search_readonly_child() -> anyhow::Result<()> {
+        let Some(marker) = std::env::var_os("CASS_REGRESSION_SEMANTIC_FIXTURE") else {
+            return Ok(());
+        };
+        let fixture: serde_json::Value = serde_json::from_slice(&std::fs::read(marker)?)?;
+        let path = |key: &str| PathBuf::from(fixture[key].as_str().unwrap());
+        let mode = match std::env::var("CASS_REGRESSION_SEMANTIC_MODE")?.as_str() {
+            "hybrid" => crate::search::query::SearchMode::Hybrid,
+            "semantic" => crate::search::query::SearchMode::Semantic,
+            _ => anyhow::bail!("invalid synthetic mode"),
+        };
+        let vector_search_mode = match std::env::var("CASS_REGRESSION_VECTOR_MODE")?.as_str() {
+            "exact" => crate::search::query::VectorSearchMode::Exact,
+            "fast" => crate::search::query::VectorSearchMode::Fast,
+            _ => anyhow::bail!("invalid synthetic vector mode"),
+        };
+        let rerank = std::env::var_os("CASS_REGRESSION_SEMANTIC_RERANK").is_some();
+        let cursor = std::env::var("CASS_REGRESSION_SEMANTIC_CURSOR").ok();
+        let window_root =
+            std::env::var_os("CASS_REGRESSION_SEMANTIC_WINDOW_ROOT").map(PathBuf::from);
+        crate::search::regression_input::run(&crate::RegressionInputCommand::Search {
+            input: crate::search::regression_input::FrozenInputArgs {
+                database: path("database"),
+                run_root: path("run_root"),
+                source_manifest: path("source_manifest"),
+                question_pack_root: path("question_pack_root"),
+            },
+            expected_binding: path("expected_binding"),
+            expected_sha256: fixture["expected_sha256"].as_str().unwrap().into(),
+            query: "retrieval".into(),
+            mode,
+            vector_search_mode: Some(vector_search_mode),
+            rrf_limit: 7,
+            rerank,
+            rerank_limit: 3,
+            rerank_provider: rerank
+                .then_some(crate::search::rerank::types::ProviderChoice::BgeLocal),
+            cursor,
+            window_root,
+        })?;
+        println!("VERIFIED_EXISTING_SEMANTIC_PIPELINE_READONLY");
+        Ok(())
     }
 }
