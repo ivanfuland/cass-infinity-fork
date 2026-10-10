@@ -512,6 +512,7 @@ pub fn agent_css_class(slug: &str) -> &'static str {
         "vibe" | "mistral" => "agent-chatgpt",
         "crush" => "agent-amp",
         "hermes" => "agent-hermes",
+        "openhands" => "agent-openhands",
         _ => "agent-default",
     }
 }
@@ -545,6 +546,7 @@ pub fn agent_display_name(slug: &str) -> &'static str {
         "hermes" => "Hermes",
         "kimi" => "Kimi",
         "qwen" => "Qwen",
+        "openhands" => "OpenHands",
         _ => "AI Assistant",
     }
 }
@@ -1611,6 +1613,23 @@ mod tests {
                 agent_display_name(slug),
                 "AI Assistant",
                 "registered connector {slug} should have a specific HTML export display name"
+            );
+        }
+    }
+
+    #[test]
+    fn openhands_identity_is_normalized_and_styled() {
+        let styles = super::super::styles::generate_styles(
+            &super::super::template::ExportOptions::default(),
+        );
+        for slug in ["openhands", " OpenHands "] {
+            let class = agent_css_class(slug);
+            assert_eq!(class, "agent-openhands");
+            assert_eq!(agent_display_name(slug), "OpenHands");
+            assert!(
+                styles
+                    .critical_css
+                    .contains(&format!(".{class} .message-assistant"))
             );
         }
     }
