@@ -34,8 +34,33 @@ fn claude_parses_project_fixture() {
         "conversation should have a non-empty title, got: {:?}",
         c.title
     );
-    assert_eq!(c.messages.len(), 2);
-    assert_eq!(c.messages[1].role, "assistant");
+    assert_eq!(
+        c.messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "tool_call"]
+    );
+    for (idx, message) in c.messages.iter().enumerate() {
+        assert_eq!(message.idx, idx as i64);
+    }
+    let tool_call = &c.messages[2];
+    assert!(tool_call.content.contains("Read"));
+    assert!(tool_call.content.contains("/test/file.rs"));
+    assert_eq!(tool_call.extra["tool_call_id"], "toolu_test");
+    let expected_args = serde_json::json!({
+        "file_path": "/test/file.rs",
+        "description": "Read the solver implementation"
+    });
+    assert_eq!(tool_call.extra["tool_call_args"], expected_args);
+    assert_eq!(tool_call.invocations.len(), 1);
+    let invocation = &tool_call.invocations[0];
+    assert_eq!(invocation.kind, "tool");
+    assert_eq!(invocation.name, "Read");
+    assert_eq!(invocation.call_id.as_deref(), Some("toolu_test"));
+    assert_eq!(invocation.arguments.as_ref(), Some(&expected_args));
+    assert!(!c.messages[1].content.contains("[Tool:"));
+    assert!(c.messages[1].invocations.is_empty());
     assert!(
         c.messages[1].content.contains("matrix completion"),
         "assistant message should contain 'matrix completion', got: {}",
@@ -208,10 +233,29 @@ fn claude_connector_flattens_tool_use() {
     let convs = conn.scan(&ctx).unwrap();
     assert_eq!(convs.len(), 1);
 
-    let assistant = &convs[0].messages[1];
-    assert!(assistant.content.contains("I'll read it"));
-    assert!(assistant.content.contains("[Tool: Read"));
-    assert!(assistant.content.contains("/src/main.rs"));
+    let messages = &convs[0].messages;
+    assert_eq!(
+        messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
+        ["user", "assistant", "tool_call"]
+    );
+    for (idx, message) in messages.iter().enumerate() {
+        assert_eq!(message.idx, idx as i64);
+    }
+    let assistant = &messages[1];
+    assert_eq!(assistant.content, "I'll read it");
+    assert!(!assistant.content.contains("[Tool:"));
+    assert!(assistant.invocations.is_empty());
+    let tool_call = &messages[2];
+    assert!(tool_call.content.contains("Read"));
+    assert!(tool_call.content.contains("/src/main.rs"));
+    let expected_args = serde_json::json!({"file_path": "/src/main.rs"});
+    assert_eq!(tool_call.extra["tool_call_args"], expected_args);
+    assert_eq!(tool_call.invocations.len(), 1);
+    let invocation = &tool_call.invocations[0];
+    assert_eq!(invocation.kind, "tool");
+    assert_eq!(invocation.name, "Read");
+    assert_eq!(invocation.arguments.as_ref(), Some(&expected_args));
+    assert_eq!(invocation.call_id, None);
 }
 
 /// Test title extraction from first user message

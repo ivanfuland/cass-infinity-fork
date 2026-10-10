@@ -1,8 +1,9 @@
 //! Tests for the OpenCode connector (JSON file-based storage)
 
+use coding_agent_search::connectors::ScanContext;
 use coding_agent_search::connectors::opencode::OpenCodeConnector;
-use coding_agent_search::connectors::{Connector, ScanContext};
 use coding_agent_search::storage::api::Conn as Connection;
+use franken_agent_detection::connectors::opencode::OpenCodeDefaultLocations;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -166,7 +167,9 @@ fn opencode_parses_json_fixture() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = conn.scan(&ctx).expect("scan");
+    let convs = conn
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .expect("scan");
     assert_eq!(convs.len(), 1);
     let c = &convs[0];
     assert_eq!(c.title.as_deref(), Some("OpenCode JSON Session"));
@@ -230,7 +233,7 @@ fn opencode_parses_drizzle_sqlite_schema() {
         since_ts: None,
     };
     let convs = connector
-        .scan(&ctx)
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
         .expect("opencode drizzle sqlite scan should succeed");
 
     assert_eq!(convs.len(), 1);
@@ -290,7 +293,9 @@ fn opencode_parses_created_storage() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
@@ -356,7 +361,9 @@ fn opencode_handles_multiple_sessions() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 2);
 
     let titles: Vec<_> = convs.iter().filter_map(|c| c.title.as_deref()).collect();
@@ -404,7 +411,9 @@ fn opencode_handles_tool_parts() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let content = &convs[0].messages[0].content;
@@ -453,7 +462,9 @@ fn opencode_handles_reasoning_parts() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let content = &convs[0].messages[0].content;
@@ -495,7 +506,9 @@ fn opencode_sets_correct_agent_slug() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
     assert_eq!(convs[0].agent_slug, "opencode");
 }
@@ -513,7 +526,9 @@ fn opencode_handles_empty_storage() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert!(convs.is_empty());
 }
 
@@ -528,7 +543,9 @@ fn opencode_handles_missing_storage() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert!(convs.is_empty());
 }
 
@@ -589,7 +606,9 @@ fn opencode_orders_messages_by_timestamp() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let msgs = &convs[0].messages;
@@ -655,7 +674,9 @@ fn opencode_assigns_sequential_indices() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let msgs = &convs[0].messages;
@@ -697,7 +718,9 @@ fn opencode_title_fallback_to_first_message() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     // Title should fall back to first line of first message
@@ -753,7 +776,9 @@ fn opencode_computes_started_ended_at() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     // started_at comes from session time.created
@@ -791,7 +816,9 @@ fn opencode_skips_sessions_without_messages() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
 
     // Should skip sessions without messages
     assert!(convs.is_empty());
@@ -830,7 +857,9 @@ fn opencode_metadata_contains_session_id() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let metadata = &convs[0].metadata;
@@ -877,7 +906,9 @@ fn opencode_external_id_is_session_id() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     assert_eq!(convs[0].external_id.as_deref(), Some("external-id-test"));
@@ -911,7 +942,9 @@ fn opencode_handles_corrupted_session_json() {
         since_ts: None,
     };
     // Should not panic, just skip the corrupted file
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert!(convs.is_empty());
 }
 
@@ -971,7 +1004,9 @@ fn opencode_handles_partial_session_data() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
@@ -1043,7 +1078,9 @@ fn opencode_handles_unicode_content() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];
@@ -1119,7 +1156,9 @@ fn opencode_handles_very_long_session() {
     };
 
     let start = std::time::Instant::now();
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     let elapsed = start.elapsed();
 
     assert_eq!(convs.len(), 1);
@@ -1180,7 +1219,9 @@ fn opencode_handles_empty_message_parts() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     // Should have at least the valid message
@@ -1233,7 +1274,9 @@ fn opencode_handles_null_text_parts() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     // Should have the message with valid text
@@ -1299,7 +1342,9 @@ fn opencode_handles_deeply_nested_project_dirs() {
         scan_roots: Vec::new(),
         since_ts: None,
     };
-    let convs = connector.scan(&ctx).unwrap();
+    let convs = connector
+        .scan_with_default_locations(&ctx, &OpenCodeDefaultLocations::default())
+        .unwrap();
     assert_eq!(convs.len(), 1);
 
     let c = &convs[0];

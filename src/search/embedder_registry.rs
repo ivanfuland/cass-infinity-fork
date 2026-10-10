@@ -402,6 +402,11 @@ fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn 
             let embedder = HashEmbedder::default();
             Ok(Arc::new(embedder))
         }
+        #[cfg(feature = "infinity")]
+        "bge-m3" => {
+            let embedder = crate::search::infinity::InfinityEmbedder::new()?;
+            Ok(Arc::new(embedder))
+        }
         // All ONNX-based embedders (baseline and bake-off candidates)
         "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
             let embedder = FastEmbedder::load_by_name(data_dir, name)?;
@@ -518,8 +523,11 @@ mod tests {
     fn test_best_available_fallback() {
         let (_tmp, registry) = registry_fixture();
 
-        // Without model files, best_available should return hash
+        // Infinity does not require local model files.
         let best = registry.best_available();
+        #[cfg(feature = "infinity")]
+        assert_eq!(best.name, "bge-m3");
+        #[cfg(not(feature = "infinity"))]
         assert_eq!(best.name, "hash");
     }
 
@@ -534,9 +542,22 @@ mod tests {
     #[test]
     fn test_get_embedder_default_no_models() {
         let tmp = tempdir().unwrap();
-        // Without model files, should fall back to hash
+        // Constructing the default does not require an embedding request.
         let embedder = get_embedder(tmp.path(), None).unwrap();
+        #[cfg(feature = "infinity")]
+        assert_eq!(embedder.id(), "bge-m3");
+        #[cfg(not(feature = "infinity"))]
         assert_eq!(embedder.id(), "fnv1a-384");
+    }
+
+    #[cfg(feature = "infinity")]
+    #[test]
+    fn test_get_embedder_bge_m3() {
+        let tmp = tempdir().unwrap();
+        let embedder = get_embedder(tmp.path(), Some("bge-m3")).unwrap();
+        assert_eq!(embedder.id(), "bge-m3");
+        assert_eq!(embedder.dimension(), 1024);
+        assert!(embedder.is_semantic());
     }
 
     #[test]
