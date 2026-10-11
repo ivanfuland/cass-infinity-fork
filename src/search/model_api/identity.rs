@@ -349,6 +349,7 @@ impl RepresentationDescriptor {
     /// Rejects duplicate keys (including keys that only collide after
     /// unescaping), unknown keys, missing keys, a mistyped or out-of-range
     /// number, a wrong domain, a wrong protocol family, an empty model, a zero
+    /// dimension, a `request_dimensions` that contradicts the effective
     /// dimension, trailing data and malformed UTF-8. Trailing whitespace is
     /// accepted, as JSON allows it.
     pub fn decode(bytes: &[u8]) -> Result<Self, IdentityError> {
@@ -382,9 +383,14 @@ impl RepresentationDescriptor {
                 "effective_dimension",
             ));
         }
-        if raw.request_dimensions == Some(0) {
+        // The constructor refuses a `request_dimensions` that disagrees with
+        // the effective width, so the decoder must too. Otherwise a stored
+        // record could hold an identity `from_profile` can never produce.
+        if let Some(requested) = raw.request_dimensions
+            && requested != raw.effective_dimension
+        {
             return Err(IdentityError::at(
-                IdentityErrorCode::InvalidDescriptor,
+                IdentityErrorCode::IdentityMismatch,
                 "request_dimensions",
             ));
         }
@@ -1107,6 +1113,28 @@ mod tests {
         RepresentationRecord::decode(bytes.as_bytes()).expect_err("must be refused")
     }
 
+    /// The descriptor decoded from [`VALID_DESCRIPTOR_DOC`] with one edit.
+    fn decoded_with(needle: &str, replacement: &str) -> RepresentationDescriptor {
+        let text = VALID_DESCRIPTOR_DOC.replace(needle, replacement);
+        assert_ne!(
+            text, VALID_DESCRIPTOR_DOC,
+            "needle {needle} must occur once"
+        );
+        RepresentationDescriptor::decode(text.as_bytes()).expect("edited document must decode")
+    }
+
+    /// A record document that pins `descriptor_json` under its own digest.
+    ///
+    /// The digest is computed here, over the exact bytes handed in, so a
+    /// rejection can never be explained away as a stale digest.
+    fn record_over(descriptor_json: &str, generation: &str) -> String {
+        let digest = hex::encode(Sha256::digest(descriptor_json.as_bytes()));
+        format!(
+            "{{\"descriptor\":{descriptor_json},\"descriptor_sha256\":\"{digest}\",\
+             \"generation_id\":{generation},\"version\":1}}"
+        )
+    }
+
     /// A valid record document with each field spelled by the caller.
     fn record_json(generation: &str, digest: &str, version: &str) -> String {
         format!(
@@ -1258,6 +1286,11 @@ mod tests {
                 1024,
             ),
             descriptor("expected_dimension = 512\n", 512),
+            // The two pipeline versions the constructor writes come from the
+            // live constants; a different positive version is a different
+            // space, and the decoder accepts it.
+            decoded_with("\"canonicalize_version\":3", "\"canonicalize_version\":2"),
+            decoded_with("\"chunking_version\":1", "\"chunking_version\":2"),
         ];
 
         for (index, variant) in variants.iter().enumerate() {
@@ -1363,6 +1396,101 @@ mod tests {
         );
     }
 
+    /// The constructor refuses a `request_dimensions` that contradicts the
+    /// effective width, so decoding must refuse the same document. Otherwise a
+    /// stored record could carry an identity `from_profile` can never produce.
+    #[test]
+    fn a_decoded_width_that_contradicts_request_dimensions_is_refused() {
+        let base = RepresentationDescriptor::decode(VALID_DESCRIPTOR_DOC.as_bytes())
+            .expect("the valid document decodes");
+        assert_eq!(
+            base,
+            descriptor("expected_dimension = 1024\n", 1024),
+            "the valid document must be the default fixture descriptor"
+        );
+
+        // Both the null form and a matching explicit form stay legal.
+        assert_eq!(base.request_dimensions(), None);
+        let matching = decoded_with("\"request_dimensions\":null", "\"request_dimensions\":1024");
+        assert_eq!(matching.effective_dimension(), 1024);
+        assert_eq!(matching.request_dimensions(), Some(1024));
+        assert!(!base.is_equivalent_to(&matching));
+
+        // A contradiction is refused at the descriptor, with the field named.
+        let conflicting = VALID_DESCRIPTOR_DOC
+            .replace("\"request_dimensions\":null", "\"request_dimensions\":768");
+        let error = refused(&conflicting);
+        assert_eq!(error.code(), IdentityErrorCode::IdentityMismatch);
+        assert_eq!(error.field(), Some("request_dimensions"));
+
+        // Zero is a contradiction too: the effective width is 1024.
+        let zero = refused(&decoded_error_text("\"request_dimensions\":0"));
+        assert_eq!(zero.code(), IdentityErrorCode::IdentityMismatch);
+        assert_eq!(zero.field(), Some("request_dimensions"));
+
+        // The same contradiction nested in a record is refused the same way,
+        // and its digest is recomputed over the conflicting bytes so nothing
+        // can be blamed on a stale digest.
+        let nested = record_over(&conflicting, "7");
+        let nested_error = refused_record(&nested);
+        assert_eq!(nested_error.code(), IdentityErrorCode::IdentityMismatch);
+        assert_eq!(nested_error.field(), Some("request_dimensions"));
+
+        // The matching form nested in a record is accepted.
+        let good = record_over(
+            &VALID_DESCRIPTOR_DOC
+                .replace("\"request_dimensions\":null", "\"request_dimensions\":1024"),
+            "7",
+        );
+        assert!(
+            RepresentationRecord::decode(good.as_bytes()).is_ok(),
+            "a consistent record must decode"
+        );
+    }
+
+    /// The valid document with `request_dimensions` spelled by the caller.
+    fn decoded_error_text(spelling: &str) -> String {
+        VALID_DESCRIPTOR_DOC.replace("\"request_dimensions\":null", spelling)
+    }
+
+    /// Every positive pipeline version is legal to read back, and a different
+    /// version is a different space. Only the current constants are written;
+    /// these are the historical values the decoder must still accept.
+    #[test]
+    fn historic_pipeline_versions_decode_and_change_the_identity() {
+        let base = RepresentationDescriptor::decode(VALID_DESCRIPTOR_DOC.as_bytes())
+            .expect("the valid document decodes");
+        assert_eq!(base.canonicalize_version(), CANONICALIZE_PIPELINE_VERSION);
+        assert_eq!(base.chunking_version(), CHUNKING_POLICY_VERSION);
+
+        let historic_canonicalize =
+            decoded_with("\"canonicalize_version\":3", "\"canonicalize_version\":2");
+        assert_eq!(historic_canonicalize.canonicalize_version(), 2);
+        assert_ne!(historic_canonicalize.sha256(), base.sha256());
+        assert!(!base.is_equivalent_to(&historic_canonicalize));
+
+        let historic_chunking = decoded_with("\"chunking_version\":1", "\"chunking_version\":2");
+        assert_eq!(historic_chunking.chunking_version(), 2);
+        assert_ne!(historic_chunking.sha256(), base.sha256());
+        assert!(!base.is_equivalent_to(&historic_chunking));
+
+        // A larger positive version is a future value, not a malformed one:
+        // the decoder still reads it, and it is still a different identity.
+        let future = decoded_with("\"canonicalize_version\":3", "\"canonicalize_version\":9");
+        assert_ne!(future.sha256(), base.sha256());
+        assert!(!base.is_equivalent_to(&future));
+
+        // Zero stays refused: a version is a positive integer or nothing.
+        assert_eq!(
+            refused(
+                &VALID_DESCRIPTOR_DOC
+                    .replace("\"canonicalize_version\":3", "\"canonicalize_version\":0")
+            )
+            .code(),
+            IdentityErrorCode::InvalidDescriptor
+        );
+    }
+
     #[test]
     fn a_rerank_profile_is_a_wrong_kind() {
         let rerank = profile(
@@ -1446,8 +1574,10 @@ mod tests {
             RepresentationDescriptor::decode(some_form.as_bytes()).expect("set form is legal");
         assert_eq!(descriptor.request_dimensions(), Some(1024));
 
+        // Zero is deliberately absent: it is well typed, so it is a width
+        // contradiction rather than a malformed field. See
+        // `a_decoded_width_that_contradicts_request_dimensions_is_refused`.
         for bad in [
-            "0",
             "1024.0",
             "1e3",
             "\"1024\"",
