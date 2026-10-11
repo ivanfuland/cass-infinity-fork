@@ -34,11 +34,12 @@
 //! a configured path instead would reinterpret a leading `//` as a new
 //! authority and could send the body to a different host.
 //!
-//! The target entry points return [`TransportFailure`], the in-memory detail the
-//! model client needs to decide whether one cloud attempt is allowed. The
-//! path-based entry points keep returning [`RerankError`] and map every
-//! [`TransportFailure`] back onto the existing short codes, so the retired
-//! adapters are unaffected.
+//! The target entry points return [`TransportError`]: the in-memory
+//! [`TransportFailure`] the model client needs to decide whether one cloud
+//! attempt is allowed, together with the HTTP status the attempt actually
+//! observed. The path-based entry points keep returning [`RerankError`] and map
+//! every failure back onto the existing short codes, so the retired adapters
+//! are unaffected.
 
 use std::error::Error as StdError;
 use std::io::Read;
@@ -152,6 +153,52 @@ impl TransportFailure {
             | Self::NetworkUnavailable
             | Self::UnclassifiedTransport => RerankError::new(RerankFailureReason::TransportError),
         }
+    }
+}
+
+/// A failed transport attempt: its routing classification plus the HTTP status
+/// the attempt actually observed, when it observed one.
+///
+/// The two travel together on purpose. A read that times out after a `200`
+/// answer is a timeout for routing purposes but the service did answer, and a
+/// malformed body after a `200` is an invalid response — never a fallback
+/// trigger — while the status stays on the record so the failure is not
+/// misreported as "the service was never reached".
+///
+/// The classification alone decides fallback eligibility; the observed status
+/// is evidence, not routing input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportError {
+    failure: TransportFailure,
+    http_status: Option<u16>,
+}
+
+impl TransportError {
+    /// A failure with the status the attempt observed, if any.
+    pub const fn new(failure: TransportFailure, http_status: Option<u16>) -> Self {
+        Self {
+            failure,
+            http_status,
+        }
+    }
+
+    /// The routing classification.
+    pub const fn failure(self) -> TransportFailure {
+        self.failure
+    }
+
+    /// The observed HTTP status, when a response was actually read.
+    pub const fn http_status(self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// Map onto the short failure codes the retired adapters already use.
+    ///
+    /// The mapping is exactly [`TransportFailure::to_rerank_error`], so the
+    /// path-based entry points keep the byte-for-byte behaviour they had before
+    /// the status field existed.
+    pub fn to_rerank_error(self) -> RerankError {
+        self.failure.to_rerank_error()
     }
 }
 
@@ -283,14 +330,14 @@ impl HttpTransport {
     pub fn get_json(&self, path: &str) -> Result<HttpJson, RerankError> {
         let target = self.resolve_target(path)?;
         self.send("GET", target, path, None)
-            .map_err(TransportFailure::to_rerank_error)
+            .map_err(TransportError::to_rerank_error)
     }
 
     /// Send one `POST` to `path` with `body` as a JSON payload.
     pub fn post_json(&self, path: &str, body: &Value) -> Result<HttpJson, RerankError> {
         let target = self.resolve_target(path)?;
         self.send("POST", target, path, Some(body))
-            .map_err(TransportFailure::to_rerank_error)
+            .map_err(TransportError::to_rerank_error)
     }
 
     /// Send one `GET` to the absolute `target` URL.
@@ -299,7 +346,7 @@ impl HttpTransport {
     /// query or fragment. The parsed URL is sent exactly as it stands, so a
     /// configured path that keeps a leading `//`, a literal `@` or a
     /// percent-encoded byte reaches the service unchanged.
-    pub fn get_json_target(&self, target: &Url) -> Result<HttpJson, TransportFailure> {
+    pub fn get_json_target(&self, target: &Url) -> Result<HttpJson, TransportError> {
         self.same_origin_target(target)?;
         let trace_path = target.path().to_string();
         self.send("GET", target.clone(), &trace_path, None)
@@ -309,11 +356,7 @@ impl HttpTransport {
     ///
     /// This is [`Self::get_json_target`]'s POST twin, and the entry point the
     /// API-only model client uses: it never re-joins or reinterprets the path.
-    pub fn post_json_target(
-        &self,
-        target: &Url,
-        body: &Value,
-    ) -> Result<HttpJson, TransportFailure> {
+    pub fn post_json_target(&self, target: &Url, body: &Value) -> Result<HttpJson, TransportError> {
         self.same_origin_target(target)?;
         let trace_path = target.path().to_string();
         self.send("POST", target.clone(), &trace_path, Some(body))
@@ -321,7 +364,7 @@ impl HttpTransport {
 
     /// Refuse a target that is not this base's origin, or that carries a query
     /// or fragment no service endpoint may have.
-    fn same_origin_target(&self, target: &Url) -> Result<(), TransportFailure> {
+    fn same_origin_target(&self, target: &Url) -> Result<(), TransportError> {
         if target.scheme() != self.base.scheme()
             || target.host_str() != self.base.host_str()
             || target.port_or_known_default() != self.base.port_or_known_default()
@@ -330,20 +373,20 @@ impl HttpTransport {
             || target.query().is_some()
             || target.fragment().is_some()
         {
-            return Err(TransportFailure::InvalidInput);
+            return Err(TransportError::new(TransportFailure::InvalidInput, None));
         }
         Ok(())
     }
 
     /// The single send path both entry points share: one request, one bounded
-    /// read, and a [`TransportFailure`] for every way it can fail.
+    /// read, and a [`TransportError`] for every way it can fail.
     fn send(
         &self,
         method: &str,
         target: Url,
         trace_path: &str,
         body: Option<&Value>,
-    ) -> Result<HttpJson, TransportFailure> {
+    ) -> Result<HttpJson, TransportError> {
         let mut req = if method == "POST" {
             self.client.post(target).json(body.unwrap_or(&Value::Null))
         } else {
@@ -354,8 +397,10 @@ impl HttpTransport {
         }
         let trace_index = self
             .record_attempt(method, trace_path, body)
-            .map_err(|_| TransportFailure::InvalidInput)?;
-        let resp = req.send().map_err(|err| classify_send_failure(&err))?;
+            .map_err(|_| TransportError::new(TransportFailure::InvalidInput, None))?;
+        let resp = req
+            .send()
+            .map_err(|err| TransportError::new(classify_send_failure(&err), None))?;
         self.finish(resp, trace_index)
     }
 
@@ -385,32 +430,43 @@ impl HttpTransport {
         &self,
         resp: reqwest::blocking::Response,
         trace_index: Option<usize>,
-    ) -> Result<HttpJson, TransportFailure> {
+    ) -> Result<HttpJson, TransportError> {
         let status = resp.status();
+        let observed = status.as_u16();
         if let (Some(trace), Some(index)) = (&self.trace, trace_index) {
             trace
                 .lock()
-                .map_err(|_| TransportFailure::InvalidInput)?
-                .response(index, status.as_u16())
-                .map_err(|_| TransportFailure::InvalidInput)?;
+                .map_err(|_| TransportError::new(TransportFailure::InvalidInput, Some(observed)))?
+                .response(index, observed)
+                .map_err(|_| TransportError::new(TransportFailure::InvalidInput, Some(observed)))?;
         }
         if !status.is_success() {
             // The body is intentionally not read: only the status is exposed.
-            return Err(TransportFailure::HttpStatus(status.as_u16()));
+            return Err(TransportError::new(
+                TransportFailure::HttpStatus(observed),
+                Some(observed),
+            ));
         }
 
+        // Every failure below happened *after* a real answer arrived, so the
+        // status stays on the record. The classification alone decides whether
+        // the failure may trigger a fallback.
         let limit = self.max_response_bytes;
         let mut body = Vec::new();
         resp.take(limit as u64 + 1)
             .read_to_end(&mut body)
-            .map_err(classify_read_failure)?;
+            .map_err(|err| TransportError::new(classify_read_failure(err), Some(observed)))?;
         if body.len() > limit {
-            return Err(TransportFailure::InvalidResponse);
+            return Err(TransportError::new(
+                TransportFailure::InvalidResponse,
+                Some(observed),
+            ));
         }
 
-        let value = serde_json::from_slice(&body).map_err(|_| TransportFailure::InvalidResponse)?;
+        let value = serde_json::from_slice(&body)
+            .map_err(|_| TransportError::new(TransportFailure::InvalidResponse, Some(observed)))?;
         Ok(HttpJson {
-            status: status.as_u16(),
+            status: observed,
             body: value,
         })
     }
@@ -1329,10 +1385,9 @@ mod tests {
         let t = transport(&served.base(), true);
         let target = Url::parse(&format!("http://127.0.0.1:{}/x", other.addr().port()))
             .expect("foreign url");
-        assert_eq!(
-            t.post_json_target(&target, &json!({})).unwrap_err(),
-            TransportFailure::InvalidInput
-        );
+        let failure = t.post_json_target(&target, &json!({})).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::InvalidInput);
+        assert_eq!(failure.http_status(), None);
         assert_eq!(served.hits(), 0);
         assert_eq!(other.hits(), 0);
     }
@@ -1342,11 +1397,15 @@ mod tests {
         let fixture = HttpFixture::ok();
         let t = transport(&fixture.base(), true);
         assert_eq!(
-            t.get_json_target(&fixture.url("/x?y=1")).unwrap_err(),
+            t.get_json_target(&fixture.url("/x?y=1"))
+                .unwrap_err()
+                .failure(),
             TransportFailure::InvalidInput
         );
         assert_eq!(
-            t.get_json_target(&fixture.url("/x#f")).unwrap_err(),
+            t.get_json_target(&fixture.url("/x#f"))
+                .unwrap_err()
+                .failure(),
             TransportFailure::InvalidInput
         );
         assert_eq!(fixture.hits(), 0);
@@ -1357,20 +1416,18 @@ mod tests {
         let refused = HttpFixture::refused_address();
         let t = transport(&format!("http://{refused}"), true);
         let target = Url::parse(&format!("http://{refused}/x")).expect("url");
-        assert_eq!(
-            t.post_json_target(&target, &json!({})).unwrap_err(),
-            TransportFailure::ConnectionRefused
-        );
+        let failure = t.post_json_target(&target, &json!({})).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::ConnectionRefused);
+        assert_eq!(failure.http_status(), None);
     }
 
     #[test]
     fn a_non_success_status_is_classified_with_its_status() {
         let fixture = HttpFixture::start(vec![Reply::status(503)]);
         let t = transport(&fixture.base(), true);
-        assert_eq!(
-            t.get_json_target(&fixture.url("/x")).unwrap_err(),
-            TransportFailure::HttpStatus(503)
-        );
+        let failure = t.get_json_target(&fixture.url("/x")).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::HttpStatus(503));
+        assert_eq!(failure.http_status(), Some(503));
         assert!(TransportFailure::HttpStatus(503).http_status() == Some(503));
         assert!(TransportFailure::HttpStatus(503).network_attempted());
         assert!(!TransportFailure::InvalidInput.network_attempted());
@@ -1393,7 +1450,8 @@ mod tests {
         )
         .expect("transport");
         let failure = t.get_json_target(&tls.url("/probe")).unwrap_err();
-        assert_eq!(failure, TransportFailure::UnclassifiedTransport);
+        assert_eq!(failure.failure(), TransportFailure::UnclassifiedTransport);
+        assert_eq!(failure.http_status(), None);
         assert!(
             tls.fixture().hits() >= 1,
             "a real handshake must have been attempted"

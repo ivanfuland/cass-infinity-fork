@@ -322,6 +322,14 @@ pub fn parse_rerank_response(
         return Err(ApiCallError::new(ApiCallErrorCode::WrongKind));
     }
 
+    // The accepted shapes are closed per protocol. `rerank-json-v1` is the
+    // generic JSON contract and accepts either the wrapped `results` form or
+    // the native array; `openrouter-rerank-v1` is a client of one specific
+    // envelope and accepts only `results/index/relevance_score`. A native array
+    // from the cloud protocol is refused rather than reinterpreted — guessing a
+    // second shape would silently invent a protocol and an identity.
+    let native_allowed = matches!(profile.protocol, ApiProtocol::RerankJsonV1);
+
     let (rows, identity, native) = match body {
         Value::Object(object) => {
             let identity = observed_identity(profile, body)?;
@@ -331,7 +339,7 @@ pub fn parse_rerank_response(
                 .ok_or_else(invalid_response)?;
             (rows, identity, false)
         }
-        Value::Array(rows) => {
+        Value::Array(rows) if native_allowed => {
             // A native array carries no top-level identity at all, so the
             // observation stays empty rather than borrowing the configuration.
             (rows, ObservedIdentity::default(), true)
@@ -428,10 +436,33 @@ fn finalize_vector(
         Normalization::L2 => 1.0 / norm,
         Normalization::None => 1.0,
     };
-    Ok(values
+    let stored: Vec<f32> = values
         .into_iter()
         .map(|value| (value * scale) as f32)
-        .collect())
+        .collect();
+
+    // The contract is on the vector that is actually returned, so it is
+    // checked in its stored type too. A `f64` value the config accepted can
+    // still be unrepresentable as `f32`: `1e40` becomes infinity and `1e-50`
+    // becomes a zero, and neither is a vector this module may hand back. The
+    // value is refused rather than clamped, and `none` keeps meaning "stored
+    // exactly as the service returned it" — if that cannot be stored, the
+    // response is invalid.
+    if stored.iter().any(|value| !value.is_finite()) {
+        return Err(invalid_response());
+    }
+    let stored_norm_squared: f64 = stored
+        .iter()
+        .map(|value| {
+            let value = f64::from(*value);
+            value * value
+        })
+        .sum();
+    let stored_norm = stored_norm_squared.sqrt();
+    if !stored_norm.is_finite() || stored_norm == 0.0 {
+        return Err(invalid_response());
+    }
+    Ok(stored)
 }
 
 /// Read the optional identity fields of a response.
@@ -706,6 +737,66 @@ model_revision = "rev"
         assert!(!object.contains_key("model"));
         assert_eq!(object["top_n"], json!(1));
         assert_eq!(object["return_documents"], json!(false));
+    }
+
+    #[test]
+    fn the_accepted_rerank_shapes_are_closed_per_protocol() {
+        let native = json!([{"index": 0, "score": 0.5}]);
+        let envelope = json!({"results": [{"index": 0, "relevance_score": 0.5}]});
+
+        let json_protocol = rerank_profile("");
+        assert!(parse_rerank_response(&json_protocol, &native, 1).is_ok());
+        assert!(parse_rerank_response(&json_protocol, &envelope, 1).is_ok());
+
+        let cloud = profile(
+            r#"
+version = 1
+[profiles.p]
+kind = "rerank"
+protocol = "openrouter-rerank-v1"
+endpoint = "https://example.invalid/r"
+scope = "remote"
+model = "m"
+model_revision = "rev"
+"#,
+        );
+        assert_eq!(
+            parse_rerank_response(&cloud, &native, 1)
+                .expect_err("native array on the cloud protocol")
+                .code(),
+            ApiCallErrorCode::InvalidResponse
+        );
+        assert!(parse_rerank_response(&cloud, &envelope, 1).is_ok());
+    }
+
+    #[test]
+    fn a_vector_must_stay_finite_and_non_zero_after_the_f32_cast() {
+        let none = embedding_profile("");
+        let l2 = embedding_profile_with("l2", "");
+        let parse = |profile: &ValidatedProfile, component: f64| {
+            let body = json!({"data": [{"index": 0, "embedding": [component]}]});
+            parse_embedding_response(profile, &body, 1)
+        };
+
+        assert_eq!(
+            parse(&none, 1.0).expect("representable").vectors[0],
+            vec![1.0f32]
+        );
+        assert_eq!(
+            parse(&none, 1e40).expect_err("f32 overflow").code(),
+            ApiCallErrorCode::InvalidResponse
+        );
+        assert_eq!(
+            parse(&none, 1e-50).expect_err("f32 underflow").code(),
+            ApiCallErrorCode::InvalidResponse
+        );
+        // `l2` maps a large finite component onto a representable unit vector,
+        // so it is accepted and the stored value is checked just the same.
+        assert_eq!(
+            parse(&l2, 1e40).expect("unit vector").vectors[0],
+            vec![1.0f32]
+        );
+        assert!((parse(&l2, 3.0).expect("normalized").vectors[0][0] - 1.0).abs() < 1e-6);
     }
 
     #[test]

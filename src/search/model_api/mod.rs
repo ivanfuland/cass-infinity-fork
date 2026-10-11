@@ -33,7 +33,7 @@ pub mod test_support;
 
 pub use client::{
     ApiAttempt, ApiCallFailure, ApiClient, AttemptStage, CredentialResolver, EmbedOutcome,
-    EnvCredentialResolver, ProbeOutcome, RequestedIdentity, RerankOptions, RerankOutcome,
+    ProbeOutcome, RequestedIdentity, RerankOptions, RerankOutcome,
 };
 pub use config::{
     ApiConfig, ApiProtocol, EmbeddingProfile, EndpointScope, Normalization, ProfileDetail,

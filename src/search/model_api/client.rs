@@ -38,7 +38,7 @@ use super::config::{
 use super::error::{ApiCallError, ApiCallErrorCode};
 use super::protocol::{self, InputKind, ObservedIdentity, RerankReply};
 use super::routing;
-use crate::search::rerank::http::{HttpConfig, HttpTransport, TransportFailure};
+use crate::search::rerank::http::{HttpConfig, HttpTransport, TransportError, TransportFailure};
 
 /// Where a per-call credential comes from.
 ///
@@ -47,19 +47,6 @@ use crate::search::rerank::http::{HttpConfig, HttpTransport, TransportFailure};
 pub trait CredentialResolver: Send + Sync {
     /// The credential for `variable`, or `None` when it is unset.
     fn resolve(&self, variable: &str) -> Option<String>;
-}
-
-/// The production resolver: the process environment.
-///
-/// This is the implementation a caller injects; [`ApiClient`] calls it but never
-/// reads the environment on its own, so a test can supply a fixed map instead.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct EnvCredentialResolver;
-
-impl CredentialResolver for EnvCredentialResolver {
-    fn resolve(&self, variable: &str) -> Option<String> {
-        std::env::var(variable).ok()
-    }
 }
 
 /// Which side of the fallback pair one attempt belongs to.
@@ -366,7 +353,7 @@ impl ApiClient {
         if query.is_empty() || documents.is_empty() {
             return Err(self.bare_failure(ApiCallErrorCode::InvalidInput, Some(profile)));
         }
-        let outcome = self.rerank_attempt(profile, query, documents, AttemptStage::Primary);
+        let outcome = self.rerank_attempt(profile, query, documents, AttemptStage::Primary, None);
         match outcome.result {
             Ok(reply) => Ok(RerankOutcome {
                 requested: requested_identity(profile),
@@ -406,8 +393,27 @@ impl ApiClient {
 
         let fallback = routing::fallback_target(&self.config, primary, options.allow_fallback);
 
-        let first = self.rerank_attempt(primary, query, documents, AttemptStage::Primary);
+        let first = self.rerank_attempt(
+            primary,
+            query,
+            documents,
+            AttemptStage::Primary,
+            options.cancel,
+        );
         let mut attempts = vec![first.attempt];
+
+        // Checked the moment the primary returns, before its result is used and
+        // before any fallback decision. A call that has observed a cancellation
+        // never reports success and never reaches the cloud, whatever the
+        // primary answered.
+        if options.cancelled() {
+            return Err(self.failure(
+                ApiCallError::new(ApiCallErrorCode::Cancelled),
+                Some(primary),
+                attempts,
+            ));
+        }
+
         let primary_failure = match first.result {
             Ok(reply) => {
                 return Ok(RerankOutcome {
@@ -442,8 +448,13 @@ impl ApiClient {
         }
 
         let reason = primary_failure.transport.map(TransportFailure::as_str);
-        let second =
-            self.rerank_attempt(fallback_profile, query, documents, AttemptStage::Fallback);
+        let second = self.rerank_attempt(
+            fallback_profile,
+            query,
+            documents,
+            AttemptStage::Fallback,
+            options.cancel,
+        );
         attempts.push(second.attempt);
         match second.result {
             Ok(reply) => Ok(RerankOutcome {
@@ -497,10 +508,11 @@ impl ApiClient {
             identity: ObservedIdentity::default(),
         };
         let Some(rows) = json.body.get("data").and_then(Value::as_array) else {
+            let code = ApiCallErrorCode::InvalidResponse;
             return Err(self.failure(
-                ApiCallError::new(ApiCallErrorCode::InvalidResponse),
+                ApiCallError::new(code),
                 Some(profile),
-                vec![attempt],
+                vec![failed_probe_attempt(profile, json.status, code)],
             ));
         };
         let model_listed = rows.iter().any(|row| {
@@ -509,10 +521,11 @@ impl ApiClient {
                 .is_some_and(|id| model_matches(profile, id))
         });
         if !model_listed {
+            let code = ApiCallErrorCode::IdentityMismatch;
             return Err(self.failure(
-                ApiCallError::new(ApiCallErrorCode::IdentityMismatch),
+                ApiCallError::new(code),
                 Some(profile),
-                vec![attempt],
+                vec![failed_probe_attempt(profile, json.status, code)],
             ));
         }
         Ok(ProbeOutcome {
@@ -539,12 +552,19 @@ impl ApiClient {
     }
 
     /// One rerank attempt against `profile`, with its own record.
+    ///
+    /// `cancel` is checked twice around the one request: after the transport —
+    /// and therefore the credential resolution — is built and before the body
+    /// is sent, and again the moment a response or a failure comes back. A set
+    /// flag stops the send, and a call that has observed a cancellation never
+    /// reports success.
     fn rerank_attempt(
         &self,
         profile: &ValidatedProfile,
         query: &str,
         documents: &[String],
         stage: AttemptStage,
+        cancel: Option<&AtomicBool>,
     ) -> AttemptOutcome {
         let started = Instant::now();
         let body = match protocol::rerank_request(profile, query, documents) {
@@ -555,43 +575,85 @@ impl ApiClient {
             Ok(transport) => transport,
             Err(error) => return self.attempt_failure_outcome(profile, stage, error, started),
         };
+        if is_cancelled(cancel) {
+            return AttemptOutcome::failed(
+                ApiCallError::new(ApiCallErrorCode::Cancelled),
+                None,
+                cancelled_attempt(profile, stage, false, None, elapsed_ms(started)),
+            );
+        }
         match transport.post_json_target(profile.endpoint.url(), &body) {
-            Ok(json) => match protocol::parse_rerank_response(profile, &json.body, documents.len())
-            {
-                Ok(reply) => {
-                    let attempt = ApiAttempt {
-                        profile_id: profile.id.clone(),
-                        stage,
-                        network_attempted: true,
-                        http_status: Some(json.status),
-                        error_code: None,
-                        duration_ms: elapsed_ms(started),
-                        identity: reply.identity.clone(),
-                    };
-                    AttemptOutcome::succeeded(reply, attempt)
-                }
-                Err(error) => {
-                    let attempt = observed_failure_attempt(
-                        profile,
-                        stage,
-                        Some(json.status),
-                        error.code().as_str(),
-                        elapsed_ms(started),
+            Ok(json) => {
+                let attempt = ApiAttempt {
+                    profile_id: profile.id.clone(),
+                    stage,
+                    network_attempted: true,
+                    http_status: Some(json.status),
+                    error_code: None,
+                    duration_ms: elapsed_ms(started),
+                    identity: ObservedIdentity::default(),
+                };
+                if is_cancelled(cancel) {
+                    // The service really answered; the cancellation still wins,
+                    // and the record keeps the status so nobody can read this as
+                    // "the request was never made".
+                    return AttemptOutcome::failed(
+                        ApiCallError::new(ApiCallErrorCode::Cancelled),
+                        None,
+                        cancelled_attempt(
+                            profile,
+                            stage,
+                            true,
+                            Some(json.status),
+                            elapsed_ms(started),
+                        ),
                     );
-                    AttemptOutcome::failed(error, None, attempt)
                 }
-            },
-            Err(failure) => {
+                match protocol::parse_rerank_response(profile, &json.body, documents.len()) {
+                    Ok(reply) => {
+                        let attempt = ApiAttempt {
+                            identity: reply.identity.clone(),
+                            ..attempt
+                        };
+                        AttemptOutcome::succeeded(reply, attempt)
+                    }
+                    Err(error) => {
+                        let attempt = observed_failure_attempt(
+                            profile,
+                            stage,
+                            Some(json.status),
+                            error.code().as_str(),
+                            elapsed_ms(started),
+                        );
+                        AttemptOutcome::failed(error, None, attempt)
+                    }
+                }
+            }
+            Err(transport_error) => {
+                let failure = transport_error.failure();
                 let error = api_error_from_transport(failure);
                 let attempt = ApiAttempt {
                     profile_id: profile.id.clone(),
                     stage,
                     network_attempted: failure.network_attempted(),
-                    http_status: failure.http_status(),
+                    http_status: transport_error.http_status(),
                     error_code: Some(failure.as_str()),
                     duration_ms: elapsed_ms(started),
                     identity: ObservedIdentity::default(),
                 };
+                if is_cancelled(cancel) {
+                    return AttemptOutcome::failed(
+                        ApiCallError::new(ApiCallErrorCode::Cancelled),
+                        None,
+                        cancelled_attempt(
+                            profile,
+                            stage,
+                            failure.network_attempted(),
+                            transport_error.http_status(),
+                            elapsed_ms(started),
+                        ),
+                    );
+                }
                 AttemptOutcome::failed(error, Some(failure), attempt)
             }
         }
@@ -673,20 +735,23 @@ impl ApiClient {
     }
 
     /// A refusal raised by the transport layer, with its classification kept for
-    /// the routing decision.
+    /// the routing decision and the status it actually observed kept as
+    /// evidence. A failure after a real answer therefore records that status
+    /// instead of reporting the service as unreachable.
     fn transport_failure(
         &self,
         profile: &ValidatedProfile,
         stage: AttemptStage,
-        failure: TransportFailure,
+        transport_error: TransportError,
         started: Instant,
     ) -> ApiCallFailure {
+        let failure = transport_error.failure();
         let error = api_error_from_transport(failure);
         let attempt = ApiAttempt {
             profile_id: profile.id.clone(),
             stage,
             network_attempted: failure.network_attempted(),
-            http_status: failure.http_status(),
+            http_status: transport_error.http_status(),
             error_code: Some(failure.as_str()),
             duration_ms: elapsed_ms(started),
             identity: ObservedIdentity::default(),
@@ -759,6 +824,34 @@ impl AttemptOutcome {
     }
 }
 
+/// Whether the caller's cancellation flag is set.
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+/// The record for an attempt the caller cancelled.
+///
+/// `network_attempted` and `http_status` are what really happened: a cancelled
+/// request reports the status it did receive rather than pretending the network
+/// was never touched.
+fn cancelled_attempt(
+    profile: &ValidatedProfile,
+    stage: AttemptStage,
+    network_attempted: bool,
+    http_status: Option<u16>,
+    duration_ms: u64,
+) -> ApiAttempt {
+    ApiAttempt {
+        profile_id: profile.id.clone(),
+        stage,
+        network_attempted,
+        http_status,
+        error_code: Some(ApiCallErrorCode::Cancelled.as_str()),
+        duration_ms,
+        identity: ObservedIdentity::default(),
+    }
+}
+
 /// The record for an attempt whose response was observed but rejected.
 fn observed_failure_attempt(
     profile: &ValidatedProfile,
@@ -774,6 +867,27 @@ fn observed_failure_attempt(
         http_status,
         error_code: Some(error_code),
         duration_ms,
+        identity: ObservedIdentity::default(),
+    }
+}
+
+/// The record for a probe that received a real answer and rejected it.
+///
+/// The HTTP status is the one the service actually returned, and the short code
+/// names the rule that refused it, so a probe failure is never recorded as an
+/// unexplained `None`.
+fn failed_probe_attempt(
+    profile: &ValidatedProfile,
+    http_status: u16,
+    code: ApiCallErrorCode,
+) -> ApiAttempt {
+    ApiAttempt {
+        profile_id: profile.id.clone(),
+        stage: AttemptStage::Probe,
+        network_attempted: true,
+        http_status: Some(http_status),
+        error_code: Some(code.as_str()),
+        duration_ms: 0,
         identity: ObservedIdentity::default(),
     }
 }
@@ -1430,6 +1544,10 @@ api_key_env = "ABSENT_KEY"
     // ------------------------------------------------------------------
 
     fn embedding_config(base: &str, extra: &str) -> String {
+        embedding_config_norm(base, "none", extra)
+    }
+
+    fn embedding_config_norm(base: &str, normalization: &str, extra: &str) -> String {
         format!(
             r#"
 version = 1
@@ -1440,7 +1558,7 @@ endpoint = "{base}/e"
 scope = "loopback"
 model = "m"
 model_revision = "r"
-normalization = "none"
+normalization = "{normalization}"
 {extra}
 "#
         )
@@ -1646,6 +1764,125 @@ model_revision = "r"
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_body_after_a_200_keeps_the_observed_status() {
+        let fixture = HttpFixture::start(vec![Reply::raw(
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
+        )]);
+        let text = format!(
+            r#"
+version = 1
+[profiles.rr]
+kind = "rerank"
+protocol = "rerank-json-v1"
+endpoint = "{base}/r"
+scope = "loopback"
+model = "m"
+model_revision = "r"
+"#,
+            base = fixture.base()
+        );
+        let documents = documents(1);
+        let failure = client(&text)
+            .rerank_once("rr", "q", &documents)
+            .expect_err("malformed body");
+        assert_eq!(failure.error().code(), ApiCallErrorCode::InvalidResponse);
+        assert_eq!(failure.attempts().len(), 1);
+        assert_eq!(
+            failure.attempts()[0].http_status,
+            Some(200),
+            "the service answered, so the status is evidence"
+        );
+        assert_eq!(failure.attempts()[0].error_code, Some("invalid_response"));
+    }
+
+    #[test]
+    fn an_unrepresentable_embedding_is_refused_over_the_wire() {
+        let cases: Vec<(&str, f64, &str, bool)> = vec![
+            ("a normal component passes", 1.0, "none", true),
+            ("f32 overflow becomes infinity", 1e40, "none", false),
+            ("f32 underflow becomes zero", 1e-50, "none", false),
+            // `l2` normalizes a large finite component to a unit vector, so the
+            // stored value stays representable.
+            ("l2 keeps a large finite component", 1e40, "l2", true),
+        ];
+        for (label, component, normalization, accepted) in cases {
+            let fixture = HttpFixture::start(vec![Reply::ok(embedding_rows(&[vec![component]]))]);
+            let text = embedding_config_norm(&fixture.base(), normalization, "");
+            let outcome = client(&text).embed_once("emb", &["a".to_string()], InputKind::Query);
+            match (accepted, outcome) {
+                (true, Ok(outcome)) => {
+                    assert_eq!(outcome.vectors.len(), 1, "{label}");
+                    assert!(
+                        outcome.vectors[0].iter().all(|value| value.is_finite()),
+                        "{label}: finite"
+                    );
+                    assert!(
+                        outcome.vectors[0].iter().any(|value| *value != 0.0),
+                        "{label}: non zero"
+                    );
+                }
+                (false, Err(failure)) => {
+                    assert_eq!(
+                        failure.error().code(),
+                        ApiCallErrorCode::InvalidResponse,
+                        "{label}"
+                    );
+                    assert_eq!(fixture.hits(), 1, "{label}: the request was made");
+                }
+                (accepted, other) => panic!("{label}: expected accepted={accepted}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_openrouter_rerank_protocol_refuses_a_native_array() {
+        let native = HttpFixture::start(vec![Reply::ok(rerank_native(2))]);
+        let text = format!(
+            r#"
+version = 1
+[profiles.rr]
+kind = "rerank"
+protocol = "openrouter-rerank-v1"
+endpoint = "{base}/r"
+scope = "loopback"
+model = "m"
+model_revision = "r"
+"#,
+            base = native.base()
+        );
+        let documents = documents(2);
+        let failure = client(&text)
+            .rerank_once("rr", "q", &documents)
+            .expect_err("native array on the cloud protocol");
+        assert_eq!(failure.error().code(), ApiCallErrorCode::InvalidResponse);
+
+        // The same profile still accepts the standard envelope.
+        let envelope = HttpFixture::start(vec![Reply::ok(rerank_results(2))]);
+        let text = text.replace(&native.base(), &envelope.base());
+        let outcome = client(&text)
+            .rerank_once("rr", "q", &documents)
+            .expect("envelope accepted");
+        assert_eq!(outcome.scores, vec![2.0, 1.0]);
+    }
+
+    #[test]
+    fn a_probe_failure_records_its_short_code() {
+        let fixture = HttpFixture::start(vec![Reply::ok(json!({}))]);
+        let text = embedding_with_models(&fixture.base(), Some(&fixture.base()));
+        let failure = client(&text).probe_models("emb").expect_err("no data");
+        assert_eq!(failure.error().code(), ApiCallErrorCode::InvalidResponse);
+        assert_eq!(failure.attempts().len(), 1);
+        assert_eq!(failure.attempts()[0].error_code, Some("InvalidResponse"));
+        assert_eq!(failure.attempts()[0].http_status, Some(200));
+
+        let fixture = HttpFixture::start(vec![Reply::ok(json!({"data": [{"id": "other"}]}))]);
+        let text = embedding_with_models(&fixture.base(), Some(&fixture.base()));
+        let failure = client(&text).probe_models("emb").expect_err("model absent");
+        assert_eq!(failure.attempts()[0].error_code, Some("IdentityMismatch"));
+        assert_eq!(failure.attempts()[0].http_status, Some(200));
     }
 
     #[test]
@@ -1870,18 +2107,17 @@ provider_only = "pinned-vendor"
     }
 
     #[test]
-    fn a_cancel_after_the_primary_completes_sends_no_cloud_request() {
-        let refused = HttpFixture::refused_address();
+    fn a_cancellation_seen_before_the_send_stops_the_request() {
+        // The credential resolver flips the flag while the transport is being
+        // built, so the flag is set strictly after the call-level pre-check and
+        // strictly before the request body exists. Nothing may be sent.
         let cloud = TlsFixture::start(vec![Reply::ok(rerank_results(2))]);
         let text = rerank_pair_full(
-            &format!("http://{refused}/rerank"),
+            &format!("http://127.0.0.1:9/rerank"),
             "api_key_env = \"PRIMARY_KEY\"",
             &format!("{}/api/v1/rerank", cloud.base()),
         );
 
-        // The flag is flipped while the primary attempt is being prepared, so
-        // it is set before the "primary returned" check runs and must block the
-        // cloud request that the failure would otherwise allow.
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let mut credentials = FixedCredentials::with(&[("PRIMARY_KEY", "synthetic-token")]);
@@ -1895,9 +2131,51 @@ provider_only = "pinned-vendor"
         };
         let failure = api
             .rerank_with_fallback("local", "q", &documents, options)
-            .expect_err("cancelled");
-        assert_eq!(failure.error().code(), ApiCallErrorCode::Transport);
+            .expect_err("cancelled before the send");
+        assert_eq!(failure.error().code(), ApiCallErrorCode::Cancelled);
         assert_eq!(failure.attempts().len(), 1);
+        assert!(
+            !failure.attempts()[0].network_attempted,
+            "no request may be sent once the flag is set"
+        );
+        assert_eq!(failure.attempts()[0].http_status, None);
+        assert_eq!(cloud.fixture().hits(), 0, "no cloud request may be sent");
+    }
+
+    #[test]
+    fn a_cancellation_seen_after_a_successful_response_is_not_a_success() {
+        // The service sets the flag and then answers a valid 200. The call must
+        // not report success, and the record must keep the status it really
+        // received rather than pretending the network was never touched.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let primary = HttpFixture::start(vec![Reply::after_setting(
+            cancel.clone(),
+            Reply::ok(rerank_results(2)),
+        )]);
+        let cloud = TlsFixture::start(vec![Reply::ok(rerank_results(2))]);
+        let text = rerank_pair(&primary.base(), &cloud.base());
+        let api = client_trusting(&text, cloud.ca_pem(), FixedCredentials::default());
+
+        let documents = documents(2);
+        let options = RerankOptions {
+            allow_fallback: true,
+            cancel: Some(&cancel),
+        };
+        let failure = api
+            .rerank_with_fallback("local", "q", &documents, options)
+            .expect_err("cancelled after the response");
+        assert_eq!(failure.error().code(), ApiCallErrorCode::Cancelled);
+        assert_eq!(failure.attempts().len(), 1);
+        assert!(
+            failure.attempts()[0].network_attempted,
+            "the request really went out"
+        );
+        assert_eq!(
+            failure.attempts()[0].http_status,
+            Some(200),
+            "the service really answered"
+        );
+        assert_eq!(primary.hits(), 1);
         assert_eq!(cloud.fixture().hits(), 0, "no cloud request may be sent");
     }
 

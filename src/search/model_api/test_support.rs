@@ -45,6 +45,13 @@ pub enum Reply {
     /// Headers that declare a body which is then never sent, so the client's
     /// read hits its own timeout.
     Stall,
+    /// Set the flag *before* answering, then answer with the inner reply.
+    ///
+    /// This is how a test makes the service observe a cancellation that the
+    /// client can only see after its own request has been served. The store
+    /// strictly precedes the response bytes on the wire, so the client's
+    /// post-response check always sees it; no sleep or race is involved.
+    Flagged(Arc<AtomicBool>, Box<Reply>),
 }
 
 impl Reply {
@@ -61,6 +68,11 @@ impl Reply {
     /// Exact bytes, for a response a DTO could not express.
     pub fn raw(bytes: impl Into<Vec<u8>>) -> Self {
         Self::Raw(bytes.into())
+    }
+
+    /// Set `flag`, then answer exactly as `inner` would.
+    pub fn after_setting(flag: Arc<AtomicBool>, inner: Reply) -> Self {
+        Self::Flagged(flag, Box::new(inner))
     }
 }
 
@@ -320,6 +332,17 @@ fn serve<S: Read + Write>(
 ) {
     let request = read_request(stream);
     requests.lock().expect("fixture request log").push(request);
+    write_reply(stream, reply, stop, deadline);
+    let _ = stream.flush();
+}
+
+/// Write one reply, unwrapping the flag-setting wrapper first.
+fn write_reply<S: Read + Write>(
+    stream: &mut S,
+    reply: &Reply,
+    stop: &AtomicBool,
+    deadline: Instant,
+) {
     match reply {
         Reply::Json(status, body) => {
             let body = serde_json::to_vec(body).expect("fixture json");
@@ -339,8 +362,11 @@ fn serve<S: Read + Write>(
                 thread::sleep(Duration::from_millis(10));
             }
         }
+        Reply::Flagged(flag, inner) => {
+            flag.store(true, Ordering::SeqCst);
+            write_reply(stream, inner, stop, deadline);
+        }
     }
-    let _ = stream.flush();
 }
 
 /// Read one request: headers up to CRLFCRLF, then the declared body.
