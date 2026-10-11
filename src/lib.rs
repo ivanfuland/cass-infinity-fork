@@ -2517,12 +2517,21 @@ pub enum ModelsCommand {
     },
     /// Run one bounded semantic backfill batch from the canonical DB
     Backfill {
-        /// Semantic tier to backfill: fast or quality
-        #[arg(long, default_value = "fast")]
-        tier: String,
-        /// Embedder implementation: hash or fastembed
+        /// Semantic tier to backfill: fast or quality (legacy local model routing;
+        /// not accepted on the API-only path)
+        #[arg(long)]
+        tier: Option<String>,
+        /// Embedder implementation: hash or fastembed (legacy local backend;
+        /// not accepted on the API-only path)
         #[arg(long)]
         embedder: Option<String>,
+        /// Embedding profile id from the model API configuration. Selects the
+        /// API-only path; defaults to the configuration's `default_embedding`.
+        #[arg(long)]
+        embedding_profile: Option<String>,
+        /// Disable the configured fallback for this command
+        #[arg(long)]
+        no_model_fallback: bool,
         /// Maximum canonical conversations to process in this batch
         #[arg(long, default_value_t = 64)]
         batch_conversations: usize,
@@ -100799,6 +100808,8 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
         ModelsCommand::Backfill {
             tier,
             embedder,
+            embedding_profile,
+            no_model_fallback,
             batch_conversations,
             scheduled,
             data_dir,
@@ -100807,10 +100818,13 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_models_backfill(
-                &tier,
+                tier.as_deref(),
                 embedder.as_deref(),
+                embedding_profile.as_deref(),
+                no_model_fallback,
                 batch_conversations,
                 scheduled,
+                cli.api_config.as_deref(),
                 data_dir,
                 db.or_else(|| cli.db.clone()),
                 structured_format,
@@ -102411,34 +102425,30 @@ fn resolve_semantic_index_embedder(raw: &str) -> String {
     }
 }
 
-fn run_models_backfill(
-    tier_raw: &str,
-    embedder_override: Option<&str>,
-    batch_conversations: usize,
-    scheduled: bool,
+/// A model-command refusal that migrates a retired local model selection onto
+/// the API profile path.
+///
+/// The kind is the shared `ModelApiMigration`, so a script can branch on it
+/// exactly as it branches on the retired environment variables' refusal.
+fn model_api_migration_error(message: String, hint: String) -> CliError {
+    CliError {
+        code: 2,
+        kind: crate::search::model_api::runtime::RuntimeErrorKind::Migration.as_str(),
+        message,
+        hint: Some(hint),
+        retryable: false,
+    }
+}
+
+/// Resolve the `data_dir`-scoped database `models backfill` operates on.
+///
+/// Extracted from the legacy path verbatim so both branches share one
+/// resolution and one set of refusals: a `--db` outside `--data-dir` is a usage
+/// error, and a missing database is `IndexMissing`.
+fn resolve_models_backfill_db(
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use crate::indexer::semantic::{
-        SemanticBackfillSchedulerSignals, SemanticIndexer, semantic_backfill_scheduler_decision,
-    };
-    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-    use crate::search::semantic_manifest::TierKind;
-    use crate::storage::sqlite::FrankenStorage;
-    use colored::Colorize;
-
-    if batch_conversations == 0 {
-        return Err(CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: "--batch-conversations must be greater than zero".to_string(),
-            hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
-            retryable: false,
-        });
-    }
-
-    let tier = parse_models_backfill_tier(tier_raw)?;
+) -> CliResult<(PathBuf, PathBuf)> {
     // T4 mission #122a (C, R2-01/R3-F3/R1-N12): canonicalize `data_dir` up
     // front so both the mismatch check below and the lock file path
     // (`acquire_index_run_lock` keys its lock file off `data_dir`) see the
@@ -102517,23 +102527,28 @@ fn run_models_backfill(
             retryable: true,
         });
     }
+    Ok((data_dir, db_path_for_open))
+}
 
-    // T4 mission #122a (C, spec §四.4): take the same `index-run.lock`
-    // `cass index`/`watch` take, keyed off this same canonicalized
-    // `data_dir` -- held for the rest of this function (dropped on every
-    // return path, including the scheduler-skip early return below) so a
-    // concurrent `cass index --semantic` (or another `models backfill`)
-    // can't drain the same chunk_holes generation at the same time.
-    // Lock-busy uses the exact same code/message `run_index` itself
-    // produces on contention (`ActiveIndexRunDetails::to_cli_error()`,
-    // code 7, `IndexBusy`) -- control-plane ruling 2026-09-11: spec's
-    // originally-drafted "exit 2" for this case was a drafting error (it
-    // never checked what `run_index` actually does), not an intentional
-    // divergence; "exit 2" is correct only for the `--db`/`data_dir`
-    // mismatch case just above, which is a genuinely different failure.
-    let _index_run_lock_guard = crate::indexer::acquire_index_run_lock(
-        &data_dir,
-        &db_path_for_open,
+/// Take the same `index-run.lock` `cass index`/`watch` take, keyed off the
+/// canonicalized `data_dir`.
+///
+/// T4 mission #122a (C, spec §四.4): a concurrent `cass index --semantic` (or
+/// another `models backfill`) must not drain the same `chunk_holes` generation
+/// at the same time. Lock-busy uses the exact code/message `run_index` itself
+/// produces on contention (`ActiveIndexRunDetails::to_cli_error()`, code 7,
+/// `IndexBusy`) -- control-plane ruling 2026-09-11: spec's originally-drafted
+/// "exit 2" for this case was a drafting error (it never checked what
+/// `run_index` actually does), not an intentional divergence; "exit 2" is
+/// correct only for the `--db`/`data_dir` mismatch case, which is a genuinely
+/// different failure.
+fn acquire_models_backfill_lock(
+    data_dir: &Path,
+    db_path_for_open: &Path,
+) -> CliResult<crate::indexer::IndexRunLockGuard> {
+    crate::indexer::acquire_index_run_lock(
+        data_dir,
+        db_path_for_open,
         crate::search::asset_state::SearchMaintenanceMode::Index,
     )
     .map_err(|err| {
@@ -102543,8 +102558,8 @@ fn run_models_backfill(
             .collect::<Vec<_>>()
             .join(" | ");
         if error_chain_indicates_active_cass_index(&chain) {
-            let details = active_index_run_details(&data_dir, &db_path_for_open)
-                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path_for_open));
+            let details = active_index_run_details(data_dir, db_path_for_open)
+                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(data_dir, db_path_for_open));
             return details.to_cli_error();
         }
         CliError {
@@ -102554,7 +102569,427 @@ fn run_models_backfill(
             hint: None,
             retryable: true,
         }
+    })
+}
+
+/// Select the embedding profile an API-path `models backfill` runs against.
+///
+/// `--embedding-profile` wins; otherwise the configuration's
+/// `default_embedding`. The id never decides a model: the profile's own
+/// document does. A rerank profile is refused as a configuration error.
+fn select_api_embedding_profile(
+    config: &crate::search::model_api::ValidatedApiConfig,
+    embedding_profile: Option<&str>,
+) -> CliResult<crate::search::model_api::ValidatedProfile> {
+    use crate::search::model_api::runtime::{self, RuntimeError};
+    use crate::search::model_api::ProfileKind;
+
+    let profile = match embedding_profile {
+        Some(id) => runtime::profile_by_id(config, id)
+            .map_err(model_api_runtime_error)?
+            .clone(),
+        None => {
+            let id = config
+                .default_profile_id(ProfileKind::Embedding)
+                .ok_or_else(|| {
+                    model_api_runtime_error(RuntimeError::configuration(
+                        "no default embedding profile is configured".to_string(),
+                        Some(
+                            "Set default_embedding in the model API configuration, or pass \
+                             --embedding-profile <ID>."
+                                .to_string(),
+                        ),
+                    ))
+                })?;
+            runtime::profile_by_id(config, id)
+                .map_err(model_api_runtime_error)?
+                .clone()
+        }
+    };
+    if profile.kind != ProfileKind::Embedding {
+        return Err(model_api_runtime_error(RuntimeError::configuration(
+            "the selected model API profile is not an embedding profile".to_string(),
+            Some(
+                "Pass --embedding-profile with an embedding profile id; run `cass models list \
+                 --json` to see them."
+                    .to_string(),
+            ),
+        )));
+    }
+    Ok(profile)
+}
+
+/// The `model_api` object printed beside a backfill result or inside a failure
+/// diagnostic, so a failed run still reports the requests it already made.
+fn api_backfill_model_api_value(
+    profile: &crate::search::model_api::ValidatedProfile,
+    call: &crate::search::model_api::PrimaryEmbeddingCall,
+) -> serde_json::Value {
+    serde_json::json!({
+        "primary_profile": profile.id,
+        "requested_model": profile.model,
+        "declared_revision": profile.model_revision,
+        "allow_fallback": call.allow_fallback(),
+        "fallback_used": false,
+        "probe_calls": call.probe_calls(),
+        "document_calls": call.document_calls(),
+        "audit_calls": call.audit_calls(),
+    })
+}
+
+/// `cass models backfill` on the API-only path (spec §§5.3-5.4, 6.1-6.2).
+///
+/// Selected by an explicit `--embedding-profile` or by a named API
+/// configuration. It reuses the legacy branch's `data_dir`/`--db` resolution,
+/// index-run lock and scheduler gate, then runs the shared chunk-domain
+/// catch-up loop over one frozen API embedding profile: one fresh probe fixes
+/// the generation's width and fingerprint, document batches are embedded at the
+/// primary endpoint only, and the generation's API record is written and
+/// re-verified inside the same transaction as its rows.
+#[allow(clippy::too_many_arguments)]
+fn run_models_backfill_api(
+    embedding_profile: Option<&str>,
+    embedder_override: Option<&str>,
+    tier_raw: Option<&str>,
+    no_model_fallback: bool,
+    batch_conversations: usize,
+    scheduled: bool,
+    api_config_path: Option<&Path>,
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::indexer::db_vector_catchup::{
+        ApiPrimaryBackfillError, run_api_primary_catchup_backfill,
+    };
+    use crate::indexer::semantic::{SemanticBackfillSchedulerSignals, semantic_backfill_scheduler_decision};
+    use crate::search::model_api::client::ApiClient;
+    use crate::search::model_api::primary_embedding::PrimaryEmbeddingCall;
+    use crate::search::model_api::runtime::{self, RuntimeError};
+    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+    use crate::storage::sqlite::FrankenStorage;
+    use colored::Colorize;
+
+    // Every retired model-selection input is refused before the database is
+    // opened and before any request, including `--embedder` and a non-default
+    // `--tier` on this path. `--tier fast` is the old default value and stays
+    // accepted; any other explicit tier is a selection this path cannot honour.
+    reject_retired_model_env()?;
+    if embedder_override.is_some() {
+        return Err(model_api_migration_error(
+            "--embedder selects a retired local model backend".to_string(),
+            "Drop --embedder and select an embedding profile with --embedding-profile (or the \
+             configuration's default_embedding)."
+                .to_string(),
+        ));
+    }
+    if let Some(raw) = tier_raw.map(str::trim).filter(|raw| !raw.is_empty())
+        && raw != "fast"
+    {
+        return Err(model_api_migration_error(
+            "--tier selects the retired local two-tier model routing".to_string(),
+            "Drop --tier and select an embedding profile with --embedding-profile (or the \
+             configuration's default_embedding)."
+                .to_string(),
+        ));
+    }
+    let config = runtime::load_config(api_config_path, |key| std::env::var_os(key))
+        .map_err(model_api_runtime_error)?;
+    let profile = select_api_embedding_profile(&config, embedding_profile)?;
+
+    let (data_dir, db_path_for_open) = resolve_models_backfill_db(data_dir_override, db_override)?;
+    let _index_run_lock_guard = acquire_models_backfill_lock(&data_dir, &db_path_for_open)?;
+
+    if scheduled {
+        let decision = semantic_backfill_scheduler_decision(
+            &SemanticPolicy::resolve(&CliSemanticOverrides::default()),
+            batch_conversations,
+            &SemanticBackfillSchedulerSignals::from_env(),
+        );
+        if !decision.should_run() {
+            let status = decision.state.as_str();
+            let next_step = decision.reason.next_step();
+            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+                if matches!(fmt, RobotFormat::Sessions) {
+                    RobotFormat::Compact
+                } else {
+                    fmt
+                }
+            });
+            if structured_format.is_some() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": status,
+                        "next_step": next_step,
+                        "tier": "api",
+                        "primary_profile": profile.id,
+                        "data_dir": data_dir.display().to_string(),
+                        "db_path": db_path_for_open.display().to_string(),
+                        "batch_conversations_limit": batch_conversations,
+                        "scheduler": decision,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!("{}", "Semantic backfill scheduler".bold());
+                println!("  Status: {}", status);
+                println!("  Profile: {}", profile.id);
+                println!("  Capacity: {}%", decision.current_capacity_pct);
+                println!("  Next eligible after: {} ms", decision.next_eligible_after_ms);
+                println!();
+                println!("{}", next_step);
+            }
+            return Ok(());
+        }
+    }
+
+    let storage = FrankenStorage::open_writer(&db_path_for_open).map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("Failed to open cass database {}: {e}", db_path_for_open.display()),
+        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
+        retryable: true,
     })?;
+
+    // One client and one embedding call carry the whole build. The
+    // configuration is frozen here; a later file change cannot alter this run.
+    let client = ApiClient::new(config, model_api_credential_resolver());
+    let call = PrimaryEmbeddingCall::new(client, profile.clone(), !no_model_fallback)
+        .map_err(|error| model_api_runtime_error(RuntimeError::invalid_config(&error)))?;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+    let structured = structured_format.is_some();
+
+    // One fresh probe per command. It is the only place the generation's width
+    // and fingerprint come from, and it is never cached across commands.
+    let probe = match call.probe() {
+        Ok(probe) => probe,
+        Err(failure) => {
+            return Err(api_backfill_failure_error(
+                failure.message(),
+                failure.is_compatibility_required(),
+                &profile,
+                &call,
+                structured,
+                &data_dir,
+                &db_path_for_open,
+            ));
+        }
+    };
+
+    let ownership_seed = FrankenStorage::now_millis() as u64;
+    let batch_size = batch_conversations.max(1);
+    let outcome = match run_api_primary_catchup_backfill(
+        &storage,
+        batch_size,
+        &call,
+        &profile,
+        &probe,
+        ownership_seed,
+    ) {
+        Ok(outcome) => outcome,
+        Err(ApiPrimaryBackfillError::CompatibilityRequired { message }) => {
+            return Err(api_backfill_failure_error(
+                message,
+                true,
+                &profile,
+                &call,
+                structured,
+                &data_dir,
+                &db_path_for_open,
+            ));
+        }
+        Err(ApiPrimaryBackfillError::Failed(error)) => {
+            return Err(api_backfill_failure_error(
+                format!("{error:#}"),
+                false,
+                &profile,
+                &call,
+                structured,
+                &data_dir,
+                &db_path_for_open,
+            ));
+        }
+    };
+
+    let report = outcome.catchup;
+    if structured {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": if report.activated { "published" } else { "in_progress" },
+                "next_step": if report.activated {
+                    "semantic tier is ready"
+                } else {
+                    "rerun the same command to continue draining chunk_holes"
+                },
+                "tier": "api",
+                "embedder_id": report.embedder_id,
+                "data_dir": data_dir.display().to_string(),
+                "db_path": db_path_for_open.display().to_string(),
+                "generation_id": report.generation_id,
+                "reused_existing_generation": report.reused_existing_generation,
+                "eligible_seeded": report.eligible_seeded,
+                "embedded_inserted": report.embedded_inserted,
+                "stale_skipped": report.stale_skipped,
+                "holes_before": report.holes_before,
+                "holes_after": report.holes_after,
+                "activated": report.activated,
+                "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
+                    "generation_id": generation_id,
+                    "error": detail,
+                })).collect::<Vec<_>>(),
+                "model_api": outcome.model_api,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("{}", "Semantic backfill (API embedding)".bold());
+        println!("  Generation: {}", report.generation_id);
+        println!("  Profile: {}", profile.id);
+        println!("  Embedder: {}", report.embedder_id);
+        println!("  Embedded (this run): {}", report.embedded_inserted);
+        println!("  Holes remaining: {}", report.holes_after);
+        println!("  Activated: {}", report.activated);
+        if !report.cleanup_failures.is_empty() {
+            println!("  Cleanup failures: {}", report.cleanup_failures.len());
+            for (generation_id, detail) in &report.cleanup_failures {
+                println!("    - generation {generation_id}: {detail}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The CLI refusal for a failed API-path backfill.
+///
+/// A compatibility-required failure reports `semantic-unavailable` (code 15);
+/// every other failure keeps the legacy `semantic-backfill` shape (code 5). In
+/// structured mode the message carries the requests already made, so a machine
+/// consumer sees exactly how far the run got.
+#[allow(clippy::too_many_arguments)]
+fn api_backfill_failure_error(
+    message: String,
+    compatibility_required: bool,
+    profile: &crate::search::model_api::ValidatedProfile,
+    call: &crate::search::model_api::PrimaryEmbeddingCall,
+    structured: bool,
+    data_dir: &Path,
+    db_path_for_open: &Path,
+) -> CliError {
+    let (code, kind, hint) = if compatibility_required {
+        (
+            15,
+            CliErrorKind::SemanticUnavailable.kind_str(),
+            "The configured fallback needs verified cross-endpoint compatibility evidence, which \
+             this build does not implement; run with --no-model-fallback for a pure-primary run, \
+             or restore the primary endpoint.",
+        )
+    } else {
+        (
+            5,
+            CliErrorKind::SemanticBackfill.kind_str(),
+            "Retry the command; the catch-up is idempotent (chunk_holes-driven)",
+        )
+    };
+    let message = if structured {
+        // A `{`-leading message is printed whole as a pre-formatted document
+        // (src/main.rs), so this document must carry the same `error` object the
+        // standard envelope does -- `{code, kind, message, hint, retryable}` --
+        // with the diagnostic's own fields beside it. A machine consumer then
+        // locates both failure classes and a configuration refusal the same way,
+        // by `/error/code`, and the CLI's own exit code equals that number.
+        serde_json::json!({
+            "status": "failed",
+            "tier": "api",
+            "primary_profile": profile.id,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path_for_open.display().to_string(),
+            "compatibility_required": compatibility_required,
+            "error": {
+                "code": code,
+                "kind": kind,
+                "message": message,
+                "hint": hint,
+                "retryable": !compatibility_required,
+            },
+            "model_api": api_backfill_model_api_value(profile, call),
+        })
+        .to_string()
+    } else {
+        message
+    };
+    CliError {
+        code,
+        kind,
+        message,
+        hint: Some(hint.to_string()),
+        retryable: !compatibility_required,
+    }
+}
+
+fn run_models_backfill(
+    tier_raw: Option<&str>,
+    embedder_override: Option<&str>,
+    embedding_profile: Option<&str>,
+    no_model_fallback: bool,
+    batch_conversations: usize,
+    scheduled: bool,
+    api_config_path: Option<&Path>,
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::indexer::semantic::{
+        SemanticBackfillSchedulerSignals, SemanticIndexer, semantic_backfill_scheduler_decision,
+    };
+    use crate::search::model_api::runtime;
+    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+    use crate::search::semantic_manifest::TierKind;
+    use crate::storage::sqlite::FrankenStorage;
+    use colored::Colorize;
+
+    if batch_conversations == 0 {
+        return Err(CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: "--batch-conversations must be greater than zero".to_string(),
+            hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
+            retryable: false,
+        });
+    }
+
+    // API02D: an explicit `--embedding-profile`, or a named API configuration
+    // on `--api-config` or `CASS_API_CONFIG`, selects the API-only path. It
+    // never falls back to the legacy local backend, so a selected-but-broken
+    // configuration is a configuration error rather than a silent switch.
+    let api_branch = embedding_profile.is_some()
+        || runtime::resolve_config_path(api_config_path, |key| std::env::var_os(key)).is_some();
+    if api_branch {
+        return run_models_backfill_api(
+            embedding_profile,
+            embedder_override,
+            tier_raw,
+            no_model_fallback,
+            batch_conversations,
+            scheduled,
+            api_config_path,
+            data_dir_override,
+            db_override,
+            output_format,
+        );
+    }
+
+    let tier = parse_models_backfill_tier(tier_raw.unwrap_or("fast"))?;
+    let (data_dir, db_path_for_open) = resolve_models_backfill_db(data_dir_override, db_override)?;
+    let _index_run_lock_guard = acquire_models_backfill_lock(&data_dir, &db_path_for_open)?;
 
     let embedder_type = embedder_override
         .map(str::trim)
@@ -102887,10 +103322,13 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         }
 
         run_models_backfill(
-            "quality",
+            Some("quality"),
             Some("infinity"),
+            None,
+            false,
             10_000,
             false,
+            None,
             Some(data_dir.clone()),
             Some(db_path.clone()),
             None,
@@ -102943,7 +103381,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         )
         .expect("test setup: acquiring the lock first must succeed");
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), None, None);
         let err = result.expect_err("models backfill must refuse to run while another index run holds the lock");
         assert_eq!(err.code, 7, "lock-busy must use the same exit code run_index uses (IndexBusy), not a bespoke one: {err:?}");
         assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
@@ -102969,7 +103407,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             let _ = FrankenStorage::open(&outside_db).unwrap();
         }
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(outside_db.clone()), None);
+        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), Some(outside_db.clone()), None);
         let err = result.expect_err("a --db outside --data-dir must be rejected");
         assert_eq!(err.code, 2, "data_dir/db_path mismatch must be a usage error: {err:?}");
         assert_eq!(err.kind, CliErrorKind::Usage.kind_str());
@@ -102997,7 +103435,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         let linked_db = data_dir.join("agent_search.db");
         std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(linked_db.clone()), None);
+        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), Some(linked_db.clone()), None);
         let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence that the explicit --db was accepted");
         assert_eq!(
             err.code, 20,
@@ -103009,7 +103447,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         // `expected_db_path`. Asserted here too so a future reordering that
         // canonicalizes only after the `db_path` match cannot pass this
         // test: it would break this direction instead.
-        let implicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let implicit = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), None, None);
         let implicit_err = implicit.expect_err("same retired embedder, reached via the default db path");
         assert_eq!(implicit_err.code, 20, "the implicit (no --db) form must keep working against a symlinked agent_search.db: {implicit_err:?}");
     }
@@ -103063,7 +103501,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         .unwrap();
         lock_file.flush().unwrap();
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), None, None);
         let err = result.expect_err(
             "a held doctor mutation lock must stop the open; a canonicalized path must not be what the storage layer is given",
         );
@@ -103121,7 +103559,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         .unwrap();
         lock_file.flush().unwrap();
 
-        let explicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(real_db), None);
+        let explicit = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), Some(real_db), None);
         let err = explicit.expect_err(
             "a held doctor mutation lock must stop the open even when --db names the symlink's target; deriving the lock from the caller's alias is what lets this form skip it",
         );
@@ -103179,7 +103617,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             storage.insert_conversation_tree(agent_id, None, &conv).expect("seed sentinel conversation into the side db");
         }
 
-        let result = run_models_backfill("fast", None, 100, false, Some(side_dir.clone()), None, None);
+        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(side_dir.clone()), None, None);
         let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence of which db got opened");
         assert_eq!(err.code, 20, "must reach the retired-embedder error, proving data_dir/db_path resolution and lock acquisition both succeeded against the side db first: {err:?}");
 

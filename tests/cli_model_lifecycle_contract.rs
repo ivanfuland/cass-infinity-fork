@@ -354,12 +354,14 @@ fn models_backfill_keeps_semantic_work_data_dir_and_db_scoped() -> Result<(), St
             Some(Commands::Models(ModelsCommand::Backfill {
                 tier,
                 embedder: Some(embedder),
+                embedding_profile: None,
+                no_model_fallback: false,
                 batch_conversations: 17,
                 scheduled: true,
                 data_dir: Some(data_dir),
                 db: Some(db),
                 json: true,
-            })) if tier == "quality"
+            })) if tier.as_deref() == Some("quality")
                 && embedder == "fastembed"
                 && data_dir.display().to_string() == "/cass/data"
                 && db.display().to_string() == "/cass/data/agent_search.db" =>
