@@ -893,6 +893,112 @@ fn non_primary_shapes_are_refused_with_closed_codes() {
     assert!(fixture.open(generation_id, &profile).is_ok());
 }
 
+/// A compatibility-evidence header is structured evidence, not a string this
+/// ticket may freeze. Any legal non-null JSON header is therefore *present and
+/// not admitted here*, which is `CompatibilityRequired` -- never a claim that
+/// the record is corrupt, and never a rewrite of its bytes.
+#[test]
+fn a_structured_compatibility_header_is_pending_admission_not_corruption() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let profile = profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[]);
+    let generation_id = fixture.create(&profile, 1024, b"fp-header");
+    let provenance = meta_value(conn, &provenance_meta_key(generation_id)).expect("provenance");
+
+    let object_header = tamper_first_contributor(
+        &provenance,
+        "compatibility_evidence_header",
+        json!({
+            "version": 1,
+            "primary": {
+                "endpoint_config_sha256": "a".repeat(64),
+                "descriptor_sha256": "b".repeat(64),
+            },
+            "fallback": { "endpoint_config_sha256": "c".repeat(64) },
+            "weights_tokenizer_pooling": ["operator_declared", "l2"],
+            "conclusion": "equivalent",
+        }),
+    );
+
+    // The codec reads a structured header as legal JSON, not as a malformed
+    // field, and the refusal is the admission one.
+    let decoded = ApiGenerationProvenance::decode(object_header.as_bytes())
+        .expect("a structured header must still be legal JSON");
+    assert!(
+        decoded.contributors()[0]
+            .compatibility_evidence_header()
+            .is_some(),
+        "the header must be read as present"
+    );
+    assert_eq!(
+        decoded
+            .single_primary_contributor()
+            .expect_err("a header-bearing contributor is not admitted")
+            .code(),
+        ApiGenerationErrorCode::CompatibilityRequired
+    );
+
+    // Every legal non-null JSON shape carries the same meaning.
+    for (label, header) in [
+        ("a nested object", json!({"version": 1, "nested": {"a": [1, {"b": null}]}})),
+        ("an array", json!([1, {"nested": true}])),
+        ("a number", json!(7)),
+        ("a boolean", json!(true)),
+    ] {
+        let text = tamper_first_contributor(&provenance, "compatibility_evidence_header", header);
+        let decoded = ApiGenerationProvenance::decode(text.as_bytes())
+            .unwrap_or_else(|error| panic!("{label} must be legal JSON, got {error}"));
+        assert_eq!(
+            decoded
+                .single_primary_contributor()
+                .expect_err("not admitted")
+                .code(),
+            ApiGenerationErrorCode::CompatibilityRequired,
+            "{label}"
+        );
+    }
+
+    // Through a real reopen, the structured header is refused as pending
+    // admission and neither record nor row changes.
+    let representation_before = meta_value(conn, &representation_meta_key(generation_id));
+    set_meta(
+        conn,
+        &provenance_meta_key(generation_id),
+        object_header.as_str(),
+    );
+    let error = fixture.reopen_error(generation_id, &profile);
+    assert_eq!(error.code(), ApiGenerationErrorCode::CompatibilityRequired);
+    assert_eq!(error.field(), Some("compatibility_evidence_header"));
+    assert_eq!(
+        meta_value(conn, &provenance_meta_key(generation_id)),
+        Some(object_header.clone()),
+        "the refused bytes must be left exactly as they were"
+    );
+    assert_eq!(
+        meta_value(conn, &representation_meta_key(generation_id)),
+        representation_before
+    );
+    assert_eq!(count(conn, "embedding_generations"), 1);
+    // A header-bearing record never yields a verified generation.
+    assert!(fixture.open(generation_id, &profile).is_err());
+
+    // Bad JSON is still a malformed record, not a pending one.
+    let broken = provenance.replace(
+        "\"compatibility_evidence_header\":null",
+        "\"compatibility_evidence_header\":{",
+    );
+    assert_eq!(
+        ApiGenerationProvenance::decode(broken.as_bytes())
+            .expect_err("broken JSON must be refused")
+            .code(),
+        ApiGenerationErrorCode::InvalidProvenance
+    );
+
+    // The explicit-null control still passes, and so does the stored record.
+    set_meta(conn, &provenance_meta_key(generation_id), &provenance);
+    assert!(fixture.open(generation_id, &profile).is_ok());
+}
+
 #[test]
 fn a_malformed_provenance_is_refused_structurally() {
     let fixture = Fixture::new();

@@ -309,9 +309,16 @@ impl From<ApiGenerationError> for StorageError {
 /// fill in. In version 1 only the pure primary contributor exists, so both
 /// compatibility fields are null; a later ticket extends the reader, and this
 /// constructor does not fabricate them.
+///
+/// The header is deliberately an opaque JSON value, not a string: the spec calls
+/// it the complete secret-free header of a versioned evidence document, which is
+/// structured data this ticket has no license to freeze into one shape. Whether
+/// a header is *well-formed* is settled by JSON itself; whether the evidence it
+/// heads may be admitted is a successor's decision, so anything present here is
+/// carried faithfully and refused as pending admission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiGenerationContributor {
-    compatibility_evidence_header: Option<String>,
+    compatibility_evidence_header: Option<serde_json::Value>,
     compatibility_evidence_sha256: Option<String>,
     document_prefix: String,
     endpoint_config_sha256: String,
@@ -350,8 +357,12 @@ impl ApiGenerationContributor {
 
     /// The cross-endpoint compatibility-evidence header, when this contributor
     /// carries one. Always `None` in version 1.
-    pub fn compatibility_evidence_header(&self) -> Option<&str> {
-        self.compatibility_evidence_header.as_deref()
+    ///
+    /// The value is the header exactly as it was stored; nothing here
+    /// re-serializes it, checks its interior or turns it into a placeholder. Its
+    /// presence alone is what makes the contributor pending admission.
+    pub fn compatibility_evidence_header(&self) -> Option<&serde_json::Value> {
+        self.compatibility_evidence_header.as_ref()
     }
 
     /// The cross-endpoint compatibility-evidence digest, when this contributor
@@ -403,7 +414,7 @@ impl ApiGenerationContributor {
 
     fn wire(&self) -> ContributorWire<'_> {
         ContributorWire {
-            compatibility_evidence_header: self.compatibility_evidence_header.as_deref(),
+            compatibility_evidence_header: self.compatibility_evidence_header.as_ref(),
             compatibility_evidence_sha256: self.compatibility_evidence_sha256.as_deref(),
             document_prefix: &self.document_prefix,
             endpoint_config_sha256: &self.endpoint_config_sha256,
@@ -638,9 +649,14 @@ impl ApiGenerationContributor {
 }
 
 /// The contributor exactly as it is written, in canonical key order.
+///
+/// The header is written straight through, so a contributor that carries one
+/// re-encodes with it intact rather than with a substituted placeholder. Only
+/// the pure-primary writer exists in this version, and it writes an explicit
+/// null.
 #[derive(Serialize)]
 struct ContributorWire<'a> {
-    compatibility_evidence_header: Option<&'a str>,
+    compatibility_evidence_header: Option<&'a serde_json::Value>,
     compatibility_evidence_sha256: Option<&'a str>,
     document_prefix: &'a str,
     endpoint_config_sha256: &'a str,
@@ -663,10 +679,12 @@ struct ProvenanceWire<'a> {
 
 /// A contributor's keys before any rule beyond structure is applied.
 ///
-/// The two compatibility fields are tracked as `Option<Option<String>>` so
-/// "absent" and "present and null" stay different facts.
+/// The two compatibility fields are tracked as `Option<Option<_>>` so "absent"
+/// and "present and null" stay different facts. The header's inner type is
+/// `serde_json::Value` on purpose: any legal JSON document is a well-formed
+/// header, and only its *presence* is this version's business.
 struct RawContributor {
-    compatibility_evidence_header: Option<String>,
+    compatibility_evidence_header: Option<serde_json::Value>,
     compatibility_evidence_sha256: Option<String>,
     document_prefix: String,
     endpoint_config_sha256: String,
@@ -714,7 +732,7 @@ impl<'de> Deserialize<'de> for RawContributor {
             where
                 A: MapAccess<'de>,
             {
-                let mut compatibility_evidence_header: Option<Option<String>> = None;
+                let mut compatibility_evidence_header: Option<Option<serde_json::Value>> = None;
                 let mut compatibility_evidence_sha256: Option<Option<String>> = None;
                 let mut document_prefix: Option<String> = None;
                 let mut endpoint_config_sha256: Option<String> = None;
@@ -734,8 +752,11 @@ impl<'de> Deserialize<'de> for RawContributor {
                             if compatibility_evidence_header.is_some() {
                                 return Err(contributor_structural());
                             }
+                            // Any legal JSON value is a well-formed header; the
+                            // interior is opaque to this version, so the value
+                            // is carried, never interpreted or replaced.
                             compatibility_evidence_header = Some(
-                                map.next_value::<Option<String>>()
+                                map.next_value::<Option<serde_json::Value>>()
                                     .map_err(|_| contributor_structural::<A::Error>())?,
                             );
                         }
