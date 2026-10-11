@@ -3018,7 +3018,7 @@ Update check state is stored in the data directory:
 
 | Dependency | Pinned source |
 |------------|-----------------|
-| `franken-agent-detection` | `0.1.10 @ 2bc59a8a61f3ca34acd05fb93f88921e77e892d7` (fork: ivanfuland/my_franken_agent_detection, main) |
+| `franken-agent-detection` | `0.1.10 @ 61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5` (fork: ivanfuland/my_franken_agent_detection, main) |
 | `asupersync` | `=0.3.5` |
 | `frankentui` | `5f78cfa0` |
 | `toon` (`tru`) | `5669b72a` |

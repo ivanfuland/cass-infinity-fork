@@ -48,7 +48,7 @@ const CONTRACTS: &[DependencyContract] = &[
         crate_package_name: "franken-agent-detection",
         manifest_package_field: None,
         expected_git: "https://github.com/ivanfuland/my_franken_agent_detection",
-        expected_rev: "2bc59a8a61f3ca34acd05fb93f88921e77e892d7",
+        expected_rev: "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5",
         expected_version: "0.1.10",
         expected_features: &[
             "chatgpt",
