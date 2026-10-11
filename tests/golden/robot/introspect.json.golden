@@ -75,6 +75,13 @@
       "description": "Disable wrapping entirely",
       "arg_type": "flag",
       "required": false
+    },
+    {
+      "name": "api-config",
+      "description": "Path to the versioned model-service API configuration (TOML); overrides CASS_API_CONFIG",
+      "arg_type": "option",
+      "value_type": "path",
+      "required": false
     }
   ],
   "commands": [

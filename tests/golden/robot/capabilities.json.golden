@@ -133,6 +133,13 @@
       "description": "Disable wrapping entirely",
       "arg_type": "flag",
       "required": false
+    },
+    {
+      "name": "api-config",
+      "description": "Path to the versioned model-service API configuration (TOML); overrides CASS_API_CONFIG",
+      "arg_type": "option",
+      "value_type": "path",
+      "required": false
     }
   ],
   "commands": [
@@ -3517,6 +3524,10 @@
     {
       "name": "CASS_RERANK_LIMIT",
       "description": "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml."
+    },
+    {
+      "name": "CASS_API_CONFIG",
+      "description": "Path to the versioned model-service API configuration (TOML). The --api-config flag overrides it; model commands refuse without one."
     },
     {
       "name": "CASS_QWEN_RERANK_URL",

@@ -588,3 +588,156 @@ fn models_install_from_file_empty_dir_emits_required_file_error() {
         "hint must name the required tokenizer.json file; got: {hint:?}"
     );
 }
+
+// ========================================================================
+// API01C: the API-only model commands `models list` / `models check` and the
+// global `--api-config` selector.
+//
+// These pin the *arg-parse* contract only. The runtime behaviour (a real
+// subprocess against a loopback HTTP service) lives in
+// `tests/api_model_commands.rs`. Adding the two variants must not disturb
+// any contract asserted above: every pre-existing test in this file stays
+// byte-for-byte and must keep passing.
+// ========================================================================
+
+#[test]
+fn models_list_parses_with_and_without_json() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let plain = parse(&["cass", "models", "list"])?;
+        match plain.command {
+            Some(Commands::Models(ModelsCommand::List { json: false })) => {}
+            other => {
+                return Err(format!(
+                    "expected `models list` to default to human output: {other:?}"
+                ));
+            }
+        }
+
+        let json = parse(&["cass", "models", "list", "--json"])?;
+        match json.command {
+            Some(Commands::Models(ModelsCommand::List { json: true })) => Ok(()),
+            other => Err(format!("expected `models list --json` to set json: {other:?}")),
+        }
+    })
+}
+
+#[test]
+fn models_list_accepts_the_robot_alias() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "models", "list", "--robot"])?;
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::List { json: true })) => Ok(()),
+            other => Err(format!("expected `--robot` to alias `--json`: {other:?}")),
+        }
+    })
+}
+
+#[test]
+fn models_check_parses_the_required_profile() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "models", "check", "--profile", "local-embed"])?;
+        match cli.command {
+            Some(Commands::Models(ModelsCommand::Check {
+                profile,
+                json: false,
+            })) if profile == "local-embed" => {}
+            other => {
+                return Err(format!(
+                    "expected `models check --profile <ID>` to parse: {other:?}"
+                ));
+            }
+        }
+
+        let json = parse(&[
+            "cass",
+            "models",
+            "check",
+            "--profile",
+            "local-rank",
+            "--json",
+        ])?;
+        match json.command {
+            Some(Commands::Models(ModelsCommand::Check {
+                profile,
+                json: true,
+            })) if profile == "local-rank" => Ok(()),
+            other => Err(format!(
+                "expected `models check --profile <ID> --json` to parse: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
+fn models_check_without_a_profile_is_a_usage_error() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let err = parse(&["cass", "models", "check"])
+            .expect_err("`--profile` is required, so this must be refused");
+        assert!(
+            err.contains("profile"),
+            "the refusal must name the missing profile argument; got: {err}"
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn api_config_is_global_and_usable_before_or_after_the_subcommand() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let before = parse(&[
+            "cass",
+            "--api-config",
+            "/etc/cass/models.toml",
+            "models",
+            "list",
+        ])?;
+        match before.api_config {
+            Some(path) if path.display().to_string() == "/etc/cass/models.toml" => {}
+            other => return Err(format!("expected the leading --api-config: {other:?}")),
+        }
+        assert!(matches!(
+            before.command,
+            Some(Commands::Models(ModelsCommand::List { .. }))
+        ));
+
+        let after = parse(&[
+            "cass",
+            "models",
+            "check",
+            "--profile",
+            "local-embed",
+            "--api-config",
+            "/etc/cass/other.toml",
+        ])?;
+        match after.api_config {
+            Some(path) if path.display().to_string() == "/etc/cass/other.toml" => {}
+            other => return Err(format!("expected the trailing --api-config: {other:?}")),
+        }
+        assert!(matches!(
+            after.command,
+            Some(Commands::Models(ModelsCommand::Check { .. }))
+        ));
+
+        let inline = parse(&["cass", "models", "list", "--api-config=/etc/cass/inline.toml"])?;
+        match inline.api_config {
+            Some(path) if path.display().to_string() == "/etc/cass/inline.toml" => Ok(()),
+            other => Err(format!(
+                "expected the inline --api-config=<PATH> form: {other:?}"
+            )),
+        }
+    })
+}
+
+#[test]
+fn api_config_is_absent_by_default() -> Result<(), String> {
+    run_on_large_stack(|| {
+        let cli = parse(&["cass", "models", "status", "--json"])?;
+        if cli.api_config.is_some() {
+            return Err(format!(
+                "expected no api_config unless the operator names one: {:?}",
+                cli.api_config
+            ));
+        }
+        Ok(())
+    })
+}

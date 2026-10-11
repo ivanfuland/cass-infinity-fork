@@ -109,6 +109,8 @@ commands:
   cass models verify [--json]      Per-file SHA-256 verification of the installed model.
   cass models check-update [--json]  Compare installed revision against the pinned registry revision.
   cass models backfill             Re-embed conversations against a newly acquired model.
+  cass models list [--json]        List the configured model API profiles (read-only, no HTTP).
+  cass models check --profile ID [--json]  Check one selected profile against its own endpoint (no fallback).
   cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.
   cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.
   cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.

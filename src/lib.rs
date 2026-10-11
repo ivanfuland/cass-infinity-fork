@@ -285,6 +285,15 @@ pub struct Cli {
     #[arg(long, value_enum, global = true)]
     pub robot_format: Option<RobotFormat>,
 
+    /// Path to the versioned model-service API configuration (TOML)
+    ///
+    /// Takes precedence over the `CASS_API_CONFIG` environment variable. A
+    /// command that needs a model reads the file once, before any request; a
+    /// command that names no file and finds no variable reports a missing
+    /// configuration instead of guessing a path.
+    #[arg(long, global = true, value_hint = ValueHint::FilePath)]
+    pub api_config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -2551,6 +2560,35 @@ pub enum ModelsCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
+    /// List the configured model API profiles (read-only, no HTTP)
+    ///
+    /// Reads the versioned model-service configuration named by --api-config or
+    /// CASS_API_CONFIG. Lists every profile by id, ascending, with its kind,
+    /// protocol, model, declared revision, endpoint and scope. It opens no
+    /// database, loads no weight and makes no request. A credential variable is
+    /// named, never read.
+    List {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Check one explicitly selected profile against its own endpoint
+    ///
+    /// The profile is named by id and its kind comes from the configuration, so
+    /// no kind is guessed from a name. Exactly the selected endpoint is
+    /// checked: the fallback is never used, even when the profile declares one.
+    /// An embedding profile is probed with one query and one document built
+    /// from a fixed public synthetic text; a rerank profile is probed with two
+    /// fixed public synthetic documents. No private corpus is sent and the
+    /// metadata endpoint is not fetched.
+    Check {
+        /// Profile id to check (required)
+        #[arg(long)]
+        profile: String,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
 }
 
 /// Subcommands for fleet-safe upgrade rehearsal and bounded post-upgrade
@@ -4511,6 +4549,8 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "display"
             | "data-dir"
             | "data_dir"
+            | "api-config"
+            | "api_config"
             | "days"
             | "since"
             | "until"
@@ -5357,6 +5397,7 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
         "preview",
         "port",
         "config",
+        "api-config",
         "validate-config",
         "example-config",
         "skip-install",
@@ -5479,7 +5520,7 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
     let global_with_value = |s: &str| {
         matches!(
             s,
-            "--color" | "--progress" | "--wrap" | "--db" | "--trace-file"
+            "--color" | "--progress" | "--wrap" | "--db" | "--trace-file" | "--api-config"
         )
     };
 
@@ -5501,6 +5542,8 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
             || s == "-v"
             || s == "--trace-file"
             || s.starts_with("--trace-file=")
+            || s == "--api-config"
+            || s.starts_with("--api-config=")
             || s == "--robot-help"
     };
 
@@ -21565,6 +21608,10 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Models(ModelsCommand::List { json })
+        | Commands::Models(ModelsCommand::Check { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Fleet(FleetCommand::UpgradeRehearsal { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -21968,6 +22015,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass models verify [--json]      Per-file SHA-256 verification of the installed model.".to_string(),
             "  cass models check-update [--json]  Compare installed revision against the pinned registry revision.".to_string(),
             "  cass models backfill             Re-embed conversations against a newly acquired model.".to_string(),
+            "  cass models list [--json]        List the configured model API profiles (read-only, no HTTP).".to_string(),
+            "  cass models check --profile ID [--json]  Check one selected profile against its own endpoint (no fallback).".to_string(),
             "  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
@@ -21990,6 +22039,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  TUI_HEADLESS=1                           skip update prompt".to_string(),
             "  CASS_DATA_DIR                            override data dir".to_string(),
             "  CASS_DB_PATH                             override db path".to_string(),
+            "  CASS_API_CONFIG                          path to the versioned model-service API configuration; --api-config overrides it".to_string(),
             "  CASS_OUTPUT_FORMAT=json|jsonl|compact|sessions|toon  default structured output".to_string(),
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
             "  CASS_RRF_LIMIT=<N>                       default search rrf candidate window N (--rrf-limit overrides)".to_string(),
@@ -81753,6 +81803,17 @@ fn build_global_flag_schemas() -> Vec<ArgumentSchema> {
             enum_values: None,
             repeatable: None,
         },
+        ArgumentSchema {
+            name: "api-config".to_string(),
+            short: None,
+            description: "Path to the versioned model-service API configuration (TOML); overrides CASS_API_CONFIG".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("path".to_string()),
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
     ]
 }
 
@@ -81931,6 +81992,11 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "CASS_RERANK_LIMIT",
             None,
             "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml.",
+        ),
+        env_var_capability(
+            "CASS_API_CONFIG",
+            None,
+            "Path to the versioned model-service API configuration (TOML). The --api-config flag overrides it; model commands refuse without one.",
         ),
         env_var_capability(
             "CASS_QWEN_RERANK_URL",
@@ -100759,7 +100825,214 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_models_check_update(structured_format, data_dir)
         }
+        ModelsCommand::List { json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_list(cli, structured_format)
+        }
+        ModelsCommand::Check { profile, json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_check(cli, &profile, structured_format)
+        }
     }
+}
+
+/// Map a model-API runtime refusal onto the CLI error envelope.
+fn model_api_runtime_error(err: crate::search::model_api::runtime::RuntimeError) -> CliError {
+    CliError {
+        code: err.code(),
+        kind: err.kind_str(),
+        message: err.message().to_string(),
+        hint: err.hint().map(|hint| hint.to_string()),
+        retryable: err.retryable(),
+    }
+}
+
+/// Refuse a model command that still carries a retired model-selection
+/// variable, before any configuration is read or request is sent.
+fn reject_retired_model_env() -> CliResult<()> {
+    crate::search::model_api::runtime::ensure_no_retired_model_env(|key| dotenvy::var(key).ok())
+        .map_err(model_api_runtime_error)
+}
+
+/// The process-environment credential source, and the only one a command uses.
+fn model_api_credential_resolver() -> Box<dyn crate::search::model_api::client::CredentialResolver> {
+    Box::new(crate::search::model_api::runtime::EnvCredentialResolver)
+}
+
+/// Normalize a structured format for a model API command.
+///
+/// `sessions` is a search-only projection; every other command renders it as
+/// compact JSON.
+fn model_api_structured_format(output_format: Option<RobotFormat>) -> Option<RobotFormat> {
+    output_format.map(|fmt| match fmt {
+        RobotFormat::Sessions => RobotFormat::Compact,
+        other => other,
+    })
+}
+
+/// `cass models list`: list the configured model API profiles.
+///
+/// Pure read of the configuration file. No database is opened and no request
+/// is sent, so it succeeds on a host with no endpoint running and no credential
+/// variable set.
+fn run_models_list(cli: &Cli, output_format: Option<RobotFormat>) -> CliResult<()> {
+    use crate::search::model_api::runtime;
+
+    reject_retired_model_env()?;
+    let config = runtime::load_config(cli.api_config.as_deref(), |key| dotenvy::var(key).ok())
+        .map_err(model_api_runtime_error)?;
+    let listings = runtime::list_profiles(&config);
+
+    if let Some(fmt) = model_api_structured_format(output_format) {
+        let payload = serde_json::json!({
+            "schema": runtime::LIST_SCHEMA,
+            "profiles": listings,
+        });
+        return output_structured_value(payload, fmt);
+    }
+
+    use colored::Colorize;
+
+    println!("Model API Profiles");
+    println!("==================");
+    println!();
+    if listings.is_empty() {
+        println!("No profiles are configured.");
+        return Ok(());
+    }
+    for row in &listings {
+        let marker = if row.is_default {
+            "default".bold().to_string()
+        } else {
+            "       ".to_string()
+        };
+        println!("{}  {} ({})", marker, row.id, row.kind);
+        println!("  Protocol:   {}", row.protocol);
+        println!("  Model:      {}", row.model);
+        println!("  Revision:   {}", row.model_revision);
+        println!("  Endpoint:   {} ({})", row.endpoint, row.scope);
+        match &row.api_key_env {
+            Some(variable) => println!("  Credential: ${variable} (name only; value never read)"),
+            None => println!("  Credential: none"),
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// `cass models check --profile <ID>`: check exactly one selected profile.
+///
+/// The selected profile's own endpoint is the only one contacted. The
+/// fallback is never used, so a declared fallback cannot turn the check green,
+/// and the check neither proves cross-endpoint compatibility nor touches a
+/// readiness cache or a generation.
+fn run_models_check(
+    cli: &Cli,
+    profile_id: &str,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::search::model_api::client::ApiClient;
+    use crate::search::model_api::runtime;
+
+    reject_retired_model_env()?;
+    let config = runtime::load_config(cli.api_config.as_deref(), |key| dotenvy::var(key).ok())
+        .map_err(model_api_runtime_error)?;
+    // Validate the id against the document before the client takes ownership,
+    // so an unknown id is a configuration refusal (code 2), not a check result.
+    let profile = runtime::profile_by_id(&config, profile_id)
+        .map_err(model_api_runtime_error)?
+        .clone();
+    let client = ApiClient::new(config, model_api_credential_resolver());
+
+    let run = runtime::run_profile_check(&client, &profile);
+    let mut payload = serde_json::to_value(&run.report).unwrap_or_default();
+    let schema = runtime::CHECK_SCHEMA;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("schema".to_string(), serde_json::Value::from(schema));
+    }
+
+    match run.failure {
+        None => {
+            if let Some(fmt) = model_api_structured_format(output_format) {
+                return output_structured_value(payload, fmt);
+            }
+            print_model_api_check_summary(&run.report);
+            Ok(())
+        }
+        Some(failure) => {
+            // The machine diagnostic keeps every attempt already made, so a
+            // failed stage is never silently dropped.
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "error".to_string(),
+                    serde_json::json!({
+                        "code": 1,
+                        "kind": runtime::RuntimeErrorKind::Check.as_str(),
+                        "message": failure.code,
+                        "http_status": failure.http_status,
+                        "retryable": false,
+                    }),
+                );
+            }
+            if output_format.is_some() {
+                return Err(CliError {
+                    code: 1,
+                    kind: runtime::RuntimeErrorKind::Check.as_str(),
+                    message: payload.to_string(),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+            Err(model_api_runtime_error(runtime::RuntimeError::check(
+                failure.code,
+            )))
+        }
+    }
+}
+
+/// The human-readable summary of a successful profile check.
+fn print_model_api_check_summary(report: &crate::search::model_api::runtime::CheckReport) {
+    use colored::Colorize;
+
+    println!("Model API Check");
+    println!("===============");
+    println!();
+    println!("Profile:    {} ({})", report.profile_id, report.kind);
+    println!("Requested:  {} @ {}", report.requested_model, report.declared_revision);
+    match &report.response_revision {
+        Some(revision) => println!("Reported:   {} @ {revision}", report.response_model.as_deref().unwrap_or("(unnamed)")),
+        None => println!("Reported:   no service identity ({})", report.revision_source),
+    }
+    println!("Mode:       {} (fallback_used=false)", report.mode);
+    for call in &report.calls {
+        match call.error_code {
+            Some(code) => println!(
+                "  {}: {} in {} ms",
+                call.stage.bold(),
+                code.red(),
+                call.duration_ms
+            ),
+            None => println!(
+                "  {}: http {} in {} ms",
+                call.stage.bold(),
+                call.http_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                call.duration_ms
+            ),
+        }
+    }
+    if let Some(dimension) = report.effective_dimension {
+        println!("Dimension:  {dimension}");
+    }
+    if let Some(digest) = &report.descriptor_sha256 {
+        println!("Descriptor: {digest}");
+    }
+    if let Some(scored) = report.scored_count {
+        println!("Scored:     {scored}");
+    }
+    println!();
+    println!("Only the selected profile was contacted; no fallback request was made.");
 }
 
 /// Dispatch the `cass fleet` subcommand group (bead sc8sp).

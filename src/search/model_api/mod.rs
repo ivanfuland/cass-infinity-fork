@@ -20,10 +20,14 @@
 //! * [`routing`] — the single cloud-fallback admission rule.
 //! * [`client`] — [`ApiClient`], the blocking client that ties a frozen
 //!   configuration, the transport and the routing rule together.
+//! * [`runtime`] — the edge a command uses: the configuration file, the process
+//!   environment and the profile selector, plus the `models list` / `models
+//!   check` report shapes.
 //! * [`test_support`] — loopback HTTP and TLS fixtures, `cfg(test)` only.
 //!
-//! The client is a kernel: it registers no production caller, reads no
-//! production configuration and never deploys or starts a service.
+//! The client is a kernel: it reads no production configuration itself and
+//! never deploys or starts a service. [`runtime`] is its only production
+//! caller, and it only loads a configuration the operator named.
 
 pub mod client;
 pub mod config;
@@ -31,6 +35,7 @@ pub mod error;
 pub mod identity;
 pub mod protocol;
 pub mod routing;
+pub mod runtime;
 
 #[cfg(test)]
 pub mod test_support;
@@ -50,3 +55,6 @@ pub use identity::{
 };
 pub use protocol::{EmbeddingReply, InputKind, ObservedIdentity, RerankReply, Usage};
 pub use routing::{allows_cloud_fallback, fallback_target};
+pub use runtime::{
+    CHECK_SCHEMA, EnvCredentialResolver, LIST_SCHEMA, ProfileListing, RuntimeError, RuntimeErrorKind,
+};
