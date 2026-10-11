@@ -68,8 +68,8 @@ pub use identity::{
     RepresentationDescriptor, RepresentationRecord,
 };
 pub use primary_embedding::{
-    API_PROBE_SENTINELS, EmbeddingCallEvidence, ModelApiBackfillReport, PrimaryEmbedFailure,
-    PrimaryEmbeddingCall, ProbeMeasurement,
+    API_PROBE_SENTINELS, DIMENSION_DRIFT_CODE, EmbeddingCallEvidence, ModelApiBackfillReport,
+    PrimaryEmbedFailure, PrimaryEmbeddingCall, ProbeMeasurement,
 };
 pub use protocol::{EmbeddingReply, InputKind, ObservedIdentity, RerankReply, Usage};
 pub use routing::{allows_cloud_fallback, fallback_target};

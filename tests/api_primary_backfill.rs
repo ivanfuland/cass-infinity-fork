@@ -407,8 +407,35 @@ fn embedding_profile_block(
     )
 }
 
+/// An argument list with no configuration named on the command line, so the
+/// environment is the only possible selection.
+fn args_without_config(data_dir: &Path) -> Vec<String> {
+    vec![
+        "models".into(),
+        "backfill".into(),
+        "--json".into(),
+        "--data-dir".into(),
+        data_dir.display().to_string(),
+    ]
+}
+
+/// Borrow an argument list built by [`backfill_args`] as `&[&str]`.
+fn argv(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 /// One CLI invocation with a scrubbed environment.
 fn cass(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let raw: Vec<(&str, std::ffi::OsString)> = envs
+        .iter()
+        .map(|(name, value)| (*name, std::ffi::OsString::from(*value)))
+        .collect();
+    cass_env_raw(args, &raw)
+}
+
+/// One CLI invocation with a scrubbed environment and raw (possibly non-UTF-8)
+/// environment values.
+fn cass_env_raw(args: &[&str], envs: &[(&str, std::ffi::OsString)]) -> Output {
     let mut command = Command::new(assert_cmd::cargo::cargo_bin("cass"));
     for variable in RETIRED_ENV {
         command.env_remove(variable);
@@ -2060,5 +2087,562 @@ fn the_database_resolution_and_lock_are_reused() {
         stub.request_count(),
         0,
         "none of these refusals may reach the endpoint"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1: the branch is chosen by presence, never by resolvability
+// ---------------------------------------------------------------------------
+
+/// Corrupt one API meta record from outside the running command.
+///
+/// A raw `rusqlite` connection is used on purpose: the point is to change the
+/// private fixture database while the real `cass` process is mid-run, the way a
+/// concurrent writer would, without touching any production state.
+fn corrupt_representation_record(db_path: &Path) {
+    let conn = rusqlite::Connection::open(db_path).expect("open raw connection");
+    conn.busy_timeout(Duration::from_secs(5))
+        .expect("busy timeout");
+    let generation_id: i64 = conn
+        .query_row(
+            "SELECT id FROM embedding_generations ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("generation row");
+    let removed = conn
+        .execute(
+            "DELETE FROM meta WHERE key = ?1",
+            rusqlite::params![format!("api_representation:v1:{generation_id}")],
+        )
+        .expect("delete the representation record");
+    assert_eq!(removed, 1, "the record to corrupt must exist");
+}
+
+#[test]
+fn the_branch_is_chosen_by_presence_not_by_resolvability() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(
+        &data_dir,
+        &["a single message that is long enough to chunk once"],
+    );
+    let stub = Stub::start(healthy_responder(8, 0));
+    let good = data_dir.join("models.toml");
+    fs::write(
+        &good,
+        config_text(
+            "local8",
+            &embedding_profile_block(
+                "local8",
+                &stub.endpoint(),
+                EMBED_MODEL,
+                EMBED_REVISION,
+                64,
+                "",
+            ),
+        ),
+    )
+    .expect("write config");
+    let elsewhere = data_dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).expect("create elsewhere");
+    let outside_db = elsewhere.join("agent_search.db");
+    {
+        let _ = FrankenStorage::open(&outside_db).expect("open outside db");
+    }
+
+    // Control: with no selection at all the legacy branch runs, so `--db`
+    // outside `--data-dir` is the legacy usage refusal.
+    let legacy = cass(
+        &[
+            "models",
+            "backfill",
+            "--json",
+            "--data-dir",
+            &data_dir.display().to_string(),
+            "--db",
+            &outside_db.display().to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(
+        legacy.status.code(),
+        Some(2),
+        "the legacy branch's own refusal"
+    );
+    assert_eq!(
+        error_envelope(&legacy)["error"]["kind"],
+        "usage",
+        "no selection must reach the legacy branch"
+    );
+
+    // An empty environment value is still a selection: it must not silently fall
+    // through to the legacy backend.
+    let empty_env = cass(
+        &argv(&args_without_config(&data_dir)),
+        &[("CASS_API_CONFIG", "")],
+    );
+    assert_eq!(
+        empty_env.status.code(),
+        Some(2),
+        "an empty selection is a configuration refusal"
+    );
+    assert_eq!(
+        error_envelope(&empty_env)["error"]["kind"],
+        "ModelApiConfiguration",
+        "CASS_API_CONFIG='' must take the API path"
+    );
+
+    // An empty command-line path never reaches the branch logic: the CLI's own
+    // argument parsing refuses a missing value for `--api-config` (exit 2,
+    // `argument_parsing`) before any configuration is read and before any
+    // database is touched. That is a fixed refusal, not a silent fall-through.
+    let empty_cli = cass(
+        &[
+            "models",
+            "backfill",
+            "--json",
+            "--api-config",
+            "",
+            "--data-dir",
+            &data_dir.display().to_string(),
+        ],
+        &[],
+    );
+    assert_eq!(empty_cli.status.code(), Some(2));
+    assert_eq!(
+        error_envelope(&empty_cli)["kind"],
+        "argument_parsing",
+        "an empty --api-config value is refused by the parser"
+    );
+    assert!(
+        error_envelope(&empty_cli)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--api-config"),
+        "the refusal must name the flag: {}",
+        stderr_text(&empty_cli)
+    );
+    assert_eq!(
+        generation_count(&storage),
+        0,
+        "an empty --api-config must not reach the legacy backend and build anything"
+    );
+
+    // A non-UTF-8 environment path is a selection as well: it is read verbatim
+    // and refused as a configuration problem, never routed to the legacy branch.
+    use std::os::unix::ffi::OsStrExt as _;
+    let non_utf8_path = std::ffi::OsStr::from_bytes(b"/tmp/api02d-\xff\xfe.toml").to_os_string();
+    let non_utf8 = cass_env_raw(
+        &argv(&args_without_config(&data_dir)),
+        &[("CASS_API_CONFIG", non_utf8_path)],
+    );
+    assert_eq!(non_utf8.status.code(), Some(2));
+    assert_eq!(
+        error_envelope(&non_utf8)["error"]["kind"],
+        "ModelApiConfiguration",
+        "a non-UTF-8 selection must be refused as configuration, not ignored"
+    );
+    assert!(
+        error_envelope(&non_utf8)["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read"),
+        "a non-UTF-8 path must be a readable-path refusal: {}",
+        stderr_text(&non_utf8)
+    );
+
+    // A valid explicit command-line path still wins over an empty environment.
+    let explicit_wins = cass(
+        &argv(&backfill_args(&data_dir, &good, Some("local8"), &[])),
+        &[("CASS_API_CONFIG", "")],
+    );
+    let payload = assert_success(&explicit_wins);
+    assert_eq!(payload["status"], "published");
+    assert_eq!(payload["model_api"]["primary_profile"], "local8");
+
+    assert_eq!(
+        stub.request_count(),
+        1 + payload["model_api"]["document_calls"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0)
+            + payload["model_api"]["audit_calls"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0),
+        "only the one successful run may reach the endpoint"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1: a width that drifts keeps its own bounded code on the request
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_document_batch_with_the_wrong_width_keeps_its_failure_code() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(
+        &data_dir,
+        &["a single message that is long enough to chunk once"],
+    );
+    // No `expected_dimension`: the client validates the response shape but not
+    // the width, so only this driver's own cross-batch check can refuse it.
+    let stub = Stub::start(|request: &RecordedRequest, index: usize| {
+        if index == 0 {
+            respond_embed(request, &request.inputs(), 8, 0)
+        } else {
+            respond_embed(request, &request.inputs(), 16, 0)
+        }
+    });
+    let config_path = data_dir.join("models.toml");
+    fs::write(
+        &config_path,
+        config_text(
+            "local8",
+            &embedding_profile_block(
+                "local8",
+                &stub.endpoint(),
+                EMBED_MODEL,
+                EMBED_REVISION,
+                64,
+                "",
+            ),
+        ),
+    )
+    .expect("write config");
+
+    let output = run_backfill(&data_dir, &config_path, Some("local8"), &[]);
+    assert!(
+        !output.status.success(),
+        "a width that drifts must fail the run"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let envelope = error_envelope(&output);
+    let document_calls = envelope["model_api"]["document_calls"]
+        .as_array()
+        .expect("document calls");
+    assert_eq!(document_calls.len(), 1);
+    assert_eq!(
+        document_calls[0]["error_code"], "DimensionDrift",
+        "the drifting request must carry its own bounded code: {envelope}"
+    );
+    assert_eq!(
+        document_calls[0]["http_status"], 200,
+        "the request really succeeded at the HTTP layer: {envelope}"
+    );
+    assert_eq!(document_calls[0]["network_attempted"], true);
+    // Nothing may be written for the refused page.
+    let generation_id: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT id FROM embedding_generations ORDER BY id LIMIT 1",
+            &[],
+            |row| row.get_typed(0),
+        )
+        .expect("generation row");
+    assert_eq!(message_chunks(&storage, generation_id), 0);
+    assert_eq!(active_generation(&storage), None);
+}
+
+#[test]
+fn a_probe_batch_with_the_wrong_width_keeps_its_failure_code() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(
+        &data_dir,
+        &["a single message that is long enough to chunk once"],
+    );
+    // max_batch 1 splits the three sentinels into three probe requests; the
+    // second one drifts.
+    let stub = Stub::start(|request: &RecordedRequest, index: usize| {
+        if index == 0 {
+            respond_embed(request, &request.inputs(), 8, 0)
+        } else {
+            respond_embed(request, &request.inputs(), 16, 0)
+        }
+    });
+    let config_path = data_dir.join("models.toml");
+    fs::write(
+        &config_path,
+        config_text(
+            "local8",
+            &embedding_profile_block(
+                "local8",
+                &stub.endpoint(),
+                EMBED_MODEL,
+                EMBED_REVISION,
+                1,
+                "",
+            ),
+        ),
+    )
+    .expect("write config");
+
+    let output = run_backfill(&data_dir, &config_path, Some("local8"), &[]);
+    assert!(
+        !output.status.success(),
+        "a drifting probe must fail the run"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let envelope = error_envelope(&output);
+    let probe_calls = envelope["model_api"]["probe_calls"]
+        .as_array()
+        .expect("probe calls");
+    assert_eq!(
+        probe_calls.len(),
+        2,
+        "the drift stops the probe at the second batch: {envelope}"
+    );
+    assert_eq!(probe_calls[0]["error_code"], serde_json::Value::Null);
+    assert_eq!(
+        probe_calls[1]["error_code"], "DimensionDrift",
+        "the drifting probe batch must carry its own bounded code: {envelope}"
+    );
+    assert_eq!(probe_calls[1]["http_status"], 200);
+    assert_eq!(
+        generation_count(&storage),
+        0,
+        "a probe that never established a width must not create a generation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R1: real write-transaction failure and late-identity-guard counter-examples
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_write_transaction_failure_leaves_no_half_page_and_keeps_the_old_active() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(&data_dir, &[filler(2500).as_str()]);
+    let stub = Stub::start(healthy_responder(8, 0));
+    let config_path = data_dir.join("models.toml");
+    // Two profiles over one endpoint: the first builds and activates the old
+    // active generation, the second must build a candidate beside it.
+    let first_profile = embedding_profile_block(
+        "local8",
+        &stub.endpoint(),
+        EMBED_MODEL,
+        EMBED_REVISION,
+        64,
+        "",
+    );
+    let second_profile = embedding_profile_block(
+        "local8b",
+        &stub.endpoint(),
+        "example/other-embed",
+        "rev-other-1",
+        64,
+        "",
+    );
+    fs::write(
+        &config_path,
+        config_text("local8", &format!("{first_profile}\n{second_profile}")),
+    )
+    .expect("write config");
+
+    let first = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
+    let old_active = first["generation_id"].as_i64().expect("generation id");
+    assert_eq!(active_generation(&storage), Some(old_active));
+
+    // A real SQLite write failure inside the candidate's page transaction.
+    let candidate_id: i64 = old_active + 1;
+    storage
+        .raw()
+        .execute_batch(&format!(
+            "CREATE TRIGGER api02d_write_failure BEFORE INSERT ON message_chunks \
+             WHEN NEW.generation_id = {candidate_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;"
+        ))
+        .expect("install the write-failure trigger");
+
+    let failed = run_backfill(
+        &data_dir,
+        &config_path,
+        Some("local8b"),
+        &["--batch-conversations", "1"],
+    );
+    assert!(
+        !failed.status.success(),
+        "the injected write failure must fail the run"
+    );
+    assert_eq!(failed.status.code(), Some(5));
+    let staging_rows: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT COUNT(*) FROM chunk_staging WHERE generation_id = ?1",
+            &[Value::Integer(candidate_id)],
+            |row| row.get_typed(0),
+        )
+        .expect("staging count");
+    assert_eq!(
+        message_chunks(&storage, candidate_id),
+        0,
+        "no half page may be committed for the failed generation"
+    );
+    assert_eq!(
+        staging_rows, 0,
+        "the failed page's staging rows must be rolled back with it"
+    );
+    assert!(
+        holes(&storage, candidate_id) >= 1,
+        "the failed page's holes must not be cleared"
+    );
+    assert_eq!(
+        active_generation(&storage),
+        Some(old_active),
+        "the previously active generation must stay active"
+    );
+
+    // With the fault removed the same candidate can be finished.
+    storage
+        .raw()
+        .execute_batch("DROP TRIGGER api02d_write_failure;")
+        .expect("drop the write-failure trigger");
+    let recovered = assert_success(&run_backfill(
+        &data_dir,
+        &config_path,
+        Some("local8b"),
+        &["--batch-conversations", "1"],
+    ));
+    assert_eq!(recovered["generation_id"].as_i64(), Some(candidate_id));
+    assert_eq!(recovered["activated"], true);
+    assert_eq!(holes(&storage, candidate_id), 0);
+    assert_eq!(message_chunks(&storage, candidate_id), 3);
+}
+
+#[test]
+fn a_page_guard_blocks_the_write_when_the_record_goes_bad_mid_run() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(&data_dir, &[filler(2500).as_str()]);
+    let db_path = data_dir.join("agent_search.db");
+    // One probe, then page 1; corrupt the record just before page 2's request.
+    let strike_at = Arc::new(AtomicUsize::new(usize::MAX));
+    let strike = Arc::clone(&strike_at);
+    let db_for_stub = db_path.clone();
+    let stub = Stub::start(move |request: &RecordedRequest, index: usize| {
+        if index == strike.load(Ordering::SeqCst) {
+            corrupt_representation_record(&db_for_stub);
+        }
+        respond_embed(request, &request.inputs(), 8, 0)
+    });
+    let config_path = data_dir.join("models.toml");
+    fs::write(
+        &config_path,
+        config_text(
+            "local8",
+            &embedding_profile_block(
+                "local8",
+                &stub.endpoint(),
+                EMBED_MODEL,
+                EMBED_REVISION,
+                64,
+                "",
+            ),
+        ),
+    )
+    .expect("write config");
+    strike_at.store(2, Ordering::SeqCst);
+
+    let output = run_backfill(
+        &data_dir,
+        &config_path,
+        Some("local8"),
+        &["--batch-conversations", "1"],
+    );
+    assert!(
+        !output.status.success(),
+        "a page whose record went bad must not commit its vectors"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let generation_id: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT id FROM embedding_generations ORDER BY id LIMIT 1",
+            &[],
+            |row| row.get_typed(0),
+        )
+        .expect("generation row");
+    assert_eq!(
+        message_chunks(&storage, generation_id),
+        1,
+        "only the page written before the record went bad may be committed"
+    );
+    assert_eq!(
+        holes(&storage, generation_id),
+        2,
+        "the aborted page keeps its holes"
+    );
+    assert_eq!(active_generation(&storage), None);
+}
+
+#[test]
+fn an_activation_guard_blocks_the_switch_when_the_record_goes_bad_late() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(
+        &data_dir,
+        &["a single message that is long enough to chunk once"],
+    );
+    let db_path = data_dir.join("agent_search.db");
+    // One probe, one drain request, then the audit's own requests start. Corrupt
+    // the record just before the audit's first request, so every page has
+    // already been written and only the activation is left to refuse.
+    let strike_at = Arc::new(AtomicUsize::new(usize::MAX));
+    let strike = Arc::clone(&strike_at);
+    let db_for_stub = db_path.clone();
+    let stub = Stub::start(move |request: &RecordedRequest, index: usize| {
+        if index == strike.load(Ordering::SeqCst) {
+            corrupt_representation_record(&db_for_stub);
+        }
+        respond_embed(request, &request.inputs(), 8, 0)
+    });
+    let config_path = data_dir.join("models.toml");
+    fs::write(
+        &config_path,
+        config_text(
+            "local8",
+            &embedding_profile_block(
+                "local8",
+                &stub.endpoint(),
+                EMBED_MODEL,
+                EMBED_REVISION,
+                64,
+                "",
+            ),
+        ),
+    )
+    .expect("write config");
+    strike_at.store(2, Ordering::SeqCst);
+
+    let output = run_backfill(&data_dir, &config_path, Some("local8"), &[]);
+    assert!(!output.status.success(), "the activation must be refused");
+    assert_eq!(output.status.code(), Some(5));
+    let generation_id: i64 = storage
+        .raw()
+        .query_row_map(
+            "SELECT id FROM embedding_generations ORDER BY id LIMIT 1",
+            &[],
+            |row| row.get_typed(0),
+        )
+        .expect("generation row");
+    assert_eq!(
+        message_chunks(&storage, generation_id),
+        1,
+        "the drain itself completed before the record went bad"
+    );
+    assert_eq!(
+        active_generation(&storage),
+        None,
+        "the generation must not be switched active"
+    );
+    let audit_status: String = storage
+        .raw()
+        .query_row_map(
+            "SELECT audit_status FROM embedding_generations WHERE id = ?1",
+            &[Value::Integer(generation_id)],
+            |row| row.get_typed(0),
+        )
+        .expect("audit status");
+    assert_eq!(
+        audit_status, "pending",
+        "the activation transaction must not have handed itself a passing status"
     );
 }

@@ -102966,12 +102966,20 @@ fn run_models_backfill(
         });
     }
 
-    // API02D: an explicit `--embedding-profile`, or a named API configuration
+    // API02D: an explicit `--embedding-profile`, or an API configuration named
     // on `--api-config` or `CASS_API_CONFIG`, selects the API-only path. It
     // never falls back to the legacy local backend, so a selected-but-broken
     // configuration is a configuration error rather than a silent switch.
+    //
+    // The decision is made on the *presence* of the selection and never on
+    // whether the selected path happens to resolve: `resolve_config_path`
+    // reports `None` for an empty environment value, so deciding on its result
+    // let `CASS_API_CONFIG=''` fall through to the legacy backend instead of
+    // reporting the configuration error the contract requires. The content is
+    // read and validated later, inside the API branch.
     let api_branch = embedding_profile.is_some()
-        || runtime::resolve_config_path(api_config_path, |key| std::env::var_os(key)).is_some();
+        || api_config_path.is_some()
+        || std::env::var_os(runtime::API_CONFIG_ENV).is_some();
     if api_branch {
         return run_models_backfill_api(
             embedding_profile,

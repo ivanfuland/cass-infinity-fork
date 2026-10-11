@@ -45,6 +45,13 @@ use crate::storage::schema::f32_vector_to_le_blob;
 ///
 /// Changing any sentence changes what every stored fingerprint means, so this is
 /// not meant to be edited casually.
+/// The bounded code one recorded request carries when its own response was
+/// valid but its width disagreed with the width this command already fixed.
+///
+/// The request's HTTP status, service identity and usage stay recorded beside
+/// it; only the code marks that this batch was refused on width.
+pub const DIMENSION_DRIFT_CODE: &str = "DimensionDrift";
+
 pub const API_PROBE_SENTINELS: [&str; 3] = [
     "The quick brown fox jumps over the lazy dog.",
     "今天天气不错，我们去公园散步吧。",
@@ -313,16 +320,24 @@ impl PrimaryEmbeddingCall {
                     Ok(outcome) => outcome,
                     Err(failure) => return Err(self.record_failure(failure, EvidenceStage::Probe)),
                 };
-            self.record_success(&outcome, EvidenceStage::Probe);
             match dimension {
-                None => dimension = Some(outcome.dimension),
+                None => {
+                    dimension = Some(outcome.dimension);
+                    self.record_success(&outcome, EvidenceStage::Probe);
+                }
                 Some(seen) if seen != outcome.dimension => {
+                    // The request itself succeeded and its HTTP status, service
+                    // identity and usage are real evidence: record them with the
+                    // bounded drift code rather than as a plain success.
+                    self.record_outcome(&outcome, EvidenceStage::Probe, Some(DIMENSION_DRIFT_CODE));
                     return Err(self.record_typed(PrimaryEmbedFailure::DimensionDrift {
                         expected: seen,
                         observed: outcome.dimension,
                     }));
                 }
-                Some(_) => {}
+                Some(_) => {
+                    self.record_success(&outcome, EvidenceStage::Probe);
+                }
             }
             vectors.extend(outcome.vectors);
         }
@@ -380,18 +395,22 @@ impl PrimaryEmbeddingCall {
                 Ok(outcome) => outcome,
                 Err(failure) => return Err(self.record_failure(failure, stage)),
             };
-            self.record_success(&outcome, stage);
             if outcome.dimension != expected {
+                // The response was a real, validated HTTP 200 with its own
+                // service identity and usage; the only thing wrong with it is the
+                // width. Record those facts with the bounded drift code so the
+                // evidence never shows a failed batch as a plain success.
+                self.record_outcome(&outcome, stage, Some(DIMENSION_DRIFT_CODE));
                 return Err(self.record_typed(PrimaryEmbedFailure::DimensionDrift {
                     expected,
                     observed: outcome.dimension,
                 }));
             }
+            self.record_success(&outcome, stage);
             vectors.extend(outcome.vectors);
         }
         Ok(vectors)
     }
-
     /// The largest number of complete inputs one request may carry.
     fn max_batch(&self) -> usize {
         let raw = self
@@ -411,6 +430,20 @@ impl PrimaryEmbeddingCall {
     }
 
     fn record_success(&self, outcome: &EmbedOutcome, stage: EvidenceStage) {
+        self.record_outcome(outcome, stage, None);
+    }
+
+    /// Record one answered request, optionally attributing a bounded code to it.
+    ///
+    /// `override_code` names a reason the caller found after the response itself
+    /// validated (a width disagreement), which the client's own attempt record
+    /// cannot know about. The attempt's own code wins when it has one.
+    fn record_outcome(
+        &self,
+        outcome: &EmbedOutcome,
+        stage: EvidenceStage,
+        override_code: Option<&'static str>,
+    ) {
         let mut buffer = self.evidence_buffer(stage).borrow_mut();
         for attempt in &outcome.attempts {
             buffer.push(evidence_row(
@@ -418,7 +451,7 @@ impl PrimaryEmbeddingCall {
                 &attempt.profile_id,
                 attempt.network_attempted,
                 attempt.http_status,
-                attempt.error_code,
+                override_code.or(attempt.error_code),
                 attempt.duration_ms,
                 &attempt.identity,
             ));
