@@ -13,8 +13,8 @@
 //!   optional `default_embedding` / `default_rerank` references;
 //! * every field of a profile, including which fields only exist for one
 //!   [`ProfileKind`];
-//! * the static URL rules: scheme, userinfo, fragment and the `loopback` /
-//!   `remote` scope split, all without resolving a name;
+//! * the static URL rules: scheme, userinfo, fragment, any query string, and
+//!   the `loopback` / `remote` scope split, all without resolving a name;
 //! * the `fallback_profile` graph: a loopback primary, a remote, same-kind
 //!   target that declares no fallback of its own, and the extra restriction a
 //!   cloud embedding fallback carries.
@@ -28,15 +28,21 @@
 //! emits one. Whether a fallback may actually be used is a later ticket's job,
 //! using the real fixture and probe evidence.
 //!
-//! # A note on URL query strings
+//! # URL query strings and other normalized-away bytes
 //!
-//! The spec forbids "credential query parameters" but does not enumerate them,
-//! and no closed set of credential-bearing parameter names exists. Rather than
-//! guess a heuristic allow-list — which would loosen the authentication
-//! boundary — this validator refuses *any* query string on an endpoint, the
-//! strictly safer side of the ambiguity. An endpoint that genuinely needs a
-//! query string is therefore rejected today; that divergence is reported rather
-//! than silently relaxed.
+//! This version's endpoint contract carries no query string at all: `endpoint`
+//! and `models_endpoint` both refuse one, credential-bearing or not. Spec §7
+//! states that a service which needs a URL query is unsupported here, and that
+//! the authentication boundary must not be relaxed by guessing which parameter
+//! names look like credentials. A query string is therefore a configuration
+//! error to report, not a case to filter.
+//!
+//! Raw bytes the URL parser strips or reinterprets are refused for the same
+//! reason. In an `http`/`https` URL the parser treats a backslash as an
+//! authority separator and removes a tab, a line feed, a carriage return or a
+//! space outright, so a userinfo component can reach it in a spelling that a
+//! raw scan of the string never sees. No legal URL carries such a byte. A
+//! literal `@` that belongs to the path is not userinfo and is accepted.
 
 use std::collections::BTreeMap;
 
@@ -764,21 +770,29 @@ fn validate_endpoint(
 ) -> Result<ValidatedEndpoint, ConfigError> {
     let invalid = || ConfigError::at(ConfigErrorCode::InvalidEndpoint, field);
 
+    // Refuse first any raw byte the URL parser strips or reinterprets, so that a
+    // userinfo component cannot reach it in a spelling this function never gets
+    // to look at.
+    if has_reinterpreted_raw_bytes(raw) {
+        return Err(invalid());
+    }
+
     let parsed = Url::parse(raw).map_err(|_| invalid())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(invalid());
     }
     // Userinfo is refused in every shape. The URL parser normalizes several
-    // spellings (`http:/@host`, `http:////@host`) into an empty username, so the
-    // raw authority region is inspected as well.
+    // spellings (`http://@host`, `http:/@host`, `http:////@host`) into a host
+    // with no username at all, so the raw authority region is inspected too; the
+    // parsed accessors alone would not see them.
     if !parsed.username().is_empty()
         || parsed.password().is_some()
         || raw_authority(raw).contains('@')
     {
         return Err(invalid());
     }
-    // A fragment is never part of a service endpoint, and a query string is
-    // refused rather than heuristically filtered (see the module docs).
+    // A fragment is never part of a service endpoint, and a query string is not
+    // supported by this version's endpoint contract (see the module docs).
     if parsed.fragment().is_some() || parsed.query().is_some() {
         return Err(invalid());
     }
@@ -809,18 +823,34 @@ fn validate_endpoint(
     })
 }
 
-/// The raw authority region of a URL string: what sits between the scheme's `:`
-/// and the first `/`, `?` or `#` after it.
+/// Whether `raw` carries a byte the URL parser strips or reinterprets before it
+/// looks for the authority.
 ///
-/// Leading slashes are skipped so the malformed spellings the URL parser would
-/// otherwise normalize away (`http:////@host`, `http:/@host`) still expose their
-/// userinfo.
+/// In an `http`/`https` URL a backslash is an authority separator, and a C0
+/// control, a space or DEL is removed outright. A userinfo component written
+/// through one of those bytes therefore reaches the parser in a form a raw scan
+/// of the string cannot see, which is how an empty username slipped past an
+/// extractor that split on `/` alone. No legal URL contains such a byte, so
+/// refusing them costs no reachable configuration and closes the whole class.
+fn has_reinterpreted_raw_bytes(raw: &str) -> bool {
+    raw.bytes()
+        .any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\')
+}
+
+/// The raw authority region of a URL string: what sits between the scheme's `:`
+/// and the first `/`, `\`, `?` or `#` after it.
+///
+/// Leading separators are skipped so the malformed spellings the URL parser
+/// would otherwise normalize away (`http:////@host`, `http:/@host`) still expose
+/// their userinfo. `\` is treated exactly like `/` because that is how the URL
+/// parser treats it in an `http`/`https` URL; an extractor that split on `/`
+/// alone would stop one character short and miss an `@` that follows.
 fn raw_authority(raw: &str) -> &str {
     let Some(colon) = raw.find(':') else {
         return "";
     };
-    let rest = raw[colon + 1..].trim_start_matches('/');
-    match rest.find(['/', '?', '#']) {
+    let rest = raw[colon + 1..].trim_start_matches(['/', '\\']);
+    match rest.find(['/', '\\', '?', '#']) {
         Some(end) => &rest[..end],
         None => rest,
     }
@@ -1954,48 +1984,143 @@ normalization = \"l2\"
         }
     }
 
+    /// A document with the given `endpoint`, plus `models_endpoint` when given.
+    ///
+    /// Both values are written with Rust's debug escaping, so a control
+    /// character reaches the validator as the byte it names and not as the
+    /// two-character escape TOML would otherwise hand back.
+    fn endpoint_document(endpoint: &str, models: Option<&str>) -> String {
+        let mut body = format!(
+            "kind = \"embedding\"\nprotocol = \"openai-embeddings-v1\"\n\
+             endpoint = {endpoint:?}\nscope = \"loopback\"\n\
+             model = \"vendor-a/arbitrary-model\"\n\
+             model_revision = \"deploy-2026-03-02\"\nnormalization = \"l2\"\n"
+        );
+        if let Some(models) = models {
+            body.push_str(&format!("models_endpoint = {models:?}\n"));
+        }
+        wrapped(&body)
+    }
+
+    /// Every spelling in which an original userinfo component reaches the URL
+    /// parser. Each is refused on `endpoint` and on `models_endpoint` alike.
+    const ORIGINAL_USERINFO_SPELLINGS: &[&str] = &[
+        // A literal userinfo.
+        "http://user:pass@127.0.0.1:8080/v1",
+        "http://user@127.0.0.1:8080/v1",
+        "http://@127.0.0.1:8080/v1",
+        "http://a@b@127.0.0.1:8080/v1",
+        // Excess leading separators the parser collapses.
+        "http:////@127.0.0.1:8080/v1",
+        "http:/@127.0.0.1:8080/v1",
+        // A backslash is an authority separator to the parser.
+        "http:\\/@127.0.0.1:8080/v1",
+        "http:/\\/@127.0.0.1:8080/v1",
+        "http:\\\\/@127.0.0.1:8080/v1",
+        "http:\\\\@127.0.0.1:8080/v1",
+        "http:/\\@127.0.0.1:8080/v1",
+        "HTTP:\\\\/@127.0.0.1:8080/v1",
+        // A control character is removed outright before the authority is read.
+        "http:\t/@127.0.0.1:8080/v1",
+        "http:\n/@127.0.0.1:8080/v1",
+        "http:\r/@127.0.0.1:8080/v1",
+        " http:/@127.0.0.1:8080/v1",
+        "http:/@127.0.0.1:8080/v1 ",
+    ];
+
     #[test]
-    fn rejects_userinfo_in_every_shape() {
-        for endpoint in [
-            "http://user:pass@127.0.0.1:8080/v1",
-            "http://user@127.0.0.1:8080/v1",
-            "http://@127.0.0.1:8080/v1",
-        ] {
-            let body = embedding_profile("").replace(LOCAL_EMBEDDING_ENDPOINT, endpoint);
-            assert_eq!(
-                reject(&wrapped(&body)).code(),
-                ConfigErrorCode::InvalidEndpoint,
-                "{endpoint}"
-            );
+    fn rejects_original_userinfo_in_every_normalized_spelling() {
+        for value in ORIGINAL_USERINFO_SPELLINGS {
+            for document in [
+                endpoint_document(value, None),
+                endpoint_document(LOCAL_EMBEDDING_ENDPOINT, Some(value)),
+            ] {
+                let error = reject(&document);
+                assert_eq!(
+                    error.code(),
+                    ConfigErrorCode::InvalidEndpoint,
+                    "{value:?} must be refused on both endpoint fields"
+                );
+            }
         }
     }
 
     #[test]
-    fn rejects_userinfo_spellings_the_url_parser_normalizes_away() {
-        for endpoint in ["http:////@127.0.0.1:8080/v1", "http:/@127.0.0.1:8080/v1"] {
-            let body = embedding_profile("").replace(LOCAL_EMBEDDING_ENDPOINT, endpoint);
-            let error = reject(&wrapped(&body));
-            assert_eq!(error.code(), ConfigErrorCode::InvalidEndpoint, "{endpoint}");
+    fn rejects_raw_bytes_the_url_parser_strips_or_reinterprets() {
+        // Covered end-to-end through TOML as well, because these all survive a
+        // TOML basic string.
+        for value in [
+            "http://127.0.0.1:8080/v1\\embeddings",
+            "http:\\/127.0.0.1:8080/v1",
+            "http://127.0.0.1:8080/v1\tembeddings",
+            "http://127.0.0.1:8080/v1\nembeddings",
+            "http://127.0.0.1:8080/v1\rembeddings",
+            " http://127.0.0.1:8080/v1",
+            "http://127.0.0.1:8080/v1 ",
+        ] {
+            for document in [
+                endpoint_document(value, None),
+                endpoint_document(LOCAL_EMBEDDING_ENDPOINT, Some(value)),
+            ] {
+                assert_eq!(
+                    reject(&document).code(),
+                    ConfigErrorCode::InvalidEndpoint,
+                    "{value:?} must be refused on both endpoint fields"
+                );
+            }
         }
+
+        // The bytes TOML cannot carry through a string literal are checked on
+        // the predicate itself.
+        assert!(has_reinterpreted_raw_bytes("\u{0}"));
+        assert!(has_reinterpreted_raw_bytes("\u{7f}"));
+        assert!(has_reinterpreted_raw_bytes(" "));
+        assert!(has_reinterpreted_raw_bytes("\t"));
+        assert!(has_reinterpreted_raw_bytes("\r"));
+        assert!(has_reinterpreted_raw_bytes("\n"));
+        assert!(has_reinterpreted_raw_bytes("\\"));
+        assert!(!has_reinterpreted_raw_bytes("http://127.0.0.1:8080/v1/@me"));
+        assert!(!has_reinterpreted_raw_bytes(
+            "https://cloud.example.invalid/v1"
+        ));
     }
 
     #[test]
     fn accepts_an_at_sign_that_is_part_of_the_path() {
-        let endpoint = "http://127.0.0.1:8080/v1/@me/embeddings";
-        let body = embedding_profile("").replace(LOCAL_EMBEDDING_ENDPOINT, endpoint);
-        assert!(ApiConfig::parse_toml(&wrapped(&body)).is_ok());
+        for value in [
+            "http://127.0.0.1:8080/v1/@me/embeddings",
+            "http://127.0.0.1:8080/v1/a@b/embeddings",
+            "http://127.0.0.1:8080/v1/embeddings@v2",
+        ] {
+            for document in [
+                endpoint_document(value, None),
+                endpoint_document(LOCAL_EMBEDDING_ENDPOINT, Some(value)),
+            ] {
+                assert!(
+                    ApiConfig::parse_toml(&document).is_ok(),
+                    "{value:?} should validate"
+                );
+            }
+        }
     }
 
     #[test]
-    fn rejects_fragments_and_query_strings() {
-        for endpoint in [
+    fn rejects_fragments_and_any_query_string() {
+        for value in [
             "http://127.0.0.1:8080/v1#fragment",
             "http://127.0.0.1:8080/v1?api_key=synthetic-secret",
             "http://127.0.0.1:8080/v1?format=json",
         ] {
-            let body = embedding_profile("").replace(LOCAL_EMBEDDING_ENDPOINT, endpoint);
-            let error = reject(&wrapped(&body));
-            assert_eq!(error.code(), ConfigErrorCode::InvalidEndpoint, "{endpoint}");
+            for document in [
+                endpoint_document(value, None),
+                endpoint_document(LOCAL_EMBEDDING_ENDPOINT, Some(value)),
+            ] {
+                assert_eq!(
+                    reject(&document).code(),
+                    ConfigErrorCode::InvalidEndpoint,
+                    "{value:?} must be refused on both endpoint fields"
+                );
+            }
         }
     }
 
