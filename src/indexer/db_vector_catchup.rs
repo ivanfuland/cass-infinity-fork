@@ -17,6 +17,7 @@
 //! to chunk-granularity holes and generation fingerprinting.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -25,7 +26,12 @@ use crate::search::chunking::canonical_role;
 use crate::search::eligibility::{ExpectedChunk, expected_chunks, for_each_expected_chunk};
 use crate::search::frankensearch_types::cosine_similarity;
 use crate::search::infinity::{InfinityServedIdentity, fingerprint_matches};
+use crate::search::model_api::{
+    EndpointConfigIdentity, ModelApiBackfillReport, PrimaryEmbeddingCall, ProbeMeasurement,
+    RepresentationDescriptor, ValidatedProfile,
+};
 use crate::storage::api::{Conn, StorageError, Tx, TxMode, params};
+use crate::storage::api_generation::{create_api_generation, open_api_generation};
 use crate::storage::schema::{self, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
@@ -1646,6 +1652,358 @@ fn scan_expected_snapshot(storage: &FrankenStorage) -> Result<(Vec<ExpectedChunk
     Ok((all_expected, expected_by_message))
 }
 
+// =============================================================================
+// API02D: the neutral engine seam the shared catch-up loop drives.
+//
+// The loop below (find-or-create the generation -> drain `chunk_holes` in
+// key-paged batches -> stage/move/vec0 -> reverse-reconcile -> activate) is
+// identical whichever embedding backend supplies the vectors. Two backends
+// exist: the legacy Infinity entry, a thin wrapper over this function's original
+// arguments, and the API-primary entry that writes and re-verifies an API
+// generation record (spec §§6.1-6.2). This trait is that seam -- deliberately
+// private, with deliberately exactly two implementations. It is not a plugin
+// framework and grants no third backend.
+// =============================================================================
+
+trait CatchupEngine {
+    /// The `embedding_generations.embedder_id` this engine writes and matches.
+    fn embedder_id(&self) -> String;
+    /// The embedding width.
+    fn dimension(&self) -> usize;
+    /// Embed one logical page of document texts for the drain.
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String>;
+    /// Embed the activation audit's own verification inputs.
+    ///
+    /// The audit runs the same HTTP implementation and the same failure rules as
+    /// the drain; only the evidence bucket differs, so an audit request is never
+    /// reported as a document batch.
+    fn embed_for_audit(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String>;
+    /// Resolve the generation to write into, creating it when no reusable one
+    /// exists. Returns `(generation_id, reused_existing, holes_seeded)`.
+    fn find_or_create_generation(
+        &self,
+        conn: &Conn,
+        now_ms: i64,
+        all_expected: &[ExpectedChunk],
+    ) -> Result<(i64, bool, u64)>;
+    /// Re-verify this engine's generation identity inside one page's write
+    /// transaction. Any failure must abort that whole page.
+    fn verify_page_identity(&self, tx: &Tx, generation_id: i64) -> Result<(), StorageError>;
+    /// The activation-time guard, run inside `switch_active_generation`'s own
+    /// transaction.
+    fn activation_guard(
+        &self,
+        tx: &Tx,
+        generation_id: i64,
+        pre_audit_chunk_count: i64,
+    ) -> Result<(), StorageError>;
+    /// Whether this run's tail may prune orphaned generations.
+    fn allows_orphan_cleanup(&self) -> bool;
+}
+
+/// The legacy Infinity engine: the original arguments, unchanged.
+struct InfinityCatchupEngine<'a> {
+    identity: &'a InfinityServedIdentity,
+    canonicalize_version: u32,
+    chunking_version: u32,
+    fingerprint: &'a [u8],
+    embedder: &'a dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
+}
+
+impl CatchupEngine for InfinityCatchupEngine<'_> {
+    fn embedder_id(&self) -> String {
+        self.identity.model_id.clone()
+    }
+
+    fn dimension(&self) -> usize {
+        self.identity.dimension
+    }
+
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        (self.embedder)(texts)
+    }
+
+    fn embed_for_audit(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        (self.embedder)(texts)
+    }
+
+    fn find_or_create_generation(
+        &self,
+        conn: &Conn,
+        now_ms: i64,
+        all_expected: &[ExpectedChunk],
+    ) -> Result<(i64, bool, u64)> {
+        find_reusable_or_create_generation(
+            conn,
+            self.identity,
+            self.canonicalize_version,
+            self.chunking_version,
+            self.fingerprint,
+            now_ms,
+            all_expected,
+        )
+    }
+
+    fn verify_page_identity(&self, _tx: &Tx, _generation_id: i64) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn activation_guard(
+        &self,
+        tx: &Tx,
+        generation_id: i64,
+        pre_audit_chunk_count: i64,
+    ) -> Result<(), StorageError> {
+        switch_guard_in_tx(tx, generation_id, pre_audit_chunk_count)
+    }
+
+    fn allows_orphan_cleanup(&self) -> bool {
+        true
+    }
+}
+
+/// The API-primary engine: one frozen profile plus its embedding driver.
+///
+/// Unlike the legacy engine, every generation it matches must reopen through
+/// `open_api_generation` in the same transaction as the lookup, and every page
+/// it writes must re-verify that record before any row lands.
+struct ApiPrimaryCatchupEngine<'a> {
+    call: &'a PrimaryEmbeddingCall,
+    profile: &'a ValidatedProfile,
+    embedder_id: String,
+    dimension: usize,
+    canonicalize_version: u32,
+    chunking_version: u32,
+    fingerprint: &'a [u8],
+}
+
+impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
+    fn embedder_id(&self) -> String {
+        self.embedder_id.clone()
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        self.call.embed_documents(texts).map_err(|e| e.message())
+    }
+
+    fn embed_for_audit(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        self.call.embed_for_audit(texts).map_err(|e| e.message())
+    }
+
+    fn find_or_create_generation(
+        &self,
+        conn: &Conn,
+        now_ms: i64,
+        all_expected: &[ExpectedChunk],
+    ) -> Result<(i64, bool, u64)> {
+        find_or_create_api_generation(
+            conn,
+            self.profile,
+            self.dimension,
+            self.canonicalize_version,
+            self.chunking_version,
+            self.fingerprint,
+            now_ms,
+            all_expected,
+        )
+    }
+
+    fn verify_page_identity(&self, tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
+        open_api_generation(tx, generation_id, self.profile)
+            .map(|_verified| ())
+            .map_err(StorageError::from)
+    }
+
+    fn activation_guard(
+        &self,
+        tx: &Tx,
+        generation_id: i64,
+        pre_audit_chunk_count: i64,
+    ) -> Result<(), StorageError> {
+        open_api_generation(tx, generation_id, self.profile).map_err(StorageError::from)?;
+        switch_guard_in_tx(tx, generation_id, pre_audit_chunk_count)
+    }
+
+    fn allows_orphan_cleanup(&self) -> bool {
+        // Spec §"代际与事务接线": the API path must not enable the automatic
+        // tail cleanup this ticket, so a candidate generation it just built and
+        // has not activated yet can never be pruned. The final cleanup contract
+        // is another ticket's; the legacy entry keeps its own behavior.
+        false
+    }
+}
+
+/// Find or create the API generation this profile and fingerprint describe.
+///
+/// The lookup and the verification share one transaction with the create, so a
+/// candidate can never be reused without its two meta records and its row having
+/// been reopened against the running profile in the same snapshot. A row that
+/// carries this exact API identity but whose records are missing, malformed or
+/// described by a moved endpoint is refused outright rather than papered over by
+/// quietly creating a replacement — the successor's admission is what clears
+/// that, not this ticket. A legacy (non-API) row is never an API candidate, so a
+/// previous Infinity generation keeps its active pointer while a new API
+/// candidate is built beside it.
+fn find_or_create_api_generation(
+    conn: &Conn,
+    profile: &ValidatedProfile,
+    dimension: usize,
+    canonicalize_version: u32,
+    chunking_version: u32,
+    fingerprint: &[u8],
+    now_ms: i64,
+    all_expected: &[ExpectedChunk],
+) -> Result<(i64, bool, u64)> {
+    let descriptor = RepresentationDescriptor::from_profile(profile, dimension as u64)
+        .map_err(|e| anyhow!("the selected API embedding profile has no usable representation identity: {e}"))?;
+    let embedder_id = descriptor.embedder_id();
+    let dim = i64::try_from(dimension)
+        .map_err(|_| anyhow!("api dimension {dimension} does not fit in i64"))?;
+
+    const ACTIVE_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
+         LIMIT 1";
+    const PENDING_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND audit_status = 'pending' \
+         ORDER BY id DESC LIMIT 1";
+
+    conn.with_tx(TxMode::Immediate, |tx| {
+        for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
+            let candidate = tx.query_opt_map(
+                sql,
+                &params![
+                    embedder_id.as_str(),
+                    dim,
+                    i64::from(canonicalize_version),
+                    i64::from(chunking_version)
+                ],
+                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Vec<u8>>(1)?)),
+            )?;
+            let Some((candidate_id, stored_fingerprint)) = candidate else {
+                continue;
+            };
+            // The row carries this exact API identity (embedder id, dimension,
+            // both pipeline versions), so it claims to be this space: the stored
+            // record must prove it *before* the fingerprint rule is consulted.
+            // A missing, malformed or relocated record is refused outright here
+            // — never bypassed by a fingerprint mismatch that would quietly
+            // build a replacement beside it.
+            open_api_generation(tx, candidate_id, profile).map_err(StorageError::from)?;
+            if fingerprint_matches(&stored_fingerprint, fingerprint, dimension) {
+                return Ok((candidate_id, true, 0u64));
+            }
+            // The record is sound but the served weights differ from this run's
+            // probe, so the existing fingerprint rule says build a new
+            // generation beside this one rather than reuse vectors that belong
+            // to another fingerprint. Keep looking: a pending candidate from the
+            // current service instance may still match.
+        }
+
+        let generation_id = create_api_generation(tx, profile, dimension as u64, fingerprint, now_ms)
+            .map_err(StorageError::from)?;
+        let holes: Vec<(i64, u32)> = all_expected
+            .iter()
+            .map(|c| (c.message_id, c.chunk_idx))
+            .collect();
+        let outcome = schema::seed_chunk_holes(tx, generation_id, &holes, now_ms, "generation_seed")?;
+        Ok((generation_id, false, outcome.rows_inserted))
+    })
+    .map_err(anyhow::Error::from)
+}
+
+/// What one API-primary catch-up run produced.
+pub struct ApiPrimaryBackfillOutcome {
+    /// The existing backfill report shape.
+    pub catchup: DbVectorCatchupReport,
+    /// The `model_api` object printed beside it.
+    pub model_api: ModelApiBackfillReport,
+}
+
+/// Why an API-primary catch-up run did not finish.
+pub enum ApiPrimaryBackfillError {
+    /// The primary failed in the frozen eligible set while a fallback was
+    /// declared and not disabled, and no verified cross-endpoint compatibility
+    /// evidence exists (spec §6.4). No vector was written and nothing was sent
+    /// to the fallback.
+    CompatibilityRequired { message: String },
+    /// Any other failure, verbatim.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for ApiPrimaryBackfillError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompatibilityRequired { message } => f.write_str(message),
+            Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+/// One API-primary catch-up run: the shared loop over an
+/// [`ApiPrimaryCatchupEngine`].
+///
+/// `probe` is the measurement this command already took from the endpoint; its
+/// dimension fixes the generation's representation identity and its fingerprint
+/// fixes the served-weights check. The call's own probe and document evidence
+/// stays readable on `call` even when this function returns an error.
+pub fn run_api_primary_catchup_backfill(
+    storage: &FrankenStorage,
+    batch_size: usize,
+    call: &PrimaryEmbeddingCall,
+    profile: &ValidatedProfile,
+    probe: &ProbeMeasurement,
+    ownership_seed: u64,
+) -> std::result::Result<ApiPrimaryBackfillOutcome, ApiPrimaryBackfillError> {
+    let descriptor = RepresentationDescriptor::from_profile(profile, probe.dimension as u64)
+        .map_err(|e| {
+            ApiPrimaryBackfillError::Failed(anyhow!(
+                "the selected API embedding profile has no usable representation identity: {e}"
+            ))
+        })?;
+    let endpoint = EndpointConfigIdentity::from_profile(profile).map_err(|e| {
+        ApiPrimaryBackfillError::Failed(anyhow!(
+            "the selected API embedding profile has no usable call identity: {e}"
+        ))
+    })?;
+    let engine = ApiPrimaryCatchupEngine {
+        call,
+        profile,
+        embedder_id: descriptor.embedder_id(),
+        dimension: probe.dimension,
+        canonicalize_version: descriptor.canonicalize_version(),
+        chunking_version: descriptor.chunking_version(),
+        fingerprint: &probe.fingerprint,
+    };
+
+    match run_catchup_with_engine(storage, batch_size, &engine, ownership_seed) {
+        Ok(catchup) => Ok(ApiPrimaryBackfillOutcome {
+            catchup,
+            model_api: call.model_api_report(descriptor.sha256(), endpoint.sha256()),
+        }),
+        Err(error) => {
+            if call
+                .last_failure()
+                .is_some_and(|failure| failure.is_compatibility_required())
+            {
+                Err(ApiPrimaryBackfillError::CompatibilityRequired {
+                    message: format!("{error:#}"),
+                })
+            } else {
+                Err(ApiPrimaryBackfillError::Failed(error))
+            }
+        }
+    }
+}
+
+/// Drive one full v5 chunk-domain catch-up run against the legacy Infinity
+/// identity. Thin wrapper over [`run_catchup_with_engine`]; behavior is
+/// unchanged from before API02D split the loop from its engine.
 #[allow(clippy::too_many_arguments)]
 pub fn run_db_vector_catchup_backfill(
     storage: &FrankenStorage,
@@ -1657,11 +2015,29 @@ pub fn run_db_vector_catchup_backfill(
     embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
     ownership_seed: u64,
 ) -> Result<DbVectorCatchupReport> {
+    let engine = InfinityCatchupEngine {
+        identity,
+        canonicalize_version,
+        chunking_version: chunking_policy_version,
+        fingerprint,
+        embedder,
+    };
+    run_catchup_with_engine(storage, batch_size, &engine, ownership_seed)
+}
+
+/// The shared loop. See [`run_db_vector_catchup_backfill`]'s original doc
+/// comment (below) for the phase-by-phase description.
+fn run_catchup_with_engine<E: CatchupEngine>(
+    storage: &FrankenStorage,
+    batch_size: usize,
+    engine: &E,
+    ownership_seed: u64,
+) -> Result<DbVectorCatchupReport> {
     if batch_size == 0 {
         bail!("batch_size must be > 0");
     }
-    let dim = i64::try_from(identity.dimension)
-        .map_err(|_| anyhow!("infinity dimension {} does not fit in i64", identity.dimension))?;
+    let dim = i64::try_from(engine.dimension())
+        .map_err(|_| anyhow!("embedding dimension {} does not fit in i64", engine.dimension()))?;
     let now_ms = FrankenStorage::now_millis();
 
     // T10.5: moved up from immediately after generation resolution (was
@@ -1674,15 +2050,8 @@ pub fn run_db_vector_catchup_backfill(
     // the reverse-reconciliation pass at the end of this function).
     let (all_expected, expected_by_message) = scan_expected_snapshot(storage)?;
 
-    let (generation_id, reused_existing_generation, holes_seeded) = find_reusable_or_create_generation(
-        storage.raw(),
-        identity,
-        canonicalize_version,
-        chunking_policy_version,
-        fingerprint,
-        now_ms,
-        &all_expected,
-    )?;
+    let (generation_id, reused_existing_generation, holes_seeded) =
+        engine.find_or_create_generation(storage.raw(), now_ms, &all_expected)?;
     // Idempotent (`CREATE VIRTUAL TABLE IF NOT EXISTS`): a no-op for a
     // reused generation, and the one place a brand-new generation's vec0
     // table actually gets created (T8 populates it incrementally via
@@ -1834,13 +2203,13 @@ pub fn run_db_vector_catchup_backfill(
 
         if !pending_embed.is_empty() {
             let texts: Vec<&str> = pending_embed.iter().map(|(_, _, _, _, t)| t.as_str()).collect();
-            let vectors = embedder(&texts).map_err(|e| anyhow!("batched embedding of {} chunk(s) failed: {e}", texts.len()))?;
+            let vectors = engine.embed(&texts).map_err(|e| anyhow!("batched embedding of {} chunk(s) failed: {e}", texts.len()))?;
             if vectors.len() != pending_embed.len() {
                 bail!("embedder returned {} vector(s) for {} input(s) (batched embed)", vectors.len(), pending_embed.len());
             }
             for ((message_id, chunk_idx, conversation_id, span, _text), vector) in pending_embed.into_iter().zip(vectors) {
-                if vector.len() != identity.dimension {
-                    bail!("embedder returned dim {} != expected {} for message {message_id} chunk_idx {chunk_idx}", vector.len(), identity.dimension);
+                if vector.len() != engine.dimension() {
+                    bail!("embedder returned dim {} != expected {} for message {message_id} chunk_idx {chunk_idx}", vector.len(), engine.dimension());
                 }
                 let norm = schema::l2_norm(&vector) as f32;
                 batch_rows.push(ChunkRow {
@@ -1863,6 +2232,12 @@ pub fn run_db_vector_catchup_backfill(
         storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
+                // API02D: re-verify this engine's generation identity inside the
+                // very transaction that writes, before any row lands. A record
+                // that no longer opens against the running profile (or was
+                // never written) aborts this whole page, so no vector can be
+                // staged under a generation whose identity stopped being true.
+                engine.verify_page_identity(tx, generation_id)?;
                 if !batch_rows.is_empty() {
                     schema::stage_chunk_rows_in_tx(tx, batch_id, &batch_rows)?;
                 }
@@ -1956,7 +2331,13 @@ pub fn run_db_vector_catchup_backfill(
     )?;
     let mut activated = false;
     if holes_after == 0 {
-        let audit_report = activate_generation(storage, generation_id, embedder, ownership_seed)
+        // The full T8 activation audit runs on every run that can activate,
+        // including a repeat run of an already-complete generation. No flag,
+        // `is_active` value or "no new holes" state may substitute for it: an
+        // active generation can have been demoted to pending by a write since,
+        // and its stored vectors can be wrong even when its identity matches.
+        let audit_embed = |texts: &[&str]| engine.embed_for_audit(texts);
+        let audit_report = activate_generation(storage, generation_id, &audit_embed, ownership_seed)
             .context("running the T8 v5 activation audit before activating a chunk-domain generation")?;
         // Task book #98 Step 1/4: the R1-B8 exact-content-twin tolerance
         // this task book added to checks ③/⑩ has no other observable
@@ -1988,7 +2369,7 @@ pub fn run_db_vector_catchup_backfill(
             );
         }
         schema::switch_active_generation(storage.raw(), generation_id, FrankenStorage::now_millis(), |tx| {
-            switch_guard_in_tx(tx, generation_id, audit_report.chunk_count)
+            engine.activation_guard(tx, generation_id, audit_report.chunk_count)
         })
         .context("activating v5 chunk-domain generation")?;
         activated = true;
@@ -2007,7 +2388,15 @@ pub fn run_db_vector_catchup_backfill(
     // scan-level failure are folded into `.failures`), so there is no
     // `?`/`.context(...)` left here to lose this run's already-committed
     // activation to a housekeeping failure.
-    let cleanup_outcome = cleanup_orphaned_generations(storage, FrankenStorage::now_millis());
+    //
+    // API02D: the API-primary engine returns `false` here, so this run never
+    // prunes a candidate it just built (spec §"代际与事务接线"). The legacy
+    // engine keeps the unconditional tail call above verbatim.
+    let cleanup_outcome = if engine.allows_orphan_cleanup() {
+        cleanup_orphaned_generations(storage, FrankenStorage::now_millis())
+    } else {
+        Ok(GenerationCleanupOutcome::default())
+    };
     let (cleanup_deleted_generation_ids, cleanup_failures) = match cleanup_outcome {
         Ok(outcome) => (outcome.deleted_ids, outcome.failures),
         Err(e) => (Vec::new(), vec![(0, format!("cleanup_orphaned_generations errored: {e}"))]),
@@ -2016,7 +2405,7 @@ pub fn run_db_vector_catchup_backfill(
     Ok(DbVectorCatchupReport {
         generation_id,
         reused_existing_generation,
-        embedder_id: identity.model_id.clone(),
+        embedder_id: engine.embedder_id(),
         dim,
         eligible_seeded: 0,
         embedded_inserted: 0,
