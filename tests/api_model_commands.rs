@@ -1341,3 +1341,255 @@ fn models_help_lists_both_new_subcommands() {
         "models --help must list `check`: {text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rework R1: the configuration boundary, bounded refusals and per-stage
+// response evidence.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_selected_path_is_used_byte_for_byte() {
+    let stub = Stub::start(embedding_answer(4));
+    let harness = Harness::new();
+    let wrong = format!(
+        "version = 1\n{}",
+        embedding_profile("wrong-config", &stub.origin(), &[])
+    );
+    let intended = format!(
+        "version = 1\n{}",
+        embedding_profile("intended-config", &stub.origin(), &[])
+    );
+    write_config(harness.dir(), "models.toml", &wrong);
+    write_config(harness.dir(), "models.toml ", &intended);
+    let spaced = harness
+        .dir()
+        .join("models.toml ")
+        .to_str()
+        .expect("utf8 path")
+        .to_string();
+    let plain = harness
+        .dir()
+        .join("models.toml")
+        .to_str()
+        .expect("utf8 path")
+        .to_string();
+
+    // The environment value names one file; trimming would read the other.
+    let output = harness.run(
+        &[("CASS_API_CONFIG", &spaced)],
+        &["models", "list", "--json"],
+    );
+    assert_exit(&output, 0, "env path with a trailing space");
+    assert_eq!(
+        stdout_json(&output)["profiles"][0]["id"],
+        "intended-config",
+        "the trailing space names a different file and must not be trimmed"
+    );
+
+    // The command line behaves identically for the same bytes.
+    let output = harness.run(&[], &["models", "list", "--api-config", &spaced, "--json"]);
+    assert_exit(&output, 0, "cli path with a trailing space");
+    assert_eq!(stdout_json(&output)["profiles"][0]["id"], "intended-config");
+
+    // The unspaced path still selects the unspaced file.
+    let output = harness.run(
+        &[("CASS_API_CONFIG", &plain)],
+        &["models", "list", "--json"],
+    );
+    assert_exit(&output, 0, "env path without a space");
+    assert_eq!(stdout_json(&output)["profiles"][0]["id"], "wrong-config");
+
+    assert_eq!(stub.request_count(), 0, "list never sends a request");
+}
+
+#[test]
+fn an_unknown_profile_argument_is_never_echoed() {
+    let stub = Stub::start(embedding_answer(4));
+    let harness = Harness::new();
+    let body = format!(
+        "version = 1\n{}",
+        embedding_profile("local-embed", &stub.origin(), &[])
+    );
+    let config = write_config(harness.dir(), "models.toml", &body);
+    let config = config.to_str().expect("utf8 path").to_string();
+
+    // A hostile id: a newline, a path and a secret-shaped fragment.
+    let hostile = "SYNTHETIC_PRIVATE_PROFILE_ARGUMENT_123\n/tmp/secret";
+    let output = harness.run(
+        &[],
+        &[
+            "models",
+            "check",
+            "--profile",
+            hostile,
+            "--api-config",
+            &config,
+            "--json",
+        ],
+    );
+    assert_exit(&output, 2, "an unknown profile id");
+    assert_eq!(err_kind(&output), "ModelApiConfiguration");
+
+    let combined = format!("{}{}", stdout_text(&output), stderr_text(&output));
+    assert!(
+        !combined.contains("SYNTHETIC_PRIVATE"),
+        "the requested id must never surface: {combined}"
+    );
+    assert!(
+        !combined.contains("/tmp/secret"),
+        "no path echo: {combined}"
+    );
+    assert_eq!(stub.request_count(), 0, "an unknown profile sends nothing");
+}
+
+/// An embedding responder whose answer depends on which call this is.
+fn per_call_embedding<F>(answer: F) -> impl Fn(&RecordedRequest, usize) -> (u16, String)
+where
+    F: Fn(usize) -> (u16, serde_json::Value) + Send + Sync + 'static,
+{
+    move |_request: &RecordedRequest, index: usize| {
+        let (status, body) = answer(index);
+        (status, body.to_string())
+    }
+}
+
+fn embedding_body(tokens: Option<u64>, provider: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": EMBED_MODEL,
+        "data": [ { "index": 0, "embedding": vec![0.25_f64; 4] } ],
+    });
+    if let Some(tokens) = tokens {
+        body["usage"] = serde_json::json!({ "total_tokens": tokens });
+    }
+    if let Some(provider) = provider {
+        body["provider"] = serde_json::json!(provider);
+    }
+    body
+}
+
+#[test]
+fn each_stage_keeps_its_own_response_evidence() {
+    let stub = Stub::start(per_call_embedding(|index| {
+        if index == 0 {
+            (200, embedding_body(Some(11), Some("provider-a")))
+        } else {
+            (200, embedding_body(Some(22), Some("provider-b")))
+        }
+    }));
+    let harness = Harness::new();
+    let body = format!(
+        "version = 1\n{}",
+        embedding_profile("local-embed", &stub.origin(), &[])
+    );
+    let config = write_config(harness.dir(), "models.toml", &body);
+
+    let output = harness.run(
+        &[],
+        &[
+            "models",
+            "check",
+            "--profile",
+            "local-embed",
+            "--api-config",
+            config.to_str().expect("path"),
+            "--json",
+        ],
+    );
+    assert_exit(&output, 0, "embedding check");
+
+    let payload = stdout_json(&output);
+    assert_eq!(u64_at(&payload, "/calls/0/usage/total_tokens"), Some(11));
+    assert_eq!(u64_at(&payload, "/calls/1/usage/total_tokens"), Some(22));
+    assert_eq!(payload["calls"][0]["serving_provider"], "provider-a");
+    assert_eq!(payload["calls"][1]["serving_provider"], "provider-b");
+    assert_eq!(payload["calls"][0]["response_model"], EMBED_MODEL);
+    assert_eq!(payload["calls"][1]["response_model"], EMBED_MODEL);
+}
+
+#[test]
+fn a_stage_without_usage_does_not_erase_the_earlier_one() {
+    let stub = Stub::start(per_call_embedding(|index| {
+        if index == 0 {
+            (200, embedding_body(Some(11), None))
+        } else {
+            (200, embedding_body(None, None))
+        }
+    }));
+    let harness = Harness::new();
+    let body = format!(
+        "version = 1\n{}",
+        embedding_profile("local-embed", &stub.origin(), &[])
+    );
+    let config = write_config(harness.dir(), "models.toml", &body);
+
+    let output = harness.run(
+        &[],
+        &[
+            "models",
+            "check",
+            "--profile",
+            "local-embed",
+            "--api-config",
+            config.to_str().expect("path"),
+            "--json",
+        ],
+    );
+    assert_exit(&output, 0, "embedding check");
+
+    let payload = stdout_json(&output);
+    assert_eq!(
+        u64_at(&payload, "/calls/0/usage/total_tokens"),
+        Some(11),
+        "the query response reported usage and must keep it"
+    );
+    assert_eq!(payload["calls"][1]["usage"], serde_json::Value::Null);
+    assert_eq!(
+        payload["usage"],
+        serde_json::Value::Null,
+        "the last response reported none, so the top-level echo is null"
+    );
+    assert_eq!(payload["calls"][0]["response_model"], EMBED_MODEL);
+}
+
+#[test]
+fn a_failed_stage_keeps_the_earlier_stage_evidence() {
+    let stub = Stub::start(per_call_embedding(|index| {
+        if index == 0 {
+            (200, embedding_body(Some(11), Some("provider-a")))
+        } else {
+            (500, serde_json::json!({ "error": SERVICE_BODY_MARKER }))
+        }
+    }));
+    let harness = Harness::new();
+    let body = format!(
+        "version = 1\n{}",
+        embedding_profile("local-embed", &stub.origin(), &[])
+    );
+    let config = write_config(harness.dir(), "models.toml", &body);
+
+    let output = harness.run(
+        &[],
+        &[
+            "models",
+            "check",
+            "--profile",
+            "local-embed",
+            "--api-config",
+            config.to_str().expect("path"),
+            "--json",
+        ],
+    );
+    assert_exit(&output, 1, "the document stage fails");
+
+    let document = stderr_document(&output);
+    assert_eq!(document["calls"][0]["stage"], "query");
+    assert_eq!(u64_at(&document, "/calls/0/usage/total_tokens"), Some(11));
+    assert_eq!(document["calls"][0]["response_model"], EMBED_MODEL);
+    assert_eq!(document["calls"][0]["serving_provider"], "provider-a");
+    assert!(
+        document["calls"][1]["error_code"].as_str().is_some(),
+        "the failed stage carries its bounded code"
+    );
+    let combined = format!("{}{}", stdout_text(&output), stderr_text(&output));
+    assert!(!combined.contains(SERVICE_BODY_MARKER));
+}

@@ -19,6 +19,7 @@
 //! The module is pure at its core: the file reader and the environment lookup
 //! are parameters, so every rule below is testable without touching either.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -176,9 +177,13 @@ impl RuntimeError {
     }
 
     /// The requested profile id is not defined by the configuration.
-    pub fn unknown_profile(profile_id: &str) -> Self {
+    ///
+    /// The id is caller-supplied text and is never echoed: it can carry a path,
+    /// a newline or a credential-shaped fragment, so the refusal reports a
+    /// bounded short code and a fixed hint instead.
+    pub fn unknown_profile() -> Self {
         Self::configuration(
-            format!("unknown model API profile: {profile_id}"),
+            "unknown model API profile id".to_string(),
             Some("Run `cass models list --json` to see the configured profile ids.".to_string()),
         )
     }
@@ -257,12 +262,15 @@ impl std::error::Error for RuntimeError {}
 ///
 /// The client asks it for a profile's `api_key_env` name and receives the
 /// value, or `None`. Nothing here searches a directory, reads a dotfile or
-/// guesses a variable name.
+/// guesses a variable name: the read is `std::env`, not a dotfile-loading
+/// helper, so this edge never widens what the process was started with. A
+/// value that is unset, empty or not valid UTF-8 has no usable bearer and
+/// resolves to `None`.
 pub struct EnvCredentialResolver;
 
 impl CredentialResolver for EnvCredentialResolver {
     fn resolve(&self, variable: &str) -> Option<String> {
-        dotenvy::var(variable)
+        std::env::var(variable)
             .ok()
             .filter(|value| !value.is_empty())
     }
@@ -270,10 +278,10 @@ impl CredentialResolver for EnvCredentialResolver {
 
 /// The first retired model-selection variable that is set, if any.
 ///
-/// "Set" includes set to the empty string, which is why the caller supplies a
-/// lookup returning `Some("")` for that case rather than an `is_some_and` on a
-/// non-empty value.
-pub fn retired_model_env_in_use(lookup: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+/// "Set" is presence, not a readable value: it includes the empty string and a
+/// value that is not valid UTF-8, so the lookup returns the raw [`OsString`]
+/// and the caller must not collapse `None` with "present but unreadable".
+pub fn retired_model_env_in_use(lookup: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> {
     RETIRED_MODEL_ENV_VARS
         .iter()
         .copied()
@@ -282,7 +290,7 @@ pub fn retired_model_env_in_use(lookup: impl Fn(&str) -> Option<String>) -> Opti
 
 /// Refuse when any retired model-selection variable is set.
 pub fn ensure_no_retired_model_env(
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Result<(), RuntimeError> {
     match retired_model_env_in_use(lookup) {
         Some(variable) => Err(RuntimeError::migration(variable)),
@@ -332,11 +340,16 @@ impl ConfigPath {
 ///
 /// The command line wins over the environment. No default directory is
 /// searched: when neither names a file the result is `None`, and the caller
-/// reports a missing configuration rather than reading an unstated path. An
-/// environment value that is empty or all whitespace counts as unset.
+/// reports a missing configuration rather than reading an unstated path.
+///
+/// The path is the caller's own bytes. Only a genuinely empty environment value
+/// counts as unset; nothing is trimmed or normalized, because trimming would
+/// silently redirect a path such as `models.toml ` to a different file. The
+/// value stays an [`OsString`] so a path that is not valid UTF-8 is still read
+/// verbatim instead of being dropped and replaced by some other configuration.
 pub fn resolve_config_path(
     cli_path: Option<&Path>,
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Option<ConfigPath> {
     if let Some(path) = cli_path {
         return Some(ConfigPath {
@@ -345,12 +358,11 @@ pub fn resolve_config_path(
         });
     }
     let from_env = lookup(API_CONFIG_ENV)?;
-    let trimmed = from_env.trim();
-    if trimmed.is_empty() {
+    if from_env.is_empty() {
         return None;
     }
     Some(ConfigPath {
-        path: PathBuf::from(trimmed),
+        path: PathBuf::from(from_env),
         source: ConfigPathSource::Environment,
     })
 }
@@ -358,7 +370,7 @@ pub fn resolve_config_path(
 /// Read and validate the configuration this command selected.
 pub fn load_config(
     cli_path: Option<&Path>,
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Result<ValidatedApiConfig, RuntimeError> {
     load_config_with(cli_path, lookup, read_config_text)
 }
@@ -375,7 +387,7 @@ fn read_config_text(path: &Path) -> std::io::Result<String> {
 /// without a real file.
 pub fn load_config_with(
     cli_path: Option<&Path>,
-    lookup: impl Fn(&str) -> Option<String>,
+    lookup: impl Fn(&str) -> Option<OsString>,
     read: impl Fn(&Path) -> std::io::Result<String>,
 ) -> Result<ValidatedApiConfig, RuntimeError> {
     let Some(selected) = resolve_config_path(cli_path, lookup) else {
@@ -388,14 +400,15 @@ pub fn load_config_with(
 /// Select one profile by its configured id.
 ///
 /// The id is the only selector. The profile's kind comes from the document, so
-/// a name that looks like a model never decides which check runs.
+/// a name that looks like a model never decides which check runs. A miss
+/// reports a bounded refusal and never echoes the requested text.
 pub fn profile_by_id<'a>(
     config: &'a ValidatedApiConfig,
     profile_id: &str,
 ) -> Result<&'a ValidatedProfile, RuntimeError> {
     config
         .profile(profile_id)
-        .ok_or_else(|| RuntimeError::unknown_profile(profile_id))
+        .ok_or_else(RuntimeError::unknown_profile)
 }
 
 /// One profile as `cass models list` reports it.
@@ -445,7 +458,11 @@ pub fn list_profiles(config: &ValidatedApiConfig) -> Vec<ProfileListing> {
 }
 
 /// One recorded stage of a profile check.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+///
+/// The observation fields are this stage's own response, not the command's
+/// latest one: a stage that reported usage keeps it even when a later stage
+/// reports none or fails. A field the service did not send stays `None`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CheckCall {
     /// `query`, `document` or `rerank`.
     pub stage: &'static str,
@@ -457,6 +474,14 @@ pub struct CheckCall {
     pub duration_ms: u64,
     /// The bounded failure code, when this stage failed.
     pub error_code: Option<&'static str>,
+    /// The model this stage's own response named, when it named one.
+    pub response_model: Option<String>,
+    /// The revision this stage's own response named, when it named one.
+    pub response_revision: Option<String>,
+    /// The serving provider this stage's own response named, when it named one.
+    pub serving_provider: Option<String>,
+    /// The usage this stage's own response reported, when it reported any.
+    pub usage: Option<CheckUsage>,
 }
 
 /// The usage a service reported, mirroring [`Usage`] for serialization.
@@ -528,6 +553,10 @@ pub struct CheckReport {
     /// The number of documents scored, for a rerank profile.
     pub scored_count: Option<u64>,
     /// The usage the last service response reported, when it reported one.
+    ///
+    /// This is a convenience echo of the final stage only. No cost is added
+    /// across stages, and every stage's own reported usage stays readable on
+    /// its entry in [`Self::calls`].
     pub usage: Option<CheckUsage>,
 }
 
@@ -661,6 +690,10 @@ fn call_record(stage: &'static str, attempt: &ApiAttempt) -> CheckCall {
         http_status: attempt.http_status,
         duration_ms: attempt.duration_ms,
         error_code: attempt.error_code,
+        response_model: attempt.identity.response_model.clone(),
+        response_revision: attempt.identity.response_revision.clone(),
+        serving_provider: attempt.identity.provider.clone(),
+        usage: CheckUsage::from_observed(attempt.identity.usage.as_ref()),
     }
 }
 
@@ -738,12 +771,12 @@ model = "example/rank"
 model_revision = "rev-2"
 "#;
 
-    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
         move |key| {
             pairs
                 .iter()
                 .find(|(name, _)| *name == key)
-                .map(|(_, value)| (*value).to_string())
+                .map(|(_, value)| OsString::from(*value))
         }
     }
 
@@ -767,10 +800,19 @@ model_revision = "rev-2"
     }
 
     #[test]
-    fn no_path_is_never_guessed() {
+    fn only_an_empty_environment_value_is_unset() {
         assert!(resolve_config_path(None, env_of(&[])).is_none());
-        assert!(resolve_config_path(None, env_of(&[(API_CONFIG_ENV, "   ")])).is_none());
         assert!(resolve_config_path(None, env_of(&[(API_CONFIG_ENV, "")])).is_none());
+    }
+
+    #[test]
+    fn a_spaced_path_is_used_byte_for_byte() {
+        // Trimming here would silently read `models.toml` instead of
+        // `models.toml ` — a different file, and a different configuration.
+        let selected = resolve_config_path(None, env_of(&[(API_CONFIG_ENV, "/cfg/models.toml ")]))
+            .expect("a non-empty value names a path");
+        assert_eq!(selected.path(), Path::new("/cfg/models.toml "));
+        assert_eq!(selected.source(), ConfigPathSource::Environment);
     }
 
     #[test]
@@ -824,7 +866,25 @@ model_revision = "rev-2"
         assert_eq!(profile.kind, ProfileKind::Embedding);
         let error = profile_by_id(&config, "missing").expect_err("unknown id");
         assert_eq!(error.code(), 2);
-        assert!(error.message().contains("missing"));
+        assert_eq!(error.kind_str(), "ModelApiConfiguration");
+    }
+
+    #[test]
+    fn an_unknown_profile_id_is_never_echoed() {
+        // The requested id is unvalidated caller text: it can carry a path, a
+        // newline or a secret-shaped fragment, so the refusal must be bounded.
+        let hostile = "SYNTHETIC_PRIVATE_PROFILE_ARGUMENT_123\n/tmp/secret";
+        let error = RuntimeError::unknown_profile();
+        assert!(!error.message().contains(hostile));
+        assert!(!error.message().contains("SYNTHETIC_PRIVATE"));
+        assert!(!error.message().contains("/tmp/secret"));
+        assert!(!format!("{error:?}").contains("SYNTHETIC_PRIVATE"));
+        assert!(!error.message().contains('\n'));
+        assert!(
+            error
+                .hint()
+                .is_some_and(|hint| hint.contains("models list"))
+        );
     }
 
     #[test]
@@ -838,6 +898,17 @@ model_revision = "rev-2"
             assert!(error.message().contains(variable));
         }
         assert!(ensure_no_retired_model_env(env_of(&[])).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_retired_value_still_counts_as_set() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(vec![0x2f, 0xff, 0xfe]);
+        let detected =
+            retired_model_env_in_use(|key| (key == "CASS_INFINITY_URL").then(|| raw.clone()));
+        assert_eq!(detected, Some("CASS_INFINITY_URL"));
     }
 
     #[test]

@@ -100849,8 +100849,12 @@ fn model_api_runtime_error(err: crate::search::model_api::runtime::RuntimeError)
 
 /// Refuse a model command that still carries a retired model-selection
 /// variable, before any configuration is read or request is sent.
+///
+/// The read is `std::env::var_os`, not a dotfile-loading helper: this boundary
+/// only reports what the process was actually started with, and presence
+/// includes an empty or non-UTF-8 value.
 fn reject_retired_model_env() -> CliResult<()> {
-    crate::search::model_api::runtime::ensure_no_retired_model_env(|key| dotenvy::var(key).ok())
+    crate::search::model_api::runtime::ensure_no_retired_model_env(|key| std::env::var_os(key))
         .map_err(model_api_runtime_error)
 }
 
@@ -100879,7 +100883,7 @@ fn run_models_list(cli: &Cli, output_format: Option<RobotFormat>) -> CliResult<(
     use crate::search::model_api::runtime;
 
     reject_retired_model_env()?;
-    let config = runtime::load_config(cli.api_config.as_deref(), |key| dotenvy::var(key).ok())
+    let config = runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key))
         .map_err(model_api_runtime_error)?;
     let listings = runtime::list_profiles(&config);
 
@@ -100935,7 +100939,7 @@ fn run_models_check(
     use crate::search::model_api::runtime;
 
     reject_retired_model_env()?;
-    let config = runtime::load_config(cli.api_config.as_deref(), |key| dotenvy::var(key).ok())
+    let config = runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key))
         .map_err(model_api_runtime_error)?;
     // Validate the id against the document before the client takes ownership,
     // so an unknown id is a configuration refusal (code 2), not a check result.
