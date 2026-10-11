@@ -17,7 +17,9 @@
 //! triggers a cloud attempt. An unclassifiable transport problem is deliberately
 //! on the "no fallback" side.
 
+use super::client::ApiCallFailure;
 use super::config::{EndpointScope, ProfileKind, ValidatedApiConfig, ValidatedProfile};
+use super::error::ApiCallErrorCode;
 use crate::search::rerank::http::TransportFailure;
 
 /// The six HTTP statuses that permit one cloud attempt.
@@ -80,6 +82,62 @@ pub fn fallback_target<'a>(
         return None;
     }
     Some(fallback)
+}
+
+/// Rebuild the transport classification behind one refused call.
+///
+/// A refused call keeps only bounded evidence — a reason code, an optional HTTP
+/// status and, for transport-layer failures, one short classification string —
+/// so the admission rule above cannot read the live [`TransportFailure`] the
+/// client already matched on. This function is the typed bridge back to it: it
+/// reconstructs the classification from exactly those three bounded fields and
+/// never from an error message, a response body or any service text.
+///
+/// A call that was refused before a request went out (an unknown profile, a
+/// kind mismatch, a missing credential, our own input validation, a
+/// cancellation) has no transport classification at all and yields `None`; so
+/// does a status failure that observed no status. An unrecognized
+/// classification string maps to [`TransportFailure::UnclassifiedTransport`],
+/// which the admission rule keeps on the no-fallback side.
+pub fn transport_failure_of(
+    code: ApiCallErrorCode,
+    http_status: Option<u16>,
+    transport_code: Option<&str>,
+) -> Option<TransportFailure> {
+    match code {
+        ApiCallErrorCode::HttpStatus => http_status.map(TransportFailure::HttpStatus),
+        ApiCallErrorCode::Transport => Some(match transport_code {
+            Some("timeout") => TransportFailure::Timeout,
+            Some("connection_refused") => TransportFailure::ConnectionRefused,
+            Some("connection_interrupted") => TransportFailure::ConnectionInterrupted,
+            Some("network_unavailable") => TransportFailure::NetworkUnavailable,
+            // Every other string — the client's own `unclassified_transport`
+            // included — stays on the no-fallback side.
+            Some(_) | None => TransportFailure::UnclassifiedTransport,
+        }),
+        ApiCallErrorCode::InvalidResponse => Some(TransportFailure::InvalidResponse),
+        ApiCallErrorCode::InvalidInput => Some(TransportFailure::InvalidInput),
+        ApiCallErrorCode::UnknownProfile
+        | ApiCallErrorCode::WrongKind
+        | ApiCallErrorCode::MissingCredentials
+        | ApiCallErrorCode::IdentityMismatch
+        | ApiCallErrorCode::DimensionMismatch
+        | ApiCallErrorCode::Cancelled
+        | ApiCallErrorCode::UnsupportedProbe => None,
+    }
+}
+
+/// Whether one refused call is in the frozen cloud-eligible failure set.
+///
+/// This is the whole admission decision for an embedding batch: the caller
+/// separately decides whether a fallback is even declared and whether this
+/// command disabled it. Nothing here reads a message, a body or any other
+/// unbounded text — only the three bounded fields
+/// [`transport_failure_of`] consumes.
+pub fn failure_allows_cloud_fallback(failure: &ApiCallFailure) -> bool {
+    let error = failure.error();
+    transport_failure_of(error.code(), error.http_status(), error.transport_code())
+        .is_some_and(allows_cloud_fallback)
 }
 
 #[cfg(test)]
@@ -185,5 +243,93 @@ provider_only = "pinned-vendor"
         let config = crate::search::model_api::config::ApiConfig::parse_toml(text).expect("config");
         let primary = config.profile("local").expect("primary");
         assert!(fallback_target(&config, primary, true).is_none());
+    }
+
+    #[test]
+    fn the_transport_bridge_reconstructs_every_classification() {
+        // Each network classification round-trips from its own short code --
+        // the string the client actually records on the attempt. This is the
+        // pin that keeps the bridge honest without editing `http.rs`.
+        for expected in [
+            TransportFailure::Timeout,
+            TransportFailure::ConnectionRefused,
+            TransportFailure::ConnectionInterrupted,
+            TransportFailure::NetworkUnavailable,
+        ] {
+            let rebuilt =
+                transport_failure_of(ApiCallErrorCode::Transport, None, Some(expected.as_str()));
+            assert_eq!(rebuilt, Some(expected), "{expected:?}");
+            assert!(allows_cloud_fallback(expected));
+        }
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::HttpStatus, Some(503), None),
+            Some(TransportFailure::HttpStatus(503))
+        );
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::HttpStatus, Some(401), None),
+            Some(TransportFailure::HttpStatus(401))
+        );
+        assert!(!failure_style_is_eligible(
+            ApiCallErrorCode::HttpStatus,
+            Some(401),
+            None
+        ));
+        assert!(failure_style_is_eligible(
+            ApiCallErrorCode::HttpStatus,
+            Some(504),
+            None
+        ));
+        // Anything the bridge cannot classify stays on the no-fallback side.
+        assert_eq!(
+            transport_failure_of(
+                ApiCallErrorCode::Transport,
+                None,
+                Some("unclassified_transport")
+            ),
+            Some(TransportFailure::UnclassifiedTransport)
+        );
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::Transport, None, None),
+            Some(TransportFailure::UnclassifiedTransport)
+        );
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::Transport, None, Some("something_new")),
+            Some(TransportFailure::UnclassifiedTransport)
+        );
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::InvalidResponse, None, None),
+            Some(TransportFailure::InvalidResponse)
+        );
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::InvalidInput, None, None),
+            Some(TransportFailure::InvalidInput)
+        );
+        // A status failure that observed no status, and every refusal that
+        // happened before a request went out, has nothing to bridge.
+        assert_eq!(
+            transport_failure_of(ApiCallErrorCode::HttpStatus, None, None),
+            None
+        );
+        for code in [
+            ApiCallErrorCode::UnknownProfile,
+            ApiCallErrorCode::WrongKind,
+            ApiCallErrorCode::MissingCredentials,
+            ApiCallErrorCode::IdentityMismatch,
+            ApiCallErrorCode::DimensionMismatch,
+            ApiCallErrorCode::Cancelled,
+            ApiCallErrorCode::UnsupportedProbe,
+        ] {
+            assert_eq!(transport_failure_of(code, None, None), None, "{code:?}");
+        }
+    }
+
+    /// The admission rule applied straight to the three bounded fields, so the
+    /// status cases above are checked without constructing an `ApiCallFailure`.
+    fn failure_style_is_eligible(
+        code: ApiCallErrorCode,
+        http_status: Option<u16>,
+        transport_code: Option<&str>,
+    ) -> bool {
+        transport_failure_of(code, http_status, transport_code).is_some_and(allows_cloud_fallback)
     }
 }

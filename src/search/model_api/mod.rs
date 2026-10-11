@@ -22,6 +22,10 @@
 //!   provenance record binds to say *how* a service was called, kept apart from
 //!   the representation identity that says which vectors may meet.
 //! * [`routing`] — the single cloud-fallback admission rule.
+//! * [`primary_embedding`] — the primary-endpoint embedding driver the DB vector
+//!   catch-up loop consumes: one fresh probe (its own POSTs, counted apart from
+//!   document batches), a `max_batch`-split document embed with per-request call
+//!   evidence, and the typed cloud-eligibility answer.
 //! * [`client`] — [`ApiClient`], the blocking client that ties a frozen
 //!   configuration, the transport and the routing rule together.
 //! * [`runtime`] — the edge a command uses: the configuration file, the process
@@ -38,6 +42,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod primary_embedding;
 pub mod protocol;
 pub mod routing;
 pub mod runtime;
@@ -62,8 +67,13 @@ pub use identity::{
     IdentityError, IdentityErrorCode, REPRESENTATION_DOMAIN, REPRESENTATION_RECORD_VERSION,
     RepresentationDescriptor, RepresentationRecord,
 };
+pub use primary_embedding::{
+    API_PROBE_SENTINELS, EmbeddingCallEvidence, ModelApiBackfillReport, PrimaryEmbedFailure,
+    PrimaryEmbeddingCall, ProbeMeasurement,
+};
 pub use protocol::{EmbeddingReply, InputKind, ObservedIdentity, RerankReply, Usage};
 pub use routing::{allows_cloud_fallback, fallback_target};
 pub use runtime::{
-    CHECK_SCHEMA, EnvCredentialResolver, LIST_SCHEMA, ProfileListing, RuntimeError, RuntimeErrorKind,
+    CHECK_SCHEMA, EnvCredentialResolver, LIST_SCHEMA, ProfileListing, RuntimeError,
+    RuntimeErrorKind,
 };
