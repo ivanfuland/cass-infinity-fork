@@ -17,6 +17,10 @@
 //! * [`identity`] — the versioned representation descriptor and the record that
 //!   pins one to an embedding generation, still pure: a codec, with no
 //!   database, no file and no caller.
+//! * [`call_identity`] — the call-configuration digest of one endpoint and the
+//!   digest of one rerank route, still pure: what a rerank window or a
+//!   provenance record binds to say *how* a service was called, kept apart from
+//!   the representation identity that says which vectors may meet.
 //! * [`routing`] — the single cloud-fallback admission rule.
 //! * [`client`] — [`ApiClient`], the blocking client that ties a frozen
 //!   configuration, the transport and the routing rule together.
@@ -29,6 +33,7 @@
 //! never deploys or starts a service. [`runtime`] is its only production
 //! caller, and it only loads a configuration the operator named.
 
+pub mod call_identity;
 pub mod client;
 pub mod config;
 pub mod error;
@@ -40,6 +45,10 @@ pub mod runtime;
 #[cfg(test)]
 pub mod test_support;
 
+pub use call_identity::{
+    CALL_CONFIG_DOMAIN, CALL_CONFIG_VERSION, EndpointConfigIdentity, RERANK_ROUTE_DOMAIN,
+    RERANK_ROUTE_VERSION, RerankRouteIdentity,
+};
 pub use client::{
     ApiAttempt, ApiCallFailure, ApiClient, AttemptStage, CredentialResolver, EmbedOutcome,
     ProbeOutcome, RequestedIdentity, RerankOptions, RerankOutcome,
