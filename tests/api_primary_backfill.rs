@@ -2646,3 +2646,31 @@ fn an_activation_guard_blocks_the_switch_when_the_record_goes_bad_late() {
         "the activation transaction must not have handed itself a passing status"
     );
 }
+
+#[test]
+fn api_query_reopens_generation_and_uses_query_prefix() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &["a sufficiently long synthetic document for API query validation"]);
+    let stub = Stub::start(healthy_responder(8, 0));
+    let config = data_dir.join("models.toml");
+    fs::write(&config, config_text("local8", &embedding_profile_block(
+        "local8", &stub.endpoint(), EMBED_MODEL, EMBED_REVISION, 64,
+        "query_prefix = \"QUERY: \"",
+    ))).unwrap();
+    assert_success(&run_backfill(&data_dir, &config, None, &[]));
+    let before = stub.requests().len();
+    let out = cass(&["search", "synthetic query", "--mode", "semantic", "--json",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap(),
+        "--embedding-profile", "local8"], &[]);
+    assert_success(&out);
+    let requests = stub.requests();
+    assert_eq!(requests.len(), before + 1, "query sends no probe");
+    assert_eq!(requests[before].inputs(), vec!["QUERY: synthetic query".to_string()]);
+    // Same width does not permit a model change against the old generation.
+    let changed = fs::read_to_string(&config).unwrap().replace(EMBED_MODEL, "example/different-model");
+    fs::write(&config, changed).unwrap();
+    let denied = cass(&["search", "synthetic query", "--mode", "semantic", "--json",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()], &[]);
+    assert!(!denied.status.success());
+    assert_eq!(stub.requests().len(), before + 1, "identity refusal precedes private query HTTP");
+}

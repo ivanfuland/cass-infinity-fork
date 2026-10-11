@@ -130,6 +130,7 @@ impl RegressionSearchRun {
             *rrf_limit as usize,
             None,
             &crate::SemanticSearchOptions {
+                    api: crate::ApiSearchOptions::default(),
                 model: (*search_mode != SearchMode::Lexical).then(|| "bge-m3".into()),
                 rerank: rerank.is_some(),
                 reranker: None,

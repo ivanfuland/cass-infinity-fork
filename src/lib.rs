@@ -519,6 +519,12 @@ pub enum Commands {
         /// cloud backend.
         #[arg(long, value_enum)]
         rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
+        /// Embedding API profile; defaults to the configured default_embedding.
+        #[arg(long)]
+        embedding_profile: Option<String>,
+        /// Disable the explicitly configured cloud fallback for this request.
+        #[arg(long)]
+        no_model_fallback: bool,
         /// Offset for pagination (start at Nth result)
         #[arg(long, default_value_t = 0)]
         offset: usize,
@@ -7271,6 +7277,8 @@ async fn execute_cli(
                     sessions_from,
                     mode,
                     vector_search_mode,
+                    embedding_profile,
+                    no_model_fallback,
                     model,
                     rerank,
                     reranker,
@@ -7382,13 +7390,19 @@ async fn execute_cli(
                         refresh_index_inline(cli.db.clone(), data_dir.clone());
                     }
 
-                    let semantic_opts = semantic_search_options_from_defaults(
+                    let mut semantic_opts = semantic_search_options_from_defaults(
                         model.clone(),
                         rerank,
                         reranker.clone(),
                         daemon && !no_daemon,
                         &defaults,
                     );
+
+                    semantic_opts.api = ApiSearchOptions {
+                        config_path: cli.api_config.clone(),
+                        embedding_profile,
+                        no_model_fallback,
+                    };
 
                     // Only pass through robot_format when it was explicitly
                     // requested (CLI flag or env var). Returning `None` here
@@ -22626,12 +22640,21 @@ pub struct TimeFilter {
     pub until: Option<i64>,
 }
 
+/// Explicit API selections for a search command.
+#[derive(Debug, Clone, Default)]
+pub struct ApiSearchOptions {
+    pub config_path: Option<PathBuf>,
+    pub embedding_profile: Option<String>,
+    pub no_model_fallback: bool,
+}
+
 /// Semantic search options from CLI flags (bd-3bbv)
 ///
 /// These options control model selection, reranking, and daemon usage
 /// for semantic search operations.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticSearchOptions {
+    pub api: ApiSearchOptions,
     /// Embedding model to use (overrides config/default)
     pub model: Option<String>,
     /// Enable reranking of results
@@ -23538,6 +23561,7 @@ fn semantic_search_options_from_defaults(
     defaults: &SearchWindowDefaults,
 ) -> SemanticSearchOptions {
     SemanticSearchOptions {
+        api: ApiSearchOptions::default(),
         model,
         rerank,
         reranker,
@@ -25636,6 +25660,30 @@ fn run_cli_search(
         mode_meta.requested,
         SearchMode::Semantic | SearchMode::Hybrid
     ) {
+        let api_selected = semantic_opts.api.config_path.is_some()
+            || semantic_opts.api.embedding_profile.is_some()
+            || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
+        if api_selected {
+            reject_retired_model_env()?;
+            if semantic_opts.model.is_some() || semantic_opts.use_daemon {
+                return Err(model_api_migration_error(
+                    "legacy model or daemon selection cannot be used with API profiles".into(),
+                    "Use --embedding-profile with --api-config".into()));
+            }
+            let config = crate::search::model_api::runtime::load_config(
+                semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
+                .map_err(model_api_runtime_error)?;
+            let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
+            let api_client = Arc::new(crate::search::model_api::ApiClient::new(
+                config, Box::new(crate::search::model_api::EnvCredentialResolver)));
+            client.set_api_semantic_context(api_client, profile, !semantic_opts.api.no_model_fallback)
+                .map_err(|_| CliError {
+                    code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message: "API generation identity is unavailable or incompatible".into(),
+                    hint: Some("Build and audit a generation with the selected API profile".into()),
+                    retryable: false,
+                })?;
+        } else {
         use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
         // Use embedder registry for model selection (bd-2mbe)
@@ -25790,6 +25838,8 @@ fn run_cli_search(
                 });
             }
         }
+    }
+
     }
 
     // P09: read the index fingerprint once the first-lookup setup (self-heal
@@ -108167,6 +108217,7 @@ mod regression_search_orchestration_tests {
             Some(crate::search::query::SearchMode::Lexical),
             None,
             SemanticSearchOptions {
+                api: ApiSearchOptions::default(),
                 model: None,
                 rerank,
                 reranker: None,

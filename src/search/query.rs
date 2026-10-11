@@ -2180,6 +2180,7 @@ impl QueryCache {
 }
 
 struct SemanticSearchState {
+    api_binding: Option<crate::search::model_api::query_embedding::QueryGenerationBinding>,
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
     roles: Option<HashSet<u8>>,
@@ -2188,6 +2189,7 @@ struct SemanticSearchState {
 
 #[derive(Clone)]
 struct SemanticCandidateContext {
+    api_binding: Option<crate::search::model_api::query_embedding::QueryGenerationBinding>,
     roles: Option<HashSet<u8>>,
 }
 
@@ -3632,6 +3634,34 @@ impl SearchClient {
         embedder: Arc<dyn Embedder>,
         roles: Option<HashSet<u8>>,
     ) -> Result<()> {
+        self.set_bound_semantic_context(embedder, roles, None)
+    }
+
+    pub fn set_api_semantic_context(
+        &self,
+        client: Arc<crate::search::model_api::ApiClient>,
+        profile: crate::search::model_api::ValidatedProfile,
+        allow_fallback: bool,
+    ) -> Result<()> {
+        use crate::search::model_api::query_embedding::{ApiQueryEmbedder, QueryGenerationBinding};
+        let binding = {
+            let guard = self.sqlite_guard()?;
+            let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
+            conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+                QueryGenerationBinding::open(tx, profile)
+            })?
+        };
+        let embedder = ApiQueryEmbedder::new(client, binding.clone(), allow_fallback)?;
+        self.set_bound_semantic_context(Arc::new(embedder),
+            Some(HashSet::from([ROLE_USER, crate::search::vector_index::ROLE_ASSISTANT])), Some(binding))
+    }
+
+    fn set_bound_semantic_context(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        roles: Option<HashSet<u8>>,
+        api_binding: Option<crate::search::model_api::query_embedding::QueryGenerationBinding>,
+    ) -> Result<()> {
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let context_token = Arc::new(());
         let embedder_id = embedder.id().to_string();
@@ -3640,6 +3670,7 @@ impl SearchClient {
             .lock()
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
         *state_guard = Some(SemanticSearchState {
+            api_binding,
             context_token,
             embedder,
             roles,
@@ -3669,7 +3700,7 @@ impl SearchClient {
 
     fn semantic_query_embedding(&self, canonical: &str) -> Result<SemanticQueryEmbedding> {
         loop {
-            let (embedder, context_token) = {
+            let (embedder, context_token, api_binding, cached) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -3677,20 +3708,20 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
-                if let Some(hit) = state
-                    .query_cache
-                    .get_cached(state.embedder.as_ref(), canonical)
-                {
-                    return Ok(SemanticQueryEmbedding {
-                        context_token: Arc::clone(&state.context_token),
-                        vector: hit,
-                    });
-                }
-                (
-                    Arc::clone(&state.embedder),
-                    Arc::clone(&state.context_token),
-                )
+                let cached = state.query_cache.get_cached(state.embedder.as_ref(), canonical);
+                (Arc::clone(&state.embedder), Arc::clone(&state.context_token),
+                    state.api_binding.clone(), cached)
             };
+            if let Some(binding) = api_binding {
+                let guard = self.sqlite_guard()?;
+                let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
+                conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+                    binding.verify_active(tx)
+                })?;
+            }
+            if let Some(vector) = cached {
+                return Ok(SemanticQueryEmbedding { context_token, vector });
+            }
 
             let embedding = embedder
                 .embed_sync(canonical)
@@ -4038,7 +4069,7 @@ impl SearchClient {
         strategy: VectorSearchMode,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
-            fetch_limit, database_path, strategy, None)
+            fetch_limit, database_path, strategy, None, None)
     }
 
     fn search_db_vector_domain_with_context(
@@ -4050,6 +4081,7 @@ impl SearchClient {
         database_path: Option<&Path>,
         strategy: VectorSearchMode,
         regression: Option<&super::regression_io::RegressionIoContext>,
+        api_binding: Option<&crate::search::model_api::query_embedding::QueryGenerationBinding>,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         // R1-W3-B6/N1/B9 (inherited from the retired v4 path, still true
         // of this vec0 build): sqlite-vec's vec0 KNN implementation hard-
@@ -4089,6 +4121,10 @@ impl SearchClient {
                     ),
                 });
             };
+
+            if let Some(binding) = api_binding {
+                binding.verify(tx, generation_id)?;
+            }
 
             let row_count: i64 = tx.query_row_map(
                 "SELECT count(*) FROM message_chunks WHERE generation_id = ?1",
@@ -4504,6 +4540,15 @@ impl SearchClient {
         filters: &SearchFilters,
         request: SemanticCandidateSearchRequest,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        if let Some(binding) = &context.api_binding {
+            let guard = self.sqlite_guard()?;
+            let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
+            return Self::search_db_vector_domain_with_context(
+                conn, embedding, filters, context.roles.as_ref(), request.fetch_limit,
+                self.sqlite_path.as_deref(), self.vector_search_mode,
+                self.regression.as_deref(), Some(binding),
+            );
+        }
         self.search_vector_candidates(embedding, filters, context.roles.as_ref(), request.fetch_limit)
     }
 
@@ -4523,7 +4568,7 @@ impl SearchClient {
         if let Some(context) = &self.regression { context.verify_input()?; }
         let result = if let Some(context) = self.regression.as_deref() {
             Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
-                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode, Some(context))
+                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode, Some(context), None)
         } else if self.vector_search_mode == VectorSearchMode::Exact {
             Self::search_db_vector_domain(conn, embedding, filters, default_roles, fetch_limit)
         } else {
@@ -4617,6 +4662,7 @@ impl SearchClient {
                     })?;
                     (
                         SemanticCandidateContext {
+                            api_binding: state.api_binding.clone(),
                             roles: state.roles.clone(),
                         },
                         Arc::clone(&state.context_token),

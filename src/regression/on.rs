@@ -126,6 +126,7 @@ fn score_question(
             .ok_or_else(|| anyhow::anyhow!("AGGREGATE_INPUT_MISSING"))?,
     };
     let semantic = crate::SemanticSearchOptions {
+                    api: crate::ApiSearchOptions::default(),
         model: (run.mode != SearchMode::Lexical).then(|| "bge-m3".into()),
         rerank: true,
         reranker: None,

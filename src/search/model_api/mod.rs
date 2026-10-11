@@ -44,6 +44,7 @@ pub mod error;
 pub mod identity;
 pub mod primary_embedding;
 pub mod protocol;
+pub mod query_embedding;
 pub mod routing;
 pub mod runtime;
 

@@ -135,6 +135,7 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
                 Some(*mode),
                 *vector_search_mode,
                 crate::SemanticSearchOptions {
+                    api: crate::ApiSearchOptions::default(),
                     model: (*mode != super::query::SearchMode::Lexical).then(|| "bge-m3".into()),
                     rerank: *rerank,
                     reranker: None,
