@@ -34,6 +34,12 @@
 //! same as calling it corrupt, so its bytes are left exactly as they were on
 //! disk for the successor ticket that will learn to read them.
 //!
+//! "Refused, not interpreted" is taken literally: the compatibility-evidence
+//! header is never parsed into a value at all. A legal header may contain a
+//! number no `f64` holds (`1e400`, a 400-digit integer) or any other structure
+//! this build has no business reading, and none of that makes the source record
+//! malformed.
+//!
 //! ## Why the rejection codes are closed
 //!
 //! Every rejection here carries a short, closed code and, at most, the
@@ -310,15 +316,16 @@ impl From<ApiGenerationError> for StorageError {
 /// compatibility fields are null; a later ticket extends the reader, and this
 /// constructor does not fabricate them.
 ///
-/// The header is deliberately an opaque JSON value, not a string: the spec calls
-/// it the complete secret-free header of a versioned evidence document, which is
-/// structured data this ticket has no license to freeze into one shape. Whether
-/// a header is *well-formed* is settled by JSON itself; whether the evidence it
-/// heads may be admitted is a successor's decision, so anything present here is
-/// carried faithfully and refused as pending admission.
+/// The header is deliberately *presence only*, not a parsed value: the spec calls
+/// it the complete secret-free header of a versioned evidence document, and this
+/// ticket has no license to interpret it — not even enough to hold its numbers.
+/// A header that is well-formed JSON but contains `1e400`, or an integer wider
+/// than `f64`, is still a header, and calling the record corrupt over it would be
+/// wrong. So the decoder records that a header is there and materializes none of
+/// it; whether the evidence it heads may be admitted is a successor's decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiGenerationContributor {
-    compatibility_evidence_header: Option<serde_json::Value>,
+    compatibility_evidence_header: Option<HeaderPresent>,
     compatibility_evidence_sha256: Option<String>,
     document_prefix: String,
     endpoint_config_sha256: String,
@@ -355,14 +362,15 @@ impl ApiGenerationContributor {
         })
     }
 
-    /// The cross-endpoint compatibility-evidence header, when this contributor
-    /// carries one. Always `None` in version 1.
+    /// Whether this contributor carries a cross-endpoint compatibility-evidence
+    /// header. Always `false` in version 1.
     ///
-    /// The value is the header exactly as it was stored; nothing here
-    /// re-serializes it, checks its interior or turns it into a placeholder. Its
-    /// presence alone is what makes the contributor pending admission.
-    pub fn compatibility_evidence_header(&self) -> Option<&serde_json::Value> {
-        self.compatibility_evidence_header.as_ref()
+    /// A read-only predicate, never a flag a caller may set: nothing here can
+    /// make a contributor admissible. The header itself is not materialized —
+    /// see the type's own documentation — so there is no value to hand out, and
+    /// a record that carries one is refused as pending admission.
+    pub const fn has_compatibility_evidence_header(&self) -> bool {
+        self.compatibility_evidence_header.is_some()
     }
 
     /// The cross-endpoint compatibility-evidence digest, when this contributor
@@ -414,7 +422,11 @@ impl ApiGenerationContributor {
 
     fn wire(&self) -> ContributorWire<'_> {
         ContributorWire {
-            compatibility_evidence_header: self.compatibility_evidence_header.as_ref(),
+            // Always null: `canonical_bytes` refuses to encode a record that
+            // carries a header, so this encoder only ever runs on a
+            // pure-primary record. The stored bytes of anything else are never
+            // rewritten from here.
+            compatibility_evidence_header: None,
             compatibility_evidence_sha256: self.compatibility_evidence_sha256.as_deref(),
             document_prefix: &self.document_prefix,
             endpoint_config_sha256: &self.endpoint_config_sha256,
@@ -502,16 +514,30 @@ impl ApiGenerationProvenance {
 
     /// The canonical bytes: one compact JSON object, ASCII-ordered, no newline.
     ///
-    /// Serializing these field types into a byte buffer cannot fail, so the
-    /// empty fallback is unreachable and exists only to keep an `unwrap` out of
-    /// the encoding path.
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(&self.wire()).unwrap_or_default()
+    /// Refuses when a contributor carries a compatibility-evidence header. This
+    /// build does not materialize that header, so encoding the record would
+    /// silently drop it — and dropping evidence is exactly what must not happen
+    /// to a record read from storage. A record that carries one is read,
+    /// classified and left alone; its bytes are never rewritten from here.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ApiGenerationError> {
+        if self
+            .contributors
+            .iter()
+            .any(ApiGenerationContributor::has_compatibility_evidence_header)
+        {
+            return Err(ApiGenerationError::at(
+                ApiGenerationErrorCode::CompatibilityRequired,
+                "compatibility_evidence_header",
+            ));
+        }
+        serde_json::to_vec(&self.wire()).map_err(|_| {
+            ApiGenerationError::at(ApiGenerationErrorCode::InvalidRecord, "canonical_bytes")
+        })
     }
 
     /// The lowercase SHA-256 of [`Self::canonical_bytes`].
-    pub fn sha256(&self) -> String {
-        hex::encode(Sha256::digest(self.canonical_bytes()))
+    pub fn sha256(&self) -> Result<String, ApiGenerationError> {
+        Ok(hex::encode(Sha256::digest(self.canonical_bytes()?)))
     }
 
     /// Parse one provenance record from its canonical bytes.
@@ -650,13 +676,12 @@ impl ApiGenerationContributor {
 
 /// The contributor exactly as it is written, in canonical key order.
 ///
-/// The header is written straight through, so a contributor that carries one
-/// re-encodes with it intact rather than with a substituted placeholder. Only
-/// the pure-primary writer exists in this version, and it writes an explicit
-/// null.
+/// The header is always written as an explicit null: only the pure-primary
+/// writer exists in this version, and `canonical_bytes` refuses any record that
+/// carries a header rather than re-encoding it without one.
 #[derive(Serialize)]
 struct ContributorWire<'a> {
-    compatibility_evidence_header: Option<&'a serde_json::Value>,
+    compatibility_evidence_header: Option<&'a str>,
     compatibility_evidence_sha256: Option<&'a str>,
     document_prefix: &'a str,
     endpoint_config_sha256: &'a str,
@@ -677,14 +702,36 @@ struct ProvenanceWire<'a> {
     version: i64,
 }
 
+/// The bare fact that a contributor carries a compatibility-evidence header.
+///
+/// "This version may not interpret the header" has to include "may not parse its
+/// numbers": `{"future_value": 1e400}` is legal JSON that no `f64` can hold, so
+/// decoding it into a `serde_json::Value` would fail and report a perfectly
+/// well-formed source record as corrupt. Instead the value is skipped at the
+/// lexer level, which validates the JSON *structure* — brackets, commas, escapes,
+/// terminators — without converting any number into anything. Nothing of the
+/// header is materialized, so nothing of it can be rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeaderPresent;
+
+impl<'de> Deserialize<'de> for HeaderPresent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(HeaderPresent)
+    }
+}
+
 /// A contributor's keys before any rule beyond structure is applied.
 ///
 /// The two compatibility fields are tracked as `Option<Option<_>>` so "absent"
 /// and "present and null" stay different facts. The header's inner type is
-/// `serde_json::Value` on purpose: any legal JSON document is a well-formed
-/// header, and only its *presence* is this version's business.
+/// [`HeaderPresent`] on purpose: a legal JSON header may contain a number no
+/// `f64` can hold, and only its *presence* is this version's business.
 struct RawContributor {
-    compatibility_evidence_header: Option<serde_json::Value>,
+    compatibility_evidence_header: Option<HeaderPresent>,
     compatibility_evidence_sha256: Option<String>,
     document_prefix: String,
     endpoint_config_sha256: String,
@@ -732,7 +779,7 @@ impl<'de> Deserialize<'de> for RawContributor {
             where
                 A: MapAccess<'de>,
             {
-                let mut compatibility_evidence_header: Option<Option<serde_json::Value>> = None;
+                let mut compatibility_evidence_header: Option<Option<HeaderPresent>> = None;
                 let mut compatibility_evidence_sha256: Option<Option<String>> = None;
                 let mut document_prefix: Option<String> = None;
                 let mut endpoint_config_sha256: Option<String> = None;
@@ -752,11 +799,13 @@ impl<'de> Deserialize<'de> for RawContributor {
                             if compatibility_evidence_header.is_some() {
                                 return Err(contributor_structural());
                             }
-                            // Any legal JSON value is a well-formed header; the
-                            // interior is opaque to this version, so the value
-                            // is carried, never interpreted or replaced.
+                            // Any legal JSON value is a well-formed header. Its
+                            // interior is opaque to this version -- including
+                            // its numbers, which may not fit an `f64` -- so the
+                            // value is skipped at the lexer level and only its
+                            // presence is kept.
                             compatibility_evidence_header = Some(
-                                map.next_value::<Option<serde_json::Value>>()
+                                map.next_value::<Option<HeaderPresent>>()
                                     .map_err(|_| contributor_structural::<A::Error>())?,
                             );
                         }
@@ -1115,7 +1164,7 @@ pub fn create_api_generation(
         generation_id,
         record.descriptor_sha256().to_string(),
     )?;
-    let provenance_text = canonical_text(provenance.canonical_bytes())?;
+    let provenance_text = canonical_text(provenance.canonical_bytes()?)?;
     write_meta(tx, &provenance.meta_key(), &provenance_text)?;
 
     Ok(generation_id)

@@ -212,6 +212,19 @@ fn tamper_first_contributor(text: &str, key: &str, new: serde_json::Value) -> St
     serde_json::to_string(&value).expect("serialize the provenance")
 }
 
+/// Replace the contributor's explicit null header with raw JSON text.
+///
+/// The text is spliced in without parsing, so a header whose numbers no `f64`
+/// can hold — `1e400`, a 400-digit integer — is exercised exactly as bytes.
+fn replace_header(provenance: &str, header_json: &str) -> String {
+    let replaced = provenance.replace(
+        "\"compatibility_evidence_header\":null",
+        &format!("\"compatibility_evidence_header\":{header_json}"),
+    );
+    assert_ne!(replaced, provenance, "the null header must be present");
+    replaced
+}
+
 /// Assert that neither rendering of `error` carries `needle`.
 fn assert_renders_without(error: &ApiGenerationError, needle: &str, label: &str) {
     for rendered in [format!("{error}"), format!("{error:?}")] {
@@ -362,7 +375,7 @@ fn a_generation_is_created_and_read_back_as_one_space() {
         let contributor = &provenance.contributors()[0];
         assert_eq!(contributor.model(), EMBED_MODEL);
         assert_eq!(contributor.model_revision(), EMBED_REVISION);
-        assert!(contributor.compatibility_evidence_header().is_none());
+        assert!(!contributor.has_compatibility_evidence_header());
         assert!(contributor.compatibility_evidence_sha256().is_none());
         assert!(contributor.provider_only().is_none());
 
@@ -925,9 +938,7 @@ fn a_structured_compatibility_header_is_pending_admission_not_corruption() {
     let decoded = ApiGenerationProvenance::decode(object_header.as_bytes())
         .expect("a structured header must still be legal JSON");
     assert!(
-        decoded.contributors()[0]
-            .compatibility_evidence_header()
-            .is_some(),
+        decoded.contributors()[0].has_compatibility_evidence_header(),
         "the header must be read as present"
     );
     assert_eq!(
@@ -995,6 +1006,113 @@ fn a_structured_compatibility_header_is_pending_admission_not_corruption() {
     );
 
     // The explicit-null control still passes, and so does the stored record.
+    set_meta(conn, &provenance_meta_key(generation_id), &provenance);
+    assert!(fixture.open(generation_id, &profile).is_ok());
+}
+
+/// A header this build cannot hold must still read as *present*, not as a
+/// corrupt record. Its numbers are part of the evidence this ticket may not
+/// interpret, so the decoder records presence and materializes nothing.
+#[test]
+fn a_header_this_build_cannot_hold_is_present_not_corruption() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let profile = profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[]);
+    let generation_id = fixture.create(&profile, 1024, b"fp-big-header");
+    let provenance = meta_value(conn, &provenance_meta_key(generation_id)).expect("provenance");
+
+    let huge_integer = "9".repeat(400);
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "a nested float that overflows f64",
+            r#"{"version":1,"nested":{"future_value":1e400}}"#.to_string(),
+        ),
+        (
+            "a nested integer larger than u64 and than f64",
+            format!(r#"{{"huge":{huge_integer}}}"#),
+        ),
+        (
+            "an integer larger than u64 but representable as f64",
+            r#"{"big":18446744073709551616}"#.to_string(),
+        ),
+        (
+            "an array holding both",
+            format!(r#"[1e400,{huge_integer},{{"ok":true}}]"#),
+        ),
+        (
+            "a plain object",
+            r#"{"version":1,"conclusion":"equivalent"}"#.to_string(),
+        ),
+        ("a string", r#""cass.api-compatibility/1""#.to_string()),
+    ];
+
+    for (label, header) in &cases {
+        let text = replace_header(&provenance, header);
+        let decoded = ApiGenerationProvenance::decode(text.as_bytes())
+            .unwrap_or_else(|error| panic!("{label} must be legal JSON, got {error}"));
+        assert!(
+            decoded.contributors()[0].has_compatibility_evidence_header(),
+            "{label} must be read as present"
+        );
+        assert_eq!(
+            decoded
+                .single_primary_contributor()
+                .expect_err("not admitted")
+                .code(),
+            ApiGenerationErrorCode::CompatibilityRequired,
+            "{label}"
+        );
+        // A record that carries evidence is never re-encoded without it.
+        assert_eq!(
+            decoded
+                .canonical_bytes()
+                .expect_err("a header this build cannot hold must not be dropped")
+                .code(),
+            ApiGenerationErrorCode::CompatibilityRequired,
+            "{label}"
+        );
+    }
+
+    // Through a real reopen the boundary is the same, and nothing changes.
+    let structured = replace_header(&provenance, r#"{"version":1,"nested":{"future_value":1e400}}"#);
+    let representation_before = meta_value(conn, &representation_meta_key(generation_id));
+    set_meta(conn, &provenance_meta_key(generation_id), &structured);
+    let error = fixture.reopen_error(generation_id, &profile);
+    assert_eq!(error.code(), ApiGenerationErrorCode::CompatibilityRequired);
+    assert_eq!(error.field(), Some("compatibility_evidence_header"));
+    assert_eq!(
+        meta_value(conn, &provenance_meta_key(generation_id)),
+        Some(structured.clone()),
+        "the refused bytes must be left exactly as they were"
+    );
+    assert_eq!(
+        meta_value(conn, &representation_meta_key(generation_id)),
+        representation_before
+    );
+    assert_eq!(count(conn, "embedding_generations"), 1);
+    assert!(fixture.open(generation_id, &profile).is_err());
+
+    // A present header cannot mask a structural defect.
+    let duplicated = replace_header(
+        &provenance.replace("\"model\":", "\"model\":\"dup\",\"model\":"),
+        r#"{"version":1}"#,
+    );
+    assert_eq!(
+        ApiGenerationProvenance::decode(duplicated.as_bytes())
+            .expect_err("a duplicated contributor key must still be refused")
+            .code(),
+        ApiGenerationErrorCode::InvalidProvenance
+    );
+
+    // Bad JSON stays a structural refusal, with or without a header.
+    assert_eq!(
+        ApiGenerationProvenance::decode(replace_header(&provenance, "{").as_bytes())
+            .expect_err("broken JSON must be refused")
+            .code(),
+        ApiGenerationErrorCode::InvalidProvenance
+    );
+
+    // The explicit null still verifies.
     set_meta(conn, &provenance_meta_key(generation_id), &provenance);
     assert!(fixture.open(generation_id, &profile).is_ok());
 }
@@ -1169,10 +1287,16 @@ fn a_hand_written_provenance_record_round_trips_to_the_gold() {
     let provenance = ApiGenerationProvenance::decode(GOLD_PROVENANCE_JSON.as_bytes())
         .expect("the gold record decodes");
     assert_eq!(
-        provenance.canonical_bytes().as_slice(),
+        provenance
+            .canonical_bytes()
+            .expect("a pure-primary record encodes")
+            .as_slice(),
         GOLD_PROVENANCE_JSON.as_bytes()
     );
-    assert_eq!(provenance.sha256(), GOLD_PROVENANCE_SHA256);
+    assert_eq!(
+        provenance.sha256().expect("a pure-primary record hashes"),
+        GOLD_PROVENANCE_SHA256
+    );
     assert_eq!(provenance.generation_id(), 7);
     assert_eq!(provenance.version(), 1);
     assert_eq!(provenance.meta_key(), "api_generation_provenance:v1:7");
@@ -1186,7 +1310,7 @@ fn a_hand_written_provenance_record_round_trips_to_the_gold() {
     assert_eq!(contributor.query_prefix(), "q:");
     assert_eq!(contributor.endpoint_config_sha256(), "1".repeat(64));
     assert!(contributor.provider_only().is_none());
-    assert!(contributor.compatibility_evidence_header().is_none());
+    assert!(!contributor.has_compatibility_evidence_header());
     assert!(contributor.compatibility_evidence_sha256().is_none());
 }
 
@@ -1201,8 +1325,14 @@ fn the_stored_records_re_encode_to_their_own_bytes() {
     let stored =
         meta_value(fixture.conn(), &provenance_meta_key(generation_id)).expect("provenance");
     let provenance = ApiGenerationProvenance::decode(stored.as_bytes()).expect("decode");
-    assert_eq!(provenance.canonical_bytes().as_slice(), stored.as_bytes());
-    assert_eq!(provenance.sha256().len(), 64);
+    assert_eq!(
+        provenance
+            .canonical_bytes()
+            .expect("a pure-primary record encodes")
+            .as_slice(),
+        stored.as_bytes()
+    );
+    assert_eq!(provenance.sha256().expect("hashes").len(), 64);
     assert_eq!(
         provenance.meta_key(),
         format!("api_generation_provenance:v1:{generation_id}")
