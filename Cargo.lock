@@ -1778,7 +1778,7 @@ dependencies = [
 [[package]]
 name = "franken-agent-detection"
 version = "0.1.10"
-source = "git+https://github.com/ivanfuland/my_franken_agent_detection?rev=2bc59a8a61f3ca34acd05fb93f88921e77e892d7#2bc59a8a61f3ca34acd05fb93f88921e77e892d7"
+source = "git+https://github.com/ivanfuland/my_franken_agent_detection?rev=61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5#61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1791,6 +1791,7 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tracing",
  "urlencoding",
