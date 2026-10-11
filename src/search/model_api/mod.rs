@@ -14,6 +14,9 @@
 //!   call-time [`ApiCallErrorCode`] set.
 //! * [`protocol`] — the four message shapes: request builders and response
 //!   validators, still pure.
+//! * [`identity`] — the versioned representation descriptor and the record that
+//!   pins one to an embedding generation, still pure: a codec, with no
+//!   database, no file and no caller.
 //! * [`routing`] — the single cloud-fallback admission rule.
 //! * [`client`] — [`ApiClient`], the blocking client that ties a frozen
 //!   configuration, the transport and the routing rule together.
@@ -25,6 +28,7 @@
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod identity;
 pub mod protocol;
 pub mod routing;
 
@@ -40,5 +44,9 @@ pub use config::{
     ProfileKind, RerankProfile, ValidatedApiConfig, ValidatedEndpoint, ValidatedProfile,
 };
 pub use error::{ApiCallError, ApiCallErrorCode, ConfigError, ConfigErrorCode};
+pub use identity::{
+    IdentityError, IdentityErrorCode, REPRESENTATION_DOMAIN, REPRESENTATION_RECORD_VERSION,
+    RepresentationDescriptor, RepresentationRecord,
+};
 pub use protocol::{EmbeddingReply, InputKind, ObservedIdentity, RerankReply, Usage};
 pub use routing::{allows_cloud_fallback, fallback_target};
