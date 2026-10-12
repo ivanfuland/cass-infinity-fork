@@ -558,6 +558,102 @@ pub(crate) mod tests {
         searchable_fixture_with_embedding(count, "synthetic-embedder", 2)
     }
 
+    /// A searchable fixture whose active vector generation is produced through
+    /// the real model-API catch-up path against the endpoint named by
+    /// `config_path`. Local inference is retired, so a semantic regression run
+    /// can only bind to a generation this path created (the API descriptor's
+    /// `embedder_id` is `api:<sha256>`, which no hand-written row can match).
+    ///
+    /// The caller must have the configured endpoint serving embeddings for both
+    /// the probe sentinels and the fixture's documents.
+    pub(crate) fn searchable_fixture_with_api_embedding(
+        count: usize,
+        config_path: &Path,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use crate::connectors::{NormalizedConversation, NormalizedMessage};
+        use crate::search::model_api::config::ProfileKind;
+        use crate::search::model_api::runtime;
+        use crate::storage::sqlite::FrankenStorage;
+        use crate::search::model_api::{ApiClient, EnvCredentialResolver, PrimaryEmbeddingCall};
+        use crate::indexer::db_vector_catchup::{probe_api_backfill, run_api_primary_catchup_backfill};
+
+        let conversation = NormalizedConversation {
+            agent_slug: "codex".into(),
+            external_id: Some("synthetic-session".into()),
+            title: Some("retrieval".into()),
+            workspace: None,
+            source_path: "synthetic.jsonl".into(),
+            started_at: Some(10),
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(20),
+                content: "Investigate retrieval ranking and compare the evidence from both runs."
+                    .into(),
+                extra: serde_json::json!({}),
+                snippets: vec![],
+                invocations: vec![],
+            }],
+        };
+        let conversations: Vec<_> = (0..count)
+            .map(|index| {
+                let mut item = conversation.clone();
+                if count > 1 {
+                    item.external_id = Some(format!("synthetic-session-{index}"));
+                    item.source_path = format!("synthetic-{index}.jsonl").into();
+                    item.messages[0]
+                        .content
+                        .push_str(&format!(" Synthetic case {index}."));
+                }
+                item
+            })
+            .collect();
+        let (root, original) =
+            super::super::query::tests::seed_conversations_for_search_client(&conversations)
+                .unwrap();
+        let input = root.path().join("input");
+        fs::create_dir(&input).unwrap();
+        let db = input.join("agent_search.db");
+        fs::rename(original, &db).unwrap();
+        let storage = FrankenStorage::open(&db).unwrap();
+        storage.rebuild_lex_domain_from_db(None).unwrap();
+
+        let config =
+            runtime::load_config(Some(config_path), |key| std::env::var_os(key)).unwrap();
+        let id = config
+            .default_profile_id(ProfileKind::Embedding)
+            .expect("config must name a default embedding profile")
+            .to_string();
+        let profile = runtime::profile_by_id(&config, &id).unwrap();
+        let client = ApiClient::new(config.clone(), Box::new(EnvCredentialResolver));
+        let call = PrimaryEmbeddingCall::new(client, profile.clone(), true).unwrap();
+        let probe = probe_api_backfill(&storage, &call)
+            .unwrap_or_else(|error| panic!("api probe for the regression fixture: {error}"));
+        run_api_primary_catchup_backfill(&storage, 64, &call, &profile, &probe, 42)
+            .unwrap_or_else(|error| panic!("api catch-up for the regression fixture: {error}"));
+
+        storage
+            .raw()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(storage);
+        let run = root.path().join("run");
+        fs::create_dir(&run).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = root.path().join("source-manifest.txt");
+        fs::write(&manifest, b"synthetic source-content manifest\n").unwrap();
+        (root, db, run, manifest)
+    }
+
     pub(crate) fn searchable_fixture_with_embedding(
         count: usize,
         embedder_id: &str,

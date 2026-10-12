@@ -566,6 +566,49 @@ query_prefix="Query: "
         (f, data, cmd)
     }
 
+    /// Like [`full_fixture_mode`], but the fixture's vector generation is built
+    /// through the frozen model API named by `config`, so a semantic or hybrid
+    /// run can bind to it. Local inference is retired.
+    pub(in crate::regression) fn api_full_fixture_mode(
+        n: u32,
+        count: usize,
+        mode: SearchMode,
+        vector: Option<crate::search::query::VectorSearchMode>,
+        config: &std::path::Path,
+    ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
+        let f = fixture("");
+        assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
+        let (data, database, _run, source_manifest) =
+            regression_binding::tests::searchable_fixture_with_api_embedding(count, config);
+        let (expected_binding, expected_binding_sha256) =
+            regression_binding::tests::prepare_expected(data.path(), &database, &source_manifest);
+        let manifest_sha = file_digest(&source_manifest).unwrap();
+        let source_producer_receipt = data.path().join("source-receipt.json");
+        let bytes = serde_json::to_vec(&json!({"schema":"cass.regression-source-receipt.v1","producer_id":"cass.pr9.verify-corpus","verification_policy":"cass.pr9.corpus-content-stable-file-v1","producer_source_sha256":digest(b"synthetic-producer"),"source_manifest_sha256":manifest_sha,"expected_file_count":5049,"checked":5049,"passed":true,"exit_code":0,"failure_count":0,"raw_evidence_sha256":digest(b"synthetic-evidence")})).unwrap();
+        fs::write(&source_producer_receipt, &bytes).unwrap();
+        let cmd = RegressionCommand::FullSearch {
+            api: crate::search::regression_input::RegressionApiOptions {
+                config_path: Some(config.to_path_buf()),
+                ..Default::default()
+            },
+            input: f.input.clone(),
+            database,
+            expected_binding,
+            expected_binding_sha256,
+            source_manifest,
+            source_producer_receipt,
+            source_producer_receipt_sha256: digest(&bytes),
+            search_mode: mode,
+            vector_search_mode: vector,
+            rrf_limit: n,
+            rerank: RerankSwitch::Off,
+            page_size: None,
+            rerank_provider: None,
+            cutoffs: vec![5, 10, 20],
+        };
+        (f, data, cmd)
+    }
+
     fn prepared(n: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionSearchRun) {
         let (f, data, cmd) = full_fixture(n, count);
         let validated = crate::regression::input::prepare_full(&cmd).unwrap();
@@ -881,6 +924,10 @@ query_prefix="Query: "
         let Ok(mode) = dotenvy::var("CASS_S2_04_SEMANTIC_CHILD") else {
             return;
         };
+        let Ok(config) = dotenvy::var("CASS_S2_04_API_CONFIG") else {
+            return;
+        };
+        let config = std::path::PathBuf::from(config);
         let mode = if mode == "semantic" {
             SearchMode::Semantic
         } else {
@@ -891,7 +938,7 @@ query_prefix="Query: "
         } else {
             crate::search::query::VectorSearchMode::Exact
         };
-        let (_f, _data, cmd) = full_fixture_mode(5, 12, mode, Some(vector));
+        let (_f, _data, cmd) = api_full_fixture_mode(5, 12, mode, Some(vector), &config);
         let result = super::run(&cmd).unwrap();
         let run_root = _f.input.output.output_root.join(&_f.input.output.run_id);
         assert_eq!(result["terminal"], "SUCCESS");
@@ -915,6 +962,29 @@ query_prefix="Query: "
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let origin = format!("http://{}", listener.local_addr().unwrap());
+                // Freeze the embedding profile the child runs under. Local
+                // inference is retired, so this explicit API config replaces the
+                // retired `CASS_INFINITY_URL` provider selection.
+                let api_config = tempfile::NamedTempFile::new().unwrap();
+                {
+                    use std::io::Write as _;
+                    write!(
+                        api_config.as_file(),
+                        "version=1\n\
+                         default_embedding=\"main\"\n\
+                         [profiles.main]\n\
+                         kind=\"embedding\"\n\
+                         protocol=\"openai-embeddings-v1\"\n\
+                         scope=\"loopback\"\n\
+                         endpoint=\"{origin}/embeddings\"\n\
+                         model=\"BAAI/bge-m3\"\n\
+                         model_revision=\"fixture-r1\"\n\
+                         normalization=\"l2\"\n\
+                         expected_dimension=1024\n"
+                    )
+                    .unwrap();
+                }
+                let api_config = api_config.into_temp_path();
                 let stop = Arc::new(AtomicBool::new(false));
                 let done = stop.clone();
                 let worker = std::thread::spawn(move || {
@@ -979,8 +1049,7 @@ query_prefix="Query: "
                     ])
                     .env("CASS_S2_04_SEMANTIC_CHILD", mode)
                     .env("CASS_S2_04_VECTOR_CHILD", vector_mode)
-                    .env("CASS_INFINITY_URL", &origin)
-                    .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+                    .env("CASS_S2_04_API_CONFIG", &api_config)
                     .env("NO_PROXY", "127.0.0.1,localhost")
                     .env("no_proxy", "127.0.0.1,localhost")
                     .output()
@@ -989,8 +1058,9 @@ query_prefix="Query: "
                 let paths = worker.join().unwrap();
                 assert!(
                     output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stdout)
+                    "child stdout:\n{}\nchild stderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(!paths.is_empty());
                 assert!(paths.iter().all(|p| p == "/embeddings"));
