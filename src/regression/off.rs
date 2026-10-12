@@ -1373,45 +1373,25 @@ query_prefix="Query: "
                 } else {
                     SearchMode::Hybrid
                 };
-                // The generation must be built against a healthy endpoint (the
-                // API catch-up really embeds), while the search itself runs
-                // against the faulty one the parent started.
-                let search_config = PathBuf::from(
-                    dotenvy::var("CASS_S2_04_API_CONFIG").expect("parent must pass the search config"),
+                // One endpoint throughout: the parent's service answers healthy
+                // embeddings until this child signals that the generation is
+                // built, then switches to the fault. endpoint / profile /
+                // descriptor never change.
+                let config = PathBuf::from(
+                    dotenvy::var("CASS_S2_04_API_CONFIG").expect("parent must pass the api config"),
                 );
-                let healthy = crate::search::model_api::test_support::HttpFixture::start(
-                    (0..32)
-                        .map(|_| crate::search::model_api::test_support::Reply::Embeddings(1024))
-                        .collect(),
-                );
-                let build_config = tempfile::NamedTempFile::new().unwrap();
-                {
-                    use std::io::Write as _;
-                    write!(
-                        build_config.as_file(),
-                        "version=1\n\
-                         default_embedding=\"main\"\n\
-                         [profiles.main]\n\
-                         kind=\"embedding\"\n\
-                         protocol=\"openai-embeddings-v1\"\n\
-                         scope=\"loopback\"\n\
-                         endpoint=\"{}/embeddings\"\n\
-                         model=\"BAAI/bge-m3\"\n\
-                         model_revision=\"fixture-r1\"\n\
-                         normalization=\"l2\"\n\
-                         expected_dimension=1024\n",
-                        healthy.base()
-                    )
-                    .unwrap();
-                }
                 let (f, _data, command) = api_full_fixture_mode(
                     5,
                     12,
                     mode,
                     Some(crate::search::query::VectorSearchMode::Exact),
-                    &search_config,
-                    build_config.path(),
+                    &config,
+                    &config,
                 );
+                let marker = PathBuf::from(
+                    dotenvy::var("CASS_S2_04_BUILD_DONE").expect("parent must pass the build marker"),
+                );
+                std::fs::write(&marker, b"built").expect("signal build completion");
                 let error = full_cli(&command).unwrap_err();
                 assert_eq!(error.code, 2);
                 let root = f.input.output.output_root.join(&f.input.output.run_id);
@@ -1474,6 +1454,11 @@ query_prefix="Query: "
                     .unwrap();
                 }
                 let failure_api_config = failure_api_config.into_temp_path();
+                // The marker is absent until the child finishes building the
+                // generation; the service answers healthy embeddings until then.
+                let marker_dir = tempfile::tempdir().unwrap();
+                let build_done_path = marker_dir.path().join("built");
+                let build_done_watch = build_done_path.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let done = stop.clone();
                 let worker = std::thread::spawn(move || {
@@ -1523,6 +1508,14 @@ query_prefix="Query: "
                                 }
                             }
                         }
+                        if !build_done_watch.exists() {
+                            let inputs = body["input"].as_array().unwrap();
+                            let mut embedding = vec![0.0; 1024];
+                            embedding[0] = 1.0;
+                            let body = serde_json::json!({"data": inputs.iter().enumerate().map(|(i,_)| json!({"index":i,"embedding":embedding})).collect::<Vec<_>>()}).to_string();
+                            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                            continue;
+                        }
                         if fault == "disconnect" {
                             drop(stream);
                             continue;
@@ -1556,6 +1549,7 @@ query_prefix="Query: "
                     .env("CASS_S2_04_FAILURE_CHILD", mode)
                     .env("CASS_S2_04_FAILURE_EVIDENCE", &case)
                     .env("CASS_S2_04_API_CONFIG", &failure_api_config)
+                    .env("CASS_S2_04_BUILD_DONE", &build_done_path)
                     .env("NO_PROXY", "127.0.0.1,localhost")
                     .env("no_proxy", "127.0.0.1,localhost")
                     .output()
