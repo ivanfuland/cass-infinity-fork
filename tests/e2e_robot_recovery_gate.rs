@@ -312,6 +312,30 @@ fn recovery_command(home: &Path, args: &[String]) -> Command {
         .env("NO_COLOR", "1")
         .env_remove("CODEX_HOME")
         .env_remove("CLAUDE_CONFIG_DIR");
+    if args.first().map(String::as_str) == Some("search") {
+        // Reach the search surface's existing missing-index/data checks under
+        // the API-only contract. Do not replace them with a configuration error.
+        // The isolated data directory has no index, so no model call is needed.
+        let config = home.join("recovery-models.toml");
+        std::fs::write(
+            &config,
+            r#"version = 1
+default_embedding = "recovery-fixture"
+[profiles.recovery-fixture]
+kind = "embedding"
+protocol = "openai-embeddings-v1"
+endpoint = "http://127.0.0.1:1/v1/embeddings"
+scope = "loopback"
+model = "synthetic/recovery-embedding"
+model_revision = "fixture-v1"
+normalization = "l2"
+expected_dimension = 8
+"#,
+        )
+        .expect("write isolated recovery model configuration");
+        cmd.env_remove("CASS_SEMANTIC_EMBEDDER")
+            .env("CASS_API_CONFIG", config);
+    }
     cmd
 }
 
@@ -442,8 +466,13 @@ fn check_error_envelope(value: &Value, kinds: &[&str], code: i32) -> Result<(), 
     if message.trim().is_empty() {
         return Err("error envelope `message` is empty".to_string());
     }
-    if !is_kebab_kind(kind) {
-        return Err(format!("error `kind` {kind:?} is not kebab-case"));
+    // API model errors have canonical names that predate this gate's migration.
+    // Keep the legacy spelling check and admit only the two declared API kinds;
+    // the per-surface stable set below still controls which errors are valid.
+    if !is_kebab_kind(kind)
+        && !matches!(kind, "ModelApiConfiguration" | "ModelApiMigration")
+    {
+        return Err(format!("error `kind` {kind:?} has no recognized contract spelling"));
     }
     if !kinds.contains(&kind) {
         return Err(format!(
@@ -941,4 +970,24 @@ fn sources_doctor_dispatches_to_sources_not_the_agent_handbook() -> Result<(), S
         );
     }
     Ok(())
+}
+
+
+#[test]
+fn model_api_error_names_preserve_surface_and_envelope_guards() {
+    let envelope = |kind: &str| serde_json::json!({"error": {
+        "code": 2, "kind": kind, "message": "synthetic configuration refusal", "retryable": false
+    }});
+    for kind in ["ModelApiConfiguration", "ModelApiMigration"] {
+        let value = envelope(kind);
+        assert!(check_error_envelope(&value, &[kind], 2).is_ok());
+        assert!(check_error_envelope(&value, &["missing-index"], 2).is_err());
+        assert!(check_error_envelope(&value, &[kind], 1).is_err());
+        let mut malformed = value.clone();
+        malformed["error"].as_object_mut().unwrap().remove("retryable");
+        assert!(check_error_envelope(&malformed, &[kind], 2).is_err());
+    }
+    // A caller-supplied stable set cannot admit arbitrary new wire spellings.
+    assert!(check_error_envelope(&envelope("UnexpectedKind"), &["UnexpectedKind"], 2).is_err());
+    assert!(check_error_envelope(&envelope("db-open"), &["db-open"], 2).is_ok());
 }
