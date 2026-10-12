@@ -12913,23 +12913,22 @@ impl CassApp {
 
         let lines = vec![
             ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Semantic/Hybrid mode needs a local embedding model download.".to_string(),
+                "Semantic/Hybrid mode needs a configured embedding API profile.".to_string(),
                 text_style,
             )]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[D]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Download model (recommended)".to_string(), text_style),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[H]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(
-                    " Use hash fallback (no download)".to_string(),
-                    text_style,
-                ),
-            ]),
+            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                "Local model downloads and the hash fallback are retired.".to_string(),
+                muted_style,
+            )]),
+            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
+                "Configure an API profile (--api-config) and use `models check` / \
+                 `models backfill`."
+                    .to_string(),
+                muted_style,
+            )]),
             ftui::text::Line::from_spans(vec![
                 ftui::text::Span::styled("[Esc]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Cancel for now".to_string(), muted_style),
+                ftui::text::Span::styled(" Close".to_string(), muted_style),
             ]),
         ];
         Paragraph::new(ftui::text::Text::from_lines(lines))

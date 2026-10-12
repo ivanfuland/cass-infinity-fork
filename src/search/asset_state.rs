@@ -2713,11 +2713,11 @@ mod tests {
     #[test]
     fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
         let data_dir = Path::new("/tmp/cass");
-        // `active_policy_model_dir` -> `model_identity::canonical_name` yields
-        // the on-disk MiniLM cache directory for the default-model preference;
-        // the local HTTP engine's names have no cache directory and return
-        // `None`.
-        let default_model_dir = Some(model_identity::default_model_dir(data_dir));
+        // `active_policy_model_dir` resolves the policy default embedder name
+        // through `model_identity::canonical_name`. The default is the DB
+        // vector domain's routing name, which is not a canonical local model,
+        // so there is no on-disk cache directory to project.
+        let default_model_dir = None;
         let cases = [
             (SemanticPreference::DefaultModel, "fastembed", default_model_dir),
             (SemanticPreference::HashFallback, "hash", None),
