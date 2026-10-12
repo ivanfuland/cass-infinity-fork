@@ -57678,17 +57678,301 @@
                             "properties": {
                               "type": "object",
                               "properties": {
+                                "model_api": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "primary_profile": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "pattern": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "realized_profile": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "pattern": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "fallback_used": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "fallback_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "attempts": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "items": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                },
+                                                "properties": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "profile": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "string"
+                                                        },
+                                                        "pattern": {
+                                                          "type": "string"
+                                                        }
+                                                      }
+                                                    },
+                                                    "network_attempted": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "string"
+                                                        }
+                                                      }
+                                                    },
+                                                    "http_status": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "minimum": {
+                                                          "type": "integer"
+                                                        },
+                                                        "maximum": {
+                                                          "type": "integer"
+                                                        }
+                                                      }
+                                                    },
+                                                    "error_code": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "duration_ms": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "string"
+                                                        },
+                                                        "minimum": {
+                                                          "type": "integer"
+                                                        }
+                                                      }
+                                                    },
+                                                    "response_model": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "response_revision": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "serving_provider": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "usage": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "properties": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "prompt_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "input_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "total_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "completion_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "output_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "cost": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        },
+                                                        "required": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "required": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "requested_provider": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
                                       "type": "string"
                                     },
-                                    "enum": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "string"
-                                      }
+                                    "pattern": {
+                                      "type": "string"
                                     }
                                   }
                                 },
@@ -59916,17 +60200,301 @@
             "properties": {
               "type": "object",
               "properties": {
+                "model_api": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "primary_profile": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "pattern": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "realized_profile": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "pattern": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "fallback_used": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "fallback_reason": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "attempts": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                },
+                                "properties": {
+                                  "type": "object",
+                                  "properties": {
+                                    "profile": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        },
+                                        "pattern": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "network_attempted": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "http_status": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "minimum": {
+                                          "type": "integer"
+                                        },
+                                        "maximum": {
+                                          "type": "integer"
+                                        }
+                                      }
+                                    },
+                                    "error_code": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "duration_ms": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        },
+                                        "minimum": {
+                                          "type": "integer"
+                                        }
+                                      }
+                                    },
+                                    "response_model": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "response_revision": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "serving_provider": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "usage": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "properties": {
+                                          "type": "object",
+                                          "properties": {
+                                            "prompt_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "input_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "total_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "completion_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "output_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "cost": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "required": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "required": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "required": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
                 "requested_provider": {
                   "type": "object",
                   "properties": {
                     "type": {
                       "type": "string"
                     },
-                    "enum": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
+                    "pattern": {
+                      "type": "string"
                     }
                   }
                 },

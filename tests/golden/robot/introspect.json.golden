@@ -30300,15 +30300,163 @@
             "rerank": {
               "type": "object",
               "properties": {
+                "model_api": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "primary_profile": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                    },
+                    "realized_profile": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                    },
+                    "fallback_used": {
+                      "type": "boolean"
+                    },
+                    "fallback_reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "attempts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "profile": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                          },
+                          "network_attempted": {
+                            "type": "boolean"
+                          },
+                          "http_status": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "minimum": 100,
+                            "maximum": 599
+                          },
+                          "error_code": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "duration_ms": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "response_model": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "response_revision": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "serving_provider": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "usage": {
+                            "type": [
+                              "object",
+                              "null"
+                            ],
+                            "properties": {
+                              "prompt_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "input_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "total_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "completion_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "output_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "cost": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "prompt_tokens",
+                              "input_tokens",
+                              "total_tokens",
+                              "completion_tokens",
+                              "output_tokens",
+                              "cost"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "profile",
+                          "network_attempted",
+                          "http_status",
+                          "error_code",
+                          "duration_ms",
+                          "response_model",
+                          "response_revision",
+                          "serving_provider",
+                          "usage"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "primary_profile",
+                    "realized_profile",
+                    "fallback_used",
+                    "fallback_reason",
+                    "attempts"
+                  ]
+                },
                 "requested_provider": {
                   "type": "string",
-                  "enum": [
-                    "qwen3-local",
-                    "bge-local",
-                    "openrouter-qwen3-8b",
-                    "openrouter-cohere-4-fast",
-                    "openrouter-voyage-2.5-lite"
-                  ]
+                  "pattern": "^[A-Za-z0-9._-]{1,64}$"
                 },
                 "requested_model": {
                   "type": "string"
@@ -30455,6 +30603,7 @@
                 }
               },
               "required": [
+                "model_api",
                 "requested_provider",
                 "requested_model",
                 "actual_provider",
@@ -31382,15 +31531,163 @@
     "search-rerank-meta": {
       "type": "object",
       "properties": {
+        "model_api": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "primary_profile": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,64}$"
+            },
+            "realized_profile": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[A-Za-z0-9._-]{1,64}$"
+            },
+            "fallback_used": {
+              "type": "boolean"
+            },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "attempts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "profile": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                  },
+                  "network_attempted": {
+                    "type": "boolean"
+                  },
+                  "http_status": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 100,
+                    "maximum": 599
+                  },
+                  "error_code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "duration_ms": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "response_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "response_revision": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "serving_provider": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "usage": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "prompt_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "input_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "total_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "completion_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "output_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "cost": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "prompt_tokens",
+                      "input_tokens",
+                      "total_tokens",
+                      "completion_tokens",
+                      "output_tokens",
+                      "cost"
+                    ]
+                  }
+                },
+                "required": [
+                  "profile",
+                  "network_attempted",
+                  "http_status",
+                  "error_code",
+                  "duration_ms",
+                  "response_model",
+                  "response_revision",
+                  "serving_provider",
+                  "usage"
+                ]
+              }
+            }
+          },
+          "required": [
+            "primary_profile",
+            "realized_profile",
+            "fallback_used",
+            "fallback_reason",
+            "attempts"
+          ]
+        },
         "requested_provider": {
           "type": "string",
-          "enum": [
-            "qwen3-local",
-            "bge-local",
-            "openrouter-qwen3-8b",
-            "openrouter-cohere-4-fast",
-            "openrouter-voyage-2.5-lite"
-          ]
+          "pattern": "^[A-Za-z0-9._-]{1,64}$"
         },
         "requested_model": {
           "type": "string"
@@ -31537,6 +31834,7 @@
         }
       },
       "required": [
+        "model_api",
         "requested_provider",
         "requested_model",
         "actual_provider",
