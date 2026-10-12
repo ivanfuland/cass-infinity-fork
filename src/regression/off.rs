@@ -944,6 +944,7 @@ query_prefix="Query: "
         assert_eq!(result["terminal"], "SUCCESS");
         let report: Value =
             serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
+        eprintln!("CHILD_COST_REPORT: {}", report["cost"]);
         assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
         assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
         assert!(report["questions"][0]["cost"]["model_execution_ms"].is_null());
