@@ -24,12 +24,21 @@ pub struct FrozenInputArgs {
 
 #[derive(Debug, Clone, Default, Args)]
 pub struct RegressionApiOptions {
+    #[arg(skip)]
+    pub config_path: Option<PathBuf>,
     #[arg(long)]
     pub embedding_profile: Option<String>,
     #[arg(long)]
     pub rerank_profile: Option<String>,
     #[arg(long)]
     pub no_model_fallback: bool,
+}
+
+impl RegressionApiOptions {
+    pub(crate) fn selected(&self) -> bool {
+        self.config_path.is_some() || self.embedding_profile.is_some() || self.rerank_profile.is_some()
+            || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some()
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]

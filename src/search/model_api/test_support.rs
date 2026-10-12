@@ -38,6 +38,8 @@ const FIXTURE_LIFETIME: Duration = Duration::from_secs(30);
 /// What the fixture answers one connection with.
 #[derive(Clone)]
 pub enum Reply {
+    /// Unit vectors for each actual submitted input; used by full indexing tests.
+    Embeddings(usize),
     /// A JSON body with the given status.
     Json(u16, Value),
     /// Exact response bytes, for the malformed and odd-shape cases.
@@ -330,9 +332,9 @@ fn serve<S: Read + Write>(
     stop: &AtomicBool,
     deadline: Instant,
 ) {
-    let request = read_request(stream);
-    requests.lock().expect("fixture request log").push(request);
-    write_reply(stream, reply, stop, deadline);
+    let request = RecordedRequest { bytes: read_request(stream) };
+    requests.lock().expect("fixture request log").push(request.bytes.clone());
+    write_reply(stream, reply, stop, deadline, &request);
     let _ = stream.flush();
 }
 
@@ -342,8 +344,17 @@ fn write_reply<S: Read + Write>(
     reply: &Reply,
     stop: &AtomicBool,
     deadline: Instant,
+    request: &RecordedRequest,
 ) {
     match reply {
+        Reply::Embeddings(dimension) => {
+            let body = request.body();
+            let inputs = body["input"].as_array().expect("embedding inputs");
+            let mut vector = vec![0.0; *dimension];
+            if let Some(first) = vector.first_mut() { *first = 1.0; }
+            let reply = Reply::ok(json!({"data": inputs.iter().enumerate().map(|(index, _)| json!({"index":index,"embedding":vector})).collect::<Vec<_>>() }));
+            write_reply(stream, &reply, stop, deadline, request);
+        }
         Reply::Json(status, body) => {
             let body = serde_json::to_vec(body).expect("fixture json");
             let _ = stream.write_all(&response_bytes(*status, &body, Some(body.len())));
@@ -364,7 +375,7 @@ fn write_reply<S: Read + Write>(
         }
         Reply::Flagged(flag, inner) => {
             flag.store(true, Ordering::SeqCst);
-            write_reply(stream, inner, stop, deadline);
+            write_reply(stream, inner, stop, deadline, request);
         }
     }
 }

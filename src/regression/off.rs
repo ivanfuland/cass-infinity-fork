@@ -136,12 +136,12 @@ pub(crate) fn private_files(root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-fn counts(mode: SearchMode) -> Vec<Value> {
+fn counts(mode: SearchMode, embedding: Option<Value>) -> Vec<Value> {
     let mut values = vec![
         json!({"scope":"rerank-http-v1","http_attempts":0,"http_response_observed":0,"delivery_unknown":0,"model_executions":0,"basis":"not-called"}),
     ];
     if mode != SearchMode::Lexical {
-        values.push(json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"}));
+        values.push(embedding.unwrap_or_else(|| json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"})));
     }
     values
 }
@@ -224,7 +224,7 @@ pub(crate) fn collect(
                 let total = milliseconds(start);
                 times.push(total);
                 let actual_n = slots.len();
-                let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n < run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n == run.n,"rerank_applied":false,"ordered_pool_sha256":null,"slots":slots,"pages":[],"window_evidence":{"relative_path":evidence_relative,"sha256":file_digest(&search.evidence_path)?},"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode == SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":search.evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":search.identity_before_ms,"identity_after_ms":search.identity_after_ms,"retrieval_ms":search.retrieval_ms,"rerank_client_ms":0.0,"model_execution_ms":null,"paging_ms":0.0,"question_total_ms":total,"http":counts(run.mode),"resource_measurements":[]}});
+                let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n < run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n == run.n,"rerank_applied":false,"ordered_pool_sha256":null,"slots":slots,"pages":[],"window_evidence":{"relative_path":evidence_relative,"sha256":file_digest(&search.evidence_path)?},"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode == SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":search.evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":search.identity_before_ms,"identity_after_ms":search.identity_after_ms,"retrieval_ms":search.retrieval_ms,"rerank_client_ms":0.0,"model_execution_ms":null,"paging_ms":0.0,"question_total_ms":total,"http":counts(run.mode, run.embedding_cost(false)),"resource_measurements":[]}});
                 let relative = format!("question-{}.json", window.qid);
                 write_private(root, &relative, &question)?;
                 writes.push(relative);
@@ -250,6 +250,7 @@ pub(crate) fn collect(
     } else {
         "SUCCESS"
     };
+    run.persist_embedding_calls()?;
     let after = succeeded.then(|| json!({"basis":"equal-physical-db-and-source-generation-policy","inventory_digests":"reused-initial-not-independently-reexported","database_sha256":run.binding.database_sha256,"source_manifest_sha256":run.binding.source_manifest_sha256,"wal_bytes":0,"generation_unchanged":true,"policies_unchanged":true,"shared_maintenance_lease_held":true}));
     let mut sorted = times.clone();
     sorted.sort_by(f64::total_cmp);
@@ -259,7 +260,7 @@ pub(crate) fn collect(
     };
     writes = private_files(root)?;
     writes.push("run.json".into());
-    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
+    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode, run.embedding_cost(true))},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
     write_private(root, "run.json", &output)?;
     if let Some(code) = failure {
         bail!("{code}");
@@ -459,6 +460,67 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn api_full_search_semantic_nine_questions_records_actual_query_costs() {
+        use crate::search::model_api::{ApiConfig, ApiClient, EnvCredentialResolver, PrimaryEmbeddingCall};
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        let (_f, data, mut cmd) = full_fixture_mode(7, 7, SearchMode::Semantic, Some(crate::search::query::VectorSearchMode::Exact));
+        let server = HttpFixture::start(vec![Reply::Embeddings(8)]);
+        let text = format!(r#"
+version=1
+default_embedding="embed"
+[profiles.embed]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="{}"
+model="example/api-embed"
+model_revision="r1"
+normalization="l2"
+query_prefix="Query: "
+"#, server.base());
+        let config_path = data.path().join("api.toml");
+        fs::write(&config_path, &text).unwrap();
+        let config = ApiConfig::parse_toml(&text).unwrap();
+        let profile = config.profile("embed").unwrap().clone();
+        let RegressionCommand::FullSearch { api, database, source_manifest, expected_binding, expected_binding_sha256, .. } = &mut cmd else { unreachable!() };
+        api.config_path = Some(config_path.clone());
+        let storage = crate::storage::sqlite::FrankenStorage::open(database).unwrap();
+        let call = PrimaryEmbeddingCall::new(ApiClient::new(config, Box::new(EnvCredentialResolver)), profile.clone(), false).unwrap();
+        let probe = call.probe().unwrap();
+        let built = crate::indexer::db_vector_catchup::run_api_primary_catchup_backfill(&storage, 64, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
+        assert!(built.catchup.activated);
+        storage.raw().execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
+        drop(storage);
+        let expected_root = data.path().join("api-expected");
+        fs::create_dir(&expected_root).unwrap();
+        let (expected, pin) = regression_binding::tests::prepare_expected(&expected_root, database, source_manifest);
+        *expected_binding = expected;
+        *expected_binding_sha256 = pin;
+        let db = database.clone();
+        let before = fs::read(&db).unwrap();
+        let before_calls = server.hits();
+        let started = Instant::now();
+        let provenance = RunProvenance::capture().unwrap();
+        let owner = RegressionSearchRun::activate(super::super::input::prepare_full(&cmd).unwrap(), &cmd).unwrap();
+        fs::write(config_path, "invalid after activation").unwrap();
+        let result = collect(&owner, &provenance, started, 0.0).unwrap();
+        assert_eq!(result["terminal"], "SUCCESS", "{result}");
+        assert_eq!(result["questions"].as_array().unwrap().len(), 9);
+        let observed = server.hits() - before_calls;
+        assert!(observed > 0);
+        let reported = result["cost"]["counts"][1]["http_attempts"].as_u64().unwrap();
+        assert_eq!(reported, observed as u64);
+        assert_eq!(result["questions"].as_array().unwrap().iter().map(|q| q["cost"]["http"][1]["http_attempts"].as_u64().unwrap()).sum::<u64>(), reported);
+        assert_eq!(result["quality_status"], "NOT_EVALUATED");
+        for request in &server.requests()[before_calls..] {
+            assert!(request.body()["input"][0].as_str().unwrap().starts_with("Query: "));
+        }
+        assert_eq!(before, fs::read(db).unwrap());
+        let calls: Value = serde_json::from_slice(&fs::read(owner.validated.paths.run_root.join("api-embedding-calls.json")).unwrap()).unwrap();
+        assert_eq!(calls["calls"].as_array().unwrap().len(), observed);
+    }
+
     fn full_fixture(n: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionCommand) {
         full_fixture_mode(n, count, SearchMode::Lexical, None)
     }
@@ -483,6 +545,7 @@ pub(super) mod tests {
         let bytes = serde_json::to_vec(&json!({"schema":"cass.regression-source-receipt.v1","producer_id":"cass.pr9.verify-corpus","verification_policy":"cass.pr9.corpus-content-stable-file-v1","producer_source_sha256":digest(b"synthetic-producer"),"source_manifest_sha256":manifest_sha,"expected_file_count":5049,"checked":5049,"passed":true,"exit_code":0,"failure_count":0,"raw_evidence_sha256":digest(b"synthetic-evidence")})).unwrap();
         fs::write(&source_producer_receipt, &bytes).unwrap();
         let cmd = RegressionCommand::FullSearch {
+            api: Default::default(),
             input: f.input.clone(),
             database,
             expected_binding,

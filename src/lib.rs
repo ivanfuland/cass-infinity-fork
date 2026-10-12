@@ -6997,7 +6997,7 @@ async fn execute_cli(
                     });
                 }
             } else {
-                let result = regression::run::run(action).map_err(|error| CliError {
+                let result = regression::run::run_with_api_config(action, cli.api_config.as_deref()).map_err(|error| CliError {
                     code: 2, kind: CliErrorKind::Usage.kind_str(),
                     message: regression::run::error_code(&error).to_string(),
                     hint: None, retryable: false,
@@ -24264,7 +24264,7 @@ struct RerankRequestContext {
 /// requested and both the per-page K and the backend were resolved. The closed
 /// path is exactly `false`.
 fn rerank_window_enabled(opts: &SemanticSearchOptions) -> bool {
-    opts.rerank && opts.rerank_limit.is_some() && opts.rerank_provider.is_some()
+    opts.rerank && opts.rerank_limit.is_some() && (opts.rerank_provider.is_some() || opts.api.frozen.is_some())
 }
 
 /// The wire spelling the binding freezes for a vector candidate strategy.
@@ -25376,13 +25376,11 @@ fn run_cli_search(
     // relative time range.
     if let Some(cursor_str) = window_cursor.as_deref() {
         let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-        let provider = semantic_opts
-            .rerank_provider
-            .expect("rerank_window_enabled guarantees a provider");
+        let provider = semantic_opts.rerank_provider;
         let api_profile = selected_api_rerank_profile(&semantic_opts)?;
-        let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.as_str().to_owned());
+        let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.expect("legacy rerank provider").as_str().to_owned());
         let endpoint = if let Some(profile) = &api_profile { profile.endpoint.as_str().to_owned() } else {
-            regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider))
+            regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider.expect("legacy rerank provider")))
         };
         let route = api_window_route(&semantic_opts, api_profile.as_ref(), mode.unwrap_or_default())?;
         let binding = build_request_binding(
@@ -26403,14 +26401,12 @@ fn score_search_first_window(
     let mut window_continuable = false;
     let mut window_unavailable: Option<&'static str> = None;
     let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-    let provider = semantic_opts
-        .rerank_provider
-        .expect("rerank_window_enabled guarantees a provider");
+    let provider = semantic_opts.rerank_provider;
     let api_profile = selected_api_rerank_profile(&semantic_opts)?;
-    let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.as_str().to_owned());
-    let requested_model = api_profile.as_ref().map(|p| p.model.clone()).unwrap_or_else(|| provider.request_model().to_owned());
+    let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.expect("legacy rerank provider").as_str().to_owned());
+    let requested_model = api_profile.as_ref().map(|p| p.model.clone()).unwrap_or_else(|| provider.expect("legacy rerank provider").request_model().to_owned());
     let endpoint = if let Some(profile) = &api_profile { profile.endpoint.as_str().to_owned() } else {
-        regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider))
+        regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider.expect("legacy rerank provider")))
     };
     let route = api_window_route(&semantic_opts, api_profile.as_ref(), mode.unwrap_or_default())?;
     let binding = build_request_binding(
@@ -26570,11 +26566,11 @@ fn score_search_first_window(
                 }
                 let backend = if api_profile.is_some() { Ok(None) } else { (match regression.as_ref() {
                     Some(run) => build_rerank_backend_with_trace(
-                        provider,
+                        provider.expect("legacy rerank provider"),
                         &endpoint,
                         Some(run.trace.clone()),
                     ),
-                    None => build_rerank_backend(provider, &endpoint),
+                    None => build_rerank_backend(provider.expect("legacy rerank provider"), &endpoint),
                 }).map(Some) };
                 match backend {
                     Ok(backend) => {

@@ -67,6 +67,8 @@ pub enum RegressionCommand {
     /// Validate pinned inputs. Search execution is a later stage.
     FullSearch {
         #[command(flatten)]
+        api: crate::search::regression_input::RegressionApiOptions,
+        #[command(flatten)]
         input: InputOptions,
         #[arg(long)]
         database: PathBuf,

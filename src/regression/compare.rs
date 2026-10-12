@@ -1892,6 +1892,7 @@ mod tests {
                 },
             };
             let command = RegressionCommand::FullSearch {
+                api: Default::default(),
                 input: input.clone(),
                 database,
                 expected_binding: expected,

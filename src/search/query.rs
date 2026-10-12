@@ -3642,7 +3642,7 @@ impl SearchClient {
         client: Arc<crate::search::model_api::ApiClient>,
         profile: crate::search::model_api::ValidatedProfile,
         allow_fallback: bool,
-    ) -> Result<()> {
+    ) -> Result<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>> {
         use crate::search::model_api::query_embedding::{ApiQueryEmbedder, QueryGenerationBinding};
         let binding = {
             let guard = self.sqlite_guard()?;
@@ -3651,9 +3651,10 @@ impl SearchClient {
                 QueryGenerationBinding::open(tx, profile)
             })?.ok_or_else(|| anyhow::Error::new(crate::search::model_api::query_embedding::QueryGenerationUnavailable))?
         };
-        let embedder = ApiQueryEmbedder::new(client, binding.clone(), allow_fallback)?;
-        self.set_bound_semantic_context(Arc::new(embedder),
-            Some(HashSet::from([ROLE_USER, crate::search::vector_index::ROLE_ASSISTANT])), Some(binding))
+        let embedder = Arc::new(ApiQueryEmbedder::new(client, binding.clone(), allow_fallback)?);
+        self.set_bound_semantic_context(embedder.clone(),
+            Some(HashSet::from([ROLE_USER, crate::search::vector_index::ROLE_ASSISTANT])), Some(binding))?;
+        Ok(embedder)
     }
 
     fn set_bound_semantic_context(
