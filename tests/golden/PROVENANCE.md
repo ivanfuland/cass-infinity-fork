@@ -151,6 +151,24 @@ the follow-up baseline-equivalence gate:
 Goldens with only that drift (no line this change touches) were left exactly as
 they were.
 
+### API03 final-surface refresh
+
+The API-only surface cleanup updated four frozen outputs whose text it directly
+changed; each was edited to the expected new value and then checked by its own
+golden test against the real binary, so only the touched hunks moved:
+
+- `robot_docs/commands.txt.golden` — `cass robot-docs commands` no longer lists
+  the duplicated / retired `models list` / `models check` / `models backfill`
+  lines.
+- `robot_docs/exit-codes.txt.golden` — codes 20-24 are now shown as retired
+  rather than as live model-acquisition / download failures.
+- `robot/capabilities.json.golden` — the search `--model` / `--reranker` /
+  `--daemon` / `--no-daemon` argument descriptions and the exit-code 15 / 20-24
+  `agent_action` rows were rewritten; no other row changed.
+- `robot/introspect.json.golden` — the same four search-argument descriptions.
+
+The pre-existing `robot/*` drift listed above is unchanged by this refresh.
+
 ## Follow-ups
 
 Goldens still to add under bead u9osp scope (each needs its own
