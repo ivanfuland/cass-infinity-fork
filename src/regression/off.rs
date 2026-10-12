@@ -1162,6 +1162,17 @@ query_prefix="Query: "
             argv.push("--api-config".into());
             argv.push(config.display().to_string());
         }
+        if let Some(profile) = api.embedding_profile.as_ref() {
+            argv.push("--embedding-profile".into());
+            argv.push(profile.clone());
+        }
+        if let Some(profile) = api.rerank_profile.as_ref() {
+            argv.push("--rerank-profile".into());
+            argv.push(profile.clone());
+        }
+        if api.no_model_fallback {
+            argv.push("--no-model-fallback".into());
+        }
         argv.extend([
             "regression".into(),
             "full-search".into(),
