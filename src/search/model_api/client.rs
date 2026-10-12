@@ -2486,8 +2486,10 @@ normalization = "l2"
     #[test]
     fn unscoreable_rerank_input_is_refused_before_any_request_or_fallback() {
         let primary = HttpFixture::start(vec![Reply::ok(json!({"results": []}))]);
-        let fallback = HttpFixture::start(vec![Reply::ok(json!({"results": []}))]);
-        let client = client(&rerank_pair(&primary.base(), &fallback.base()));
+        // The declared fallback is a reserved, never-resolvable https origin
+        // (the remote scope requires https): a refusal made before the first
+        // request must reach neither service.
+        let client = client(&rerank_pair(&primary.base(), "https://rerank.invalid"));
         let scoreable = || vec!["a scoreable document".to_string()];
         let cases: Vec<(&str, Vec<String>)> = vec![
             ("", vec![]),
@@ -2525,7 +2527,6 @@ normalization = "l2"
             assert!(with_fallback.attempts().is_empty());
         }
         assert_eq!(primary.hits(), 0, "a refused input sends no request");
-        assert_eq!(fallback.hits(), 0, "a refused input never falls back");
     }
 
     /// Whitespace is used to decide emptiness only: a padded but non-empty
@@ -2536,7 +2537,7 @@ normalization = "l2"
             "model": "local-reranker",
             "results": [{"index": 0, "relevance_score": 1.0}, {"index": 1, "relevance_score": 0.5}]
         }))]);
-        let client = client(&rerank_pair(&primary.base(), "http://127.0.0.1:9"));
+        let client = client(&rerank_pair(&primary.base(), "https://rerank.invalid"));
         let query = "  padded query  ";
         let documents = vec![
             "  leading and trailing  ".to_string(),
