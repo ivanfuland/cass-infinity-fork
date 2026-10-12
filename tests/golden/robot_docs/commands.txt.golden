@@ -103,11 +103,10 @@ commands:
   cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).
   cass api-version [--json]        Show crate_version + api_version + contract_version.
   cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).
-  cass models status [--json]      Semantic model acquisition + cache state.
-  cass models install [--from-file DIR] [--model NAME]  Download + install embedder (minilm | snowflake-arctic-s | nomic-embed).
-  cass models remove [--model NAME]  Remove an installed semantic model from disk.
-  cass models verify [--json]      Per-file SHA-256 verification of the installed model.
-  cass models check-update [--json]  Compare installed revision against the pinned registry revision.
+  cass models list [--json]        List configured model API profiles (alias: models status).
+  cass models check --profile ID [--json]  Check one configured model API profile against its endpoint.
+  cass models backfill [--json]   Build/refresh the semantic vector domain (requires --api-config).
+  cass models install|verify|remove|check-update  Retired; local weight management refuses with a migration error.
   cass models backfill             Re-embed conversations against a newly acquired model.
   cass models list [--json]        List the configured model API profiles (read-only, no HTTP).
   cass models check --profile ID [--json]  Check one selected profile against its own endpoint (no fallback).

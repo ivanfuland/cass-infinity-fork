@@ -206,7 +206,12 @@ fn recovery_surfaces(data_dir: &str) -> Vec<RecoverySurface> {
             // isolated HOME/XDG redirects everything it might read.
             args: argv(&["models", "status", "--json"], None),
             expect: Expect::Error {
-                kinds: &["ModelApiConfiguration"],
+                // This harness' shared environment sets the retired
+                // `CASS_SEMANTIC_EMBEDDER`, which a model command refuses with a
+                // migration error before it ever reads a configuration; with no
+                // retired variable set, the same command reports the
+                // configuration error instead.
+                kinds: &["ModelApiConfiguration", "ModelApiMigration"],
             },
             contract_version: None,
         },

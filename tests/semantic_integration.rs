@@ -247,12 +247,16 @@ fn test_mode_flag_semantic() {
         .output()
         .expect("search --mode semantic");
 
-    // Either succeeds or fails with "semantic-unavailable" error (when model not installed)
+    // Either it succeeds, or it fails because semantic capability is
+    // unavailable. With no model configuration at all the refusal is the
+    // API-configuration error; either way the failure is *semantic
+    // unavailability*, never an argument error or a crash.
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("semantic-unavailable")
-                || stderr.contains("Semantic search not available"),
+                || stderr.contains("Semantic search not available")
+                || stderr.contains("ModelApiConfiguration"),
             "If semantic fails, should be due to unavailability. Got: {}",
             stderr
         );
@@ -311,7 +315,8 @@ fn test_mode_flag_hybrid() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("semantic-unavailable")
-                || stderr.contains("Hybrid search not available"),
+                || stderr.contains("Hybrid search not available")
+                || stderr.contains("ModelApiConfiguration"),
             "If hybrid fails, should be due to unavailability. Got: {}",
             stderr
         );
@@ -359,9 +364,13 @@ fn test_same_query_same_results() {
     let mut results: Vec<String> = Vec::new();
     for _ in 0..3 {
         let output = cargo_bin_cmd!("cass")
+            // Lexical mode: this test is about determinism, not semantic
+            // capability, and it must not need a model configuration.
             .args([
                 "search",
                 "deterministic_test_content",
+                "--mode",
+                "lexical",
                 "--robot",
                 "--data-dir",
             ])
@@ -434,7 +443,16 @@ fn test_result_ordering_deterministic() {
     let mut orderings: Vec<Vec<String>> = Vec::new();
     for _ in 0..3 {
         let output = cargo_bin_cmd!("cass")
-            .args(["search", "ordering_test_shared", "--robot", "--data-dir"])
+            // Lexical mode: ordering is a lexical-search property, so this must
+            // not require a model configuration.
+            .args([
+                "search",
+                "ordering_test_shared",
+                "--mode",
+                "lexical",
+                "--robot",
+                "--data-dir",
+            ])
             .arg(&data_dir)
             .env("HOME", home)
             .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -502,7 +520,16 @@ fn test_robot_output_schema() {
 
     // Search with --robot
     let output = cargo_bin_cmd!("cass")
-        .args(["search", "schema_test_content", "--robot", "--data-dir"])
+        // Lexical mode: this pins the robot-search response schema, which does
+        // not depend on semantic capability (or a model configuration).
+        .args([
+            "search",
+            "schema_test_content",
+            "--mode",
+            "lexical",
+            "--robot",
+            "--data-dir",
+        ])
         .arg(&data_dir)
         .env("HOME", home)
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
@@ -677,9 +704,12 @@ fn test_incremental_index_picks_up_new_files() {
 
     // Search for new content
     let output = cargo_bin_cmd!("cass")
+        // Lexical mode: incremental pickup is a lexical-index property.
         .args([
             "search",
             "new_content_for_incremental",
+            "--mode",
+            "lexical",
             "--robot",
             "--data-dir",
         ])
@@ -940,46 +970,23 @@ fn test_models_install_from_file_missing_directory() {
 // Approximate (ANN/HNSW) Search Tests
 // =============================================================================
 
-/// Test: --approximate flag is accepted in semantic mode
-/// (May fail if HNSW index not built, but should parse correctly)
+/// Test: `--approximate` is no longer a valid flag
+///
+/// Semantic mapping: this test asserted that `--approximate` was accepted (and
+/// failed gracefully without an HNSW index). The flag and its HNSW/ANN tier were
+/// removed from the CLI in commit 3f7aa054, so it is a usage error now. The
+/// surviving, meaningful check is that the flag is not silently accepted.
 #[test]
 fn test_approximate_flag_semantic_mode() {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
-
-    // Create fixture
-    make_codex_session(
-        &codex_home,
-        "2024/11/20",
-        "rollout-approximate.jsonl",
-        "approximate_test_content",
-        1732118400000,
-    );
-
-    // Index first (without --build-hnsw, so HNSW won't be available)
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .assert()
-        .success();
-
-    // Search with --approximate in semantic mode
-    // Should fail gracefully if HNSW not available or model not installed
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
             "approximate_test_content",
-            "--mode",
-            "semantic",
             "--approximate",
             "--robot",
             "--data-dir",
@@ -990,53 +997,33 @@ fn test_approximate_flag_semantic_mode() {
         .output()
         .expect("search with --approximate");
 
-    // Either succeeds or fails with appropriate error message
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Should fail due to missing HNSW index or semantic unavailable
-        assert!(
-            stderr.contains("HNSW")
-                || stderr.contains("approximate")
-                || stderr.contains("semantic-unavailable")
-                || stderr.contains("Semantic search not available"),
-            "Error should mention HNSW or approximate search. Got: {}",
-            stderr
-        );
-    }
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--approximate is no longer a valid flag; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--approximate"),
+        "the usage error should name the rejected flag; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
-/// Test: --approximate flag in lexical mode produces warning
+/// Test: `--approximate` is rejected in lexical mode too
+///
+/// Semantic mapping: this test asserted a warning about `--approximate` having
+/// no effect in lexical mode. The flag itself was removed in commit 3f7aa054, so
+/// it is now rejected before mode handling. The surviving check is that the flag
+/// is refused regardless of mode.
 #[test]
 fn test_approximate_flag_lexical_mode_warning() {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path();
-    let codex_home = home.join(".codex");
     let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
-    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
-
-    // Create fixture
-    make_codex_session(
-        &codex_home,
-        "2024/11/20",
-        "rollout-approx-lexical.jsonl",
-        "approx_lexical_test_content",
-        1732118400000,
-    );
-
-    // Index first
-    cargo_bin_cmd!("cass")
-        .args(["index", "--full", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", home)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .assert()
-        .success();
-
-    // Search with --approximate in lexical mode
     let output = cargo_bin_cmd!("cass")
         .args([
             "search",
@@ -1053,18 +1040,17 @@ fn test_approximate_flag_lexical_mode_warning() {
         .output()
         .expect("search with --approximate in lexical mode");
 
-    // Should succeed (lexical search works) but may warn about --approximate
-    assert!(
-        output.status.success(),
-        "Lexical search should succeed even with --approximate"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "--approximate must be rejected in lexical mode too; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Should produce warning about --approximate having no effect in lexical mode
     assert!(
-        stderr.contains("no effect") || stderr.contains("lexical") || stderr.is_empty(),
-        "Should warn about --approximate having no effect in lexical mode or be empty. Got: {}",
-        stderr
+        String::from_utf8_lossy(&output.stderr).contains("--approximate"),
+        "the usage error should name the rejected flag; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 

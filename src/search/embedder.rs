@@ -12,8 +12,16 @@
 //!
 //! # Implementations
 //!
-//! - **Hash embedder**: FNV-1a feature hashing (always available, ~256 dimensions)
-//! - **ML embedder**: FastEmbed with the MiniLM model (requires model download, 384 dimensions)
+//! - **HTTP model API**: the only production embedder. Vectors come from a
+//!   configured embedding profile (`--api-config`); the model, revision and
+//!   dimension are the ones the API representation descriptor records. See
+//!   [`crate::search::model_api`].
+//! - **Hash embedder**: FNV-1a feature hashing. Deterministic and
+//!   dependency-free; used for identity/path arithmetic and by tests, not
+//!   registered as a production semantic backend.
+//!
+//! The former on-device FastEmbed/MiniLM implementation was retired with the
+//! model-API migration: this build ships no local inference runtime.
 
 use std::fmt;
 

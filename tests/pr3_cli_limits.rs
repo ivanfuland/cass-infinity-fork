@@ -109,14 +109,39 @@ fn assert_usage_error(env: &Env, args: &[&str]) {
     );
 }
 
+/// The stable `error.kind` from a JSON refusal envelope, or an empty string when
+/// the output carries no envelope.
+fn stderr_error_kind(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// The arguments got past argument validation.
+///
+/// A refusal from the model API shares exit code 2 with a usage error, so the
+/// discriminator is the error `kind`: `usage` means the arguments themselves
+/// were rejected, anything else (e.g. `ModelApiConfiguration`) means parsing and
+/// validation passed and the command failed later.
 fn assert_not_usage_error(env: &Env, args: &[&str]) -> Output {
     let out = run(env, args);
-    assert_ne!(
-        code(&out),
-        2,
-        "expected {args:?} to get past argument validation; got usage error\n{}",
-        combined(&out)
-    );
+    if code(&out) == 2 {
+        assert_ne!(
+            stderr_error_kind(&combined(&out)),
+            "usage",
+            "expected {args:?} to get past argument validation; got a usage error\n{}",
+            combined(&out)
+        );
+    }
     out
 }
 
@@ -527,7 +552,14 @@ fn window_precedence_cli_over_env_over_config() {
         .args(["--color=never", "search", "q", "--json", "--rerank"])
         .output()
         .expect("run cass");
-    assert_ne!(code(&out), 2, "env must override config: {}", combined(&out));
+    // N=30 clears the K<=N check; the remaining refusal, if any, is the model
+    // API configuration, not a usage error.
+    assert_ne!(
+        stderr_error_kind(&combined(&out)),
+        "usage",
+        "env must override config: {}",
+        combined(&out)
+    );
 
     // CLI over env: N=30 from CLI -> past validation even though env says 3.
     let env = Env::new();
@@ -544,7 +576,12 @@ fn window_precedence_cli_over_env_over_config() {
         ])
         .output()
         .expect("run cass");
-    assert_ne!(code(&out), 2, "CLI must override env: {}", combined(&out));
+    assert_ne!(
+        stderr_error_kind(&combined(&out)),
+        "usage",
+        "CLI must override env: {}",
+        combined(&out)
+    );
 }
 
 // --------------------------------------------------------------------------

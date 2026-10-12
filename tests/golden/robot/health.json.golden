@@ -466,7 +466,7 @@
       "available": false,
       "can_search": false,
       "fallback_mode": "lexical",
-      "preferred_backend": "fastembed",
+      "preferred_backend": "external",
       "embedder_id": null,
       "vector_index_path": null,
       "model_dir": null,
@@ -476,7 +476,7 @@
       "feature_compiled_in": false,
       "quality_tier_published": false,
       "semantic_only_search_available": false,
-      "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'.",
+      "hint": "Run 'cass index --full' first. Optional later: configure a model API profile with --api-config (see 'cass models list') and run 'cass index --semantic'.",
       "fast_tier": {
         "present": false,
         "ready": false,

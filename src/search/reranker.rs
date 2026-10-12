@@ -12,8 +12,13 @@
 //!
 //! # Implementations
 //!
-//! - **FastEmbed Reranker**: Uses ms-marco-MiniLM-L-6-v2 cross-encoder via FastEmbed.
-//!   Requires model download with user consent.
+//! - **HTTP model API**: the only production reranker. Scoring comes from a
+//!   configured rerank profile (`--rerank-profile` with `--api-config`); the
+//!   model and revision are the ones the profile declares and the service
+//!   reports. See [`crate::search::model_api`].
+//!
+//! The former on-device FastEmbed cross-encoder and the local/OpenRouter
+//! provider selection were retired with the model-API migration.
 
 use std::fmt;
 

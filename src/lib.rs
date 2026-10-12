@@ -517,8 +517,11 @@ pub enum Commands {
         /// value is refused with a migration error before any request. The
         /// backend now comes from the configured rerank API profile
         /// (`--rerank-profile` with `--api-config`).
-        #[arg(long, value_enum)]
-        rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
+        ///
+        /// Taken as a free-form string on purpose: a `value_enum` would make
+        /// clap advertise the retired spellings as valid choices in `--help`.
+        #[arg(long)]
+        rerank_provider: Option<String>,
         /// Embedding API profile; defaults to the configured default_embedding.
         #[arg(long)]
         embedding_profile: Option<String>,
@@ -23739,7 +23742,6 @@ mod pr3_cli_limits {
     //! subprocess-isolated environment.
 
     use super::*;
-    use crate::search::rerank::types::ProviderChoice;
     use crate::search_defaults::SearchDefaults;
 
     fn base_inputs(config: &SearchDefaults) -> SearchWindowInputs<'_> {
@@ -24018,7 +24020,9 @@ mod pr3_cli_limits {
         assert!(rerank);
         assert_eq!(rrf_limit, Some(10));
         assert_eq!(rerank_limit, Some(3));
-        assert_eq!(rerank_provider, Some(ProviderChoice::BgeLocal));
+        // The retired selection is parsed as a free-form string (so clap does
+        // not advertise its spellings) and refused later by the dispatch.
+        assert_eq!(rerank_provider.as_deref(), Some("bge-local"));
     }
 
     #[test]

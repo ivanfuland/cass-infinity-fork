@@ -601,15 +601,8 @@
           "name": "rerank-provider",
           "description": "Retired rerank backend selection. The local and OpenRouter rerank backends were removed with the model-API migration, so any supplied value is refused with a migration error before any request. The backend now comes from the configured rerank API profile (`--rerank-profile` with `--api-config`)",
           "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "qwen3-local",
-            "bge-local",
-            "openrouter-qwen3-8b",
-            "openrouter-cohere-4-fast",
-            "openrouter-voyage-2.5-lite"
-          ]
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "embedding-profile",
@@ -3792,10 +3785,9 @@
       "intent": "Understand or repair semantic-search readiness.",
       "first_command": "cass models status --json",
       "follow_up_commands": [
-        "cass models verify --json",
-        "cass models install --model minilm",
-        "cass models install --from-file <dir> --model minilm",
-        "cass models backfill"
+        "cass models list --json",
+        "cass models check --profile <id> --json",
+        "cass models backfill --api-config <file>"
       ],
       "parse_contract": "Parse installed, available, cache_dir, verification status, and err.kind.",
       "note": "Models are opt-in; lexical fallback is valid while the model is absent."

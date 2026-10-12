@@ -1960,10 +1960,23 @@ fn an_illegal_endpoint_is_refused_before_any_request_or_window() {
         "a userinfo endpoint must be a configuration refusal; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Parse the stable envelope rather than matching product prose: the refusal
+    // must be the endpoint configuration error, with a bounded message that does
+    // not echo the supplied credentials.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("stderr must be the JSON error envelope: {e}; stderr: {stderr}"));
+    let error = &envelope["error"];
+    assert_eq!(error["code"], serde_json::json!(2));
+    assert_eq!(error["kind"], serde_json::json!("ModelApiConfiguration"));
+    let message = error["message"].as_str().unwrap_or_default();
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("userinfo"),
-        "the refusal should name the userinfo prohibition; stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        message.contains("InvalidEndpoint"),
+        "the refusal should name the invalid endpoint; message: {message}"
+    );
+    assert!(
+        !stderr.contains("user:pass"),
+        "the refusal must not echo the credential-bearing URL; stderr: {stderr}"
     );
     assert_eq!(
         stub.request_count(),

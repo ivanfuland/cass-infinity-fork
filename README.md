@@ -85,8 +85,8 @@ cass sources agents include openclaw
 - SQLite is the source of truth for indexed conversations and messages. All derived assets (lexical index, semantic vectors, analytics rollups, retention backups) can be rebuilt from SQLite; no derived asset is authoritative.
 - Lexical search is the required fast path. Missing, stale, or incompatible lexical assets are treated as derived-state problems that cass should rebuild from SQLite instead of asking operators to perform routine manual repair.
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
-- Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
-- Semantic model acquisition is **opt-in**: `cass models install` downloads the requested embedder on explicit request; cass never auto-downloads. Three embedders are supported via `--model <name>`: `all-minilm-l6-v2` (alias `minilm`, ~90 MB; the default), `snowflake-arctic-s` (~120 MB), and `nomic-embed` (~270 MB). Air-gapped installs use `--from-file <dir>`. While the chosen model is absent, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
+- Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or an unconfigured or unready embedding profile.
+- Semantic embedding and reranking are served by external **HTTP model APIs**. The operator writes a versioned TOML configuration (`version = 1`, a `profiles` table, and optional `default_embedding` / `default_rerank` ids) and selects it with `--api-config <PATH>` or the `CASS_API_CONFIG` environment variable. cass performs no on-device inference and downloads no model weights. While no embedding profile is configured or ready, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
 - `cass triage --json` is the safest first command for agents: it combines readiness, `next_command`, `recommended_commands[]`, docs/schema pointers, starter workflows, and accepted recoveries. `cass health --json` and `cass status --json` remain the narrower truth surfaces for readiness, active rebuilds, and recovery.
 
 **Lexical publish durability (atomic-swap)**
@@ -100,7 +100,7 @@ cass sources agents include openclaw
 - Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit derived-asset rebuild (`cass models backfill` or an index refresh recommended by `cass health --json`) supersedes it.
 
 **Schema stability guarantees**
-- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
+- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`, `swarm status`, `swarm work-packet`, `swarm lint`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
 - `cass introspect --json`'s `response_schemas` block enumerates every schema in a stable alphabetical order (`BTreeMap`-backed — see bead coding_agent_session_search-8sl73).
 - Error envelopes (`{error: {code, kind, message, hint, retryable}}`) have a fixed shape. `kind` values are kebab-case; branch on `err.kind`, not on the numeric code, for codes ≥ 10 (see the Error Handling section below).
 
@@ -186,7 +186,7 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Fragmented storage**: Each agent stores data differently—JSONL files, SQLite databases, markdown logs, proprietary JSON formats
 - **No cross-agent visibility**: Solutions discovered in Cursor are invisible when you're using Claude Code
 - **Lost context**: That brilliant debugging session from two weeks ago? Good luck finding it by scrolling through files
-- **No semantic search by default**: File-based grep doesn't understand natural language queries; cass can add optional local ML search when model files are installed
+- **No semantic search by default**: File-based grep doesn't understand natural language queries; cass can add optional semantic search through configured HTTP model APIs
 
 ### The Solution
 
@@ -214,49 +214,42 @@ AI coding agents are transforming how we write software. Claude Code, Codex, Cur
 - **Smart Tokenization**: Handles `snake_case` ("my_var" matches "my" and "var"), hyphenated terms, and code symbols (`c++`, `foo.bar`) correctly.
 - **Zero-Stall Updates**: The background indexer commits changes atomically; `reader.reload()` ensures new messages appear in the search bar immediately without restarting.
 
-### 🧠 Optional Semantic Search (Local Inference, No Network at Query Time)
-- **Local inference**: Uses a FastEmbed embedder running ONNX on-device. Once the chosen model is installed, no network traffic is required to answer queries.
-- **Opt-in acquisition**: `cass models install` downloads the requested embedder from Hugging Face on explicit request and verifies SHA256 checksums. Nothing is fetched until you run the install command. Three embedders are supported:
-  - `all-minilm-l6-v2` — `cass models install --model all-minilm-l6-v2` (alias: `minilm`). 384-dim. ~90 MB. The default; fastest. Best for general English semantic similarity.
-  - `snowflake-arctic-s` — `cass models install --model snowflake-arctic-s`. 384-dim. ~120 MB. Stronger MTEB scores than MiniLM at similar cost; good drop-in replacement for code-heavy corpora.
-  - `nomic-embed` — `cass models install --model nomic-embed` (alias: `nomic-embed-text-v1.5`). 768-dim. ~270 MB. Highest recall on long-context queries; trade off larger index footprint.
+### 🧠 Optional Semantic Search (HTTP Model APIs)
+- **HTTP model APIs**: Embedding and reranking are provided by external HTTP model services that you configure. There is no on-device ONNX/FastEmbed inference and no model weight download.
+- **Configuration**: The configuration file is version 1 TOML with a `profiles` table and optional `default_embedding` / `default_rerank` ids. Select it with `--api-config <PATH>` or the `CASS_API_CONFIG` environment variable. Each profile names a `kind` (`embedding` or `rerank`), a `protocol` (for example `openai-embeddings-v1` or `rerank-json-v1`), an `endpoint`, a `scope` (`loopback` or `remote`), a `model`, a `model_revision`, and an optional `api_key_env` naming the environment variable that holds the credential.
+- **Inspecting and probing profiles**: `cass models list` (alias `cass models status`) lists the configured profiles read-only; it opens no database and makes no HTTP request. `cass models check --profile <id>` probes exactly one profile against its own endpoint, with no fallback. `cass models backfill` builds or refreshes the semantic vector domain from the configured embedding profile.
+- **Retired local commands**: `cass models install`, `cass models verify`, `cass models remove`, and `cass models check-update` are retired; each exits 2 with `err.kind = "ModelApiMigration"`. With no configuration, `cass models status` / `cass models list` exits 2 with `err.kind = "ModelApiConfiguration"`.
+- **Lexical fail-open**: While no embedding profile is configured or ready, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
 
-  Removal mirrors install: `cass models remove --model <name>` accepts the same alias set. The same alias map is honored by the daemon embedding worker (see `src/daemon/worker.rs::resolve_embedder_kind`) so background indexing accepts whatever the operator installed.
+A minimal configuration looks like this:
 
-- **Air-gapped install**: `cass models install --model <name> --from-file <dir>` accepts a pre-downloaded model directory so you can bring the assets in yourself.
-- **Required files** (all must be present after install; `cass models verify` checks them):
-  - `model.onnx`
-  - `tokenizer.json`
-  - `config.json`
-  - `special_tokens_map.json`
-  - `tokenizer_config.json`
-- **Vector index**: Stored as `vector_index/index-<embedder>.fsvi` in the data directory.
-- **Lexical fail-open**: While the model is absent, `cass` returns lexical-only results and reports `fallback_mode="lexical"` in health/status; search never blocks on semantic assets.
+```toml
+version = 1
+default_embedding = "local-embed"
+default_rerank = "local-rank"
 
-#### Hash Embedder Fallback
+[profiles.local-embed]
+kind = "embedding"
+protocol = "openai-embeddings-v1"
+endpoint = "http://127.0.0.1:8080/v1/embeddings"
+scope = "loopback"
+model = "example/embed"
+model_revision = "rev-1"
+normalization = "l2"
+api_key_env = "EMBED_API_KEY"
 
-When ML model files are not installed, `cass` uses a deterministic hash-based embedder as a fallback. While not "truly" semantic (it captures lexical overlap rather than meaning), it provides useful functionality:
+[profiles.local-rank]
+kind = "rerank"
+protocol = "rerank-json-v1"
+endpoint = "http://127.0.0.1:8080/v1/rerank"
+scope = "loopback"
+model = "example/rank"
+model_revision = "rev-2"
+```
 
-| Feature | ML Model (MiniLM) | Hash Embedder (FNV-1a) |
-|---------|-------------------|------------------------|
-| **Meaning Understanding** | ✅ "car" ≈ "automobile" | ❌ Exact tokens only |
-| **Initialization Time** | ~500ms (model loading) | <1ms (instant) |
-| **Network Dependency** | None (after install) | None |
-| **Disk Footprint** | ~90MB model files | 0 bytes |
-| **Deterministic** | ✅ Same input = same output | ✅ Same input = same output |
+#### Semantic Backends
 
-**Algorithm**:
-1. **Tokenize**: Lowercase, split on non-alphanumeric, filter tokens <2 characters
-2. **Hash**: Apply FNV-1a to each token
-3. **Project**: Use hash to determine dimension index and sign (+1 or -1) in a 384-dimensional vector
-4. **Normalize**: L2 normalize to unit length for cosine similarity
-
-**When to Use**:
-- Quick setup without downloading model files
-- Environments where ML inference overhead is unwanted
-- Fallback when ML model fails to load
-
-**Override**: Set `CASS_SEMANTIC_EMBEDDER=hash` to force hash mode even when ML model is available.
+Semantic search computes vector similarity from embeddings produced by the configured HTTP embedding profile. Semantic readiness is reported from the database vector domain by `cass health --json` and `cass status --json`. The former on-device backends — the ONNX/FastEmbed embedders and the deterministic hash embedder — are retired and are no longer production semantic backends. `CASS_SEMANTIC_EMBEDDER` is refused with a migration error.
 
 #### FSVI Vector Index Format
 
@@ -281,7 +274,7 @@ When ML model files are not installed, `cass` uses a deterministic hash-based em
 
 **Lexical Search**: Uses Tantivy's BM25 implementation with edge n-grams for prefix matching. Best when you know the exact terms you're looking for. The lexical index is derived from SQLite; if it is missing, stale, or incompatible, cass reports the state and rebuilds through the normal indexing path from the canonical database.
 
-**Semantic Search**: Computes vector similarity between query and indexed message embeddings. Finds conceptually related content even without exact term overlap. Requires either the ML model (MiniLM) or falls back to hash embedder.
+**Semantic Search**: Computes vector similarity between query and indexed message embeddings. Finds conceptually related content even without exact term overlap. Requires a configured and ready embedding profile; without one, semantic refinement is unavailable and search fails open to lexical.
 
 **Hybrid Search**: The default. It combines lexical and semantic results using Reciprocal Rank Fusion (RRF) when semantic assets are ready, and it fails open to lexical when semantic enrichment is still catching up or disabled:
 ```
@@ -853,20 +846,20 @@ The CLI applies multiple normalization layers:
 22. **Current-session shorthand**: `current`, `current-session`, and `sessions current` become `sessions --current`
 23. **Global flag hoisting**: Position-independent flag handling
 
-**Search result windows**: Reranking is off by default. `cass search` uses `--rrf-limit N` for the rrf candidate window and `--rerank-limit K` for the per-page rerank count (requires `--rerank`). With `--rerank` off, an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on, N defaults to 200 and K defaults to 5 per page (K must be at most N). An explicit `0` is rejected for either, and `--rerank-limit`/`--rerank-provider` without `--rerank` are usage errors.
+**Search result windows**: Reranking is off by default. `cass search` uses `--rrf-limit N` for the rrf candidate window and `--rerank-limit K` for the per-page rerank count (requires `--rerank`). With `--rerank` off, an omitted N keeps the existing search defaults, with no explicit candidate limit; with `--rerank` on, N defaults to 200 and K defaults to 5 per page (K must be at most N). An explicit `0` is rejected for either, and `--rerank-limit` without `--rerank` is a usage error. The retired `--rerank-provider` flag is refused with a migration error.
 
-`--rerank` scores every actual candidate before it selects a page. The default backend is `qwen3-local`. Choose `bge-local`, `openrouter-qwen3-8b`, `openrouter-cohere-4-fast`, or `openrouter-voyage-2.5-lite` explicitly to use another backend. `--provider` still filters session sources. Local endpoints use `CASS_QWEN_RERANK_URL` or `CASS_INFINITY_URL` and must resolve to loopback. Only an explicit cloud selection consumes `OPENROUTER_API_KEY` and sends the query and verified passages to OpenRouter. Search does not start a service or download a model.
+`--rerank` scores every actual candidate before it selects a page. The rerank backend comes from a configured rerank API profile: select it with `--rerank-profile <id>` or the configuration's `default_rerank`. The retired `--rerank-provider` spellings (`qwen3-local`, `bge-local`, `openrouter-*`) are refused with a migration error, as are the retired `CASS_QWEN_RERANK_URL` and `CASS_INFINITY_URL` variables. `--provider` still filters session sources. `OPENROUTER_API_KEY` is no longer a backend selector; it is usable only as the variable a profile's `api_key_env` names. Search does not start a service or download a model; it sends the query and verified passages to the configured endpoint.
 
 The original `score` remains unchanged. Full rerank output adds `rerank_score`, with `null` for unscored hits. The `minimal` and `summary` presets keep their fields; use `--fields source_path,score,rerank_score` to select both scores. JSON, compact JSON, JSONL headers, and decoded TOON carry the same `_meta.rerank` facts even without `--robot-meta`. Requested and actual identities are separate. Unproven identities or counts remain `null`. `applied=true` means complete scoring succeeded, including when tied scores keep the original order.
 
 On failure, search keeps original order and returns at most K hits per page. It reports a short `failure_reason` and does not switch backends. A stable failed window can still be paged without retrying the model. Continuation pages report `cache_reused=true`, zero current request counts and duration, and the unchanged `first_*` facts. Display budgets act after scoring. If a budget reduces a page, the cursor advances by the actual delivered count.
 
 ```bash
-cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json
-cass search "auth error" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"
+cass search "auth error" --mode lexical --agent codex --rerank --api-config <file> --rerank-profile <id> --rrf-limit 200 --rerank-limit 5 --json
+cass search "auth error" --mode lexical --agent codex --rerank --api-config <file> --rerank-profile <id> --rrf-limit 200 --rerank-limit 5 --json --cursor "<next_cursor>"
 ```
 
-Copy `_meta.next_cursor` from the first response. Repeat the query, N/K, backend, and filters on later pages. Display fields and display budgets may change. The fixed window ends after its actual candidates, even when the archive has more matches. A changed query, filter, backend, or index requires a new search. `sessions` output still lists only unique paths from the current page.
+Copy `_meta.next_cursor` from the first response. Repeat the query, N/K, profile, and filters on later pages. Display fields and display budgets may change. The fixed window ends after its actual candidates, even when the archive has more matches. A changed query, filter, profile, or index requires a new search. `sessions` output still lists only unique paths from the current page.
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 
@@ -1066,11 +1059,11 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 12 | Source / SSH | Check remote host |
 | 13 | Mapping / not-found | Depends on `err.kind` |
 | 14 | I/O / mapping | Retry or inspect path |
-| 15 | Semantic / embedder unavailable | Install model or `--mode lexical` |
-| 20-21 | Model acquisition | Check `err.kind`, `err.hint` |
-| 22 | I/O during model handling | Retry |
-| 23 | Model download | Retry or use `--from-file` |
-| 24 | I/O during model verify/install | Retry |
+| 15 | Semantic / embedder unavailable | Configure an embedding profile with `--api-config` (`cass models check`), or use `--mode lexical` |
+| 20-21 | Model acquisition (retired) | Belongs to the removed local install flow; select a profile with `--api-config` |
+| 22 | I/O during model handling (retired) | Belongs to the removed local install flow |
+| 23 | Model download (retired) | Belongs to the removed local install flow; no download occurs |
+| 24 | I/O during model verify/install (retired) | Belongs to the removed local install flow |
 
 **Codes ≥ 10 are domain-specific** and the numeric value alone is ambiguous (e.g. code 10 maps to either `config` or `timeout` kinds depending on context). Agents should branch on `err.kind` from the JSON error envelope — not on the numeric code — when handling codes ≥ 10. See the Error Handling section above for the canonical `kind` list.
 
@@ -2498,7 +2491,7 @@ cass completions powershell >> $PROFILE
 
 ## System Requirements
 
-- **CPU**: x86_64 processor with **AVX** instruction support (any Intel/AMD CPU from ~2011 onwards). The ONNX Runtime dependency used for semantic search requires AVX instructions. On CPUs without AVX support, the binary will crash with a `SIGILL` (illegal instruction) signal. The `cass` binary includes a runtime check and will print a clear error message if AVX is not detected, but note that ONNX Runtime may be loaded before this check in some code paths.
+- **CPU**: Any x86_64 processor. The former ONNX Runtime / on-device inference stack is retired, so no AVX/AVX2 requirement remains and the binary no longer risks a `SIGILL` crash on pre-AVX2 hosts.
 - **OS**: Linux, macOS, or Windows
 - **Linux glibc**: Pre-built binaries require **glibc 2.38+** (Ubuntu 24.04+, Fedora 39+, Debian 13+). Ubuntu 20.04 (glibc 2.31) and 22.04 (glibc 2.35) are **not supported** with pre-built binaries. Users on older distributions should build from source with `cargo install --git https://github.com/Dicklesworthstone/coding_agent_session_search`. This requirement exists because CI builds target ubuntu-24.04 to access newer kernel features used by the frankensqlite storage engine.
 - **Disk**: Sufficient space for the search index (varies with session history size)
@@ -2777,51 +2770,40 @@ unless the user explicitly opts into sensitive evidence attachment.
 
 ### Model Management
 
-Commands for managing the semantic search ML model:
+Commands for managing the configured model API profiles (see *Optional Semantic Search* above for the configuration format):
 
 ```bash
-# Check current model status (abbreviated schema — real output also
-# includes cache_lifecycle, files[], revision, license, and more):
-cass models status --json
+# List the configured profiles read-only (alias: models status). No HTTP request is made.
+cass models list --json
 # → {
-#     "model_id": "all-minilm-l6-v2",
-#     "model_dir": "~/.local/share/coding-agent-search/models/all-MiniLM-L6-v2",
-#     "installed": false,
-#     "state": "not_acquired",
-#     "state_detail": "model not acquired (user consent required); missing ...",
-#     "next_step": "Run `cass models install`, or keep using lexical search.",
-#     "lexical_fail_open": true,
-#     "revision": "c9745ed1...",
-#     "license": "Apache-2.0",
-#     "total_size_bytes": 90872535,
-#     "installed_size_bytes": 0,
-#     "observed_file_bytes": 0,
-#     "policy_source": "semantic_policy"
+#     "schema": "cass.model-api-list.v1",
+#     "profiles": [
+#       {
+#         "id": "local-embed",
+#         "kind": "embedding",
+#         "protocol": "openai-embeddings-v1",
+#         "model": "example/embed",
+#         "model_revision": "rev-1",
+#         "default": true,
+#         "endpoint": "http://127.0.0.1:8080/v1/embeddings",
+#         "scope": "loopback",
+#         "api_key_env": "EMBED_API_KEY"
+#       }
+#     ]
 #   }
+# With no configuration, `models status` / `models list` exits 2 with err.kind "ModelApiConfiguration".
 
-# Install model (downloads ~90MB from Hugging Face on explicit request)
-cass models install
-# → Downloads from Hugging Face, verifies checksum
+# Probe exactly one configured profile against its own endpoint (no fallback)
+cass models check --profile local-embed --json
+# → { "schema": "cass.model-api-check.v1", "mode": "single_profile_check", ... }
 
-# Install from local directory (air-gapped environments)
-cass models install --from-file /path/to/model-dir
-
-# Verify model integrity
-cass models verify --json
-# → all_valid bool + per-file SHA-256 checks (see `cass models verify --help`)
-
-# Check for model updates
-cass models check-update --json
-# → { "update_available": bool, "reason": str,
-#     "current_revision": str|null, "latest_revision": str }
+# Build or refresh the semantic vector domain from the configured embedding profile
+cass models backfill --api-config /path/to/models.toml --embedding-profile local-embed --json
 ```
 
-**Model Files** (stored in `$CASS_DATA_DIR/models/all-MiniLM-L6-v2/`):
-- `model.onnx` - The neural network weights (~90MB)
-- `tokenizer.json` - Vocabulary and tokenization rules
-- `config.json` - Model configuration
-- `special_tokens_map.json` - Special token definitions
-- `tokenizer_config.json` - Tokenizer settings
+The retired local weight commands `cass models install`, `cass models verify`, `cass models remove`, and `cass models check-update` no longer act on a local model cache; each exits 2 with `err.kind = "ModelApiMigration"`.
+
+There is no longer a `models/` directory of downloaded weights. The profile configuration replaces the former local model files (`model.onnx`, `tokenizer.json`, `config.json`, `special_tokens_map.json`, `tokenizer_config.json`).
 
 ---
 
@@ -2845,23 +2827,15 @@ cass models check-update --json
 ```
 If a crash occurs during step 2, the original file is untouched. The rename operation (step 3) is atomic on all modern filesystems—it either completes fully or not at all.
 
-**ML Model Installation** (`models/all-MiniLM-L6-v2/`):
-```
-1. Download to temp directory (models/all-MiniLM-L6-v2.tmp/)
-2. Verify all checksums
-3. If existing model present: rename to backup (models/all-MiniLM-L6-v2.bak/)
-4. Atomic rename: temp → final
-5. On success: remove backup
-6. On failure: restore from backup
-```
-This backup-rename-cleanup pattern ensures that either the old model or new model is always available—never a half-installed state.
+**Model API configuration** (`--api-config` / `CASS_API_CONFIG`):
+The selected TOML file is read-only input that `cass` never modifies. With local model installation retired there is no weight-download step to stage atomically.
 
 **Configuration Files** (`sources.toml`, `watch_state.json`):
 All configuration writes follow the same temp-file-then-rename pattern, ensuring consistency even during power loss or unexpected termination.
 
 **Why This Matters**:
 - System crashes mid-write won't corrupt your preferences
-- Network interruptions during model download won't leave broken installations
+- Interrupted writes won't leave partially-written files
 - Concurrent processes won't see partially-written files
 
 
@@ -2987,7 +2961,8 @@ Update check state is stored in the data directory:
 | `CASS_WARM_DEBOUNCE_MS` | 120 | Warm-up search debounce |
 | `CASS_DEBUG_CACHE_METRICS` | unset | Enable cache hit/miss logging |
 | **Semantic Search** | | |
-| `CASS_SEMANTIC_EMBEDDER` | auto | Force embedder: `hash` or `minilm` |
+| `CASS_API_CONFIG` | unset | Path to the versioned model API configuration TOML (`--api-config` overrides it) |
+| `CASS_SEMANTIC_EMBEDDER` | unset | Retired; a model command that finds it set refuses with a migration error |
 | `CASS_SEMANTIC_PROGRESS_JSONL` | unset | Absolute path to a JSONL file the semantic backfill appends one event per transition to (`selection_*`, `packet_replay_*`, `embed_batch_*`, `staging_write_*`, `checkpoint_save_*`, `publish_*`, `error`, `cancelled`, `complete`). Each line carries timestamp, phase + sub-phase, batch/row counters, byte counts, elapsed-since-start, and a cheap RSS estimate. Silent when unset. Best-effort writes — failures log at debug and never crash a backfill. See [cass#257](https://github.com/Dicklesworthstone/coding_agent_session_search/issues/257). |
 | `CASS_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS` | 30000 | Warn when one embedder batch takes more than 30s. Derived from cass#257 boxed quality-corpus telemetry: 60 MiniLM batches averaged ~5.95s, so the default is about 5x the observed healthy batch. Set `0` to disable warnings. |
 | `CASS_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS` | 300000 | Abort a semantic backfill batch after a single embedder batch returns if it exceeded 5 minutes. Derived as a conservative ~50x multiple of the cass#257 healthy 128-doc MiniLM batch average. Set `0` to disable failure. |

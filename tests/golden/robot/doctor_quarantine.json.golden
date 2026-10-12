@@ -730,17 +730,17 @@
     "available": false,
     "can_search": false,
     "fallback_mode": "lexical",
-    "preferred_backend": "fastembed",
+    "preferred_backend": "external",
     "embedder_id": null,
     "vector_index_path": null,
     "model_dir": null,
     "hnsw_path": null,
     "hnsw_ready": false,
     "progressive_ready": false,
-    "feature_compiled_in": true,
+    "feature_compiled_in": false,
     "quality_tier_published": false,
     "semantic_only_search_available": false,
-    "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'.",
+    "hint": "Run 'cass index --full' first. Optional later: configure a model API profile with --api-config (see 'cass models list') and run 'cass index --semantic'.",
     "fast_tier": {
       "present": false,
       "ready": false,
@@ -786,6 +786,7 @@
       "saved_at": null
     }
   },
+  "db_vector_domain": null,
   "derived_semantic_assets": {
     "schema_version": 1,
     "status": "skipped-archive-unavailable",
@@ -803,7 +804,7 @@
     "network_allowed": false,
     "auto_download_allowed": false,
     "auto_download_attempted": false,
-    "skipped_auto_download_reason": "doctor never downloads semantic models; model acquisition requires explicit cass models install or --from-file",
+    "skipped_auto_download_reason": "doctor never downloads or installs semantic models; semantic assets come from a model API profile configured with --api-config",
     "model_policy": "no-auto-download",
     "selected_repair_action": "none",
     "recommended_action": "repair canonical archive DB before rebuilding semantic derivatives",
@@ -889,19 +890,18 @@
     "min_recommended_free_bytes": 1073741824,
     "low_disk_risk": "none",
     "total_accounted_bytes": 1138,
-    "reclaimable_derived_bytes": 50,
-    "precious_evidence_bytes": 19,
-    "protected_non_reclaimable_bytes": 1088,
-    "unknown_bytes": 0,
-    "reclaimable_bytes_by_class": {
-      "retained_publish_backup": 50
-    },
+    "reclaimable_derived_bytes": 0,
+    "precious_evidence_bytes": 1138,
+    "protected_non_reclaimable_bytes": 1138,
+    "unknown_bytes": 1119,
+    "reclaimable_bytes_by_class": {},
     "precious_bytes_by_class": {
-      "backup_bundle": 19
+      "backup_bundle": 19,
+      "unknown": 1119
     },
     "protected_bytes_by_class": {
       "backup_bundle": 19,
-      "quarantined_lexical_generation": 1069
+      "unknown": 1119
     },
     "bytes_by_class": {
       "backup_bundle": {
@@ -916,44 +916,36 @@
           "backups/agent_search.db.20260423T120000.12345.deadbeef.failed-baseline-seed.bak-wal"
         ]
       },
-      "quarantined_lexical_generation": {
-        "bytes": 1069,
-        "file_count": 2,
-        "safety_classification": "diagnostic_evidence",
-        "derived": true,
-        "precious": false,
+      "unknown": {
+        "bytes": 1119,
+        "file_count": 4,
+        "safety_classification": "unknown",
+        "derived": false,
+        "precious": true,
         "reclaimable": false,
         "example_paths": [
-          "index/generation-quarantined/lexical-generation-manifest.json",
-          "index/generation-quarantined/segment-a"
-        ]
-      },
-      "retained_publish_backup": {
-        "bytes": 50,
-        "file_count": 2,
-        "safety_classification": "derived_reclaimable",
-        "derived": true,
-        "precious": false,
-        "reclaimable": true,
-        "example_paths": [
-          "index/.lexical-publish-backups/prior-live-newer/segment-b",
-          "index/.lexical-publish-backups/prior-live-older/segment-a"
+          ".lexical-publish-backups/prior-live-newer/segment-b",
+          "generation-quarantined/lexical-generation-manifest.json",
+          "generation-quarantined/segment-a"
         ]
       }
     },
-    "safe_cleanup_scope": [
-      "retained_publish_backup"
-    ],
+    "safe_cleanup_scope": [],
     "precious_evidence_classes": [
-      "backup_bundle"
+      "backup_bundle",
+      "unknown"
     ],
-    "classification_warnings": [],
-    "recommended_action": "No immediate low-disk risk: derived reclaimable bytes exist, but cleanup still requires an explicit dry-run fingerprint.",
+    "classification_warnings": [
+      "storage inventory classified generation-quarantined/lexical-generation-manifest.json as unknown and protected it from cleanup",
+      "storage inventory classified generation-quarantined/segment-a as unknown and protected it from cleanup",
+      "storage inventory classified .lexical-publish-backups/prior-live-newer/segment-b as unknown and protected it from cleanup",
+      "storage inventory classified .lexical-publish-backups/prior-live-older/segment-a as unknown and protected it from cleanup"
+    ],
+    "recommended_action": "No immediate low-disk risk: monitor precious archive growth and use verified export or relocation if it outgrows this disk.",
     "notes": [
       "Available space is above the doctor safety floor.",
-      "Storage inventory accounted for 1138 bytes: 50 derived-reclaimable bytes and 19 precious evidence bytes.",
-      "Precious evidence bytes are not cleanup candidates; use verified export, backup, or relocation workflows instead.",
-      "Reclaimable derived bytes still require cleanup dry-run approval and a matching fingerprint before apply."
+      "Storage inventory accounted for 1138 bytes: 0 derived-reclaimable bytes and 1138 precious evidence bytes.",
+      "Precious evidence bytes are not cleanup candidates; use verified export, backup, or relocation workflows instead."
     ]
   },
   "storage_integrity": {
@@ -3335,38 +3327,38 @@
   "quarantine": {
     "summary": {
       "failed_seed_bundle_count": 2,
-      "retained_publish_backup_count": 2,
+      "retained_publish_backup_count": 0,
       "retained_publish_backup_retention_limit": 1,
-      "lexical_generation_count": 1,
+      "lexical_generation_count": 0,
       "lexical_generation_build_state_counts": {
         "building": 0,
         "built": 0,
-        "failed": 1,
+        "failed": 0,
         "scratch": 0,
         "validated": 0,
         "validating": 0
       },
       "lexical_generation_publish_state_counts": {
         "published": 0,
-        "quarantined": 1,
+        "quarantined": 0,
         "staged": 0,
         "superseded": 0
       },
-      "lexical_quarantined_generation_count": 1,
-      "lexical_quarantined_shard_count": 1,
-      "total_retained_bytes": 1138,
-      "gc_eligible_asset_count": 1,
-      "gc_eligible_bytes": 25,
-      "inspection_required_asset_count": 3,
-      "inspection_required_bytes": 1088,
-      "cleanup_dry_run_generation_count": 1,
+      "lexical_quarantined_generation_count": 0,
+      "lexical_quarantined_shard_count": 0,
+      "total_retained_bytes": 19,
+      "gc_eligible_asset_count": 0,
+      "gc_eligible_bytes": 0,
+      "inspection_required_asset_count": 2,
+      "inspection_required_bytes": 19,
+      "cleanup_dry_run_generation_count": 0,
       "cleanup_dry_run_reclaim_candidate_count": 0,
       "cleanup_dry_run_reclaimable_bytes": 0,
-      "cleanup_dry_run_retained_bytes": 512,
-      "cleanup_dry_run_protected_generation_count": 1,
+      "cleanup_dry_run_retained_bytes": 0,
+      "cleanup_dry_run_protected_generation_count": 0,
       "cleanup_dry_run_active_generation_count": 0,
-      "cleanup_dry_run_inspection_required_count": 1,
-      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "cleanup_dry_run_inspection_required_count": 0,
+      "cleanup_dry_run_approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
       "cleanup_apply_allowed": false
     },
     "quarantined_artifacts": [
@@ -3407,44 +3399,6 @@
         "last_read_at_ms": "[LAST_READ_MS]",
         "safe_to_gc": false,
         "gc_reason": "failed baseline seed quarantine requires operator inspection"
-      },
-      {
-        "asset_class": "quarantined_lexical_generation",
-        "safety_classification": "diagnostic_evidence",
-        "derived": true,
-        "precious": false,
-        "auto_delete_allowed": false,
-        "safe_to_gc_allowed": false,
-        "artifact_kind": "lexical_generation",
-        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
-        "generation_id": "gen-quarantined",
-        "shard_id": null,
-        "publish_state": "quarantined",
-        "shard_state": null,
-        "size_bytes": 1069,
-        "age_seconds": "[AGE_SECONDS]",
-        "last_read_at_ms": "[LAST_READ_MS]",
-        "safe_to_gc": false,
-        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
-      },
-      {
-        "asset_class": "quarantined_lexical_shard",
-        "safety_classification": "diagnostic_evidence",
-        "derived": true,
-        "precious": false,
-        "auto_delete_allowed": false,
-        "safe_to_gc_allowed": false,
-        "artifact_kind": "lexical_shard",
-        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
-        "generation_id": "gen-quarantined",
-        "shard_id": "shard-a",
-        "publish_state": "quarantined",
-        "shard_state": "quarantined",
-        "size_bytes": 512,
-        "age_seconds": "[AGE_SECONDS]",
-        "last_read_at_ms": "[LAST_READ_MS]",
-        "safe_to_gc": false,
-        "gc_reason": "validation_failed"
       }
     ],
     "failed_seed_bundle_files": [
@@ -3477,178 +3431,51 @@
         "gc_reason": "failed baseline seed quarantine requires operator inspection"
       }
     ],
-    "retained_publish_backups": [
-      {
-        "asset_class": "retained_publish_backup",
-        "safety_classification": "derived_reclaimable",
-        "derived": true,
-        "precious": false,
-        "auto_delete_allowed": true,
-        "safe_to_gc_allowed": true,
-        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-newer",
-        "size_bytes": 25,
-        "age_seconds": "[AGE_SECONDS]",
-        "last_read_at_ms": "[LAST_READ_MS]",
-        "safe_to_gc": false,
-        "gc_reason": "retained lexical publish backup is still protected by retention cap (1)"
-      },
-      {
-        "asset_class": "retained_publish_backup",
-        "safety_classification": "derived_reclaimable",
-        "derived": true,
-        "precious": false,
-        "auto_delete_allowed": true,
-        "safe_to_gc_allowed": true,
-        "path": "[TEST_HOME]/cass-data/index/.lexical-publish-backups/prior-live-older",
-        "size_bytes": 25,
-        "age_seconds": "[AGE_SECONDS]",
-        "last_read_at_ms": "[LAST_READ_MS]",
-        "safe_to_gc": true,
-        "gc_reason": "retained lexical publish backup falls outside retention cap (1)"
-      }
-    ],
-    "lexical_generations": [
-      {
-        "asset_class": "quarantined_lexical_generation",
-        "safety_classification": "diagnostic_evidence",
-        "derived": true,
-        "precious": false,
-        "auto_delete_allowed": false,
-        "safe_to_gc_allowed": false,
-        "path": "[TEST_HOME]/cass-data/index/generation-quarantined",
-        "generation_id": "gen-quarantined",
-        "publish_state": "quarantined",
-        "quarantined_shards": 1,
-        "total_shards": 1,
-        "artifact_bytes": 1069,
-        "updated_at_ms": 1733000000321,
-        "age_seconds": "[AGE_SECONDS]",
-        "last_read_at_ms": "[LAST_READ_MS]",
-        "reclaimable_bytes": 0,
-        "inspection_required": true,
-        "safe_to_gc": false,
-        "gc_reason": "cleanup dry-run requires inspection before garbage collection"
-      }
-    ],
+    "retained_publish_backups": [],
+    "lexical_generations": [],
     "lexical_cleanup_dry_run": {
       "dry_run": true,
-      "approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
-      "generation_count": 1,
-      "total_artifact_bytes": 512,
+      "approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
+      "generation_count": 0,
+      "total_artifact_bytes": 0,
       "total_reclaimable_bytes": 0,
-      "total_retained_bytes": 512,
+      "total_retained_bytes": 0,
       "reclaim_candidates": [],
       "reclaimable_generation_ids": [],
-      "fully_retained_generation_ids": [
-        "gen-quarantined"
-      ],
-      "protected_generation_ids": [
-        "gen-quarantined"
-      ],
-      "protected_retained_bytes": 512,
-      "quarantined_generation_ids": [
-        "gen-quarantined"
-      ],
+      "fully_retained_generation_ids": [],
+      "protected_generation_ids": [],
+      "protected_retained_bytes": 0,
+      "quarantined_generation_ids": [],
       "active_generation_ids": [],
-      "disposition_counts": {
-        "quarantined_retained": 1
-      },
-      "generation_disposition_summaries": {
-        "quarantined_retained": {
-          "generation_count": 1,
-          "artifact_bytes": 512,
-          "reclaimable_bytes": 0,
-          "retained_bytes": 512
-        }
-      },
-      "inspection_items": [
-        {
-          "generation_id": "gen-quarantined",
-          "shard_id": "shard-a",
-          "disposition": "quarantined_retained",
-          "reason": "validation_failed",
-          "retained_bytes": 512
-        }
-      ],
-      "inspection_required_generation_ids": [
-        "gen-quarantined"
-      ],
-      "inspection_required_count": 1,
-      "inspection_required_retained_bytes": 512,
-      "shard_disposition_summaries": {
-        "quarantined_retained": {
-          "shard_count": 1,
-          "artifact_bytes": 512,
-          "reclaimable_bytes": 0,
-          "retained_bytes": 512
-        }
-      },
-      "inventories": [
-        {
-          "generation_id": "gen-quarantined",
-          "build_state": "failed",
-          "publish_state": "quarantined",
-          "disposition": "quarantined_retained",
-          "reason": "quarantined lexical generation is retained for inspection",
-          "retain_until_ms": null,
-          "retention_reason": "quarantined generation is retained indefinitely until operator inspection clears it",
-          "artifact_bytes": 512,
-          "reclaimable_bytes": 0,
-          "retained_bytes": 512,
-          "shards": [
-            {
-              "shard_id": "shard-a",
-              "state": "quarantined",
-              "disposition": "quarantined_retained",
-              "reason": "validation_failed",
-              "artifact_bytes": 512,
-              "reclaimable_bytes": 0,
-              "retained_bytes": 512
-            }
-          ]
-        }
-      ]
+      "disposition_counts": {},
+      "generation_disposition_summaries": {},
+      "inspection_items": [],
+      "inspection_required_generation_ids": [],
+      "inspection_required_count": 0,
+      "inspection_required_retained_bytes": 0,
+      "shard_disposition_summaries": {},
+      "inventories": []
     },
     "lexical_cleanup_apply_gate": {
       "apply_allowed": false,
       "dry_run": true,
       "explicit_operator_approval": false,
-      "approval_fingerprint": "cleanup-v1-6ccf4cfcf4dc2e46ee789a8531ea21cf1281cd50840978e797928bf330e31fc7",
+      "approval_fingerprint": "cleanup-v1-1529494c33aceb4d443809482b810b5f2410dc1b37c3cc95e2c9838ecbaff098",
       "provided_approval_fingerprint": null,
       "approval_fingerprint_status": "not_requested",
       "approval_fingerprint_matches": false,
-      "generation_count": 1,
-      "total_artifact_bytes": 512,
-      "total_retained_bytes": 512,
+      "generation_count": 0,
+      "total_artifact_bytes": 0,
+      "total_retained_bytes": 0,
       "candidate_count": 0,
       "reclaimable_bytes": 0,
-      "disposition_counts": {
-        "quarantined_retained": 1
-      },
-      "generation_disposition_summaries": {
-        "quarantined_retained": {
-          "generation_count": 1,
-          "artifact_bytes": 512,
-          "reclaimable_bytes": 0,
-          "retained_bytes": 512
-        }
-      },
-      "shard_disposition_summaries": {
-        "quarantined_retained": {
-          "shard_count": 1,
-          "artifact_bytes": 512,
-          "reclaimable_bytes": 0,
-          "retained_bytes": 512
-        }
-      },
+      "disposition_counts": {},
+      "generation_disposition_summaries": {},
+      "shard_disposition_summaries": {},
       "candidate_previews": [],
       "reclaimable_generation_ids": [],
-      "fully_retained_generation_ids": [
-        "gen-quarantined"
-      ],
-      "quarantined_generation_ids": [
-        "gen-quarantined"
-      ],
+      "fully_retained_generation_ids": [],
+      "quarantined_generation_ids": [],
       "blocker_codes": [
         "no_reclaimable_candidates",
         "operator_approval_required"
@@ -3658,24 +3485,12 @@
         "destructive cleanup requires explicit operator approval after dry-run"
       ],
       "active_generation_ids": [],
-      "protected_generation_ids": [
-        "gen-quarantined"
-      ],
-      "protected_retained_bytes": 512,
-      "inspection_previews": [
-        {
-          "generation_id": "gen-quarantined",
-          "shard_id": "shard-a",
-          "disposition": "quarantined_retained",
-          "reason": "validation_failed",
-          "retained_bytes": 512
-        }
-      ],
-      "inspection_required_count": 1,
-      "inspection_required_retained_bytes": 512,
-      "inspection_required_generation_ids": [
-        "gen-quarantined"
-      ]
+      "protected_generation_ids": [],
+      "protected_retained_bytes": 0,
+      "inspection_previews": [],
+      "inspection_required_count": 0,
+      "inspection_required_retained_bytes": 0,
+      "inspection_required_generation_ids": []
     },
     "warnings": []
   },

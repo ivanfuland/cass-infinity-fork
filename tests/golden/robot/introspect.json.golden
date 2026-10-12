@@ -543,15 +543,8 @@
           "name": "rerank-provider",
           "description": "Retired rerank backend selection. The local and OpenRouter rerank backends were removed with the model-API migration, so any supplied value is refused with a migration error before any request. The backend now comes from the configured rerank API profile (`--rerank-profile` with `--api-config`)",
           "arg_type": "option",
-          "value_type": "enum",
-          "required": false,
-          "enum_values": [
-            "qwen3-local",
-            "bge-local",
-            "openrouter-qwen3-8b",
-            "openrouter-cohere-4-fast",
-            "openrouter-voyage-2.5-lite"
-          ]
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "embedding-profile",

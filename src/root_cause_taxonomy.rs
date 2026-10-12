@@ -241,7 +241,7 @@ source path (which is workspace-provenance).",
                 family: self,
                 title: "semantic assets missing or incompatible",
                 examples: &[
-                    "embedding model not downloaded; ONNX runtime missing",
+                    "model API profile not configured, unreachable, or returning an incompatible identity",
                     "vector index build artifacts absent or partial",
                     "embedding dimension mismatch vs. the stored index",
                 ],
