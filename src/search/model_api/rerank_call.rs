@@ -36,3 +36,89 @@ pub fn score(client: &ApiClient, profile: &str, query: &str, documents: &[String
         }
     }
 }
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+    use crate::search::model_api::{ApiConfig, CredentialResolver};
+    use crate::search::model_api::test_support::{HttpFixture, TlsFixture, Reply};
+    use serde_json::json;
+
+    struct NoCredentials;
+    impl CredentialResolver for NoCredentials {
+        fn resolve(&self, _: &str) -> Option<String> { None }
+    }
+
+    fn client(local: &HttpFixture, cloud: &TlsFixture) -> ApiClient {
+        let text = format!(r#"
+version=1
+[profiles.local]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/local-rank"
+model_revision="r1"
+instruction="Rank complete documents"
+fallback_profile="cloud"
+[profiles.cloud]
+kind="rerank"
+protocol="openrouter-rerank-v1"
+scope="remote"
+endpoint="{}"
+model="example/cloud-rank"
+model_revision="r2"
+instruction="Rank complete documents"
+provider_only="fixed-provider"
+"#, local.base(), cloud.base());
+        ApiClient::new_with_test_root(ApiConfig::parse_toml(&text).unwrap(), Box::new(NoCredentials), cloud.ca_pem().to_vec())
+    }
+
+    #[test]
+    fn whole_window_fallback_preserves_actual_attempts_and_cloud_scores() {
+        let local = HttpFixture::start(vec![Reply::status(503)]);
+        let cloud = TlsFixture::start(vec![Reply::ok(json!({"results":[
+            {"index":1,"relevance_score":0.9}, {"index":0,"relevance_score":0.1}
+        ], "model":"example/cloud-rank", "usage":{"input_tokens":23}}))]);
+        let api = client(&local, &cloud);
+        let documents = vec!["first complete document".into(), "second complete document".into()];
+        let mut evidence = None;
+        let result = score(&api, "local", "query", &documents, true, &mut evidence).unwrap();
+        assert_eq!(result.scores, vec![0.1, 0.9]);
+        assert_eq!(result.http_requests, 2);
+        assert_eq!(result.identity.actual_model.as_deref(), Some("example/cloud-rank"));
+        assert_eq!(result.identity.actual_provider, None);
+        let evidence = evidence.unwrap();
+        assert_eq!(evidence.realized_profile.as_deref(), Some("cloud"));
+        assert!(evidence.fallback_used);
+        assert_eq!(evidence.attempts.len(), 2);
+        assert_eq!(evidence.attempts[0].http_status, Some(503));
+        assert!(evidence.attempts[0].error_code.is_some());
+        assert_eq!(evidence.attempts[1].http_status, Some(200));
+        assert_eq!(evidence.attempts[1].error_code, None);
+        assert_eq!(evidence.attempts[1].usage.as_ref().unwrap().input_tokens, Some(23));
+        let first = local.requests()[0].body();
+        let second = cloud.fixture().requests()[0].body();
+        for field in ["query", "documents", "instruct", "top_n"] { assert_eq!(first[field], second[field], "{field}"); }
+        assert_eq!(first["documents"], json!(documents));
+        assert_eq!(local.hits(), 1);
+        assert_eq!(cloud.fixture().hits(), 1);
+    }
+
+    #[test]
+    fn failed_cloud_has_no_winner_and_no_partial_score_result() {
+        let local = HttpFixture::start(vec![Reply::status(503)]);
+        let cloud = TlsFixture::start(vec![Reply::status(500)]);
+        let api = client(&local, &cloud);
+        let mut evidence = None;
+        let failure = score(&api, "local", "query", &["complete document".into()], true, &mut evidence).unwrap_err();
+        assert_eq!(failure.http_status, Some(500));
+        let evidence = evidence.unwrap();
+        assert_eq!(evidence.realized_profile, None);
+        assert!(!evidence.fallback_used);
+        assert_eq!(evidence.attempts.len(), 2);
+        assert!(evidence.attempts.iter().all(|a| a.error_code.is_some()));
+        assert_eq!(local.hits(), 1);
+        assert_eq!(cloud.fixture().hits(), 1);
+    }
+}

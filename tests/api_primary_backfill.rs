@@ -2806,3 +2806,22 @@ fn api_rerank_window_pages_without_http_and_rejects_changed_instruction() {
     assert_eq!(offline["_meta"]["rerank"]["http_requests"], 0);
     assert_eq!(offline["hits"], second["hits"], "server shutdown does not change the frozen page");
 }
+
+#[test]
+fn api_query_without_a_generation_preserves_hybrid_policy_without_http() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &["synthetic document for hybrid without an active generation"]);
+    let stub = Stub::start(healthy_responder(8, 0));
+    let config = data_dir.join("models.toml");
+    fs::write(&config, config_text("local8", &embedding_profile_block(
+        "local8", &stub.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, "",
+    ))).unwrap();
+    let hybrid = cass(&["search", "synthetic", "--mode", "hybrid", "--json", "--robot-meta",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()], &[]);
+    let result = assert_success(&hybrid);
+    assert_eq!(result["_meta"]["search_mode"], "lexical");
+    let semantic = cass(&["search", "synthetic", "--mode", "semantic", "--json",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()], &[]);
+    assert_eq!(semantic.status.code(), Some(15));
+    assert_eq!(stub.requests().len(), 0);
+}

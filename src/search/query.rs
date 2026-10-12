@@ -3649,7 +3649,7 @@ impl SearchClient {
             let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
             conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
                 QueryGenerationBinding::open(tx, profile)
-            })?
+            })?.ok_or_else(|| anyhow::Error::new(crate::search::model_api::query_embedding::QueryGenerationUnavailable))?
         };
         let embedder = ApiQueryEmbedder::new(client, binding.clone(), allow_fallback)?;
         self.set_bound_semantic_context(Arc::new(embedder),

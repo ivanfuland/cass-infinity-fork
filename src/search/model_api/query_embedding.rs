@@ -8,6 +8,10 @@ use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult, ModelCate
 use crate::storage::api::{StorageError, Tx};
 use crate::storage::api_generation::{VerifiedPrimaryGeneration, open_api_generation};
 
+#[derive(Debug, thiserror::Error)]
+#[error("API generation is absent or not audited")]
+pub struct QueryGenerationUnavailable;
+
 /// Identity checked again in the transaction that reads candidate vectors.
 #[derive(Clone)]
 pub struct QueryGenerationBinding {
@@ -18,13 +22,13 @@ pub struct QueryGenerationBinding {
 }
 
 impl QueryGenerationBinding {
-    pub fn open(tx: &Tx, profile: ValidatedProfile) -> Result<Self, StorageError> {
-        let id = tx.query_opt_map(
+    pub fn open(tx: &Tx, profile: ValidatedProfile) -> Result<Option<Self>, StorageError> {
+        let Some(id) = tx.query_opt_map(
             "SELECT id FROM embedding_generations WHERE is_active = 1 AND audit_status = 'passed'",
             &[], |row| row.get_typed::<i64>(0),
-        )?.ok_or_else(|| unavailable("API generation is absent or not audited"))?;
+        )? else { return Ok(None); };
         let verified = open_api_generation(tx, id, &profile).map_err(StorageError::from)?;
-        Self::from_verified(profile, verified)
+        Self::from_verified(profile, verified).map(Some)
     }
 
     fn from_verified(profile: ValidatedProfile, verified: VerifiedPrimaryGeneration) -> Result<Self, StorageError> {

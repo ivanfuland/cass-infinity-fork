@@ -25754,13 +25754,18 @@ fn run_cli_search(
             let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
             let api_client = Arc::new(crate::search::model_api::ApiClient::new(
                 config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)));
-            client.set_api_semantic_context(api_client, profile, !semantic_opts.api.no_model_fallback)
-                .map_err(|_| CliError {
-                    code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message: "API generation identity is unavailable or incompatible".into(),
-                    hint: Some("Build and audit a generation with the selected API profile".into()),
-                    retryable: false,
-                })?;
+            if let Err(error) = client.set_api_semantic_context(api_client, profile, !semantic_opts.api.no_model_fallback) {
+                if hybrid_fail_open && error.is::<crate::search::model_api::query_embedding::QueryGenerationUnavailable>() {
+                    mode_meta.fall_back_to_lexical("API generation is absent or not audited");
+                } else {
+                    return Err(CliError {
+                        code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                        message: "API generation identity is unavailable or incompatible".into(),
+                        hint: Some("Build and audit a generation with the selected API profile".into()),
+                        retryable: false,
+                    });
+                }
+            }
         } else {
         use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
 
