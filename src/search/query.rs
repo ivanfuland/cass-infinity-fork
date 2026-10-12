@@ -3725,7 +3725,7 @@ impl SearchClient {
 
             let embedding = embedder
                 .embed_sync(canonical)
-                .map_err(|e| anyhow!("embedding failed: {e}"))?;
+                .map_err(anyhow::Error::new)?;
 
             let mut guard = self
                 .semantic
@@ -5144,6 +5144,11 @@ impl SearchClient {
     /// keep propagating as a hard error -- fail-open only covers the two
     /// conditions plan v5.1 names, not "any semantic failure whatsoever".
     fn is_semantic_fail_open_condition(err: &anyhow::Error) -> bool {
+        if let Some(failure) = err.chain().find_map(|cause| {
+            cause.downcast_ref::<crate::search::model_api::query_embedding::QueryApiFailure>()
+        }) {
+            return failure.allow_lexical;
+        }
         let msg = err.to_string();
         msg.contains("vector_domain_state=absent")
             || msg.contains("vector_domain_state=building")

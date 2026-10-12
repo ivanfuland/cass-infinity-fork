@@ -24874,6 +24874,7 @@ fn execute_search_retrieval(
                 let (hits, candidate_meta) = client
                     .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
                     .map_err(|e| {
+                        if let Some(error) = api_query_compatibility_error(&e) { return error; }
                         let err_str = e.to_string();
                         if err_str.contains("unavailable")
                             || err_str.contains("no embedder")
@@ -24926,6 +24927,7 @@ fn execute_search_retrieval(
                 result
             }
             Err(e) => {
+                if let Some(error) = api_query_compatibility_error(&e) { return Err(error); }
                 let err_str = e.to_string();
                 if hybrid_fail_open
                     && (err_str.contains("unavailable") || err_str.contains("no embedder"))
@@ -24983,6 +24985,18 @@ fn execute_search_retrieval(
                 }
             }
         },
+    })
+}
+
+fn api_query_compatibility_error(error: &anyhow::Error) -> Option<CliError> {
+    let failure = error.chain().find_map(|cause| cause.downcast_ref::<
+        crate::search::model_api::query_embedding::QueryApiFailure>())?;
+    (failure.code == "CompatibilityRequired").then(|| CliError {
+        code: 15,
+        kind: CliErrorKind::SemanticUnavailable.kind_str(),
+        message: "CompatibilityRequired: embedding primary unavailable; cloud compatibility is not verified".into(),
+        hint: Some("Verify the configured fallback or explicitly request lexical search".into()),
+        retryable: true,
     })
 }
 

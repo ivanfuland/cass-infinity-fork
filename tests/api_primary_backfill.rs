@@ -2674,3 +2674,58 @@ fn api_query_reopens_generation_and_uses_query_prefix() {
     assert!(!denied.status.success());
     assert_eq!(stub.requests().len(), before + 1, "identity refusal precedes private query HTTP");
 }
+
+#[test]
+fn api_query_rejects_metadata_changed_during_http() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &["a sufficiently long synthetic document for API query validation"]);
+    let tamper = Arc::new(AtomicBool::new(false));
+    let tamper_in_http = Arc::clone(&tamper);
+    let db = data_dir.join("agent_search.db");
+    let stub = Stub::start(move |request, _| {
+        if tamper_in_http.load(Ordering::SeqCst) { corrupt_representation_record(&db); }
+        respond_embed(request, &request.inputs(), 8, 0)
+    });
+    let config = data_dir.join("models.toml");
+    fs::write(&config, config_text("local8", &embedding_profile_block(
+        "local8", &stub.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, "",
+    ))).unwrap();
+    assert_success(&run_backfill(&data_dir, &config, None, &[]));
+    let before = stub.requests().len();
+    tamper.store(true, Ordering::SeqCst);
+    let out = cass(&["search", "synthetic query", "--mode", "semantic", "--json",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()], &[]);
+    assert!(!out.status.success(), "query must not use vectors after their identity changes");
+    assert_eq!(stub.requests().len(), before + 1, "the record changed inside the query request");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("InvalidRecord"), "{}", stderr_text(&out));
+}
+
+#[test]
+fn api_query_hybrid_requires_proof_only_for_enabled_fallback() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &["a sufficiently long synthetic document for API query validation"]);
+    let fail = Arc::new(AtomicBool::new(false));
+    let fail_http = Arc::clone(&fail);
+    let stub = Stub::start(move |request, _| {
+        if fail_http.load(Ordering::SeqCst) { return (503, "{}".into()); }
+        respond_embed(request, &request.inputs(), 8, 0)
+    });
+    let cloud = ConnectionSpy::start();
+    let config = data_dir.join("models.toml");
+    fs::write(&config, fallback_config(&stub.endpoint(), &cloud.endpoint())).unwrap();
+    assert_success(&run_backfill(&data_dir, &config, None, &[]));
+    fail.store(true, Ordering::SeqCst);
+    let before = stub.requests().len();
+    let args = ["search", "synthetic query", "--mode", "hybrid", "--json",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()];
+    let out = cass(&args, &[]);
+    assert!(!out.status.success(), "unverified fallback must not degrade to lexical; HTTP before={before} after={} stdout={} stderr={}", stub.requests().len(), String::from_utf8_lossy(&out.stdout), stderr_text(&out));
+    assert!(stderr_text(&out).contains("CompatibilityRequired"), "{}", stderr_text(&out));
+    assert_eq!(stub.requests().len(), before + 1);
+    assert_eq!(cloud.connections(), 0);
+    let mut disabled = args.to_vec();
+    disabled.push("--no-model-fallback");
+    assert_success(&cass(&disabled, &[]));
+    assert_eq!(stub.requests().len(), before + 2);
+    assert_eq!(cloud.connections(), 0);
+}

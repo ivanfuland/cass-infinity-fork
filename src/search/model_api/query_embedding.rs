@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::{ApiAttempt, ApiClient, InputKind, ValidatedProfile};
-use super::routing::{failure_allows_cloud_fallback, fallback_target};
+use super::routing::failure_allows_cloud_fallback;
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult, ModelCategory};
 use crate::storage::api::{StorageError, Tx};
 use crate::storage::api_generation::{VerifiedPrimaryGeneration, open_api_generation};
@@ -63,6 +63,15 @@ fn unavailable(detail: &str) -> StorageError {
     StorageError::Other { code: None, detail: detail.to_owned() }
 }
 
+/// Typed policy survives the embedding error chain; message text never decides
+/// whether a query may degrade to lexical results.
+#[derive(Debug, thiserror::Error)]
+#[error("{code}")]
+pub struct QueryApiFailure {
+    pub code: &'static str,
+    pub allow_lexical: bool,
+}
+
 /// Only search constructs this adapter; document embedding has its own driver.
 pub struct ApiQueryEmbedder {
     client: Arc<ApiClient>,
@@ -88,10 +97,10 @@ impl ApiQueryEmbedder {
         self.attempts.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
-    fn failure(&self, code: &str) -> EmbedderError {
+    fn failure(&self, code: &'static str, allow_lexical: bool) -> EmbedderError {
         EmbedderError::EmbeddingFailed {
             model: self.binding.embedder_id.clone(),
-            source: Box::new(std::io::Error::other(code.to_owned())),
+            source: Box::new(QueryApiFailure { code, allow_lexical }),
         }
     }
 }
@@ -101,17 +110,24 @@ impl Embedder for ApiQueryEmbedder {
         let profile = &self.binding.profile;
         match self.client.embed_once(&profile.id, &[text.to_owned()], InputKind::Query) {
             Ok(mut outcome) => {
-                self.attempts.lock().unwrap_or_else(|p| p.into_inner()).extend(outcome.attempts);
-                if outcome.dimension != self.binding.dimension {
-                    return Err(self.failure("DimensionMismatch"));
+                let wrong_dimension = outcome.dimension != self.binding.dimension;
+                if wrong_dimension {
+                    if let Some(attempt) = outcome.attempts.last_mut() {
+                        attempt.error_code = Some("DimensionMismatch");
+                    }
                 }
-                outcome.vectors.pop().ok_or_else(|| self.failure("InvalidResponse"))
+                self.attempts.lock().unwrap_or_else(|p| p.into_inner()).extend(outcome.attempts);
+                if wrong_dimension {
+                    return Err(self.failure("DimensionMismatch", false));
+                }
+                outcome.vectors.pop().ok_or_else(|| self.failure("InvalidResponse", false))
             }
             Err(failure) => {
                 self.attempts.lock().unwrap_or_else(|p| p.into_inner()).extend_from_slice(failure.attempts());
-                let needs_proof = fallback_target(self.client.config(), profile, self.allow_fallback).is_some()
+                let needs_proof = self.allow_fallback && profile.fallback_profile.is_some()
                     && failure_allows_cloud_fallback(&failure);
-                Err(self.failure(if needs_proof { "CompatibilityRequired" } else { failure.error().code().as_str() }))
+                Err(self.failure(if needs_proof { "CompatibilityRequired" } else { failure.error().code().as_str() },
+                    !needs_proof && failure_allows_cloud_fallback(&failure)))
             }
         }
     }
