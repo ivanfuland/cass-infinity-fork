@@ -7305,32 +7305,10 @@ async fn execute_cli(
                         ));
                     }
 
-                    let api_selection = cli.api_config.is_some() || embedding_profile.is_some() || rerank_profile.is_some()
-                        || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
-                    if api_selection && (rerank_provider.is_some() || reranker.is_some()) {
+                    if model.is_some() || daemon || rerank_provider.is_some() || reranker.is_some() {
                         return Err(model_api_migration_error(
-                            "legacy rerank selection cannot be combined with API configuration".into(),
-                            "Use --rerank-profile".into()));
-                    }
-
-                    // `--reranker` is deprecated: it is still parsed for
-                    // compatibility, but it never selects a backend and its
-                    // value is never echoed. Combining it with the new
-                    // `--rerank-provider` is an explicit conflict rather than a
-                    // silent preference for one of them.
-                    if reranker.is_some() {
-                        if rerank_provider.is_some() {
-                            return Err(CliError::usage(
-                                "--reranker cannot be combined with --rerank-provider",
-                                Some(
-                                    "--rerank-provider now selects the rerank backend; drop --reranker."
-                                        .to_string(),
-                                ),
-                            ));
-                        }
-                        eprintln!(
-                            "Warning: --reranker is deprecated and no longer selects a rerank backend; use --rerank-provider"
-                        );
+                            "legacy model, daemon, and rerank-provider selections are retired".into(),
+                            "Use --api-config with --embedding-profile or --rerank-profile".into()));
                     }
 
                     // Resolve configurable search defaults (#303 + PR3 windows)
@@ -7402,10 +7380,6 @@ async fn execute_cli(
                         }
                     }
 
-                    if refresh {
-                        refresh_index_inline(cli.db.clone(), data_dir.clone());
-                    }
-
                     let mut semantic_opts = semantic_search_options_from_defaults(
                         model.clone(),
                         rerank,
@@ -7422,6 +7396,10 @@ async fn execute_cli(
                         rerank_profile,
                         no_model_fallback,
                     };
+                    freeze_search_model_api(&mut semantic_opts, defaults.mode, dry_run)?;
+                    if refresh && !dry_run {
+                        refresh_index_inline(cli.db.clone(), data_dir.clone());
+                    }
 
                     // Only pass through robot_format when it was explicitly
                     // requested (CLI flag or env var). Returning `None` here
@@ -24313,29 +24291,6 @@ fn rerank_endpoint_origin(provider: crate::search::rerank::types::ProviderChoice
     }
 }
 
-/// The effective embedding-model selection the semantic loader will use: the
-/// CLI `--model` when given, else `CASS_SEMANTIC_EMBEDDER` resolved exactly as
-/// that loader resolves it (the literal `hash`, or a canonical FastEmbedder
-/// name). It reads no registry, builds no client and sends no request, so the
-/// first lookup's retrieval and both sides of the frozen binding consume one
-/// identical value. An unsupported env string yields `None`, exactly as the
-/// loader treats it -- it never invents a model.
-fn effective_embedding_model(cli_model: Option<&str>) -> Option<String> {
-    if let Some(model) = cli_model {
-        return Some(model.to_string());
-    }
-    dotenvy::var("CASS_SEMANTIC_EMBEDDER")
-        .ok()
-        .and_then(|value| {
-            if value.trim().eq_ignore_ascii_case("hash") {
-                Some("hash".to_string())
-            } else {
-                crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
-                    .map(str::to_string)
-            }
-        })
-}
-
 /// Build the one rerank backend for `provider`, binding `origin` for a local
 /// selection and reading only `OPENROUTER_API_KEY` for a cloud one.
 ///
@@ -25062,6 +25017,39 @@ fn api_window_route(opts: &SemanticSearchOptions, profile: Option<&crate::search
     }))
 }
 
+/// Freeze API selections before refresh or search can touch storage.
+fn freeze_search_model_api(
+    semantic_opts: &mut SemanticSearchOptions,
+    mode: Option<crate::search::query::SearchMode>,
+    dry_run: bool,
+) -> CliResult<()> {
+    use crate::search::query::SearchMode;
+    if semantic_opts.model.is_some() || semantic_opts.use_daemon {
+        return Err(model_api_migration_error(
+            "legacy model and daemon selection are retired".into(),
+            "Use --embedding-profile with --api-config".into()));
+    }
+    // Pure query analysis and explicit lexical searches need no model service.
+    if !dry_run && (mode != Some(SearchMode::Lexical) || semantic_opts.rerank) {
+        reject_retired_model_env()?;
+        let config = match semantic_opts.api.frozen.clone() {
+            Some(config) => config,
+            None => crate::search::model_api::runtime::load_config(
+                semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
+                .map_err(model_api_runtime_error)?,
+        };
+        if mode != Some(SearchMode::Lexical) && semantic_opts.api.embedding_route.is_none() {
+            let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
+            semantic_opts.api.embedding_route = Some(crate::search::model_api::embedding_route::EmbeddingRoute::load(
+                &config, &profile, !semantic_opts.api.no_model_fallback));
+        }
+        semantic_opts.api.frozen = Some(config);
+        if semantic_opts.rerank { selected_api_rerank_profile(&semantic_opts)?; }
+    }
+
+    Ok(())
+}
+
 fn api_regression_embedding_binding(conn: &crate::storage::api::Conn, route: &crate::search::model_api::embedding_route::EmbeddingRoute) -> anyhow::Result<serde_json::Value> {
     let profile = &route.primary;
     let call = crate::search::model_api::EndpointConfigIdentity::from_profile(profile)?;
@@ -25122,11 +25110,6 @@ fn run_cli_search(
     rerank_ctx: RerankRequestContext,
     mut regression: Option<RegressionSearchExecution>,
 ) -> CliResult<()> {
-    #[cfg(feature = "infinity")]
-    use crate::search::model_manager::load_infinity_semantic_context;
-    use crate::search::model_manager::{
-        load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
-    };
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -25135,61 +25118,10 @@ fn run_cli_search(
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    let api_selected = semantic_opts.api.config_path.is_some()
-        || semantic_opts.api.embedding_profile.is_some()
-        || semantic_opts.api.rerank_profile.is_some()
-        || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
-    if api_selected && (mode != Some(SearchMode::Lexical) || semantic_opts.rerank) {
-        reject_retired_model_env()?;
-        if semantic_opts.model.is_some() || semantic_opts.use_daemon {
-            return Err(model_api_migration_error(
-                "legacy model or daemon selection cannot be used with API profiles".into(),
-                "Use --embedding-profile with --api-config".into()));
-        }
-        let config = crate::search::model_api::runtime::load_config(
-            semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
-            .map_err(model_api_runtime_error)?;
-        if mode != Some(SearchMode::Lexical) {
-            let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
-            semantic_opts.api.embedding_route = Some(crate::search::model_api::embedding_route::EmbeddingRoute::load(
-                &config, &profile, !semantic_opts.api.no_model_fallback));
-        }
-        semantic_opts.api.frozen = Some(config);
-        if semantic_opts.rerank { selected_api_rerank_profile(&semantic_opts)?; }
-    }
+    freeze_search_model_api(&mut semantic_opts, mode, dry_run)?;
 
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
-    if regression.is_some() && mode != Some(SearchMode::Lexical) && semantic_opts.api.frozen.is_none() {
-        #[cfg(not(feature = "infinity"))]
-        return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
-        if !matches!(semantic_opts.model.as_deref(), Some("bge-m3" | "infinity"))
-            || semantic_opts.use_daemon
-        {
-            return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
-        }
-    }
-    #[cfg(feature = "infinity")]
-    let regression_embedding_config = if regression.is_some() && mode != Some(SearchMode::Lexical) && semantic_opts.api.frozen.is_none() {
-        let config = crate::search::infinity::InfinityConfig::from_env();
-        if config.embed_model != "BAAI/bge-m3" {
-            return Err(regression_search_error(
-                "REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH",
-            ));
-        }
-        Some(config)
-    } else {
-        None
-    };
-    #[cfg(feature = "infinity")]
-    let mut regression_embedding_binding = regression_embedding_config.as_ref().map(|config| serde_json::json!({
-        "requested_model": config.embed_model,
-        "origin_sha256": crate::search::regression_trace::TextDigest::of(&config.base_url).sha256,
-        "dimension": config.expected_dim,
-        "timeout_ms": config.timeout.as_millis() as u64,
-        "max_batch": config.max_batch,
-    }));
-    #[cfg(not(feature = "infinity"))]
     let mut regression_embedding_binding: Option<serde_json::Value> = None;
 
     if let (Some(run), Some(_)) = (regression.as_ref(), semantic_opts.api.frozen.as_ref()) {
@@ -25260,9 +25192,8 @@ fn run_cli_search(
     // decides which family is accepted, so neither can be silently mis-read as
     // the other.
     let rerank_on = rerank_window_enabled(&semantic_opts);
-    // One effective embedding selection, shared by the retrieval and by both
-    // sides of the frozen binding.
-    let effective_model = effective_embedding_model(semantic_opts.model.as_deref());
+    // API embedding identity is carried by the frozen route, not a legacy model selector.
+    let effective_model: Option<String> = None;
     let mut limit_val = *limit;
     let mut offset_val = *offset;
     let mut window_cursor: Option<String> = None;
@@ -25789,183 +25720,23 @@ fn run_cli_search(
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
     let hybrid_fail_open = regression.is_none() && mode_meta.fail_open_on_semantic_unavailable();
 
-    if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) {
-        if let Some(config) = semantic_opts.api.frozen.as_ref() {
-            let api_client = Arc::new(crate::search::model_api::ApiClient::new(
-                config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)));
-            let route = semantic_opts.api.embedding_route.clone().expect("semantic route frozen");
-            if let Err(error) = client.set_api_frozen_semantic_context(api_client, route) {
-                if hybrid_fail_open && error.is::<crate::search::model_api::query_embedding::QueryGenerationUnavailable>() {
-                    mode_meta.fall_back_to_lexical("API generation is absent or not audited");
-                } else {
-                    return Err(CliError {
-                        code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                        message: "API generation identity is unavailable or incompatible".into(),
-                        hint: Some("Build and audit a generation with the selected API profile".into()),
-                        retryable: false,
-                    });
-                }
-            }
-        } else {
-        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
-
-        // Use embedder registry for model selection (bd-2mbe)
-        let registry = EmbedderRegistry::new(&data_dir);
-        let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
-            .ok()
-            .and_then(|value| {
-                if value.trim().eq_ignore_ascii_case("hash") {
-                    Some("hash")
-                } else {
-                    crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
-                }
-            });
-        let requested_model = semantic_opts.model.as_deref().or(env_model);
-
-        // Validate requested model if specified
-        if let Some(model_name) = semantic_opts.model.as_deref()
-            && let Err(e) = registry.validate(model_name)
-        {
-            return Err(CliError {
-                code: 15,
-                kind: CliErrorKind::EmbedderUnavailable.kind_str(),
-                message: format!("Embedder validation failed: {e}"),
-                hint: Some("Run 'cass models list' to see available embedders".to_string()),
-                retryable: false,
-            });
-        }
-
-        // Determine which embedder to use
-        let embedder_info = match requested_model {
-            Some(name) => registry.get(name),
-            None => Some(registry.best_available()),
-        };
-        let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
-
-        // M4-pre spike: route the bge-m3 / infinity embedder through the
-        // Infinity HTTP context loader (no ONNX / model-file machinery).
-        #[cfg(feature = "infinity")]
-        let setup_infinity = if matches!(requested_model, Some("bge-m3") | Some("infinity")) {
-            Some(match regression.as_ref() {
-                Some(run) => {
-                    crate::search::model_manager::load_infinity_semantic_context_for_regression(
-                        &run.context,
-                        regression_embedding_config
-                            .as_ref()
-                            .expect("regression semantic configuration frozen before search"),
-                    )
-                    .map_err(regression_search_error)?
-                }
-                None => load_infinity_semantic_context(&data_dir, &db_path),
-            })
-        } else {
-            None
-        };
-        #[cfg(not(feature = "infinity"))]
-        let setup_infinity: Option<crate::search::model_manager::SemanticSetup> = None;
-
-        let setup = if let Some(setup_infinity) = setup_infinity {
-            setup_infinity
-        } else if prefer_hash {
-            load_hash_semantic_context(&data_dir, &db_path)
-        } else if let Some(model_name) = requested_model {
-            load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
-        } else {
-            load_semantic_context(&data_dir, &db_path)
-        };
-
-        if let Some(context) = setup.context {
-            let embedder = context.embedder;
-            let roles = context.roles;
-
-            let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
-                use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
-
-                #[cfg(unix)]
-                {
-                    // M4-pre spike: route query embedding through Infinity HTTP
-                    // when built with `--features infinity` (baseline is ORT-free,
-                    // so the UDS daemon's ONNX embedder is unavailable anyway).
-                    #[cfg(feature = "infinity")]
-                    let daemon: Arc<
-                        dyn crate::search::daemon_client::DaemonClient,
-                    > = match crate::search::infinity::InfinityDaemonClient::new() {
-                        Ok(c) => Arc::new(c),
-                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "infinity-unavailable",
-                        )),
-                    };
-                    #[cfg(not(feature = "infinity"))]
-                    let daemon = crate::daemon::client::try_connect()
-                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                        .unwrap_or_else(|| {
-                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                                "daemon-unconfigured",
-                            ))
-                        });
-                    let config = DaemonRetryConfig::from_env();
-                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                }
-                #[cfg(not(unix))]
-                {
-                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                        "daemon-unconfigured",
-                    ));
-                    let config = DaemonRetryConfig::from_env();
-                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                }
-            } else {
-                embedder
-            };
-
-            if let Err(err) = client.set_semantic_context(embedder, roles) {
-                let hint = if prefer_hash {
-                    "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
-                        .to_string()
-                } else {
-                    "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
-                        .to_string()
-                };
-                if hybrid_fail_open {
-                    mode_meta.fall_back_to_lexical(format!("semantic context rejected: {err}"));
-                    let _ = client.clear_semantic_context();
-                } else {
-                    return Err(CliError {
-                        code: 15,
-                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                        message: format!("Semantic search not available: {err}"),
-                        hint: Some(hint),
-                        retryable: false,
-                    });
-                }
-            }
-        } else {
-            let _ = client.clear_semantic_context();
-            let summary = setup.availability.summary();
-            let hint = if prefer_hash {
-                "Run 'cass index --semantic --embedder hash' to build the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
-                    .to_string()
-            } else {
-                "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
-                    .to_string()
-            };
-            if hybrid_fail_open {
-                mode_meta.fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
+    if matches!(mode_meta.requested, SearchMode::Semantic | SearchMode::Hybrid) {
+        let config = semantic_opts.api.frozen.as_ref().expect("semantic API configuration frozen");
+        let api_client = Arc::new(crate::search::model_api::ApiClient::new(
+            config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)));
+        let route = semantic_opts.api.embedding_route.clone().expect("semantic route frozen");
+        if let Err(error) = client.set_api_frozen_semantic_context(api_client, route) {
+            if hybrid_fail_open && error.is::<crate::search::model_api::query_embedding::QueryGenerationUnavailable>() {
+                mode_meta.fall_back_to_lexical("API generation is absent or not audited");
             } else {
                 return Err(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message: format!("Semantic search not available: {summary}"),
-                    hint: Some(hint),
+                    code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message: "API generation identity is unavailable or incompatible".into(),
+                    hint: Some("Build and audit a generation with the selected API profile".into()),
                     retryable: false,
                 });
             }
         }
-    }
-
     }
 
     // P09: read the index fingerprint once the first-lookup setup (self-heal

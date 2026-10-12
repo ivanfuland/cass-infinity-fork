@@ -2882,3 +2882,50 @@ fn absent_api_configuration_cannot_fall_through_to_a_legacy_backend() {
     assert!(stderr_text(&output).contains("ModelApiConfiguration"));
     assert!(!data.exists(), "missing configuration must fail before database or lock creation");
 }
+
+#[test]
+fn search_retires_local_selectors_before_any_database_work() {
+    for selector in [vec!["--model", "hash"], vec!["--daemon"], vec!["--reranker", "minilm"], vec!["--rerank-provider", "qwen3-local"]] {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("not-created");
+        let data_text = data.display().to_string();
+        let mut args = vec!["search", "example", "--json", "--data-dir", data_text.as_str()];
+        args.extend(selector);
+        let output = cass(&args, &[]);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+        assert!(stderr_text(&output).contains("ModelApiMigration"), "{}", stderr_text(&output));
+        assert!(!data.exists());
+    }
+}
+
+#[test]
+fn semantic_search_requires_api_config_but_dry_run_remains_model_free() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("not-created");
+    let data_text = data.display().to_string();
+    for mode in ["semantic", "hybrid"] {
+        let output = cass(&["search", "example", "--json", "--mode", mode, "--data-dir", &data_text], &[]);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+        assert!(stderr_text(&output).contains("ModelApiConfiguration"));
+        assert!(!data.exists());
+    }
+    let output = cass(&["search", "example", "--json", "--dry-run", "--data-dir", &data_text], &[]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(!data.exists());
+}
+
+#[test]
+fn model_configuration_is_validated_before_refresh_and_dry_run_never_refreshes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("not-created");
+    let data_text = data.display().to_string();
+    let missing = root.path().join("missing.toml").display().to_string();
+    let output = cass(&["search", "example", "--json", "--refresh", "--api-config", &missing,
+        "--data-dir", &data_text], &[]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    assert!(stderr_text(&output).contains("ModelApiConfiguration"));
+    assert!(!data.exists(), "configuration refusal must precede refresh ingestion");
+    let output = cass(&["search", "example", "--json", "--dry-run", "--refresh", "--data-dir", &data_text], &[]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(!data.exists(), "query analysis must not refresh the index");
+}
