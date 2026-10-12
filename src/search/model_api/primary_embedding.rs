@@ -672,13 +672,24 @@ mod page_writer_tests {
     #[cfg(not(windows))]
     #[test]
     fn backup_only_sqlite_backfill_activates_and_reuses_the_same_generation() {
+        exercise_backup_sqlite_lifecycle(false);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn failed_backup_page_rolls_back_contributor_and_vectors_then_resumes() {
+        exercise_backup_sqlite_lifecycle(true);
+    }
+
+    #[cfg(not(windows))]
+    fn exercise_backup_sqlite_lifecycle(inject_failure: bool) {
         use super::super::compatibility_bundle::tests::fallback_fixture;
         use super::super::test_support::TlsFixture;
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use crate::storage::api::{TxMode, StorageError};
         use crate::storage::api_generation::open_api_generation_with_compatibility;
         use crate::indexer::db_vector_catchup::{run_api_primary_catchup_backfill, probe_api_backfill};
-        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let primary = HttpFixture::start(if inject_failure { vec![Reply::Embeddings(2), Reply::status(503)] } else { vec![Reply::status(503)] });
         let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
         let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
         let profile = config.profile("primary").unwrap().clone();
@@ -702,7 +713,33 @@ mod page_writer_tests {
             started_at:Some(1000), ended_at:Some(1002), approx_tokens:None, metadata_json:serde_json::Value::Null,
             messages, source_id:"local".into(), origin_host:None,
         }).unwrap();
-        let probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| panic!("{error}"));
+        let mut probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| panic!("{error}"));
+        if inject_failure {
+            use crate::storage::{api_generation, schema};
+            let ids: Vec<i64> = storage.raw().query_all_map("SELECT id FROM messages ORDER BY id", &[], |row| row.get_typed(0)).unwrap();
+            let id = storage.raw().with_tx(TxMode::Immediate, |tx| {
+                let id = api_generation::create_api_generation(tx, &profile, 2, &probe.fingerprint, 1).map_err(StorageError::from)?;
+                let holes: Vec<_> = ids.iter().map(|id| (*id, 0u32)).collect();
+                schema::seed_chunk_holes(tx, id, &holes, 1, "test_seed")?;
+                Ok(id)
+            }).unwrap();
+            let key = api_generation::provenance_meta_key(id);
+            let before: String = storage.raw().query_row_map("SELECT value FROM meta WHERE key=?1", &crate::storage::api::params![key.as_str()], |row|row.get_typed(0)).unwrap();
+            storage.raw().execute_batch("CREATE TRIGGER reject_backup_page BEFORE INSERT ON message_chunks BEGIN SELECT RAISE(ABORT, 'synthetic page failure'); END;").unwrap();
+            let failed = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42);
+            assert!(failed.is_err());
+            assert!(backup.fixture().hits() > 0, "backup must actually produce the refused page");
+            let after: String = storage.raw().query_row_map("SELECT value FROM meta WHERE key=?1", &crate::storage::api::params![key.as_str()], |row|row.get_typed(0)).unwrap();
+            assert_eq!(before, after, "failed page must roll back the new backup contributor");
+            for table in ["message_chunks", "chunk_staging"] {
+                let count: i64 = storage.raw().query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |row|row.get_typed(0)).unwrap();
+                assert_eq!(count, 0, "no partial vectors in {table}");
+            }
+            let active: i64 = storage.raw().query_row_map("SELECT is_active FROM embedding_generations WHERE id=?1", &crate::storage::api::params![id], |row|row.get_typed(0)).unwrap();
+            assert_eq!(active, 0);
+            storage.raw().execute_batch("DROP TRIGGER reject_backup_page;").unwrap();
+            probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| panic!("{error}"));
+        }
         let first = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
         assert!(first.catchup.activated);
         assert_eq!(first.catchup.chunks_embedded, 2);
@@ -725,12 +762,12 @@ mod page_writer_tests {
         assert_eq!(call.document_calls().len(), document_attempts);
         let verified = storage.raw().with_tx(TxMode::Deferred, |tx| open_api_generation_with_compatibility(
             tx, id, &profile, call.route.proof.as_ref().unwrap()).map_err(StorageError::from)).unwrap();
-        assert_eq!(verified.provenance().contributors().len(), 1);
+        assert_eq!(verified.provenance().contributors().len(), if inject_failure { 2 } else { 1 });
         assert!(verified.primary_contributor().is_err());
-        assert_eq!(verified.provenance().contributors()[0].endpoint_config_sha256(),
+        assert_eq!(verified.provenance().contributors().last().unwrap().endpoint_config_sha256(),
             super::super::EndpointConfigIdentity::from_profile(call.route.fallback.as_ref().unwrap()).unwrap().sha256());
         let total_attempts = call.probe_calls().len() + call.document_calls().len() + call.audit_calls().len();
-        assert_eq!(primary.hits(), backup.fixture().hits());
+        assert_eq!(primary.hits(), backup.fixture().hits() + usize::from(inject_failure));
         assert_eq!(total_attempts, primary.hits() + backup.fixture().hits());
     }
 
