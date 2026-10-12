@@ -15,6 +15,12 @@ pub(crate) struct EmbeddingRoute {
     pub proof: Option<Arc<CheckedBundle>>,
     pub proof_sha256: Option<String>,
 }
+impl std::fmt::Debug for EmbeddingRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingRoute").field("profile", &self.primary.id)
+            .field("proof_sha256", &self.proof_sha256).finish_non_exhaustive()
+    }
+}
 #[derive(Debug)]
 pub(crate) struct RoutedEmbedFailure {
     pub code: &'static str,
@@ -42,6 +48,16 @@ impl EmbeddingRoute {
                 None=>Err(StorageError::from(original)),
             },
         }
+    }
+    pub(crate) fn identity_sha256(&self) -> String {
+        let identity = |profile: &ValidatedProfile| super::EndpointConfigIdentity::from_profile(profile)
+            .expect("validated embedding profile").sha256();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "primary": identity(&self.primary),
+            "fallback": self.fallback.as_ref().map(identity), "allow_fallback": self.allow_fallback,
+            "proof_sha256": self.proof_sha256, "proof_admitted": self.proof.is_some(),
+        })).expect("route identity serialization");
+        hex::encode(Sha256::digest(bytes))
     }
     pub(crate) fn max_batch(&self)->usize {
         let primary=self.primary.embedding().map(|e|e.max_batch).unwrap_or(1);
@@ -93,6 +109,28 @@ mod tests {
     use super::*;
     use super::super::compatibility_capture::tests::inputs;
     use super::super::test_support::{HttpFixture, Reply};
+
+    #[test]
+    fn route_digest_binds_backup_policy_and_proof_without_network() {
+        let server = HttpFixture::start(vec![Reply::Embeddings(2)]);
+        let (client, _, _, _) = inputs(&server);
+        let route = EmbeddingRoute::load(client.config(), client.config().profile("archived").unwrap(), true);
+        let original = route.identity_sha256();
+        let mut changed = route.clone();
+        changed.allow_fallback = false;
+        assert_ne!(original, changed.identity_sha256());
+        let mut changed = route.clone();
+        changed.fallback = Some(route.primary.clone());
+        assert_ne!(original, changed.identity_sha256());
+        let mut changed = route.clone();
+        changed.proof_sha256 = Some("a".repeat(64));
+        assert_ne!(original, changed.identity_sha256());
+        let first_proof = changed.identity_sha256();
+        changed.proof_sha256 = Some("b".repeat(64));
+        assert_ne!(first_proof, changed.identity_sha256());
+        assert_eq!(original, route.clone().identity_sha256());
+        assert_eq!(server.hits(), 0);
+    }
 
     #[test]
     fn dimension_change_is_terminal_after_actual_primary_response() {

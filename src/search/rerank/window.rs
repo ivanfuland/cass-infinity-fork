@@ -281,6 +281,7 @@ pub struct ApiWindowRoute {
     pub allow_fallback: bool,
     pub embedding_profile: Option<String>,
     pub embedding_config_sha256: Option<String>,
+    pub embedding_route_sha256: Option<String>,
 }
 
 /// The frozen request identity of the first lookup.
@@ -351,6 +352,8 @@ impl RequestBinding {
             let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
             if route.rerank_profile != out.provider || !digest(&route.rerank_route_sha256)
                 || route.embedding_profile.is_some() != route.embedding_config_sha256.is_some()
+                || route.embedding_profile.is_some() != route.embedding_route_sha256.is_some()
+                || route.embedding_route_sha256.as_ref().is_some_and(|sha| !digest(sha))
                 || route.embedding_config_sha256.as_ref().is_some_and(|sha| !digest(sha)) {
                 return Err(WindowError::InvalidInput);
             }
@@ -2400,7 +2403,7 @@ mod tests {
         snap.request_binding.api_route = Some(ApiWindowRoute {
             rerank_profile: "ranker".into(), rerank_route_sha256: "a".repeat(64),
             fallback_profile: None, allow_fallback: true,
-            embedding_profile: Some("embed".into()), embedding_config_sha256: Some("b".repeat(64)),
+            embedding_profile: Some("embed".into()), embedding_config_sha256: Some("b".repeat(64)), embedding_route_sha256: Some("c".repeat(64)),
         });
         snap.rerank.requested_provider = "ranker".into();
         snap.rerank.identity.actual_provider = None;
@@ -2417,7 +2420,7 @@ mod tests {
             }],
         });
         st.save(&snap, NOW).expect("valid API window");
-        for mutation in 0..6 {
+        for mutation in 0..8 {
             let mut bad = snap.clone();
             match mutation {
                 0 => bad.rerank.http_requests = Some(0),
@@ -2425,6 +2428,8 @@ mod tests {
                 2 => bad.rerank.model_api.as_mut().unwrap().attempts[0].error_code = Some("HttpStatus".into()),
                 3 => bad.rerank.model_api.as_mut().unwrap().fallback_used = true,
                 4 => bad.rerank.model_api = None,
+                5 => bad.request_binding.api_route.as_mut().unwrap().embedding_route_sha256 = None,
+                6 => bad.request_binding.api_route.as_mut().unwrap().embedding_route_sha256 = Some("invalid".into()),
                 _ => bad.rerank.requested_provider = "other".into(),
             }
             assert_eq!(st.save(&bad, NOW).unwrap_err(), WindowError::InvalidInput, "mutation {mutation}");

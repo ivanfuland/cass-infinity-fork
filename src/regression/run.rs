@@ -116,8 +116,10 @@ impl RegressionSearchRun {
         if *search_mode != SearchMode::Lexical {
             if let Some(config) = &semantic.api.frozen {
                 let profile = crate::select_api_embedding_profile(config, api.embedding_profile.as_deref()).map_err(|e| anyhow::anyhow!(e.message))?;
-                embedding_binding = Some({ let conn = context.connection()?; crate::api_regression_embedding_binding(&conn, &profile)? });
-                query_driver = Some(client.set_api_semantic_context(Arc::new(crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver))), profile, !api.no_model_fallback)?);
+                let route = crate::search::model_api::embedding_route::EmbeddingRoute::load(config, &profile, !api.no_model_fallback);
+                embedding_binding = Some({ let conn = context.connection()?; crate::api_regression_embedding_binding(&conn, &route)? });
+                semantic.api.embedding_route = Some(route.clone());
+                query_driver = Some(client.set_api_frozen_semantic_context(Arc::new(crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver))), route)?);
             } else {
             #[cfg(not(feature = "infinity"))]
             bail!("REGRESSION_SEMANTIC_NOT_INTEGRATED");

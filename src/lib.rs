@@ -7416,6 +7416,7 @@ async fn execute_cli(
 
                     semantic_opts.api = ApiSearchOptions {
                         frozen: None,
+                        embedding_route: None,
                         config_path: cli.api_config.clone(),
                         embedding_profile,
                         rerank_profile,
@@ -22668,6 +22669,7 @@ pub struct TimeFilter {
 #[derive(Debug, Clone, Default)]
 pub struct ApiSearchOptions {
     frozen: Option<crate::search::model_api::ValidatedApiConfig>,
+    embedding_route: Option<crate::search::model_api::embedding_route::EmbeddingRoute>,
     pub config_path: Option<PathBuf>,
     pub embedding_profile: Option<String>,
     pub rerank_profile: Option<String>,
@@ -25053,17 +25055,21 @@ fn api_window_route(opts: &SemanticSearchOptions, profile: Option<&crate::search
     Ok(Some(crate::search::rerank::window::ApiWindowRoute {
         rerank_profile: profile.id.clone(), rerank_route_sha256: route.sha256(),
         fallback_profile: route.fallback_profile().map(str::to_owned), allow_fallback: !opts.api.no_model_fallback,
+        embedding_route_sha256: if embedding.is_some() {
+            Some(opts.api.embedding_route.as_ref().ok_or_else(|| CliError::usage("embedding route was not frozen", None))?.identity_sha256())
+        } else { None },
         embedding_profile: embedding.map(|p| p.id), embedding_config_sha256,
     }))
 }
 
-fn api_regression_embedding_binding(conn: &crate::storage::api::Conn, profile: &crate::search::model_api::ValidatedProfile) -> anyhow::Result<serde_json::Value> {
+fn api_regression_embedding_binding(conn: &crate::storage::api::Conn, route: &crate::search::model_api::embedding_route::EmbeddingRoute) -> anyhow::Result<serde_json::Value> {
+    let profile = &route.primary;
     let call = crate::search::model_api::EndpointConfigIdentity::from_profile(profile)?;
     Ok(conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
         let id = tx.query_row_map("SELECT id FROM embedding_generations WHERE is_active = 1 AND audit_status = 'passed'", &[], |row| row.get_typed::<i64>(0))?;
-        let verified = crate::storage::api_generation::open_api_generation(tx, id, profile).map_err(crate::storage::api::StorageError::from)?;
+        let verified = route.open_generation(tx, id)?;
         Ok(serde_json::json!({"profile":profile.id,"requested_model":profile.model,"declared_revision":profile.model_revision,
-            "endpoint_config_sha256":call.sha256(),"descriptor_sha256":verified.descriptor_sha256(),
+            "endpoint_config_sha256":call.sha256(),"embedding_route_sha256":route.identity_sha256(),"descriptor_sha256":verified.descriptor_sha256(),
             "generation_id":id,"dimension":verified.descriptor().effective_dimension()}))
     })?)
 }
@@ -25144,7 +25150,9 @@ fn run_cli_search(
             semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
             .map_err(model_api_runtime_error)?;
         if mode != Some(SearchMode::Lexical) {
-            select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
+            let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
+            semantic_opts.api.embedding_route = Some(crate::search::model_api::embedding_route::EmbeddingRoute::load(
+                &config, &profile, !semantic_opts.api.no_model_fallback));
         }
         semantic_opts.api.frozen = Some(config);
         if semantic_opts.rerank { selected_api_rerank_profile(&semantic_opts)?; }
@@ -25184,11 +25192,11 @@ fn run_cli_search(
     #[cfg(not(feature = "infinity"))]
     let mut regression_embedding_binding: Option<serde_json::Value> = None;
 
-    if let (Some(run), Some(config)) = (regression.as_ref(), semantic_opts.api.frozen.as_ref()) {
+    if let (Some(run), Some(_)) = (regression.as_ref(), semantic_opts.api.frozen.as_ref()) {
         if mode != Some(SearchMode::Lexical) {
-            let profile = select_api_embedding_profile(config, semantic_opts.api.embedding_profile.as_deref())?;
+            let route = semantic_opts.api.embedding_route.as_ref().expect("semantic route frozen");
             let conn = run.context.connection().map_err(regression_search_error)?;
-            regression_embedding_binding = Some(api_regression_embedding_binding(&conn, &profile).map_err(regression_search_error)?);
+            regression_embedding_binding = Some(api_regression_embedding_binding(&conn, route).map_err(regression_search_error)?);
         }
     }
 
@@ -25786,10 +25794,10 @@ fn run_cli_search(
         SearchMode::Semantic | SearchMode::Hybrid
     ) {
         if let Some(config) = semantic_opts.api.frozen.as_ref() {
-            let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
             let api_client = Arc::new(crate::search::model_api::ApiClient::new(
                 config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)));
-            if let Err(error) = client.set_api_semantic_context(api_client, profile, !semantic_opts.api.no_model_fallback) {
+            let route = semantic_opts.api.embedding_route.clone().expect("semantic route frozen");
+            if let Err(error) = client.set_api_frozen_semantic_context(api_client, route) {
                 if hybrid_fail_open && error.is::<crate::search::model_api::query_embedding::QueryGenerationUnavailable>() {
                     mode_meta.fall_back_to_lexical("API generation is absent or not audited");
                 } else {

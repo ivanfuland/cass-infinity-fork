@@ -3643,8 +3643,16 @@ impl SearchClient {
         profile: crate::search::model_api::ValidatedProfile,
         allow_fallback: bool,
     ) -> Result<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>> {
-        use crate::search::model_api::query_embedding::{ApiQueryEmbedder, QueryGenerationBinding};
         let route=crate::search::model_api::embedding_route::EmbeddingRoute::load(client.config(),&profile,allow_fallback);
+        self.set_api_frozen_semantic_context(client, route)
+    }
+
+    pub(crate) fn set_api_frozen_semantic_context(
+        &self, client: Arc<crate::search::model_api::ApiClient>,
+        route: crate::search::model_api::embedding_route::EmbeddingRoute,
+    ) -> Result<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>> {
+        use crate::search::model_api::query_embedding::{ApiQueryEmbedder, QueryGenerationBinding};
+        let allow_fallback = route.allow_fallback;
         let binding = {
             let guard = self.sqlite_guard()?;
             let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
