@@ -1977,6 +1977,38 @@ impl fmt::Display for ApiPrimaryBackfillError {
     }
 }
 
+/// Refuse to probe when the archive's existing active/pending generations are
+/// not admitted under the route's compatibility proof (spec §6.4): a fallback
+/// must never be reached while an existing generation is unadmitted. Read-only
+/// — it opens generations inside a deferred, no-replay transaction and never
+/// writes. Shared by [`probe_api_backfill`] and [`probe_api_preflight`] so the
+/// two callers enforce the identical rule instead of two copies drifting apart.
+fn admit_existing_primary_generations(
+    storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<(), ApiPrimaryBackfillError> {
+    let Some(proof) = &call.route().proof else {
+        return Ok(());
+    };
+    let descriptor = RepresentationDescriptor::from_profile(call.profile(), proof.primary_dimension() as u64)
+        .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
+    let id = descriptor.embedder_id();
+    let checked = storage.raw().with_tx_no_replay(TxMode::Deferred, |tx| {
+        for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
+            let candidate = tx.query_opt_map(sql, &params![id.as_str(), proof.primary_dimension() as i64,
+                i64::from(descriptor.canonicalize_version()), i64::from(descriptor.chunking_version())],
+                |row| row.get_typed::<i64>(0))?;
+            if let Some(candidate) = candidate { call.route().open_generation(tx, candidate)?; }
+        }
+        Ok(())
+    });
+    if checked.is_err() {
+        return Err(ApiPrimaryBackfillError::CompatibilityRequired {
+            message: "CompatibilityRequired: existing generation history was not admitted before probe; no model request sent".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Verify every possible existing target before a probe may use the backup.
 /// The fingerprint is still measured live; proof metadata only supplies the
 /// expected space for this read-only preflight. Page/activation checks remain.
@@ -1984,24 +2016,30 @@ pub fn probe_api_backfill(
     storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
 ) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
     call.invalidate_probe();
-    if let Some(proof) = &call.route().proof {
-        let descriptor = RepresentationDescriptor::from_profile(call.profile(), proof.primary_dimension() as u64)
-            .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
-        let id = descriptor.embedder_id();
-        let checked = storage.raw().with_tx_no_replay(TxMode::Deferred, |tx| {
-            for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
-                let candidate = tx.query_opt_map(sql, &params![id.as_str(), proof.primary_dimension() as i64,
-                    i64::from(descriptor.canonicalize_version()), i64::from(descriptor.chunking_version())],
-                    |row| row.get_typed::<i64>(0))?;
-                if let Some(candidate) = candidate { call.route().open_generation(tx, candidate)?; }
-            }
-            Ok(())
-        });
-        if checked.is_err() {
-            return Err(ApiPrimaryBackfillError::CompatibilityRequired {
-                message: "CompatibilityRequired: existing generation history was not admitted before probe; no model request sent".into(),
-            });
-        }
+    admit_existing_primary_generations(storage, call)?;
+    call.probe().map_err(|error| if error.is_compatibility_required() {
+        ApiPrimaryBackfillError::CompatibilityRequired { message: error.message() }
+    } else { ApiPrimaryBackfillError::Failed(anyhow!(error)) })
+}
+
+/// One fresh, generic synthetic probe for a command that must decide
+/// reachability **before** it touches the archive (`cass sync`'s semantic
+/// preflight).
+///
+/// `existing_database` is the canonical archive opened **read-only**, or `None`
+/// when the path holds no current-schema archive yet. When an archive is
+/// present, the same historical admission `probe_api_backfill` enforces runs
+/// first, so a fallback cannot be reached while an existing generation is
+/// unadmitted; a fresh archive has no generation history, so the compatibility
+/// proof `EmbeddingRoute::load` already read and validated is the whole fallback
+/// admission. No write transaction is opened either way, so a failed probe
+/// leaves an existing archive unchanged and a missing one uncreated.
+pub fn probe_api_preflight(
+    existing_database: Option<&FrankenStorage>, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
+    call.invalidate_probe();
+    if let Some(storage) = existing_database {
+        admit_existing_primary_generations(storage, call)?;
     }
     call.probe().map_err(|error| if error.is_compatibility_required() {
         ApiPrimaryBackfillError::CompatibilityRequired { message: error.message() }
