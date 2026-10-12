@@ -331,10 +331,14 @@ impl PrimaryEmbeddingCall {
     /// The probe's requests are recorded separately from document batches. A
     /// second probe on this same call re-probes the live endpoint; nothing is
     /// cached across commands.
-    pub fn probe(&self) -> Result<ProbeMeasurement, PrimaryEmbedFailure> {
+    pub(crate) fn invalidate_probe(&self) {
         self.probed_dimension.set(0);
         self.probe_writers.borrow_mut().clear();
         self.page_writers.borrow_mut().clear();
+    }
+
+    pub fn probe(&self) -> Result<ProbeMeasurement, PrimaryEmbedFailure> {
+        self.invalidate_probe();
         let mut writers = Vec::<ValidatedProfile>::new();
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(API_PROBE_SENTINELS.len());
         let mut dimension: Option<usize> = None;
@@ -797,6 +801,16 @@ mod page_writer_tests {
         assert!(call.probe_calls().is_empty());
         assert_eq!(primary.hits(), 0);
         assert_eq!(backup.fixture().hits(), 0);
+        // An independently measured probe must not survive a rejected build preflight.
+        call.probe().unwrap();
+        assert_eq!(call.dimension(), 2);
+        assert!(probe_api_backfill(&storage, &call).is_err());
+        assert_eq!(call.dimension(), 0);
+        assert!(call.probe_writers().is_empty());
+        assert!(call.page_writers().is_empty());
+        assert_eq!(primary.hits(), 1);
+        assert_eq!(backup.fixture().hits(), 1);
+        assert_eq!(call.embed_documents(&["stale state"]).unwrap_err(), PrimaryEmbedFailure::ProbeMissing);
     }
 
     #[test]

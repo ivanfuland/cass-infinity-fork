@@ -1967,6 +1967,7 @@ impl fmt::Display for ApiPrimaryBackfillError {
 pub fn probe_api_backfill(
     storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
 ) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
+    call.invalidate_probe();
     if let Some(proof) = &call.route().proof {
         let descriptor = RepresentationDescriptor::from_profile(call.profile(), proof.primary_dimension() as u64)
             .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
