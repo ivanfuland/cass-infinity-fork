@@ -18,7 +18,7 @@ fn valid_sha(s: &str) -> bool { s.len()==64 && s.bytes().all(|b| b.is_ascii_digi
 #[serde(deny_unknown_fields)]
 pub(crate) struct FilePin { pub name: String, pub sha256: String }
 impl FilePin {
-    fn validate(&self) -> Result<(), Error> {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
         if !valid_sha(&self.sha256) || self.name.is_empty() || self.name.len()>128 || self.name.starts_with('.')
             || !self.name.ends_with(".json") || !self.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
             return Err(Error::InvalidEvidence);
@@ -98,7 +98,7 @@ fn matching_summary(a: &PairSummary, b: &PairSummary) -> bool {
         && close(a.maximum_relative_norm_delta,b.maximum_relative_norm_delta)
 }
 
-fn read_regular(path: &std::path::Path) -> Result<Vec<u8>, Error> {
+pub(crate) fn read_regular(path: &std::path::Path) -> Result<Vec<u8>, Error> {
     use std::io::Read;
     let metadata=std::fs::symlink_metadata(path).map_err(|_|Error::InvalidEvidence)?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len()>MAX_FILE as u64 { return Err(Error::InvalidEvidence); }

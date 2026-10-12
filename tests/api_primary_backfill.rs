@@ -2825,3 +2825,50 @@ fn api_query_without_a_generation_preserves_hybrid_policy_without_http() {
     assert_eq!(semantic.status.code(), Some(15));
     assert_eq!(stub.requests().len(), 0);
 }
+
+#[test]
+fn compatibility_capture_cli_publishes_private_pinned_files_and_never_overwrites() {
+    use sha2::{Digest,Sha256};
+    let digest=|bytes:&[u8]| hex::encode(Sha256::digest(bytes));
+    let (_dir,data_dir)=scratch();
+    let server=Stub::start(healthy_responder(8,0));
+    let config=data_dir.join("models.toml");
+    fs::write(&config,config_text("local8",&embedding_profile_block("local8",&server.endpoint(),EMBED_MODEL,EMBED_REVISION,2,"query_prefix = \"Q:\""))).unwrap();
+    let texts=vec!["Rust 所有权是什么？".to_owned(),"Rust ownership tracks values.".to_owned(),"fn lock() {}".to_owned(),"café ☃".to_owned(),"lock".to_owned(),"x ".repeat(45)];
+    let categories=["chinese","english","code","unicode","short","long"];
+    let fixture=serde_json::json!({"version":1,"samples":texts.iter().enumerate().map(|(i,text)|serde_json::json!({"id":format!("s{i}"),"text":text,"coverage":categories[i]})).collect::<Vec<_>>(),
+        "documents":["s1","s2"],"queries":[{"sample":"s0","expected_document":"s1"},{"sample":"s4","expected_document":"s2"}]});
+    let declaration=serde_json::json!({"basis":"operator_declared","value":"synthetic test source"});
+    let counter=serde_json::json!({"basis":"operator_declared","value":"synthetic scalar counter"});
+    let inputs=|prefix:&str| texts.iter().map(|s|format!("{prefix}{s}")).collect::<Vec<_>>();
+    let query=inputs("Q:"); let document=inputs(DOCUMENT_PREFIX);
+    let records=|texts:&[String]| texts.iter().map(|s|serde_json::json!({"input_sha256":digest(s.as_bytes()),"token_ids":s.chars().map(|c|c as u32).collect::<Vec<_>>()})).collect::<Vec<_>>();
+    let tokens=serde_json::json!({"version":1,"counter_id":"synthetic scalar counter","counter_source_sha256":digest(b"synthetic counter source"),
+        "tokenizer_declaration_sha256":digest(&serde_json::to_vec(&declaration).unwrap()),"query":records(&query),"document":records(&document)});
+    let token_bytes=serde_json::to_vec(&tokens).unwrap();
+    let sources=serde_json::json!({"weights":declaration,"tokenizer":declaration,"pooling":declaration,"server_input_template":declaration,
+        "token_counter":counter,"token_counter_artifact_sha256":digest(&token_bytes),"safe_input_tokens":100,
+        "query_token_counts":query.iter().map(|s|s.chars().count()).collect::<Vec<_>>(),"document_token_counts":document.iter().map(|s|s.chars().count()).collect::<Vec<_>>()});
+    let fixture_bytes=serde_json::to_vec(&fixture).unwrap(); let source_bytes=serde_json::to_vec(&sources).unwrap();
+    let fixture_path=data_dir.join("fixture.json");let source_path=data_dir.join("sources.json");let token_path=data_dir.join("tokens.json");
+    fs::write(&fixture_path,&fixture_bytes).unwrap();fs::write(&source_path,&source_bytes).unwrap();fs::write(&token_path,&token_bytes).unwrap();
+    let fixture_sha=digest(&fixture_bytes);let source_sha=digest(&source_bytes);let token_sha=digest(&token_bytes);
+    let output=data_dir.join("capture-result");
+    let args=["models","capture-compatibility","--profile","local8","--api-config",config.to_str().unwrap(),"--json",
+        "--fixture",fixture_path.to_str().unwrap(),"--fixture-sha256",&fixture_sha,
+        "--sources",source_path.to_str().unwrap(),"--sources-sha256",&source_sha,
+        "--token-receipt",token_path.to_str().unwrap(),"--token-receipt-sha256",&token_sha,"--output",output.to_str().unwrap()];
+    let result=assert_success(&cass(&args,&[]));
+    assert_eq!(result["status"],"captured");assert_eq!(result["requests"],12);assert_eq!(server.requests().len(),12);
+    let manifest_bytes=fs::read(output.join("capture-manifest.json")).unwrap();
+    assert_eq!(result["manifest_sha256"],digest(&manifest_bytes));
+    let manifest:serde_json::Value=serde_json::from_slice(&manifest_bytes).unwrap();
+    for field in ["fixture","capture","token_receipt","calls"] {
+        let path=output.join(manifest[field]["name"].as_str().unwrap());
+        assert_eq!(digest(&fs::read(&path).unwrap()),manifest[field]["sha256"]);
+        #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(fs::metadata(path).unwrap().permissions().mode()&0o777,0o600);}
+    }
+    #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(fs::metadata(&output).unwrap().permissions().mode()&0o777,0o700);}
+    let repeated=cass(&args,&[]);assert!(!repeated.status.success());
+    assert_eq!(server.requests().len(),12);assert_eq!(manifest_bytes,fs::read(output.join("capture-manifest.json")).unwrap());
+}

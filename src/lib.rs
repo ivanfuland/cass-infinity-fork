@@ -2488,6 +2488,10 @@ pub enum IngestCommand {
 /// Subcommands for managing semantic search models
 #[derive(Subcommand, Debug, Clone)]
 pub enum ModelsCommand {
+    /// Capture both rounds of an explicitly pinned compatibility fixture.
+    CaptureCompatibility(crate::search::model_api::compatibility_tools::CaptureArgs),
+    /// Recompute compatibility from pinned capture manifests without network I/O.
+    VerifyCompatibility(crate::search::model_api::compatibility_tools::VerifyArgs),
     /// Show model installation status
     Status {
         /// Output as JSON (`--robot` also works)
@@ -21644,6 +21648,12 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         }
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
+        }
+        Commands::Models(ModelsCommand::VerifyCompatibility(args)) => {
+            resolve_subcommand_structured_format(cli, args.json).is_some()
+        }
+        Commands::Models(ModelsCommand::CaptureCompatibility(args)) => {
+            resolve_subcommand_structured_format(cli, args.json).is_some()
         }
         Commands::Models(ModelsCommand::List { json })
         | Commands::Models(ModelsCommand::Check { json, .. }) => {
@@ -100966,6 +100976,25 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
 /// Handle models subcommands
 fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
+        ModelsCommand::VerifyCompatibility(args) => {
+            reject_retired_model_env()?;
+            let config = crate::search::model_api::runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key)).map_err(model_api_runtime_error)?;
+            let report = crate::search::model_api::compatibility_tools::verify_to_directory(&config, &args)
+                .map_err(|error| CliError::usage(error.to_string(), Some("Use complete pinned captures and a fresh output directory".into())))?;
+            println!("{}", serde_json::to_string(&report).map_err(|_|CliError::unknown("compatibility proof encoding failed"))?);
+            Ok(())
+        }
+        ModelsCommand::CaptureCompatibility(args) => {
+            reject_retired_model_env()?;
+            let config = crate::search::model_api::runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key)).map_err(model_api_runtime_error)?;
+            let client = crate::search::model_api::ApiClient::new(config, Box::new(crate::search::model_api::EnvCredentialResolver));
+            let report = crate::search::model_api::compatibility_tools::capture_to_directory(&client, &args)
+                .map_err(|error| CliError::usage(error.to_string(), Some("Use pinned regular input files and a new output directory".into())))?;
+            let failed = report["status"] != "captured";
+            println!("{}", serde_json::to_string(&report).map_err(|_|CliError::unknown("compatibility capture encoding failed"))?);
+            if failed { return Err(CliError {code:1,kind:"ModelApiCompatibilityCapture",message:"Compatibility capture failed; private failure report retained".into(),hint:None,retryable:false}); }
+            Ok(())
+        }
         ModelsCommand::Status { json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_models_status(structured_format)

@@ -1,6 +1,6 @@
 //! Explicit single-endpoint compatibility capture. All inputs and token receipts
 //! are frozen before the first POST. No fallback, metadata GET or retry occurs.
-use serde::Serialize;
+use serde::{Serialize,Deserialize};
 use sha2::{Digest, Sha256};
 use super::{ApiClient, ApiCallErrorCode, EndpointConfigIdentity, InputKind, ValidatedProfile};
 use super::compatibility::CompatibilityError;
@@ -8,8 +8,9 @@ use super::compatibility_archive::{Capture, CheckedCapture, CheckedFixture, Resp
 use super::compatibility_bundle::check_counter_inputs;
 use crate::search::rerank::window::ApiWindowAttempt;
 
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct ProbeAttempt { pub round: usize, pub input_kind: &'static str, pub call: ApiWindowAttempt }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProbeAttempt { pub round: usize, pub input_kind: String, pub call: ApiWindowAttempt }
 #[derive(Debug)]
 pub(crate) struct CaptureFailure {
     pub code: CompatibilityError,
@@ -72,11 +73,11 @@ pub(crate) fn capture(
                 let outcome=match client.embed_once(profile_id,texts,kind) {
                     Ok(outcome)=>outcome,
                     Err(error)=>{
-                        attempts.extend(error.attempts().iter().map(|call| ProbeAttempt{round,input_kind:name,call:call.into()}));
+                        attempts.extend(error.attempts().iter().map(|call| ProbeAttempt{round,input_kind:name.to_owned(),call:call.into()}));
                         return Err(CaptureFailure{code:CompatibilityError::CaptureFailed,api_error:Some(error.error().code()),attempts});
                     }
                 };
-                attempts.extend(outcome.attempts.iter().map(|call| ProbeAttempt{round,input_kind:name,call:call.into()}));
+                attempts.extend(outcome.attempts.iter().map(|call| ProbeAttempt{round,input_kind:name.to_owned(),call:call.into()}));
                 if dimension.is_some_and(|seen|seen!=outcome.dimension) {
                     if let Some(last)=attempts.last_mut() {last.call.error_code=Some("DimensionMismatch".into());}
                     return Err(CaptureFailure{code:CompatibilityError::DimensionMismatch,api_error:None,attempts});
@@ -98,13 +99,13 @@ pub(crate) fn capture(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use super::super::compatibility_archive::tests::{fixture,archive};
     use super::super::compatibility_bundle::{CountedInput,TokenReceipt};
     use super::super::test_support::{HttpFixture,Reply};
 
-    fn inputs(server:&HttpFixture)->(ApiClient,CheckedFixture,Sources,Vec<u8>) {
+    pub(in crate::search::model_api) fn inputs(server:&HttpFixture)->(ApiClient,CheckedFixture,Sources,Vec<u8>) {
         let (_,fixture)=fixture(); let mut template=archive(&fixture,1);
         let text=template.profile_toml.replace("http://127.0.0.1:1/embedding",&server.base())+"max_batch=2\n";
         let config=super::super::ApiConfig::parse_toml(&text).unwrap();
