@@ -106996,12 +106996,19 @@ model_revision="r1"
             let path = root.path().join("invalid-api.toml");
             std::fs::write(
                 &path,
-                "version=1\ndefault_rerank=\"rank\"\n[profiles.rank]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"http://127.0.0.1:1\"\nmodel=\"BAAI/bge-reranker-v2-m3\"\nmodel_revision=\"r1\"\n",
+                "version=1\ndefault_rerank=\"rank\"\n[profiles.rank]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"http://not-loopback.invalid:1/v1/rerank\"\nmodel=\"BAAI/bge-reranker-v2-m3\"\nmodel_revision=\"r1\"\n",
             )
             .unwrap();
             path
         };
-        search_with_api(
+        // The endpoint is refused when the frozen config loads, i.e. before the
+        // run reaches any HTTP stage: the request is never sent, no evidence
+        // window is written, and the run root stays empty. A merely unreachable
+        // (connection-refused) endpoint is a different outcome — that one *is*
+        // attempted and recorded — so this guard keeps the "zero sends"
+        // semantics the retired local provider expressed with an unparseable
+        // origin.
+        let error = search_with_api(
             execution(
                 context,
                 &expected,
@@ -107015,10 +107022,23 @@ model_revision="r1"
             ApiSearchOptions { config_path: Some(invalid_config), ..Default::default() },
         )
         .unwrap_err();
-        let proof = evidence(&invalid_root);
-        assert!(!proof.applied);
-        assert!(proof.failure_reason.is_some());
-        assert!(proof.transport.requests.is_empty());
+        assert!(
+            !error.message.is_empty(),
+            "a refused endpoint must surface a typed regression error"
+        );
+        let has_evidence_window = std::fs::read_dir(&invalid_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("regression-search-")
+            });
+        assert!(
+            !has_evidence_window,
+            "a config-time refusal must not write an evidence window: nothing was sent"
+        );
         assert_eq!(before, std::fs::read(db).unwrap());
     }
     #[test]
