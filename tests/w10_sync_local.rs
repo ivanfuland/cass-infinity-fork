@@ -15,10 +15,9 @@
 //! 4. `semantic_activation_decides_exit_3` — the post-index decision table
 //!    itself, including the `semantic_activated = false` arm that the
 //!    end-to-end fixtures cannot reach (see the note in test 3).
-//! 5. `sync_without_the_infinity_feature_fails_the_same_precondition` — the
-//!    mirror image of the unreachable-Infinity arm, for a build compiled
-//!    without the `infinity` feature; PR10 task 08 added it, and it compiles
-//!    only in that configuration.
+//! 5. `sync_without_a_configured_embedding_profile_fails_the_precondition` —
+//!    the mirror image of the unreachable-backend arm, for a round with no
+//!    embedding API configuration at all; PR10 task 08 added it.
 //!
 //! The Infinity stub is a deliberate copy of the one in
 //! `tests/w8_t6b_ingest.rs`: `tests/util/` is outside this task's write
@@ -685,21 +684,24 @@ fn sync_precondition_failures_exit_2() {
 
 /// The same precondition, reached from the other side.
 ///
-/// A binary compiled without the `infinity` feature has no semantic backend
-/// to probe at all, so the round must stop at the identical precondition with
-/// the identical kind — not compile the probe away, not degrade silently to
-/// lexical, and not report success. Only such a build can run this: with the
-/// feature on, the binary has a semantic tier and the round succeeds.
-#[cfg(not(feature = "infinity"))]
+/// A round with no embedding API configuration at all has no semantic backend
+/// to run, so it must stop at the identical precondition with the identical
+/// kind — not silently degrade to lexical, and not report success. The retired
+/// `infinity` feature no longer gates this: with no `--api-config` and no
+/// `CASS_API_CONFIG`, the preflight refuses before any side effect.
 #[test]
-fn sync_without_the_infinity_feature_fails_the_same_precondition() {
+fn sync_without_a_configured_embedding_profile_fails_the_precondition() {
     let fixture = Fixture::new();
     fixture.seed_session("rollout-noinf.jsonl", "w10-noinf");
 
-    // No backend is configured *and* none is reachable: `CASS_INFINITY_URL`
-    // is removed rather than pointed at a stub, so a round that failed only
-    // because of the network could not produce this report.
+    // No embedding API configuration is present at all: no `--api-config`, no
+    // `CASS_API_CONFIG`, and the retired `CASS_INFINITY_URL` removed, so a
+    // round that failed only because of the network could not produce this
+    // report. `Fixture::command` only scrubs its own defaults, so the two
+    // configuration/selection variables are cleared here explicitly rather
+    // than inherited from the operator's environment.
     let mut cmd = fixture.command();
+    cmd.env_remove("CASS_API_CONFIG");
     cmd.env_remove("CASS_INFINITY_URL");
     cmd.args(["sync", "--json", "--data-dir"]);
     cmd.arg(fixture.data_dir());
@@ -712,7 +714,7 @@ fn sync_without_the_infinity_feature_fails_the_same_precondition() {
     assert_eq!(
         output.status.code(),
         Some(EXIT_PRECONDITION),
-        "a build with no semantic backend must exit 2: {}",
+        "a round with no configured semantic backend must exit 2: {}",
         stderr_of(&output)
     );
     assert_eq!(
@@ -720,20 +722,20 @@ fn sync_without_the_infinity_feature_fails_the_same_precondition() {
         serde_json::json!("semantic-unavailable"),
         "the report must name the missing semantic backend: {report}"
     );
-    // `semantic-unavailable` is shared with "Infinity is configured but
-    // unreachable", so the kind alone cannot tell the two apart. Pin the
-    // build-specific wording: a binary compiled without the feature has no
-    // probe to fail, and must not describe one as unreachable.
+    // `semantic-unavailable` is shared with "a profile is configured but
+    // unusable", so the kind alone cannot tell the two apart. Pin the wording:
+    // with no configuration named at all, the preflight must name the missing
+    // configuration, not a network problem.
     let message = report["error"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("the report must carry a string error message: {report}"));
     assert!(
-        message.contains("compiled without the `infinity` feature"),
-        "the message must name the missing build feature, not a network problem: {message}"
+        message.contains("no model API configuration selected"),
+        "the message must name the missing embedding API configuration, not a network problem: {message}"
     );
     assert!(
         !message.contains("did not answer the embed-identity probe"),
-        "a build with no probe must not report one as unreachable: {message}"
+        "a round with no configured backend must not report a probe as unreachable: {message}"
     );
     assert_eq!(
         report["mirror"]["attempted"],

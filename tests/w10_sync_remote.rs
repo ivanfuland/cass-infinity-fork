@@ -48,24 +48,22 @@
 //! 9. `concurrent_rounds_append_one_intact_line_each` — the same contract
 //!    across four real `cass sync` processes appending at once.
 //!
-//! What a build configuration can run, and why the gate is
-//! `all(unix, feature = "infinity")` rather than just `unix`:
+//! What a build configuration can run, and why the gate is `unix`:
 //!
 //! * The eight cross-thread/cross-process cases that drive the real binary
 //!   (`cass sync`, the stand-in `ssh`/`rsync` on a private `PATH`) expect the
-//!   round to get past the semantic precondition — which a build without the
-//!   `infinity` feature can never do (it exits 2 by construction, see
-//!   `src/sync.rs::preflight_semantic`). Leaving them Unix-only made them
-//!   *run* under `--features qr,encryption` and fail; that was a test gap, not
-//!   a product one.
+//!   round to get past the semantic precondition, which now needs a configured
+//!   embedding API profile (see `src/sync.rs::preflight_semantic`). They are
+//!   Unix-only for the private `PATH` and process signalling the fixture
+//!   relies on; the former `infinity` feature gate was retired with the
+//!   model-API migration.
 //! * The log-writer cases, the status case and the decision-table case call
 //!   only feature-independent functions, so they run in every configuration,
-//!   Windows and no-Infinity included.
+//!   Windows included.
 //!
-//! The dead-code and unused-import allowance therefore covers exactly the two
-//! configurations where the fixture is genuinely unreachable —
-//! `not(all(unix, feature = "infinity"))` — and no other, so the full build
-//! still reports an unused item if one appears.
+//! The dead-code and unused-import allowance therefore covers exactly the
+//! non-Unix configuration where the fixture is genuinely unreachable, and no
+//! other, so the Unix build still reports an unused item if one appears.
 
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 

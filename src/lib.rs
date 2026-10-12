@@ -79755,7 +79755,10 @@ pub(crate) fn run_doctor_impl(
                     db_path: db_path.clone(),
                     data_dir: data_dir.clone(),
                     semantic: false,
-                    embedder: "fastembed".to_string(),
+                    // `embedder` is only read on semantic runs (it is the
+                    // progress label); this lexical-only rebuild uses a
+                    // neutral value rather than a retired backend name.
+                    embedder: "lexical".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
                 };
@@ -89651,7 +89654,10 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         db_path,
         data_dir,
         semantic: false,
-        embedder: "fastembed".to_string(),
+        // `embedder` is only read on semantic runs (it is the progress label);
+        // this lexical-only refresh uses a neutral value rather than a retired
+        // backend name.
+        embedder: "lexical".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
     };
