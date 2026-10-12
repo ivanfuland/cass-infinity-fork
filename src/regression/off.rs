@@ -1475,6 +1475,7 @@ query_prefix="Query: "
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
+                        let mut parsed_body: Value = Value::Null;
                         let mut bytes = Vec::new();
                         let mut buffer = [0; 4096];
                         loop {
@@ -1500,16 +1501,16 @@ query_prefix="Query: "
                                         .to_string();
                                     assert_eq!(path, "/embeddings");
                                     paths.push(path);
-                                    let body: Value =
+                                    parsed_body =
                                         serde_json::from_slice(&bytes[end + 4..end + 4 + length])
                                             .unwrap();
-                                    assert_eq!(body["model"], "BAAI/bge-m3");
+                                    assert_eq!(parsed_body["model"], "BAAI/bge-m3");
                                     break;
                                 }
                             }
                         }
                         if !build_done_watch.exists() {
-                            let inputs = body["input"].as_array().unwrap();
+                            let inputs = parsed_body["input"].as_array().unwrap();
                             let mut embedding = vec![0.0; 1024];
                             embedding[0] = 1.0;
                             let body = serde_json::json!({"data": inputs.iter().enumerate().map(|(i,_)| json!({"index":i,"embedding":embedding})).collect::<Vec<_>>()}).to_string();
