@@ -2729,3 +2729,19 @@ fn api_query_hybrid_requires_proof_only_for_enabled_fallback() {
     assert_eq!(stub.requests().len(), before + 2);
     assert_eq!(cloud.connections(), 0);
 }
+
+#[test]
+fn api_query_configuration_is_checked_before_database_work() {
+    let (_dir, data_dir) = scratch();
+    let absent = data_dir.join("must-not-be-created");
+    let missing_config = data_dir.join("missing.toml");
+    let output = cass(&["search", "query", "--mode", "semantic", "--json",
+        "--data-dir", absent.to_str().unwrap(), "--api-config", missing_config.to_str().unwrap()], &[]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    assert!(stderr_text(&output).contains("ModelApiConfiguration"));
+    assert!(!absent.exists(), "configuration refusal must not create a database or self-heal state");
+    let _storage = build_db(&data_dir, &["a synthetic searchable document for lexical independence"]);
+    let lexical = cass(&["search", "synthetic", "--mode", "lexical", "--json",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", missing_config.to_str().unwrap()], &[]);
+    assert_success(&lexical);
+}

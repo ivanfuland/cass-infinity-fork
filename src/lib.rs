@@ -7399,6 +7399,7 @@ async fn execute_cli(
                     );
 
                     semantic_opts.api = ApiSearchOptions {
+                        frozen: None,
                         config_path: cli.api_config.clone(),
                         embedding_profile,
                         no_model_fallback,
@@ -22643,6 +22644,7 @@ pub struct TimeFilter {
 /// Explicit API selections for a search command.
 #[derive(Debug, Clone, Default)]
 pub struct ApiSearchOptions {
+    frozen: Option<crate::search::model_api::ValidatedApiConfig>,
     pub config_path: Option<PathBuf>,
     pub embedding_profile: Option<String>,
     pub no_model_fallback: bool,
@@ -25032,7 +25034,7 @@ fn run_cli_search(
     sessions_from: Option<String>,
     mode: Option<crate::search::query::SearchMode>,
     vector_search_mode: Option<crate::search::query::VectorSearchMode>,
-    semantic_opts: SemanticSearchOptions,
+    mut semantic_opts: SemanticSearchOptions,
     rerank_ctx: RerankRequestContext,
     mut regression: Option<RegressionSearchExecution>,
 ) -> CliResult<()> {
@@ -25048,6 +25050,25 @@ fn run_cli_search(
     use crate::sources::provenance::SourceFilter;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    let api_selected = semantic_opts.api.config_path.is_some()
+        || semantic_opts.api.embedding_profile.is_some()
+        || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
+    if api_selected && (mode != Some(SearchMode::Lexical) || semantic_opts.rerank) {
+        reject_retired_model_env()?;
+        if semantic_opts.model.is_some() || semantic_opts.use_daemon {
+            return Err(model_api_migration_error(
+                "legacy model or daemon selection cannot be used with API profiles".into(),
+                "Use --embedding-profile with --api-config".into()));
+        }
+        let config = crate::search::model_api::runtime::load_config(
+            semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
+            .map_err(model_api_runtime_error)?;
+        if mode != Some(SearchMode::Lexical) {
+            select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
+        }
+        semantic_opts.api.frozen = Some(config);
+    }
 
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
@@ -25674,22 +25695,10 @@ fn run_cli_search(
         mode_meta.requested,
         SearchMode::Semantic | SearchMode::Hybrid
     ) {
-        let api_selected = semantic_opts.api.config_path.is_some()
-            || semantic_opts.api.embedding_profile.is_some()
-            || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
-        if api_selected {
-            reject_retired_model_env()?;
-            if semantic_opts.model.is_some() || semantic_opts.use_daemon {
-                return Err(model_api_migration_error(
-                    "legacy model or daemon selection cannot be used with API profiles".into(),
-                    "Use --embedding-profile with --api-config".into()));
-            }
-            let config = crate::search::model_api::runtime::load_config(
-                semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
-                .map_err(model_api_runtime_error)?;
+        if let Some(config) = semantic_opts.api.frozen.as_ref() {
             let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
             let api_client = Arc::new(crate::search::model_api::ApiClient::new(
-                config, Box::new(crate::search::model_api::EnvCredentialResolver)));
+                config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)));
             client.set_api_semantic_context(api_client, profile, !semantic_opts.api.no_model_fallback)
                 .map_err(|_| CliError {
                     code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
