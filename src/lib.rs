@@ -19508,7 +19508,7 @@ fn state_meta_json_inner(
                 available: false,
                 can_search: false,
                 fallback_mode: Some("lexical"),
-                preferred_backend: "fastembed",
+                preferred_backend: "external",
                 embedder_id: None,
                 vector_index_path: None,
                 model_dir: None,
@@ -76146,6 +76146,51 @@ mod cli_read_db_tests {
             database.get("open_error").and_then(|v| v.as_str()),
             None,
             "lazy open reports no open_error; corruption (if any) only surfaces on a real query"
+        );
+    }
+
+    /// API03 final-surface S2: the asset-inspection *failure* branch must
+    /// report the neutral `external` preferred backend, matching the normal
+    /// path in `asset_state::semantic_preference_surface`, and must keep the
+    /// underlying failure status and reason. Before this fix the branch
+    /// hardcoded the retired `fastembed` backend name.
+    ///
+    /// A real file with an invalid SQLite header drives it: the status probe
+    /// opens it lazily (`opened=true`, no `open_error`), but the lexical
+    /// fingerprint pass runs a real query and fails, which sends
+    /// `inspect_search_assets` into its error arm. `state_meta_json_for_status`
+    /// pins `include_counts=false`, so reach the branch through the full form
+    /// with counts enabled.
+    #[test]
+    fn status_state_asset_inspection_failure_uses_neutral_backend() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let file = std::fs::File::create(&db_path).expect("create placeholder");
+        file.set_len(64 * 1024).expect("grow placeholder");
+        drop(file);
+
+        let state = state_meta_json_full(temp.path(), &db_path, 60, true, Some(true), false, true);
+        let semantic = state
+            .get("semantic")
+            .and_then(serde_json::Value::as_object)
+            .expect("semantic state");
+        assert_eq!(
+            semantic.get("status").and_then(|v| v.as_str()),
+            Some("error"),
+            "the failure branch must keep the error status: {semantic:?}"
+        );
+        assert_eq!(
+            semantic.get("preferred_backend").and_then(|v| v.as_str()),
+            Some("external"),
+            "the failure branch must report the neutral backend, not the retired fastembed name: {semantic:?}"
+        );
+        assert!(
+            semantic
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("asset inspection failed"),
+            "the failure branch must preserve the raw failure reason: {semantic:?}"
         );
     }
 
