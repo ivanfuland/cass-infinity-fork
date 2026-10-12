@@ -27,10 +27,20 @@ use crate::storage::sqlite::FrankenStorage;
 
 /// Unified TUI state machine for semantic search availability.
 ///
-/// This enum tracks the full lifecycle of semantic search from the user's perspective:
-/// - Model installation flow (NotInstalled → NeedsConsent → Downloading → Verifying → Ready)
+/// On the API-only build nothing installs, downloads or loads a local weight,
+/// so the installation variants (`NotInstalled`, `NeedsConsent`,
+/// `Downloading`, `Verifying`) are retained legacy representations only: they
+/// keep existing state-machine consumers compiling and can still be reported,
+/// but no production path drives them as an executable download flow.
+/// `HashFallback` is different -- [`probe_hash_semantic_availability`] still
+/// returns it for a hash tier -- but it likewise never provides the API-only
+/// semantic inference path; it names the legacy hash representation. The
+/// states the API-only build produces for real semantic search are the index
+/// states and the diagnostic/error states.
+///
 /// - Index building flow (Ready → IndexBuilding → Ready)
-/// - User preferences (HashFallback, Disabled)
+/// - Legacy installation states (Downloading, Verifying, NotInstalled, NeedsConsent)
+/// - Legacy hash representation (HashFallback)
 /// - Error states (LoadFailed, ModelMissing, etc.)
 #[derive(Debug, Clone)]
 pub enum SemanticAvailability {
@@ -41,14 +51,15 @@ pub enum SemanticAvailability {
     // TUI-centric states for user flow
     // =========================================================================
     /// Model not installed - semantic not available.
-    /// TUI should show option to download or use hash fallback.
+    /// Legacy state: no production path installs a local model any more.
     NotInstalled,
 
     /// User needs to consent before downloading model.
-    /// TUI should show consent dialog.
+    /// Legacy state: no production path starts a local model download any more.
     NeedsConsent,
 
     /// Model download in progress.
+    /// Legacy state retained for existing consumers; never produced by the API-only build.
     Downloading {
         /// Progress percentage (0-100).
         progress_pct: u8,
@@ -59,6 +70,7 @@ pub enum SemanticAvailability {
     },
 
     /// Verifying downloaded model (SHA256 check).
+    /// Legacy state retained for existing consumers; never produced by the API-only build.
     Verifying,
 
     /// Index is being built or rebuilt.
@@ -72,7 +84,10 @@ pub enum SemanticAvailability {
         total_items: u64,
     },
 
-    /// User opted for hash-based fallback (no ML model).
+    /// Hash-based fallback (no ML model).
+    /// Legacy representation for a hash tier: still returned by
+    /// [`probe_hash_semantic_availability`], but it never provides the
+    /// API-only semantic inference path.
     HashFallback,
 
     /// Semantic search disabled by policy or user.
@@ -120,17 +135,18 @@ impl SemanticAvailability {
         matches!(self, SemanticAvailability::IndexBuilding { .. })
     }
 
-    /// Check if a download is in progress.
+    /// Check if a download is in progress (legacy state; see the enum docs).
     pub fn is_downloading(&self) -> bool {
         matches!(self, SemanticAvailability::Downloading { .. })
     }
 
-    /// Check if user consent is needed.
+    /// Check if user consent is needed (legacy state; see the enum docs).
     pub fn needs_consent(&self) -> bool {
         matches!(self, SemanticAvailability::NeedsConsent)
     }
 
-    /// Check if hash fallback is active.
+    /// Check if the legacy hash representation is active (still returned for a
+    /// hash tier; see the enum docs).
     pub fn is_hash_fallback(&self) -> bool {
         matches!(self, SemanticAvailability::HashFallback)
     }
