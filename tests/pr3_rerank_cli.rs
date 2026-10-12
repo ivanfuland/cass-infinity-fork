@@ -1888,7 +1888,6 @@ fn group6_partial_timeout_and_unwritable_cache_deliver_a_page_without_a_cursor()
 // dimension, bad stored metadata, and a failing call's real duration
 // ---------------------------------------------------------------------------
 
-#[test]
 // Migrated from `a_bad_local_endpoint_still_delivers_the_page`. That case drove
 // a legacy endpoint the binding could not normalize (embedded credentials) and
 // asserted a *refused binding*: page delivered, no cursor. Under the model-API

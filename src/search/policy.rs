@@ -1510,7 +1510,13 @@ mod tests {
         // without env vars.
         assert!(settings.get("fast_tier_embedder").is_some());
         assert!(settings.get("reranker").is_some());
-        assert_eq!(settings.get("reranker").unwrap().value, "ms-marco-minilm");
+        // The reranker default is a neutral role marker now; the effective
+        // model comes from the configured rerank API profile.
+        assert_eq!(
+            settings.get("reranker").unwrap().value,
+            DEFAULT_RERANKER
+        );
+        assert_eq!(settings.get("reranker").unwrap().value, "external");
     }
 
     #[test]

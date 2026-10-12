@@ -1,14 +1,18 @@
-//! Semantic model management (local-only detection).
+//! Semantic readiness detection for the API-only search build.
 //!
-//! This module wires the FastEmbed MiniLM embedder into semantic search by:
-//! - validating the local model files
-//! - loading the vector index
-//! - building filter maps from the SQLite database
-//! - detecting model version mismatches
+//! This module reports whether semantic search can run by reading state that
+//! does not depend on a local model:
+//! - the DB vector domain (`embedding_generations`): active generation, audit
+//!   status, dimension, chunk counts
+//! - the vector-index path layout
+//! - the retired hash-fallback preference, which is only reachable when the
+//!   retired `CASS_SEMANTIC_EMBEDDER` variable is still set
 //!
-//! It does **not** download or load models: embedding is served exclusively by
-//! the configured external model API. Availability is surfaced from the
-//! DB-vector-domain state so the UI can report semantic readiness.
+//! It does **not** download, install or load a local model: embedding is served
+//! exclusively by the configured external model API (`--api-config`), and the
+//! effective model/revision/dimension come from the API representation
+//! descriptor. The former FastEmbed/MiniLM wiring was retired with the model-API
+//! migration, so no local weight file is validated here any more.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
