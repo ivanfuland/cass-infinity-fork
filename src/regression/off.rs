@@ -1412,7 +1412,16 @@ query_prefix="Query: "
                 assert!(report["observed_after"].is_null());
                 assert!(report["after_verification"].is_null());
                 assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
-                assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
+                // The embedding leg now runs over HTTP, so a transport fault is
+                // recorded as an attempted request on that bucket (the retired
+                // provider reported the leg under a different scope), and no
+                // local model ever executes.
+                assert!(
+                    !report["cost"]["counts"][1]["http_attempts"].is_null(),
+                    "a transport fault must be recorded as an attempted request: {}",
+                    report["cost"]["counts"][1]
+                );
+                assert!(report["cost"]["counts"][1]["model_executions"].is_null());
                 archive_run(
                     &root,
                     &PathBuf::from(dotenvy::var("CASS_S2_04_FAILURE_EVIDENCE").unwrap())
