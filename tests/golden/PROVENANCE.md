@@ -80,20 +80,28 @@ contract surface: `api_version`, `contract_version`, `features` list,
 an isolated TempDir and `CASS_IGNORE_SOURCES_CONFIG=1` so no ambient
 sources leak into the output.
 
-### `robot/models_status.json.golden`
+### Removed: `robot/models_status*.json.golden`, `models_verify_*`, `models_check_update_*`
 
-Frozen output of `cass models status --json` against an isolated empty
-model cache (XDG_DATA_HOME pinned to a TempDir). Captures the full
-not-installed state: `state="not_acquired"`, `state_detail` missing-file
-listing, `next_step` user-facing hint, `files[]` per-manifest-file sizes,
-and the `cache_lifecycle` sub-structure (state machine + per-file
-`last_check_at_ms`). Paths to `model_dir` and per-file locations are
-scrubbed to `[TEST_HOME]/...`.
+Retired with the model-API migration. These pinned the local weight-cache
+lifecycle (`state="not_acquired"`, `state_detail`, `next_step`, `files[]`,
+`cache_lifecycle`, `model_acquisition`, and `models check-update`'s
+`reason=model_not_installed`). The local model acquisition, verification and
+update surfaces no longer exist:
 
-**Command:** `cass models status --json` with `XDG_DATA_HOME`, `HOME`,
-and `CASS_IGNORE_SOURCES_CONFIG=1` all pinned to an isolated TempDir so
-the model cache is guaranteed empty. Shape includes every field
-`run_models_status` emits in the JSON branch of the structured output.
+- `cass models status` is now an alias of `cass models list` and reports the
+  configured HTTP model API profiles (`{schema: cass.model-api-list.v1,
+  profiles: [...]}`); with no `--api-config` it is a configuration refusal
+  (exit 2).
+- `cass models verify` / `models install` / `models remove` /
+  `models check-update` refuse with a migration error (exit 2).
+
+The surviving contracts are asserted in `tests/golden_robot_json.rs`
+(`models_status_without_a_model_api_config_refuses`,
+`retired_models_verify_and_check_update_refuse_as_migration_errors`) and, for
+the real profile listing against a real config file, in
+`tests/api_model_commands.rs`. The `models-status` / `models-verify` /
+`models-check-update` keys in `robot/introspect*.json.golden` were replaced by
+`models-list` / `models-check`.
 
 ### `html_export/basic_export.html.golden`
 
@@ -125,8 +133,8 @@ output):
 
 - `robot/health.json.golden` — needs a seeded data dir with a stable
   fixture index so the `last_indexed_at` / counts are scrubbable.
-- `robot/models_status.json.golden` — needs a pinned `CASS_DATA_DIR`
-  with a known model-cache state (empty vs installed) so `state`,
-  `next_step`, and per-file `size_match` are deterministic.
+- `robot/models_list.json.golden` — needs a pinned `--api-config` fixture so the
+  profile listing (`cass.model-api-list.v1`) is deterministic. The retired
+  local `models_status.json.golden` follow-up no longer applies.
 - `robot/robot_docs.json.golden` — needs a topic-specific fixture
   since the output is a large formatted doc string per topic.

@@ -1,7 +1,8 @@
 //! Integration tests for semantic search flows.
 //!
 //! Tests cover:
-//! - CLI models commands (status, verify, check-update)
+//! - CLI models commands (the retired local status/verify/check-update/install
+//!   surfaces refuse; the API profile commands live in tests/api_model_commands.rs)
 //! - Search mode flags (lexical, semantic, hybrid)
 //! - Determinism tests (same query yields consistent results)
 //! - Robot output schema validation
@@ -11,7 +12,6 @@
 use assert_cmd::cargo::cargo_bin_cmd;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
 
 mod util;
 use util::EnvGuard;
@@ -39,206 +39,38 @@ fn make_codex_session(
 // CLI Models Command Tests
 // =============================================================================
 
-/// Test: cass models status returns valid output
+/// Test: the retired local weight-cache commands refuse instead of inspecting a
+/// local model cache.
+///
+/// The local model-cache surface was retired. `cass models status` is now an
+/// alias of `cass models list` (configured HTTP model API profiles); with no
+/// `--api-config` it exits 2 with a configuration refusal. `cass models verify`
+/// (like the other removed subcommands) exits 2 with a migration error. Neither
+/// command downloads or inspects a local weight cache any more.
 #[test]
-fn test_models_status_command() {
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "status"])
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models status command");
-
-    // Should succeed (exit 0) regardless of installation state
-    assert!(
-        output.status.success(),
-        "models status should succeed. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Should contain status-related output
-    assert!(
-        stdout.contains("Model") || stdout.contains("model") || stdout.contains("Status"),
-        "Output should mention models or status. Got: {}",
-        stdout
-    );
-}
-
-/// Test: cass models status --json returns valid JSON
-#[test]
-fn test_models_status_json_output() {
-    let output = cargo_bin_cmd!("cass")
+fn retired_local_model_commands_refuse() {
+    let status = cargo_bin_cmd!("cass")
         .args(["models", "status", "--json"])
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .output()
         .expect("models status --json command");
-
-    assert!(
-        output.status.success(),
-        "models status --json should succeed. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+    assert_eq!(
+        status.status.code(),
+        Some(2),
+        "models status --json should exit 2 (configuration refusal). stderr: {}",
+        String::from_utf8_lossy(&status.stderr)
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value =
-        serde_json::from_str(stdout.trim()).expect("models status --json should return valid JSON");
-
-    // Bead 7k7pl: pin TYPE + non-empty content on model_id/state, not
-    // just "field present". A regression that emitted `null` or a
-    // number would slip past `.is_some()` while breaking downstream
-    // consumers that expect string IDs.
-    let model_id = json
-        .get("model_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("model_id must be a string. Got: {}", json));
-    assert!(
-        !model_id.is_empty(),
-        "model_id must be a non-empty string. Got: {}",
-        json
-    );
-    let state = json
-        .get("state")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("state must be a string. Got: {}", json));
-    assert!(
-        !state.is_empty(),
-        "state must be a non-empty string. Got: {}",
-        json
-    );
-}
-
-/// Test: cass models verify returns valid output
-#[test]
-fn test_models_verify_command() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "verify", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models verify command");
-
-    // Should succeed (model not installed is still a valid result)
-    assert!(
-        output.status.success(),
-        "models verify should succeed. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Test: cass models verify --json returns valid JSON
-#[test]
-fn test_models_verify_json_output() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "verify", "--json", "--data-dir"])
-        .arg(&data_dir)
+    let verify = cargo_bin_cmd!("cass")
+        .args(["models", "verify", "--json"])
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .output()
         .expect("models verify --json command");
-
-    assert!(
-        output.status.success(),
-        "models verify --json should succeed. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value =
-        serde_json::from_str(stdout.trim()).expect("models verify --json should return valid JSON");
-
-    // Bead 7k7pl: pin TYPE on model_dir/status — both must be
-    // non-empty strings, not just "present". A null or numeric
-    // regression would slip past `.is_some()`.
-    let model_dir = json
-        .get("model_dir")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("model_dir must be a string. Got: {}", json));
-    assert!(
-        !model_dir.is_empty(),
-        "model_dir must be a non-empty string path. Got: {}",
-        json
-    );
-    let status = json
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("status must be a string. Got: {}", json));
-    assert!(
-        !status.is_empty(),
-        "status must be a non-empty string. Got: {}",
-        json
-    );
-}
-
-/// Test: cass models check-update returns valid output
-#[test]
-fn test_models_check_update_command() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "check-update", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models check-update command");
-
-    // Should succeed regardless of installation state
-    assert!(
-        output.status.success(),
-        "models check-update should succeed. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Test: cass models check-update --json returns valid JSON
-#[test]
-fn test_models_check_update_json_output() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "check-update", "--json", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models check-update --json command");
-
-    assert!(
-        output.status.success(),
-        "models check-update --json should succeed. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: Value = serde_json::from_str(stdout.trim())
-        .expect("models check-update --json should return valid JSON");
-
-    // Bead 7k7pl: pin update_available as a boolean (not `null` or a
-    // string like "maybe"), and latest_revision as a string. CLI
-    // consumers branch on the bool; a type regression would slip past
-    // `.is_some()`.
-    assert!(
-        json.get("update_available")
-            .and_then(|v| v.as_bool())
-            .is_some(),
-        "update_available must be a boolean. Got: {}",
-        json
-    );
-    assert!(
-        json.get("latest_revision")
-            .and_then(|v| v.as_str())
-            .is_some(),
-        "latest_revision must be a string. Got: {}",
-        json
+    assert_eq!(
+        verify.status.code(),
+        Some(2),
+        "models verify --json should exit 2 (migration error). stderr: {}",
+        String::from_utf8_lossy(&verify.stderr)
     );
 }
 
@@ -920,37 +752,44 @@ fn test_filter_parity_agent_filter() {
 // Offline Mode Tests
 // =============================================================================
 
-/// Test: CASS_OFFLINE=1 disables network calls
+/// Test: CASS_OFFLINE=1 keeps local work network-free
 #[test]
 fn test_offline_mode_environment() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
     fs::create_dir_all(&data_dir).unwrap();
 
-    // With CASS_OFFLINE=1, models check-update should not make network calls
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2024/11/20",
+        "rollout-offline.jsonl",
+        "offline_mode_test_content",
+        1732118400000,
+    );
+
+    // The retired models commands used to be the offline-surface probe. Repoint
+    // this at a still-live local surface: CASS_OFFLINE=1 must not break a full
+    // local index run, which stays network-free and still succeeds.
     let output = cargo_bin_cmd!("cass")
-        .args(["models", "check-update", "--json", "--data-dir"])
+        .args(["index", "--full", "--data-dir"])
         .arg(&data_dir)
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", home)
         .env("CASS_OFFLINE", "1")
         .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
         .output()
-        .expect("offline check-update");
+        .expect("offline index");
 
-    // Should succeed but indicate offline mode
+    // Should succeed without any network access
     assert!(
         output.status.success(),
-        "check-update in offline mode should succeed. stderr: {}",
+        "index in offline mode should succeed. stderr: {}",
         String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // In offline mode, should either skip check or return cached/offline result
-    let json: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
-    // Verify it returns valid structure (doesn't fail on network)
-    assert!(
-        json.is_object(),
-        "Should return valid JSON in offline mode. Got: {}",
-        stdout
     );
 }
 
@@ -1026,101 +865,13 @@ fn test_search_mode_flag_consistency() {
 // Models Install From File Tests
 // =============================================================================
 
-/// Test: models install --from-file validates a local model directory instead of
-/// failing as \"not implemented\"
-#[test]
-fn test_models_install_from_file_directory_validates_checksums() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
-
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "install", "--from-file"])
-        .arg(&fixture_dir)
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("-y")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models install from-file command");
-
-    assert!(
-        !output.status.success(),
-        "repo fixture directory should fail checksum validation through the real local-directory install path. stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("SHA256 mismatch"),
-        "stderr should show the real checksum-validation failure from the implemented --from-file path. Got: {}",
-        stderr
-    );
-}
-
-/// Test: models install rejects an invalid mirror URL before any network work
-#[test]
-fn test_models_install_rejects_invalid_mirror_url() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let data_dir = tmp.path().join("cass_data");
-    fs::create_dir_all(&data_dir).unwrap();
-
-    let output = cargo_bin_cmd!("cass")
-        .args(["models", "install", "--mirror", "not-a-valid-url"])
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .arg("-y")
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models install with invalid mirror URL");
-
-    assert!(
-        !output.status.success(),
-        "install --mirror with an invalid URL should fail"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid mirror URL"),
-        "stderr should explain that the mirror URL is invalid. Got: {}",
-        stderr
-    );
-}
-
-/// Test: models install rejects conflicting mirror and from-file sources
-#[test]
-fn test_models_install_rejects_conflicting_mirror_and_from_file() {
-    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/models");
-
-    let output = cargo_bin_cmd!("cass")
-        .args([
-            "models",
-            "install",
-            "--mirror",
-            "https://mirror.example/cache",
-            "--from-file",
-        ])
-        .arg(&fixture_dir)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .output()
-        .expect("models install with conflicting flags");
-
-    assert!(
-        !output.status.success(),
-        "conflicting --mirror and --from-file flags should fail to parse"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Could not parse arguments"),
-        "stderr should report a parse failure for conflicting flags. Got: {}",
-        stderr
-    );
-}
-
-/// Test: models install --from-file with non-existent directory fails appropriately
+/// Test: models install --from-file is a migration refusal
+///
+/// Semantic mapping (model-API migration): this asserted that a missing
+/// `--from-file` directory failed with a "not a directory" validation message.
+/// Local installation is retired, so the command now refuses with a migration
+/// error before it ever looks at the source directory — the exit code (2) is the
+/// surviving, stronger contract.
 #[test]
 fn test_models_install_from_file_missing_directory() {
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1139,16 +890,15 @@ fn test_models_install_from_file_missing_directory() {
         .output()
         .expect("models install with missing directory");
 
-    assert!(
-        !output.status.success(),
-        "install --from-file with a missing directory should fail"
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "models install must be a migration refusal (exit 2); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("not a directory"),
-        "stderr should explain that --from-file expects a directory. Got: {}",
-        stderr
+        !data_dir.join("models").exists(),
+        "a retired install must not create a model directory"
     );
 }
 

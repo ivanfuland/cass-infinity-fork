@@ -68,8 +68,6 @@ use crate::storage::sqlite::{
 use semantic::EmbeddingInput;
 use semantic_progress::{SemanticFinalizeProgressEmitter, SemanticProgressSink};
 
-use crate::search::semantic_manifest::TierKind as SemanticTierKind;
-
 #[cfg(test)]
 use std::iter::Peekable;
 
@@ -5243,32 +5241,18 @@ fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
-    match embedder_id {
-        // fork: Infinity 的 `bge-m3`（src/search/infinity.rs EMBEDDER_ID）与上游 `minilm-384`
-        // 同属 quality tier。少了这一行，`index --semantic --watch-once` 的**增量追加**路径会以
-        // "semantic watch-once cannot publish unknown embedder tier for bge-m3" 失败，
-        // 于是只能退回 `models backfill` 的全量重建——每加一条会话就重嵌整个语料。
-        "bge-m3" | "minilm-384" => Some(SemanticTierKind::Quality),
-        "fnv1a-384" => Some(SemanticTierKind::Fast),
-        _ => None,
-    }
-}
-
-fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
-    match embedder_id {
-        "fnv1a-384" => "hash".to_string(),
-        // fork: 与 lib.rs backfill 路径写进 manifest 的 `infinity-bge-m3` 保持一致；
-        // 否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
-        "bge-m3" => "infinity-bge-m3".to_string(),
-        // No local weight manifest supplies a revision any more: a semantic
-        // generation's identity and revision come from the API representation
-        // descriptor. For an id this mapping does not recognise, the neutral
-        // fallback is the id itself rather than a borrowed MiniLM revision,
-        // which would falsely claim the generation came from a local model.
-        other => other.to_string(),
-    }
-}
+// `semantic_tier_for_embedder_id` and `semantic_model_revision_for_embedder_id`
+// were removed here. They were the local-model tier/revision routing table --
+// a hardcoded `bge-m3`/`minilm-384` -> tier map and a `minilm_v2` revision
+// fallback -- and after the model-API migration neither had any production
+// caller left in the crate (verified against the base commit: only their own
+// definitions and unit tests referenced them). A semantic generation's tier,
+// model and revision now come from the API representation descriptor, so an
+// unknown embedder id must be an explicit absence, never a fabricated tier or a
+// revision borrowed from a local weight manifest. The four unit tests that
+// pinned the deleted maps are removed with them; their API-path equivalent
+// (descriptor-derived identity) is covered by tests/api_primary_backfill.rs and
+// the model-API unit tests.
 
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     let total_messages: i64 = storage
@@ -25244,63 +25228,17 @@ mod tests {
         );
     }
 
-    /// Regression for issue #203: the direct `cass index --semantic`
-    /// path must classify embedder ids onto the right manifest tier so
-    /// the published artifact lands where `cass status` looks for it.
-    #[test]
-    fn semantic_tier_for_embedder_id_maps_known_ids() {
-        assert_eq!(
-            super::semantic_tier_for_embedder_id("minilm-384"),
-            Some(super::SemanticTierKind::Quality)
-        );
-        assert_eq!(
-            super::semantic_tier_for_embedder_id("fnv1a-384"),
-            Some(super::SemanticTierKind::Fast)
-        );
-        assert_eq!(super::semantic_tier_for_embedder_id("unknown"), None);
-    }
-
-    /// fork: Infinity 的 `bge-m3` 必须映射到 quality tier。不映射会让
-    /// `index --semantic --watch-once` 的**增量追加**路径以
-    /// "semantic watch-once cannot publish unknown embedder tier for bge-m3" 失败，
-    /// 只能退回 `models backfill` 的全量重建——每加一条会话就把整个语料重嵌一遍
-    /// （实测 176669 doc / ~2h，而追加只需 ~16s）。
-    #[test]
-    fn semantic_tier_for_embedder_id_maps_infinity_bge_m3_to_quality() {
-        assert_eq!(
-            super::semantic_tier_for_embedder_id("bge-m3"),
-            Some(super::SemanticTierKind::Quality),
-            "bge-m3 must resolve to the quality tier or the incremental append path bails"
-        );
-    }
-
-    /// fork: `bge-m3` 的 model_revision 必须与 lib.rs backfill 路径写进 manifest 的
-    /// `infinity-bge-m3` 一致；否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
-    #[test]
-    fn semantic_model_revision_for_embedder_id_maps_bge_m3_to_infinity_revision() {
-        assert_eq!(
-            super::semantic_model_revision_for_embedder_id("bge-m3"),
-            "infinity-bge-m3"
-        );
-    }
-
-    /// Regression for issue #203: hash embedder must report a stable
-    /// "hash" model_revision so the manifest record matches what
-    /// `run_backfill_batch` writes for the same embedder.
-    #[test]
-    fn semantic_model_revision_for_embedder_id_known_ids() {
-        assert_eq!(
-            super::semantic_model_revision_for_embedder_id("fnv1a-384"),
-            "hash"
-        );
-        // An id this mapping does not recognise falls back to the id itself
-        // (never a borrowed MiniLM revision, which would falsely claim a local
-        // model produced the generation).
-        assert_eq!(
-            super::semantic_model_revision_for_embedder_id("minilm-384"),
-            "minilm-384"
-        );
-    }
+    // The four tests that used to live here
+    // (`semantic_tier_for_embedder_id_maps_known_ids`,
+    // `semantic_tier_for_embedder_id_maps_infinity_bge_m3_to_quality`,
+    // `semantic_model_revision_for_embedder_id_maps_bge_m3_to_infinity_revision`,
+    // `semantic_model_revision_for_embedder_id_known_ids`) pinned the
+    // local-model tier/revision routing table. That table is deleted with the
+    // model-API migration -- a semantic generation's tier/model/revision come
+    // from the API representation descriptor -- so the tests are removed with
+    // it rather than kept asserting a mapping no code performs. The API-path
+    // equivalent (descriptor-derived identity) is covered by
+    // `tests/api_primary_backfill.rs` and the model-API unit tests.
 
     /// Regression test for issue #201: `staged_*` progress fields must
     /// surface as JSON `null` when the lexical rebuild pipeline isn't

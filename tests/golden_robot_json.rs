@@ -1239,33 +1239,54 @@ fn capabilities_shape_matches_golden() {
     assert_golden("robot/capabilities_shape.json.golden", &canonical);
 }
 
+// Semantic mapping (model-API migration): the former `models_status_json` /
+// `models_status_shape` goldens pinned the local model-cache payload
+// (`model_acquisition`, `cache_lifecycle`, `files[]`, `cass models install`
+// next-steps). That surface was retired -- `cass models status` is now an alias
+// of `cass models list` and reports the configured HTTP model API profiles, and
+// the local download/acquisition contract no longer exists. The retired goldens
+// are removed; the surviving contract (a configuration refusal with no config,
+// and the real profile listing with one) is asserted here and in
+// `tests/api_model_commands.rs`, which drives the real CLI against a real
+// config file.
 #[test]
-fn models_status_json_matches_golden() {
-    // `cass models status --json` reads XDG_DATA_HOME for the model cache
-    // directory. In our isolated test home the cache is always empty, so
-    // the output is deterministic: state=not_installed across every field.
-    // Absolute paths inside the payload (`model_dir`, `files[].actual_path`)
-    // get scrubbed by `scrub_robot_json` → `[TEST_HOME]` prefix.
+fn models_status_without_a_model_api_config_refuses() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &["models", "status", "--json"],
-        ExpectStatus::ExitOk,
+    let out = cass_cmd(test_home.path())
+        .args(["models", "status", "--json"])
+        .output()
+        .expect("run cass models status --json");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "models status with no --api-config must be a configuration refusal; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
-    assert_golden("robot/models_status.json.golden", &scrubbed);
 }
 
 #[test]
-fn models_status_shape_matches_golden() {
+fn retired_models_verify_and_check_update_refuse_as_migration_errors() {
+    // `models verify` / `models check-update` addressed the local weight cache.
+    // They now refuse with a migration error (exit 2) instead of inspecting a
+    // local model directory.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let status = capture_robot_json_value(
-        test_home.path(),
-        &["models", "status", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
-    assert_golden("robot/models_status_shape.json.golden", &canonical);
+    for args in [
+        ["models", "verify", "--json"],
+        ["models", "check-update", "--json"],
+    ] {
+        let out = cass_cmd(test_home.path())
+            .args(args)
+            .output()
+            .expect("run a retired models subcommand");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} must be a migration refusal; stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
 }
 
 #[test]
@@ -2273,61 +2294,10 @@ fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
     assert_golden("robot/sessions_missing_db_shape.json.golden", &canonical);
 }
 
-#[test]
-fn models_verify_json_not_acquired_shape_matches_golden() {
-    // Empty data_dir ⇒ model is not acquired, `cass models verify
-    // --json` emits the stable not_acquired envelope on stdout with
-    // exit 0. Shape golden pins: status, state_detail, next_step,
-    // lexical_fail_open, model_dir, all_valid, cache_lifecycle
-    // (nested), error.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let out = cass_cmd(test_home.path())
-        .args([
-            "models",
-            "verify",
-            "--json",
-            "--data-dir",
-            test_home.path().to_str().expect("utf8 path"),
-        ])
-        .output()
-        .expect("run cass models verify --json");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|err| panic!("models verify stdout is not JSON: {err}\nstdout:\n{stdout}"));
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
-    assert_golden(
-        "robot/models_verify_not_acquired_shape.json.golden",
-        &canonical,
-    );
-}
-
-#[test]
-fn models_check_update_json_not_installed_shape_matches_golden() {
-    // Empty data_dir ⇒ `cass models check-update --json` returns
-    // `reason=model_not_installed` with current_revision=null +
-    // latest_revision=<pinned sha>. Shape golden pins the 4-field
-    // envelope so a regression that renamed/removed any field would
-    // trip CI.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let out = cass_cmd(test_home.path())
-        .args([
-            "models",
-            "check-update",
-            "--json",
-            "--data-dir",
-            test_home.path().to_str().expect("utf8 path"),
-        ])
-        .output()
-        .expect("run cass models check-update --json");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
-        panic!("models check-update stdout is not JSON: {err}\nstdout:\n{stdout}")
-    });
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
-    assert_golden(
-        "robot/models_check_update_not_installed_shape.json.golden",
-        &canonical,
-    );
-}
+// The former `models_verify_not_acquired_shape` / `models_check_update_not_installed_shape`
+// goldens pinned the local weight-cache lifecycle (`status`, `state_detail`,
+// `next_step`, `cache_lifecycle`, `all_valid`, `reason=model_not_installed`).
+// Those subcommands were retired with the model-API migration and now refuse
+// with a migration error (exit 2), which is asserted by
+// `retired_models_verify_and_check_update_refuse_as_migration_errors` above; the
+// goldens are removed rather than kept alive with a fake payload.

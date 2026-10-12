@@ -198,12 +198,15 @@ fn recovery_surfaces(data_dir: &str) -> Vec<RecoverySurface> {
         },
         RecoverySurface {
             name: "models-status",
-            // `models status` has no `--data-dir`; the isolated HOME/XDG
-            // already redirects its default model dir into the tempdir.
+            // Semantic mapping (model-API migration): `models status` used to
+            // return the local model-cache payload (`models`,
+            // `lexical_fail_open`, `active_registry_name`). It is now an alias of
+            // `models list`, so with no --api-config it is a structured
+            // configuration refusal. `models status` has no `--data-dir`; the
+            // isolated HOME/XDG redirects everything it might read.
             args: argv(&["models", "status", "--json"], None),
-            expect: Expect::Success {
-                identity: &["models", "lexical_fail_open", "active_registry_name"],
-                allow_advisory_error: false,
+            expect: Expect::Error {
+                kinds: &["ModelApiConfiguration"],
             },
             contract_version: None,
         },

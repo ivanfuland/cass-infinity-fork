@@ -198,11 +198,15 @@ fn models_verify_defaults_to_inspection_without_repair() -> Result<(), String> {
 }
 
 #[test]
-fn models_verify_json_missing_cache_stays_fail_open_and_read_only() {
+fn models_verify_json_is_a_migration_refusal_and_creates_no_model_dir() {
     use assert_cmd::cargo::cargo_bin;
-    use serde_json::Value;
-    use std::path::Path;
 
+    // Semantic mapping (model-API migration): this test used to assert that
+    // `models verify --json` emitted a fail-open local lifecycle payload
+    // (`status=not_acquired`, `all_valid=false`, `cache_lifecycle`, `model_dir`)
+    // without creating the model directory. Local weight verification was
+    // retired, so the surviving contract is stricter: the command refuses with a
+    // migration error (exit 2) and still must not create a model directory.
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().join("cass-data");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -220,36 +224,18 @@ fn models_verify_json_missing_cache_stays_fail_open_and_read_only() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "models verify --json should succeed with a fail-open lifecycle payload; stdout: {stdout}\nstderr: {stderr}"
-    );
-
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("models verify emits JSON");
-    assert_eq!(payload["status"].as_str(), Some("not_acquired"));
-    assert_eq!(payload["lexical_fail_open"].as_bool(), Some(true));
-    assert_eq!(payload["all_valid"].as_bool(), Some(false));
     assert_eq!(
-        payload["error"].as_str(),
-        Some("model directory does not exist")
+        output.status.code(),
+        Some(2),
+        "models verify must be a migration refusal; stdout: {stdout}\nstderr: {stderr}"
     );
 
-    let model_dir = payload["model_dir"]
-        .as_str()
-        .expect("models verify must expose model_dir");
+    let model_dir = data_dir.join("models");
     assert!(
-        Path::new(model_dir).starts_with(&data_dir),
-        "model_dir must stay under the requested data_dir; got {model_dir}"
+        !model_dir.exists(),
+        "a retired verify must not create a model directory; got {}",
+        model_dir.display()
     );
-    assert!(
-        !Path::new(model_dir).exists(),
-        "verify --json must inspect an absent cache without creating model_dir; got {model_dir}"
-    );
-
-    let lifecycle = &payload["cache_lifecycle"];
-    assert_eq!(lifecycle["model_dir"].as_str(), Some(model_dir));
-    assert_eq!(lifecycle["state"]["state"].as_str(), Some("not_acquired"));
-    assert_eq!(lifecycle["installed_size_bytes"].as_u64(), Some(0));
 }
 
 #[test]
@@ -406,190 +392,54 @@ fn models_backfill_keeps_semantic_work_data_dir_and_db_scoped() -> Result<(), St
 //        (model.onnx, tokenizer.json, config.json, ...).
 // ========================================================================
 
+// Semantic mapping (model-API migration):
+// `models_install_from_file_nonexistent_path_emits_model_error_envelope` and
+// `models_install_from_file_empty_dir_emits_required_file_error` asserted the
+// retired local-install `--from-file` validation (exit 21, err.kind "model",
+// "is not a directory" / "Required file ... not found"). Local installation is
+// retired, so the two collapse into one assertion: install refuses with a
+// migration error before it ever reads a source directory, whichever source
+// path is given.
 #[test]
-fn models_install_from_file_nonexistent_path_emits_model_error_envelope() {
+fn models_install_from_file_refuses_with_a_migration_error() {
     use assert_cmd::cargo::cargo_bin;
-    use serde_json::Value;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().join("cass-data");
-    std::fs::create_dir_all(&data_dir).expect("create data dir");
-    let nonexistent = tmp.path().join("definitely-not-there");
-    assert!(
-        !nonexistent.exists(),
-        "precondition: target path must not exist"
-    );
-
-    let output = std::process::Command::new(cargo_bin("cass"))
-        .args(["models", "install", "--from-file"])
-        .arg(&nonexistent)
-        .args(["--yes", "--robot-format", "json", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("HOME", tmp.path())
-        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
-        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
-        .output()
-        .expect("run cass models install");
-
-    let exit = output.status.code().expect("exit code present");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        exit, 21,
-        "--from-file pointing at a nonexistent path must exit 21 (model kind); \
-         stdout: {stdout}\nstderr: {stderr}"
-    );
-
-    // Find the JSON error envelope — may be on stderr or stdout.
-    let envelope_line = stderr
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .or_else(|| {
-            stdout
-                .lines()
-                .rev()
-                .find(|l| l.trim_start().starts_with('{'))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "expected JSON error envelope on stderr or stdout; \
-                 stdout: {stdout}\nstderr: {stderr}"
-            )
-        });
-    let envelope: Value = serde_json::from_str(envelope_line.trim()).unwrap_or_else(|err| {
-        panic!("JSON parse of error envelope failed: {err}; line: {envelope_line}")
-    });
-    let err_obj = envelope
-        .get("error")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("error envelope must have `error` object; got: {envelope}"));
-
-    assert_eq!(
-        err_obj.get("kind").and_then(Value::as_str),
-        Some("model"),
-        "err.kind must be 'model' for --from-file validation failures; got: {err_obj:?}"
-    );
-    assert_eq!(
-        err_obj.get("code").and_then(Value::as_i64),
-        Some(21),
-        "err.code must be 21 (model acquisition) and match exit code; got: {err_obj:?}"
-    );
-    assert_eq!(
-        err_obj.get("retryable").and_then(Value::as_bool),
-        Some(false),
-        "err.retryable must be false for invalid-path validation; got: {err_obj:?}"
-    );
-
-    let message = err_obj
-        .get("message")
-        .and_then(Value::as_str)
-        .expect("message must be a string");
-    assert!(
-        message.contains("is not a directory"),
-        "message must name the not-a-directory condition so operators can diagnose; \
-         got: {message:?}"
-    );
-
-    let hint = err_obj
-        .get("hint")
-        .and_then(Value::as_str)
-        .expect("hint must be a string");
-    assert!(
-        hint.contains("directory"),
-        "hint must guide the operator toward providing a directory; got: {hint:?}"
-    );
-}
-
-#[test]
-fn models_install_from_file_empty_dir_emits_required_file_error() {
-    use assert_cmd::cargo::cargo_bin;
-    use serde_json::Value;
-
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let data_dir = tmp.path().join("cass-data");
-    let model_src = tmp.path().join("empty-model-source");
+    let model_src = tmp.path().join("model-source");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
     std::fs::create_dir_all(&model_src).expect("create empty model source dir");
+    let nonexistent = tmp.path().join("definitely-not-there");
 
-    let output = std::process::Command::new(cargo_bin("cass"))
-        .args(["models", "install", "--from-file"])
-        .arg(&model_src)
-        .args(["--yes", "--robot-format", "json", "--data-dir"])
-        .arg(&data_dir)
-        .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
-        .env("CASS_IGNORE_SOURCES_CONFIG", "1")
-        .env("HOME", tmp.path())
-        .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
-        .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
-        .output()
-        .expect("run cass models install");
+    for source in [&nonexistent, &model_src] {
+        let output = std::process::Command::new(cargo_bin("cass"))
+            .args(["models", "install", "--from-file"])
+            .arg(source)
+            .args(["--yes", "--robot-format", "json", "--data-dir"])
+            .arg(&data_dir)
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+            .env("HOME", tmp.path())
+            .env("XDG_DATA_HOME", tmp.path().join(".local/share"))
+            .env("XDG_CONFIG_HOME", tmp.path().join(".config"))
+            .output()
+            .expect("run cass models install");
 
-    let exit = output.status.code().expect("exit code present");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(
-        exit, 21,
-        "--from-file pointing at an empty dir must exit 21 (model kind); \
-         stdout: {stdout}\nstderr: {stderr}"
-    );
-
-    let envelope_line = stderr
-        .lines()
-        .rev()
-        .find(|l| l.trim_start().starts_with('{'))
-        .or_else(|| {
-            stdout
-                .lines()
-                .rev()
-                .find(|l| l.trim_start().starts_with('{'))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "expected JSON error envelope on stderr or stdout; \
-                 stdout: {stdout}\nstderr: {stderr}"
-            )
-        });
-    let envelope: Value = serde_json::from_str(envelope_line.trim())
-        .unwrap_or_else(|err| panic!("JSON parse failed: {err}; line: {envelope_line}"));
-    let err_obj = envelope
-        .get("error")
-        .and_then(Value::as_object)
-        .unwrap_or_else(|| panic!("error envelope must have `error` object; got: {envelope}"));
-
-    assert_eq!(
-        err_obj.get("kind").and_then(Value::as_str),
-        Some("model"),
-        "err.kind must be 'model'; got: {err_obj:?}"
-    );
-
-    let message = err_obj
-        .get("message")
-        .and_then(Value::as_str)
-        .expect("message must be a string");
-    assert!(
-        message.contains("Required file") && message.contains("not found"),
-        "message must name the 'Required file ... not found' condition; got: {message:?}"
-    );
-
-    let hint = err_obj
-        .get("hint")
-        .and_then(Value::as_str)
-        .expect("hint must be a string");
-    // Hint must enumerate the expected file set so operators can
-    // assemble the air-gap bundle correctly. At minimum it names
-    // model.onnx and tokenizer.json.
-    assert!(
-        hint.contains("model.onnx"),
-        "hint must name the required model.onnx file; got: {hint:?}"
-    );
-    assert!(
-        hint.contains("tokenizer.json"),
-        "hint must name the required tokenizer.json file; got: {hint:?}"
-    );
+        let exit = output.status.code().expect("exit code present");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            exit, 2,
+            "models install must refuse with a migration error (exit 2) whatever the source path; \
+             source: {source:?}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
 }
+
+// `models_install_from_file_empty_dir_emits_required_file_error` was removed
+// with the local-install surface; its empty-source-directory case is folded into
+// `models_install_from_file_refuses_with_a_migration_error` above, which runs
+// both an empty and a nonexistent source directory.
 
 // ========================================================================
 // API01C: the API-only model commands `models list` / `models check` and the

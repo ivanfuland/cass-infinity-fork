@@ -512,13 +512,11 @@ pub enum Commands {
         /// env/config K values are ignored when --rerank is off.
         #[arg(long)]
         rerank_limit: Option<usize>,
-        /// Retired rerank backend selection. The local Qwen/Infinity backends
-        /// and the shared OpenRouter adapter were removed with the model-API
-        /// migration, so any supplied value (qwen3-local, bge-local,
-        /// openrouter-qwen3-8b, openrouter-cohere-4-fast,
-        /// openrouter-voyage-2.5-lite) is refused with a migration error before
-        /// any request. The backend now comes from the configured rerank API
-        /// profile (`--rerank-profile` with `--api-config`).
+        /// Retired rerank backend selection. The local and OpenRouter rerank
+        /// backends were removed with the model-API migration, so any supplied
+        /// value is refused with a migration error before any request. The
+        /// backend now comes from the configured rerank API profile
+        /// (`--rerank-profile` with `--api-config`).
         #[arg(long, value_enum)]
         rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
         /// Embedding API profile; defaults to the configured default_embedding.
@@ -106441,8 +106439,6 @@ mod regression_search_orchestration_tests {
                 reranker: None,
                 use_daemon: false,
                 rerank_limit: rerank.then_some(k),
-                rerank_provider: rerank
-                    .then_some(crate::search::rerank::types::ProviderChoice::BgeLocal),
             },
             RerankRequestContext::default(),
             Some(run),

@@ -457,7 +457,7 @@ fn live_drivers() -> Vec<(&'static str, &'static str)> {
         ("sources", "cass sources doctor --json"),
         (
             "models",
-            "cass models status --json (no-download lexical fallback)",
+            "cass models status --json (API profile listing; ModelApiConfiguration refusal with no --api-config)",
         ),
         (
             "connectors",
@@ -655,9 +655,13 @@ fn fresh_failure_bundle_surfaces_are_bounded_clean_and_safe() -> TestResult {
         }
         log_surface(name, &run);
     }
-    // Most readiness surfaces emit a JSON object; only `search` legitimately
-    // emits empty stdout (error envelope on stderr). Require the bulk to parse.
-    ensure(json_surfaces >= surfaces.len() - 1, || {
+    // Most readiness surfaces emit a JSON object on stdout. Two legitimately do
+    // not, and each puts a structured error envelope on stderr instead:
+    // `search` (missing index/db on a fresh data dir), and `models-status` --
+    // `models status` is now an alias of `models list` (configured HTTP model
+    // API profiles) and refuses with a ModelApiConfiguration error when no
+    // --api-config is given. Require the bulk to parse.
+    ensure(json_surfaces >= surfaces.len() - 2, || {
         format!(
             "only {json_surfaces}/{} surfaces produced parseable JSON",
             surfaces.len()

@@ -157,7 +157,12 @@ fn search_help_lists_new_flags_and_provider_values() {
 
     assert!(help.contains("--rrf-limit"), "help missing --rrf-limit:\n{help}");
     assert!(help.contains("--rerank-limit"), "help missing --rerank-limit:\n{help}");
+    // The `--rerank-provider` flag survives so a legacy script still parses and
+    // gets a migration error, but the local/OpenRouter backend names are no
+    // longer advertised as choices: the backend now comes from a configured
+    // rerank API profile.
     assert!(help.contains("--rerank-provider"), "help missing --rerank-provider:\n{help}");
+    assert!(help.contains("--rerank-profile"), "help missing --rerank-profile:\n{help}");
     for provider in [
         "qwen3-local",
         "bge-local",
@@ -165,8 +170,15 @@ fn search_help_lists_new_flags_and_provider_values() {
         "openrouter-cohere-4-fast",
         "openrouter-voyage-2.5-lite",
     ] {
-        assert!(help.contains(provider), "help missing provider {provider}:\n{help}");
+        assert!(
+            !help.contains(provider),
+            "help must not advertise the retired rerank provider {provider}:\n{help}"
+        );
     }
+    assert!(
+        help.contains("Retired"),
+        "the rerank-provider help entry should say the selection is retired:\n{help}"
+    );
 
     // The legacy search count flags must not be listed as usable flags: no help
     // line starts with an indented `--limit`/`--max-results` flag entry.
@@ -420,7 +432,13 @@ fn invalid_window_arguments_are_usage_errors() {
 fn valid_window_arguments_get_past_validation() {
     let env = Env::new();
     assert_not_usage_error(&env, &["search", "q", "--json", "--rrf-limit", "30"]);
-    assert_not_usage_error(
+
+    // A rerank window with N/K and no model configuration gets past argument
+    // validation: the run fails later, in the rerank profile lookup, with the
+    // explicit configuration refusal that names --api-config / --rerank-profile.
+    // (Both a usage error and this configuration error report exit code 2, so
+    // the discriminating check is the refusal text, not the code.)
+    let out = run(
         &env,
         &[
             "search",
@@ -431,9 +449,12 @@ fn valid_window_arguments_get_past_validation() {
             "30",
             "--rerank-limit",
             "5",
-            "--rerank-provider",
-            "bge-local",
         ],
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("--api-config") || text.contains("--rerank-profile"),
+        "expected the rerank profile configuration refusal; got:\n{text}"
     );
 }
 
