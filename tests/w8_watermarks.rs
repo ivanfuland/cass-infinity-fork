@@ -204,6 +204,7 @@ impl Fixture {
         ]);
         run_index(
             IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full,
                 force_rebuild: false,

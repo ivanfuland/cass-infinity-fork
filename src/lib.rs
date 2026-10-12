@@ -403,14 +403,15 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         ingest: bool,
 
-        /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
-        /// requires the `semantic` build feature, retired in this build --
-        /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
-        /// a bare `cass index --semantic` reaches the DB vector domain
-        /// instead of the retired default)
-        #[cfg_attr(feature = "infinity", arg(long, default_value = "infinity"))]
-        #[cfg_attr(not(feature = "infinity"), arg(long, default_value = "fastembed"))]
-        embedder: String,
+        /// retired local backend selector; use --embedding-profile
+        #[arg(long)]
+        embedder: Option<String>,
+        /// embedding profile from the model API configuration
+        #[arg(long, requires = "semantic")]
+        embedding_profile: Option<String>,
+        /// disable the configured model fallback for this command
+        #[arg(long, requires = "semantic")]
+        no_model_fallback: bool,
 
         /// Override data dir (index + db). Defaults to platform data dir.
         #[arg(long)]
@@ -7187,6 +7188,8 @@ async fn execute_cli(
                     no_ingest,
                     ingest,
                     embedder,
+                    embedding_profile,
+                    no_model_fallback,
                     idempotency_key,
                     json,
                     progress_interval_ms,
@@ -7216,6 +7219,13 @@ async fn execute_cli(
                     } else {
                         IngestMode::Implicit
                     };
+                    if embedder.is_some() {
+                        return Err(model_api_migration_error("--embedder is retired".into(), "Use --embedding-profile with --api-config".into()));
+                    }
+                    let model_api = if semantic {
+                        Some(std::sync::Arc::new(crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(
+                            cli.api_config.as_deref(), embedding_profile.as_deref(), !no_model_fallback).map_err(model_api_runtime_error)?))
+                    } else { None };
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
                         cli.db.clone(),
@@ -7228,7 +7238,7 @@ async fn execute_cli(
                         semantic,
                         no_ingest,
                         ingest_mode,
-                        embedder,
+                        model_api,
                         progress,
                         structured_format,
                         idempotency_key,
@@ -76682,22 +76692,6 @@ mod cli_read_db_tests {
 
     #[test]
     #[serial]
-    fn semantic_index_embedder_policy_env_overrides_fastembed_default() {
-        let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
-
-        assert_eq!(
-            resolve_semantic_index_embedder("fastembed"),
-            "snowflake-arctic-s"
-        );
-        assert_eq!(
-            resolve_semantic_index_embedder("minilm"),
-            "snowflake-arctic-s"
-        );
-        assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
-    }
-
-    #[test]
-    #[serial]
     fn state_meta_json_reports_lexical_rebuild_pipeline_settings() {
         let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
         let _workers = set_env("CASS_TANTIVY_REBUILD_WORKERS", "9");
@@ -79825,6 +79819,7 @@ pub(crate) fn run_doctor_impl(
                 needs_rebuild = true;
             } else {
                 let index_opts = indexer::IndexOptions {
+                    model_api: None,
                     no_ingest: false,
                     // When the database is missing or corrupted, doctor must
                     // rebuild from source sessions using the full path rather
@@ -89741,6 +89736,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let progress = Arc::new(indexer::IndexingProgress::default());
     let opts = indexer::IndexOptions {
+        model_api: None,
         no_ingest: false,
         full: false,
         force_rebuild: false,
@@ -89903,7 +89899,7 @@ fn run_index_with_data(
     semantic: bool,
     no_ingest: bool,
     ingest_mode: IngestMode,
-    embedder: String,
+    model_api: Option<std::sync::Arc<crate::search::model_api::index_embedding::IndexEmbeddingSetup>>,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
@@ -89915,7 +89911,7 @@ fn run_index_with_data(
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let embedder = resolve_semantic_index_embedder(&embedder);
+    let embedder = model_api.as_ref().map(|setup| setup.profile_id()).unwrap_or("api").to_owned();
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -89937,6 +89933,7 @@ fn run_index_with_data(
         semantic.hash(&mut hasher);
         no_ingest.hash(&mut hasher);
         embedder.hash(&mut hasher);
+        model_api.as_ref().map(|setup| setup.identity_sha256()).hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
         hasher.finish()
@@ -90147,6 +90144,7 @@ fn run_index_with_data(
     let index_progress = std::sync::Arc::new(indexer::IndexingProgress::default());
 
     let opts = IndexOptions {
+        model_api,
         full,
         force_rebuild,
         watch,
@@ -90518,6 +90516,9 @@ fn run_index_with_data(
         );
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
+            if let Ok(stats) = index_progress.stats.lock() {
+                if let Some(model_api) = &stats.model_api { payload["model_api"] = model_api.clone(); }
+            }
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
             }
@@ -100340,7 +100341,7 @@ fn run_sources_sync(
             false,          // semantic
             false,          // no_ingest
             IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
-            "fastembed".to_string(),
+            None, // no model configuration for lexical ingestion
             progress,
             output_format,
             None,  // idempotency_key
@@ -100494,7 +100495,7 @@ fn run_sources_reingest(
         false,                  // semantic
         false,                  // no_ingest
         IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
-        "fastembed".to_string(),
+        None, // no model configuration for lexical ingestion
         progress,
         output_format,
         None,  // idempotency_key
@@ -101481,34 +101482,6 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
     );
 }
 
-fn resolve_semantic_index_embedder(raw: &str) -> String {
-    let requested = raw.trim();
-    if !matches!(requested, "fastembed" | "minilm") {
-        return requested.to_string();
-    }
-
-    let policy = crate::search::policy::SemanticPolicy::resolve(
-        &crate::search::policy::CliSemanticOverrides::default(),
-    );
-    if policy
-        .quality_tier_embedder
-        .trim()
-        .eq_ignore_ascii_case("hash")
-    {
-        return "hash".to_string();
-    }
-    let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
-        &policy.quality_tier_embedder,
-    ) else {
-        return requested.to_string();
-    };
-    if policy_embedder == "minilm" {
-        requested.to_string()
-    } else {
-        policy_embedder.to_string()
-    }
-}
-
 /// A model-command refusal that migrates a retired local model selection onto
 /// the API profile path.
 ///
@@ -101701,24 +101674,6 @@ fn select_api_embedding_profile(
         )));
     }
     Ok(profile)
-}
-
-/// The `model_api` object printed beside a backfill result or inside a failure
-/// diagnostic, so a failed run still reports the requests it already made.
-fn api_backfill_model_api_value(
-    profile: &crate::search::model_api::ValidatedProfile,
-    call: &crate::search::model_api::PrimaryEmbeddingCall,
-) -> serde_json::Value {
-    serde_json::json!({
-        "primary_profile": profile.id,
-        "requested_model": profile.model,
-        "declared_revision": profile.model_revision,
-        "allow_fallback": call.allow_fallback(),
-        "fallback_used": call.fallback_used(),
-        "probe_calls": call.probe_calls(),
-        "document_calls": call.document_calls(),
-        "audit_calls": call.audit_calls(),
-    })
 }
 
 /// `cass models backfill` on the API-only path (spec §§5.3-5.4, 6.1-6.2).
@@ -101999,7 +101954,7 @@ fn api_backfill_failure_error(
                 "hint": hint,
                 "retryable": !compatibility_required,
             },
-            "model_api": api_backfill_model_api_value(profile, call),
+            "model_api": call.diagnostic(),
         })
         .to_string()
     } else {

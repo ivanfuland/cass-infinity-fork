@@ -6012,6 +6012,7 @@ mod e5_p30_blob_read_tests {
 
     fn index_opts(data_dir: &Path, session: &Path, full: bool) -> crate::indexer::IndexOptions {
         crate::indexer::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full,
             watch: false,

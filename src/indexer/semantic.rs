@@ -67,7 +67,7 @@ fn resolved_env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-fn resolved_default_batch_size() -> usize {
+pub(crate) fn resolved_default_batch_size() -> usize {
     dotenvy::var("CASS_SEMANTIC_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())

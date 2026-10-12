@@ -93,6 +93,7 @@ fn index_opts(
     no_ingest: bool,
 ) -> IndexOptions {
     IndexOptions {
+        model_api: None,
         full: false,
         force_rebuild: false,
         watch: false,
@@ -292,6 +293,7 @@ fn build_backup_corpus(other: &TempDir) -> PathBuf {
     seed_codex_session(&codex_home, "rollout-backup.jsonl", "noingestsalvagebackup", true);
 
     let options = IndexOptions {
+        model_api: None,
         full: false,
         force_rebuild: false,
         watch: false,

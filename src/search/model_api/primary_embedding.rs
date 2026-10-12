@@ -159,7 +159,7 @@ pub struct ModelApiBackfillReport {
     pub endpoint_config_sha256: String,
     /// The effective fallback policy of this command.
     pub allow_fallback: bool,
-    /// Always `false`: this build never produces vectors at the fallback.
+    /// Whether a successful request used the admitted backup.
     pub fallback_used: bool,
     /// The probe requests this command made, in order.
     pub probe_calls: Vec<EmbeddingCallEvidence>,
@@ -234,6 +234,12 @@ impl PrimaryEmbeddingCall {
             return Err(ConfigError::at(ConfigErrorCode::KindMismatch, "kind"));
         }
         let route = super::embedding_route::EmbeddingRoute::load(client.config(), &profile, allow_fallback);
+        Self::from_frozen_route(client, route)
+    }
+
+    pub(crate) fn from_frozen_route(client: ApiClient, route: super::embedding_route::EmbeddingRoute) -> Result<Self, ConfigError> {
+        let profile = route.primary.clone();
+        let allow_fallback = route.allow_fallback;
         Ok(Self {
             route,
             client,
@@ -298,6 +304,20 @@ impl PrimaryEmbeddingCall {
     /// The refusal of the last request that failed, when one did.
     pub fn last_failure(&self) -> Option<PrimaryEmbedFailure> {
         self.last_failure.borrow().clone()
+    }
+
+    /// Actual request evidence, including commands that fail before a generation exists.
+    pub fn diagnostic(&self) -> serde_json::Value {
+        serde_json::json!({
+            "primary_profile": self.profile.id,
+            "requested_model": self.profile.model,
+            "declared_revision": self.profile.model_revision,
+            "allow_fallback": self.allow_fallback(),
+            "fallback_used": self.fallback_used(),
+            "probe_calls": self.probe_calls(),
+            "document_calls": self.document_calls(),
+            "audit_calls": self.audit_calls(),
+        })
     }
 
     /// Build the `model_api` report over the digests the caller computed.

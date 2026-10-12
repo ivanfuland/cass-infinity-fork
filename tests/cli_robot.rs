@@ -6960,10 +6960,7 @@ fn introspect_index_embedder_default() {
         embedder["value_type"], "string",
         "index --embedder should be string type"
     );
-    assert_eq!(
-        embedder["default"], "fastembed",
-        "index --embedder should default to fastembed"
-    );
+    assert!(embedder["default"].is_null(), "retired embedder selector has no default");
 }
 
 /// Index command parsing should accept semantic + embedder flags.
@@ -6983,12 +6980,12 @@ fn parse_index_semantic_embedder_flags() {
         }) = command
         {
             assert!(*semantic, "semantic flag should be set");
-            assert_eq!(embedder.as_str(), "fastembed");
+            assert_eq!(embedder.as_deref(), Some("fastembed"));
         }
     });
 }
 
-/// Index command parsing should default embedder to fastembed.
+/// Index command parsing must not choose a hardcoded model.
 #[test]
 fn parse_index_embedder_default() {
     run_on_large_stack(|| {
@@ -7004,7 +7001,7 @@ fn parse_index_embedder_default() {
         }) = command
         {
             assert!(*semantic, "semantic flag should be set");
-            assert_eq!(embedder.as_str(), "fastembed");
+            assert!(embedder.is_none());
         }
     });
 }

@@ -44,7 +44,7 @@ fn models_install_from_file_keeps_acquisition_data_dir_scoped() -> Result<(), St
                 from_file: Some(from_file),
                 yes: true,
                 data_dir: Some(data_dir),
-            })) if model == "all-minilm-l6-v2"
+            })) if model.as_deref() == Some("all-minilm-l6-v2")
                 && from_file.display().to_string() == "/seeded/models/all-minilm-l6-v2"
                 && data_dir.display().to_string() == "/cass/models" =>
             {
@@ -80,7 +80,7 @@ fn models_install_from_mirror_keeps_acquisition_data_dir_scoped() -> Result<(), 
                 from_file: None,
                 yes: true,
                 data_dir: Some(data_dir),
-            })) if model == "all-minilm-l6-v2"
+            })) if model.as_deref() == Some("all-minilm-l6-v2")
                 && mirror == "https://mirror.example/models"
                 && data_dir.display().to_string() == "/cass/models" =>
             {
@@ -123,7 +123,7 @@ fn models_install_rejects_ambiguous_mirror_and_from_file_sources() -> Result<(),
 }
 
 #[test]
-fn models_install_defaults_to_standard_model_with_confirmation() -> Result<(), String> {
+fn retired_install_does_not_select_a_default_model() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&["cass", "models", "install", "--data-dir", "/cass/models"])?;
 
@@ -134,7 +134,7 @@ fn models_install_defaults_to_standard_model_with_confirmation() -> Result<(), S
                 from_file: None,
                 yes: false,
                 data_dir: Some(data_dir),
-            })) if model == "all-minilm-l6-v2"
+            })) if model.is_none()
                 && data_dir.display().to_string() == "/cass/models" =>
             {
                 Ok(())
@@ -271,7 +271,7 @@ fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String
                 model,
                 yes: true,
                 data_dir: Some(data_dir),
-            })) if model == "all-minilm-l6-v2"
+            })) if model.as_deref() == Some("all-minilm-l6-v2")
                 && data_dir.display().to_string() == "/cass/models" =>
             {
                 Ok(())
@@ -284,7 +284,7 @@ fn models_remove_requires_explicit_model_and_yes_controls() -> Result<(), String
 }
 
 #[test]
-fn models_remove_defaults_to_interactive_reclamation() -> Result<(), String> {
+fn retired_remove_does_not_select_a_default_model() -> Result<(), String> {
     run_on_large_stack(|| {
         let cli = parse(&["cass", "models", "remove", "--data-dir", "/cass/models"])?;
 
@@ -293,7 +293,7 @@ fn models_remove_defaults_to_interactive_reclamation() -> Result<(), String> {
                 model,
                 yes: false,
                 data_dir: Some(data_dir),
-            })) if model == "all-minilm-l6-v2"
+            })) if model.is_none()
                 && data_dir.display().to_string() == "/cass/models" =>
             {
                 Ok(())

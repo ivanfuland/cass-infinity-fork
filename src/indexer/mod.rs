@@ -66,7 +66,7 @@ use crate::storage::sqlite::{
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
     historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
-use semantic::{EmbeddingInput, SemanticIndexer};
+use semantic::EmbeddingInput;
 use semantic_progress::{SemanticFinalizeProgressEmitter, SemanticProgressSink};
 
 use crate::search::semantic_manifest::TierKind as SemanticTierKind;
@@ -949,6 +949,9 @@ pub struct IndexingStats {
     /// `None` when this run didn't request semantic indexing at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_activated: Option<bool>,
+    /// Actual model attempts from the latest semantic pass, retained on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_api: Option<serde_json::Value>,
     /// R4-4: `DbVectorCatchupReport::cleanup_failures` from the same
     /// `run_semantic_db_vector_catchup` call, previously discarded at
     /// that call's `Ok(report.activated)` return -- `cass models
@@ -1608,6 +1611,8 @@ fn active_rebuild_json_optional_u64(is_rebuilding: bool, value: Option<u64>) -> 
 
 #[derive(Clone)]
 pub struct IndexOptions {
+    /// Frozen model API configuration, reused across watch cycles.
+    pub model_api: Option<Arc<crate::search::model_api::index_embedding::IndexEmbeddingSetup>>,
     pub full: bool,
     pub force_rebuild: bool,
     pub watch: bool,
@@ -1623,7 +1628,7 @@ pub struct IndexOptions {
     /// watermark must not advance (this is T12 v2's exam-hall mode: the
     /// corpus must be byte-identical before and after).
     pub no_ingest: bool,
-    /// Embedder ID to use for semantic indexing (hash, fastembed).
+    /// Progress label; semantic runs replace it with the selected API profile ID.
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
     /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
@@ -10096,52 +10101,23 @@ struct SemanticDbVectorCatchupOutcome {
     cleanup_failures: Vec<(i64, String)>,
 }
 
-#[cfg(feature = "infinity")]
 fn run_semantic_db_vector_catchup(
-    opts: &IndexOptions,
-    caller: &str,
+    opts: &IndexOptions, caller: &str,
 ) -> Result<SemanticDbVectorCatchupOutcome> {
     memprobe_point("run_semantic_db_vector_catchup", "holes", "start");
-    if opts.embedder != "infinity" {
-        anyhow::bail!(
-            "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
-             use --embedder infinity",
-            opts.embedder
-        );
-    }
-    let storage = FrankenStorage::open_writer(&opts.db_path).with_context(|| {
-        format!(
-            "opening writer storage for DB-vector-domain catch-up: {}",
-            opts.db_path.display()
-        )
-    })?;
-    let batch_size = SemanticIndexer::new("infinity", None)?.batch_size();
-
-    // T8 (plan v5.1, task book #92): `cass index --semantic` drains the
-    // chunk domain (`chunk_holes` -> `message_chunks`) -- the retired v4
-    // message-granularity engine T11 deleted is no longer reachable from
-    // anywhere.
-    let infinity_config = crate::search::infinity::InfinityConfig::from_env();
-    let (identity, fingerprint) = crate::search::infinity::probe_identity_and_fingerprint(&infinity_config)
-        .map_err(|e| anyhow::anyhow!("{caller}: infinity identity+fingerprint probe failed: {e}"))?;
-    let embedder = crate::search::infinity::InfinityEmbedder::new()
-        .map_err(|e| anyhow::anyhow!("{caller}: failed to construct infinity embedder: {e}"))?;
-    let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
-        use crate::search::embedder::Embedder as _;
-        embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
-    };
+    let setup = opts.model_api.as_ref().ok_or_else(|| anyhow::anyhow!("embedding API configuration was not frozen"))?;
+    let call = setup.call()?;
+    let storage = FrankenStorage::open_writer(&opts.db_path)?;
     let ownership_seed = FrankenStorage::now_millis() as u64;
-    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
-        &storage,
-        batch_size,
-        &identity,
-        crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
-        crate::search::chunking::CHUNKING_POLICY_VERSION,
-        &fingerprint,
-        &embed_fn,
-        ownership_seed,
-    )
-    .map_err(|e| anyhow::anyhow!("{caller}: db vector catchup failed: {e:#}"))?;
+    let result = db_vector_catchup::probe_api_backfill(&storage, &call).and_then(|probe| {
+        db_vector_catchup::run_api_primary_catchup_backfill(
+            &storage, semantic::resolved_default_batch_size(), &call, call.profile(), &probe, ownership_seed)
+    });
+    if let Some(progress) = &opts.progress {
+        if let Ok(mut stats) = progress.stats.lock() { stats.model_api = Some(call.diagnostic()); }
+    }
+    let outcome = result.map_err(|error| anyhow::anyhow!("{caller}: {error}"))?;
+    let report = outcome.catchup;
     tracing::info!(
         caller,
         generation_id = report.generation_id,
@@ -10173,17 +10149,6 @@ fn run_semantic_db_vector_catchup(
         activated: report.activated,
         cleanup_failures: report.cleanup_failures,
     })
-}
-
-#[cfg(not(feature = "infinity"))]
-fn run_semantic_db_vector_catchup(
-    _opts: &IndexOptions,
-    caller: &str,
-) -> Result<SemanticDbVectorCatchupOutcome> {
-    anyhow::bail!(
-        "{caller}: semantic indexing requires the `infinity` feature (fsvi-backed semantic \
-         indexing was retired in W3-5); rebuild with --features infinity"
-    );
 }
 
 /// R2-B1 (任务书 #119a): an actionable message for the `scan_had_errors`
@@ -10224,10 +10189,16 @@ fn scan_had_errors_bail_message(opts: &IndexOptions, context: &str) -> String {
 }
 
 pub fn run_index(
-    opts: IndexOptions,
+    mut opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    if opts.semantic {
+        if opts.model_api.is_none() {
+            opts.model_api = Some(Arc::new(crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(None, None, true)?));
+        }
+        opts.embedder = opts.model_api.as_ref().expect("semantic API frozen").profile_id().to_owned();
+    }
     // mission #116⑥: run_index 入口归零 meta 三键计数器 -- "watch 模式每 cycle
     // 视为一次 run" 的归零边界见 watch 循环内 `ingest_watch_batch_with_oom_split`
     // 前的同名调用。
@@ -21835,6 +21806,7 @@ pub mod persist {
             db_path: std::path::PathBuf,
         ) -> crate::indexer::IndexOptions {
             crate::indexer::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 force_rebuild: false,
@@ -23555,6 +23527,7 @@ mod tests {
         }
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -25213,6 +25186,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("storage");
         ensure_fts_schema(&storage);
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: false,
@@ -30222,6 +30196,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30310,6 +30285,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30367,6 +30343,7 @@ mod tests {
         let progress = std::sync::Arc::new(super::IndexingProgress::default());
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30428,6 +30405,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30494,6 +30472,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30566,6 +30545,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let db_path = data_dir.join("db.sqlite");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -30646,6 +30626,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30724,6 +30705,7 @@ mod tests {
 
         run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -32251,6 +32233,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32335,6 +32318,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32380,6 +32364,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32443,6 +32428,7 @@ mod tests {
         ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32528,6 +32514,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32581,6 +32568,7 @@ mod tests {
             ensure_fts_schema(&storage);
             let progress = Arc::new(IndexingProgress::default());
             let opts = IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 force_rebuild: false,
@@ -32663,6 +32651,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: false,
@@ -33931,6 +33920,7 @@ mod tests {
         watch_once_paths: Option<Vec<std::path::PathBuf>>,
     ) -> IndexOptions {
         IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -34516,6 +34506,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34588,6 +34579,7 @@ mod tests {
         .unwrap();
 
         let opts = |watch_once_path: PathBuf| super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34644,6 +34636,7 @@ mod tests {
         std::fs::write(&session, initial).unwrap();
 
         let opts = |data_dir: &Path, session: &Path| super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34703,6 +34696,7 @@ mod tests {
         progress: Arc<IndexingProgress>,
     ) -> super::IndexOptions {
         super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34770,6 +34764,7 @@ mod tests {
         // populated (F1's fix covers this path) -- exactly why the next
         // step reverts it, rather than trusting that as the test's proof.
         let seed_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34831,6 +34826,7 @@ mod tests {
         // The real dispatch this bug lived in:
         // `should_try_readonly_canonical_force_rebuild`'s exact condition.
         let force_rebuild_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34937,6 +34933,7 @@ mod tests {
         // normal watch-once entry point (not a direct storage call) so the
         // `--full` run below starts from a real populated-DB state.
         let seed_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34970,6 +34967,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let full_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             watch: false,
@@ -35047,6 +35045,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let seed_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -35083,6 +35082,7 @@ mod tests {
         }
 
         let full_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             watch: false,
@@ -35494,6 +35494,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -35581,6 +35582,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35665,6 +35667,7 @@ mod tests {
         let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35732,6 +35735,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35856,6 +35860,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35967,6 +35972,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36044,6 +36050,7 @@ mod tests {
         let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36125,6 +36132,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36212,6 +36220,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36301,6 +36310,7 @@ mod tests {
 
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "600");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36448,6 +36458,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36520,6 +36531,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -36612,6 +36624,7 @@ mod tests {
         let _active_guard = set_env("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS", &active_paths);
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -36695,6 +36708,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36820,6 +36834,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36933,6 +36948,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -36986,6 +37002,7 @@ mod tests {
         std::fs::write(&amp_file, "not valid json").unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37070,6 +37087,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37138,6 +37156,7 @@ mod tests {
 
         let progress = Arc::new(IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37209,6 +37228,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37329,6 +37349,7 @@ mod tests {
         save_watch_state(&data_dir, &persisted_state).unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,

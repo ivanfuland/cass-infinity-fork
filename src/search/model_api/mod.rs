@@ -85,3 +85,5 @@ pub use runtime::{
     CHECK_SCHEMA, EnvCredentialResolver, LIST_SCHEMA, ProfileListing, RuntimeError,
     RuntimeErrorKind,
 };
+
+pub mod index_embedding;

@@ -450,6 +450,7 @@ fn execute(
     let index_started = Utc::now_stamp();
     let progress = Arc::new(IndexingProgress::default());
     let opts = IndexOptions {
+        model_api: None,
         full: false,
         force_rebuild: false,
         watch: false,

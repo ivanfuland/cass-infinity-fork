@@ -2959,3 +2959,62 @@ fn retired_local_model_commands_preserve_files_and_send_no_http() {
     }
     assert!(service.requests().is_empty());
 }
+
+#[test]
+fn index_semantic_uses_frozen_api_configuration_without_ingestion() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(&data_dir, &["A synthetic index document verifies the API vector pipeline."]);
+    let config = data_dir.join("index-models.toml");
+    let config_for_service = config.clone();
+    let service = Stub::start(move |request: &RecordedRequest, index: usize| {
+        if index == 0 { fs::write(&config_for_service, "invalid after command freeze").unwrap(); }
+        respond_embed(request, &request.inputs(), 8, 0)
+    });
+    fs::write(&config, config_text("local8", &embedding_profile_block("local8", &service.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, ""))).unwrap();
+    let output = cass(&["index", "--semantic", "--no-ingest", "--json", "--data-dir", &data_dir.display().to_string(),
+        "--api-config", &config.display().to_string(), "--embedding-profile", "local8"], &[]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["scan_invocations"], 0);
+    let calls = &report["indexing_stats"]["model_api"];
+    assert_eq!(calls["primary_profile"], "local8");
+    assert!(!calls["probe_calls"].as_array().unwrap().is_empty());
+    assert!(!calls["document_calls"].as_array().unwrap().is_empty());
+    assert!(!calls["audit_calls"].as_array().unwrap().is_empty());
+    let dim: i64 = storage.raw().query_row_map("SELECT dim FROM embedding_generations WHERE is_active=1", &[], |row| row.get_typed(0)).unwrap();
+    assert_eq!(dim, 8);
+    let count: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM message_chunks", &[], |row|row.get_typed(0)).unwrap();
+    assert_eq!(count, 1);
+    assert!(service.requests().len() >= 3, "probe, document and audit must execute against the same frozen endpoint");
+}
+
+#[test]
+fn index_rejects_missing_api_configuration_and_retired_selector_before_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("not-created");
+    let output = cass(&["index", "--semantic", "--no-ingest", "--json", "--data-dir", &data.display().to_string()], &[]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    assert!(stderr_text(&output).contains("ModelApiConfiguration"));
+    assert!(!data.exists());
+    let output = cass(&["index", "--semantic", "--embedder", "infinity", "--json", "--data-dir", &data.display().to_string()], &[]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    assert!(stderr_text(&output).contains("ModelApiMigration"));
+    assert!(!data.exists());
+}
+
+#[test]
+fn index_failure_preserves_actual_model_request_evidence() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &["A synthetic document verifies index failure evidence."]);
+    let service = Stub::start(|_: &RecordedRequest, _: usize| (503, "{}".into()));
+    let config = data_dir.join("index-models.toml");
+    fs::write(&config, config_text("local8", &embedding_profile_block("local8", &service.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, ""))).unwrap();
+    let output = cass(&["index", "--semantic", "--no-ingest", "--json", "--data-dir", &data_dir.display().to_string(), "--api-config", &config.display().to_string()], &[]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["model_api"]["primary_profile"], "local8");
+    let calls = report["model_api"]["probe_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["http_status"], 503);
+    assert_eq!(service.requests().len(), 1);
+}
