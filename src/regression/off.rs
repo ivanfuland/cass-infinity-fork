@@ -1626,11 +1626,20 @@ query_prefix="Query: "
         let _reset = ResetBudget;
         crate::search::query::set_exact_scan_row_budget_for_test(10);
         let started = Instant::now();
-        let (_f, _data, command) = full_fixture_mode(
+        // Local inference is retired: the semantic generation must be built
+        // through the frozen model API the parent froze, so the partial result
+        // can only come from the exact-scan budget, never a missing config.
+        let config = PathBuf::from(
+            dotenvy::var("CASS_S2_04_PARTIAL_API_CONFIG")
+                .expect("parent must pass the frozen api config"),
+        );
+        let (_f, _data, command) = api_full_fixture_mode(
             5000,
             4200,
             SearchMode::Semantic,
             Some(crate::search::query::VectorSearchMode::Exact),
+            &config,
+            &config,
         );
         let validated = crate::regression::input::prepare_full(&command).unwrap();
         let run = RegressionSearchRun::activate(validated, &command).unwrap();
@@ -1752,6 +1761,27 @@ query_prefix="Query: "
         };
         fs::create_dir(&case).unwrap();
         fs::set_permissions(&case, fs::Permissions::from_mode(0o700)).unwrap();
+        // Local inference is retired: freeze the explicit model API the child
+        // runs under, on this owned loopback origin, instead of the legacy
+        // `CASS_INFINITY_URL` provider variables.
+        let api_config = case.join("api.toml");
+        fs::write(
+            &api_config,
+            format!(
+                "version=1\n\
+                 default_embedding=\"main\"\n\
+                 [profiles.main]\n\
+                 kind=\"embedding\"\n\
+                 protocol=\"openai-embeddings-v1\"\n\
+                 scope=\"loopback\"\n\
+                 endpoint=\"{origin}/embeddings\"\n\
+                 model=\"BAAI/bge-m3\"\n\
+                 model_revision=\"fixture-r1\"\n\
+                 normalization=\"l2\"\n\
+                 expected_dimension=1024\n"
+            ),
+        )
+        .unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1760,8 +1790,7 @@ query_prefix="Query: "
             ])
             .env("CASS_S2_04_PARTIAL_CHILD", "1")
             .env("CASS_S2_04_PARTIAL_EVIDENCE", &case)
-            .env("CASS_INFINITY_URL", origin)
-            .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+            .env("CASS_S2_04_PARTIAL_API_CONFIG", &api_config)
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost")
             .output()

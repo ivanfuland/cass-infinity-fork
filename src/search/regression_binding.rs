@@ -575,6 +575,34 @@ pub(crate) mod tests {
         std::path::PathBuf,
         std::path::PathBuf,
     ) {
+        api_embedding_fixture(count, config_path, false)
+    }
+
+    /// Like [`searchable_fixture_with_api_embedding`], but every message carries
+    /// a body long enough that one rerank window is a strict subset of the full
+    /// content, so neighbour pages and slot binding stay observable.
+    pub(crate) fn searchable_long_fixture_with_api_embedding(
+        count: usize,
+        config_path: &Path,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        api_embedding_fixture(count, config_path, true)
+    }
+
+    fn api_embedding_fixture(
+        count: usize,
+        config_path: &Path,
+        long: bool,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
         use crate::connectors::{NormalizedConversation, NormalizedMessage};
         use crate::search::model_api::config::ProfileKind;
         use crate::search::model_api::runtime;
@@ -596,8 +624,11 @@ pub(crate) mod tests {
                 role: "user".into(),
                 author: None,
                 created_at: Some(20),
-                content: "Investigate retrieval ranking and compare the evidence from both runs."
-                    .into(),
+                content: if long {
+                    format!("retrieval 初始锚点。\n{}", "后续中文合成段落 ".repeat(8000))
+                } else {
+                    "Investigate retrieval ranking and compare the evidence from both runs.".into()
+                },
                 extra: serde_json::json!({}),
                 snippets: vec![],
                 invocations: vec![],

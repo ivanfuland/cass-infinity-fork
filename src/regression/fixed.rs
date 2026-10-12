@@ -2268,7 +2268,23 @@ provider_only="fixed-provider"
         let Ok(case) = std::env::var("CASS_S2_06_OWNED_CASE") else {
             return;
         };
-        let package = package_fixture(&case);
+        let mut package = package_fixture(&case);
+        // Local inference is retired: the parent freezes the explicit model API
+        // and this child runs under it, with no legacy provider selection left.
+        let api_config = std::path::PathBuf::from(
+            std::env::var("CASS_S2_06_API_CONFIG").expect("parent must pass the frozen api config"),
+        );
+        let RegressionCommand::FixedCandidate {
+            api,
+            rerank_provider,
+            ..
+        } = &mut package.command
+        else {
+            unreachable!();
+        };
+        api.config_path = Some(api_config);
+        api.no_model_fallback = true;
+        *rerank_provider = None;
         let outcome = run(&package.command);
         let RegressionCommand::FixedCandidate { input, .. } = &package.command else {
             unreachable!();
@@ -2483,6 +2499,26 @@ provider_only="fixed-provider"
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
+            // Local inference is retired: freeze the explicit model API the
+            // child runs under, on this case's owned loopback origin, in place
+            // of the legacy `CASS_INFINITY_URL` provider variable.
+            let api_root = tempfile::tempdir().unwrap();
+            let api_config = api_root.path().join("api.toml");
+            std::fs::write(
+                &api_config,
+                format!(
+                    "version=1\n\
+                     default_rerank=\"rank\"\n\
+                     [profiles.rank]\n\
+                     kind=\"rerank\"\n\
+                     protocol=\"rerank-json-v1\"\n\
+                     scope=\"loopback\"\n\
+                     endpoint=\"{origin}/rerank\"\n\
+                     model=\"BAAI/bge-reranker-v2-m3\"\n\
+                     model_revision=\"fixture-r1\"\n"
+                ),
+            )
+            .unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stopping = stop.clone();
             let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -2538,7 +2574,7 @@ provider_only="fixed-provider"
                     "regression::fixed::tests::owned_http_child",
                     "--nocapture",
                 ])
-                .env("CASS_INFINITY_URL", &origin)
+                .env("CASS_S2_06_API_CONFIG", &api_config)
                 .env_remove("HTTP_PROXY")
                 .env_remove("HTTPS_PROXY")
                 .env_remove("ALL_PROXY")
