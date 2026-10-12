@@ -4,12 +4,9 @@
 //!
 //! - **[`query`]**: Query parsing, execution, and caching for FTS5-based full-text search.
 //! - **[`embedder`]**: Embedder trait for semantic search (hash and ML implementations).
-//! - **[`embedder_registry`]**: Embedder registry for model selection (bd-2mbe).
 //! - **[`hash_embedder`]**: FNV-1a feature hashing embedder (deterministic fallback).
 //! - **[`fastembed_embedder`]**: FastEmbed-backed ML embedder (MiniLM).
 //! - **[`reranker`]**: Reranker trait for cross-encoder reranking of search results.
-//! - **[`reranker_registry`]**: Reranker registry for model selection with bake-off support.
-//! - **[`fastembed_reranker`]**: FastEmbed-backed cross-encoder reranker (ms-marco-MiniLM-L-6-v2).
 //! - **[`daemon_client`]**: Daemon client wrappers for warm embedder/reranker (bd-1lps).
 //! - **[`model_manager`]**: Semantic model detection + context wiring (no downloads).
 //! - **[`model_download`]**: Model download system with consent, verification, and atomic install.
@@ -29,9 +26,7 @@ pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;
 pub mod eligibility;
 pub mod embedder;
-pub mod embedder_registry;
-pub mod fastembed_embedder;
-pub mod fastembed_reranker;
+pub mod model_identity;
 pub(crate) mod fleet_cheap_probes;
 pub(crate) mod frankensearch_daemon;
 pub(crate) mod frankensearch_hash_embedder;
@@ -41,8 +36,6 @@ pub mod hash_embedder;
 pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
-#[cfg(feature = "infinity")]
-pub mod infinity;
 pub(crate) mod index_provenance;
 pub mod lexical_index_health;
 pub(crate) mod lexical_rerank;
@@ -72,7 +65,6 @@ pub(crate) mod regression_input;
 pub(crate) mod regression_trace;
 pub mod rerank;
 pub mod reranker;
-pub mod reranker_registry;
 pub mod runtime_optimizations;
 pub(crate) mod salvage_ledger;
 pub(crate) mod search_mode_metadata;

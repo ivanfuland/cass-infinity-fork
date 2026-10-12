@@ -67,7 +67,7 @@
 //! `not(all(unix, feature = "infinity"))` — and no other, so the full build
 //! still reports an unused item if one appears.
 
-#![cfg_attr(not(all(unix, feature = "infinity")), allow(dead_code, unused_imports))]
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 mod util;
 
@@ -557,7 +557,7 @@ fn db_scalar(db_path: &Path, sql: &str) -> i64 {
         .unwrap_or_else(|e| panic!("query {sql:?}: {e}"))
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -587,7 +587,7 @@ origin_host = "cass-bad"
 paths = ["~/.claude/projects"]
 "#;
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn remote_sources_mirror_then_index_once() {
     let fixture = Fixture::new();
@@ -724,7 +724,7 @@ fn remote_sources_mirror_then_index_once() {
 // M2 — zero transfer, no sources, and a lying "Ok"
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn zero_transfer_and_no_sources_still_ingest() {
     let stub = StubInfinity::start();
@@ -863,7 +863,7 @@ paths = ["{REMOTE_PATH}", "~/.codex/sessions"]
 // M2 — a transfer that claims success without materialising its root
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn a_successful_transfer_without_its_root_is_exit_1() {
     let fixture = Fixture::new();
@@ -918,7 +918,7 @@ paths = ["{REMOTE_PATH}"]
 // M3 — the lock is a typed precondition, and it never wraps the mirror
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn a_held_index_lock_is_exit_2() {
     use fs2::FileExt;
@@ -1007,7 +1007,7 @@ paths = ["{REMOTE_PATH}"]
     );
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn an_unreachable_infinity_is_exit_2() {
     let fixture = Fixture::new();
@@ -1046,7 +1046,7 @@ fn an_unreachable_infinity_is_exit_2() {
 // M3 — the run log
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn the_run_log_matches_stdout_byte_for_byte() {
     let fixture = Fixture::new();
@@ -1124,7 +1124,7 @@ fn the_run_log_matches_stdout_byte_for_byte() {
     }
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn a_log_that_cannot_be_written_only_warns() {
     let fixture = Fixture::new();
@@ -1476,7 +1476,7 @@ fn many_failing_sources(count: usize) -> String {
     body
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn concurrent_rounds_append_one_intact_line_each() {
     // The cross-process half of the log contract: four separate `cass sync`

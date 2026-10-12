@@ -106,10 +106,14 @@ impl RuntimeLoadability {
     }
 
     /// Cheap host loadability for the running binary: reflects the compiled
-    /// `semantic` feature and, on x86_64, AVX2 support. Mirrors the guard in
-    /// `src/main.rs`. Never loads ONNX, so it is safe on any host.
+    /// `semantic` feature and, on x86_64, AVX2 support. Never loads ONNX, so it
+    /// is safe on any host.
+    ///
+    /// The `semantic` feature is retired, so `semantic_feature_built` is
+    /// permanently `false` and this always classifies as
+    /// [`Self::BaselineBuildNoSemantic`] — no local model can load any more.
     pub(crate) fn probe_cheap_host() -> Self {
-        let semantic_feature_built = cfg!(feature = "semantic");
+        let semantic_feature_built = false;
         #[cfg(target_arch = "x86_64")]
         let cpu_has_avx2 = std::arch::is_x86_feature_detected!("avx2");
         #[cfg(not(target_arch = "x86_64"))]

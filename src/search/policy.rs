@@ -160,10 +160,7 @@ pub const DEFAULT_FAST_TIER_EMBEDDER: &str = "hash";
 /// `infinity` is `is_infinity_embedder_name`'s (`search::model_manager`)
 /// own routing name for the DB-vector-domain path, so this default now
 /// matches what the build can actually serve.
-#[cfg(feature = "infinity")]
 pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "infinity";
-#[cfg(not(feature = "infinity"))]
-pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "minilm";
 
 /// Default reranker name (requires cross-encoder model files).
 pub const DEFAULT_RERANKER: &str = "ms-marco-minilm";
@@ -1011,13 +1008,12 @@ impl SemanticArtifactKind {
 mod tests {
     use super::*;
 
-    /// R1-W3-N2: under this build's actual feature (ORT-free, `semantic`
-    /// retired), the quality-tier default must be the routing name for
-    /// the DB vector domain this build can actually serve, not a
-    /// FastEmbed/ONNX model that can never load here.
-    #[cfg(feature = "infinity")]
+    /// R1-W3-N2: under this build's actual feature set (ORT-free, local
+    /// inference retired), the quality-tier default is the routing name for the
+    /// DB vector domain this build actually serves, not a FastEmbed/ONNX model
+    /// that can never load here.
     #[test]
-    fn default_quality_tier_embedder_is_infinity_under_the_infinity_feature() {
+    fn default_quality_tier_embedder_is_the_db_vector_domain_routing_name() {
         assert_eq!(DEFAULT_QUALITY_TIER_EMBEDDER, "infinity");
     }
 

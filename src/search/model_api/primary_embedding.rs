@@ -594,21 +594,21 @@ fn evidence_row(
     }
 }
 
-/// The probe sentinel list must stay byte-equal to the legacy Infinity list.
+/// The probe sentinel list must stay byte-equal to the canonical list.
 ///
-/// The legacy constant sits behind the `infinity` Cargo feature, so this test
-/// only exists in a build that has it. It is the single pin keeping the two
-/// copies from drifting, because a changed sentinel silently changes what every
-/// stored generation fingerprint means.
-#[cfg(all(test, feature = "infinity"))]
+/// `API_PROBE_SENTINELS` and `generation_fingerprint::FINGERPRINT_SENTINELS` are
+/// the two copies of the model-independent sentinel text; a changed sentinel
+/// silently changes what every stored generation fingerprint means, so this is
+/// the single pin keeping them from drifting.
+#[cfg(test)]
 mod sentinel_parity_tests {
     use super::*;
 
     #[test]
-    fn api_probe_sentinels_match_the_legacy_infinity_list() {
+    fn api_probe_sentinels_match_the_canonical_list() {
         assert_eq!(
             API_PROBE_SENTINELS,
-            crate::search::infinity::FINGERPRINT_SENTINELS
+            crate::search::generation_fingerprint::FINGERPRINT_SENTINELS
         );
     }
 

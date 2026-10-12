@@ -7259,7 +7259,14 @@ async fn execute_cli(
                     no_mirror,
                 } => {
                     let structured = resolve_subcommand_structured_format(cli, json).is_some();
-                    sync::run_sync(cli.db.clone(), data_dir, no_ingest, no_mirror, structured)?;
+                    sync::run_sync(
+                        cli.db.clone(),
+                        data_dir,
+                        no_ingest,
+                        no_mirror,
+                        structured,
+                        cli.api_config.clone(),
+                    )?;
                 }
                 Commands::Search {
                     query,
@@ -19786,12 +19793,13 @@ fn state_meta_json_inner(
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
-            // cass#256: surface whether this binary was built with the
-            // `semantic` Cargo feature. `false` means the prebuilt
-            // Microsoft ONNX Runtime is NOT linked (the baseline build
-            // for pre-AVX2 CPUs); semantic search modes will return an
-            // explicit error and hybrid degrades to lexical.
-            "feature_compiled_in": cfg!(feature = "semantic"),
+            // cass#256: whether the retired in-process `semantic` (ONNX)
+            // feature was compiled in. It is permanently `false` now: local
+            // inference is retired, the prebuilt Microsoft ONNX Runtime is
+            // never linked, and semantic search is served exclusively by the
+            // configured external model API (hybrid still degrades to lexical
+            // when no API profile is configured).
+            "feature_compiled_in": false,
             // Sub-fix 3 for cass#257 — additive fields that report
             // quality-tier readiness independently of the
             // progressive/hybrid stack so `--mode semantic` consumers
@@ -24845,36 +24853,6 @@ fn execute_search_retrieval(
                 }
             })?,
         SearchMode::Semantic => {
-            // cass#256: in the `-baseline` build (the `semantic` Cargo
-            // feature is disabled), `--mode semantic` returns a clear
-            // CLI envelope rather than reaching code that would expect a
-            // working ORT runtime. Hybrid degrades to lexical via the
-            // existing fail-open path; lexical-only mode is unaffected.
-            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
-            {
-                // Suppress unused-binding warnings in the baseline arm:
-                // every input is consumed by the documented error envelope.
-                let _ = (
-                    &filters,
-                    query,
-                    search_limit,
-                    search_offset,
-                );
-                let _ = client;
-                Err::<crate::search::query::SearchResult, CliError>(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message:
-                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
-                            .to_string(),
-                    hint: Some(
-                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
-                            .to_string(),
-                    ),
-                    retryable: false,
-                })?
-            }
-            #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
                 let (hits, candidate_meta) = client
                     .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
@@ -107087,7 +107065,7 @@ model_revision="r1"
     }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "infinity"))]
+#[cfg(all(test, target_os = "linux"))]
 mod regression_semantic_pipeline_child {
     use super::*;
 

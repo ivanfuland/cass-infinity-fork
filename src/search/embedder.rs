@@ -59,20 +59,7 @@ impl fmt::Display for EmbedderInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::hash_embedder::HashEmbedder;
-    use std::path::PathBuf;
-
-    fn fastembed_fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/models/xenova-paraphrase-minilm-l3-v2-int8")
-    }
-
-    #[cfg(feature = "semantic")]
-    fn load_fastembed_fixture() -> FastEmbedder {
-        FastEmbedder::load_from_dir(&fastembed_fixture_dir())
-            .expect("fastembed fixture should load")
-    }
 
     #[test]
     fn test_embedder_trait_basic() {
@@ -81,70 +68,6 @@ mod tests {
         assert_eq!(embedding.len(), 256);
         assert_eq!(embedder.id(), "fnv1a-256");
         assert!(!embedder.is_semantic());
-    }
-
-    #[cfg(feature = "semantic")]
-    #[test]
-    fn test_embedder_trait_semantic() {
-        let embedder = load_fastembed_fixture();
-        assert_eq!(embedder.dimension(), 384);
-        assert_eq!(embedder.id(), FastEmbedder::embedder_id_static());
-        assert!(embedder.is_semantic());
-    }
-
-    #[cfg(feature = "semantic")]
-    #[test]
-    fn test_embedder_batch() {
-        let embedder = load_fastembed_fixture();
-        let texts = &["hello", "world", "test"];
-        let embeddings = embedder.embed_batch_sync(texts).unwrap();
-
-        assert_eq!(embeddings.len(), 3);
-        for embedding in &embeddings {
-            assert_eq!(embedding.len(), 384);
-        }
-    }
-
-    #[cfg(feature = "semantic")]
-    #[test]
-    fn test_embedder_empty_input_error() {
-        let embedder = load_fastembed_fixture();
-        let result = embedder.embed_sync("");
-        assert!(result.is_err());
-    }
-
-    #[cfg(feature = "semantic")]
-    #[test]
-    fn test_embedder_info() {
-        let embedder = load_fastembed_fixture();
-        let info = EmbedderInfo::from_embedder(&embedder);
-        assert_eq!(info.id, FastEmbedder::embedder_id_static());
-        assert_eq!(info.dimension, 384);
-        assert!(info.is_semantic);
-
-        let display = format!("{info}");
-        for expected in [FastEmbedder::embedder_id_static(), "semantic", "384"] {
-            assert!(
-                display.contains(expected),
-                "display {display:?} should contain {expected:?}"
-            );
-        }
-    }
-
-    #[cfg(not(feature = "semantic"))]
-    #[test]
-    fn test_fastembed_unavailable_without_semantic() {
-        let error = match FastEmbedder::load_from_dir(&fastembed_fixture_dir()) {
-            Ok(_) => panic!("ORT-free builds must not load an ONNX model"),
-            Err(error) => error,
-        };
-        match error {
-            EmbedderError::EmbedderUnavailable { model, reason } => {
-                assert_eq!(model, FastEmbedder::embedder_id_static());
-                assert!(reason.contains("without the `semantic` feature"));
-            }
-            other => panic!("expected disabled semantic support, got {other:?}"),
-        }
     }
 
     // These exercise the real lexical implementation, not an ML model.

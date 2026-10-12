@@ -84,13 +84,6 @@ urlencoding = "2.1.3"
 half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 bytemuck = "1.25.0"
-# `fastembed` ships prebuilt Microsoft ONNX Runtime binaries via
-# `ort-download-binaries-rustls-tls` that contain AVX/AVX2 instructions
-# compiled in. RUSTFLAGS cannot reach that already-linked vendor code, so
-# pre-AVX2 CPUs (Sandy/Ivy Bridge, pre-Excavator AMD) crash at static init
-# with STATUS_ILLEGAL_INSTRUCTION (#256). The `semantic` feature gate
-# below carries this dep so we can ship a `-baseline` artifact without it.
-fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"], optional = true }
 # w3 Task W3-3 (spec 3.4 D4, KU2 basis: probe/sqlite-vec-eval @969c29b9, real
 # 101.6万x1024 bge-m3 corpus) -- vec0 KNN over message_embeddings. Pinned to
 # the last stable release, not the newest crates.io publish: v0.1.10-alpha.4
@@ -148,27 +141,10 @@ openssl = { version = "0.10.79", features = ["vendored"] }
 libc = "=0.2.186"
 
 [features]
-default = ["qr", "encryption", "semantic"]
+default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
-# M4-pre spike: route semantic embedding + rerank through a local Infinity HTTP
-# engine (bge-m3 / bge-reranker-v2-m3) instead of in-process ONNX. `reqwest` is
-# already a non-optional dep, so this pulls in NO ONNX runtime — combine with
-# `--no-default-features --features qr,encryption,infinity` for an ORT-free yet
-# semantic-capable (and Chinese-capable) build.
-infinity = []
-# `semantic` enables ONNX-runtime-backed embedding via fastembed. Disabling
-# it (e.g. via `--no-default-features --features qr,encryption`) builds the
-# `-baseline` artifact that does not pull in the prebuilt Microsoft ONNX
-# Runtime binary, so pre-AVX2 CPUs no longer crash with
-# STATUS_ILLEGAL_INSTRUCTION at static init (cass#256). Semantic search modes
-# return a clear error in baseline builds; lexical search and all other
-# functionality remain fully available. W3-5: the cross-encoder reranker
-# (`search::fastembed_reranker`) is an unconditional stub regardless of this
-# feature now that its upstream backing dependency is retired -- see that
-# module's doc comment.
-semantic = ["dep:fastembed"]
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []

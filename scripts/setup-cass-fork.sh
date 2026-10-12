@@ -13,7 +13,7 @@ ASUPERSYNC_REPO="https://github.com/Dicklesworthstone/asupersync"
 ASUPERSYNC_REV="e136c5da4547a44cec3201ada6d94325a7ca216b"
 ASUPERSYNC_DIR="$(dirname "$FORK_DIR")/asupersync"   # 必须是 FORK_DIR 的 ../asupersync sibling
 INSTALL_PATH="${INSTALL_PATH:-}"
-FEATURES="qr,encryption,infinity"
+FEATURES="qr,encryption"
 
 step() { printf '\n=== %s ===\n' "$1"; }
 die()  { printf 'FAIL[%s]: %s\n' "$1" "$2" >&2; exit 1; }

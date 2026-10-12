@@ -22,7 +22,7 @@ use crate::indexer::lexical_storage_fingerprint_for_db;
 use crate::storage::sqlite::LexDomainRebuildMarkerState;
 use crate::search::vector_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::FastEmbedder;
+use crate::search::model_identity;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
     SemanticAvailability, probe_hash_semantic_availability, probe_semantic_availability,
@@ -979,13 +979,13 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
 
 fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
-    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+    let embedder_name = model_identity::canonical_name(&policy.quality_tier_embedder)?;
+    model_identity::runtime_model_dir_for(data_dir, embedder_name)
 }
 
 fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
-    let embedder_name = FastEmbedder::canonical_name(embedder_id)?;
-    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+    let embedder_name = model_identity::canonical_name(embedder_id)?;
+    model_identity::runtime_model_dir_for(data_dir, embedder_name)
 }
 
 fn semantic_tier_queryable(
@@ -1492,7 +1492,7 @@ fn semantic_embedder_id(
         SemanticAvailability::HashFallback => Some(HashEmbedder::default().id().to_string()),
         _ => match preference {
             SemanticPreference::DefaultModel => {
-                Some(FastEmbedder::embedder_id_static().to_string())
+                Some(model_identity::embedder_id_static().to_string())
             }
             SemanticPreference::HashFallback => Some(HashEmbedder::default().id().to_string()),
         },
@@ -2713,18 +2713,11 @@ mod tests {
     #[test]
     fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
         let data_dir = Path::new("/tmp/cass");
-        // R1-W3-N2 fallout: `active_policy_model_dir` -> `FastEmbedder::
-        // canonical_name(&policy.quality_tier_embedder)` returns `None`
-        // for the infinity-routing names ("infinity"/"bge-m3") -- correct
-        // behavior, not a bug, DEFAULT_QUALITY_TIER_EMBEDDER's default
-        // under `infinity` is `is_infinity_embedder_name`-shaped, and the
-        // Infinity-served model lives on a remote HTTP service with no
-        // on-disk FastEmbed directory to project a path for at all.
-        let default_model_dir = if cfg!(feature = "infinity") {
-            None
-        } else {
-            Some(FastEmbedder::default_model_dir(data_dir))
-        };
+        // `active_policy_model_dir` -> `model_identity::canonical_name` yields
+        // the on-disk MiniLM cache directory for the default-model preference;
+        // the local HTTP engine's names have no cache directory and return
+        // `None`.
+        let default_model_dir = Some(model_identity::default_model_dir(data_dir));
         let cases = [
             (SemanticPreference::DefaultModel, "fastembed", default_model_dir),
             (SemanticPreference::HashFallback, "hash", None),
@@ -2746,13 +2739,13 @@ mod tests {
         std::fs::write(vector_dir.join("vector.fast.idx"), b"fast").expect("write fast tier");
         std::fs::write(vector_dir.join("vector.quality.idx"), b"quality")
             .expect("write quality tier");
-        let hnsw_path = hnsw_index_path(temp.path(), FastEmbedder::embedder_id_static());
+        let hnsw_path = hnsw_index_path(temp.path(), model_identity::embedder_id_static());
         std::fs::write(&hnsw_path, b"hnsw").expect("write hnsw");
 
         let state = semantic_state_from_availability(
             temp.path(),
             &SemanticAvailability::Ready {
-                embedder_id: FastEmbedder::embedder_id_static().to_string(),
+                embedder_id: model_identity::embedder_id_static().to_string(),
             },
             SemanticPreference::DefaultModel,
             None,
@@ -2763,7 +2756,7 @@ mod tests {
         assert!(state.hnsw_ready);
         assert_eq!(
             state.embedder_id.as_deref(),
-            Some(FastEmbedder::embedder_id_static())
+            Some(model_identity::embedder_id_static())
         );
     }
 

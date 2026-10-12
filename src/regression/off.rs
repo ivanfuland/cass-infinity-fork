@@ -876,7 +876,6 @@ query_prefix="Query: "
         }
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn semantic_fake_http_child() {
         let Ok(mode) = dotenvy::var("CASS_S2_04_SEMANTIC_CHILD") else {
@@ -903,7 +902,6 @@ query_prefix="Query: "
         assert!(report["questions"][0]["cost"]["model_execution_ms"].is_null());
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn semantic_and_hybrid_off_use_only_isolated_fake_embedding_http() {
         use std::net::TcpListener;
@@ -1285,7 +1283,6 @@ query_prefix="Query: "
         }
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn embedding_transport_failure_child() {
         let Ok(mode) = dotenvy::var("CASS_S2_04_FAILURE_CHILD") else {
@@ -1332,7 +1329,6 @@ query_prefix="Query: "
         std::process::exit(rc);
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn aggregate_semantic_hybrid_http500_invalid_response_disconnect_are_failed() {
         use std::net::TcpListener;
@@ -1454,7 +1450,6 @@ query_prefix="Query: "
             }
         }
     }
-    #[cfg(feature = "infinity")]
     #[test]
     fn exact_partial_aggregate_child() {
         if dotenvy::var("CASS_S2_04_PARTIAL_CHILD").is_err() {
@@ -1525,7 +1520,6 @@ query_prefix="Query: "
         println!("REAL_PARTIAL_AGGREGATE_REJECTED_CODE=REGRESSION_PARTIAL_RESULTS");
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn aggregate_exact_budget_partial_is_rejected_in_isolated_child() {
         use std::net::TcpListener;

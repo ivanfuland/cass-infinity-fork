@@ -102,7 +102,7 @@ impl RegressionSearchRun {
                 rerank_profile: api.rerank_profile.clone(), no_model_fallback: api.no_model_fallback,
                 ..Default::default()
             },
-            model: (!api.selected() && *search_mode != SearchMode::Lexical).then(|| "bge-m3".into()),
+            model: None,
             rerank: rerank_limit.is_some(), rerank_limit, rerank_provider: *rerank_provider,
             ..Default::default()
         };
@@ -121,31 +121,11 @@ impl RegressionSearchRun {
                 semantic.api.embedding_route = Some(route.clone());
                 query_driver = Some(client.set_api_frozen_semantic_context(Arc::new(crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver))), route)?);
             } else {
-            #[cfg(not(feature = "infinity"))]
-            bail!("REGRESSION_SEMANTIC_NOT_INTEGRATED");
-            #[cfg(feature = "infinity")]
-            {
-                let config = crate::search::infinity::InfinityConfig::from_env();
-                if config.embed_model != "BAAI/bge-m3" {
-                    bail!("REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH");
-                }
-                let setup =
-                    crate::search::model_manager::load_infinity_semantic_context_for_regression(
-                        &context, &config,
-                    )?;
-                let semantic = setup
-                    .context
-                    .ok_or_else(|| anyhow::anyhow!("REGRESSION_SEMANTIC_NOT_INTEGRATED"))?;
-                client.set_semantic_context(semantic.embedder, semantic.roles)?;
-                embedding_binding = Some(json!({
-                    "requested_model": config.embed_model,
-                    "origin_sha256": regression_trace::TextDigest::of(&config.base_url).sha256,
-                    "dimension": config.expected_dim,
-                    "timeout_ms": config.timeout.as_millis() as u64,
-                    "max_batch": config.max_batch,
-                }));
+                // Semantic regression requires a frozen model-API profile.
+                // There is no local inference tier left to fall back to.
+                bail!("REGRESSION_SEMANTIC_NOT_INTEGRATED");
             }
-        }        }
+        }
         let rerank = rerank_limit;
         let endpoint = api_reranker.as_ref().map(|p| p.endpoint.as_str().to_owned())
             .or_else(|| rerank_provider.map(crate::rerank_endpoint_origin));

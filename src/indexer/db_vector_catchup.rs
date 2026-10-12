@@ -25,7 +25,6 @@ use crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use crate::search::chunking::canonical_role;
 use crate::search::eligibility::{ExpectedChunk, expected_chunks, for_each_expected_chunk};
 use crate::search::frankensearch_types::cosine_similarity;
-use crate::search::infinity::InfinityServedIdentity;
 use crate::search::generation_fingerprint::fingerprint_matches;
 use crate::search::model_api::{
     EndpointConfigIdentity, ModelApiBackfillReport, PrimaryEmbeddingCall, ProbeMeasurement,
@@ -36,6 +35,20 @@ use crate::storage::api_generation::{create_api_generation, create_api_generatio
 use crate::storage::schema::{self, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
+
+/// A served embedding identity: the model id a generation is keyed on and its
+/// vector width.
+///
+/// This is the model-independent identity the v5 generation lookup matches on.
+/// It was previously borrowed from the retired Infinity HTTP module; it now
+/// lives here because the (generic, closure-driven) catch-up loop still keys
+/// generations by `(model_id, dimension)`.
+pub struct ServedEmbeddingIdentity {
+    /// The `embedding_generations.embedder_id` this identity writes and matches.
+    pub model_id: String,
+    /// The embedding width.
+    pub dimension: usize,
+}
 
 /// T4 mission #122a (D), spec §五 "ownership oracle cosine 阈值": the
 /// activation audit's fresh-vs-stored ownership check (`run_activation_
@@ -606,7 +619,7 @@ fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, 
 /// this fix.
 fn find_reusable_or_create_generation(
     conn: &Conn,
-    identity: &InfinityServedIdentity,
+    identity: &ServedEmbeddingIdentity,
     canonicalize_version: u32,
     chunking_policy_version: u32,
     fingerprint: &[u8],
@@ -1704,7 +1717,7 @@ trait CatchupEngine {
 
 /// The legacy Infinity engine: the original arguments, unchanged.
 struct InfinityCatchupEngine<'a> {
-    identity: &'a InfinityServedIdentity,
+    identity: &'a ServedEmbeddingIdentity,
     canonicalize_version: u32,
     chunking_version: u32,
     fingerprint: &'a [u8],
@@ -2056,7 +2069,7 @@ pub fn run_api_primary_catchup_backfill(
 pub fn run_db_vector_catchup_backfill(
     storage: &FrankenStorage,
     batch_size: usize,
-    identity: &InfinityServedIdentity,
+    identity: &ServedEmbeddingIdentity,
     canonicalize_version: u32,
     chunking_policy_version: u32,
     fingerprint: &[u8],
@@ -2671,8 +2684,8 @@ mod chunk_catchup_v5_tests {
         out
     }
 
-    fn mock_identity() -> InfinityServedIdentity {
-        InfinityServedIdentity { model_id: "mock-embedder-t8".to_string(), dimension: DIM }
+    fn mock_identity() -> ServedEmbeddingIdentity {
+        ServedEmbeddingIdentity { model_id: "mock-embedder-t8".to_string(), dimension: DIM }
     }
 
     fn insert_conversation(storage: &FrankenStorage, external_id: &str, contents: &[&str]) -> Vec<i64> {
@@ -4320,239 +4333,4 @@ mod chunk_catchup_v5_tests {
         assert!(!plan_details.iter().any(|d| d.contains("SCAN chunk_holes")), "must not fall back to a chunk_holes table SCAN: {plan_details:?}");
     }
 
-    /// Live proof (real Infinity at 127.0.0.1:7997): a real chunk-domain
-    /// backfill run must actually activate, using the real production
-    /// embedder wrapper (`InfinityEmbedder::embed_batch_sync`) instead of
-    /// the deterministic mock every other test in this module uses.
-    /// `#[ignore]`d -- run explicitly with `--ignored`.
-    #[test]
-    #[ignore]
-    fn fingerprint_live_chunk_backfill_activates() {
-        use crate::search::embedder::Embedder as _;
-        use crate::search::infinity::{InfinityConfig, InfinityEmbedder, probe_identity_and_fingerprint};
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = open_storage(&dir.path().join("db.sqlite"));
-
-        let config = InfinityConfig::from_env();
-        let (identity, fingerprint) = probe_identity_and_fingerprint(&config).expect("live infinity identity+fingerprint probe");
-        let embedder = InfinityEmbedder::new().expect("live infinity embedder");
-        let embed_fn = |texts: &[&str]| embedder.embed_batch_sync(texts).map_err(|e| e.to_string());
-
-        // Create the (pending) generation + its vec0 table directly --
-        // not via a genesis backfill call on zero messages -- for the same
-        // reason `genesis()` above does (③'s positive-check has no anchor
-        // to pick with nothing embedded yet; a real corpus is never
-        // actually empty in production).
-        let generation_id = storage
-            .raw()
-            .with_tx(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation(tx, &identity.model_id, i64::try_from(identity.dimension).unwrap(), CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &fingerprint, TS)
-            })
-            .unwrap();
-        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, i64::try_from(identity.dimension).unwrap()).unwrap();
-
-        insert_conversation(&storage, "t8-live", &["a real message about how vec0 chunk-domain catch-up should behave against a live Infinity service"]);
-        let report = run_db_vector_catchup_backfill(&storage, 32, &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &fingerprint, &embed_fn, 7).unwrap();
-        assert_eq!(report.generation_id, generation_id);
-        assert!(report.activated, "a real live drain of one small message must activate cleanly: {report:?}");
-        assert!(report.chunks_embedded >= 1);
-    }
-
-    /// mission #92 Step 4/5 (T-R's own v5 positive fixture source, per
-    /// control plane 2026-09-04): a synthetic 200-conversation corpus,
-    /// drained through the *real* candidate release binary (via the run
-    /// root wrapper, `$CASS_WRAP index --semantic`) against a real
-    /// Infinity, must activate cleanly with a zero-failure audit and
-    /// `ownership_checked == 200`. `#[ignore]`d, run with `--ignored`.
-    ///
-    /// No run-root path is hardcoded here (PUBLIC repo constraint,
-    /// control plane 2026-09-04): the data dir comes from
-    /// `CASS_W4_SYNTH_DIR` (falls back to an ephemeral tempdir if unset,
-    /// so the test still runs standalone) and the wrapper binary from
-    /// `CASS_WRAP` -- both set by whoever invokes this test, not baked
-    /// into the source.
-    ///
-    /// The 200 conversations are seeded via the production write path
-    /// directly (`insert_conversation_tree`) -- "走生产写入路径建库" -- not
-    /// via any CLI ingest command (there is no source file to scan); only
-    /// the *semantic* step goes through the real CLI subprocess. The
-    /// generation is pre-created (same reason `genesis()`/the single-
-    /// message live test above do it) via the exact same `probe_identity_
-    /// and_fingerprint` call the CLI subprocess will independently make
-    /// against the same live Infinity -- both resolve to the same
-    /// identity+fingerprint bytes, so the subprocess's own generation
-    /// lookup reuses this pre-created row (tier ① of `find_reusable_or_
-    /// create_generation`) instead of creating a second one.
-    #[test]
-    #[ignore]
-    fn live_synth_200_v5_backfill_via_real_binary() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use crate::search::infinity::{InfinityConfig, InfinityEmbedder, probe_identity_and_fingerprint};
-
-        let synth_dir_env = std::env::var("CASS_W4_SYNTH_DIR").ok();
-        let _tempdir_keepalive;
-        let synth_dir: std::path::PathBuf = match &synth_dir_env {
-            Some(dir) => {
-                std::fs::create_dir_all(dir).expect("create CASS_W4_SYNTH_DIR");
-                _tempdir_keepalive = None;
-                std::path::PathBuf::from(dir)
-            }
-            None => {
-                let t = tempfile::TempDir::new().unwrap();
-                let p = t.path().to_path_buf();
-                _tempdir_keepalive = Some(t);
-                p
-            }
-        };
-        let db_path = synth_dir.join("agent_search.db");
-
-        let config = InfinityConfig::from_env();
-        let (identity, fingerprint) = probe_identity_and_fingerprint(&config).expect("live infinity identity+fingerprint probe");
-
-        let storage = FrankenStorage::open(&db_path).expect("open synth db");
-        let generation_id = storage
-            .raw()
-            .with_tx(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation(
-                    tx,
-                    &identity.model_id,
-                    i64::try_from(identity.dimension).unwrap(),
-                    CANONICALIZE_PIPELINE_VERSION,
-                    CHUNKING_POLICY_VERSION,
-                    &fingerprint,
-                    TS,
-                )
-            })
-            .unwrap();
-        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, i64::try_from(identity.dimension).unwrap()).unwrap();
-
-        let agent_id = storage
-            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
-            .unwrap();
-        for i in 0..200 {
-            let conv = Conversation {
-                id: None,
-                agent_slug: "claude_code".into(),
-                workspace: None,
-                external_id: Some(format!("t8-synth200-{i}")),
-                title: Some("T8 synth-200-v5 fixture".into()),
-                source_path: std::path::PathBuf::from(format!("/fixtures/synth200-{i}.jsonl")),
-                started_at: Some(TS),
-                ended_at: Some(TS + 1),
-                approx_tokens: None,
-                metadata_json: serde_json::Value::Null,
-                messages: vec![Message {
-                    excluded: None,
-                    id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(TS),
-                    content: format!("synthetic T-R fixture message number {i} with distinct real content for chunk-domain backfill"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: vec![],
-                }],
-                source_id: "local".into(),
-                origin_host: None,
-            };
-            storage.insert_conversation_tree(agent_id, None, &conv).expect("insert synth conversation");
-        }
-        drop(storage);
-
-        let wrapper = std::env::var("CASS_WRAP").expect("CASS_WRAP env var must point at the run-root wrapper script (no path hardcoded in source)");
-        // control plane 2026-09-04 (root-cause correction): cass's built-in
-        // agent source discovery walks HOME (`~/.codex`, `~/.claude`, ...)
-        // directly, unaffected by XDG_CONFIG_HOME -- an inherited real HOME
-        // makes `index` (even scoped to an isolated CASS_DATA_DIR) discover
-        // and ingest the *real* local corpus. `CASS_W4_TEST_HOME` (an
-        // empty, run-root-scoped directory the caller creates) must be
-        // passed explicitly; no path is hardcoded in source.
-        let test_home = std::env::var("CASS_W4_TEST_HOME").expect("CASS_W4_TEST_HOME env var must point at an empty run-root-scoped HOME (no path hardcoded in source)");
-        // `$RUN_ROOT/cass-candidate` is T12's own setup-cass-fork.sh output
-        // position (sha-asserted there) -- this test must not pre-occupy
-        // it, so it points the wrapper at this run's own release build via
-        // the wrapper's CASS_CAND_BIN override instead.
-        let cand_bin = std::env::var("CASS_CAND_BIN").unwrap_or_else(|_| "/tmp/cc-cass-pr4-target/release/cass".to_string());
-
-        // Dry run first (no --semantic): proves HOME isolation actually
-        // worked -- the streaming-ingest summary must report exactly the
-        // 200 synthetic conversations/messages just seeded, not a real
-        // local corpus, before any Infinity call is ever made.
-        let dry_run = std::process::Command::new(&wrapper)
-            .arg("index")
-            .env("CASS_DATA_DIR", &synth_dir)
-            .env("HOME", &test_home)
-            .env("CASS_CAND_BIN", &cand_bin)
-            .output()
-            .expect("spawn $CASS_WRAP index (dry run, no --semantic)");
-        assert!(
-            dry_run.status.success(),
-            "dry-run `index` must exit 0: stdout={} stderr={}",
-            String::from_utf8_lossy(&dry_run.stdout),
-            String::from_utf8_lossy(&dry_run.stderr)
-        );
-        // HOME isolation proof: the 200 conversations were seeded directly
-        // via the production write path (not by `index` scanning source
-        // files), so a correctly-isolated `index` run finds *zero* new
-        // conversations to discover from disk -- `total_conversations=0`
-        // is the *positive* signal here, not a fluke; a real-corpus leak
-        // (this test's original failure mode) would instead show
-        // `discovered=true` for at least one connector and a large
-        // nonzero total_conversations/total_messages count.
-        let dry_run_stderr = String::from_utf8_lossy(&dry_run.stderr);
-        assert!(
-            dry_run_stderr.contains("total_conversations=0 total_messages=0"),
-            "HOME isolation must be proven BEFORE any Infinity call: expected zero newly-discovered conversations (the 200 fixture rows were seeded directly, not via source-file ingest), got: {dry_run_stderr}"
-        );
-        assert!(
-            !dry_run_stderr.contains("discovered=true"),
-            "no connector may discover a real local corpus once HOME is isolated: {dry_run_stderr}"
-        );
-        let seeded_message_count: i64 = FrankenStorage::open_readonly(&db_path)
-            .expect("reopen synth db read-only to confirm the 200 fixture rows survived the dry run")
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
-            .unwrap();
-        assert_eq!(seeded_message_count, 200, "the 200 directly-seeded messages must still be present after the dry run");
-
-        let output = std::process::Command::new(&wrapper)
-            .arg("index")
-            .arg("--semantic")
-            .env("CASS_DATA_DIR", &synth_dir)
-            .env("HOME", &test_home)
-            .env("CASS_CAND_BIN", &cand_bin)
-            .output()
-            .expect("spawn $CASS_WRAP index --semantic");
-        assert!(
-            output.status.success(),
-            "real candidate binary `index --semantic` must exit 0: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let storage = FrankenStorage::open_readonly(&db_path).expect("reopen synth db read-only");
-        let (active_generation_id, audit_status): (i64, String) = storage
-            .raw()
-            .query_row_map("SELECT id, audit_status FROM embedding_generations WHERE is_active = 1", &[], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))
-            .expect("an active generation must exist after a successful CLI run");
-        assert_eq!(active_generation_id, generation_id, "the CLI subprocess must have reused the pre-created generation (identity+fingerprint match), not created a second one");
-        assert_eq!(audit_status, "passed");
-
-        let embedder = InfinityEmbedder::new().expect("live infinity embedder for the re-verification audit");
-        use crate::search::embedder::Embedder as _;
-        let embed_fn = |texts: &[&str]| embedder.embed_batch_sync(texts).map_err(|e| e.to_string());
-        let report = run_activation_audit(&storage, generation_id, 500, None, Some(&embed_fn), 200, 12345).expect("re-audit the CLI-produced generation");
-        assert!(report.passed, "the CLI-produced generation must re-audit clean: {report:?}");
-        assert_eq!(report.hash_mismatch, 0, "⑧: {report:?}");
-        assert_eq!(report.span_mismatch, 0, "⑨ span: {report:?}");
-        assert_eq!(report.completeness_missing, 0, "⑨ completeness missing: {report:?}");
-        assert_eq!(report.completeness_extra, 0, "⑨ completeness extra: {report:?}");
-        assert_eq!(report.ownership_failed, 0, "⑩: {report:?}");
-        assert!(report.fingerprint_ok, "⑪: {report:?}");
-        assert_eq!(report.ownership_checked, 200, "min(200, chunk_count) must be 200 for a 200-message, one-chunk-each corpus: {report:?}");
-
-        if synth_dir_env.is_some() {
-            eprintln!("live_synth_200_v5_backfill_via_real_binary: synth-200-v5 library left at {} (not cleaned up)", synth_dir.display());
-        }
-    }
 }

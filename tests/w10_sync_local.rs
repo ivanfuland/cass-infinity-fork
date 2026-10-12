@@ -29,7 +29,6 @@ mod util;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-#[cfg(feature = "infinity")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -38,11 +37,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(feature = "infinity")]
 use coding_agent_search::storage::api::{Profile, Value};
-#[cfg(feature = "infinity")]
 use coding_agent_search::storage::sqlite::FrankenStorage;
-#[cfg(feature = "infinity")]
 use coding_agent_search::storage::testing::open_writable_for_tests;
 use coding_agent_search::sync::{
     EXIT_INTERNAL, EXIT_PARTIAL, EXIT_PRECONDITION, EXIT_READY, IndexOutcome, REASON_MIRROR_FAILED,
@@ -231,7 +227,6 @@ fn handle_request(mut stream: TcpStream) {
 }
 
 /// A port nobody is listening on: bind, read the address, drop the listener.
-#[cfg(feature = "infinity")]
 fn closed_port_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let addr = listener.local_addr().expect("ephemeral address");
@@ -311,8 +306,7 @@ impl Fixture {
     }
 
     /// One `cass sync --json` round against the fixture.
-    #[cfg(feature = "infinity")]
-    fn sync_json(&self, infinity_url: &str, extra: &[&str]) -> Output {
+        fn sync_json(&self, infinity_url: &str, extra: &[&str]) -> Output {
         let mut cmd = self.command();
         cmd.env("CASS_INFINITY_URL", infinity_url);
         cmd.args(["sync", "--json", "--data-dir"]);
@@ -359,7 +353,6 @@ fn report_of(output: &Output) -> serde_json::Value {
     payload
 }
 
-#[cfg(feature = "infinity")]
 fn db_scalar(db_path: &Path, sql: &str) -> i64 {
     let storage = FrankenStorage::open_readonly(db_path).expect("open corpus read-only");
     storage
@@ -370,7 +363,6 @@ fn db_scalar(db_path: &Path, sql: &str) -> i64 {
 
 /// Every row of a one-column projection, joined — used to compare a whole
 /// watermark table before/after without depending on row order.
-#[cfg(feature = "infinity")]
 fn table_rows(db_path: &Path, sql: &str) -> Vec<String> {
     let storage = FrankenStorage::open_readonly(db_path).expect("open corpus read-only");
     storage
@@ -379,10 +371,8 @@ fn table_rows(db_path: &Path, sql: &str) -> Vec<String> {
         .unwrap_or_else(|e| panic!("query {sql:?}: {e}"))
 }
 
-#[cfg(feature = "infinity")]
 const WATERMARK_ROWS: &str = "SELECT root_id || '|' || connector || '|' || last_scan_ts \
      FROM scan_watermarks ORDER BY root_id, connector";
-#[cfg(feature = "infinity")]
 const FILE_STATE_ROWS: &str = "SELECT root_id || '|' || connector || '|' || relative_path || '|' \
      || size || '|' || mtime FROM scan_file_state ORDER BY root_id, connector, relative_path";
 
@@ -392,7 +382,6 @@ const FILE_STATE_ROWS: &str = "SELECT root_id || '|' || connector || '|' || rela
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_indexes_locally_without_remote_sources() {
     let fixture = Fixture::new();
@@ -513,7 +502,6 @@ fn sync_indexes_locally_without_remote_sources() {
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_no_ingest_ignores_a_broken_sources_config() {
     let fixture = Fixture::new();
@@ -595,7 +583,6 @@ fn sync_no_ingest_ignores_a_broken_sources_config() {
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_precondition_failures_exit_2() {
     let stub = StubInfinity::start();
@@ -768,7 +755,6 @@ fn sync_without_the_infinity_feature_fails_the_same_precondition() {
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_partial_round_exits_3() {
     let fixture = Fixture::new();
@@ -831,7 +817,6 @@ paths = ["~/.codex/sessions"]
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_with_only_a_local_source_is_a_complete_round() {
     // S1: a `type = "local"` entry is a local root for the indexer, not a
@@ -943,7 +928,6 @@ paths = ["{}"]
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_no_ingest_still_runs_with_the_ignore_sources_config_set() {
     // S2, second half: `--no-ingest` neither mirrors nor scans, so it never
@@ -1015,7 +999,6 @@ paths = ["{}"]
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_unidentified_index_failure_exits_1() {
     let fixture = Fixture::new();
@@ -1175,7 +1158,6 @@ fn a_late_sources_config_error_fails_closed() {
 
 // Needs a live Infinity backend: this round has to reach a real index, and a
 // build without the feature stops at the semantic precondition (task 08).
-#[cfg(feature = "infinity")]
 #[test]
 fn sync_report_values_are_readable_from_a_plain_sqlite_handle() {
     // Guards the fixture helpers above: a raw read of the archive must see

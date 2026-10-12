@@ -1,4 +1,3 @@
-#[cfg(feature = "infinity")]
 pub mod db_vector_catchup;
 pub mod exclusion;
 pub(crate) mod lexical_generation;
@@ -40441,7 +40440,6 @@ normalization="l2"
     /// = "requires a live Infinity service..."]` tests in tests/w3_5_n3_
     /// generation_reuse.rs hit the same constraint for the same reason).
     #[test]
-    #[cfg(feature = "infinity")]
     fn cleanup_failure_from_a_real_scan_failure_maps_into_stats_and_its_json() {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("agent_search.db");

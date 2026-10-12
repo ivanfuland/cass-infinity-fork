@@ -237,9 +237,10 @@ pub fn run_sync(
     no_ingest: bool,
     no_mirror: bool,
     structured: bool,
+    api_config: Option<PathBuf>,
 ) -> Result<(), CliError> {
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
-    let mut report = execute(db_override, data_dir.clone(), no_ingest, no_mirror);
+    let mut report = execute(db_override, data_dir.clone(), no_ingest, no_mirror, api_config);
 
     // The fourth stage, and what its window can honestly be.
     //
@@ -320,6 +321,7 @@ fn execute(
     data_dir: PathBuf,
     no_ingest: bool,
     no_mirror: bool,
+    api_config: Option<PathBuf>,
 ) -> SyncReport {
     let started = Utc::now_stamp();
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -385,14 +387,17 @@ fn execute(
             preflight_failed(started.clone()),
         );
     }
-    if let Some(err) = preflight_semantic() {
-        return finish(
-            report,
-            EXIT_PRECONDITION,
-            Some(err),
-            preflight_failed(started.clone()),
-        );
-    }
+    let semantic_setup = match preflight_semantic(api_config.as_deref()) {
+        Ok(setup) => setup,
+        Err(err) => {
+            return finish(
+                report,
+                EXIT_PRECONDITION,
+                Some(err),
+                preflight_failed(started.clone()),
+            );
+        }
+    };
     // The `preflight` stage's window is the whole read-only probe block above;
     // it is closed here, before the first thing with a side effect.
     let preflight = closed_stage(STAGE_PREFLIGHT, started, STAGE_OK);
@@ -450,7 +455,7 @@ fn execute(
     let index_started = Utc::now_stamp();
     let progress = Arc::new(IndexingProgress::default());
     let opts = IndexOptions {
-        model_api: None,
+        model_api: Some(Arc::clone(&semantic_setup)),
         full: false,
         force_rebuild: false,
         watch: false,
@@ -459,7 +464,7 @@ fn execute(
         data_dir,
         semantic: true,
         no_ingest,
-        embedder: "infinity".to_string(),
+        embedder: semantic_setup.profile_id().to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
     };
@@ -974,54 +979,27 @@ fn preflight_schema(db_path: &Path) -> Option<SyncError> {
     })
 }
 
-/// Probe the semantic backend before indexing.
+/// Freeze and validate the semantic backend before indexing.
 ///
-/// `run_index --semantic` probes Infinity itself and returns an `anyhow`
-/// error whose text is the only signal; classifying *that* string after the
-/// fact is the pattern the spec bans. Probing here — with the same
-/// purpose-built probe, whose own doc comment already calls a missing
-/// identity a precondition failure — makes "Infinity is unreachable" a
-/// typed exit 2 by construction.
-///
-/// Infinity *is* the semantic backend in this fork — the fsvi/ONNX tier was
-/// retired in W3-5 (`src/indexer/mod.rs`'s `#[cfg(not(feature =
-/// "infinity"))]` arm says the same thing to `run_index`). The two arms below
-/// are therefore the same precondition reached two ways, not a degraded
-/// fallback: a build without the feature has no probe to run, so it fails
-/// here, before the mirror stage and before the index, rather than compiling
-/// the call away or letting the round report success.
-#[cfg(feature = "infinity")]
-fn preflight_semantic() -> Option<SyncError> {
-    let config = crate::search::infinity::InfinityConfig::from_env();
-    match crate::search::infinity::probe_served_embed_identity(&config) {
-        Ok(_) => None,
-        Err(err) => Some(SyncError {
+/// `cass sync` requires semantic readiness. Both in-process semantic tiers this
+/// fork ever had — the fsvi/ONNX embedder (retired W3-5) and the local Infinity
+/// HTTP engine (retired with this build) — are gone; embedding is served
+/// exclusively by the configured external model API. This preflight loads the
+/// frozen API configuration and its embedding route **once**, before any side
+/// effect, and returns that same snapshot for the indexer to reuse, so the
+/// mirror set and the vectors are produced against one configuration. A missing
+/// or unusable configuration is a precondition failure (exit 2) raised before
+/// the mirror stage and before the index, exactly as an unreachable backend
+/// always was; the round can then report `index.started = false` truthfully.
+fn preflight_semantic(
+    api_config: Option<&Path>,
+) -> Result<Arc<crate::search::model_api::index_embedding::IndexEmbeddingSetup>, SyncError> {
+    crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(api_config, None, true)
+        .map(Arc::new)
+        .map_err(|err| SyncError {
             kind: CliErrorKind::SemanticUnavailable.kind_str(),
-            message: format!(
-                "Infinity at {} did not answer the embed-identity probe: {err}",
-                config.base_url
-            ),
-        }),
-    }
-}
-
-/// The same precondition for a build compiled without the `infinity` feature.
-///
-/// There is nothing to probe and no semantic tier this build could activate,
-/// so `cass sync` — which requires semantic readiness — cannot start a round
-/// at all. Same kind and same exit code as an unreachable Infinity; the
-/// fixed message points at the build rather than at a server, because
-/// retrying the network cannot fix it.
-#[cfg(not(feature = "infinity"))]
-fn preflight_semantic() -> Option<SyncError> {
-    Some(SyncError {
-        kind: CliErrorKind::SemanticUnavailable.kind_str(),
-        message: "this build has no semantic backend: it was compiled without the \
-                  `infinity` feature, and the fsvi/ONNX semantic tier was retired in \
-                  W3-5; rebuild with --no-default-features --features \
-                  qr,encryption,infinity to run `cass sync`"
-            .to_string(),
-    })
+            message: format!("the configured embedding API profile is not usable: {err}"),
+        })
 }
 
 // ---------------------------------------------------------------------------

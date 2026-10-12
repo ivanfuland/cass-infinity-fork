@@ -7097,17 +7097,11 @@ pub(crate) mod tests {
     const ISOLATED_QUERY_CHILD: &str = "CASS_TEST_ISOLATED_QUERY_CHILD";
 
     fn isolated_query_child_output(name: &str) -> std::process::Output {
-        let previous_url = std::env::var_os("CASS_INFINITY_URL");
         let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["--exact", name, "--nocapture", "--format", "pretty", "--color", "never"])
             .env(ISOLATED_QUERY_CHILD, name);
-        if name == "search::query::tests::hybrid_fails_open_when_infinity_unreachable" {
-            command.env("CASS_INFINITY_URL", "http://127.0.0.1:1");
-        }
-        let output = command.output().expect("run isolated query test");
-        assert_eq!(std::env::var_os("CASS_INFINITY_URL"), previous_url, "child must preserve parent Infinity URL");
-        output
+        command.output().expect("run isolated query test")
     }
 
     fn isolated_query_child_passed(output: &std::process::Output, name: &str) -> bool {
@@ -7964,61 +7958,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// T9 part 2 (mission #93/#93b Step 1): `search_hybrid` must also fail
-    /// open when Infinity itself is unreachable -- a real `InfinityEmbedder`
-    /// pointed at a dead port, not a fixture double, so the actual
-    /// `http_embed` -> `"embeddings request failed:"` error text is what
-    /// `is_semantic_fail_open_condition` has to match.
-    #[test]
-    #[cfg(feature = "infinity")]
-    fn hybrid_fails_open_when_infinity_unreachable() -> Result<()> {
-        if !in_isolated_query_child("hybrid_fails_open_when_infinity_unreachable") {
-            return Ok(());
-        }
-        let conv = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("lexical only".into()),
-            workspace: None,
-            source_path: std::path::PathBuf::from("/tmp/lexical-only-unreachable.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: Some("me".into()),
-                created_at: Some(1_700_000_000_000),
-                content: "hello infinity world".into(),
-                extra: serde_json::json!({}),
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }],
-        };
-        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-
-        // The parent binds the dead local port only in this child process.
-        // Keep the real constructor and unreachable HTTP fail-open path.
-        let embedder_result = crate::search::infinity::InfinityEmbedder::new();
-        let embedder = embedder_result.expect("constructing the embedder itself does not touch the network");
-        client.set_semantic_context(Arc::new(embedder), None)?;
-
-        let result = client.search_hybrid(
-            "hello",
-            "hello infinity world",
-            SearchFilters::default(),
-            5,
-            0,
-            0,
-            FieldMask::FULL,
-        )?;
-
-        assert!(result.semantic_degraded, "an unreachable Infinity must fail open, not error");
-        assert!(result.candidates.is_none());
-        assert!(!result.hits.is_empty(), "the lexical leg alone must still return the seeded message");
-        Ok(())
-    }
 
     /// T9 part 2 (mission #93/#93b Step 1, advisor 2026-09-04 addendum):
     /// `hydrate_semantic_hits_with_ids`'s `HYDRATE_ID_BATCH_ROWS`-sized

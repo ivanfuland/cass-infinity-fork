@@ -9167,7 +9167,6 @@ fn restore_invalidate_embeddings(journal: &RestoreJournal) -> anyhow::Result<()>
 /// `register_chunk_holes_for_message_in_tx`/
 /// `demote_active_generation_readiness_in_tx`）,零第二定义；两者都是
 /// `INSERT OR IGNORE`/no-op-safe,整体重跑幂等。
-#[cfg(feature = "infinity")]
 fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Result<()> {
     let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db for db-vector-domain invalidation: {e}"))?;
@@ -9214,12 +9213,7 @@ fn restore_invalidate_db_vector_domain(journal: &RestoreJournal) -> anyhow::Resu
     Ok(())
 }
 
-#[cfg(not(feature = "infinity"))]
-fn restore_invalidate_db_vector_domain(_journal: &RestoreJournal) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(all(test, feature = "infinity"))]
+#[cfg(test)]
 mod w3_4_step2_4_db_vector_domain_invalidation_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};

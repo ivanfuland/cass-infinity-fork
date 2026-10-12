@@ -191,8 +191,6 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed={STRICT_PATH_DEP_ENV}");
 
-    emit_platform_link_hints();
-
     let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
         Ok(value) => PathBuf::from(value),
         Err(err) => fatal(format!(
@@ -253,14 +251,6 @@ fn emit_regression_source_metadata(manifest_dir: &Path) {
     if head_after.trim() != head { return; }
     println!("cargo:rustc-env=CASS_BUILD_SOURCE_COMMIT={head}");
     println!("cargo:rustc-env=CASS_BUILD_SOURCE_CLEAN={}", status.trim().is_empty());
-}
-
-fn emit_platform_link_hints() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        // The aarch64-apple-darwin ONNX Runtime static archive used by ort-sys
-        // references CoreML symbols, but ort-sys only emits Foundation today.
-        println!("cargo:rustc-link-lib=framework=CoreML");
-    }
 }
 
 fn validate_path_dependency_contracts(
