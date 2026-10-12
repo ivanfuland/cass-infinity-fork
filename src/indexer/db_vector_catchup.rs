@@ -1977,12 +1977,45 @@ impl fmt::Display for ApiPrimaryBackfillError {
     }
 }
 
+/// The dimensions of the archive's own live generations. Used by
+/// [`refuse_unopenable_archive`], which has no declared dimension to pin its
+/// candidate with. A legacy (non-API) generation simply never matches this
+/// route's identity, and a dimension the profile cannot describe is skipped
+/// rather than turned into a refusal.
+const ARCHIVE_LIVE_DIMENSIONS_SQL: &str = "SELECT DISTINCT dim FROM embedding_generations \
+     WHERE (is_active = 1 AND audit_status != 'failed') OR audit_status = 'pending' ORDER BY dim";
+
+/// One identity's live candidates, inside an already-open read-only transaction.
+///
+/// The single place the candidate query and its bound parameters are written, so
+/// the proof admission and the proof-less archive check cannot drift apart.
+fn live_candidates_for(
+    tx: &Tx, id: &str, dimension: u64, canonicalize: u32, chunking: u32,
+) -> Result<Vec<i64>, StorageError> {
+    let mut candidates = Vec::new();
+    for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
+        let candidate = tx.query_opt_map(sql, &params![id, dimension as i64,
+            i64::from(canonicalize), i64::from(chunking)],
+            |row| row.get_typed::<i64>(0))?;
+        if let Some(candidate) = candidate { candidates.push(candidate); }
+    }
+    Ok(candidates)
+}
+
 /// Refuse to probe when the archive's existing active/pending generations are
 /// not admitted under the route's compatibility proof (spec §6.4): a fallback
-/// must never be reached while an existing generation is unadmitted. Read-only
-/// — it opens generations inside a deferred, no-replay transaction and never
+/// must never be reached while an existing generation is unadmitted. Read-only —
+/// it opens generations inside a deferred, no-replay transaction and never
 /// writes. Shared by [`probe_api_backfill`] and [`probe_api_preflight`] so the
 /// two callers enforce the identical rule instead of two copies drifting apart.
+///
+/// This is the **proof** arm only, and it stays byte-for-byte what
+/// `models backfill` has always done: with no proof there is no declared
+/// dimension and nothing to compare, so the check is a no-op and a record
+/// rejection surfaces later, from the catch-up itself, with its own
+/// classification and request count. [`probe_api_preflight`] adds the
+/// proof-less archive check separately, because `cass sync` — not
+/// `models backfill` — is the command that must refuse before any side effect.
 fn admit_existing_primary_generations(
     storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
 ) -> std::result::Result<(), ApiPrimaryBackfillError> {
@@ -1993,11 +2026,9 @@ fn admit_existing_primary_generations(
         .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
     let id = descriptor.embedder_id();
     let checked = storage.raw().with_tx_no_replay(TxMode::Deferred, |tx| {
-        for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
-            let candidate = tx.query_opt_map(sql, &params![id.as_str(), proof.primary_dimension() as i64,
-                i64::from(descriptor.canonicalize_version()), i64::from(descriptor.chunking_version())],
-                |row| row.get_typed::<i64>(0))?;
-            if let Some(candidate) = candidate { call.route().open_generation(tx, candidate)?; }
+        for candidate in live_candidates_for(tx, &id, proof.primary_dimension() as u64,
+            descriptor.canonicalize_version(), descriptor.chunking_version())? {
+            call.route().open_generation(tx, candidate)?;
         }
         Ok(())
     });
@@ -2007,6 +2038,78 @@ fn admit_existing_primary_generations(
         });
     }
     Ok(())
+}
+
+/// Refuse a **proof-less** route whose archive already holds a live generation
+/// of the very space this route describes, when that generation cannot be
+/// opened.
+///
+/// Without a proof the route has no declared dimension, so the archive's own
+/// live dimensions are enumerated and this route's identity re-derived at each.
+/// A generation this route cannot open — for example one a previous fallback
+/// contribution shaped and the since-removed proof no longer covers — can never
+/// be reused or extended, so `cass sync` must stop here, before the mirror stage
+/// and before `run_index`, instead of mirroring and indexing and only then
+/// reporting the incompatibility.
+///
+/// The rejection keeps the code the record itself carried:
+/// `CompatibilityRequired` when the record needs cross-endpoint evidence, and
+/// every other code as a plain failure, so a malformed record is never
+/// relabelled as a compatibility problem. Read-only, like the admission above.
+fn refuse_unopenable_archive(
+    storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<(), ApiPrimaryBackfillError> {
+    let dimensions: Vec<u64> = storage
+        .raw()
+        .with_tx_no_replay(TxMode::Deferred, |tx| {
+            tx.query_all_map(ARCHIVE_LIVE_DIMENSIONS_SQL, &[], |row| row.get_typed::<i64>(0))
+        })
+        .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?
+        .into_iter()
+        .filter_map(|dim| u64::try_from(dim).ok())
+        .collect();
+    let mut identities = Vec::with_capacity(dimensions.len());
+    for dimension in dimensions {
+        if let Ok(descriptor) = RepresentationDescriptor::from_profile(call.profile(), dimension) {
+            identities.push((
+                descriptor.embedder_id(),
+                dimension,
+                descriptor.canonicalize_version(),
+                descriptor.chunking_version(),
+            ));
+        }
+    }
+    if identities.is_empty() {
+        return Ok(());
+    }
+    let rejection = storage
+        .raw()
+        .with_tx_no_replay(TxMode::Deferred, |tx| {
+            for (id, dimension, canonicalize, chunking) in &identities {
+                for candidate in live_candidates_for(tx, id, *dimension, *canonicalize, *chunking)? {
+                    if let Err(error) = crate::storage::api_generation::open_api_generation(
+                        tx, candidate, call.profile(),
+                    ) {
+                        return Ok(Some(error));
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
+    match rejection {
+        None => Ok(()),
+        Some(error)
+            if error.code() == crate::storage::api_generation::ApiGenerationErrorCode::CompatibilityRequired =>
+        {
+            Err(ApiPrimaryBackfillError::CompatibilityRequired {
+                message: "CompatibilityRequired: the archive holds a generation this route cannot \
+                          open without cross-endpoint compatibility evidence; no model request sent"
+                    .into(),
+            })
+        }
+        Some(error) => Err(ApiPrimaryBackfillError::Failed(anyhow!(error))),
+    }
 }
 
 /// Verify every possible existing target before a probe may use the backup.
@@ -2030,16 +2133,27 @@ pub fn probe_api_backfill(
 /// when the path holds no current-schema archive yet. When an archive is
 /// present, the same historical admission `probe_api_backfill` enforces runs
 /// first, so a fallback cannot be reached while an existing generation is
-/// unadmitted; a fresh archive has no generation history, so the compatibility
-/// proof `EmbeddingRoute::load` already read and validated is the whole fallback
-/// admission. No write transaction is opened either way, so a failed probe
-/// leaves an existing archive unchanged and a missing one uncreated.
+/// unadmitted; on top of it, a route **without** a proof additionally checks the
+/// archive's own generations with [`refuse_unopenable_archive`], because this
+/// command must refuse before it mirrors or indexes. A fresh archive has no
+/// generation history, so the compatibility proof `EmbeddingRoute::load` already
+/// read and validated is the whole fallback admission. No write transaction is
+/// opened either way, so a failed probe leaves an existing archive unchanged and
+/// a missing one uncreated.
 pub fn probe_api_preflight(
     existing_database: Option<&FrankenStorage>, call: &PrimaryEmbeddingCall,
 ) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
     call.invalidate_probe();
     if let Some(storage) = existing_database {
         admit_existing_primary_generations(storage, call)?;
+        // `models backfill` opens a writer up front and has no "refuse before a
+        // side effect" contract, so its proof-less path is left exactly as it
+        // was. `cass sync` does have that contract, so the archive's own
+        // generations are checked here as well — the extra check lives only on
+        // this entry.
+        if call.route().proof.is_none() {
+            refuse_unopenable_archive(storage, call)?;
+        }
     }
     call.probe().map_err(|error| if error.is_compatibility_required() {
         ApiPrimaryBackfillError::CompatibilityRequired { message: error.message() }
@@ -4373,4 +4487,303 @@ mod chunk_catchup_v5_tests {
         assert!(!plan_details.iter().any(|d| d.contains("SCAN chunk_holes")), "must not fall back to a chunk_holes table SCAN: {plan_details:?}");
     }
 
+}
+/// API03G: the `cass sync` semantic preflight's own production entry,
+/// [`probe_api_preflight`], driven against a **read-only** SQLite handle and the
+/// existing TLS fallback fixtures.
+///
+/// These are in-crate tests on purpose. `ApiClient::new_with_test_root` is a
+/// `cfg(test)` trust root and no production trust switch may be added for it, so
+/// the TLS half of the fallback contract cannot be driven from the CLI
+/// integration suite. They supplement -- they do not replace -- the real-CLI
+/// coverage in `tests/api_sync_preflight.rs`, and they are not a CLI run or a
+/// real-cloud drill.
+///
+/// The handle handed to the preflight is always the one
+/// `FrankenStorage::open_readonly` returns, on the same path a writer just
+/// finished with. That is what makes "the preflight writes nothing" a structural
+/// fact rather than a comparison of a few columns: a read-only connection
+/// cannot write at all.
+#[cfg(all(test, not(windows)))]
+mod api03g_sync_preflight_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::search::model_api::compatibility_bundle::tests::{
+        fallback_fixture, migration_fixture,
+    };
+    use crate::search::model_api::embedding_route::EmbeddingRoute;
+    use crate::search::model_api::primary_embedding::PrimaryEmbeddingCall;
+    use crate::search::model_api::test_support::{HttpFixture, Reply, TlsFixture};
+    use crate::search::model_api::{ApiClient, EnvCredentialResolver};
+    use crate::storage::api::{StorageError, TxMode};
+    use crate::storage::api_generation::create_api_generation;
+    use crate::storage::sqlite::FrankenStorage;
+
+    use super::{probe_api_backfill, probe_api_preflight, run_api_primary_catchup_backfill};
+
+    /// Open the same archive read-only, the way `cass sync`'s preflight does.
+    fn readonly(path: &std::path::Path) -> FrankenStorage {
+        FrankenStorage::open_readonly(path).expect("open the archive read-only")
+    }
+
+    /// Every generation row, for a before/after comparison that does not depend
+    /// on row order.
+    fn generation_rows(storage: &FrankenStorage) -> Vec<String> {
+        storage
+            .raw()
+            .query_all_map(
+                "SELECT id || '|' || embedder_id || '|' || dim || '|' || is_active || '|' \
+                 || audit_status || '|' || canonicalize_version || '|' || chunking_policy_version \
+                 || '|' || hex(fingerprint) FROM embedding_generations ORDER BY id",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .expect("read generations")
+    }
+
+    fn seed_messages(storage: &FrankenStorage, texts: &[&str]) {
+        let agent = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "fixture".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure agent");
+        let messages: Vec<Message> = texts
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| Message {
+                excluded: None,
+                id: None,
+                idx: idx as i64,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000 + idx as i64),
+                content: (*text).into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            })
+            .collect();
+        storage
+            .insert_conversation_tree(
+                agent,
+                None,
+                &Conversation {
+                    id: None,
+                    agent_slug: "claude_code".into(),
+                    workspace: None,
+                    external_id: Some("api03g-preflight".into()),
+                    title: Some("api03g preflight".into()),
+                    source_path: "/fixtures/api03g-preflight.jsonl".into(),
+                    started_at: Some(1_700_000_000),
+                    ended_at: Some(1_700_000_002),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages,
+                    source_id: "local".into(),
+                    origin_host: None,
+                },
+            )
+            .expect("insert fixture conversation");
+    }
+
+    /// A primary endpoint, a TLS backup, and the frozen route built from the
+    /// compatibility fixture. `with_proof` installs the checked bundle the
+    /// fixture produced -- what the production loader would have read from
+    /// `fallback_compatibility_file` -- and the returned flag records whether it
+    /// was installed, so a caller can pin the arm it is testing.
+    fn fallback_call(
+        primary: &str,
+        backup: &TlsFixture,
+        with_proof: bool,
+    ) -> (PrimaryEmbeddingCall, bool) {
+        let (config, proof) = fallback_fixture(primary, &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let mut route = EmbeddingRoute::load(&config, &profile, true);
+        if with_proof {
+            route.proof_sha256 = Some(proof.digest().into());
+            route.proof = Some(Arc::new(proof));
+        }
+        let installed = route.proof.is_some();
+        let client = ApiClient::new_with_test_root(
+            config,
+            Box::new(EnvCredentialResolver),
+            backup.ca_pem().to_vec(),
+        );
+        let call = PrimaryEmbeddingCall::from_frozen_route(client, route)
+            .unwrap_or_else(|error| panic!("frozen route: {error}"));
+        (call, installed)
+    }
+
+    /// A valid, admitted proof lets the preflight reach the declared backup when
+    /// the primary refuses.
+    #[test]
+    fn valid_proof_reaches_the_tls_backup_and_writes_nothing() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        assert!(has_proof, "this arm must carry the checked bundle");
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+        // Create the archive with a writer, then hand the preflight only the
+        // read-only handle.
+        FrankenStorage::open(&db_path).expect("create the archive").close().expect("close");
+        let storage = readonly(&db_path);
+        let before = generation_rows(&storage);
+
+        let probe = match probe_api_preflight(Some(&storage), &call) {
+            Ok(probe) => probe,
+            Err(error) => panic!("an admitted backup must be allowed to answer the probe: {error}"),
+        };
+        assert_eq!(probe.dimension, 2);
+
+        // The real producer and the per-attempt HTTP facts, as observed.
+        let calls = call.probe_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one primary attempt, then one backup attempt: {calls:?}"
+        );
+        assert_eq!(calls[0].profile_id, "primary");
+        assert_eq!(calls[0].http_status, Some(503));
+        assert_eq!(calls[1].profile_id, "backup");
+        assert_eq!(calls[1].http_status, Some(200));
+        assert!(calls[1].network_attempted);
+        assert_eq!(calls[1].response_model, None, "the fixture reports no model");
+        assert_eq!(calls[1].serving_provider, None);
+        assert_eq!(primary.hits(), 1);
+        assert_eq!(backup.fixture().hits(), 1);
+
+        assert_eq!(generation_rows(&storage), before);
+        assert!(before.is_empty());
+    }
+
+    /// A generation this route cannot open is refused before any request, so a
+    /// proof that does not cover the archive's history never reaches the cloud.
+    #[test]
+    fn uncovered_history_refuses_before_any_http() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        assert!(has_proof);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        {
+            let writer = FrankenStorage::open(&db_path).expect("create the archive");
+            writer
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+                })
+                .expect("seed an uncovered historical generation");
+            writer.close().expect("close the writer");
+        }
+        let storage = readonly(&db_path);
+        let before = generation_rows(&storage);
+
+        let error = match probe_api_preflight(Some(&storage), &call) {
+            Ok(_) => panic!("an uncovered historical generation must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("CompatibilityRequired"),
+            "the refusal must name the compatibility requirement: {error}"
+        );
+        assert!(
+            call.probe_calls().is_empty(),
+            "a refused admission must record no probe attempt: {:?}",
+            call.probe_calls()
+        );
+        assert_eq!(primary.hits(), 0, "no request may be sent for a refused admission");
+        assert_eq!(backup.fixture().hits(), 0);
+        assert_eq!(generation_rows(&storage), before);
+    }
+
+    /// The risk lead, measured on **one** pair of endpoints: build a generation
+    /// through the backup, then flip the *same* primary from refusing to
+    /// healthy and remove only the proof. Nothing but the proof differs, so a
+    /// refusal here is attributable to the missing proof and not to endpoint
+    /// drift.
+    ///
+    /// The preflight must refuse before the mirror stage and before `run_index`,
+    /// instead of letting the round mirror and index and only then report the
+    /// incompatibility. It is asserted rather than assumed: if the preflight
+    /// answers here instead, the risk lead is confirmed.
+    #[test]
+    fn missing_proof_over_a_backup_built_generation_is_refused_before_any_http() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+
+        // One primary service, refusing while the backup builds, healthy after.
+        let healed = Arc::new(AtomicBool::new(false));
+        let primary = HttpFixture::start(vec![Reply::Conditional(
+            Arc::clone(&healed),
+            Box::new(Reply::status(503)),
+            Box::new(Reply::Embeddings(2)),
+        )]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+
+        // ---- build phase: a real generation whose only contributor is the backup
+        {
+            let writer = FrankenStorage::open(&db_path).expect("create the archive");
+            seed_messages(
+                &writer,
+                &[
+                    "A synthetic document describes how to verify an embedding service response.",
+                    "Another synthetic document describes atomic storage and provenance.",
+                ],
+            );
+            let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+            assert!(has_proof, "the build phase needs the proof");
+            let profile = call.profile().clone();
+            let probe = probe_api_backfill(&writer, &call)
+                .unwrap_or_else(|error| panic!("probe: {error}"));
+            let outcome =
+                run_api_primary_catchup_backfill(&writer, 1, &call, &profile, &probe, 42)
+                    .unwrap_or_else(|error| panic!("backup-only catch-up: {error}"));
+            assert!(outcome.catchup.activated);
+            assert!(outcome.model_api.fallback_used, "the build must have used the backup");
+            writer.close().expect("close the writer");
+        }
+        let hits_before = (primary.hits(), backup.fixture().hits());
+        assert!(hits_before.0 > 0 && hits_before.1 > 0, "the build must have hit both");
+
+        // ---- verify phase: same endpoints, healthy primary, *no* proof
+        healed.store(true, Ordering::SeqCst);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, false);
+        assert!(!has_proof, "this arm must have no proof");
+
+        let storage = readonly(&db_path);
+        let before = generation_rows(&storage);
+        assert!(
+            before.iter().any(|row| row.contains("api:")),
+            "the fixture must hold an API generation: {before:?}"
+        );
+
+        let error = match probe_api_preflight(Some(&storage), &call) {
+            Ok(_) => panic!(
+                "risk lead confirmed: with no proof, a backup-built generation is refused only \
+                 after the round would have mirrored and indexed; the preflight must refuse here"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("CompatibilityRequired"),
+            "the refusal must name the compatibility requirement: {error}"
+        );
+        assert!(call.probe_calls().is_empty(), "{:?}", call.probe_calls());
+        assert_eq!(
+            (primary.hits(), backup.fixture().hits()),
+            hits_before,
+            "a refused preflight may not send anything, on either endpoint"
+        );
+        assert_eq!(generation_rows(&storage), before);
+    }
 }

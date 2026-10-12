@@ -412,6 +412,16 @@ fn fallback_config_without_proof(endpoint: &str, cloud_endpoint: &str) -> String
     config_text(&format!("{local}{cloud}"))
 }
 
+/// Two loopback profiles, with `default` naming the one the round should pick.
+/// Written twice by the config-freeze test: first with `local` selected, then
+/// with `second` selected, to prove the round kept the frozen first choice.
+fn two_profile_config(local_endpoint: &str, second_endpoint: &str, default: &str) -> String {
+    let local = embedding_profile_block("local", local_endpoint, EMBED_MODEL, EMBED_REVISION, "");
+    let second =
+        embedding_profile_block("second", second_endpoint, EMBED_MODEL, EMBED_REVISION, "");
+    format!("version = 1\ndefault_embedding = \"{default}\"\n\n{local}{second}")
+}
+
 // ---------------------------------------------------------------------------
 // CLI harness
 // ---------------------------------------------------------------------------
@@ -611,10 +621,14 @@ fn preflight(report: &serde_json::Value) -> serde_json::Value {
         .get("semantic_preflight")
         .unwrap_or_else(|| panic!("the report must always carry semantic_preflight: {report}"))
         .clone();
-    assert_eq!(
-        value["error"]["kind"], report["error"]["kind"],
-        "the field's refusal is this round's refusal: {value} vs {report}"
-    );
+    // When the preflight refused, its refusal is the round's refusal. A later
+    // stage's failure is a different fact and must not be compared to it.
+    if !value["error"].is_null() {
+        assert_eq!(
+            value["error"]["kind"], report["error"]["kind"],
+            "the field's refusal is this round's refusal: {value} vs {report}"
+        );
+    }
     value
 }
 
@@ -1040,6 +1054,15 @@ fn directory_at_db_path_still_reaches_the_index_failure() {
         serde_json::json!(true),
         "the index stage is what fails here, so it must have started: {report}"
     );
+    // The preflight stage's own fact is unaffected by the later failure: the
+    // probe answered, so the field stays ok with no error.
+    let pre = preflight(&report);
+    assert_eq!(
+        pre["outcome"],
+        serde_json::json!("ok"),
+        "a later index failure must not rewrite the preflight's own outcome: {pre}"
+    );
+    assert_eq!(pre["error"], serde_json::Value::Null, "{pre}");
 }
 
 /// A schema this binary must not open in place is still its own rebuild refusal,
@@ -1094,5 +1117,96 @@ fn incompatible_schema_is_still_a_rebuild_refusal() {
         live.request_count(),
         0,
         "an incompatible archive must be refused before any model request"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC 7 — the round keeps the configuration it froze, not the file on disk
+// ---------------------------------------------------------------------------
+
+/// The semantic preflight loads the model configuration once and hands the same
+/// frozen snapshot to the indexer. So rewriting the TOML *during* the probe must
+/// change nothing: the round keeps calling the endpoint it selected, and the
+/// newly-defaulted second service gets no request at all.
+#[test]
+fn a_config_rewritten_during_the_probe_does_not_change_the_round() {
+    let fixture = Fixture::new();
+    fixture.seed_session("rollout-freeze.jsonl", "api03g-freeze");
+
+    let second = Stub::start(healthy_responder(16, 9));
+    // The first stub rewrites the configuration file the instant the probe
+    // arrives. The rewrite body needs the stub's own address, so it is handed
+    // in after the stub exists and before the round starts.
+    let rewrite_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let rewrite_path: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+    let body_for_stub = Arc::clone(&rewrite_body);
+    let path_for_stub = Arc::clone(&rewrite_path);
+    let first = Stub::start(move |request: &RecordedRequest, index: usize| {
+        if index == 0 {
+            let body = body_for_stub.lock().expect("rewrite lock").clone();
+            let path = path_for_stub.lock().expect("rewrite lock").clone();
+            if let (Some(body), Some(path)) = (body, path) {
+                fs::write(&path, body).expect("rewrite the config during the probe");
+            }
+        }
+        let model = request.request_model();
+        let model = if model.is_empty() {
+            EMBED_MODEL.to_string()
+        } else {
+            model
+        };
+        (200, embed_body(&request.inputs(), 16, &model, 7))
+    });
+
+    let config = fixture.write_config(
+        "models.toml",
+        &two_profile_config(&first.endpoint(), &second.endpoint(), "local"),
+    );
+    *rewrite_body.lock().expect("rewrite lock") = Some(two_profile_config(
+        &first.endpoint(),
+        &second.endpoint(),
+        "second",
+    ));
+    *rewrite_path.lock().expect("rewrite lock") = Some(config.clone());
+
+    let output = fixture.sync_json(Some(&config), &[]);
+    dump_round("config-freeze", &output);
+    let report = report_of(&output);
+    assert_eq!(
+        report["exit_code"],
+        serde_json::json!(0),
+        "the round must still finish: {report} stderr={}",
+        stderr_of(&output)
+    );
+    assert_eq!(report["semantic_activated"], serde_json::json!(true), "{report}");
+
+    // The rewrite really happened, so "the second service got nothing" means
+    // something.
+    let on_disk = fs::read_to_string(&config).expect("read the rewritten config");
+    assert!(
+        on_disk.contains("default_embedding = \"second\""),
+        "the fixture must have rewritten the config mid-round: {on_disk}"
+    );
+    assert_eq!(
+        report["semantic_preflight"]["profile"],
+        serde_json::json!("local"),
+        "the frozen profile is the one selected before the rewrite: {report}"
+    );
+
+    // The frozen endpoint served the whole round; the newly-defaulted one saw
+    // nothing at all.
+    let frozen_requests = first.requests();
+    assert!(
+        frozen_requests.iter().any(|r| r.inputs().len() == 3),
+        "the frozen endpoint must have served the probe: {frozen_requests:?}"
+    );
+    assert!(
+        frozen_requests.len() > 1,
+        "the frozen endpoint must have served the index too: {frozen_requests:?}"
+    );
+    assert_eq!(
+        second.request_count(),
+        0,
+        "the configuration must not be re-selected after the freeze"
     );
 }
