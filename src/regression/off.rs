@@ -1070,10 +1070,6 @@ query_prefix="Query: "
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(!paths.is_empty());
-                assert!(
-                    fault_served.load(Ordering::Acquire),
-                    "the faulty response must actually have been served: a config precondition                      failure would also exit 2 without reaching this endpoint"
-                );
                 assert!(paths.iter().all(|p| p == "/embeddings"));
                 println!(
                     "FAKE_HTTP mode={mode} vector={vector_mode} observed_embedding_requests={} observed_rerank_requests=0",
@@ -1599,6 +1595,11 @@ query_prefix="Query: "
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(!paths.is_empty());
+                assert!(
+                    fault_served.load(Ordering::Acquire),
+                    "the faulty response must actually have been served: a config precondition \
+                     failure would also exit 2 without reaching this endpoint"
+                );
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 assert!(stdout.contains("FAILED_CLI_RC=2"));
                 assert!(!stdout.contains("retrieval"));
