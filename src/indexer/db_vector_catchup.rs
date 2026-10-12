@@ -791,10 +791,11 @@ fn clear_drain_events_for_test() {
 }
 
 /// Re-derive a fresh generation fingerprint through the injected
-/// `embedder` closure (not [`crate::search::infinity::compute_generation_
-/// fingerprint`], which insists on its own live `InfinityConfig`/HTTP
-/// client -- audit check ⑪ must be exercisable with a deterministic mock
-/// embedder in tests, same as check ⑩). Same wire format:
+/// `embedder` closure (not the live endpoint probe
+/// [`crate::search::model_api::primary_embedding::PrimaryEmbeddingCall::probe`],
+/// which insists on its own endpoint client -- audit check ⑪ must be
+/// exercisable with a deterministic mock embedder in tests, same as check
+/// ⑩). Same wire format:
 /// [`crate::search::generation_fingerprint::FINGERPRINT_SENTINELS`] embedded in order,
 /// concatenated as LE f32 bytes.
 fn compute_fresh_fingerprint_via(
@@ -1462,9 +1463,10 @@ fn switch_guard_in_tx(tx: &Tx, generation_id: i64, pre_audit_chunk_count: i64) -
 /// `identity`/`fingerprint` are caller-supplied (not probed internally)
 /// so this function -- and everything it calls -- is fully exercisable
 /// against a deterministic mock `embedder` in tests, with zero live
-/// Infinity dependency; the real CLI call sites probe them once via
-/// [`crate::search::infinity::probe_identity_and_fingerprint`] and pass
-/// the results straight through.
+/// endpoint dependency; the real CLI call sites probe them once via
+/// [`crate::search::model_api::primary_embedding::PrimaryEmbeddingCall::probe`]
+/// (see [`probe_api_backfill`] in this module) and pass the results
+/// straight through.
 ///
 /// Task book #98 Step 2: `#[cfg(test)]`-only wall-clock hook for the
 /// reverse-reconciliation pass below -- compiled out entirely (zero
