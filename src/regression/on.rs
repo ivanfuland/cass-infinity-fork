@@ -1199,6 +1199,9 @@ mod tests {
                     write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
                     continue;
                 }
+                // Kept as a regression guard: the frozen model API names its
+                // identity in the configuration, so this probe must never be
+                // reached and the caller asserts a zero count.
                 let (status, response) = if path == "/models" {
                     gets += 1;
                     if server_fault == "model-mismatch" {
@@ -1232,7 +1235,15 @@ mod tests {
                         } else {
                             len
                         };
-                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":if server_fault=="neighbour" {i as f64} else {1.0}})).collect::<Vec<_>>()}).to_string())
+                        // The frozen model API checks identity on the scoring
+                        // response itself, so the mismatch fault travels there
+                        // instead of on the retired `GET /models` probe.
+                        let model = if server_fault == "model-mismatch" {
+                            "synthetic-other-model"
+                        } else {
+                            "BAAI/bge-reranker-v2-m3"
+                        };
+                        ("200 OK",json!({"model":model,"results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":if server_fault=="neighbour" {i as f64} else {1.0}})).collect::<Vec<_>>()}).to_string())
                     }
                 };
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
