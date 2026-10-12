@@ -281,6 +281,33 @@ pub(crate) mod tests {
             fixed_provider:None,members,comparisons,conclusion:"compatible".into()};
         (bundle,files,primary)
     }
+    pub(in crate::search::model_api) fn fallback_fixture(local: &str, cloud: &str)
+        -> (super::super::ValidatedApiConfig, CheckedBundle) {
+        let (bytes, f) = fixture();
+        let mut a = archive(&f, 1);
+        let mut b = archive(&f, 2);
+        a.profile_toml = a.profile_toml.replace("http://127.0.0.1:1/embedding", local)
+            .replace("profiles.archived", "profiles.primary");
+        b.profile_toml = b.profile_toml.replace("http://127.0.0.1:2/embedding", cloud)
+            .replace("profiles.archived", "profiles.backup")
+            .replace("openai-embeddings-v1", "openrouter-embeddings-v1")
+            .replace("scope=\"loopback\"", "scope=\"remote\"");
+        b.profile_toml.push_str("provider_only=\"fixed-provider\"\n");
+        for capture in [&mut a, &mut b] {
+            let config = super::super::ApiConfig::parse_toml(&capture.profile_toml).unwrap();
+            capture.endpoint_config_sha256 = EndpointConfigIdentity::from_profile(config.profiles().next().unwrap()).unwrap().sha256();
+        }
+        let config_text = format!("{}fallback_profile=\"backup\"\n{}", a.profile_toml,
+            b.profile_toml.strip_prefix("version=1\n").unwrap());
+        let config = super::super::ApiConfig::parse_toml(&config_text).unwrap();
+        let (mut bundle, files, _) = package(vec![a,b], bytes, false);
+        bundle.fallback_capture_sha256 = Some(bundle.members[1].capture.sha256.clone());
+        bundle.fixed_provider = Some("fixed-provider".into());
+        let proof = CheckedBundle::read(&serde_json::to_vec(&bundle).unwrap(),
+            config.profile("primary").unwrap(), config.profile("backup"),
+            |pin| files.get(&pin.name).cloned().ok_or(Error::EvidenceMismatch)).unwrap();
+        (config, proof)
+    }
     fn read(bundle:&Bundle,files:&HashMap<String,Vec<u8>>,primary:&ValidatedProfile)->Result<CheckedBundle,Error> {
         CheckedBundle::read(&serde_json::to_vec(bundle).unwrap(),primary,None,|pin| files.get(&pin.name).cloned().ok_or(Error::EvidenceMismatch))
     }

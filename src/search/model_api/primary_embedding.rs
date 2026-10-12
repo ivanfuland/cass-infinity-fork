@@ -591,6 +591,31 @@ mod page_writer_tests {
     use super::super::compatibility_capture::tests::inputs;
     use super::super::test_support::{HttpFixture, Reply};
 
+    #[cfg(not(windows))]
+    #[test]
+    fn complete_fallback_page_records_the_backup_as_writer() {
+        use super::super::compatibility_bundle::tests::fallback_fixture;
+        use super::super::test_support::TlsFixture;
+        let primary = HttpFixture::start(vec![Reply::Embeddings(2), Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let client = ApiClient::new_with_test_root(config, Box::new(super::super::EnvCredentialResolver), backup.ca_pem().to_vec());
+        let mut call = PrimaryEmbeddingCall::new(client, profile, true).unwrap();
+        call.route.proof_sha256 = Some(proof.digest().into());
+        call.route.proof = Some(std::sync::Arc::new(proof));
+        call.probe().unwrap();
+        assert_eq!(call.embed_documents(&["first", "second"]).unwrap().len(), 2);
+        assert_eq!(call.page_writers().iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["backup"]);
+        assert!(call.model_api_report("descriptor".into(), "endpoint".into()).fallback_used);
+        let calls = call.document_calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].http_status, Some(503));
+        assert_eq!(calls[1].profile_id, "backup");
+        assert_eq!(primary.hits(), 2);
+        assert_eq!(backup.fixture().hits(), 1);
+    }
+
     #[test]
     fn only_a_complete_page_publishes_its_actual_writers() {
         let server = HttpFixture::start(vec![

@@ -125,3 +125,36 @@ mod tests {
         assert_eq!(server.hits(), 1);
     }
 }
+
+#[cfg(all(test, not(windows)))]
+mod tls_tests {
+    use super::*;
+    use super::super::compatibility_bundle::tests::fallback_fixture;
+    use super::super::test_support::{HttpFixture, TlsFixture, Reply};
+
+    #[test]
+    fn verified_route_sends_one_complete_backup_request_over_tls() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
+        let descriptor = proof.header().primary_descriptor_sha256.clone();
+        let mut route = EmbeddingRoute::load(&config, config.profile("primary").unwrap(), true);
+        route.proof_sha256 = Some(proof.digest().into());
+        route.proof = Some(Arc::new(proof));
+        let client = ApiClient::new_with_test_root(config, Box::new(super::super::EnvCredentialResolver), backup.ca_pem().to_vec());
+        let outcome = route.embed(&client, &["first".into(), "second".into()], InputKind::Document, 2, &descriptor).unwrap();
+        assert_eq!(outcome.vectors.len(), 2);
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].http_status, Some(503));
+        assert_eq!(outcome.attempts[1].stage, AttemptStage::Fallback);
+        assert_eq!(outcome.attempts[1].profile_id, "backup");
+        assert_eq!(primary.hits(), 1);
+        assert_eq!(backup.fixture().hits(), 1);
+        let requests = backup.fixture().requests();
+        assert_eq!(requests[0].body()["input"], serde_json::json!(["D:first", "D:second"]));
+        route.allow_fallback = false;
+        assert!(route.embed(&client, &["third".into()], InputKind::Query, 2, &descriptor).is_err());
+        assert_eq!(primary.hits(), 2);
+        assert_eq!(backup.fixture().hits(), 1, "disabled fallback must send no cloud request");
+    }
+}
