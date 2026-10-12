@@ -3644,11 +3644,12 @@ impl SearchClient {
         allow_fallback: bool,
     ) -> Result<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>> {
         use crate::search::model_api::query_embedding::{ApiQueryEmbedder, QueryGenerationBinding};
+        let route=crate::search::model_api::embedding_route::EmbeddingRoute::load(client.config(),&profile,allow_fallback);
         let binding = {
             let guard = self.sqlite_guard()?;
             let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
             conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
-                QueryGenerationBinding::open(tx, profile)
+                QueryGenerationBinding::open_routed(tx, route)
             })?.ok_or_else(|| anyhow::Error::new(crate::search::model_api::query_embedding::QueryGenerationUnavailable))?
         };
         let embedder = Arc::new(ApiQueryEmbedder::new(client, binding.clone(), allow_fallback)?);

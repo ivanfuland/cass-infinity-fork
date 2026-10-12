@@ -31,7 +31,7 @@ use crate::search::model_api::{
     RepresentationDescriptor, ValidatedProfile,
 };
 use crate::storage::api::{Conn, StorageError, Tx, TxMode, params};
-use crate::storage::api_generation::{create_api_generation, open_api_generation};
+use crate::storage::api_generation::{create_api_generation, register_api_contribution};
 use crate::storage::schema::{self, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
@@ -1688,7 +1688,7 @@ trait CatchupEngine {
     ) -> Result<(i64, bool, u64)>;
     /// Re-verify this engine's generation identity inside one page's write
     /// transaction. Any failure must abort that whole page.
-    fn verify_page_identity(&self, tx: &Tx, generation_id: i64) -> Result<(), StorageError>;
+    fn verify_page_identity(&self, tx: &Tx, generation_id: i64, has_new_vectors: bool) -> Result<(), StorageError>;
     /// The activation-time guard, run inside `switch_active_generation`'s own
     /// transaction.
     fn activation_guard(
@@ -1744,7 +1744,7 @@ impl CatchupEngine for InfinityCatchupEngine<'_> {
         )
     }
 
-    fn verify_page_identity(&self, _tx: &Tx, _generation_id: i64) -> Result<(), StorageError> {
+    fn verify_page_identity(&self, _tx: &Tx, _generation_id: i64, _has_new_vectors: bool) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -1802,7 +1802,7 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
     ) -> Result<(i64, bool, u64)> {
         find_or_create_api_generation(
             conn,
-            self.profile,
+            self.call,
             self.dimension,
             self.canonicalize_version,
             self.chunking_version,
@@ -1812,10 +1812,17 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
         )
     }
 
-    fn verify_page_identity(&self, tx: &Tx, generation_id: i64) -> Result<(), StorageError> {
-        open_api_generation(tx, generation_id, self.profile)
-            .map(|_verified| ())
-            .map_err(StorageError::from)
+    fn verify_page_identity(&self, tx: &Tx, generation_id: i64, has_new_vectors: bool) -> Result<(), StorageError> {
+        self.call.route().open_generation(tx, generation_id)?;
+        // This hook runs inside the same transaction that writes the vector page.
+        // A relocated primary must retain its proof with the vectors it produced.
+        if let Some(proof) = self.call.route().proof.as_ref().filter(|_| has_new_vectors) {
+            for writer in self.call.page_writers() {
+                register_api_contribution(tx, generation_id, self.profile, &writer, proof)
+                    .map_err(StorageError::from)?;
+            }
+        }
+        Ok(())
     }
 
     fn activation_guard(
@@ -1824,7 +1831,7 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
         generation_id: i64,
         pre_audit_chunk_count: i64,
     ) -> Result<(), StorageError> {
-        open_api_generation(tx, generation_id, self.profile).map_err(StorageError::from)?;
+        self.call.route().open_generation(tx, generation_id)?;
         switch_guard_in_tx(tx, generation_id, pre_audit_chunk_count)
     }
 
@@ -1850,7 +1857,7 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
 /// candidate is built beside it.
 fn find_or_create_api_generation(
     conn: &Conn,
-    profile: &ValidatedProfile,
+    call: &PrimaryEmbeddingCall,
     dimension: usize,
     canonicalize_version: u32,
     chunking_version: u32,
@@ -1858,6 +1865,7 @@ fn find_or_create_api_generation(
     now_ms: i64,
     all_expected: &[ExpectedChunk],
 ) -> Result<(i64, bool, u64)> {
+    let profile = call.profile();
     let descriptor = RepresentationDescriptor::from_profile(profile, dimension as u64)
         .map_err(|e| anyhow!("the selected API embedding profile has no usable representation identity: {e}"))?;
     let embedder_id = descriptor.embedder_id();
@@ -1894,7 +1902,7 @@ fn find_or_create_api_generation(
             // A missing, malformed or relocated record is refused outright here
             // — never bypassed by a fingerprint mismatch that would quietly
             // build a replacement beside it.
-            open_api_generation(tx, candidate_id, profile).map_err(StorageError::from)?;
+            call.route().open_generation(tx, candidate_id)?;
             if fingerprint_matches(&stored_fingerprint, fingerprint, dimension) {
                 return Ok((candidate_id, true, 0u64));
             }
@@ -2237,7 +2245,7 @@ fn run_catchup_with_engine<E: CatchupEngine>(
                 // that no longer opens against the running profile (or was
                 // never written) aborts this whole page, so no vector can be
                 // staged under a generation whose identity stopped being true.
-                engine.verify_page_identity(tx, generation_id)?;
+                engine.verify_page_identity(tx, generation_id, !batch_rows.is_empty())?;
                 if !batch_rows.is_empty() {
                     schema::stage_chunk_rows_in_tx(tx, batch_id, &batch_rows)?;
                 }

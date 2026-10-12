@@ -46,6 +46,7 @@ pub(crate) mod compatibility_bundle;
 pub(crate) mod compatibility_capture;
 pub mod compatibility_tools;
 pub mod error;
+pub(crate) mod embedding_route;
 pub mod identity;
 pub mod primary_embedding;
 pub mod protocol;

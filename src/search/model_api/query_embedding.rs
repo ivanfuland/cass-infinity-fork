@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::{ApiAttempt, ApiClient, InputKind, ValidatedProfile};
-use super::routing::failure_allows_cloud_fallback;
+use super::embedding_route::EmbeddingRoute;
 use crate::search::embedder::{Embedder, EmbedderError, EmbedderResult, ModelCategory};
 use crate::storage::api::{StorageError, Tx};
 use crate::storage::api_generation::{VerifiedPrimaryGeneration, open_api_generation};
@@ -16,6 +16,7 @@ pub struct QueryGenerationUnavailable;
 #[derive(Clone)]
 pub struct QueryGenerationBinding {
     profile: ValidatedProfile,
+    route: Option<EmbeddingRoute>,
     generation_id: i64,
     embedder_id: String,
     dimension: usize,
@@ -31,9 +32,17 @@ impl QueryGenerationBinding {
         Self::from_verified(profile, verified).map(Some)
     }
 
+    pub(crate) fn open_routed(tx:&Tx, route:EmbeddingRoute)->Result<Option<Self>,StorageError> {
+        let Some(id)=tx.query_opt_map("SELECT id FROM embedding_generations WHERE is_active=1 AND audit_status='passed'",&[],|row|row.get_typed::<i64>(0))? else {return Ok(None);};
+        let verified=route.open_generation(tx,id)?;
+        let mut binding=Self::from_verified(route.primary.clone(),verified)?;
+        binding.route=Some(route);Ok(Some(binding))
+    }
+
     fn from_verified(profile: ValidatedProfile, verified: VerifiedPrimaryGeneration) -> Result<Self, StorageError> {
         Ok(Self {
             profile,
+            route: None,
             generation_id: verified.generation_id(),
             embedder_id: verified.embedder_id(),
             dimension: usize::try_from(verified.descriptor().effective_dimension())
@@ -49,8 +58,10 @@ impl QueryGenerationBinding {
         if generation_id != self.generation_id {
             return Err(unavailable("API generation changed during query"));
         }
-        let current = open_api_generation(tx, generation_id, &self.profile)
-            .map_err(StorageError::from)?;
+        let current = match &self.route {
+            Some(route)=>route.open_generation(tx,generation_id)?,
+            None=>open_api_generation(tx,generation_id,&self.profile).map_err(StorageError::from)?,
+        };
         if current.embedder_id() != self.embedder_id {
             return Err(unavailable("API representation changed during query"));
         }
@@ -80,12 +91,11 @@ pub struct QueryApiFailure {
 pub struct ApiQueryEmbedder {
     client: Arc<ApiClient>,
     binding: QueryGenerationBinding,
-    allow_fallback: bool,
     attempts: Mutex<Vec<ApiAttempt>>,
 }
 
 impl ApiQueryEmbedder {
-    pub fn new(client: Arc<ApiClient>, binding: QueryGenerationBinding, allow_fallback: bool) -> Result<Self, StorageError> {
+    pub fn new(client: Arc<ApiClient>, mut binding: QueryGenerationBinding, allow_fallback: bool) -> Result<Self, StorageError> {
         let configured = client.config().profile(&binding.profile.id)
             .ok_or_else(|| unavailable("API query profile is missing"))?;
         if super::EndpointConfigIdentity::from_profile(configured)
@@ -94,7 +104,20 @@ impl ApiQueryEmbedder {
                 .map_err(|_| unavailable("Invalid bound API profile"))?.sha256() {
             return Err(unavailable("API query profile differs from verified generation"));
         }
-        Ok(Self { client, binding, allow_fallback, attempts: Mutex::new(Vec::new()) })
+        // Only open_routed validates proof against the actual generation history.
+        // A primary-only binding must never acquire cloud permission later.
+        match binding.route.as_mut() {
+            Some(route) => route.allow_fallback &= allow_fallback,
+            None => binding.route = Some(EmbeddingRoute {
+                primary: binding.profile.clone(),
+                fallback: configured.fallback_profile.as_deref()
+                    .and_then(|id| client.config().profile(id)).cloned(),
+                allow_fallback,
+                proof: None,
+                proof_sha256: None,
+            }),
+        }
+        Ok(Self { client, binding, attempts: Mutex::new(Vec::new()) })
     }
 
     pub fn attempts(&self) -> Vec<ApiAttempt> {
@@ -111,30 +134,20 @@ impl ApiQueryEmbedder {
 
 impl Embedder for ApiQueryEmbedder {
     fn embed_sync(&self, text: &str) -> EmbedderResult<Vec<f32>> {
-        let profile = &self.binding.profile;
-        match self.client.embed_once(&profile.id, &[text.to_owned()], InputKind::Query) {
-            Ok(mut outcome) => {
-                let wrong_dimension = outcome.dimension != self.binding.dimension;
-                if wrong_dimension {
-                    if let Some(attempt) = outcome.attempts.last_mut() {
-                        attempt.error_code = Some("DimensionMismatch");
-                    }
-                }
-                self.attempts.lock().unwrap_or_else(|p| p.into_inner()).extend(outcome.attempts);
-                if wrong_dimension {
-                    return Err(self.failure("DimensionMismatch", false));
-                }
-                outcome.vectors.pop().ok_or_else(|| self.failure("InvalidResponse", false))
+        let route=self.binding.route.as_ref().ok_or_else(||self.failure("CompatibilityRequired",false))?;
+        let descriptor=self.binding.embedder_id.strip_prefix("api:").unwrap_or("");
+        match route.embed(&self.client,&[text.to_owned()],InputKind::Query,self.binding.dimension,descriptor) {
+            Ok(mut outcome)=>{
+                self.attempts.lock().unwrap_or_else(|p|p.into_inner()).extend(outcome.attempts);
+                outcome.vectors.pop().ok_or_else(||self.failure("InvalidResponse",false))
             }
-            Err(failure) => {
-                self.attempts.lock().unwrap_or_else(|p| p.into_inner()).extend_from_slice(failure.attempts());
-                let needs_proof = self.allow_fallback && profile.fallback_profile.is_some()
-                    && failure_allows_cloud_fallback(&failure);
-                Err(self.failure(if needs_proof { "CompatibilityRequired" } else { failure.error().code().as_str() },
-                    !needs_proof && failure_allows_cloud_fallback(&failure)))
+            Err(failure)=>{
+                self.attempts.lock().unwrap_or_else(|p|p.into_inner()).extend(failure.attempts);
+                Err(self.failure(failure.code,failure.lexical_eligible))
             }
         }
     }
+
     fn dimension(&self) -> usize { self.binding.dimension }
     fn id(&self) -> &str { &self.binding.embedder_id }
     fn is_semantic(&self) -> bool { true }

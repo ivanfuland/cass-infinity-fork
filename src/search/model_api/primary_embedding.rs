@@ -67,6 +67,8 @@ pub enum PrimaryEmbedFailure {
     DimensionDrift { expected: usize, observed: usize },
     /// Documents were submitted before any probe established the width.
     ProbeMissing,
+    /// A checked route failed after recording all actual attempts.
+    Routed { code: &'static str },
     /// The primary failed inside the frozen cloud-eligible set while a fallback
     /// was declared and not disabled. Producing vectors here would need the
     /// cross-endpoint compatibility evidence of spec §6.4, which this build does
@@ -80,6 +82,7 @@ impl PrimaryEmbedFailure {
     pub fn message(&self) -> String {
         match self {
             Self::Call(failure) => failure.to_string(),
+            Self::Routed { code } => format!("embedding route failed: {code}"),
             Self::DimensionDrift { expected, observed } => format!(
                 "embedding response width {observed} differs from the probed width {expected}"
             ),
@@ -210,6 +213,7 @@ impl EvidenceStage {
 /// even when the run aborted.
 pub struct PrimaryEmbeddingCall {
     client: ApiClient,
+    route: super::embedding_route::EmbeddingRoute,
     profile: ValidatedProfile,
     allow_fallback: bool,
     probed_dimension: Cell<usize>,
@@ -217,6 +221,8 @@ pub struct PrimaryEmbeddingCall {
     document_calls: RefCell<Vec<EmbeddingCallEvidence>>,
     audit_calls: RefCell<Vec<EmbeddingCallEvidence>>,
     last_failure: RefCell<Option<PrimaryEmbedFailure>>,
+    page_writers: RefCell<Vec<ValidatedProfile>>,
+    fallback_used: Cell<bool>,
 }
 
 impl PrimaryEmbeddingCall {
@@ -233,7 +239,9 @@ impl PrimaryEmbeddingCall {
         if profile.kind != ProfileKind::Embedding || profile.embedding().is_none() {
             return Err(ConfigError::at(ConfigErrorCode::KindMismatch, "kind"));
         }
+        let route = super::embedding_route::EmbeddingRoute::load(client.config(), &profile, allow_fallback);
         Ok(Self {
+            route,
             client,
             profile,
             allow_fallback,
@@ -242,7 +250,17 @@ impl PrimaryEmbeddingCall {
             document_calls: RefCell::new(Vec::new()),
             audit_calls: RefCell::new(Vec::new()),
             last_failure: RefCell::new(None),
+            page_writers: RefCell::new(Vec::new()),
+            fallback_used: Cell::new(false),
         })
+    }
+
+    pub(crate) fn route(&self) -> &super::embedding_route::EmbeddingRoute {
+        &self.route
+    }
+
+    pub(crate) fn page_writers(&self) -> Vec<ValidatedProfile> {
+        self.page_writers.borrow().clone()
     }
 
     /// The frozen profile.
@@ -293,7 +311,7 @@ impl PrimaryEmbeddingCall {
             descriptor_sha256,
             endpoint_config_sha256,
             allow_fallback: self.allow_fallback,
-            fallback_used: false,
+            fallback_used: self.fallback_used.get(),
             probe_calls: self.probe_calls(),
             document_calls: self.document_calls(),
             audit_calls: self.audit_calls(),
@@ -362,6 +380,7 @@ impl PrimaryEmbeddingCall {
     /// request returns no vectors for this page at all — the caller cannot write
     /// a half page. The requests are recorded as document batches.
     pub fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, PrimaryEmbedFailure> {
+        self.page_writers.borrow_mut().clear();
         self.embed_into(texts, EvidenceStage::Document)
     }
 
@@ -387,13 +406,30 @@ impl PrimaryEmbeddingCall {
         }
         let inputs: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+        let mut writers = Vec::<ValidatedProfile>::new();
         for batch in inputs.chunks(self.max_batch()) {
-            let outcome = match self
-                .client
-                .embed_once(&self.profile.id, batch, InputKind::Document)
-            {
-                Ok(outcome) => outcome,
-                Err(failure) => return Err(self.record_failure(failure, stage)),
+            let outcome = if self.route.proof.is_some() {
+                let descriptor = super::RepresentationDescriptor::from_profile(&self.profile, expected as u64)
+                    .map_err(|_| self.record_typed(PrimaryEmbedFailure::Routed { code: "InvalidDescriptor" }))?;
+                match self.route.embed(&self.client, batch, InputKind::Document, expected, &descriptor.sha256()) {
+                    Ok(outcome) => outcome,
+                    Err(failure) => {
+                        let mut buffer = self.evidence_buffer(stage).borrow_mut();
+                        for attempt in &failure.attempts {
+                            buffer.push(evidence_row(stage, &attempt.profile_id, attempt.network_attempted,
+                                attempt.http_status, attempt.error_code, attempt.duration_ms, &attempt.identity));
+                        }
+                        drop(buffer);
+                        return Err(self.record_typed(if failure.compatibility_required {
+                            PrimaryEmbedFailure::CompatibilityRequired { code: failure.code }
+                        } else { PrimaryEmbedFailure::Routed { code: failure.code } }));
+                    }
+                }
+            } else {
+                match self.client.embed_once(&self.profile.id, batch, InputKind::Document) {
+                    Ok(outcome) => outcome,
+                    Err(failure) => return Err(self.record_failure(failure, stage)),
+                }
             };
             if outcome.dimension != expected {
                 // The response was a real, validated HTTP 200 with its own
@@ -407,18 +443,20 @@ impl PrimaryEmbeddingCall {
                 }));
             }
             self.record_success(&outcome, stage);
+            if let Some(attempt) = outcome.attempts.last() {
+                if attempt.stage == super::AttemptStage::Fallback { self.fallback_used.set(true); }
+                if let Some(writer) = self.client.config().profile(&attempt.profile_id) {
+                    if !writers.iter().any(|p| p.id == writer.id) { writers.push(writer.clone()); }
+                }
+            }
             vectors.extend(outcome.vectors);
         }
+        if matches!(stage, EvidenceStage::Document) { *self.page_writers.borrow_mut() = writers; }
         Ok(vectors)
     }
     /// The largest number of complete inputs one request may carry.
     fn max_batch(&self) -> usize {
-        let raw = self
-            .profile
-            .embedding()
-            .map(|detail| detail.max_batch)
-            .unwrap_or(1);
-        usize::try_from(raw).unwrap_or(usize::MAX).max(1)
+        self.route.max_batch()
     }
 
     fn evidence_buffer(&self, stage: EvidenceStage) -> &RefCell<Vec<EmbeddingCallEvidence>> {
@@ -544,5 +582,33 @@ mod sentinel_parity_tests {
             fingerprint.extend_from_slice(&f32_vector_to_le_blob(vector));
         }
         assert_eq!(fingerprint.len(), API_PROBE_SENTINELS.len() * 4 * 4);
+    }
+}
+
+#[cfg(test)]
+mod page_writer_tests {
+    use super::*;
+    use super::super::compatibility_capture::tests::inputs;
+    use super::super::test_support::{HttpFixture, Reply};
+
+    #[test]
+    fn only_a_complete_page_publishes_its_actual_writers() {
+        let server = HttpFixture::start(vec![
+            Reply::Embeddings(2), Reply::Embeddings(2), // probe
+            Reply::Embeddings(2), Reply::Embeddings(2), // complete page
+            Reply::Embeddings(2), Reply::status(503),   // incomplete next page
+        ]);
+        let (client, _, _, _) = inputs(&server);
+        let profile = client.config().profile("archived").unwrap().clone();
+        let call = PrimaryEmbeddingCall::new(client, profile, true).unwrap();
+        call.probe().unwrap();
+        assert!(call.page_writers().is_empty());
+        assert_eq!(call.embed_documents(&["one", "two", "three"]).unwrap().len(), 3);
+        assert_eq!(call.page_writers().iter().map(|p|p.id.as_str()).collect::<Vec<_>>(), vec!["archived"]);
+        assert!(call.embed_documents(&["four", "five", "six"]).is_err());
+        assert!(call.page_writers().is_empty(), "failed page must not retain the preceding page's writer");
+        assert_eq!(server.hits(), 6);
+        assert_eq!(call.document_calls().len(), 4);
+        assert_eq!(call.document_calls().last().unwrap().http_status, Some(503));
     }
 }
