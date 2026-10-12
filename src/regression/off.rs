@@ -944,9 +944,14 @@ query_prefix="Query: "
         assert_eq!(result["terminal"], "SUCCESS");
         let report: Value =
             serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
-        eprintln!("CHILD_COST_REPORT: {}", report["cost"]);
+        // The semantic leg is served exclusively by the isolated fake embedding
+        // HTTP now: the rerank bucket is never called, the embedding bucket sees
+        // the isolated request(s), and no local model ever executes (the retired
+        // provider reported the embedding leg under a different scope).
         assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
-        assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
+        assert_eq!(report["cost"]["counts"][1]["http_attempts"], 1);
+        assert_eq!(report["cost"]["counts"][1]["http_response_observed"], 1);
+        assert!(report["cost"]["counts"][1]["model_executions"].is_null());
         assert!(report["questions"][0]["cost"]["model_execution_ms"].is_null());
     }
 
