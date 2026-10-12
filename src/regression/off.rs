@@ -1070,6 +1070,10 @@ query_prefix="Query: "
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(!paths.is_empty());
+                assert!(
+                    fault_served.load(Ordering::Acquire),
+                    "the faulty response must actually have been served: a config precondition                      failure would also exit 2 without reaching this endpoint"
+                );
                 assert!(paths.iter().all(|p| p == "/embeddings"));
                 println!(
                     "FAKE_HTTP mode={mode} vector={vector_mode} observed_embedding_requests={} observed_rerank_requests=0",
@@ -1487,6 +1491,8 @@ query_prefix="Query: "
                 let marker_dir = tempfile::tempdir().unwrap();
                 let build_done_path = marker_dir.path().join("built");
                 let build_done_watch = build_done_path.clone();
+                let fault_served = Arc::new(AtomicBool::new(false));
+                let fault_served_watch = fault_served.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let done = stop.clone();
                 let worker = std::thread::spawn(move || {
@@ -1545,6 +1551,7 @@ query_prefix="Query: "
                             write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
                             continue;
                         }
+                        fault_served_watch.store(true, Ordering::Release);
                         if fault == "disconnect" {
                             drop(stream);
                             continue;
