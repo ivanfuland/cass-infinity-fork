@@ -68,13 +68,13 @@ impl CheckedFixture {
 }
 
 /// Source declarations remain declarations. Service observations live separately.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeclarationBasis { OperatorDeclared }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Declaration { pub basis: DeclarationBasis, pub value: String }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Sources {
     pub weights: Declaration, pub tokenizer: Declaration, pub pooling: Declaration,
@@ -185,10 +185,29 @@ impl CheckedCapture {
             profile, query_inputs, document_inputs, query_rounds, document_rounds })
     }
     pub(crate) fn digest(&self) -> &str { &self.digest }
+    pub(crate) fn dimension(&self) -> usize { self.dimension }
+    pub(crate) fn sources(&self) -> &Sources { &self.sources }
+    pub(crate) fn inputs(&self, kind: InputKind) -> &[String] {
+        match kind { InputKind::Query => &self.query_inputs, InputKind::Document => &self.document_inputs }
+    }
 }
 fn valid_sha(value: &str) -> bool { value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PairSummary {
+    pub minimum_cosine: f64,
+    pub maximum_component_delta: f64,
+    pub maximum_relative_norm_delta: f64,
+    pub numerical_comparisons: usize,
+    pub retrieval_assertions: usize,
+}
+
 pub(crate) fn verify_pair(fixture: &CheckedFixture, left: &CheckedCapture, right: &CheckedCapture) -> Result<(), CompatibilityError> {
+    compare_pair(fixture, left, right).map(|_| ())
+}
+
+pub(crate) fn compare_pair(fixture: &CheckedFixture, left: &CheckedCapture, right: &CheckedCapture) -> Result<PairSummary, CompatibilityError> {
     if left.fixture_sha256 != fixture.digest || right.fixture_sha256 != fixture.digest
         || left.query_inputs != right.query_inputs || left.document_inputs != right.document_inputs {
         return Err(CompatibilityError::InputMismatch);
@@ -203,9 +222,16 @@ pub(crate) fn verify_pair(fixture: &CheckedFixture, left: &CheckedCapture, right
     let normalization = if [left,right].iter().any(|c| c.profile.embedding().is_some_and(|p| p.normalization == Normalization::None)) {
         Normalization::None
     } else { Normalization::L2 };
+    let mut summary = PairSummary { minimum_cosine:1.0, maximum_component_delta:0.0, maximum_relative_norm_delta:0.0,
+        numerical_comparisons:0, retrieval_assertions:16 * fixture.labels.len() };
     for (a,b) in [(&left.query_rounds,&right.query_rounds), (&left.document_rounds,&right.document_rounds)] {
         for index in 0..fixture.data.samples.len() {
-            verify_four_observations([&a[0][index], &a[1][index], &b[0][index], &b[1][index]], normalization)?;
+            for result in verify_four_observations([&a[0][index], &a[1][index], &b[0][index], &b[1][index]], normalization)? {
+                summary.minimum_cosine = summary.minimum_cosine.min(result.cosine);
+                summary.maximum_component_delta = summary.maximum_component_delta.max(result.max_component_delta);
+                summary.maximum_relative_norm_delta = summary.maximum_relative_norm_delta.max(result.relative_norm_delta);
+                summary.numerical_comparisons += 1;
+            }
         }
     }
     let queries = |c: &CheckedCapture| c.query_rounds.each_ref().map(|r| fixture.queries.iter().map(|i| r[*i].clone()).collect::<Vec<_>>());
@@ -214,13 +240,14 @@ pub(crate) fn verify_pair(fixture: &CheckedFixture, left: &CheckedCapture, right
     verify_cross_retrieval([
         RetrievalVectors { query_rounds:[&lq[0],&lq[1]], document_rounds:[&ld[0],&ld[1]] },
         RetrievalVectors { query_rounds:[&rq[0],&rq[1]], document_rounds:[&rd[0],&rd[1]] },
-    ], &fixture.labels)
+    ], &fixture.labels)?;
+    Ok(summary)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    fn fixture() -> (Vec<u8>, CheckedFixture) {
+    pub(in crate::search::model_api) fn fixture() -> (Vec<u8>, CheckedFixture) {
         let data = Fixture { version:1, samples: vec![
             Sample{id:"q1".into(),text:"Rust 所有权是什么？".into(),coverage:Coverage::Chinese},
             Sample{id:"d1".into(),text:"Rust ownership tracks values.".into(),coverage:Coverage::English},
@@ -236,7 +263,7 @@ mod tests {
         let checked = CheckedFixture::read(&bytes, &sha(&bytes)).unwrap();
         (bytes, checked)
     }
-    fn archive(fixture: &CheckedFixture, port: u16) -> Capture {
+    pub(in crate::search::model_api) fn archive(fixture: &CheckedFixture, port: u16) -> Capture {
         let toml = format!("version=1\n[profiles.archived]\nkind=\"embedding\"\nprotocol=\"openai-embeddings-v1\"\nendpoint=\"http://127.0.0.1:{port}/embedding\"\nscope=\"loopback\"\nmodel=\"example/embedding\"\nmodel_revision=\"r1\"\nnormalization=\"l2\"\nquery_prefix=\"Q:\"\ndocument_prefix=\"D:\"\n");
         let config = ApiConfig::parse_toml(&toml).unwrap();
         let profile = config.profile("archived").unwrap();

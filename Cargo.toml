@@ -143,6 +143,10 @@ security-framework = "3.7.0"
 [target.'cfg(not(windows))'.dependencies]
 openssl = { version = "0.10.79", features = ["vendored"] }
 
+# Secure opening of explicit compatibility proof files on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.186"
+
 [features]
 default = ["qr", "encryption", "semantic"]
 qr = ["dep:qrcode", "dep:image"]

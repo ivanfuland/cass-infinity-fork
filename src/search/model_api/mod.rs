@@ -42,6 +42,7 @@ pub mod client;
 pub mod config;
 pub(crate) mod compatibility;
 pub(crate) mod compatibility_archive;
+pub(crate) mod compatibility_bundle;
 pub mod error;
 pub mod identity;
 pub mod primary_embedding;
