@@ -3018,3 +3018,51 @@ fn index_failure_preserves_actual_model_request_evidence() {
     assert_eq!(calls[0]["http_status"], 503);
     assert_eq!(service.requests().len(), 1);
 }
+
+#[test]
+fn semantic_watch_once_ingests_appended_events_and_reuses_api_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let codex = home.join(".codex");
+    let sessions = codex.join("sessions/2026/05/28");
+    fs::create_dir_all(&sessions).unwrap();
+    let session = sessions.join("rollout-api-watch.jsonl");
+    let initial = concat!(
+        "{\"timestamp\":\"2026-05-28T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"api-watch\",\"cwd\":\"/synthetic\"}}\n",
+        "{\"timestamp\":\"2026-05-28T09:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"A synthetic first message verifies the watch API pipeline.\"}]}}\n",
+    );
+    fs::write(&session, initial).unwrap();
+    let data = root.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    let service = Stub::start(healthy_responder(8, 0));
+    let config = root.path().join("models.toml");
+    fs::write(&config, config_text("local8", &embedding_profile_block("local8", &service.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, ""))).unwrap();
+    let home_text = home.display().to_string();
+    let codex_text = codex.display().to_string();
+    let xdg_data = root.path().join("xdg-data").display().to_string();
+    let xdg_config = root.path().join("xdg-config").display().to_string();
+    let envs = [("HOME", home_text.as_str()), ("CODEX_HOME", codex_text.as_str()),
+        ("XDG_DATA_HOME", xdg_data.as_str()), ("XDG_CONFIG_HOME", xdg_config.as_str()),
+        ("CASS_IGNORE_SOURCES_CONFIG", "1"), ("CASS_RESPONSIVENESS_DISABLE", "1")];
+    let run = || cass(&["index", "--semantic", "--watch-once", &session.display().to_string(),
+        "--api-config", &config.display().to_string(), "--data-dir", &data.display().to_string(), "--json"], &envs);
+    let first = run();
+    assert!(first.status.success(), "{}", stderr_text(&first));
+    let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+    let generation: i64 = storage.raw().query_row_map("SELECT id FROM embedding_generations WHERE is_active=1", &[], |row|row.get_typed(0)).unwrap();
+    let chunks: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM message_chunks", &[], |row|row.get_typed(0)).unwrap();
+    assert_eq!(chunks, 1);
+    drop(storage);
+    let added = "{\"timestamp\":\"2026-05-28T09:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A synthetic appended answer verifies the next watch pass.\"}]}}\n";
+    fs::write(&session, format!("{initial}{added}")).unwrap();
+    let second = run();
+    assert!(second.status.success(), "{}", stderr_text(&second));
+    let storage = FrankenStorage::open_readonly(&data.join("agent_search.db")).unwrap();
+    let active: i64 = storage.raw().query_row_map("SELECT id FROM embedding_generations WHERE is_active=1", &[], |row|row.get_typed(0)).unwrap();
+    assert_eq!(active, generation);
+    let counts: (i64,i64) = storage.raw().query_row_map("SELECT (SELECT COUNT(*) FROM messages),(SELECT COUNT(*) FROM message_chunks)", &[], |row|Ok((row.get_typed(0)?,row.get_typed(1)?))).unwrap();
+    assert_eq!(counts, (2,2));
+    let report: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(report["indexing_stats"]["model_api"]["primary_profile"], "local8");
+    assert!(!service.requests().is_empty());
+}

@@ -34695,8 +34695,21 @@ mod tests {
         session: &Path,
         progress: Arc<IndexingProgress>,
     ) -> super::IndexOptions {
+        let config = data_dir.join("watch-models.toml");
+        std::fs::write(&config, r#"version=1
+default_embedding="watch-test"
+[profiles.watch-test]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="http://127.0.0.1:1/v1/embeddings"
+model="example/watch-test"
+model_revision="fixture-r1"
+normalization="l2"
+"#).unwrap();
+        let setup = crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(Some(&config), None, false).unwrap();
         super::IndexOptions {
-            model_api: None,
+            model_api: Some(Arc::new(setup)),
             no_ingest: false,
             full: false,
             watch: false,
@@ -34705,7 +34718,7 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: true,
-            embedder: "hash".to_string(),
+            embedder: "watch-test".to_string(),
             progress: Some(progress),
             watch_interval_secs: 30,
         }
