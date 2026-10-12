@@ -788,7 +788,7 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Retired local embedding-model selector. The local backend was removed with the model-API migration, so a supplied value is refused with a migration error before any request. Embedding is served by the configured API profile (`--api-config` with `--embedding-profile`)",
           "arg_type": "option",
           "value_type": "string",
           "required": false
@@ -806,14 +806,14 @@
         },
         {
           "name": "reranker",
-          "description": "Deprecated reranker selector. Use --rerank-provider instead",
+          "description": "Retired reranker selector. A supplied value is refused with a migration error before any request; the backend comes from the configured rerank API profile (`--rerank-profile`)",
           "arg_type": "option",
           "value_type": "string",
           "required": false
         },
         {
           "name": "daemon",
-          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
+          "description": "Retired daemon-inference selector. Warm local-model inference was removed with the model-API migration, so this flag is refused with a migration error before any request",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -824,7 +824,7 @@
         },
         {
           "name": "no-daemon",
-          "description": "Disable daemon usage even if available (force direct inference)",
+          "description": "No effect on the API-only build: it selects no model and enables no local inference, so there is no daemon for it to disable. Retained for compatibility",
           "arg_type": "flag",
           "required": false,
           "default": "false",

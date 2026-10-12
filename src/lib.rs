@@ -622,9 +622,11 @@ pub enum Commands {
         // ==========================================================================
         // Model / Reranker / Daemon flags (bd-3bbv)
         // ==========================================================================
-        /// Embedding model to use for semantic search.
-        /// Available models depend on what's been downloaded.
-        /// Use `cass models --list` to see available options.
+        /// Retired local embedding-model selector. The local backend was
+        /// removed with the model-API migration, so a supplied value is
+        /// refused with a migration error before any request. Embedding is
+        /// served by the configured API profile (`--api-config` with
+        /// `--embedding-profile`).
         #[arg(long)]
         model: Option<String>,
 
@@ -634,16 +636,21 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         rerank: bool,
 
-        /// Deprecated reranker selector. Use --rerank-provider instead.
+        /// Retired reranker selector. A supplied value is refused with a
+        /// migration error before any request; the backend comes from the
+        /// configured rerank API profile (`--rerank-profile`).
         #[arg(long)]
         reranker: Option<String>,
 
-        /// Use daemon for warm model inference (faster repeated queries).
-        /// If daemon is unavailable, falls back to direct inference.
+        /// Retired daemon-inference selector. Warm local-model inference was
+        /// removed with the model-API migration, so this flag is refused with
+        /// a migration error before any request.
         #[arg(long, default_value_t = false)]
         daemon: bool,
 
-        /// Disable daemon usage even if available (force direct inference).
+        /// No effect on the API-only build: it selects no model and enables no
+        /// local inference, so there is no daemon for it to disable. Retained
+        /// for compatibility.
         #[arg(long, default_value_t = false)]
         no_daemon: bool,
 
@@ -24039,9 +24046,15 @@ mod pr3_cli_limits {
         assert_eq!(rerank_provider, None);
     }
 
+    /// The retired `--rerank-provider` is a free-form string now, so an unknown
+    /// or legacy value still parses (clap advertises no retired spellings) and
+    /// is preserved verbatim for the dispatch to refuse. The end-to-end refusal
+    /// (exit 2, `ModelApiMigration`, no database touched) is pinned by
+    /// `tests/api_primary_backfill.rs::search_retires_local_selectors_before_any_database_work`
+    /// and `tests/pr3_cli_limits.rs::retired_rerank_provider_value_is_a_migration_refusal`.
     #[test]
-    fn unknown_provider_is_a_usage_error() {
-        let err = parse_err(&[
+    fn unknown_provider_value_is_parsed_for_later_refusal() {
+        let cmd = search_fields(&[
             "cass",
             "search",
             "q",
@@ -24049,7 +24062,10 @@ mod pr3_cli_limits {
             "--rerank-provider",
             "not-a-provider",
         ]);
-        assert_eq!(err.code, 2);
+        let Commands::Search { rerank_provider, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(rerank_provider.as_deref(), Some("not-a-provider"));
     }
 
     #[test]
@@ -24061,8 +24077,11 @@ mod pr3_cli_limits {
         assert_eq!(agent, vec!["codex".to_string()]);
     }
 
+    /// `--model` no longer selects an embedder: it parses as a free-form string
+    /// and the dispatch refuses it with a migration error. Parsing must still
+    /// preserve the value so that refusal can name it.
     #[test]
-    fn search_model_still_selects_the_embedder() {
+    fn search_model_is_parsed_for_later_refusal() {
         let cmd = search_fields(&["cass", "search", "q", "--model", "bge-m3"]);
         let Commands::Search { model, .. } = cmd else {
             unreachable!()

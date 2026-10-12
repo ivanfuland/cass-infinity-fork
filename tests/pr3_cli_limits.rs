@@ -433,8 +433,6 @@ fn invalid_window_arguments_are_usage_errors() {
         &["search", "q", "--rerank", "--rrf-limit", "10", "--rerank-limit", "11"],
         // N < 5 with K omitted (default K=5) while rerank is on
         &["search", "q", "--rerank", "--rrf-limit", "3"],
-        // unknown provider value
-        &["search", "q", "--rerank", "--rerank-provider", "nope"],
         // reranker + provider conflict
         &[
             "search",
@@ -451,6 +449,29 @@ fn invalid_window_arguments_are_usage_errors() {
     for args in cases {
         assert_usage_error(&env, args);
     }
+}
+
+/// A retired or unknown `--rerank-provider` value is no longer a *usage* error.
+///
+/// The flag is a free-form string so clap advertises no retired spellings:
+/// parsing succeeds, the value is preserved, and the dispatch refuses it with a
+/// migration error before any database or network work. The end-to-end form of
+/// this expectation (exit 2, `ModelApiMigration`, no data dir created) is pinned
+/// by `tests/api_primary_backfill.rs::search_retires_local_selectors_before_any_database_work`.
+#[test]
+fn retired_rerank_provider_value_is_a_migration_refusal() {
+    let env = Env::new();
+    let out = assert_not_usage_error(
+        &env,
+        &["search", "q", "--json", "--rerank", "--rerank-provider", "nope"],
+    );
+    assert_eq!(code(&out), 2, "{}", combined(&out));
+    assert_eq!(
+        stderr_error_kind(&combined(&out)),
+        "ModelApiMigration",
+        "a retired provider value must be refused as a migration error: {}",
+        combined(&out)
+    );
 }
 
 #[test]
