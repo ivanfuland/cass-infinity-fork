@@ -137,12 +137,12 @@ be silently skipped during closeout.
 ### models
 
 - **Owning beads:** .5, .5.1, .5.5
-- **Failure modes:** fm-models-fastembed-missing, fm-models-onnx-load-failure, fm-models-checksum-mismatch
+- **Failure modes:** fm-models-api-config-missing, fm-models-api-endpoint-unreachable, fm-models-api-identity-mismatch
 - **Mandatory proofs:** integration
-- **Proof artifacts:** `tests/cli_model_lifecycle_contract.rs`, `tests/e2e_analytics_models.rs`
-- **Optional diagnostics:** live model download (opt-in; never CI-required)
-- **Fixture provenance:** missing/mismatched model dirs; no network at test time
-- **Log expectation:** deterministic contract test result line; live download is opt-in only
+- **Proof artifacts:** `tests/cli_model_lifecycle_contract.rs`, `tests/api_model_commands.rs`, `tests/e2e_analytics_models.rs`
+- **Optional diagnostics:** live model API profile check (explicit; never CI-required)
+- **Fixture provenance:** isolated HOME plus versioned TOML config fixtures; the real-CLI harness in tests/api_model_commands.rs uses a loopback stub, and no test reaches a real endpoint
+- **Log expectation:** deterministic contract test result line; a real model endpoint is never contacted by CI
 - **Redaction:** no-user-content
 - **Closure evidence:** cargo test --test cli_model_lifecycle_contract
 
