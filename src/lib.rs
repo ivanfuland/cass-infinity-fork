@@ -106996,7 +106996,7 @@ model_revision="r1"
             let path = root.path().join("invalid-api.toml");
             std::fs::write(
                 &path,
-                "version=1\ndefault_rerank=\"rank\"\n[profiles.rank]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"invalid-origin\"\nmodel=\"BAAI/bge-reranker-v2-m3\"\nmodel_revision=\"r1\"\n",
+                "version=1\ndefault_rerank=\"rank\"\n[profiles.rank]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"http://127.0.0.1:1\"\nmodel=\"BAAI/bge-reranker-v2-m3\"\nmodel_revision=\"r1\"\n",
             )
             .unwrap();
             path
