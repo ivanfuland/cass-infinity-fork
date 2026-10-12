@@ -26,7 +26,11 @@ pub fn score(client: &ApiClient, profile: &str, query: &str, documents: &[String
             });
             let reason = match failure.error().code() {
                 ApiCallErrorCode::MissingCredentials => RerankFailureReason::MissingCredentials,
-                ApiCallErrorCode::Transport => RerankFailureReason::TransportError,
+                ApiCallErrorCode::Transport => match super::routing::transport_failure_of(
+                    failure.error().code(), failure.error().http_status(), failure.error().transport_code()) {
+                    Some(crate::search::rerank::http::TransportFailure::Timeout) => RerankFailureReason::Timeout,
+                    _ => RerankFailureReason::TransportError,
+                },
                 ApiCallErrorCode::HttpStatus => RerankFailureReason::HttpError,
                 ApiCallErrorCode::IdentityMismatch => RerankFailureReason::ModelIdentityMismatch,
                 ApiCallErrorCode::InvalidResponse | ApiCallErrorCode::DimensionMismatch => RerankFailureReason::InvalidResponse,
@@ -80,7 +84,8 @@ provider_only="fixed-provider"
         let cloud = TlsFixture::start(vec![Reply::ok(json!({"results":[
             {"index":1,"relevance_score":0.9}, {"index":0,"relevance_score":0.1}
         ], "model":"example/cloud-rank", "usage":{"input_tokens":23}}))]);
-        let api = client(&local, &cloud);
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(crate::search::regression_trace::RequestTrace::default()));
+        let api = client(&local, &cloud).with_rerank_trace(trace.clone());
         let documents = vec!["first complete document".into(), "second complete document".into()];
         let mut evidence = None;
         let result = score(&api, "local", "query", &documents, true, &mut evidence).unwrap();
@@ -101,8 +106,44 @@ provider_only="fixed-provider"
         let second = cloud.fixture().requests()[0].body();
         for field in ["query", "documents", "instruct", "top_n"] { assert_eq!(first[field], second[field], "{field}"); }
         assert_eq!(first["documents"], json!(documents));
+        let captured = trace.lock().unwrap();
+        assert_eq!(captured.requests.len(), 2);
+        assert_eq!(captured.requests[0].http_status, Some(503));
+        assert_eq!(captured.requests[1].http_status, Some(200));
+        for (request, sent) in captured.requests.iter().zip([&first, &second]) {
+            use sha2::{Digest, Sha256};
+            assert_eq!(request.json_body_sha256.as_ref().unwrap(), &hex::encode(Sha256::digest(serde_json::to_vec(sent).unwrap())));
+            assert_eq!(request.documents.as_ref().unwrap().len(), documents.len());
+            for (slot, text) in request.documents.as_ref().unwrap().iter().zip(&documents) {
+                assert_eq!(slot.text, crate::search::regression_trace::TextDigest::of(text));
+            }
+        }
+        assert_eq!(captured.model_requests, None, "HTTP does not prove GPU execution count");
         assert_eq!(local.hits(), 1);
         assert_eq!(cloud.fixture().hits(), 1);
+    }
+
+    #[test]
+    fn timeout_keeps_its_classification_for_regression_costs() {
+        let local = HttpFixture::start(vec![Reply::Stall]);
+        let text = format!(r#"
+version=1
+[profiles.local]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/rank"
+model_revision="r1"
+connect_timeout_ms=100
+timeout_ms=200
+"#, local.base());
+        let api = ApiClient::new(ApiConfig::parse_toml(&text).unwrap(), Box::new(NoCredentials));
+        let mut evidence = None;
+        let error = score(&api, "local", "query", &["document".into()], false, &mut evidence).unwrap_err();
+        assert_eq!(error.reason, RerankFailureReason::Timeout);
+        assert_eq!(evidence.unwrap().attempts[0].error_code.as_deref(), Some("timeout"));
+        assert_eq!(local.hits(), 1);
     }
 
     #[test]

@@ -222,6 +222,7 @@ impl<'a> RerankOptions<'a> {
 pub struct ApiClient {
     config: ValidatedApiConfig,
     credentials: Box<dyn CredentialResolver>,
+    rerank_trace: Option<std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>>,
     /// Test-only: one extra PEM-encoded CA every transport of this client
     /// trusts. `None` on every production path; there is no runtime switch.
     #[cfg(test)]
@@ -234,6 +235,7 @@ impl ApiClient {
         Self {
             config,
             credentials,
+            rerank_trace: None,
             #[cfg(test)]
             test_root: None,
         }
@@ -253,8 +255,16 @@ impl ApiClient {
         Self {
             config,
             credentials,
+            rerank_trace: None,
             test_root: Some(ca_pem),
         }
+    }
+
+    /// Record rerank payload hashes at the actual HTTP transport boundary.
+    /// Embedding requests have a different wire shape and never enter this trace.
+    pub(crate) fn with_rerank_trace(mut self, trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>) -> Self {
+        self.rerank_trace = Some(trace);
+        self
     }
 
     /// The frozen configuration this client works from.
@@ -685,12 +695,20 @@ impl ApiClient {
             }
             None => None,
         };
+        let attach_trace = |transport: HttpTransport| {
+            if profile.kind == ProfileKind::Rerank {
+                if let Some(trace) = &self.rerank_trace { return transport.with_trace(trace.clone()); }
+            }
+            transport
+        };
         #[cfg(test)]
         if let Some(ca_pem) = &self.test_root {
             return HttpTransport::new_with_test_root(config, bearer, ca_pem)
+                .map(attach_trace)
                 .map_err(|_| ApiCallError::new(ApiCallErrorCode::InvalidInput));
         }
         HttpTransport::new(config, bearer)
+            .map(attach_trace)
             .map_err(|_| ApiCallError::new(ApiCallErrorCode::InvalidInput))
     }
 

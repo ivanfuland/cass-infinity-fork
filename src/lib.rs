@@ -26559,6 +26559,10 @@ fn score_search_first_window(
                             None => {
                                 let config = semantic_opts.api.frozen.as_ref().expect("API config frozen");
                                 let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver));
+                                let client = match regression.as_ref() {
+                                    Some(run) => client.with_rerank_trace(run.trace.clone()),
+                                    None => client,
+                                };
                                 crate::search::model_api::rerank_call::score(&client, &requested_profile, query, &documents,
                                     !semantic_opts.api.no_model_fallback, &mut api_evidence)
                             }
