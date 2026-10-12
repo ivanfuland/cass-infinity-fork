@@ -1,7 +1,7 @@
 //! PR10 task 05 — the local half of `cass sync`, end to end.
 //!
 //! Five behaviours, all through the real `cass` binary against an isolated
-//! HOME / XDG / `--data-dir` and a canned Infinity stub:
+//! HOME / XDG / `--data-dir` and a canned loopback model API:
 //!
 //! 1. `sync_indexes_locally_without_remote_sources` — a config with no
 //!    sources still runs exactly one index, ingests a new local session,
@@ -20,19 +20,20 @@
 //!    without the `infinity` feature; PR10 task 08 added it, and it compiles
 //!    only in that configuration.
 //!
-//! The Infinity stub is a deliberate copy of the one in
-//! `tests/w8_t6b_ingest.rs`: `tests/util/` is outside this task's write
-//! surface, and the two stubs answering the same canned wire shape is
-//! cheaper to review than a shared helper quietly changing under both.
+//! The model stub is local to this file: the success and fault fixtures only
+//! need a loopback HTTP service that answers the configured embedding profile
+//! with a deterministic, per-text vector, so it stays here rather than changing
+//! a shared helper under every other suite.
 
 mod util;
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -47,26 +48,55 @@ use coding_agent_search::sync::{
 use tempfile::TempDir;
 use util::seed_codex_session;
 
-/// `src/search/infinity.rs::DIMENSION` — the served dimension the probe
-/// validates the advertised model against.
+/// The served embedding width. The profile declares it as
+/// `expected_dimension`, and the stub answers every request at this width.
 const EMBED_DIM: usize = 1024;
-/// Kept in step with the fallback in `InfinityConfig::from_env`.
-const EMBED_MODEL: &str = "BAAI/bge-m3";
+/// The model identity the profile declares. The stub echoes the requested
+/// model, so the request and the response agree on one identity.
+const EMBED_MODEL: &str = "fixture/synthetic-embed";
+/// The deployment revision the profile declares.
+const EMBED_REVISION: &str = "rev-synthetic-1";
+/// The path the configured endpoint carries; the client appends nothing.
+const EMBED_PATH: &str = "/v1/embeddings";
 
 const SCHEMA: &str = "cass.sync.v1";
 
+/// The closed list of retired model-selection variables. A model-related
+/// command refuses when any of them is set, so the fixture removes all of
+/// them rather than letting an operator's shell decide the round's outcome.
+const RETIRED_MODEL_ENV: [&str; 7] = [
+    "CASS_INFINITY_URL",
+    "CASS_INFINITY_EMBED_MODEL",
+    "CASS_INFINITY_RERANK_MODEL",
+    "CASS_QWEN_RERANK_URL",
+    "CASS_SEMANTIC_EMBEDDER",
+    "CASS_SEMANTIC_DOWNLOAD_POLICY",
+    "CASS_SEMANTIC_MAX_MODEL_SIZE_MB",
+];
+
 // ---------------------------------------------------------------------------
-// Canned Infinity stub (mirrors tests/w8_t6b_ingest.rs)
+// Canned loopback model API
+//
+// The success and fault fixtures need a service that answers the configured
+// embedding profile. It speaks `openai-embeddings-v1`: `POST` the configured
+// path with `input` as a string array, and answer `data[].index`/`embedding`
+// covering `0..N-1` at a fixed width. The vector direction is derived from the
+// whole input text, so distinct texts get distinct directions — the activation
+// audit asks each chunk's row to be its own nearest neighbour, and collinear
+// vectors would make every chunk match every other one.
 // ---------------------------------------------------------------------------
 
-struct StubInfinity {
-    base_url: String,
+struct ApiStub {
+    endpoint: String,
     wake_addr: String,
     stop: Arc<AtomicBool>,
+    /// `"<method> <path>"` for every request the stub answered, so a test can
+    /// prove the round really sent embedding HTTP.
+    requests: Arc<Mutex<Vec<String>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
-impl Drop for StubInfinity {
+impl Drop for ApiStub {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(stream) = TcpStream::connect(&self.wake_addr) {
@@ -78,20 +108,23 @@ impl Drop for StubInfinity {
     }
 }
 
-impl StubInfinity {
+impl ApiStub {
     fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind infinity stub");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind model stub");
         listener
             .set_nonblocking(true)
-            .expect("set infinity stub nonblocking");
+            .expect("set model stub nonblocking");
         let addr = listener.local_addr().expect("stub address");
         let wake_addr = addr.to_string();
+        let origin = format!("http://{addr}");
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
         let handle = thread::spawn(move || {
             while !stop_flag.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_request(stream),
+                    Ok((stream, _)) => handle_request(stream, &recorded),
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -100,12 +133,50 @@ impl StubInfinity {
             }
         });
         Self {
-            base_url: format!("http://{wake_addr}"),
+            endpoint: format!("{origin}{EMBED_PATH}"),
             wake_addr,
             stop,
+            requests,
             handle: Some(handle),
         }
     }
+
+    /// The full endpoint the configured profile names.
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Every request the stub answered, as `"<method> <path>"`.
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("stub request log").clone()
+    }
+}
+
+/// The versioned model-service configuration the ready and partial fixtures
+/// select: one embedding profile, declared as the default, pointing at `stub`.
+///
+/// `expected_dimension` pins the served width, so a response of any other
+/// width is refused by the client rather than accepted on trust.
+fn api_config_text(endpoint: &str) -> String {
+    format!(
+        "version = 1\n\
+         default_embedding = \"fixture-local\"\n\n\
+         [profiles.fixture-local]\n\
+         kind = \"embedding\"\n\
+         protocol = \"openai-embeddings-v1\"\n\
+         endpoint = \"{endpoint}\"\n\
+         scope = \"loopback\"\n\
+         model = \"{EMBED_MODEL}\"\n\
+         model_revision = \"{EMBED_REVISION}\"\n\
+         normalization = \"l2\"\n\
+         expected_dimension = {EMBED_DIM}\n"
+    )
+}
+
+/// A configuration that parses as TOML but cannot yield an embedding route:
+/// its default embedding names no profile in the document.
+fn unusable_api_config_text() -> String {
+    "version = 1\ndefault_embedding = \"not-a-profile\"\n".to_string()
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -160,70 +231,70 @@ fn ok_json(body: &str) -> String {
     )
 }
 
-fn handle_request(mut stream: TcpStream) {
+fn handle_request(mut stream: TcpStream, requests: &Mutex<Vec<String>>) {
     let Some((method, path, body)) = read_http_request(&mut stream) else {
         return;
     };
-    let response = if method == "GET" && path == "/models" {
-        ok_json(&format!(
-            r#"{{"data":[{{"id":"{EMBED_MODEL}","capabilities":["embed"]}}]}}"#
-        ))
-    } else if method == "POST" && path == "/embeddings" {
-        let requested = serde_json::from_slice::<serde_json::Value>(&body).ok();
-        let model = requested
-            .as_ref()
-            .and_then(|v| v.get("model"))
-            .and_then(|m| m.as_str())
-            .unwrap_or_default();
-        if model != EMBED_MODEL {
-            let msg = format!("infinity stub: unexpected model {model:?}");
-            format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                msg.len(),
-                msg
-            )
-        } else {
-            // `http_embed` requires `data[].index` to permute 0..N-1.
-            // Vectors must be distinct per input text: the activation
-            // audit's ownership check asks each chunk's row to be its own
-            // nearest neighbour, so collinear vectors would make every
-            // chunk match every other one.
-            let inputs: Vec<String> = requested
-                .as_ref()
-                .and_then(|v| v.get("input"))
-                .and_then(|i| i.as_array())
-                .map(|items| {
-                    items
-                        .iter()
-                        .map(|item| item.as_str().unwrap_or_default().to_string())
-                        .collect()
-                })
-                .unwrap_or_else(|| vec![String::new()]);
-            let data: Vec<serde_json::Value> = inputs
-                .iter()
-                .enumerate()
-                .map(|(index, text)| {
-                    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-                    for byte in text.as_bytes() {
-                        hash ^= u64::from(*byte);
-                        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-                    }
-                    let vector: Vec<f32> = (0..EMBED_DIM)
-                        .map(|i| {
-                            let mixed = hash ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                            (mixed % 997) as f32 / 997.0 - 0.5
-                        })
-                        .collect();
-                    serde_json::json!({ "embedding": vector, "index": index })
-                })
-                .collect();
-            ok_json(&serde_json::json!({ "data": data }).to_string())
-        }
+    if let Ok(mut log) = requests.lock() {
+        log.push(format!("{method} {path}"));
+    }
+    let response = if method == "POST" && path == EMBED_PATH {
+        embedding_response(&body)
     } else {
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
     };
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+/// Answer one `openai-embeddings-v1` request.
+///
+/// The request must name the model the profile declares; anything else is
+/// refused with a 500, so a client that sent some other model could not be
+/// mistaken for a healthy round. The response carries one vector per input,
+/// indexed `0..N-1` in request order, under the same model identity.
+fn embedding_response(body: &[u8]) -> String {
+    let requested = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let model = requested
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    if model != EMBED_MODEL {
+        let msg = format!("model stub: unexpected model {model:?}");
+        return format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            msg.len(),
+            msg
+        );
+    }
+    let inputs: Vec<String> = requested
+        .as_ref()
+        .and_then(|v| v.get("input"))
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let data: Vec<serde_json::Value> = inputs
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            serde_json::json!({ "object": "embedding", "index": index, "embedding": vector_for(text) })
+        })
+        .collect();
+    ok_json(
+        &serde_json::json!({
+            "object": "list",
+            "data": data,
+            "model": EMBED_MODEL,
+            "usage": { "prompt_tokens": inputs.len(), "total_tokens": inputs.len() },
+        })
+        .to_string(),
+    )
 }
 
 /// A port nobody is listening on: bind, read the address, drop the listener.
@@ -232,6 +303,21 @@ fn closed_port_url() -> String {
     let addr = listener.local_addr().expect("ephemeral address");
     drop(listener);
     format!("http://{addr}")
+}
+
+/// A deterministic vector whose direction is decided by the whole input text.
+fn vector_for(text: &str) -> Vec<f32> {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (0..EMBED_DIM)
+        .map(|i| {
+            let mixed = hash ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            (mixed % 997) as f32 / 997.0 - 0.5
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +373,11 @@ impl Fixture {
     /// Every env var the child needs. The isolation is explicit per child
     /// rather than via `EnvGuard`, so these tests share no process-global
     /// state and stay safe under cargo's default parallel test threads.
+    ///
+    /// The model-service configuration is named on the command line, never
+    /// through the environment: an operator's `CASS_API_CONFIG`, and every
+    /// retired model-selection variable, is removed so the profile this suite
+    /// writes is the only one the round can select.
     fn command(&self) -> Command {
         let mut cmd = Command::new(util::cass_bin());
         cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
@@ -296,22 +387,107 @@ impl Fixture {
         cmd.env("XDG_CONFIG_HOME", self.tmp.path().join("xdg-config"));
         cmd.env("CASS_RESPONSIVENESS_DISABLE", "1");
         cmd.env("CASS_TANTIVY_REBUILD_WORKERS", "1");
+        // The semantic finalize ticker sleeps a whole interval before it can be
+        // joined, and its default interval is 60s, so every completed round
+        // would otherwise pay that wait at the end. The existing test knob
+        // shortens only this child's ticker; no production default changes.
+        cmd.env("CASS_SEMANTIC_FINALIZE_PROGRESS_EVERY_MS", "10");
         // Never inherit an operator/CI opt-out: several other suites set it,
         // and this suite's whole point is that the config IS consulted.
         cmd.env_remove("CASS_IGNORE_SOURCES_CONFIG");
         cmd.env_remove("CASS_DATA_DIR");
         cmd.env_remove("CASS_OUTPUT_FORMAT");
         cmd.env_remove("TOON_DEFAULT_FORMAT");
+        cmd.env_remove("CASS_API_CONFIG");
+        for variable in RETIRED_MODEL_ENV {
+            cmd.env_remove(variable);
+        }
         cmd
     }
 
-    /// One `cass sync --json` round against the fixture.
-        fn sync_json(&self, infinity_url: &str, extra: &[&str]) -> Output {
+    /// The temporary model-service configuration this suite writes.
+    fn api_config_path(&self) -> PathBuf {
+        self.tmp.path().join("api-models.toml")
+    }
+
+    /// Write a valid embedding profile for `stub` and return its path.
+    fn write_api_config(&self, stub: &ApiStub) -> PathBuf {
+        self.write_api_config_for_endpoint(stub.endpoint())
+    }
+
+    /// Write a valid embedding profile for an arbitrary endpoint and return
+    /// its path. Used to point the profile at a real endpoint that does not
+    /// answer, without weakening the configuration itself.
+    fn write_api_config_for_endpoint(&self, endpoint: &str) -> PathBuf {
+        let path = self.api_config_path();
+        std::fs::write(&path, api_config_text(endpoint)).expect("write model-service config");
+        path
+    }
+
+    /// One `cass sync --json` round against the fixture. `api_config` is the
+    /// profile file to select, or `None` when the round must run with no model
+    /// configuration at all.
+    fn sync_json(&self, api_config: Option<&Path>, extra: &[&str]) -> Output {
         let mut cmd = self.command();
-        cmd.env("CASS_INFINITY_URL", infinity_url);
         cmd.args(["sync", "--json", "--data-dir"]);
         cmd.arg(self.data_dir());
+        if let Some(path) = api_config {
+            cmd.arg("--api-config").arg(path);
+        }
         cmd.args(extra);
+        cmd.output().expect("spawn cass sync")
+    }
+
+    /// The common round: a valid loopback profile for `stub`, then `cass sync`.
+    fn sync_with_stub(&self, stub: &ApiStub, extra: &[&str]) -> Output {
+        let api_config = self.write_api_config(stub);
+        self.sync_json(Some(&api_config), extra)
+    }
+
+    /// A PATH whose `ssh`, `rsync` and `scp` are stubs that fail at once.
+    ///
+    /// The mirror transport shells out to these binaries. Pointing only the
+    /// child at failing stubs keeps a mirror failure hermetic: the round still
+    /// takes the mirror path and still reports the source as unsynced, but no
+    /// process ever opens a real SSH connection. The shim directory comes
+    /// first, so it shadows the real tools without changing the parent's PATH.
+    fn transport_shim_path(&self) -> OsString {
+        let dir = self.tmp.path().join("transport-bin");
+        std::fs::create_dir_all(&dir).expect("create transport shim dir");
+        for tool in ["ssh", "rsync", "scp"] {
+            let path = dir.join(tool);
+            std::fs::write(&path, "#!/bin/sh\nexit 1\n").expect("write transport shim");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .expect("make transport shim executable");
+            }
+        }
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![dir];
+        paths.extend(std::env::split_paths(&existing));
+        std::env::join_paths(paths).expect("join shim path")
+    }
+
+    /// One `cass sync --json` round whose mirror transport cannot reach the
+    /// network: only this child gets the failing transport stubs, and every
+    /// inherited SSH credential source is cleared.
+    fn sync_json_without_real_ssh(&self, api_config: &Path) -> Output {
+        let mut cmd = self.command();
+        cmd.args(["sync", "--json", "--data-dir"]);
+        cmd.arg(self.data_dir());
+        cmd.arg("--api-config").arg(api_config);
+        cmd.env("PATH", self.transport_shim_path());
+        for variable in [
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "SSH_ASKPASS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+        ] {
+            cmd.env_remove(variable);
+        }
         cmd.output().expect("spawn cass sync")
     }
 }
@@ -380,21 +556,21 @@ const FILE_STATE_ROWS: &str = "SELECT root_id || '|' || connector || '|' || rela
 // AC B1 — no remote sources still means exactly one index
 // ---------------------------------------------------------------------------
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_indexes_locally_without_remote_sources() {
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-alpha.jsonl", "w10-alpha");
 
     // First pass: the fixture starts from no database at all.
-    let first = fixture.sync_json(&stub.base_url, &[]);
+    let first = fixture.sync_with_stub(&stub, &[]);
     let report = report_of(&first);
     assert_eq!(
         report["exit_code"],
         serde_json::json!(EXIT_READY),
-        "a source-less sync with a live Infinity must be ready: {report} stderr={}",
+        "a source-less sync with a live model API must be ready: {report} stderr={}",
         stderr_of(&first)
     );
     assert_eq!(
@@ -424,6 +600,18 @@ fn sync_indexes_locally_without_remote_sources() {
         serde_json::json!([]),
         "a ready round has no partial reasons: {report}"
     );
+    // The ready round reached semantic activation, which can only have come
+    // from the configured endpoint: every vector the corpus stored was served
+    // by this stub over real loopback HTTP. The log is the request evidence.
+    let sent = stub.requests();
+    assert!(
+        sent.iter().any(|request| request == "POST /v1/embeddings"),
+        "the ready round must really send embedding HTTP: {sent:?}"
+    );
+    assert!(
+        sent.iter().all(|request| request == "POST /v1/embeddings"),
+        "the client sends only POSTs to the configured path: {sent:?}"
+    );
 
     let db = fixture.db_path();
     let sessions_after_first = db_scalar(&db, "SELECT COUNT(*) FROM conversations");
@@ -435,7 +623,7 @@ fn sync_indexes_locally_without_remote_sources() {
     assert!(messages_after_first >= 2, "seeded session has two messages");
 
     // Second pass: nothing changed, so nothing new is ingested.
-    let second = fixture.sync_json(&stub.base_url, &[]);
+    let second = fixture.sync_with_stub(&stub, &[]);
     let report = report_of(&second);
     assert_eq!(
         report["exit_code"],
@@ -471,7 +659,7 @@ fn sync_indexes_locally_without_remote_sources() {
     // conversation appears. This is the pass where a connector scan must
     // actually be invoked -- there is a changed file to look at.
     fixture.seed_session("rollout-beta.jsonl", "w10-beta");
-    let third = fixture.sync_json(&stub.base_url, &[]);
+    let third = fixture.sync_with_stub(&stub, &[]);
     let report = report_of(&third);
     assert_eq!(
         report["exit_code"],
@@ -500,16 +688,16 @@ fn sync_indexes_locally_without_remote_sources() {
 // AC B2 — --no-ingest reads no config and touches no corpus state
 // ---------------------------------------------------------------------------
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_no_ingest_ignores_a_broken_sources_config() {
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-first.jsonl", "w10-noingest-first");
 
     // Build a real corpus first, so "unchanged" is a meaningful claim.
-    let warmup = fixture.sync_json(&stub.base_url, &[]);
+    let warmup = fixture.sync_with_stub(&stub, &[]);
     assert_eq!(
         warmup.status.code(),
         Some(EXIT_READY),
@@ -531,7 +719,7 @@ fn sync_no_ingest_ignores_a_broken_sources_config() {
     fixture.seed_session("rollout-second.jsonl", "w10-noingest-second");
     fixture.write_sources_config("this is not = valid toml [[[");
 
-    let output = fixture.sync_json(&stub.base_url, &["--no-ingest"]);
+    let output = fixture.sync_with_stub(&stub, &["--no-ingest"]);
     let report = report_of(&output);
     assert_eq!(
         report["exit_code"],
@@ -581,11 +769,11 @@ fn sync_no_ingest_ignores_a_broken_sources_config() {
 // AC B3 — the 0 / 1 / 2 / 3 contract
 // ---------------------------------------------------------------------------
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_precondition_failures_exit_2() {
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
 
     // --- a config that exists but does not load -------------------------
     {
@@ -593,7 +781,7 @@ fn sync_precondition_failures_exit_2() {
         fixture.seed_session("rollout-cfg.jsonl", "w10-cfg");
         fixture.write_sources_config("this is not = valid toml [[[");
 
-        let output = fixture.sync_json(&stub.base_url, &[]);
+        let output = fixture.sync_with_stub(&stub, &[]);
         let report = report_of(&output);
         assert_eq!(
             report["exit_code"],
@@ -621,7 +809,7 @@ fn sync_precondition_failures_exit_2() {
         let fixture = Fixture::new();
         fixture.seed_session("rollout-old.jsonl", "w10-old");
 
-        let warmup = fixture.sync_json(&stub.base_url, &[]);
+        let warmup = fixture.sync_with_stub(&stub, &[]);
         assert_eq!(
             warmup.status.code(),
             Some(EXIT_READY),
@@ -638,7 +826,7 @@ fn sync_precondition_failures_exit_2() {
             conn.close().expect("close writer");
         }
 
-        let output = fixture.sync_json(&stub.base_url, &[]);
+        let output = fixture.sync_with_stub(&stub, &[]);
         let report = report_of(&output);
         assert_eq!(
             report["exit_code"],
@@ -657,30 +845,89 @@ fn sync_precondition_failures_exit_2() {
         );
     }
 
-    // --- Infinity not answering -------------------------------------------
+    // --- a live configuration whose embedding backend does not answer -----
+    //
+    // The configuration itself is valid; only the service is absent. The
+    // retired Infinity build probed its backend in the preflight, so an
+    // unreachable backend was a precondition (2) that stopped the round before
+    // the mirror and before the index. This arm keeps that contract: the same
+    // exit code, the same kind, and neither the mirror nor the corpus may
+    // start.
     {
         let fixture = Fixture::new();
-        fixture.seed_session("rollout-inf.jsonl", "w10-inf");
+        fixture.seed_session("rollout-unreachable.jsonl", "w10-unreachable");
         let unreachable = closed_port_url();
+        let api_config =
+            fixture.write_api_config_for_endpoint(&format!("{unreachable}{EMBED_PATH}"));
 
-        let output = fixture.sync_json(&unreachable, &[]);
+        let output = fixture.sync_json(Some(&api_config), &[]);
         let report = report_of(&output);
         assert_eq!(
             report["exit_code"],
             serde_json::json!(EXIT_PRECONDITION),
-            "an unreachable Infinity is a precondition failure: {report}"
+            "an unreachable embedding backend is a precondition failure: {report}"
         );
         assert_eq!(
             report["error"]["kind"],
             serde_json::json!("semantic-unavailable"),
-            "an unreachable Infinity must be named as such: {report}"
+            "an unreachable embedding backend must be named as such: {report}"
         );
         assert_eq!(
             report["index"]["started"],
             serde_json::json!(false),
-            "the index must not start without a semantic backend: {report}"
+            "the index must not start without a reachable semantic backend: {report}"
+        );
+        assert_eq!(
+            report["mirror"]["attempted"],
+            serde_json::json!(false),
+            "the mirror must not start on a failed precondition: {report}"
+        );
+        assert!(
+            !fixture.db_path().exists(),
+            "the round must stop before the corpus exists: {report}"
         );
     }
+}
+
+/// The same precondition, reached from the configuration side rather than
+/// from an absent service.
+///
+/// A separate test rather than a fourth arm of
+/// `sync_precondition_failures_exit_2`: that test is knowingly red on the
+/// unreachable-backend arm (the API-only preflight validates configuration
+/// only and no longer probes), and an arm after a failed assertion never runs.
+/// Keeping this one here means the configuration refusal is still executed and
+/// checked while that gap is open.
+#[test]
+fn sync_unusable_model_configuration_fails_the_precondition() {
+    let fixture = Fixture::new();
+    fixture.seed_session("rollout-nomodel.jsonl", "w10-nomodel");
+    // The file exists and parses, but its default embedding names no profile,
+    // so no embedding route can be built at all.
+    let api_config = fixture.api_config_path();
+    std::fs::write(&api_config, unusable_api_config_text()).expect("write unusable config");
+
+    let output = fixture.sync_json(Some(&api_config), &[]);
+    let report = report_of(&output);
+    assert_eq!(
+        report["exit_code"],
+        serde_json::json!(EXIT_PRECONDITION),
+        "an unusable model configuration is a precondition failure: {report}"
+    );
+    assert_eq!(
+        report["error"]["kind"],
+        serde_json::json!("semantic-unavailable"),
+        "an unusable model configuration must be named as such: {report}"
+    );
+    assert_eq!(
+        report["index"]["started"],
+        serde_json::json!(false),
+        "the index must not start without a usable embedding route: {report}"
+    );
+    assert!(
+        !fixture.db_path().exists(),
+        "the round must stop before the corpus exists: {report}"
+    );
 }
 
 /// The same precondition, reached from the other side.
@@ -753,16 +1000,21 @@ fn sync_without_the_infinity_feature_fails_the_same_precondition() {
     );
 }
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_partial_round_exits_3() {
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-partial.jsonl", "w10-partial");
-    // One declared source. Task 05 has no mirror stage, so this round's
-    // remote half is not done -- which is a partial round (3), not a
-    // failure (1) and certainly not a success (0).
+    // One declared remote source that this round cannot pull: the mirror runs
+    // and the source fails, so the round is partial (3) -- not a failure (1)
+    // and certainly not a success (0).
+    //
+    // The failure is produced by the child's own failing `ssh`/`rsync`/`scp`
+    // stubs and a cleared agent environment (see
+    // `Fixture::sync_json_without_real_ssh`). The mirror stage is exercised;
+    // no real SSH connection is ever opened.
     fixture.write_sources_config(
         r#"
 [[sources]]
@@ -774,7 +1026,8 @@ paths = ["~/.codex/sessions"]
 "#,
     );
 
-    let output = fixture.sync_json(&stub.base_url, &[]);
+    let api_config = fixture.write_api_config(&stub);
+    let output = fixture.sync_json_without_real_ssh(&api_config);
     let report = report_of(&output);
     assert_eq!(
         report["exit_code"],
@@ -815,15 +1068,15 @@ paths = ["~/.codex/sessions"]
     );
 }
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_with_only_a_local_source_is_a_complete_round() {
     // S1: a `type = "local"` entry is a local root for the indexer, not a
     // pending mirror. Counting it as one would fail a healthy round with
     // `mirror_failed` / exit 3 even though there is nothing to pull.
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-local.jsonl", "w10-local-src");
 
     let local_root = fixture.tmp.path().join("local-root");
@@ -839,7 +1092,7 @@ paths = ["{}"]
         local_root.display()
     ));
 
-    let output = fixture.sync_json(&stub.base_url, &[]);
+    let output = fixture.sync_with_stub(&stub, &[]);
     let report = report_of(&output);
     assert_eq!(
         report["exit_code"],
@@ -880,7 +1133,7 @@ fn sync_refuses_the_ignore_sources_config_escape_hatch() {
     // one would be refused by the ordinary load-failure branch and the test
     // would no longer prove the escape hatch itself is what got rejected.
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-ignore.jsonl", "w10-ignore");
 
     let local_root = fixture.tmp.path().join("local-root");
@@ -896,11 +1149,12 @@ paths = ["{}"]
         local_root.display()
     ));
 
+    let api_config = fixture.write_api_config(&stub);
     let mut cmd = fixture.command();
-    cmd.env("CASS_INFINITY_URL", &stub.base_url);
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd.args(["sync", "--json", "--data-dir"]);
     cmd.arg(fixture.data_dir());
+    cmd.arg("--api-config").arg(&api_config);
     let output = cmd
         .output()
         .expect("spawn cass sync with the escape hatch set");
@@ -926,8 +1180,8 @@ paths = ["{}"]
     );
 }
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_no_ingest_still_runs_with_the_ignore_sources_config_set() {
     // S2, second half: `--no-ingest` neither mirrors nor scans, so it never
@@ -936,10 +1190,10 @@ fn sync_no_ingest_still_runs_with_the_ignore_sources_config_set() {
     // generation with zero chunk rows, so an empty database is not a
     // meaningful fixture for the hole-draining path.
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-ignore-ro.jsonl", "w10-ignore-ro");
 
-    let warmup = fixture.sync_json(&stub.base_url, &[]);
+    let warmup = fixture.sync_with_stub(&stub, &[]);
     assert_eq!(
         warmup.status.code(),
         Some(EXIT_READY),
@@ -967,11 +1221,12 @@ paths = ["{}"]
 
     fixture.seed_session("rollout-ignore-ro2.jsonl", "w10-ignore-ro2");
 
+    let api_config = fixture.write_api_config(&stub);
     let mut cmd = fixture.command();
-    cmd.env("CASS_INFINITY_URL", &stub.base_url);
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd.args(["sync", "--json", "--no-ingest", "--data-dir"]);
     cmd.arg(fixture.data_dir());
+    cmd.arg("--api-config").arg(&api_config);
     let output = cmd.output().expect("spawn cass sync --no-ingest");
     let report = report_of(&output);
     assert_eq!(
@@ -997,12 +1252,12 @@ paths = ["{}"]
     );
 }
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_unidentified_index_failure_exits_1() {
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-broken.jsonl", "w10-broken");
 
     // A directory where the database belongs: it exists, so the schema
@@ -1010,7 +1265,7 @@ fn sync_unidentified_index_failure_exits_1() {
     // exactly the "unidentified internal failure" bucket.
     std::fs::create_dir_all(fixture.db_path()).expect("create directory at the db path");
 
-    let output = fixture.sync_json(&stub.base_url, &[]);
+    let output = fixture.sync_with_stub(&stub, &[]);
     let report = report_of(&output);
     assert_eq!(
         report["exit_code"],
@@ -1033,10 +1288,8 @@ fn sync_unidentified_index_failure_exits_1() {
 #[test]
 fn sync_rejects_full_as_a_usage_error() {
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
 
     let mut cmd = fixture.command();
-    cmd.env("CASS_INFINITY_URL", &stub.base_url);
     cmd.args(["sync", "--full", "--data-dir"]);
     cmd.arg(fixture.data_dir());
     let output = cmd.output().expect("spawn cass sync --full");
@@ -1156,16 +1409,16 @@ fn a_late_sources_config_error_fails_closed() {
 // The value type is exported where the report needs it
 // ---------------------------------------------------------------------------
 
-// Needs a live Infinity backend: this round has to reach a real index, and a
-// build without the feature stops at the semantic precondition (task 08).
+// Needs a usable model API profile: this round has to reach a real index, and
+// a round without one stops at the semantic precondition.
 #[test]
 fn sync_report_values_are_readable_from_a_plain_sqlite_handle() {
     // Guards the fixture helpers above: a raw read of the archive must see
     // the schema this suite's watermark comparisons rely on.
     let fixture = Fixture::new();
-    let stub = StubInfinity::start();
+    let stub = ApiStub::start();
     fixture.seed_session("rollout-read.jsonl", "w10-read");
-    let output = fixture.sync_json(&stub.base_url, &[]);
+    let output = fixture.sync_with_stub(&stub, &[]);
     assert_eq!(
         output.status.code(),
         Some(EXIT_READY),
