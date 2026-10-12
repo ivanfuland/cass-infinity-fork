@@ -32,6 +32,12 @@ impl IndexEmbeddingSetup {
     /// Complete route identity for idempotency and immutable command binding.
     pub fn identity_sha256(&self) -> String { self.route.identity_sha256() }
 
+    pub(crate) fn bind_search(&self, client: &crate::search::query::SearchClient)
+        -> anyhow::Result<std::sync::Arc<super::query_embedding::ApiQueryEmbedder>> {
+        client.set_api_frozen_semantic_context(std::sync::Arc::new(ApiClient::new(
+            self.config.clone(), Box::new(EnvCredentialResolver))), self.route.clone())
+    }
+
     pub(crate) fn call(&self) -> Result<PrimaryEmbeddingCall, super::ConfigError> {
         PrimaryEmbeddingCall::from_frozen_route(
             ApiClient::new(self.config.clone(), Box::new(EnvCredentialResolver)), self.route.clone())

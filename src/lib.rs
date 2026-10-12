@@ -7136,7 +7136,7 @@ async fn execute_cli(
                     let run_result = if let Some(path) = asciicast {
                         tui_asciicast::run_tui_with_asciicast(&path, !once)
                     } else {
-                        ui::app::run_tui_ftui(inline_config, macro_config, Some(tui_data_dir))
+                        ui::app::run_tui_ftui(inline_config, macro_config, Some(tui_data_dir), cli.api_config.clone())
                     };
 
                     if let Err(e) = run_result {
