@@ -126,6 +126,28 @@ pub(crate) fn run_with_api_config(command: &RegressionInputCommand, api_config: 
             // the selection is refused outright, not only when a model-API
             // configuration happens to be present as well.
             if rerank_provider.is_some() { bail!("REGRESSION_MODEL_API_MIGRATION"); }
+            let api_selected = api_config.is_some() || api.embedding_profile.is_some() || api.rerank_profile.is_some()
+                || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
+            // A scored or semantic run must name its services in the frozen
+            // model-API configuration: the retired local model and the retired
+            // local provider are no longer fallbacks, so a run that would need
+            // one is refused before any input is read.
+            if *mode != super::query::SearchMode::Lexical && !api_selected {
+                bail!("REGRESSION_SEMANTIC_NOT_INTEGRATED");
+            }
+            if *rerank {
+                let frozen = crate::search::model_api::runtime::load_config(
+                    api.config_path.as_deref(),
+                    |key| std::env::var_os(key),
+                )?;
+                let rerank_profile = match api.rerank_profile.as_deref() {
+                    Some(id) => crate::search::model_api::runtime::profile_by_id(&frozen, id).ok(),
+                    None => frozen
+                        .default_profile_id(crate::search::model_api::config::ProfileKind::Rerank)
+                        .and_then(|id| crate::search::model_api::runtime::profile_by_id(&frozen, &id).ok()),
+                };
+                if rerank_profile.is_none() { bail!("REQUEST_PROFILE_INVALID"); }
+            }
             let verified = open_verified_search(
                 context.clone(),
                 expected_binding,
@@ -170,14 +192,16 @@ pub(crate) fn run_with_api_config(command: &RegressionInputCommand, api_config: 
                         embedding_profile: api.embedding_profile.clone(), rerank_profile: api.rerank_profile.clone(),
                         no_model_fallback: api.no_model_fallback, ..Default::default()
                     },
-                    model: (!api_selected && *mode != super::query::SearchMode::Lexical).then(|| "bge-m3".into()),
+                    // The retired local embedder is never named: a semantic run
+                    // without a frozen model-API configuration is refused above.
+                    model: None,
                     rerank: *rerank,
                     reranker: None,
                     use_daemon: false,
                     rerank_limit: rerank.then_some(*rerank_limit as usize),
-                    rerank_provider: rerank.then_some(
-                        rerank_provider.unwrap_or(super::rerank::types::ProviderChoice::Qwen3Local),
-                    ),
+                    // The retired local provider is never selected: a scored run
+                    // without a frozen model-API rerank profile is refused above.
+                    rerank_provider: None,
                 },
                 crate::RerankRequestContext::default(),
                 Some(crate::RegressionSearchExecution {
