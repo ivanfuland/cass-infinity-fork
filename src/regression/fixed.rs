@@ -1029,22 +1029,21 @@ fn preparation_failure(
 
 /// Production entry: input admission owns all filesystem reads and run-root
 /// creation. Provenance identifies this clean built executable, never git HEAD.
-pub(crate) enum FixedBackend {
-    Legacy { provider: ProviderChoice, endpoint: String },
-    Api {
-        config: crate::search::model_api::ValidatedApiConfig,
-        profile: crate::search::model_api::ValidatedProfile,
-        route: crate::search::rerank::window::ApiWindowRoute,
-    },
-}
-
-impl From<ProviderChoice> for FixedBackend {
-    fn from(provider: ProviderChoice) -> Self { Self::Legacy { provider, endpoint: crate::rerank_endpoint_origin(provider) } }
+/// The retired local rerank provider is deliberately not selectable here: a
+/// backtest names its service in a frozen model-API configuration, so the only
+/// backend this selection can produce is the API one.
+pub(crate) struct FixedBackend {
+    config: crate::search::model_api::ValidatedApiConfig,
+    profile: crate::search::model_api::ValidatedProfile,
+    route: crate::search::rerank::window::ApiWindowRoute,
 }
 
 impl FixedBackend {
     fn selected(api: &crate::search::regression_input::RegressionApiOptions, legacy: Option<ProviderChoice>) -> Result<Self> {
-        if !api.selected() { return Ok(legacy.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?.into()); }
+        // Production retirement: a fixed-candidate run without a frozen model
+        // API is refused, and the legacy provider selection is refused outright
+        // instead of being honoured, so the old service path is unreachable.
+        ensure!(api.selected(), "REGRESSION_MODEL_API_MIGRATION");
         ensure!(legacy.is_none(), "REGRESSION_MODEL_API_MIGRATION");
         ensure!(api.embedding_profile.is_none(), "REQUEST_PROFILE_INVALID");
         use crate::search::model_api::runtime;
@@ -1059,25 +1058,17 @@ impl FixedBackend {
             .ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?;
         let route = crate::api_window_route(&options, Some(&profile), crate::search::query::SearchMode::Lexical)
             .map_err(|e| anyhow::anyhow!(e.message))?.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?;
-        Ok(Self::Api { config, profile, route })
+        Ok(Self { config, profile, route })
     }
-    fn legacy(&self) -> Option<ProviderChoice> { match self { Self::Legacy { provider, .. } => Some(*provider), _ => None } }
-    fn route(&self) -> Option<&crate::search::rerank::window::ApiWindowRoute> { match self { Self::Api { route, .. } => Some(route), _ => None } }
-    fn profile_id(&self) -> String { match self { Self::Legacy { provider, .. } => provider.as_str().into(), Self::Api { profile, .. } => profile.id.clone() } }
-    fn origin(&self) -> String { match self { Self::Legacy { endpoint, .. } => endpoint.clone(), Self::Api { profile, .. } => profile.endpoint.url().origin().ascii_serialization() } }
-    fn declaration(&self) -> Result<Value> { match self {
-        Self::Legacy { .. } => Ok(Value::Null),
-        Self::Api { config, profile, .. } => Ok(crate::search::model_api::runtime::configuration_snapshot(config, profile)?),
-    } }
+    fn route(&self) -> Option<&crate::search::rerank::window::ApiWindowRoute> { Some(&self.route) }
+    fn profile_id(&self) -> String { self.profile.id.clone() }
+    fn origin(&self) -> String { self.profile.endpoint.url().origin().ascii_serialization() }
+    fn declaration(&self) -> Result<Value> {
+        Ok(crate::search::model_api::runtime::configuration_snapshot(&self.config, &self.profile)?)
+    }
     fn score(&self, trace: Arc<Mutex<RequestTrace>>, query: &str, documents: &[String], evidence: &mut Option<crate::search::rerank::window::ApiWindowRerank>) -> Result<crate::search::rerank::types::RerankResponse> {
-        match self {
-            Self::Legacy { provider, endpoint } => crate::build_rerank_backend_with_trace(*provider, endpoint, Some(trace))?
-                .rerank(query, documents).map_err(anyhow::Error::new),
-            Self::Api { config, profile, route } => {
-                let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)).with_rerank_trace(trace);
-                crate::search::model_api::rerank_call::score(&client, &profile.id, query, documents, route.allow_fallback, evidence).map_err(anyhow::Error::new)
-            }
-        }
+        let client = crate::search::model_api::ApiClient::new(self.config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)).with_rerank_trace(trace);
+        crate::search::model_api::rerank_call::score(&client, &self.profile.id, query, documents, self.route.allow_fallback, evidence).map_err(anyhow::Error::new)
     }
 }
 
@@ -1125,7 +1116,7 @@ pub(crate) fn collect(
     validated: &ValidatedRun,
     pool_path: &Path,
     pool_sha: &str,
-    backend: impl Into<FixedBackend>,
+    backend: FixedBackend,
     cutoffs: &[u32],
     provenance: &RunProvenance,
     started: Instant,
@@ -1141,7 +1132,6 @@ pub(crate) fn collect(
     );
     let root = &validated.paths.run_root;
     let inputs = &validated.inputs;
-    let backend = backend.into();
     let endpoint = backend.origin();
     let provider = backend.profile_id();
     let argv_ref = write_private(root, "argv.json", &serde_json::to_value(&provenance.argv)?)?;
@@ -1172,7 +1162,7 @@ pub(crate) fn collect(
     for pool in &pools {
         let question_started = Instant::now();
         let result = execute_prepared_with_call(
-            pool, inputs, backend.legacy(), backend.route(),
+            pool, inputs, None, backend.route(),
             |reference| super::input::read_registered_asset(inputs, reference),
             |trace, query, documents, evidence| backend.score(trace, query, documents, evidence),
         );

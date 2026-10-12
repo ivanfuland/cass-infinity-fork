@@ -6976,6 +6976,17 @@ async fn execute_cli(
         Commands::Regression { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+            // The local rerank provider is retired for the production backtest:
+            // a run names its scoring service in a frozen model-API
+            // configuration. The legacy selection is refused here, before any
+            // input is read and before any request, instead of falling back to
+            // the retired service path.
+            if legacy_rerank_provider_selected(action) {
+                return Err(model_api_migration_error(
+                    "the legacy rerank-provider selection is retired for the backtest".into(),
+                    "Pass --api-config with --rerank-profile instead".into(),
+                ));
+            }
             if matches!(action, regression::RegressionCommand::Compare { .. }) {
                 let outcome = regression::run::run_compare(action).map_err(|error| CliError {
                     code: 2,
@@ -101465,6 +101476,20 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
 ///
 /// The kind is the shared `ModelApiMigration`, so a script can branch on it
 /// exactly as it branches on the retired environment variables' refusal.
+/// Whether a backtest command still selects the retired local rerank provider.
+///
+/// The production entry refuses such a command before it reads any input, so a
+/// backtest can never reach the retired rerank service path from the CLI.
+fn legacy_rerank_provider_selected(action: &regression::RegressionCommand) -> bool {
+    match action {
+        regression::RegressionCommand::FullSearch { rerank_provider, .. }
+        | regression::RegressionCommand::FixedCandidate { rerank_provider, .. } => {
+            rerank_provider.is_some()
+        }
+        _ => false,
+    }
+}
+
 fn model_api_migration_error(message: String, hint: String) -> CliError {
     CliError {
         code: 2,

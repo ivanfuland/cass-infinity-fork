@@ -1090,8 +1090,13 @@ fn validate_full_profile(command: &RegressionCommand) -> Result<()> {
     require(
         match rerank {
             RerankSwitch::Off => page_size.is_none() && rerank_provider.is_none() && api.rerank_profile.is_none(),
+            // The local rerank provider is retired: a scored window must name
+            // its service in a frozen model-API configuration. The legacy
+            // selection no longer satisfies this profile, so a production run
+            // without an API config is refused instead of reaching the old
+            // service path.
             RerankSwitch::On => {
-                page_size.is_some_and(|k| k > 0 && k <= *rrf_limit) && (rerank_provider.is_some() || api.selected())
+                page_size.is_some_and(|k| k > 0 && k <= *rrf_limit) && api.selected()
             }
         },
         "REQUEST_PROFILE_INVALID",

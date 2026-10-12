@@ -122,9 +122,10 @@ pub(crate) fn run_with_api_config(command: &RegressionInputCommand, api_config: 
             if *mode == super::query::SearchMode::Lexical && vector_search_mode.is_some() {
                 bail!("REGRESSION_VECTOR_MODE_REQUIRES_SEMANTIC");
             }
-            let api_selected = api_config.is_some() || api.embedding_profile.is_some() || api.rerank_profile.is_some()
-                || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
-            if api_selected && rerank_provider.is_some() { bail!("REGRESSION_MODEL_API_MIGRATION"); }
+            // The local rerank provider is retired for the production backtest:
+            // the selection is refused outright, not only when a model-API
+            // configuration happens to be present as well.
+            if rerank_provider.is_some() { bail!("REGRESSION_MODEL_API_MIGRATION"); }
             let verified = open_verified_search(
                 context.clone(),
                 expected_binding,
