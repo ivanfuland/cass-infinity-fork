@@ -574,12 +574,13 @@ query_prefix="Query: "
         count: usize,
         mode: SearchMode,
         vector: Option<crate::search::query::VectorSearchMode>,
-        config: &std::path::Path,
+        search_config: &std::path::Path,
+        build_config: &std::path::Path,
     ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
         let f = fixture("");
         assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
         let (data, database, _run, source_manifest) =
-            regression_binding::tests::searchable_fixture_with_api_embedding(count, config);
+            regression_binding::tests::searchable_fixture_with_api_embedding(count, build_config);
         let (expected_binding, expected_binding_sha256) =
             regression_binding::tests::prepare_expected(data.path(), &database, &source_manifest);
         let manifest_sha = file_digest(&source_manifest).unwrap();
@@ -588,7 +589,7 @@ query_prefix="Query: "
         fs::write(&source_producer_receipt, &bytes).unwrap();
         let cmd = RegressionCommand::FullSearch {
             api: crate::search::regression_input::RegressionApiOptions {
-                config_path: Some(config.to_path_buf()),
+                config_path: Some(search_config.to_path_buf()),
                 ..Default::default()
             },
             input: f.input.clone(),
@@ -938,7 +939,7 @@ query_prefix="Query: "
         } else {
             crate::search::query::VectorSearchMode::Exact
         };
-        let (_f, _data, cmd) = api_full_fixture_mode(5, 12, mode, Some(vector), &config);
+        let (_f, _data, cmd) = api_full_fixture_mode(5, 12, mode, Some(vector), &config, &config);
         let result = super::run(&cmd).unwrap();
         let run_root = _f.input.output.output_root.join(&_f.input.output.run_id);
         assert_eq!(result["terminal"], "SUCCESS");
@@ -1372,11 +1373,44 @@ query_prefix="Query: "
                 } else {
                     SearchMode::Hybrid
                 };
-                let (f, _data, command) = full_fixture_mode(
+                // The generation must be built against a healthy endpoint (the
+                // API catch-up really embeds), while the search itself runs
+                // against the faulty one the parent started.
+                let search_config = PathBuf::from(
+                    dotenvy::var("CASS_S2_04_API_CONFIG").expect("parent must pass the search config"),
+                );
+                let healthy = crate::search::model_api::test_support::HttpFixture::start(
+                    (0..32)
+                        .map(|_| crate::search::model_api::test_support::Reply::Embeddings(1024))
+                        .collect(),
+                );
+                let build_config = tempfile::NamedTempFile::new().unwrap();
+                {
+                    use std::io::Write as _;
+                    write!(
+                        build_config.as_file(),
+                        "version=1\n\
+                         default_embedding=\"main\"\n\
+                         [profiles.main]\n\
+                         kind=\"embedding\"\n\
+                         protocol=\"openai-embeddings-v1\"\n\
+                         scope=\"loopback\"\n\
+                         endpoint=\"{}/embeddings\"\n\
+                         model=\"BAAI/bge-m3\"\n\
+                         model_revision=\"fixture-r1\"\n\
+                         normalization=\"l2\"\n\
+                         expected_dimension=1024\n",
+                        healthy.base()
+                    )
+                    .unwrap();
+                }
+                let (f, _data, command) = api_full_fixture_mode(
                     5,
                     12,
                     mode,
                     Some(crate::search::query::VectorSearchMode::Exact),
+                    &search_config,
+                    build_config.path(),
                 );
                 let error = full_cli(&command).unwrap_err();
                 assert_eq!(error.code, 2);
@@ -1418,6 +1452,28 @@ query_prefix="Query: "
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let origin = format!("http://{}", listener.local_addr().unwrap());
+                // The child builds its generation against a healthy endpoint of
+                // its own and runs the search against this faulty one.
+                let failure_api_config = tempfile::NamedTempFile::new().unwrap();
+                {
+                    use std::io::Write as _;
+                    write!(
+                        failure_api_config.as_file(),
+                        "version=1\n\
+                         default_embedding=\"main\"\n\
+                         [profiles.main]\n\
+                         kind=\"embedding\"\n\
+                         protocol=\"openai-embeddings-v1\"\n\
+                         scope=\"loopback\"\n\
+                         endpoint=\"{origin}/embeddings\"\n\
+                         model=\"BAAI/bge-m3\"\n\
+                         model_revision=\"fixture-r1\"\n\
+                         normalization=\"l2\"\n\
+                         expected_dimension=1024\n"
+                    )
+                    .unwrap();
+                }
+                let failure_api_config = failure_api_config.into_temp_path();
                 let stop = Arc::new(AtomicBool::new(false));
                 let done = stop.clone();
                 let worker = std::thread::spawn(move || {
@@ -1499,8 +1555,7 @@ query_prefix="Query: "
                     ])
                     .env("CASS_S2_04_FAILURE_CHILD", mode)
                     .env("CASS_S2_04_FAILURE_EVIDENCE", &case)
-                    .env("CASS_INFINITY_URL", origin)
-                    .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+                    .env("CASS_S2_04_API_CONFIG", &failure_api_config)
                     .env("NO_PROXY", "127.0.0.1,localhost")
                     .env("no_proxy", "127.0.0.1,localhost")
                     .output()
