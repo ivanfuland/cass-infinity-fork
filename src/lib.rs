@@ -6083,11 +6083,20 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
             ],
         ),
         "models" => (
-            &["status", "install", "verify", "remove", "check-update"],
             &[
-                "cass models status --json",
-                "cass models install --model all-minilm-l6-v2",
-                "cass models verify --json",
+                "status",
+                "list",
+                "check",
+                "backfill",
+                "install",
+                "verify",
+                "remove",
+                "check-update",
+            ],
+            &[
+                "cass models list --json",
+                "cass models check --profile <id> --json",
+                "cass models backfill --json",
             ],
         ),
         "import" => (
@@ -19546,7 +19555,7 @@ fn state_meta_json_inner(
         assets.semantic.quality_tier_published = false;
         assets.semantic.semantic_only_search_available = false;
         assets.semantic.hint = Some(
-            "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'."
+            "Run 'cass index --full' first. Optional later: configure a model API profile with --api-config (see 'cass models list') and run 'cass index --semantic'."
                 .to_string(),
         );
         assets.semantic.fast_tier = Default::default();
@@ -22063,11 +22072,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).".to_string(),
             "  cass api-version [--json]        Show crate_version + api_version + contract_version.".to_string(),
             "  cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).".to_string(),
-            "  cass models status [--json]      Semantic model acquisition + cache state.".to_string(),
-            "  cass models install [--from-file DIR] [--model NAME]  Download + install embedder (minilm | snowflake-arctic-s | nomic-embed).".to_string(),
-            "  cass models remove [--model NAME]  Remove an installed semantic model from disk.".to_string(),
-            "  cass models verify [--json]      Per-file SHA-256 verification of the installed model.".to_string(),
-            "  cass models check-update [--json]  Compare installed revision against the pinned registry revision.".to_string(),
+            "  cass models list [--json]        List configured model API profiles (alias: models status).".to_string(),
+            "  cass models check --profile ID [--json]  Check one configured model API profile against its endpoint.".to_string(),
+            "  cass models backfill [--json]   Build/refresh the semantic vector domain (requires --api-config).".to_string(),
+            "  cass models install|verify|remove|check-update  Retired; local weight management refuses with a migration error.".to_string(),
             "  cass models backfill             Re-embed conversations against a newly acquired model.".to_string(),
             "  cass models list [--json]        List the configured model API profiles (read-only, no HTTP).".to_string(),
             "  cass models check --profile ID [--json]  Check one selected profile against its own endpoint (no fallback).".to_string(),
@@ -35728,7 +35736,7 @@ fn doctor_human_semantic_fallback_summary(
     }
 
     Some(format!(
-        "Semantic search: {}. This is derived-search state, not archive damage; cass will not download models during doctor. Next optional command: cass models install --json, then cass index --semantic --json.",
+        "Semantic search: {}. This is derived-search state, not archive damage; cass never downloads or installs models during doctor. Next optional step: configure an embedding profile with --api-config, verify it with cass models check, then run cass index --semantic --json.",
         derived_semantic_assets.recommended_action
     ))
 }
@@ -39048,7 +39056,7 @@ fn doctor_semantic_recommended_action(
     }
     match availability {
         "not_installed" | "needs_consent" | "model_missing" => {
-            "cass models status --json; install explicitly with cass models install --json or cass models install --from-file <dir> --json, then run cass index --semantic --json".to_string()
+            "cass models list --json; configure an embedding profile with --api-config, verify it with cass models check --profile <id> --json, then run cass index --semantic --json".to_string()
         }
         "index_missing" | "update_available" | "index_building" => {
             "cass index --semantic --json, or keep using lexical search".to_string()
@@ -39169,7 +39177,7 @@ fn doctor_build_derived_semantic_asset_report(
     }
     .to_string();
     let skipped_auto_download_reason = (!semantic_ready).then(|| {
-        "doctor never downloads semantic models; model acquisition requires explicit cass models install or --from-file".to_string()
+        "doctor never downloads or installs semantic models; semantic assets come from a model API profile configured with --api-config".to_string()
     });
 
     let model_status = if !archive_db_usable {
@@ -39412,11 +39420,9 @@ mod doctor_derived_semantic_asset_tests {
         assert!(!report.auto_download_allowed);
         assert!(!report.auto_download_attempted);
         assert!(!report.model_cache.safe_to_rebuild);
-        assert!(
-            report
-                .recommended_action
-                .contains("cass models install --json")
-        );
+        // Local installation is retired; the recommended action points at the
+        // configured model API profile instead.
+        assert!(report.recommended_action.contains("cass models check"));
     }
 
     #[test]
@@ -39435,8 +39441,8 @@ mod doctor_derived_semantic_asset_tests {
             doctor_human_semantic_fallback_summary(&report).expect("semantic fallback copy");
 
         assert!(summary.contains("not archive damage"));
-        assert!(summary.contains("cass will not download models during doctor"));
-        assert!(summary.contains("cass models install --json"));
+        assert!(summary.contains("never downloads or installs models during doctor"));
+        assert!(summary.contains("cass models check"));
         assert!(summary.contains("cass index --semantic --json"));
     }
 
@@ -82075,10 +82081,9 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
             "Understand or repair semantic-search readiness.",
             "cass models status --json",
             &[
-                "cass models verify --json",
-                "cass models install --model minilm",
-                "cass models install --from-file <dir> --model minilm",
-                "cass models backfill",
+                "cass models list --json",
+                "cass models check --profile <id> --json",
+                "cass models backfill --api-config <file>",
             ],
             "Parse installed, available, cache_dir, verification status, and err.kind.",
             "Models are opt-in; lexical fallback is valid while the model is absent.",

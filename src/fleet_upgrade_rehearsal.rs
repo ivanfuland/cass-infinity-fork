@@ -655,7 +655,9 @@ fn action_command(action: UpgradeAction, install_command: Option<&str>) -> Optio
         // doctor handles safe migrations/rebuilds; the mutating apply is gated by
         // a backup, so the dry-run inspection command is what we surface here.
         UpgradeAction::DataSchemaMigration => Some("cass doctor --json".to_string()),
-        UpgradeAction::ModelInstall => Some("cass models install --model minilm".to_string()),
+        // Local weights are no longer installed; the operator checks the
+        // configured HTTP model API profile instead.
+        UpgradeAction::ModelInstall => Some("cass models check --profile <id>".to_string()),
         UpgradeAction::SourceSync => Some("cass sources sync --all --json".to_string()),
         UpgradeAction::DerivedIndexRefresh => Some("cass index --full".to_string()),
     }
@@ -1461,17 +1463,18 @@ mod tests {
         assert!(model.opt_in);
         assert!(model.blocked, "opt-in install is blocked by default");
         assert!(model.requires_confirmation);
-        // Never auto-downloaded: it appears only among the blocked commands.
+        // The action now surfaces the model-API check, never a local install;
+        // it appears only among the blocked commands.
         assert!(
             plan.blocked_next_commands
                 .iter()
-                .any(|b| b.command.contains("models install"))
+                .any(|b| b.command.contains("models check"))
         );
         assert!(
             !plan
                 .safe_next_commands
                 .iter()
-                .any(|c| c.contains("models install"))
+                .any(|c| c.contains("models check"))
         );
     }
 

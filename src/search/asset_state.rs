@@ -802,10 +802,18 @@ fn semantic_preference_surface(
     preference: SemanticPreference,
 ) -> SemanticPreferenceSurface {
     match preference {
+        // The effective semantic identity now comes from the API representation
+        // descriptor, so the surface must not claim a local backend by name
+        // (`fastembed` was a local ONNX model this build no longer ships).
+        // `external` is a neutral role marker, not a model identity; the real
+        // model/revision/dimension are reported from the descriptor elsewhere.
         SemanticPreference::DefaultModel => SemanticPreferenceSurface {
-            preferred_backend: "fastembed",
+            preferred_backend: "external",
             model_dir: active_policy_model_dir(data_dir),
         },
+        // Only reachable when a retired `CASS_SEMANTIC_EMBEDDER=hash` override is
+        // still in force (the var is refused by model commands); kept as the
+        // honest name for that preference rather than re-labelled.
         SemanticPreference::HashFallback => SemanticPreferenceSurface {
             preferred_backend: "hash",
             model_dir: None,
@@ -1557,28 +1565,33 @@ fn semantic_hint(
     preference: SemanticPreference,
 ) -> Option<String> {
     let hint = match (preference, availability) {
+        // The retired `--embedder` selection is refused, so the hint must name
+        // the API path instead: a configured embedding profile drives the build.
         (SemanticPreference::HashFallback, SemanticAvailability::IndexMissing { .. }) => {
-            "Run 'cass index --semantic --embedder hash' to build the hash vector index; lexical search remains available without semantic assets"
+            "Run 'cass models backfill --api-config <file> --embedding-profile <id>' to build the vector domain; lexical search remains available without semantic assets"
         }
         (SemanticPreference::HashFallback, SemanticAvailability::LoadFailed { .. })
         | (SemanticPreference::HashFallback, SemanticAvailability::DatabaseUnavailable { .. }) => {
-            "Run 'cass index --semantic --embedder hash' after the database is healthy; lexical search remains available"
+            "Run 'cass models backfill --api-config <file> --embedding-profile <id>' after the database is healthy; lexical search remains available"
         }
         (SemanticPreference::HashFallback, _) => {
-            "Run 'cass index --semantic --embedder hash' to build the hash vector index; lexical search remains available"
+            "Run 'cass models backfill --api-config <file> --embedding-profile <id>' to build the vector domain; lexical search remains available"
         }
+        // These availability variants are no longer produced on the API-only
+        // path (nothing installs or loads a local weight). The hint points at the
+        // configuration surface that replaces them.
         (_, SemanticAvailability::NotInstalled)
         | (_, SemanticAvailability::NeedsConsent)
         | (_, SemanticAvailability::ModelMissing { .. }) => {
-            "Run 'cass models install' and then 'cass index --semantic'; lexical search remains available without the model"
+            "Configure an embedding profile with --api-config (see 'cass models list') and run 'cass models check'; lexical search remains available without it"
         }
         (_, SemanticAvailability::IndexMissing { .. })
         | (_, SemanticAvailability::UpdateAvailable { .. })
         | (_, SemanticAvailability::IndexBuilding { .. }) => {
-            "Run 'cass index --semantic' to build or refresh vector assets; lexical search remains available"
+            "Run 'cass index --semantic --api-config <file>' to build or refresh vector assets; lexical search remains available"
         }
         (_, SemanticAvailability::Downloading { .. }) | (_, SemanticAvailability::Verifying) => {
-            "Wait for the semantic model installation to finish; lexical search remains available"
+            "Wait for the semantic asset build to finish; lexical search remains available"
         }
         (_, SemanticAvailability::Disabled { .. }) => {
             "Semantic search is disabled by policy; lexical search remains available, or re-enable semantic search"
@@ -2719,7 +2732,10 @@ mod tests {
         // so there is no on-disk cache directory to project.
         let default_model_dir = None;
         let cases = [
-            (SemanticPreference::DefaultModel, "fastembed", default_model_dir),
+            // The role marker is neutral now: the effective model identity comes
+            // from the API representation descriptor, not from a local backend
+            // name (`fastembed` was a local ONNX model this build no longer ships).
+            (SemanticPreference::DefaultModel, "external", default_model_dir),
             (SemanticPreference::HashFallback, "hash", None),
         ];
 

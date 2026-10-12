@@ -258,9 +258,9 @@
           "min_free_disk_mb": "200",
           "mode": "hybrid_preferred",
           "quality_dimension": "384",
-          "quality_tier_embedder": "minilm",
+          "quality_tier_embedder": "external",
           "quality_weight": "0.7",
-          "reranker": "ms-marco-minilm",
+          "reranker": "external",
           "semantic_available": "false",
           "semantic_budget_mb": "500",
           "semantic_fallback_mode": "lexical",
@@ -361,6 +361,15 @@
     "config_source": "default"
   },
   "state": {
+    "last_index": {
+      "codex_host_shell_hits": null,
+      "codex_idx0_user_total": null,
+      "event_align_failed": null,
+      "capture_na": null,
+      "capture_failed": null,
+      "scan_roots_missing": null,
+      "sources_config_error": null
+    },
     "index": {
       "exists": false,
       "status": "missing",
@@ -464,7 +473,7 @@
       "hnsw_path": null,
       "hnsw_ready": false,
       "progressive_ready": false,
-      "feature_compiled_in": true,
+      "feature_compiled_in": false,
       "quality_tier_published": false,
       "semantic_only_search_available": false,
       "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'.",
@@ -513,6 +522,7 @@
         "saved_at": null
       }
     },
+    "db_vector_domain": null,
     "ingest_quarantine": {
       "schema_version": 1,
       "status": "ok",
@@ -571,9 +581,9 @@
             "min_free_disk_mb": "200",
             "mode": "hybrid_preferred",
             "quality_dimension": "384",
-            "quality_tier_embedder": "minilm",
+            "quality_tier_embedder": "external",
             "quality_weight": "0.7",
-            "reranker": "ms-marco-minilm",
+            "reranker": "external",
             "semantic_available": "false",
             "semantic_budget_mb": "500",
             "semantic_fallback_mode": "lexical",

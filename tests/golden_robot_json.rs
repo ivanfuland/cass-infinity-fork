@@ -1249,6 +1249,36 @@ fn capabilities_shape_matches_golden() {
 // and the real profile listing with one) is asserted here and in
 // `tests/api_model_commands.rs`, which drives the real CLI against a real
 // config file.
+/// The stable `error.kind` / `error.code` a `--json` refusal puts on stderr.
+///
+/// Pinning the kind (not just the exit code) is what makes the refusal proof
+/// meaningful: any other failure that also exits 2 — a usage error, a different
+/// configuration problem, a crash — must not be able to masquerade as the
+/// intended migration/configuration refusal.
+fn stderr_error_kind_code(out: &std::process::Output, label: &str) -> (String, i64) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("{label}: no JSON error envelope on stderr; stderr: {stderr}"));
+    let envelope: serde_json::Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("{label}: stderr envelope is not JSON: {e}; line: {line}"));
+    let error = envelope
+        .get("error")
+        .unwrap_or_else(|| panic!("{label}: envelope has no `error` object: {envelope}"));
+    let kind = error
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{label}: error has no string `kind`: {error}"))
+        .to_string();
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("{label}: error has no integer `code`: {error}"));
+    (kind, code)
+}
+
 #[test]
 fn models_status_without_a_model_api_config_refuses() {
     let test_home = tempfile::tempdir().expect("create temp home");
@@ -1263,13 +1293,17 @@ fn models_status_without_a_model_api_config_refuses() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
+    let (kind, code) = stderr_error_kind_code(&out, "models status");
+    assert_eq!(kind, "ModelApiConfiguration", "the refusal must be the API configuration error");
+    assert_eq!(code, 2, "the envelope code must mirror the exit code");
 }
 
 #[test]
 fn retired_models_verify_and_check_update_refuse_as_migration_errors() {
     // `models verify` / `models check-update` addressed the local weight cache.
-    // They now refuse with a migration error (exit 2) instead of inspecting a
-    // local model directory.
+    // They now refuse with a migration error instead of inspecting a local model
+    // directory. The `kind` is pinned so an unrelated exit-2 failure cannot pass
+    // for the intended refusal.
     let test_home = tempfile::tempdir().expect("create temp home");
     for args in [
         ["models", "verify", "--json"],
@@ -1286,6 +1320,9 @@ fn retired_models_verify_and_check_update_refuse_as_migration_errors() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+        let (kind, code) = stderr_error_kind_code(&out, &format!("{args:?}"));
+        assert_eq!(kind, "ModelApiMigration", "{args:?} must refuse as a migration error");
+        assert_eq!(code, 2, "{args:?} envelope code must mirror the exit code");
     }
 }
 

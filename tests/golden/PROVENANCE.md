@@ -124,6 +124,33 @@ with `[SCRUBBED-*]` placeholders.
 
 **Command:** `printf '%s\n' <fixture-phrase> | cass export-html <fixture.jsonl> --output-dir <temp> --filename encrypted_export.html --json --no-cdns --encrypt --password-stdin`.
 
+### Pre-existing `robot/*` drift (not fixed here)
+
+Several `tests/golden/robot/*` goldens were already stale at the commit this
+change builds on (`e4acf395`), i.e. they did not match the binary at that commit
+either. Evidence: `robot/health.json.golden` recorded
+`quality_tier_embedder: "minilm"` while that commit's
+`src/search/policy.rs` declared `DEFAULT_QUALITY_TIER_EMBEDDER = "infinity"`.
+
+This change updates the goldens whose content it directly changes
+(`capabilities.json` argument/env descriptions and the neutralised
+`quality_tier_embedder` / `reranker` defaults, `health.json` for the same two
+fields, `introspect.json` / `introspect_shape.json` for the `models-list` /
+`models-check` response-schema keys that replaced `models-status` /
+`models-verify` / `models-check-update`). Those files therefore also carry the
+pre-existing drift listed below; it is *not* part of this change and is left for
+the follow-up baseline-equivalence gate:
+
+- `health*.json` / `status_quarantine*.json`: new `last_index` block.
+- `doctor*.json` / `diag_quarantine.json`: `feature_compiled_in` flipped
+  `true → false`, new `db_vector_domain` block, and different quarantine /
+  reclaimable-byte counts.
+- `capabilities*.json` / `introspect*.json`: a `regression` / `regression-input`
+  command that the golden lacks.
+
+Goldens with only that drift (no line this change touches) were left exactly as
+they were.
+
 ## Follow-ups
 
 Goldens still to add under bead u9osp scope (each needs its own

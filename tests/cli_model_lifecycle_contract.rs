@@ -197,6 +197,24 @@ fn models_verify_defaults_to_inspection_without_repair() -> Result<(), String> {
     })
 }
 
+/// The stable `error.kind` from a `--json` refusal envelope on stderr, or an
+/// empty string when the stream carries no envelope.
+fn stderr_error_kind(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn models_verify_json_is_a_migration_refusal_and_creates_no_model_dir() {
     use assert_cmd::cargo::cargo_bin;
@@ -228,6 +246,11 @@ fn models_verify_json_is_a_migration_refusal_and_creates_no_model_dir() {
         output.status.code(),
         Some(2),
         "models verify must be a migration refusal; stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert_eq!(
+        stderr_error_kind(&stderr),
+        "ModelApiMigration",
+        "models verify must refuse as the migration error, not some other exit-2 failure; stderr: {stderr}"
     );
 
     let model_dir = data_dir.join("models");
@@ -432,6 +455,16 @@ fn models_install_from_file_refuses_with_a_migration_error() {
             exit, 2,
             "models install must refuse with a migration error (exit 2) whatever the source path; \
              source: {source:?}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert_eq!(
+            stderr_error_kind(&stderr),
+            "ModelApiMigration",
+            "models install must refuse as the migration error, not some other exit-2 failure; \
+             source: {source:?}\nstderr: {stderr}"
+        );
+        assert!(
+            !data_dir.join("models").exists(),
+            "a retired install must not create a model directory"
         );
     }
 }

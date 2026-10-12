@@ -85,6 +85,13 @@ fn model_commands_create_no_local_model_cache_and_lexical_needs_no_config() -> R
             "models status with no --api-config must refuse with exit 2; got {scode:?}; stdout: {sout}; stderr: {serr}"
         ));
     }
+    // Pin the stable error kind, not just the exit code: an unrelated exit-2
+    // failure must not be able to pass for the intended configuration refusal.
+    if stderr_error_kind(&serr) != "ModelApiConfiguration" {
+        return Err(format!(
+            "models status must refuse as a ModelApiConfiguration error; stderr: {serr}"
+        ));
+    }
     assert_no_model_cache(tmp.path(), "models status")?;
 
     // The retired local-weight subcommands refuse with a migration error and
@@ -101,7 +108,38 @@ fn model_commands_create_no_local_model_cache_and_lexical_needs_no_config() -> R
                 "{args:?} must be a migration refusal (exit 2); got {mcode:?}; stdout: {mout}; stderr: {merr}"
             ));
         }
+        // The `--json` forms carry the stable envelope; the human forms (install,
+        // remove) name the retirement in prose. Both must be the migration
+        // refusal, not some unrelated exit-2 failure.
+        let migration = if args.contains(&"--json") {
+            stderr_error_kind(&merr) == "ModelApiMigration"
+        } else {
+            merr.contains("retired")
+        };
+        if !migration {
+            return Err(format!(
+                "{args:?} must refuse as the migration error; stderr: {merr}"
+            ));
+        }
         assert_no_model_cache(tmp.path(), &format!("{args:?}"))?;
     }
     Ok(())
+}
+
+/// The stable `error.kind` from a `--json` refusal envelope on stderr, or an
+/// empty string when the stream carries no envelope.
+fn stderr_error_kind(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }

@@ -1604,6 +1604,24 @@ fn sources_artifact_manifest_verify_existing_json_rejects_corrupt_artifact() {
 // model API profiles), so with no `--api-config` it is a configuration refusal.
 // `tests/api_model_commands.rs` covers the real profile listing against a real
 // config file; this test pins the no-config refusal.
+/// The stable `error.kind` from a `--json` refusal envelope on stderr, or an
+/// empty string when the stream carries no envelope.
+fn stderr_error_kind(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn models_status_json_without_config_refuses() {
     let tmp = TempDir::new().unwrap();
@@ -1611,7 +1629,14 @@ fn models_status_json_without_config_refuses() {
     let mut cmd = base_cmd(tmp.path());
     cmd.args(["models", "status", "--json"]);
 
-    cmd.assert().code(2);
+    let output = cmd.assert().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Pin the kind: an unrelated exit-2 failure must not pass for this refusal.
+    assert_eq!(
+        stderr_error_kind(&stderr),
+        "ModelApiConfiguration",
+        "models status must refuse as the API configuration error; stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -1631,7 +1656,13 @@ fn models_verify_json_with_no_model_is_a_migration_refusal() {
 
     // Local weight verification was retired: the command refuses with a
     // migration error rather than inspecting a local model directory.
-    cmd.assert().code(2);
+    let output = cmd.assert().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr_error_kind(&stderr),
+        "ModelApiMigration",
+        "models verify must refuse as the migration error; stderr: {stderr}"
+    );
 }
 
 #[test]

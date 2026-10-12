@@ -60,6 +60,11 @@ fn retired_local_model_commands_refuse() {
         "models status --json should exit 2 (configuration refusal). stderr: {}",
         String::from_utf8_lossy(&status.stderr)
     );
+    assert_eq!(
+        stderr_error_kind(&String::from_utf8_lossy(&status.stderr)),
+        "ModelApiConfiguration",
+        "models status must refuse as the API configuration error"
+    );
 
     let verify = cargo_bin_cmd!("cass")
         .args(["models", "verify", "--json"])
@@ -72,6 +77,31 @@ fn retired_local_model_commands_refuse() {
         "models verify --json should exit 2 (migration error). stderr: {}",
         String::from_utf8_lossy(&verify.stderr)
     );
+    assert_eq!(
+        stderr_error_kind(&String::from_utf8_lossy(&verify.stderr)),
+        "ModelApiMigration",
+        "models verify must refuse as the migration error"
+    );
+}
+
+/// The stable `error.kind` from a `--json` refusal envelope on stderr, or an
+/// empty string when the stream carries no envelope. Pinning the kind (not just
+/// the exit code) keeps an unrelated exit-2 failure from passing for the
+/// intended refusal.
+fn stderr_error_kind(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 /// Test: cass models help shows all subcommands
