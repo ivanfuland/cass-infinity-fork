@@ -40,6 +40,7 @@
 pub mod call_identity;
 pub mod client;
 pub mod config;
+pub(crate) mod compatibility;
 pub mod error;
 pub mod identity;
 pub mod primary_embedding;
