@@ -140,6 +140,7 @@ pub(crate) fn off_evidence(
 ) -> anyhow::Result<WindowEvidence> {
     let retrieval = freeze_retrieval_slots(context, hits)?;
     let evidence = WindowEvidence {
+        api_rerank: None,
         schema: "cass.regression-window-trace.v2".into(),
         binding: binding.clone(), query: TextDigest::of(query), request,
         transport_scope: "rerank-http-v1".into(), lexical_statistics_used,
@@ -279,6 +280,8 @@ pub(crate) fn verify_submitted_slots(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct WindowEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) api_rerank: Option<crate::search::rerank::window::ApiWindowRerank>,
     pub(crate) schema: String,
     pub(crate) binding: crate::search::regression_binding::InputBinding,
     pub(crate) query: TextDigest,
@@ -357,10 +360,48 @@ impl WindowEvidence {
             .iter()
             .filter(|r| r.method == "POST")
             .collect();
-        if posts.len() > 1 || (applied && posts.len() != 1) {
+        let route = self.request.get("model_api_route").filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value::<crate::search::rerank::window::ApiWindowRoute>(v.clone()))
+            .transpose().map_err(|_| anyhow::anyhow!("TRACE_WINDOW_REQUEST_MISMATCH"))?;
+        let maximum = if route.as_ref().is_some_and(|r| r.allow_fallback && r.fallback_profile.is_some()) { 2 } else { 1 };
+        if posts.len() > maximum || (applied && posts.is_empty()) {
             bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
         }
-        if let Some(post) = posts.first() {
+        match (&route, &self.api_rerank) {
+            (Some(route), Some(api)) => {
+                let attempts = &api.attempts;
+                if api.primary_profile != route.rerank_profile || attempts.len() > maximum
+                    || attempts.first().is_some_and(|a| a.profile != route.rerank_profile)
+                    || attempts.get(1).is_some_and(|a| Some(&a.profile) != route.fallback_profile.as_ref()) {
+                    bail!("TRACE_WINDOW_REQUEST_MISMATCH");
+                }
+                let sent: Vec<_> = attempts.iter().filter(|a| a.network_attempted).collect();
+                if sent.len() != posts.len() || sent.iter().zip(&posts).any(|(a,p)| a.http_status != p.http_status) {
+                    bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
+                }
+                if attempts.len() == 2 {
+                    let first = &attempts[0];
+                    let eligible = match first.http_status {
+                        Some(status) => [408,429,500,502,503,504].contains(&status),
+                        None => matches!(first.error_code.as_deref(), Some("timeout" | "connection_refused" | "connection_interrupted" | "network_unavailable")),
+                    };
+                    if !eligible || first.error_code.is_none() || api.fallback_reason != first.error_code {
+                        bail!("TRACE_WINDOW_REQUEST_MISMATCH");
+                    }
+                }
+                if applied {
+                    let winner = attempts.last().ok_or_else(|| anyhow::anyhow!("TRACE_SCORING_RESPONSE_UNPROVEN"))?;
+                    if api.realized_profile.as_ref() != Some(&winner.profile) || winner.error_code.is_some()
+                        || api.fallback_used != (attempts.len() == 2) {
+                        bail!("TRACE_SCORING_RESPONSE_UNPROVEN");
+                    }
+                } else if api.realized_profile.is_some() || api.fallback_used { bail!("TRACE_SCORING_RESPONSE_UNPROVEN"); }
+            }
+            (Some(_), None) if !posts.is_empty() || applied => bail!("TRACE_SCORING_RESPONSE_UNPROVEN"),
+            (None, Some(_)) => bail!("TRACE_WINDOW_REQUEST_MISMATCH"),
+            _ => {}
+        }
+        for (index, post) in posts.iter().enumerate() {
             let docs = post
                 .documents
                 .as_ref()
@@ -380,7 +421,7 @@ impl WindowEvidence {
             {
                 bail!("TRACE_SUBMITTED_TEXT_MISMATCH");
             }
-            if applied
+            if applied && index + 1 == posts.len()
                 && (post.state != "http-response-observed"
                     || !post.http_status.is_some_and(|s| (200..300).contains(&s)))
             {
@@ -579,6 +620,78 @@ mod tests {
         );
         trace.requests[0].documents.as_mut().unwrap()[1].input_slot = 0;
         assert!(verify_submitted_slots(&slots, &trace, "synthetic", &prepared).is_err());
+    }
+
+    #[test]
+    fn api_fallback_trace_validates_both_real_requests_and_rejects_tampering() {
+        use crate::search::model_api::{ApiConfig, ApiClient, CredentialResolver};
+        use crate::search::model_api::test_support::{HttpFixture, TlsFixture, Reply};
+        use crate::search::regression_binding::{open_verified_search, tests::{searchable_fixture_with_count, prepare_expected}};
+        use std::sync::{Arc, Mutex};
+        struct NoCredentials;
+        impl CredentialResolver for NoCredentials { fn resolve(&self, _: &str) -> Option<String> { None } }
+        let (root, db, run, manifest) = searchable_fixture_with_count(7);
+        let (expected, pin) = prepare_expected(root.path(), &db, &manifest);
+        let context = Arc::new(super::super::regression_io::RegressionIoContext::open(&db, &run).unwrap());
+        let verified = open_verified_search(context.clone(), &expected, &pin, &manifest).unwrap();
+        let hits = verified.client.search("retrieval", Default::default(), 7, 0, super::super::query::FieldMask::FULL).unwrap();
+        let documents = super::super::rerank::context::build_documents_for_regression(&context, "retrieval", &hits).unwrap();
+        let local = HttpFixture::start(vec![Reply::status(503)]);
+        let cloud = TlsFixture::start(vec![Reply::ok(json!({"results":(0..hits.len()).map(|i| json!({"index":i,"relevance_score":i as f64})).collect::<Vec<_>>() }))]);
+        let config = ApiConfig::parse_toml(&format!(r#"
+version=1
+default_rerank="local"
+[profiles.local]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/local"
+model_revision="r1"
+fallback_profile="cloud"
+[profiles.cloud]
+kind="rerank"
+protocol="openrouter-rerank-v1"
+scope="remote"
+endpoint="{}"
+model="example/cloud"
+model_revision="r1"
+provider_only="fixed-provider"
+"#, local.base(), cloud.base())).unwrap();
+        let options = crate::SemanticSearchOptions {
+            api: crate::ApiSearchOptions { frozen: Some(config.clone()), ..Default::default() },
+            rerank: true, rerank_limit: Some(3), ..Default::default()
+        };
+        let request = crate::regression_request_evidence(&Default::default(), super::super::query::SearchMode::Lexical,
+            super::super::query::VectorSearchMode::Exact, 7, None, &options, &Default::default(), None).unwrap();
+        let mut proof = off_evidence(&context, &verified.binding, "retrieval", &hits, request, true).unwrap();
+        let trace = Arc::new(Mutex::new(RequestTrace::default()));
+        let client = ApiClient::new_with_test_root(config, Box::new(NoCredentials), cloud.ca_pem().to_vec()).with_rerank_trace(trace.clone());
+        let response = super::super::model_api::rerank_call::score(&client, "local", "retrieval", &documents, true, &mut proof.api_rerank).unwrap();
+        let order = super::super::rerank::types::stable_rank_order(&response.scores).unwrap();
+        let sorted: Vec<_> = order.iter().map(|i| hits[*i].clone()).collect();
+        proof.final_slots = final_slot_mapping(&proof.retrieval, &order).unwrap();
+        proof.prepared_documents = Some(documents.iter().map(|s| TextDigest::of(s)).collect());
+        proof.transport = trace.lock().unwrap().clone();
+        proof.rerank_requested = true;
+        proof.applied = true;
+        proof.validate(&context, &verified.binding, "retrieval", &sorted, true).unwrap();
+        assert_eq!(local.hits(), 1);
+        assert_eq!(cloud.fixture().hits(), 1);
+        for mutation in 0..5 {
+            let mut bad = proof.clone();
+            match mutation {
+                0 => {
+                    bad.transport.requests[0].http_status = Some(401);
+                    bad.api_rerank.as_mut().unwrap().attempts[0].http_status = Some(401);
+                }
+                1 => bad.transport.requests[1].documents.as_mut().unwrap()[0].text = TextDigest::of("changed"),
+                2 => bad.request["model_api_route"]["allow_fallback"] = json!(false),
+                3 => bad.transport.requests[0].documents.as_mut().unwrap()[0].input_slot = 1,
+                _ => bad.api_rerank.as_mut().unwrap().attempts[1].error_code = Some("InvalidResponse".into()),
+            }
+            assert!(bad.validate(&context, &verified.binding, "retrieval", &sorted, true).is_err(), "mutation {mutation}");
+        }
     }
 
     #[test]

@@ -22,10 +22,22 @@ pub struct FrozenInputArgs {
     pub question_pack_root: PathBuf,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+pub struct RegressionApiOptions {
+    #[arg(long)]
+    pub embedding_profile: Option<String>,
+    #[arg(long)]
+    pub rerank_profile: Option<String>,
+    #[arg(long)]
+    pub no_model_fallback: bool,
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum RegressionInputCommand {
     /// Search the verified frozen lexical domain through the existing pipeline.
     Search {
+        #[command(flatten)]
+        api: RegressionApiOptions,
         #[command(flatten)]
         input: FrozenInputArgs,
         #[arg(long)]
@@ -68,6 +80,10 @@ pub enum RegressionInputCommand {
 }
 
 pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json::Value>> {
+    run_with_api_config(command, None)
+}
+
+pub(crate) fn run_with_api_config(command: &RegressionInputCommand, api_config: Option<&std::path::Path>) -> Result<Option<serde_json::Value>> {
     let input = match command {
         RegressionInputCommand::Inspect { input }
         | RegressionInputCommand::Verify { input, .. }
@@ -77,6 +93,7 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
     context.forbid_output_under(&input.question_pack_root)?;
     match command {
         RegressionInputCommand::Search {
+            api,
             expected_binding,
             expected_sha256,
             query,
@@ -96,6 +113,9 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
             if *mode == super::query::SearchMode::Lexical && vector_search_mode.is_some() {
                 bail!("REGRESSION_VECTOR_MODE_REQUIRES_SEMANTIC");
             }
+            let api_selected = api_config.is_some() || api.embedding_profile.is_some() || api.rerank_profile.is_some()
+                || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
+            if api_selected && rerank_provider.is_some() { bail!("REGRESSION_MODEL_API_MIGRATION"); }
             let verified = open_verified_search(
                 context.clone(),
                 expected_binding,
@@ -135,8 +155,12 @@ pub(crate) fn run(command: &RegressionInputCommand) -> Result<Option<serde_json:
                 Some(*mode),
                 *vector_search_mode,
                 crate::SemanticSearchOptions {
-                    api: crate::ApiSearchOptions::default(),
-                    model: (*mode != super::query::SearchMode::Lexical).then(|| "bge-m3".into()),
+                    api: crate::ApiSearchOptions {
+                        config_path: api_config.map(std::path::Path::to_path_buf),
+                        embedding_profile: api.embedding_profile.clone(), rerank_profile: api.rerank_profile.clone(),
+                        no_model_fallback: api.no_model_fallback, ..Default::default()
+                    },
+                    model: (!api_selected && *mode != super::query::SearchMode::Lexical).then(|| "bge-m3".into()),
                     rerank: *rerank,
                     reranker: None,
                     use_daemon: false,
@@ -195,6 +219,7 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
         "REGRESSION_RETRIEVAL_DEGRADED",
         "REGRESSION_SEARCH_FAILED",
         "REGRESSION_RERANK_FAILED",
+        "REGRESSION_MODEL_API_MIGRATION",
         "REGRESSION_WINDOW_UNAVAILABLE",
         "TRACE_FAILED_WINDOW",
         "REGRESSION_SEARCH_EVIDENCE_FAILED",

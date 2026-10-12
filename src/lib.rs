@@ -7008,7 +7008,7 @@ async fn execute_cli(
         Commands::RegressionInput { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
-            let result = search::regression_input::run(action).map_err(|error| CliError {
+            let result = search::regression_input::run_with_api_config(action, cli.api_config.as_deref()).map_err(|error| CliError {
                 code: 2, kind: CliErrorKind::Usage.kind_str(),
                 message: search::regression_input::error_code(&error).to_string(),
                 hint: None, retryable: false,
@@ -24797,7 +24797,12 @@ fn regression_request_evidence(
             values.sort_by_key(serde_json::Value::to_string);
         }
     }
+    let api_profile = if semantic.rerank { selected_api_rerank_profile(semantic)? } else { None };
+    let api_route = api_window_route(semantic, api_profile.as_ref(), mode)?;
+    let provider = api_profile.as_ref().map(|p| p.id.clone())
+        .or_else(|| semantic.rerank_provider.map(|p| p.as_str().to_owned()));
     Ok(serde_json::json!({
+        "model_api_route": api_route,
         "mode": search_mode_canonical_str(mode),
         "vector_search_mode": vector_search_mode_wire(vector_mode),
         "resolved_filters": filters,
@@ -24811,7 +24816,7 @@ fn regression_request_evidence(
         "client_submission_policy": semantic.rerank.then_some("verbatim-query-documents-v1"),
         "server_template_policy": serde_json::Value::Null,
         "rerank_limit": semantic.rerank_limit,
-        "rerank_provider": semantic.rerank_provider,
+        "rerank_provider": provider,
         "time_selectors": rerank.time_selectors,
         "daemon": rerank.daemon,
         "no_daemon": rerank.no_daemon,
@@ -25039,6 +25044,17 @@ fn api_window_route(opts: &SemanticSearchOptions, profile: Option<&crate::search
     }))
 }
 
+fn api_regression_embedding_binding(conn: &crate::storage::api::Conn, profile: &crate::search::model_api::ValidatedProfile) -> anyhow::Result<serde_json::Value> {
+    let call = crate::search::model_api::EndpointConfigIdentity::from_profile(profile)?;
+    Ok(conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+        let id = tx.query_row_map("SELECT id FROM embedding_generations WHERE is_active = 1 AND audit_status = 'passed'", &[], |row| row.get_typed::<i64>(0))?;
+        let verified = crate::storage::api_generation::open_api_generation(tx, id, profile).map_err(crate::storage::api::StorageError::from)?;
+        Ok(serde_json::json!({"profile":profile.id,"requested_model":profile.model,"declared_revision":profile.model_revision,
+            "endpoint_config_sha256":call.sha256(),"descriptor_sha256":verified.descriptor_sha256(),
+            "generation_id":id,"dimension":verified.descriptor().effective_dimension()}))
+    })?)
+}
+
 fn api_query_compatibility_error(error: &anyhow::Error) -> Option<CliError> {
     let failure = error.chain().find_map(|cause| cause.downcast_ref::<
         crate::search::model_api::query_embedding::QueryApiFailure>())?;
@@ -25123,7 +25139,7 @@ fn run_cli_search(
 
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
-    if regression.is_some() && mode != Some(SearchMode::Lexical) {
+    if regression.is_some() && mode != Some(SearchMode::Lexical) && semantic_opts.api.frozen.is_none() {
         #[cfg(not(feature = "infinity"))]
         return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
         if !matches!(semantic_opts.model.as_deref(), Some("bge-m3" | "infinity"))
@@ -25133,7 +25149,7 @@ fn run_cli_search(
         }
     }
     #[cfg(feature = "infinity")]
-    let regression_embedding_config = if regression.is_some() && mode != Some(SearchMode::Lexical) {
+    let regression_embedding_config = if regression.is_some() && mode != Some(SearchMode::Lexical) && semantic_opts.api.frozen.is_none() {
         let config = crate::search::infinity::InfinityConfig::from_env();
         if config.embed_model != "BAAI/bge-m3" {
             return Err(regression_search_error(
@@ -25145,7 +25161,7 @@ fn run_cli_search(
         None
     };
     #[cfg(feature = "infinity")]
-    let regression_embedding_binding = regression_embedding_config.as_ref().map(|config| serde_json::json!({
+    let mut regression_embedding_binding = regression_embedding_config.as_ref().map(|config| serde_json::json!({
         "requested_model": config.embed_model,
         "origin_sha256": crate::search::regression_trace::TextDigest::of(&config.base_url).sha256,
         "dimension": config.expected_dim,
@@ -25153,7 +25169,15 @@ fn run_cli_search(
         "max_batch": config.max_batch,
     }));
     #[cfg(not(feature = "infinity"))]
-    let regression_embedding_binding: Option<serde_json::Value> = None;
+    let mut regression_embedding_binding: Option<serde_json::Value> = None;
+
+    if let (Some(run), Some(config)) = (regression.as_ref(), semantic_opts.api.frozen.as_ref()) {
+        if mode != Some(SearchMode::Lexical) {
+            let profile = select_api_embedding_profile(config, semantic_opts.api.embedding_profile.as_deref())?;
+            let conn = run.context.connection().map_err(regression_search_error)?;
+            regression_embedding_binding = Some(api_regression_embedding_binding(&conn, &profile).map_err(regression_search_error)?);
+        }
+    }
 
     let data_dir = regression
         .as_ref()
@@ -26457,6 +26481,7 @@ fn score_search_first_window(
                 &window_result.hits,
             )?;
             Ok::<_, anyhow::Error>(crate::search::regression_trace::WindowEvidence {
+                api_rerank: None,
                 schema: "cass.regression-window-trace.v2".into(),
                 request: regression_request_evidence(
                     &filters,
@@ -26672,6 +26697,7 @@ fn score_search_first_window(
 
     if let (Some(run), Some(evidence)) = (regression.as_ref(), regression_evidence.as_mut()) {
         evidence.transport = run.trace.lock().map_err(regression_search_error)?.clone();
+        evidence.api_rerank = api_evidence.clone();
         evidence.applied = rerank_applied;
         evidence.failure_reason = failure_reason.map(|reason| reason.as_str().to_string());
         evidence
@@ -108290,11 +108316,16 @@ mod regression_search_orchestration_tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    fn search(
+    fn search(run: RegressionSearchExecution, rerank: bool, k: usize, cursor: Option<String>) -> CliResult<()> {
+        search_with_api(run, rerank, k, cursor, ApiSearchOptions::default())
+    }
+
+    fn search_with_api(
         run: RegressionSearchExecution,
         rerank: bool,
         k: usize,
         cursor: Option<String>,
+        api: ApiSearchOptions,
     ) -> CliResult<()> {
         run_cli_search(
             "retrieval",
@@ -108328,7 +108359,7 @@ mod regression_search_orchestration_tests {
             Some(crate::search::query::SearchMode::Lexical),
             None,
             SemanticSearchOptions {
-                api: ApiSearchOptions::default(),
+                api,
                 model: None,
                 rerank,
                 reranker: None,
@@ -108458,6 +108489,46 @@ mod regression_search_orchestration_tests {
     }
 
     #[test]
+    fn regression_api_window_records_real_posts_and_preserves_frozen_database() {
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        let (root, db, run_root, manifest) = regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) = regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let server = HttpFixture::start(vec![Reply::ok(serde_json::json!({
+            "model":"example/api-rank", "results":(0..7).map(|i| serde_json::json!({"index":i,"relevance_score":i as f64})).collect::<Vec<_>>()
+        }))]);
+        let config = root.path().join("api.toml");
+        std::fs::write(&config, format!(r#"
+version=1
+default_rerank="rank"
+[profiles.rank]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/api-rank"
+model_revision="r1"
+"#, server.base())).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let run = execution(context.clone(), &expected, &pin, &manifest, None);
+        let binding = run.binding.clone();
+        search_with_api(run, true, 3, None, ApiSearchOptions { config_path: Some(config), ..Default::default() }).unwrap();
+        let proof = evidence(&run_root);
+        assert_eq!(server.hits(), 1);
+        assert_eq!(proof.transport.requests.len(), 1);
+        assert_eq!(proof.transport.model_requests, None);
+        assert_eq!(proof.final_slots.iter().map(|s| s.input_slot).collect::<Vec<_>>(), vec![6,5,4,3,2,1,0]);
+        assert_eq!(proof.api_rerank.as_ref().unwrap().realized_profile.as_deref(), Some("rank"));
+        assert_eq!(proof.request["rerank_provider"], "rank");
+        assert!(proof.request["model_api_route"]["rerank_route_sha256"].as_str().is_some());
+        assert_eq!(proof.transport.requests[0].documents.as_ref().unwrap().len(), 7);
+        assert_eq!(proof.transport.requests[0].query.as_ref().unwrap(), &crate::search::regression_trace::TextDigest::of("retrieval"));
+        assert_eq!(before, std::fs::read(&db).unwrap());
+        assert_eq!(proof.binding, binding);
+        context.verify_input().unwrap();
+    }
+
+    #[test]
     fn regression_existing_pipeline_preserves_seven_slots_and_cursor_without_second_http_call() {
         let (root, db, run_root, manifest) =
             regression_binding::tests::searchable_fixture_with_count(7);
@@ -108507,7 +108578,7 @@ mod regression_search_orchestration_tests {
             .unwrap();
         let id = path.file_stem().unwrap().to_str().unwrap();
         let cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":3}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":id,"offset":3}))
                 .unwrap(),
         );
         let client = crate::search::query::SearchClient::open_for_regression(
@@ -108536,7 +108607,7 @@ mod regression_search_orchestration_tests {
         )
         .unwrap();
         let cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":6}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":id,"offset":6}))
                 .unwrap(),
         );
         let client = crate::search::query::SearchClient::open_for_regression(
@@ -108594,7 +108665,7 @@ mod regression_search_orchestration_tests {
         )
         .unwrap();
         let cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":3}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":id,"offset":3}))
                 .unwrap(),
         );
         let (mut old, _) = store
@@ -108618,7 +108689,7 @@ mod regression_search_orchestration_tests {
             .save(&old, crate::storage::sqlite::FrankenStorage::now_millis())
             .unwrap();
         let legacy_cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":legacy_id,"offset":3}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":legacy_id,"offset":3}))
                 .unwrap(),
         );
         let client = crate::search::query::SearchClient::open_for_regression(
@@ -108818,6 +108889,7 @@ mod regression_semantic_pipeline_child {
         let window_root =
             std::env::var_os("CASS_REGRESSION_SEMANTIC_WINDOW_ROOT").map(PathBuf::from);
         crate::search::regression_input::run(&crate::RegressionInputCommand::Search {
+            api: Default::default(),
             input: crate::search::regression_input::FrozenInputArgs {
                 database: path("database"),
                 run_root: path("run_root"),

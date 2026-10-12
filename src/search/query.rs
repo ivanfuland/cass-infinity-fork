@@ -3713,6 +3713,7 @@ impl SearchClient {
                     state.api_binding.clone(), cached)
             };
             if let Some(binding) = api_binding {
+                if let Some(context) = &self.regression { context.verify_input()?; }
                 let guard = self.sqlite_guard()?;
                 let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
                 conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
@@ -4541,13 +4542,19 @@ impl SearchClient {
         request: SemanticCandidateSearchRequest,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         if let Some(binding) = &context.api_binding {
-            let guard = self.sqlite_guard()?;
+            if let Some(context) = &self.regression { context.verify_input()?; }
+            let mut guard = self.sqlite_guard()?;
             let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
-            return Self::search_db_vector_domain_with_context(
+            let result = Self::search_db_vector_domain_with_context(
                 conn, embedding, filters, context.roles.as_ref(), request.fetch_limit,
                 self.sqlite_path.as_deref(), self.vector_search_mode,
                 self.regression.as_deref(), Some(binding),
             );
+            if let Some(context) = &self.regression { context.verify_input()?; }
+            if result.as_ref().err().is_some_and(|e| e.to_string().contains("vector_database_changed")) {
+                *guard = None;
+            }
+            return result;
         }
         self.search_vector_candidates(embedding, filters, context.roles.as_ref(), request.fetch_limit)
     }
