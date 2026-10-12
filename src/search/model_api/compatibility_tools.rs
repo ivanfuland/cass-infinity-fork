@@ -8,17 +8,26 @@ use super::compatibility::CompatibilityError as Error;
 use super::compatibility_archive::{CheckedFixture,Sources};
 use super::compatibility_bundle::{FilePin,read_regular};
 
+/// Capture two query/document rounds for one pinned endpoint and input set.
 #[derive(Debug,Clone,clap::Args)]
 pub struct CaptureArgs {
+    /// Selected profile from the explicit model API configuration.
     #[arg(long)] pub profile:String,
+    /// Frozen fixture JSON with public sample texts and independent labels.
     #[arg(long)] pub fixture:PathBuf,
+    /// SHA-256 of the exact fixture file bytes.
     #[arg(long)] pub fixture_sha256:String,
+    /// JSON declarations for model sources and input limits.
     #[arg(long)] pub sources:PathBuf,
+    /// SHA-256 of the exact source declarations file.
     #[arg(long)] pub sources_sha256:String,
+    /// Token IDs and input hashes from the separately validated counter.
     #[arg(long)] pub token_receipt:PathBuf,
+    /// SHA-256 of the exact token receipt file.
     #[arg(long)] pub token_receipt_sha256:String,
     /// A new directory; the parent must exist. Existing results are not replaced.
     #[arg(long)] pub output:PathBuf,
+    /// Explicit machine-readable output flag; this command always emits JSON.
     #[arg(long,visible_alias="robot")] pub json:bool,
 }
 #[derive(Clone,Serialize,Deserialize)]
@@ -92,15 +101,25 @@ pub(crate) fn capture_to_directory(client:&super::ApiClient,args:&CaptureArgs)->
     }
 }
 
+/// Verify all direct comparisons between pinned captures without network access.
+/// Repeat manifest and digest flags in matching order, for example:
+/// `--capture-manifest a.json --capture-manifest b.json
+/// --capture-manifest-sha256 SHA_A --capture-manifest-sha256 SHA_B`.
 #[derive(Debug,Clone,clap::Args)]
 pub struct VerifyArgs {
+    /// Selected profile from the explicit model API configuration.
     #[arg(long)] pub profile:String,
+    /// Capture manifests, paired by position with the repeated digest flags.
     #[arg(long,required=true)] pub capture_manifest:Vec<PathBuf>,
+    /// Exact manifest SHA-256 values in the same order as the manifest paths.
     #[arg(long,required=true)] pub capture_manifest_sha256:Vec<String>,
+    /// Capture digest selecting the canonical primary endpoint.
     #[arg(long)] pub primary_capture_sha256:String,
+    /// Capture digest selecting the configured backup, when present.
     #[arg(long)] pub fallback_capture_sha256:Option<String>,
     /// A new directory for proof and its immutable copied inputs.
     #[arg(long)] pub output:PathBuf,
+    /// Explicit machine-readable output flag; this command always emits JSON.
     #[arg(long,visible_alias="robot")] pub json:bool,
 }
 fn member_bytes(base:&Path,pin:&FilePin)->Result<Vec<u8>,Error> {

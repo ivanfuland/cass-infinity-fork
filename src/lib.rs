@@ -101000,7 +101000,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
                 .map_err(|error| CliError::usage(error.to_string(), Some("Use pinned regular input files and a new output directory".into())))?;
             let failed = report["status"] != "captured";
             println!("{}", serde_json::to_string(&report).map_err(|_|CliError::unknown("compatibility capture encoding failed"))?);
-            if failed { return Err(CliError {code:1,kind:"ModelApiCompatibilityCapture",message:"Compatibility capture failed; private failure report retained".into(),hint:None,retryable:false}); }
+            if failed { return Err(CliError {code:1,kind:"model-api-compatibility-capture",message:"Compatibility capture failed; private failure report retained".into(),hint:None,retryable:false}); }
             Ok(())
         }
         ModelsCommand::Status { json } => {
@@ -102853,7 +102853,7 @@ fn api_backfill_model_api_value(
         "requested_model": profile.model,
         "declared_revision": profile.model_revision,
         "allow_fallback": call.allow_fallback(),
-        "fallback_used": false,
+        "fallback_used": call.fallback_used(),
         "probe_calls": call.probe_calls(),
         "document_calls": call.document_calls(),
         "audit_calls": call.audit_calls(),
@@ -102867,7 +102867,7 @@ fn api_backfill_model_api_value(
 /// index-run lock and scheduler gate, then runs the shared chunk-domain
 /// catch-up loop over one frozen API embedding profile: one fresh probe fixes
 /// the generation's width and fingerprint, document batches are embedded at the
-/// primary endpoint only, and the generation's API record is written and
+/// admitted primary or backup endpoint, and the generation's API record is written and
 /// re-verified inside the same transaction as its rows.
 #[allow(clippy::too_many_arguments)]
 fn run_models_backfill_api(
@@ -103107,9 +103107,8 @@ fn api_backfill_failure_error(
         (
             15,
             CliErrorKind::SemanticUnavailable.kind_str(),
-            "The configured fallback needs verified cross-endpoint compatibility evidence, which \
-             this build does not implement; run with --no-model-fallback for a pure-primary run, \
-             or restore the primary endpoint.",
+            "Verify compatibility evidence covering the selected route and stored generation history, \
+             or restore a compatible configuration.",
         )
     } else {
         (

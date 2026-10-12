@@ -279,6 +279,9 @@ impl PrimaryEmbeddingCall {
         self.allow_fallback
     }
 
+    /// Whether any successful request in this command used its backup.
+    pub fn fallback_used(&self) -> bool { self.fallback_used.get() }
+
     /// The width the probe established, or `0` before any probe ran.
     pub fn dimension(&self) -> usize {
         self.probed_dimension.get()
@@ -354,12 +357,7 @@ impl PrimaryEmbeddingCall {
                     Err(failure) => return Err(self.record_failure(failure, EvidenceStage::Probe)),
                 }
             };
-            if let Some(attempt) = outcome.attempts.last() {
-                if attempt.stage == super::AttemptStage::Fallback { self.fallback_used.set(true); }
-                if let Some(writer) = self.client.config().profile(&attempt.profile_id) {
-                    if !writers.iter().any(|p| p.id == writer.id) { writers.push(writer.clone()); }
-                }
-            }
+            self.record_successful_producer(&outcome, &mut writers);
             match dimension {
                 None => {
                     dimension = Some(outcome.dimension);
@@ -456,12 +454,7 @@ impl PrimaryEmbeddingCall {
                 }));
             }
             self.record_success(&outcome, stage);
-            if let Some(attempt) = outcome.attempts.last() {
-                if attempt.stage == super::AttemptStage::Fallback { self.fallback_used.set(true); }
-                if let Some(writer) = self.client.config().profile(&attempt.profile_id) {
-                    if !writers.iter().any(|p| p.id == writer.id) { writers.push(writer.clone()); }
-                }
-            }
+            self.record_successful_producer(&outcome, &mut writers);
             vectors.extend(outcome.vectors);
         }
         if matches!(stage, EvidenceStage::Document) { *self.page_writers.borrow_mut() = writers; }
@@ -470,6 +463,15 @@ impl PrimaryEmbeddingCall {
     /// The largest number of complete inputs one request may carry.
     fn max_batch(&self) -> usize {
         self.route.max_batch()
+    }
+
+    fn record_successful_producer(&self, outcome: &EmbedOutcome, writers: &mut Vec<ValidatedProfile>) {
+        if let Some(attempt) = outcome.attempts.last() {
+            if attempt.stage == super::AttemptStage::Fallback { self.fallback_used.set(true); }
+            if let Some(writer) = self.client.config().profile(&attempt.profile_id) {
+                if !writers.iter().any(|profile| profile.id == writer.id) { writers.push(writer.clone()); }
+            }
+        }
     }
 
     fn evidence_buffer(&self, stage: EvidenceStage) -> &RefCell<Vec<EmbeddingCallEvidence>> {
@@ -732,6 +734,11 @@ mod page_writer_tests {
             storage.raw().execute_batch("CREATE TRIGGER reject_backup_page BEFORE INSERT ON message_chunks BEGIN SELECT RAISE(ABORT, 'synthetic page failure'); END;").unwrap();
             let failed = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42);
             assert!(failed.is_err());
+            let diagnostic = crate::api_backfill_failure_error("synthetic page failure".into(), false,
+                &profile, &call, true, root.path(), &path);
+            let report: serde_json::Value = serde_json::from_str(&diagnostic.message).unwrap();
+            assert_eq!(report["model_api"]["fallback_used"], true,
+                "CLI failure report must retain successful backup usage before SQL failure");
             assert!(backup.fixture().hits() > 0, "backup must actually produce the refused page");
             let after: String = storage.raw().query_row_map("SELECT value FROM meta WHERE key=?1", &crate::storage::api::params![key.as_str()], |row|row.get_typed(0)).unwrap();
             assert_eq!(before, after, "failed page must roll back the new backup contributor");
