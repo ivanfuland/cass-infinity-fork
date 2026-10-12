@@ -41,6 +41,8 @@ pub(crate) struct CheckedFixture {
     labels: Vec<usize>,
 }
 impl CheckedFixture {
+    pub(crate) fn samples(&self) -> &[Sample] { &self.data.samples }
+    pub(crate) fn digest(&self) -> &str { &self.digest }
     pub(crate) fn read(bytes: &[u8], expected: &str) -> Result<Self, CompatibilityError> {
         let data: Fixture = decode(bytes, expected)?;
         if data.version != 1 || data.samples.len() > MAX_SAMPLES || data.samples.len() < 6
@@ -85,6 +87,23 @@ pub(crate) struct Sources {
     pub query_token_counts: Vec<u64>,
     pub document_token_counts: Vec<u64>,
 }
+impl Sources {
+    pub(crate) fn validate(&self, samples: usize) -> Result<(), CompatibilityError> {
+        let source = self;
+        if [&source.weights, &source.tokenizer, &source.pooling, &source.server_input_template, &source.token_counter]
+            .iter().any(|d| d.value.trim().is_empty() || d.value.len() > 4096)
+            || source.safe_input_tokens == 0 || !valid_sha(&source.token_counter_artifact_sha256) {
+            return Err(CompatibilityError::InvalidEvidence);
+        }
+        for counts in [&source.query_token_counts, &source.document_token_counts] {
+            if counts.len() != samples || counts.iter().any(|n| *n == 0 || *n > source.safe_input_tokens) {
+                return Err(CompatibilityError::InvalidEvidence);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResponseCapture {
@@ -138,17 +157,7 @@ impl CheckedCapture {
             || EndpointConfigIdentity::from_profile(&profile).map_err(|_| CompatibilityError::InvalidEvidence)?.sha256() != data.endpoint_config_sha256 {
             return Err(CompatibilityError::EvidenceMismatch);
         }
-        let source = &data.sources;
-        if [&source.weights, &source.tokenizer, &source.pooling, &source.server_input_template, &source.token_counter]
-            .iter().any(|d| d.value.trim().is_empty() || d.value.len() > 4096)
-            || source.safe_input_tokens == 0 || !valid_sha(&source.token_counter_artifact_sha256) {
-            return Err(CompatibilityError::InvalidEvidence);
-        }
-        for counts in [&source.query_token_counts, &source.document_token_counts] {
-            if counts.len() != fixture.data.samples.len() || counts.iter().any(|n| *n == 0 || *n > source.safe_input_tokens) {
-                return Err(CompatibilityError::InvalidEvidence);
-            }
-        }
+        data.sources.validate(fixture.data.samples.len())?;
         let inputs = |kind| fixture.data.samples.iter().map(|s| super::protocol::embedding_input(&profile, kind, &s.text)).collect::<Vec<_>>();
         let query_inputs = inputs(InputKind::Query);
         let document_inputs = inputs(InputKind::Document);

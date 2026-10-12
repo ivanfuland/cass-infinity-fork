@@ -11,6 +11,8 @@ pub(crate) const MAX_RELATIVE_NORM_DELTA: f64 = 0.001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CompatibilityError {
+    #[error("CompatibilityCaptureFailed")]
+    CaptureFailed,
     #[error("CompatibilityEvidenceMismatch")]
     EvidenceMismatch,
     #[error("CompatibilityInvalidEvidence")]

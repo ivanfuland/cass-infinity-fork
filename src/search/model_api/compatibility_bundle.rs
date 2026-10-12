@@ -71,16 +71,14 @@ pub(crate) struct TokenReceipt {
     pub document: Vec<CountedInput>,
 }
 
-fn check_counter(bytes: &[u8], capture: &CheckedCapture) -> Result<(), Error> {
+pub(crate) fn check_counter_inputs(bytes: &[u8], source: &Sources, query_inputs: &[String], document_inputs: &[String]) -> Result<(), Error> {
     let receipt: TokenReceipt = serde_json::from_slice(bytes).map_err(|_| Error::InvalidEvidence)?;
-    let source = capture.sources();
     if receipt.version != 1 || receipt.counter_id != source.token_counter.value || !valid_sha(&receipt.counter_source_sha256)
         || receipt.tokenizer_declaration_sha256 != sha(&serde_json::to_vec(&source.tokenizer).map_err(|_| Error::InvalidEvidence)?) {
         return Err(Error::EvidenceMismatch);
     }
-    for (kind, records, counts) in [(InputKind::Query, &receipt.query, &source.query_token_counts),
-        (InputKind::Document, &receipt.document, &source.document_token_counts)] {
-        let inputs = capture.inputs(kind);
+    for (inputs, records, counts) in [(query_inputs, &receipt.query, &source.query_token_counts),
+        (document_inputs, &receipt.document, &source.document_token_counts)] {
         if records.len()!=inputs.len() || counts.len()!=inputs.len() { return Err(Error::EvidenceMismatch); }
         for ((record,input),count) in records.iter().zip(inputs).zip(counts) {
             if record.input_sha256 != sha(input.as_bytes()) || record.token_ids.len() as u64 != *count {
@@ -169,7 +167,7 @@ impl CheckedBundle {
                 || &member.sources!=capture.sources() || member.token_receipt.sha256!=capture.sources().token_counter_artifact_sha256 {
                 return Err(Error::EvidenceMismatch);
             }
-            check_counter(&load(&member.token_receipt)?,&capture)?;
+            check_counter_inputs(&load(&member.token_receipt)?,capture.sources(),capture.inputs(InputKind::Query),capture.inputs(InputKind::Document))?;
             if captures.insert(member.capture.sha256.clone(),capture).is_some() { return Err(Error::InvalidEvidence); }
         }
         let main=captures.get(&header.primary_capture_sha256).ok_or(Error::EvidenceMismatch)?;

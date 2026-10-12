@@ -43,6 +43,7 @@ pub mod config;
 pub(crate) mod compatibility;
 pub(crate) mod compatibility_archive;
 pub(crate) mod compatibility_bundle;
+pub(crate) mod compatibility_capture;
 pub mod error;
 pub mod identity;
 pub mod primary_embedding;
