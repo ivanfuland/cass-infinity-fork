@@ -391,7 +391,7 @@ fn missing_or_stale_note(
         match table.readiness.semantic {
             SemanticReadinessState::Absent => notes.push(
                 "semantic refinement unavailable (semantic=absent); results are lexical-only until \
-                 a model is installed"
+                 an embedding API profile is configured"
                     .into(),
             ),
             SemanticReadinessState::Backfilling => notes.push(
