@@ -1148,13 +1148,21 @@ query_prefix="Query: "
             search_mode,
             vector_search_mode,
             rrf_limit,
+            api,
             ..
         } = command
         else {
             unreachable!()
         };
-        let mut argv = vec![
-            "cass".into(),
+        let mut argv = vec!["cass".into()];
+        // The frozen model API config selected by the caller must travel with the
+        // rebuilt argv: local inference is retired, so a semantic or rerank run
+        // has no other way to name its endpoint.
+        if let Some(config) = api.config_path.as_ref() {
+            argv.push("--api-config".into());
+            argv.push(config.display().to_string());
+        }
+        argv.extend([
             "regression".into(),
             "full-search".into(),
             "--suite".into(),
@@ -1187,7 +1195,7 @@ query_prefix="Query: "
             rrf_limit.to_string(),
             "--rerank".into(),
             "off".into(),
-        ];
+        ]);
 
         if let Some(vector) = vector_search_mode {
             argv.extend([
