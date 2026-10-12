@@ -104460,13 +104460,14 @@ fn run_daemon(
     max_connections: Option<usize>,
     data_dir: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::daemon::{ModelDaemon, ModelManager};
+    use crate::daemon::ModelDaemon;
 
-    let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    if data_dir.is_some() {
+        return Err(model_api_migration_error("daemon local model directories are retired".into(),
+            "Use --api-config with HTTP model profiles".into()));
+    }
     let config = resolved_daemon_config(socket, idle_timeout, max_connections);
-
-    let models = ModelManager::new(&data_dir);
-    let daemon = ModelDaemon::new(config, models);
+    let daemon = ModelDaemon::new(config);
 
     daemon.run().map_err(|e| CliError {
         code: 9,

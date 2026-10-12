@@ -1,7 +1,7 @@
-//! Daemon server core for the semantic model daemon.
+//! Unix socket control server for legacy clients and job records.
 //!
-//! This module provides the server that listens on a Unix Domain Socket
-//! and handles embedding/reranking requests using loaded models.
+//! Direct inference and legacy job submission return migration errors;
+//! status, historical job cancellation, and shutdown remain available.
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
@@ -9,6 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -18,14 +19,12 @@ use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
 use super::daemon_run_lock_path;
-use super::models::ModelManager;
 use super::protocol::{
-    EmbedResponse, EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
-    HealthStatus, ModelInfo, PROTOCOL_VERSION, Request, RerankResponse, Response, StatusResponse,
+    EmbeddingJobDetail, EmbeddingJobInfo, ErrorCode, ErrorResponse, FramedMessage,
+    HealthStatus, PROTOCOL_VERSION, Request, Response, StatusResponse,
     decode_message, default_socket_path, encode_message,
 };
 use super::resource::ResourceMonitor;
-use super::worker::{EmbeddingJobConfig, EmbeddingWorker, EmbeddingWorkerHandle};
 
 struct BoundDaemonSocket {
     listener: UnixListener,
@@ -239,37 +238,31 @@ impl DaemonConfig {
 /// Daemon server state.
 pub struct ModelDaemon {
     config: DaemonConfig,
-    models: Arc<ModelManager>,
     resources: ResourceMonitor,
     start_time: Instant,
     total_requests: AtomicU64,
     active_connections: AtomicU64,
     shutdown: AtomicBool,
     last_activity: RwLock<Instant>,
-    worker_handle: parking_lot::Mutex<Option<EmbeddingWorkerHandle>>,
 }
 
 impl ModelDaemon {
     /// Create a new daemon with the given configuration.
-    pub fn new(config: DaemonConfig, models: ModelManager) -> Self {
+    pub fn new(config: DaemonConfig) -> Self {
         Self {
             config,
-            models: Arc::new(models),
             resources: ResourceMonitor::new(),
             start_time: Instant::now(),
             total_requests: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             last_activity: RwLock::new(Instant::now()),
-            worker_handle: parking_lot::Mutex::new(None),
         }
     }
 
-    /// Create daemon with default config and models from data directory.
-    pub fn with_defaults(data_dir: &Path) -> Self {
-        let config = DaemonConfig::from_env();
-        let models = ModelManager::new(data_dir);
-        Self::new(config, models)
+    /// Create a daemon with the default control configuration.
+    pub fn with_defaults() -> Self {
+        Self::new(DaemonConfig::from_env())
     }
 
     /// Get current uptime in seconds.
@@ -298,27 +291,6 @@ impl ModelDaemon {
         }
         let memory_bytes = self.resources.memory_usage();
         memory_bytes > self.config.memory_limit
-    }
-
-    /// Initialize the background embedding worker thread.
-    fn init_worker(&self) {
-        let (worker, handle) = EmbeddingWorker::new();
-        match std::thread::Builder::new()
-            .name("embedding-worker".into())
-            .spawn(move || worker.run())
-        {
-            Ok(_) => {
-                *self.worker_handle.lock() = Some(handle);
-                info!("Embedding worker initialized");
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "Failed to spawn embedding worker - background jobs will be unavailable"
-                );
-                // Continue without worker - daemon can still handle other requests
-            }
-        }
     }
 
     /// Start the daemon server.
@@ -393,19 +365,6 @@ impl ModelDaemon {
             "Daemon listening"
         );
 
-        // Pre-warm models if available
-        info!("Pre-warming models...");
-        if let Err(e) = self.models.warm_embedder() {
-            warn!(error = %e, "Failed to pre-warm embedder");
-        }
-        if let Err(e) = self.models.warm_reranker() {
-            warn!(error = %e, "Failed to pre-warm reranker");
-        }
-        info!("Model pre-warming complete");
-
-        // Start background embedding worker
-        self.init_worker();
-
         std::thread::scope(|s| {
             loop {
                 // Check for shutdown
@@ -467,14 +426,6 @@ impl ModelDaemon {
                 }
             }
         });
-
-        // Shutdown embedding worker
-        let worker_handle = self.worker_handle.lock().take();
-        if let Some(handle) = worker_handle
-            && let Err(e) = handle.shutdown()
-        {
-            warn!(error = %e, "Failed to send shutdown to embedding worker");
-        }
 
         // Cleanup
         cleanup_bound_socket(&public_path, &bind_path);
@@ -625,132 +576,30 @@ impl ModelDaemon {
 
     /// Handle a single request.
     fn handle_request(&self, request_id: String, request: Request) -> Response {
-        let start = Instant::now();
-
         match request {
             Request::Health => Response::Health(HealthStatus {
                 uptime_secs: self.uptime_secs(),
                 version: PROTOCOL_VERSION,
-                ready: self.models.is_ready(),
+                ready: false,
                 memory_bytes: self.resources.memory_usage(),
             }),
 
-            Request::Embed {
-                texts,
-                model,
-                dims: _,
-            } => {
-                debug!(
-                    request_id = %request_id,
-                    batch_size = texts.len(),
-                    model = %model,
-                    "Processing embed request"
-                );
-
-                match self.models.embed_batch(&texts) {
-                    Ok(embeddings) => Response::Embed(EmbedResponse {
-                        embeddings,
-                        model: self.models.embedder_id().to_string(),
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }),
-                    Err(e) => Response::Error(ErrorResponse {
-                        code: ErrorCode::ModelLoadFailed,
-                        message: e.to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
-            }
-
-            Request::Rerank {
-                query,
-                documents,
-                model,
-            } => {
-                debug!(
-                    request_id = %request_id,
-                    doc_count = documents.len(),
-                    model = %model,
-                    "Processing rerank request"
-                );
-
-                match self.models.rerank(&query, &documents) {
-                    Ok(scores) => Response::Rerank(RerankResponse {
-                        scores,
-                        model: self.models.reranker_id().to_string(),
-                        elapsed_ms: start.elapsed().as_millis() as u64,
-                    }),
-                    Err(e) => Response::Error(ErrorResponse {
-                        code: ErrorCode::ModelLoadFailed,
-                        message: e.to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
-            }
+            Request::Embed { .. } | Request::Rerank { .. } | Request::SubmitEmbeddingJob { .. } => Response::Error(ErrorResponse {
+                code: ErrorCode::InvalidInput,
+                message: "ModelApiMigration: daemon model execution and legacy jobs are retired; use --api-config with search or models backfill".into(),
+                retryable: false,
+                retry_after_ms: None,
+            }),
 
             Request::Status => {
-                let embedder_info = ModelInfo {
-                    id: self.models.embedder_id().to_string(),
-                    name: self.models.embedder_name().to_string(),
-                    dimension: Some(self.models.embedder_dimension()),
-                    loaded: self.models.embedder_loaded(),
-                    memory_bytes: 0, // Would need model-specific tracking
-                };
-
-                let reranker_info = ModelInfo {
-                    id: self.models.reranker_id().to_string(),
-                    name: self.models.reranker_name().to_string(),
-                    dimension: None,
-                    loaded: self.models.reranker_loaded(),
-                    memory_bytes: 0,
-                };
-
                 Response::Status(StatusResponse {
                     uptime_secs: self.uptime_secs(),
                     version: PROTOCOL_VERSION,
-                    embedders: vec![embedder_info],
-                    rerankers: vec![reranker_info],
+                    embedders: vec![],
+                    rerankers: vec![],
                     memory_bytes: self.resources.memory_usage(),
                     total_requests: self.total_requests.load(Ordering::Relaxed),
                 })
-            }
-
-            Request::SubmitEmbeddingJob {
-                db_path,
-                index_path,
-                two_tier,
-                fast_model,
-                quality_model,
-            } => {
-                let config = EmbeddingJobConfig {
-                    db_path,
-                    index_path,
-                    two_tier,
-                    fast_model,
-                    quality_model,
-                };
-                let worker_handle = self.worker_handle.lock().clone();
-                match worker_handle {
-                    Some(handle) => match handle.submit(config) {
-                        Ok(()) => Response::JobSubmitted {
-                            job_id: request_id.clone(),
-                            message: "embedding job submitted".to_string(),
-                        },
-                        Err(e) => Response::Error(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!("failed to submit job: {e}"),
-                            retryable: true,
-                            retry_after_ms: Some(1000),
-                        }),
-                    },
-                    None => Response::Error(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: "embedding worker not initialized".to_string(),
-                        retryable: true,
-                        retry_after_ms: Some(1000),
-                    }),
-                }
             }
 
             Request::EmbeddingJobStatus { db_path } => {
@@ -789,15 +638,7 @@ impl ModelDaemon {
             }
 
             Request::CancelEmbeddingJob { db_path, model_id } => {
-                // Send cancel to worker
-                let worker_handle = self.worker_handle.lock().clone();
-                if let Some(handle) = worker_handle
-                    && let Err(e) = handle.cancel(db_path.clone(), model_id.clone())
-                {
-                    warn!(error = %e, "Failed to send cancel to embedding worker");
-                }
-
-                // Also cancel in database
+                // Cancel historical jobs in the database
                 // w1b Task B8 (d16, open-consumer audit): write path.
                 match crate::storage::sqlite::FrankenStorage::open_writer(std::path::Path::new(&db_path)) {
                     Ok(storage) => {
@@ -845,8 +686,47 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn test_data_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    #[test]
+    fn legacy_model_requests_return_migration_errors_over_real_socket() {
+        use std::os::unix::net::UnixStream;
+        let daemon = Arc::new(ModelDaemon::new(DaemonConfig::default()));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let handler = daemon.clone();
+        let thread = std::thread::spawn(move || handler.handle_connection(server));
+        let root = TempDir::new().unwrap();
+        let untouched = root.path().join("must-not-be-created.db");
+        let requests = [
+            Request::Embed { texts:vec!["synthetic input".into()], model:"retired-model".into(), dims:Some(384) },
+            Request::Rerank { query:"query".into(), documents:vec!["document".into()], model:"retired-model".into() },
+            Request::SubmitEmbeddingJob { db_path:untouched.display().to_string(), index_path:root.path().display().to_string(), two_tier:true, fast_model:None, quality_model:None },
+            Request::Status,
+            Request::Health,
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let id = index.to_string();
+            client.write_all(&encode_message(&FramedMessage::new(&id, request)).unwrap()).unwrap();
+            let mut prefix = [0u8;4]; client.read_exact(&mut prefix).unwrap();
+            let mut body = vec![0;u32::from_be_bytes(prefix) as usize]; client.read_exact(&mut body).unwrap();
+            let response: FramedMessage<Response> = decode_message(&body).unwrap();
+            assert_eq!(response.request_id, id);
+            match (index, response.payload) {
+                (0 | 1 | 2, Response::Error(error)) => {
+                    assert_eq!(error.code, ErrorCode::InvalidInput);
+                    assert!(!error.retryable);
+                    assert!(error.retry_after_ms.is_none());
+                    assert!(error.message.contains("ModelApiMigration"));
+                }
+                (3, Response::Status(status)) => {
+                    assert!(status.embedders.is_empty()); assert!(status.rerankers.is_empty());
+                }
+                (4, Response::Health(health)) => assert!(!health.ready),
+                (_, other) => panic!("unexpected daemon response: {other:?}"),
+            }
+        }
+        assert!(!untouched.exists(), "retired job submission must not open or create a database");
+        drop(client);
+        thread.join().unwrap().unwrap();
     }
 
     #[test]
@@ -860,8 +740,7 @@ mod tests {
     #[test]
     fn test_daemon_uptime() {
         let config = DaemonConfig::default();
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = ModelDaemon::new(config, models);
+        let daemon = ModelDaemon::new(config);
 
         // Uptime should be 0 or 1 second initially
         let initial = daemon.uptime_secs();
@@ -874,8 +753,7 @@ mod tests {
     #[test]
     fn test_activity_tracking() {
         let config = DaemonConfig::default();
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = ModelDaemon::new(config, models);
+        let daemon = ModelDaemon::new(config);
 
         let before = *daemon.last_activity.read();
         std::thread::sleep(Duration::from_millis(10));
@@ -888,8 +766,7 @@ mod tests {
     #[test]
     fn test_shutdown_flag() {
         let config = DaemonConfig::default();
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = ModelDaemon::new(config, models);
+        let daemon = ModelDaemon::new(config);
 
         assert!(!daemon.shutdown.load(Ordering::SeqCst));
         daemon.request_shutdown();
@@ -899,8 +776,7 @@ mod tests {
     #[test]
     fn test_idle_timeout_disabled_by_default() {
         let config = DaemonConfig::default();
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = ModelDaemon::new(config, models);
+        let daemon = ModelDaemon::new(config);
 
         // With idle_timeout = 0, should never trigger idle shutdown
         assert!(!daemon.should_shutdown_idle());
@@ -991,8 +867,7 @@ mod tests {
             request_timeout: Duration::from_secs(10),
             ..Default::default()
         };
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = Arc::new(ModelDaemon::new(config, models));
+        let daemon = Arc::new(ModelDaemon::new(config));
 
         let (server_side, _client_side) = UnixStream::pair().expect("create socketpair");
 
@@ -1055,8 +930,7 @@ mod tests {
             request_timeout: Duration::from_secs(10),
             ..Default::default()
         };
-        let models = ModelManager::new(&test_data_dir());
-        let daemon = Arc::new(ModelDaemon::new(config, models));
+        let daemon = Arc::new(ModelDaemon::new(config));
 
         let (server_side, mut client_side) = UnixStream::pair().expect("create socketpair");
         client_side

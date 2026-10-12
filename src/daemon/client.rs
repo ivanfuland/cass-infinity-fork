@@ -21,7 +21,7 @@ use super::protocol::{
     EmbeddingJobInfo, ErrorCode, FramedMessage, HealthStatus, PROTOCOL_VERSION, Request, Response,
     decode_message, default_socket_path, encode_message,
 };
-use super::worker::EmbeddingJobConfig;
+use super::protocol::EmbeddingJobConfig;
 use crate::search::daemon_client::{DaemonClient, DaemonError};
 
 fn connection_not_established() -> DaemonError {

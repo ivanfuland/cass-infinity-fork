@@ -3583,3 +3583,23 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod integer_conversion_contract_tests {
+    use super::{message_id_from_db, saturating_u32_from_i64};
+    #[test]
+    fn test_message_id_from_db_rejects_negative_ids() {
+        assert_eq!(message_id_from_db(-1), None);
+        assert_eq!(message_id_from_db(0), Some(0));
+        assert_eq!(message_id_from_db(42), Some(42));
+    }
+
+    #[test]
+    fn test_saturating_u32_from_i64_clamps_bounds() {
+        assert_eq!(saturating_u32_from_i64(-7), 0);
+        assert_eq!(saturating_u32_from_i64(0), 0);
+        assert_eq!(saturating_u32_from_i64(7), 7);
+        assert_eq!(saturating_u32_from_i64(i64::from(u32::MAX) + 123), u32::MAX);
+    }
+
+}
