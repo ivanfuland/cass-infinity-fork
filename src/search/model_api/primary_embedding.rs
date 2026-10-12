@@ -71,8 +71,8 @@ pub enum PrimaryEmbedFailure {
     Routed { code: &'static str },
     /// The primary failed inside the frozen cloud-eligible set while a fallback
     /// was declared and not disabled. Producing vectors here would need the
-    /// cross-endpoint compatibility evidence of spec §6.4, which this build does
-    /// not implement, so the batch is refused instead of being sent anywhere else.
+    /// cross-endpoint compatibility evidence of spec §6.4. Without valid
+    /// evidence the batch is refused before any backup request.
     CompatibilityRequired { code: &'static str },
 }
 
@@ -92,7 +92,7 @@ impl PrimaryEmbedFailure {
             }
             Self::CompatibilityRequired { code } => format!(
                 "CompatibilityRequired: the embedding primary failed in the eligible set ({code}) \
-                 and a fallback is declared; this build has no verified cross-endpoint \
+                 and a fallback is declared; this route has no verified cross-endpoint \
                  compatibility evidence, so the batch was not sent to the fallback and no \
                  vectors were produced"
             ),
@@ -222,6 +222,7 @@ pub struct PrimaryEmbeddingCall {
     audit_calls: RefCell<Vec<EmbeddingCallEvidence>>,
     last_failure: RefCell<Option<PrimaryEmbedFailure>>,
     page_writers: RefCell<Vec<ValidatedProfile>>,
+    probe_writers: RefCell<Vec<ValidatedProfile>>,
     fallback_used: Cell<bool>,
 }
 
@@ -251,12 +252,17 @@ impl PrimaryEmbeddingCall {
             audit_calls: RefCell::new(Vec::new()),
             last_failure: RefCell::new(None),
             page_writers: RefCell::new(Vec::new()),
+            probe_writers: RefCell::new(Vec::new()),
             fallback_used: Cell::new(false),
         })
     }
 
     pub(crate) fn route(&self) -> &super::embedding_route::EmbeddingRoute {
         &self.route
+    }
+
+    pub(crate) fn probe_writers(&self) -> Vec<ValidatedProfile> {
+        self.probe_writers.borrow().clone()
     }
 
     pub(crate) fn page_writers(&self) -> Vec<ValidatedProfile> {
@@ -326,18 +332,30 @@ impl PrimaryEmbeddingCall {
     /// second probe on this same call re-probes the live endpoint; nothing is
     /// cached across commands.
     pub fn probe(&self) -> Result<ProbeMeasurement, PrimaryEmbedFailure> {
+        self.probed_dimension.set(0);
+        self.probe_writers.borrow_mut().clear();
+        self.page_writers.borrow_mut().clear();
+        let mut writers = Vec::<ValidatedProfile>::new();
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(API_PROBE_SENTINELS.len());
         let mut dimension: Option<usize> = None;
         for batch in API_PROBE_SENTINELS.chunks(self.max_batch()) {
             let inputs: Vec<String> = batch.iter().map(|text| (*text).to_string()).collect();
-            let outcome =
-                match self
-                    .client
-                    .embed_once(&self.profile.id, &inputs, InputKind::Document)
-                {
+            let outcome = if let Some(proof) = &self.route.proof {
+                self.route.embed(&self.client, &inputs, InputKind::Document, proof.primary_dimension(),
+                    &proof.header().primary_descriptor_sha256)
+                    .map_err(|failure| self.record_route_failure(failure, EvidenceStage::Probe))?
+            } else {
+                match self.client.embed_once(&self.profile.id, &inputs, InputKind::Document) {
                     Ok(outcome) => outcome,
                     Err(failure) => return Err(self.record_failure(failure, EvidenceStage::Probe)),
-                };
+                }
+            };
+            if let Some(attempt) = outcome.attempts.last() {
+                if attempt.stage == super::AttemptStage::Fallback { self.fallback_used.set(true); }
+                if let Some(writer) = self.client.config().profile(&attempt.profile_id) {
+                    if !writers.iter().any(|p| p.id == writer.id) { writers.push(writer.clone()); }
+                }
+            }
             match dimension {
                 None => {
                     dimension = Some(outcome.dimension);
@@ -363,6 +381,7 @@ impl PrimaryEmbeddingCall {
         // `chunks` always yields at least one batch and `dimension` is set.
         let dimension = dimension.expect("a non-empty sentinel list always yields one probe batch");
         self.probed_dimension.set(dimension);
+        *self.probe_writers.borrow_mut() = writers;
         let mut fingerprint = Vec::with_capacity(vectors.len() * dimension * 4);
         for vector in &vectors {
             fingerprint.extend_from_slice(&f32_vector_to_le_blob(vector));
@@ -413,17 +432,7 @@ impl PrimaryEmbeddingCall {
                     .map_err(|_| self.record_typed(PrimaryEmbedFailure::Routed { code: "InvalidDescriptor" }))?;
                 match self.route.embed(&self.client, batch, InputKind::Document, expected, &descriptor.sha256()) {
                     Ok(outcome) => outcome,
-                    Err(failure) => {
-                        let mut buffer = self.evidence_buffer(stage).borrow_mut();
-                        for attempt in &failure.attempts {
-                            buffer.push(evidence_row(stage, &attempt.profile_id, attempt.network_attempted,
-                                attempt.http_status, attempt.error_code, attempt.duration_ms, &attempt.identity));
-                        }
-                        drop(buffer);
-                        return Err(self.record_typed(if failure.compatibility_required {
-                            PrimaryEmbedFailure::CompatibilityRequired { code: failure.code }
-                        } else { PrimaryEmbedFailure::Routed { code: failure.code } }));
-                    }
+                    Err(failure) => return Err(self.record_route_failure(failure, stage)),
                 }
             } else {
                 match self.client.embed_once(&self.profile.id, batch, InputKind::Document) {
@@ -494,6 +503,18 @@ impl PrimaryEmbeddingCall {
                 &attempt.identity,
             ));
         }
+    }
+
+    fn record_route_failure(&self, failure: super::embedding_route::RoutedEmbedFailure, stage: EvidenceStage) -> PrimaryEmbedFailure {
+        let mut buffer = self.evidence_buffer(stage).borrow_mut();
+        for attempt in &failure.attempts {
+            buffer.push(evidence_row(stage, &attempt.profile_id, attempt.network_attempted,
+                attempt.http_status, attempt.error_code, attempt.duration_ms, &attempt.identity));
+        }
+        drop(buffer);
+        self.record_typed(if failure.compatibility_required {
+            PrimaryEmbedFailure::CompatibilityRequired { code: failure.code }
+        } else { PrimaryEmbedFailure::Routed { code: failure.code } })
     }
 
     /// Record one refused request and classify it into a typed failure.
@@ -614,6 +635,38 @@ mod page_writer_tests {
         assert_eq!(calls[1].profile_id, "backup");
         assert_eq!(primary.hits(), 2);
         assert_eq!(backup.fixture().hits(), 1);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn backup_can_probe_and_embed_when_primary_is_already_down() {
+        use super::super::compatibility_bundle::tests::fallback_fixture;
+        use super::super::test_support::TlsFixture;
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let client = ApiClient::new_with_test_root(config, Box::new(super::super::EnvCredentialResolver), backup.ca_pem().to_vec());
+        let mut call = PrimaryEmbeddingCall::new(client, profile, true).unwrap();
+        call.route.proof_sha256 = Some(proof.digest().into());
+        call.route.proof = Some(std::sync::Arc::new(proof));
+        let probe = call.probe().unwrap();
+        assert_eq!(probe.dimension, 2);
+        assert_eq!(probe.fingerprint.len(), 3 * 2 * 4);
+        assert_eq!(call.probe_writers().iter().map(|p|p.id.as_str()).collect::<Vec<_>>(), vec!["backup"]);
+        assert_eq!(call.probe_calls().len(), 2);
+        assert_eq!(call.probe_calls()[1].profile_id, "backup");
+        assert_eq!(call.embed_documents(&["first", "second"]).unwrap().len(), 2);
+        assert_eq!(call.page_writers()[0].id, "backup");
+        assert_eq!(primary.hits(), 2);
+        assert_eq!(backup.fixture().hits(), 2);
+        call.route.allow_fallback = false;
+        assert!(call.probe().is_err());
+        assert_eq!(call.dimension(), 0, "a failed fresh probe must invalidate its old dimension");
+        assert!(call.probe_writers().is_empty());
+        assert!(call.page_writers().is_empty());
+        assert_eq!(call.embed_documents(&["later"]).unwrap_err(), PrimaryEmbedFailure::ProbeMissing);
+        assert_eq!(backup.fixture().hits(), 2);
     }
 
     #[test]

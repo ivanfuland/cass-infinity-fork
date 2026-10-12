@@ -384,7 +384,7 @@ fn a_generation_is_created_and_read_back_as_one_space() {
             .expect("the generation verifies in the writing transaction");
         assert_eq!(verified.generation_id(), generation_id);
         assert_eq!(verified.descriptor_sha256(), record.descriptor_sha256());
-        assert_eq!(verified.primary_contributor().model(), EMBED_MODEL);
+        assert_eq!(verified.primary_contributor().expect("pure primary").model(), EMBED_MODEL);
 
         tx.commit().expect("commit the caller transaction");
         generation_id

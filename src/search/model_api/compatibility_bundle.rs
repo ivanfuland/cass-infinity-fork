@@ -204,6 +204,9 @@ impl CheckedBundle {
         }
         Ok(Self { header,digest:sha(bytes),original_json:String::from_utf8(bytes.to_vec()).map_err(|_|Error::InvalidEvidence)?,captures })
     }
+    pub(crate) fn primary_dimension(&self) -> usize {
+        self.captures.get(&self.header.primary_capture_sha256).expect("checked primary capture").dimension()
+    }
     pub(crate) fn digest(&self)->&str { &self.digest }
     pub(crate) fn original_json(&self)->&str { &self.original_json }
     pub(crate) fn capture_profile(&self, pin:&str)->Option<&ValidatedProfile> { self.captures.get(pin).map(|c|&c.profile) }
@@ -281,7 +284,7 @@ pub(crate) mod tests {
             fixed_provider:None,members,comparisons,conclusion:"compatible".into()};
         (bundle,files,primary)
     }
-    pub(in crate::search::model_api) fn fallback_fixture(local: &str, cloud: &str)
+    pub(crate) fn fallback_fixture(local: &str, cloud: &str)
         -> (super::super::ValidatedApiConfig, CheckedBundle) {
         let (bytes, f) = fixture();
         let mut a = archive(&f, 1);

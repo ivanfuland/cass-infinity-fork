@@ -31,7 +31,7 @@ use crate::search::model_api::{
     RepresentationDescriptor, ValidatedProfile,
 };
 use crate::storage::api::{Conn, StorageError, Tx, TxMode, params};
-use crate::storage::api_generation::{create_api_generation, register_api_contribution};
+use crate::storage::api_generation::{create_api_generation, create_api_generation_with_producers, register_api_contribution};
 use crate::storage::schema::{self, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
@@ -1913,8 +1913,16 @@ fn find_or_create_api_generation(
             // current service instance may still match.
         }
 
-        let generation_id = create_api_generation(tx, profile, dimension as u64, fingerprint, now_ms)
-            .map_err(StorageError::from)?;
+        let producers = call.probe_writers();
+        let used_backup = producers.iter().any(|writer| writer.id != profile.id);
+        let generation_id = if used_backup {
+            let proof = call.route().proof.as_ref().ok_or_else(|| StorageError::Other {
+                code: None, detail: "CompatibilityRequired".into(),
+            })?;
+            create_api_generation_with_producers(tx, profile, dimension as u64, fingerprint, now_ms, &producers, proof)
+        } else {
+            create_api_generation(tx, profile, dimension as u64, fingerprint, now_ms)
+        }.map_err(StorageError::from)?;
         let holes: Vec<(i64, u32)> = all_expected
             .iter()
             .map(|c| (c.message_id, c.chunk_idx))

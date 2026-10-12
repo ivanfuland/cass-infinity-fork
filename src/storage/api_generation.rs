@@ -1153,6 +1153,36 @@ pub fn create_api_generation(
     Ok(generation_id)
 }
 
+/// Establish a new canonical space with the backends that actually produced
+/// its probe. Both metadata records remain in the caller's creation transaction.
+pub(crate) fn create_api_generation_with_producers(
+    tx: &Tx, primary: &ValidatedProfile, dimension: u64, fingerprint: &[u8], now: i64,
+    producers: &[ValidatedProfile], proof: &crate::search::model_api::compatibility_bundle::CheckedBundle,
+) -> Result<i64, ApiGenerationError> {
+    if producers.is_empty() { return Err(compatibility_required()); }
+    let id = create_api_generation(tx, primary, dimension, fingerprint, now)?;
+    let mut verified = open_api_generation(tx, id, primary)?;
+    let mut contributors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for writer in producers {
+        let endpoint = EndpointConfigIdentity::from_profile(writer).map_err(ApiGenerationError::from_config)?;
+        if !seen.insert(endpoint.sha256()) { continue; }
+        if proof.selected_capture(&endpoint.sha256()).is_none() { return Err(compatibility_required()); }
+        let descriptor = RepresentationDescriptor::from_profile(writer, dimension).map_err(ApiGenerationError::from_profile_identity)?;
+        let mut contributor = ApiGenerationContributor::primary(&descriptor, writer, &endpoint)?;
+        contributor.compatibility_evidence_header = Some(HeaderPresent::from_checked(proof)?);
+        contributor.compatibility_evidence_sha256 = Some(proof.digest().into());
+        contributors.push(contributor);
+    }
+    verified.provenance.contributors = contributors;
+    check_provenance_with_compatibility(&verified.provenance, &verified.record, primary, proof)?;
+    let text = canonical_text(verified.provenance.canonical_bytes()?)?;
+    let changed = tx.execute("UPDATE meta SET value=?1 WHERE key=?2",
+        &params![text, verified.provenance.meta_key()]).map_err(ApiGenerationError::Storage)?;
+    if changed != 1 { return Err(ApiGenerationError::plain(ApiGenerationErrorCode::InvalidRecord)); }
+    Ok(id)
+}
+
 // ---------------------------------------------------------------------------
 // Open
 // ---------------------------------------------------------------------------
@@ -1196,11 +1226,10 @@ impl VerifiedPrimaryGeneration {
         &self.provenance
     }
 
-    /// The single pure-primary contributor, already admitted.
-    pub fn primary_contributor(&self) -> &ApiGenerationContributor {
-        // `single_primary_contributor` ran to build this value, so index 0
-        // exists and carries no compatibility evidence.
-        &self.provenance.contributors[0]
+    /// Return a pure-primary contributor only when this is still a pure-primary
+    /// generation. A proof-aware generation must inspect full provenance.
+    pub fn primary_contributor(&self) -> Result<&ApiGenerationContributor, ApiGenerationError> {
+        self.provenance.single_primary_contributor()
     }
 }
 
@@ -1315,8 +1344,13 @@ fn check_provenance_with_compatibility(
     proof:&crate::search::model_api::compatibility_bundle::CheckedBundle,
 )->Result<(),ApiGenerationError> {
     let first=provenance.contributors.first().ok_or_else(||ApiGenerationError::plain(ApiGenerationErrorCode::InvalidProvenance))?;
-    if first.compatibility_evidence_header.is_some() || first.compatibility_evidence_sha256.is_some() {return Err(compatibility_required());}
-    check_contributor_against_descriptor(first,record.descriptor())?;
+    // A generation may start on an admitted backup while its primary is down.
+    // Its first actual producer then carries proof, rather than a fabricated
+    // pure-primary contribution. The loop below validates that proof normally.
+    if first.compatibility_evidence_header.is_none() {
+        if first.compatibility_evidence_sha256.is_some() { return Err(compatibility_required()); }
+        check_contributor_against_descriptor(first,record.descriptor())?;
+    }
     check_descriptor_against_profile(record.descriptor(),primary)?;
     let primary_sha=EndpointConfigIdentity::from_profile(primary).map_err(ApiGenerationError::from_config)?.sha256();
     let header=proof.header();
@@ -1529,6 +1563,28 @@ mod compatibility_tests {
     use super::*;
     use crate::search::model_api::compatibility_bundle::tests::migration_fixture;
     use crate::storage::api::{TxMode, StorageError};
+
+    #[test]
+    fn backup_only_generation_keeps_canonical_space_without_inventing_primary_production() {
+        use crate::search::model_api::compatibility_bundle::tests::fallback_fixture;
+        let (config, proof) = fallback_fixture("http://127.0.0.1:1/embedding", "https://example.invalid/embedding");
+        let primary = config.profile("primary").unwrap();
+        let backup = config.profile("backup").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::storage::sqlite::FrankenStorage::open(&root.path().join("db.sqlite")).unwrap();
+        let id = storage.raw().with_tx(TxMode::Immediate, |tx| create_api_generation_with_producers(
+            tx, primary, 2, &[1;24], 1, &[backup.clone()], &proof).map_err(StorageError::from)).unwrap();
+        assert!(storage.raw().with_tx(TxMode::Deferred, |tx| open_api_generation(tx,id,primary).map_err(StorageError::from)).is_err());
+        let verified = storage.raw().with_tx(TxMode::Deferred, |tx| open_api_generation_with_compatibility(tx,id,primary,&proof).map_err(StorageError::from)).unwrap();
+        assert_eq!(verified.descriptor_sha256(), proof.header().primary_descriptor_sha256);
+        assert_eq!(verified.provenance().contributors().len(), 1);
+        assert!(verified.primary_contributor().is_err());
+        assert_eq!(verified.provenance().contributors()[0].endpoint_config_sha256,
+            EndpointConfigIdentity::from_profile(backup).unwrap().sha256());
+        storage.raw().with_tx(TxMode::Immediate, |tx| register_api_contribution(tx,id,primary,primary,&proof).map_err(StorageError::from)).unwrap();
+        let verified = storage.raw().with_tx(TxMode::Deferred, |tx| open_api_generation_with_compatibility(tx,id,primary,&proof).map_err(StorageError::from)).unwrap();
+        assert_eq!(verified.provenance().contributors().len(), 2);
+    }
 
     #[test]
     fn contribution_and_page_failure_share_the_callers_transaction() {
