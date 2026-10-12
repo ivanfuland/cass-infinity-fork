@@ -106627,80 +106627,6 @@ mod regression_search_orchestration_tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    fn server(status: u16) -> (String, std::thread::JoinHandle<serde_json::Value>) {
-        server_with_manifest_change(status, None)
-    }
-
-    fn server_with_manifest_change(
-        status: u16,
-        manifest: Option<PathBuf>,
-    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
-        server_with_output_change(status, manifest, None)
-    }
-
-    fn server_with_output_change(
-        status: u16,
-        manifest: Option<PathBuf>,
-        blocked_cache_root: Option<PathBuf>,
-    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let worker = std::thread::spawn(move || {
-            let mut captured = serde_json::Value::Null;
-            for step in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let mut part = [0u8; 4096];
-                loop {
-                    let n = stream.read(&mut part).unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&part[..n]);
-                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                        let header = String::from_utf8_lossy(&bytes[..end]);
-                        let length = header
-                            .lines()
-                            .filter_map(|line| line.split_once(':'))
-                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
-                            .unwrap_or(0);
-                        if bytes.len() >= end + 4 + length {
-                            if step == 1 {
-                                captured =
-                                    serde_json::from_slice(&bytes[end + 4..end + 4 + length])
-                                        .unwrap();
-                            }
-                            break;
-                        }
-                    }
-                }
-                let body = if step == 0 {
-                    serde_json::json!({"data":[{"id":"BAAI/bge-reranker-v2-m3"}]})
-                } else {
-                    let count = captured["documents"].as_array().unwrap().len();
-                    serde_json::json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..count).map(|i| serde_json::json!({"index":i,"relevance_score":1.0})).collect::<Vec<_>>()})
-                }.to_string();
-                if step == 1 {
-                    if let Some(path) = manifest.as_ref() {
-                        std::fs::write(path, b"changed synthetic source manifest\n").unwrap();
-                    }
-                    if let Some(path) = blocked_cache_root.as_ref() {
-                        std::fs::write(path.join("cache"), b"blocked").unwrap();
-                    }
-                }
-                let response_status = if step == 0 { 200 } else { status };
-                if step == 1 && status == 0 {
-                    continue;
-                }
-                write!(stream, "HTTP/1.1 {response_status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
-            captured
-        });
-        (origin, worker)
-    }
-
     fn evidence(root: &std::path::Path) -> WindowEvidence {
         let path = std::fs::read_dir(root)
             .unwrap()
@@ -107074,7 +107000,13 @@ model_revision="r1"
             regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
         let before = std::fs::read(&db).unwrap();
         let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
-        let (origin, worker) = server_with_output_change(200, None, Some(run_root.clone()));
+        let blocked_cache_root = run_root.clone();
+        let (origin, worker) = api_rerank_fixture(move || {
+            // The scoring POST is read and about to be answered; a file now
+            // occupies the cache directory path, so the window write that must
+            // follow a successful score cannot create its directory.
+            std::fs::write(blocked_cache_root.join("cache"), b"blocked").unwrap();
+        });
         let result = search(
             execution(context, &expected, &pin, &manifest, Some(origin)),
             true,
