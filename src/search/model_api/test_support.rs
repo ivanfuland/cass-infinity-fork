@@ -40,6 +40,8 @@ const FIXTURE_LIFETIME: Duration = Duration::from_secs(30);
 pub enum Reply {
     /// Unit vectors for each actual submitted input; used by full indexing tests.
     Embeddings(usize),
+    /// Switch a live fixture between two replies without changing its endpoint.
+    Conditional(Arc<AtomicBool>, Box<Reply>, Box<Reply>),
     /// A JSON body with the given status.
     Json(u16, Value),
     /// Exact response bytes, for the malformed and odd-shape cases.
@@ -347,6 +349,10 @@ fn write_reply<S: Read + Write>(
     request: &RecordedRequest,
 ) {
     match reply {
+        Reply::Conditional(flag, when_false, when_true) => {
+            let selected = if flag.load(Ordering::SeqCst) { when_true } else { when_false };
+            write_reply(stream, selected, stop, deadline, request);
+        }
         Reply::Embeddings(dimension) => {
             let body = request.body();
             let inputs = body["input"].as_array().expect("embedding inputs");

@@ -5134,6 +5134,8 @@ pub struct CassApp {
     pub results_list_state: RefCell<VirtualizedListState>,
     /// Whether wildcard fallback was triggered for the current query.
     pub wildcard_fallback: bool,
+    /// The displayed result includes an allowed semantic-to-lexical fallback.
+    pub semantic_degraded: bool,
     /// Did-you-mean / filter suggestions for the current query.
     pub suggestions: Vec<QuerySuggestion>,
     /// Elapsed time of the last search (for latency badge).
@@ -5505,6 +5507,7 @@ impl Default for CassApp {
             per_pane_limit: 0,
             results_list_state: RefCell::new(VirtualizedListState::new()),
             wildcard_fallback: false,
+            semantic_degraded: false,
             suggestions: Vec::new(),
             last_search_ms: None,
             search_error_message: None,
@@ -5683,6 +5686,11 @@ impl Default for CassApp {
 }
 
 impl CassApp {
+    fn disclose_semantic_fallback(&mut self) {
+        const SUFFIX: &str = " · lexical fallback (semantic search unavailable)";
+        if self.semantic_degraded && !self.status.ends_with(SUFFIX) { self.status.push_str(SUFFIX); }
+    }
+
     /// Reload persisted theme configuration from `self.data_dir/theme.json`.
     ///
     /// Baseline always starts from env-derived style options to keep startup
@@ -7177,6 +7185,7 @@ impl CassApp {
                     elapsed_ms: result.elapsed_ms,
                     suggestions: result.suggestions,
                     wildcard_fallback: result.wildcard_fallback,
+                    semantic_degraded: result.semantic_degraded,
                     append: matches!(pass, SearchPass::Pagination),
                 },
                 Err(e) => CassMsg::SearchFailed {
@@ -14075,6 +14084,7 @@ pub enum CassMsg {
         elapsed_ms: u128,
         suggestions: Vec<QuerySuggestion>,
         wildcard_fallback: bool,
+        semantic_degraded: bool,
         /// When true, append hits to the existing result set instead of replacing it.
         append: bool,
     },
@@ -15295,6 +15305,8 @@ pub struct SearchResult {
     pub elapsed_ms: u128,
     pub suggestions: Vec<QuerySuggestion>,
     pub wildcard_fallback: bool,
+    /// The displayed result includes an allowed semantic-to-lexical fallback.
+    pub semantic_degraded: bool,
 }
 
 /// Background indexing with progress reporting.
@@ -15445,6 +15457,7 @@ impl TantivySearchService {
                 elapsed_ms: result.elapsed_ms,
                 suggestions: result.suggestions,
                 wildcard_fallback: result.wildcard_fallback,
+                semantic_degraded: result.semantic_degraded,
                 append: matches!(params.pass, SearchPass::Pagination),
             },
             Err(error) => CassMsg::SearchFailed { generation, error },
@@ -15491,6 +15504,7 @@ impl SearchService for TantivySearchService {
                 elapsed_ms: started.elapsed().as_millis(),
                 suggestions: Vec::new(),
                 wildcard_fallback: false,
+                semantic_degraded: false,
             });
         }
 
@@ -15549,6 +15563,7 @@ impl SearchService for TantivySearchService {
             elapsed_ms: started.elapsed().as_millis(),
             suggestions: backend.suggestions,
             wildcard_fallback: backend.wildcard_fallback,
+            semantic_degraded: backend.semantic_degraded,
         })
     }
 }
@@ -17000,12 +17015,14 @@ impl super::ftui_adapter::Model for CassApp {
                 elapsed_ms,
                 suggestions,
                 wildcard_fallback,
+                semantic_degraded,
                 append,
             } => {
                 if generation != self.search_generation {
                     // Stale async completion from an older query — ignore.
                     return ftui::Cmd::none();
                 }
+                self.semantic_degraded = if append { self.semantic_degraded || semantic_degraded } else { semantic_degraded };
                 let progressive_initial = matches!(pass, SearchPass::Interactive)
                     && self.live_request_is_progressive_for(generation);
                 self.search_in_flight = false;
@@ -17050,6 +17067,7 @@ impl super::ftui_adapter::Model for CassApp {
                             ""
                         }
                     );
+                    self.disclose_semantic_fallback();
                     // If the user typed while the request was in-flight, schedule
                     // the next debounced search now that we're idle again.
                     if let Some(dirty_ts) = self.search_dirty_since {
@@ -17105,6 +17123,7 @@ impl super::ftui_adapter::Model for CassApp {
                         }
                     ),
                 };
+                self.disclose_semantic_fallback();
                 // Warn on slow searches so users notice latency issues.
                 if elapsed_ms >= 1000 {
                     self.toast_manager.push(
@@ -17218,6 +17237,7 @@ impl super::ftui_adapter::Model for CassApp {
                         }
                     );
                 }
+                self.disclose_semantic_fallback();
                 ftui::Cmd::none()
             }
             CassMsg::CursorMoved { delta } => {
@@ -25128,12 +25148,38 @@ mod tests {
     }
 
     #[test]
+    fn semantic_fallback_notice_survives_pagination_and_stream_completion() {
+        let mut app = CassApp::default();
+        let completion = |generation, degraded, append| CassMsg::SearchCompleted {
+            generation, pass: if append { SearchPass::Pagination } else { SearchPass::Interactive },
+            requested_limit: 16, hits: vec![], elapsed_ms: 1, suggestions: vec![],
+            wildcard_fallback: false, semantic_degraded: degraded, append,
+        };
+        let current = app.search_generation;
+        let _ = app.update(completion(current, true, false));
+        assert!(app.semantic_degraded);
+        assert!(app.status.contains("lexical fallback"));
+        let _ = app.update(completion(current, false, true));
+        assert!(app.status.contains("lexical fallback"));
+        app.search_refining = true;
+        app.status.push_str(" · refining");
+        let _ = app.update(CassMsg::SearchStreamFinished { generation: current });
+        assert_eq!(app.status.matches("lexical fallback").count(), 1);
+        let _ = app.update(completion(current.wrapping_add(1), false, false));
+        assert!(app.semantic_degraded, "an unrelated completion must not clear the displayed result state");
+        let _ = app.update(completion(current, false, false));
+        assert!(!app.semantic_degraded);
+        assert!(!app.status.contains("lexical fallback"));
+    }
+
+    #[test]
     fn search_result_constructible() {
         let _result = SearchResult {
             hits: Vec::new(),
             elapsed_ms: 42,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_degraded: false,
         };
     }
 
@@ -26705,6 +26751,7 @@ mod tests {
             elapsed_ms: 42,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert_eq!(app.panes.len(), 2, "should have 2 agent panes");
@@ -27633,7 +27680,9 @@ mod tests {
         use crate::search::model_api::test_support::{HttpFixture, Reply};
         use crate::search::model_api::index_embedding::IndexEmbeddingSetup;
         use crate::indexer::db_vector_catchup::{probe_api_backfill, run_api_primary_catchup_backfill};
-        let endpoint = HttpFixture::start(vec![Reply::Embeddings(8)]);
+        let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let endpoint = HttpFixture::start(vec![Reply::Conditional(unavailable.clone(),
+            Box::new(Reply::Embeddings(8)), Box::new(Reply::status(503)))]);
         let config = data_dir.join("models.toml");
         std::fs::write(&config, format!(r#"version=1
 default_embedding="ui"
@@ -27661,11 +27710,19 @@ query_prefix="Q:"
         assert!(!service.execute(&requested).unwrap().hits.is_empty());
         assert_eq!(endpoint.hits(), before + 1);
         assert_eq!(endpoint.requests().last().unwrap().body()["input"], json!([format!("Q:{unique_token}")]));
+        unavailable.store(true, std::sync::atomic::Ordering::SeqCst);
+        requested.mode = SearchMode::Hybrid;
+        requested.query = "Investigate".into();
+        let degraded = service.execute(&requested).unwrap();
+        assert!(!degraded.hits.is_empty());
+        assert!(degraded.semantic_degraded, "allowed HTTP failure must retain the realized lexical mode");
+        assert_eq!(endpoint.hits(), before + 2);
+        unavailable.store(false, std::sync::atomic::Ordering::SeqCst);
         let key = crate::storage::api_generation::provenance_meta_key(built.catchup.generation_id);
         storage.raw().execute("DELETE FROM meta WHERE key=?1", &crate::storage::api::params![key]).unwrap();
         requested.mode = SearchMode::Hybrid;
         assert!(service.execute(&requested).is_err(), "late provenance failure must not become lexical success");
-        assert_eq!(endpoint.hits(), before + 1, "broken provenance is checked before another model request");
+        assert_eq!(endpoint.hits(), before + 2, "broken provenance is checked before another model request");
         assert!(!service.execute(&params).unwrap().hits.is_empty());
 
     }
@@ -27685,6 +27742,7 @@ query_prefix="Q:"
                     elapsed_ms: 5,
                     suggestions: vec![],
                     wildcard_fallback: false,
+                    semantic_degraded: false,
                 })
             }
         }
@@ -27728,6 +27786,7 @@ query_prefix="Q:"
                     elapsed_ms: 5,
                     suggestions: vec![],
                     wildcard_fallback: false,
+                    semantic_degraded: false,
                 })
             }
         }
@@ -27790,6 +27849,7 @@ query_prefix="Q:"
             elapsed_ms: 1,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert!(app.loading_context.is_none());
@@ -27834,6 +27894,7 @@ query_prefix="Q:"
             elapsed_ms: 3,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
 
@@ -27893,6 +27954,7 @@ query_prefix="Q:"
             elapsed_ms: 3,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
 
@@ -28105,6 +28167,7 @@ query_prefix="Q:"
             elapsed_ms: 10,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         let state = app.results_list_state.borrow();
@@ -41724,6 +41787,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 7,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert!(
@@ -41757,6 +41821,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 6,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert!(
