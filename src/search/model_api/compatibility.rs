@@ -11,6 +11,12 @@ pub(crate) const MAX_RELATIVE_NORM_DELTA: f64 = 0.001;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum CompatibilityError {
+    #[error("CompatibilityEvidenceMismatch")]
+    EvidenceMismatch,
+    #[error("CompatibilityInvalidEvidence")]
+    InvalidEvidence,
+    #[error("CompatibilityInputMismatch")]
+    InputMismatch,
     #[error("CompatibilityInvalidVector")]
     InvalidVector,
     #[error("CompatibilityDimensionMismatch")]
@@ -139,6 +145,16 @@ mod tests {
         assert!(!result.passed);
         assert!(result.max_component_delta > MAX_COMPONENT_DELTA);
         assert!(compare_vectors(&[1.0,0.0], &[1.0,0.0005], Normalization::L2).unwrap().passed);
+    }
+
+    #[test]
+    fn cosine_gate_detects_small_errors_accumulated_across_dimensions() {
+        let mut left = vec![0.0; 4096]; left[0] = 1.0;
+        let mut right = vec![0.0005; 4096]; right[0] = 1.0;
+        let result = compare_vectors(&left, &right, Normalization::L2).unwrap();
+        assert!(result.max_component_delta < MAX_COMPONENT_DELTA);
+        assert!(result.cosine < MIN_COSINE);
+        assert!(!result.passed);
     }
 
     #[test]
