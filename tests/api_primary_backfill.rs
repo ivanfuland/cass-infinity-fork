@@ -2929,3 +2929,33 @@ fn model_configuration_is_validated_before_refresh_and_dry_run_never_refreshes()
     assert!(output.status.success(), "{}", stderr_text(&output));
     assert!(!data.exists(), "query analysis must not refresh the index");
 }
+
+#[test]
+fn retired_local_model_commands_preserve_files_and_send_no_http() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let model_dir = data.join("models").join("all-MiniLM-L6-v2");
+    fs::create_dir_all(&model_dir).unwrap();
+    let sentinel = model_dir.join("model.onnx");
+    fs::write(&sentinel, b"synthetic existing asset; do not modify").unwrap();
+    let service = Stub::start(healthy_responder(8, 0));
+    let endpoint = service.endpoint();
+    let data_text = data.display().to_string();
+    let commands = [
+        vec!["install", "--mirror", endpoint.as_str(), "--yes"],
+        vec!["verify", "--repair"],
+        vec!["remove", "--model", "all-minilm-l6-v2", "--yes"],
+        vec!["check-update"],
+    ];
+    for command in commands {
+        let mut args = vec!["--robot-format", "json", "models"];
+        args.extend(command);
+        args.extend(["--data-dir", data_text.as_str()]);
+        let output = cass(&args, &[]);
+        assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+        assert!(stderr_text(&output).contains("ModelApiMigration"), "{}", stderr_text(&output));
+        assert_eq!(fs::read(&sentinel).unwrap(), b"synthetic existing asset; do not modify");
+        assert!(!data.join("agent_search.db").exists());
+    }
+    assert!(service.requests().is_empty());
+}

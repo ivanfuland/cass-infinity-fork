@@ -442,6 +442,9 @@ fn list_reports_profiles_sorted_with_zero_http() {
         payload["schema"], "cass.model-api-list.v1",
         "the list envelope schema is fixed"
     );
+    let status = harness.run(&[], &["models", "status", "--api-config", config.to_str().expect("path"), "--json"]);
+    assert_exit(&status, 0, "models status API configuration readback");
+    assert_eq!(stdout_json(&status), payload, "status must describe configured API profiles, not local weights");
     let profiles = payload["profiles"].as_array().expect("profiles array");
     let ids: Vec<&str> = profiles
         .iter()
