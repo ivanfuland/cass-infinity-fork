@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-cass-fork.sh — 从零 bootstrap CASS-on-Infinity fork 的可运行 release 二进制。
+# setup-cass-fork.sh — 从零 bootstrap CASS API-only fork 的可运行 release 二进制。
 # 幂等：重复跑安全。新机可直接跑（自动 clone fork + asupersync）。
 set -euo pipefail
 
@@ -93,5 +93,5 @@ if [ -e "$INSTALL_PATH" ]; then cp -a "$INSTALL_PATH" "$INSTALL_PATH.prev"; fi
 step "7/7 install (atomic via temp+mv)"
 mkdir -p "$(dirname "$INSTALL_PATH")"
 cp "$BIN" "$INSTALL_PATH.tmp" && mv -f "$INSTALL_PATH.tmp" "$INSTALL_PATH"
-printf '\nOK: ONNX-free CASS-on-Infinity installed -> %s\n' "$INSTALL_PATH"
+printf '\nOK: ONNX-free CASS API-only installed -> %s\n' "$INSTALL_PATH"
 "$INSTALL_PATH" --version
