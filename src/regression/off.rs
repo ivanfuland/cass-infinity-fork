@@ -504,7 +504,9 @@ query_prefix="Query: "
         let provenance = RunProvenance::capture().unwrap();
         let owner = RegressionSearchRun::activate(super::super::input::prepare_full(&cmd).unwrap(), &cmd).unwrap();
         fs::write(config_path, "invalid after activation").unwrap();
-        let result = collect(&owner, &provenance, started, 0.0).unwrap();
+        let summary = collect(&owner, &provenance, started, 0.0).unwrap();
+        assert_eq!(summary["terminal"], "SUCCESS", "{summary}");
+        let result: Value = serde_json::from_slice(&fs::read(owner.validated.paths.run_root.join("run.json")).unwrap()).unwrap();
         assert_eq!(result["terminal"], "SUCCESS", "{result}");
         assert_eq!(result["questions"].as_array().unwrap().len(), 9);
         let observed = server.hits() - before_calls;

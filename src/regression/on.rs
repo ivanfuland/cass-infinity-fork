@@ -1418,7 +1418,9 @@ model_revision="r1"
         let validated = super::super::input::prepare_full(&cmd).unwrap();
         let owner = RegressionSearchRun::activate(validated, &cmd).unwrap();
         fs::write(&config, "deliberately invalid after activation").unwrap();
-        let result = collect(&owner, &provenance, started, 0.0).unwrap();
+        let summary = collect(&owner, &provenance, started, 0.0).unwrap();
+        assert_eq!(summary["terminal"], "SUCCESS", "{summary}");
+        let result: Value = serde_json::from_slice(&fs::read(owner.validated.paths.run_root.join("run.json")).unwrap()).unwrap();
         assert_eq!(result["terminal"], "SUCCESS", "{result}");
         assert_eq!(result["quality_status"], "NOT_EVALUATED");
         let questions = result["questions"].as_array().unwrap();
