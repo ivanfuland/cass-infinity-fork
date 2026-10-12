@@ -3508,31 +3508,31 @@
       "code": "15",
       "meaning": "semantic or embedder unavailable",
       "retryable": "yes",
-      "agent_action": "Install/verify models or continue with lexical fallback when acceptable."
+      "agent_action": "Configure an embedding profile with --api-config and run 'cass models check'; continue with lexical fallback when acceptable."
     },
     {
       "code": "20-21",
-      "meaning": "model acquisition failure",
+      "meaning": "retired: model acquisition failure",
       "retryable": "maybe",
-      "agent_action": "Check err.kind and err.hint; retry download or use --from-file."
+      "agent_action": "Retired with the model-API migration; no active path returns this code and no local model is acquired. Configure an external profile with --api-config."
     },
     {
       "code": "22",
-      "meaning": "I/O during model handling",
+      "meaning": "retired: I/O during model handling",
       "retryable": "maybe",
-      "agent_action": "Verify model cache permissions and available disk before retrying."
+      "agent_action": "Retired with the model-API migration; no local model cache I/O path remains."
     },
     {
       "code": "23",
-      "meaning": "download failure",
+      "meaning": "retired: download failure",
       "retryable": "yes",
-      "agent_action": "Retry with network available or install from a local model directory."
+      "agent_action": "Retired with the model-API migration; cass downloads no model weights."
     },
     {
       "code": "24",
-      "meaning": "I/O during model verify/install",
+      "meaning": "retired: I/O during model verify/install",
       "retryable": "maybe",
-      "agent_action": "Fix filesystem permissions or disk space, then retry."
+      "agent_action": "Retired with the model-API migration; no local model verify/install path remains."
     }
   ],
   "env_vars": [
