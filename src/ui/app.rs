@@ -5294,8 +5294,6 @@ pub struct CassApp {
     pub saved_view_rename_mode: bool,
     /// Rename buffer used while editing saved view labels.
     pub saved_view_rename_buffer: String,
-    /// Whether the consent dialog (model download) is visible.
-    pub show_consent_dialog: bool,
     /// Semantic search availability state.
     pub semantic_availability: SemanticAvailability,
     /// Whether the source filter popup menu is open.
@@ -5578,7 +5576,6 @@ impl Default for CassApp {
             saved_view_drag: None,
             saved_view_rename_mode: false,
             saved_view_rename_buffer: String::new(),
-            show_consent_dialog: false,
             semantic_availability: SemanticAvailability::Disabled { reason: "Configure HTTP model services with --api-config".into() },
             source_filter_menu_open: false,
             source_filter_menu_selection: 0,
@@ -6478,7 +6475,6 @@ impl CassApp {
             && !self.show_bulk_modal
             && !self.show_saved_views_modal
             && !self.show_export_modal
-            && !self.show_consent_dialog
             && !self.source_filter_menu_open
             && !self.command_palette.is_visible()
     }
@@ -6487,7 +6483,6 @@ impl CassApp {
         if self.show_export_modal
             || self.show_bulk_modal
             || self.show_saved_views_modal
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible()
             || self.show_help
@@ -12872,71 +12867,6 @@ impl CassApp {
         }
     }
 
-    /// Render the semantic model consent dialog overlay.
-    fn render_consent_overlay(
-        &self,
-        frame: &mut super::ftui_adapter::Frame,
-        area: Rect,
-        styles: &StyleContext,
-    ) {
-        let dialog_w = 68u16.min(area.width.saturating_sub(2));
-        let dialog_h = 9u16.min(area.height.saturating_sub(2));
-        if dialog_w < 28 || dialog_h < 6 {
-            return;
-        }
-
-        let dialog_x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-        let dialog_area = Rect::new(dialog_x, dialog_y, dialog_w, dialog_h);
-
-        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
-        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
-        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
-        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
-        let key_style = styles.style(style_system::STYLE_KBD_KEY);
-
-        // Clear background — use draw_rect_filled to overwrite both characters
-        // and styles (Block::style only sets bg without clearing foreground text).
-        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
-        frame.draw_rect_filled(dialog_area, ftui::Cell::from_char(' ').with_bg(bg_color));
-        let outer = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title("Enable semantic search?")
-            .title_alignment(Alignment::Left)
-            .style(border_style);
-        let inner = outer.inner(dialog_area);
-        outer.render(dialog_area, frame);
-        if inner.is_empty() {
-            return;
-        }
-
-        let lines = vec![
-            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Semantic/Hybrid mode needs a configured embedding API profile.".to_string(),
-                text_style,
-            )]),
-            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Local model downloads and the hash fallback are retired.".to_string(),
-                muted_style,
-            )]),
-            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Configure an API profile (--api-config) and use `models check` / \
-                 `models backfill`."
-                    .to_string(),
-                muted_style,
-            )]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[Esc]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Close".to_string(), muted_style),
-            ]),
-        ];
-        Paragraph::new(ftui::text::Text::from_lines(lines))
-            .style(text_style)
-            .wrap(ftui::text::WrapMode::Word)
-            .render(inner, frame);
-    }
-
     /// Render the saved views manager popup centered on screen.
     fn render_saved_views_overlay(
         &self,
@@ -14329,23 +14259,9 @@ pub enum CassMsg {
     /// Export failed.
     ExportFailed(String),
 
-    // -- Consent dialog (semantic model download) -------------------------
-    /// Open the consent dialog.
-    ConsentDialogOpened,
-    /// Close the consent dialog.
-    ConsentDialogClosed,
-    /// User accepted model download.
-    ModelDownloadAccepted,
-    /// Model download progress update.
-    ModelDownloadProgress { bytes_downloaded: u64, total: u64 },
-    /// Model download completed.
-    ModelDownloadCompleted,
-    /// Model download failed.
-    ModelDownloadFailed(String),
-    /// User cancelled the active download.
-    ModelDownloadCancelled,
-    /// User accepted hash mode fallback (no ML model).
-    HashModeAccepted,
+    // The semantic-model consent/download messages were retired with the
+    // model-API migration: the TUI offers lexical and explicit API state only,
+    // and never prompts to download or install a local weight file.
 
     // -- Source filter menu ------------------------------------------------
     /// Toggle the source filter popup menu.
@@ -15959,20 +15875,6 @@ impl super::ftui_adapter::Model for CassApp {
                 if ke.modifiers.contains(super::ftui_adapter::Modifiers::ALT)
         );
         if raw_alt_update_shortcut && !self.can_handle_update_shortcuts() {
-            return ftui::Cmd::none();
-        }
-
-        // Consent dialog intercepts D/H keys and blocks other query input
-        if self.show_consent_dialog
-            && let CassMsg::QueryChanged(ref text) = msg
-        {
-            if text.eq_ignore_ascii_case("d") {
-                return self.update(CassMsg::ModelDownloadAccepted);
-            }
-            if text.eq_ignore_ascii_case("h") {
-                return self.update(CassMsg::HashModeAccepted);
-            }
-            // Ignore other query input while consent dialog is open
             return ftui::Cmd::none();
         }
 
@@ -18897,25 +18799,6 @@ impl super::ftui_adapter::Model for CassApp {
                 })
             }
 
-            // -- Consent dialog -----------------------------------------------
-            CassMsg::ConsentDialogOpened | CassMsg::ModelDownloadAccepted | CassMsg::HashModeAccepted => {
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.status = "Local model downloads and hash fallback are retired. Configure --api-config; use models check and models backfill.".into();
-                ftui::Cmd::none()
-            }
-            CassMsg::ConsentDialogClosed => {
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadProgress { .. } | CassMsg::ModelDownloadCompleted
-            | CassMsg::ModelDownloadFailed(_) | CassMsg::ModelDownloadCancelled => ftui::Cmd::none(),
-
             // -- Source filter menu -------------------------------------------
             CassMsg::SourceFilterMenuToggled => {
                 if self.source_filter_menu_open {
@@ -20840,11 +20723,6 @@ impl super::ftui_adapter::Model for CassApp {
                 ) {
                     return ftui::Cmd::msg(CassMsg::ViewStackPopped);
                 }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                    return ftui::Cmd::none();
-                }
                 if self.show_inspector {
                     self.show_inspector = false;
                     if self.inspector_state.is_active() {
@@ -22242,7 +22120,6 @@ impl super::ftui_adapter::Model for CassApp {
             || self.show_detail_modal
             || self.show_help
             || self.show_inspector
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible();
         if modal_visible && apply_style {
@@ -22358,10 +22235,6 @@ impl super::ftui_adapter::Model for CassApp {
 
         if self.source_filter_menu_open {
             self.render_source_filter_menu_overlay(frame, area, &styles);
-        }
-
-        if self.show_consent_dialog {
-            self.render_consent_overlay(frame, area, &styles);
         }
 
         // ── Help overlay ─────────────────────────────────────────────
@@ -24050,7 +23923,6 @@ mod tests {
         assert!(!app.show_detail_modal);
         assert!(!app.show_export_modal);
         assert!(!app.show_bulk_modal);
-        assert!(!app.show_consent_dialog);
         assert!(!app.source_filter_menu_open);
         assert_eq!(app.source_filter_menu_selection, 0);
         assert!(app.available_source_ids.is_empty());
@@ -24059,26 +23931,31 @@ mod tests {
         assert!(app.query_history.is_empty());
     }
 
+    // Semantic mapping of the two retired tests above: `retired_model_actions_
+    // cannot_enable_local_or_hash_semantics` and `stale_download_events_cannot_
+    // change_verified_api_readiness` both drove the consent/download messages,
+    // which are removed here along with the messages themselves. The behavior
+    // they guarded -- that no local-model or hash action can turn on semantics,
+    // and that a verified API readiness is never downgraded -- is now structural
+    // (there is no such action left), and the surviving assertions are kept.
     #[test]
-    fn retired_model_actions_cannot_enable_local_or_hash_semantics() {
-        for message in [CassMsg::ConsentDialogOpened, CassMsg::ModelDownloadAccepted, CassMsg::HashModeAccepted] {
-            let mut app = CassApp::default();
-            let _ = app.update(message);
-            assert!(!app.show_consent_dialog);
-            assert!(!app.semantic_availability.can_search());
-            assert!(app.status.contains("--api-config"));
+    fn tui_offers_no_local_model_download_or_consent_surface() {
+        let app = CassApp::default();
+        assert!(!app.semantic_availability.can_search());
+        match &app.semantic_availability {
+            SemanticAvailability::Disabled { reason } => {
+                assert!(reason.contains("--api-config"), "{reason}");
+            }
+            other => panic!("expected Disabled default, got {other:?}"),
         }
     }
 
     #[test]
-    fn stale_download_events_cannot_change_verified_api_readiness() {
+    fn verified_api_readiness_reports_searchable() {
         let mut app = CassApp::default();
         app.semantic_availability = SemanticAvailability::Ready { embedder_id:"api:verified".into() };
-        for message in [CassMsg::ModelDownloadProgress { bytes_downloaded:10, total:100 },
-            CassMsg::ModelDownloadCompleted, CassMsg::ModelDownloadFailed("obsolete".into()), CassMsg::ModelDownloadCancelled] {
-            let _ = app.update(message);
-            assert!(matches!(&app.semantic_availability, SemanticAvailability::Ready { embedder_id } if embedder_id == "api:verified"));
-        }
+        assert!(app.semantic_availability.can_search());
+        assert!(matches!(&app.semantic_availability, SemanticAvailability::Ready { embedder_id } if embedder_id == "api:verified"));
     }
 
     #[test]

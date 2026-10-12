@@ -147,23 +147,23 @@ impl ModelDownloadPolicy {
 /// Default fast-tier embedder name (always available, no model files).
 pub const DEFAULT_FAST_TIER_EMBEDDER: &str = "hash";
 
-/// Default quality-tier embedder name (requires ML model files).
+/// Default quality-tier embedder name.
 ///
-/// R1-W3-N2: `minilm` is a FastEmbed/ONNX model, which requires the
-/// `semantic` build feature -- retired in this build (W3-5,
-/// `--no-default-features --features qr,encryption,infinity`, ORT-free).
-/// Defaulting to it anyway meant every default-configuration semantic
-/// search/index/TUI path (nothing consults this constant besides through
-/// `SemanticPolicy::resolve`'s own default) silently pointed at an
-/// unreachable model, forcing every caller to know to pass an explicit
-/// override just to reach the DB vector domain this build actually ships.
-/// `infinity` is `is_infinity_embedder_name`'s (`search::model_manager`)
-/// own routing name for the DB-vector-domain path, so this default now
-/// matches what the build can actually serve.
-pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "infinity";
+/// This is a **neutral placeholder, not a model identity**. Embedding is served
+/// exclusively by the configured external model API: the effective model,
+/// revision and dimension come from the API representation descriptor (see
+/// `search::model_api`), never from a name baked in here. The previous local
+/// routing names (`minilm`, then `infinity`) claimed an identity the API-only
+/// build cannot prove, so they were replaced by this marker.
+pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "external";
 
-/// Default reranker name (requires cross-encoder model files).
-pub const DEFAULT_RERANKER: &str = "ms-marco-minilm";
+/// Default reranker name.
+///
+/// Neutral placeholder, not a model identity: reranking is served exclusively
+/// by the configured external model API rerank profile. The previous
+/// `ms-marco-minilm` name claimed a local cross-encoder the API-only build does
+/// not ship.
+pub const DEFAULT_RERANKER: &str = "external";
 
 // ─── Dimension defaults ────────────────────────────────────────────────────
 
@@ -1008,13 +1008,14 @@ impl SemanticArtifactKind {
 mod tests {
     use super::*;
 
-    /// R1-W3-N2: under this build's actual feature set (ORT-free, local
-    /// inference retired), the quality-tier default is the routing name for the
-    /// DB vector domain this build actually serves, not a FastEmbed/ONNX model
-    /// that can never load here.
+    /// R1-W3-N2 / model-API migration: the quality-tier default is a neutral
+    /// placeholder, not a model identity. The effective identity comes from the
+    /// API representation descriptor, so the default must not name a model
+    /// (`minilm`, `infinity`) the API-only build cannot prove it serves.
     #[test]
-    fn default_quality_tier_embedder_is_the_db_vector_domain_routing_name() {
-        assert_eq!(DEFAULT_QUALITY_TIER_EMBEDDER, "infinity");
+    fn default_quality_tier_embedder_is_a_neutral_placeholder() {
+        assert_eq!(DEFAULT_QUALITY_TIER_EMBEDDER, "external");
+        assert_eq!(DEFAULT_RERANKER, "external");
     }
 
     // ── Precedence resolution ──────────────────────────────────────────

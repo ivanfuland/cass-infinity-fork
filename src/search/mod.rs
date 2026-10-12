@@ -3,13 +3,13 @@
 //! This module provides the search infrastructure for cass, including:
 //!
 //! - **[`query`]**: Query parsing, execution, and caching for FTS5-based full-text search.
-//! - **[`embedder`]**: Embedder trait for semantic search (hash and ML implementations).
+//! - **[`embedder`]**: Embedder trait for semantic search (hash and API implementations).
 //! - **[`hash_embedder`]**: FNV-1a feature hashing embedder (deterministic fallback).
-//! - **[`fastembed_embedder`]**: FastEmbed-backed ML embedder (MiniLM).
+//! - **[`model_api`]**: The HTTP model API client and configuration; the only model
+//!   call path. Local weight download/load was retired with the model-API migration.
 //! - **[`reranker`]**: Reranker trait for cross-encoder reranking of search results.
 //! - **[`daemon_client`]**: Daemon client wrappers for warm embedder/reranker (bd-1lps).
-//! - **[`model_manager`]**: Semantic model detection + context wiring (no downloads).
-//! - **[`model_download`]**: Model download system with consent, verification, and atomic install.
+//! - **[`model_manager`]**: Semantic readiness detection + context wiring (no downloads).
 //! - **[`policy`]**: Semantic policy contract: model defaults, tiers, budgets, invalidation.
 //! - **[`semantic_manifest`]**: Durable semantic asset manifests, backlog ledger, and checkpoints.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
@@ -40,10 +40,8 @@ pub(crate) mod index_provenance;
 pub mod lexical_index_health;
 pub(crate) mod lexical_rerank;
 pub(crate) mod liveness_fixtures;
-pub(crate) mod model_acquisition;
 pub mod model_api;
 pub mod generation_fingerprint;
-pub mod model_download;
 pub mod model_manager;
 pub mod pack_planner;
 pub mod policy;

@@ -6,8 +6,9 @@
 //! - building filter maps from the SQLite database
 //! - detecting model version mismatches
 //!
-//! It does **not** download models. Missing files are surfaced as availability
-//! states so the UI can guide the user. Downloads are handled by [`model_download`].
+//! It does **not** download or load models: embedding is served exclusively by
+//! the configured external model API. Availability is surfaced from the
+//! DB-vector-domain state so the UI can report semantic readiness.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,6 @@ use std::sync::Arc;
 
 use crate::search::embedder::Embedder;
 use crate::search::hash_embedder::HashEmbedder;
-use crate::search::model_download::ModelManifest;
 use crate::search::model_identity;
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_USER, vector_index_path};
 use crate::storage::api::params;
@@ -537,14 +537,12 @@ pub fn delete_vector_index_for_rebuild(data_dir: &Path) -> std::io::Result<bool>
     }
 }
 
-/// Get the model directory path for the default MiniLM model.
+/// Get the model directory path for the retired default MiniLM model.
+///
+/// Retained only as a path helper for legacy read surfaces; no local weight is
+/// ever loaded from here on the API-only path.
 pub fn default_model_dir(data_dir: &Path) -> PathBuf {
     model_identity::default_model_dir(data_dir)
-}
-
-/// Get the model manifest for the default MiniLM model.
-pub fn default_model_manifest() -> ModelManifest {
-    ModelManifest::minilm_v2()
 }
 
 #[cfg(test)]

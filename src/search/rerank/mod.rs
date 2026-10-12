@@ -10,16 +10,16 @@
 //! - [`http`] (P02): shared HTTP transport, safety and failure boundaries.
 //! - [`context`] (P03): verifiable anchor and neighbour-block document assembly.
 //! - [`window`] (P04): fixed-order window snapshot and cursor persistence.
-//! - [`qwen`] (P05): local SGLang Qwen adapter.
-//! - [`bge`] (P06): local Infinity BGE adapter.
-//! - [`openrouter`] (P07): shared OpenRouter adapter for its three models.
+//! The per-provider adapters — the local SGLang Qwen backend, the local
+//! Infinity BGE backend and the shared OpenRouter backend — were retired with
+//! the model-API migration. Reranking now runs only through
+//! [`crate::search::model_api`], which reuses [`types`], [`http`], [`context`]
+//! and [`window`]; the retired `--rerank-provider` spellings are refused before
+//! any request.
 //!
 //! Continuation pages load the verified window without another model request.
 
-pub mod bge;
 pub mod context;
 pub mod http;
-pub mod openrouter;
-pub mod qwen;
 pub mod types;
 pub mod window;

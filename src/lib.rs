@@ -512,12 +512,13 @@ pub enum Commands {
         /// env/config K values are ignored when --rerank is off.
         #[arg(long)]
         rerank_limit: Option<usize>,
-        /// Rerank backend selection. Requires --rerank. Exactly one of
-        /// qwen3-local (the default when omitted), bge-local,
+        /// Retired rerank backend selection. The local Qwen/Infinity backends
+        /// and the shared OpenRouter adapter were removed with the model-API
+        /// migration, so any supplied value (qwen3-local, bge-local,
         /// openrouter-qwen3-8b, openrouter-cohere-4-fast,
-        /// openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage
-        /// error. Nothing is read from env or config; omitting it never selects a
-        /// cloud backend.
+        /// openrouter-voyage-2.5-lite) is refused with a migration error before
+        /// any request. The backend now comes from the configured rerank API
+        /// profile (`--rerank-profile` with `--api-config`).
         #[arg(long, value_enum)]
         rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
         /// Embedding API profile; defaults to the configured default_embedding.
@@ -627,7 +628,8 @@ pub enum Commands {
         model: Option<String>,
 
         /// Enable complete-window reranking (off by default).
-        /// Default: qwen3-local, N=200 candidates, K=5 results per page.
+        /// Default: N=200 candidates, K=5 results per page; the backend is the
+        /// configured rerank API profile (--rerank-profile).
         #[arg(long, default_value_t = false)]
         rerank: bool,
 
@@ -7342,7 +7344,7 @@ async fn execute_cli(
                     // Resolve configurable search defaults (#303 + PR3 windows)
                     // in one pass: timeout/mode as before, plus the window limits
                     // N/K and the rerank provider. This MUST run before
-                    // `refresh_index_inline` so an invalid window/provider
+                    // `refresh_index_inline` so an invalid window
                     // argument fails before any ingest, DB or model work starts.
                     let defaults = resolve_search_window_defaults(
                         timeout,
@@ -7350,7 +7352,6 @@ async fn execute_cli(
                         rerank,
                         rrf_limit,
                         rerank_limit,
-                        rerank_provider,
                     )?;
 
                     // PR9 09a: `--vector-search-mode` is an independent
@@ -21930,7 +21931,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "",
         "OUTPUT:",
         "  --robot | --json   Machine-readable JSON output (auto-quiet enabled)",
-        "  --rerank enables qwen3-local by default (N=200/K=5); select --rerank-provider explicitly to change backend.",
+        "  --rerank requires a configured rerank API profile (--api-config / --rerank-profile); N=200/K=5 by default. The retired --rerank-provider selection is refused.",
         "  Search uses --rrf-limit N and --rerank-limit K; legacy search --limit is refused. Pack --limit is unchanged.",
         "  _meta.rerank is present in JSON/compact/JSONL/TOON when enabled, without --robot-meta; score and rerank_score are separate.",
         "  Cursor pages repeat query/N/K/provider/filters and reuse the window without another model call.",
@@ -21959,7 +21960,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --workspace W     Filter by workspace path".to_string(),
             "    --rrf-limit N     Candidate window N before pagination. Default: 200 with --rerank; without --rerank an omitted N keeps the legacy unbounded fetch (internal 0). Explicit 0 is rejected.".to_string(),
             "    --rerank-limit K  Per-page count K when --rerank is on (default 5; must be >=1 and <=N; explicit 0 rejected)".to_string(),
-            "    --rerank-provider P  Rerank backend when --rerank is on: qwen3-local (default when omitted) | bge-local | openrouter-qwen3-8b | openrouter-cohere-4-fast | openrouter-voyage-2.5-lite".to_string(),
+            "    --rerank-provider P  Retired. The local/OpenRouter rerank backends were removed; a supplied value is refused with a migration error. Use --rerank-profile with --api-config.".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
@@ -22099,9 +22100,9 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
             "  CASS_RRF_LIMIT=<N>                       default search rrf candidate window N (--rrf-limit overrides)".to_string(),
             "  CASS_RERANK_LIMIT=<K>                    default search per-page rerank count K (--rerank-limit overrides)".to_string(),
-            "  CASS_QWEN_RERANK_URL                     qwen3-local endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
-            "  CASS_INFINITY_URL                        bge-local rerank endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
-            "  OPENROUTER_API_KEY                       consumed only by an explicit OpenRouter rerank selection; never selects a cloud backend by itself".to_string(),
+            "  CASS_QWEN_RERANK_URL                     retired; a model command that finds it set refuses with a migration error".to_string(),
+            "  CASS_INFINITY_URL                        retired; a model command that finds it set refuses with a migration error".to_string(),
+            "  OPENROUTER_API_KEY                       credential usable only via a profile's api_key_env; its presence never selects a backend".to_string(),
             "  CASS_SEARCH_LIMIT=<N>                    legacy pack default limit (--limit overrides); rejected by `cass search` (use CASS_RRF_LIMIT)".to_string(),
             "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
@@ -22432,12 +22433,12 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Guide | RobotTopic::Contracts | RobotTopic::Examples
     ) {
         lines.extend([
-            "  Rerank is off by default. --rerank uses qwen3-local with N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.".to_string(),
-            "  Choose --rerank-provider qwen3-local|bge-local|openrouter-qwen3-8b|openrouter-cohere-4-fast|openrouter-voyage-2.5-lite. --provider still filters the session source.".to_string(),
+            "  Rerank is off by default. --rerank requires a configured rerank API profile and uses N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.".to_string(),
+            "  The retired --rerank-provider spellings (qwen3-local|bge-local|openrouter-*) are refused before any request. --provider still filters the session source.".to_string(),
             "  score keeps its search meaning. rerank_score is separate and null when unscored; minimal/summary omit it unless explicitly added. JSON/compact/JSONL/TOON carry _meta.rerank without --robot-meta.".to_string(),
             "  Failure keeps original order and K-result paging; failure_reason is a short code, not response text. No automatic backend switch. Actual identity and unproven counts stay null.".to_string(),
-            "  First page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json".to_string(),
-            "  Next page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor \"<next_cursor>\"".to_string(),
+            "  First page: cass search \"auth error\" --mode lexical --agent codex --rerank --api-config <file> --rerank-profile <id> --rrf-limit 200 --rerank-limit 5 --json".to_string(),
+            "  Next page: cass search \"auth error\" --mode lexical --agent codex --rerank --api-config <file> --rerank-profile <id> --rrf-limit 200 --rerank-limit 5 --json --cursor \"<next_cursor>\"".to_string(),
             "  Repeat the original query, N/K, provider and filters. Only display fields and content/token budgets may change. Pages reuse a fixed window; current model requests and duration are zero, first-call facts remain. A reduced page advances by its delivered count.".to_string(),
         ]);
     }
@@ -22697,17 +22698,13 @@ pub struct SemanticSearchOptions {
     /// Reranker model to use (if rerank is enabled)
     ///
     /// Deprecated: parsed for compatibility but never selects a backend. The
-    /// rerank backend now comes from [`Self::rerank_provider`].
+    /// rerank backend now comes from the configured model API rerank profile.
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
     /// Per-page rerank window K. Resolved by the search defaults bridge; `None`
     /// when reranking is off. Carried through to the rerank stage (P09).
     pub rerank_limit: Option<usize>,
-    /// Selected rerank backend. `Some` only when reranking is on (defaulting to
-    /// `qwen3-local`); `None` when reranking is off. Carried through to the
-    /// rerank stage (P09).
-    pub rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
 impl TimeFilter {
@@ -23569,8 +23566,7 @@ fn resolve_search_defaults(
 }
 
 /// Resolved `cass search` defaults: `--timeout`/`--mode` (same resolution as
-/// [`resolve_search_defaults`]) plus the P08a window limits N/K and the
-/// CLI-only rerank provider selection.
+/// [`resolve_search_defaults`]) plus the P08a window limits N/K.
 #[derive(Debug)]
 struct SearchWindowDefaults {
     timeout_ms: Option<u64>,
@@ -23580,14 +23576,12 @@ struct SearchWindowDefaults {
     rrf_limit: usize,
     /// Per-page rerank window K, present only when reranking is enabled.
     rerank_limit: Option<usize>,
-    /// Selected rerank backend, present only when reranking is enabled.
-    rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
 /// Map the resolved search defaults onto the [`SemanticSearchOptions`] carried
 /// into the search engine. Extracted from the dispatch so the mapping (which
-/// propagates the per-page rerank window K and the selected backend) is
-/// unit-testable without opening a database.
+/// propagates the per-page rerank window K) is unit-testable without opening a
+/// database.
 fn semantic_search_options_from_defaults(
     model: Option<String>,
     rerank: bool,
@@ -23602,7 +23596,6 @@ fn semantic_search_options_from_defaults(
         reranker,
         use_daemon,
         rerank_limit: defaults.rerank_limit,
-        rerank_provider: defaults.rerank_provider,
     }
 }
 
@@ -23613,7 +23606,6 @@ struct SearchWindowInputs<'a> {
     rerank: bool,
     cli_rrf: Option<usize>,
     cli_rerank: Option<usize>,
-    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
     cli_timeout: Option<u64>,
     cli_mode: Option<crate::search::query::SearchMode>,
     env_timeout: Option<&'a str>,
@@ -23633,17 +23625,17 @@ struct SearchWindowInputs<'a> {
 /// `search_defaults::resolve_window_limits`, so a legacy `[search].limit` or
 /// `CASS_SEARCH_LIMIT` is a migration error instead of a silent fetch bound.
 ///
-/// The rerank provider is a pure CLI selection: it requires `--rerank`,
-/// defaults to the local Qwen backend when omitted, and never reads env or
-/// config. Every error is produced here, before the DB is opened, before any
-/// refresh/ingest, and before any model request.
+/// Every error is produced here, before the DB is opened, before any
+/// refresh/ingest, and before any model request. The rerank backend is no
+/// longer chosen here: the retired `--rerank-provider` selection is refused in
+/// the dispatch, and the backend now comes from the configured model API rerank
+/// profile.
 fn resolve_search_window_defaults(
     cli_timeout: Option<u64>,
     cli_mode: Option<crate::search::query::SearchMode>,
     rerank: bool,
     cli_rrf: Option<usize>,
     cli_rerank: Option<usize>,
-    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
 ) -> CliResult<SearchWindowDefaults> {
     use crate::search_defaults as sd;
 
@@ -23664,7 +23656,6 @@ fn resolve_search_window_defaults(
         rerank,
         cli_rrf,
         cli_rerank,
-        cli_provider,
         cli_timeout,
         cli_mode,
         env_timeout: env_timeout.as_deref(),
@@ -23681,22 +23672,7 @@ fn resolve_search_window_defaults(
 fn resolve_search_window_defaults_from(
     inputs: SearchWindowInputs<'_>,
 ) -> CliResult<SearchWindowDefaults> {
-    use crate::search::rerank::types::ProviderChoice;
     use crate::search_defaults as sd;
-
-    // The provider only exists when reranking is on. An explicit selection with
-    // --rerank off is a usage error, not a silently ignored flag.
-    if !inputs.rerank && inputs.cli_provider.is_some() {
-        return Err(CliError::usage(
-            "--rerank-provider requires --rerank",
-            Some("Enable --rerank to select a rerank backend, or drop --rerank-provider.".to_string()),
-        ));
-    }
-    let rerank_provider = if inputs.rerank {
-        Some(inputs.cli_provider.unwrap_or(ProviderChoice::Qwen3Local))
-    } else {
-        None
-    };
 
     let (timeout, _t_src) =
         sd::resolve_timeout_ms(inputs.cli_timeout, inputs.env_timeout, inputs.config.timeout_ms)
@@ -23741,7 +23717,6 @@ fn resolve_search_window_defaults_from(
         mode,
         rrf_limit: resolved.rrf_limit,
         rerank_limit: resolved.rerank_limit,
-        rerank_provider,
     })
 }
 
@@ -23766,7 +23741,6 @@ mod pr3_cli_limits {
             rerank: false,
             cli_rrf: None,
             cli_rerank: None,
-            cli_provider: None,
             cli_timeout: None,
             cli_mode: None,
             env_timeout: None,
@@ -23821,32 +23795,32 @@ mod pr3_cli_limits {
             .expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 0, "rerank off keeps the legacy no-window sentinel");
         assert_eq!(resolved.rerank_limit, None);
-        assert_eq!(resolved.rerank_provider, None);
     }
 
+    // The rerank *backend* is no longer resolved from the CLI here: the retired
+    // `--rerank-provider` selection is refused in the dispatch (see
+    // `tests/pr3_cli_limits.rs`), and the backend now comes from the configured
+    // model API rerank profile. These cases pin the window limits only.
     #[test]
-    fn on_omitted_defaults_are_200_5_qwen() {
+    fn on_omitted_defaults_are_200_5() {
         let config = SearchDefaults::default();
         let mut inputs = base_inputs(&config);
         inputs.rerank = true;
         let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 200);
         assert_eq!(resolved.rerank_limit, Some(5));
-        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
     }
 
     #[test]
-    fn explicit_n_k_provider_propagate_field_by_field() {
+    fn explicit_n_k_propagate_field_by_field() {
         let config = SearchDefaults::default();
         let mut inputs = base_inputs(&config);
         inputs.rerank = true;
         inputs.cli_rrf = Some(50);
         inputs.cli_rerank = Some(3);
-        inputs.cli_provider = Some(ProviderChoice::BgeLocal);
         let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 50);
         assert_eq!(resolved.rerank_limit, Some(3));
-        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::BgeLocal));
     }
 
     #[test]
@@ -23857,29 +23831,6 @@ mod pr3_cli_limits {
         let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 7);
         assert_eq!(resolved.rerank_limit, None);
-        assert_eq!(resolved.rerank_provider, None);
-    }
-
-    #[test]
-    fn provider_with_rerank_off_is_a_usage_error() {
-        let config = SearchDefaults::default();
-        let mut inputs = base_inputs(&config);
-        inputs.cli_provider = Some(ProviderChoice::OpenrouterQwen38b);
-        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
-        assert_eq!(err.code, 2);
-        assert!(err.message.contains("--rerank-provider"), "{}", err.message);
-    }
-
-    #[test]
-    fn provider_is_not_read_from_env_or_config() {
-        // Env has no provider input at all, and config carries none, so an
-        // enabled rerank with no CLI selection must land on qwen3-local.
-        let config = SearchDefaults::default();
-        let mut inputs = base_inputs(&config);
-        inputs.rerank = true;
-        inputs.env_rrf = Some("300");
-        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
-        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
     }
 
     #[test]
@@ -24003,19 +23954,17 @@ mod pr3_cli_limits {
     // ---- dispatch mapping ----
 
     #[test]
-    fn semantic_options_carry_k_and_provider_only_when_on() {
+    fn semantic_options_carry_k_only_when_on() {
         let config = SearchDefaults::default();
 
         let mut inputs = base_inputs(&config);
         inputs.rerank = true;
         inputs.cli_rrf = Some(80);
         inputs.cli_rerank = Some(4);
-        inputs.cli_provider = Some(ProviderChoice::OpenrouterCohere4Fast);
         let defaults = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         let opts =
             semantic_search_options_from_defaults(None, true, None, false, &defaults);
         assert_eq!(opts.rerank_limit, Some(4));
-        assert_eq!(opts.rerank_provider, Some(ProviderChoice::OpenrouterCohere4Fast));
         assert!(opts.rerank);
         assert_eq!(defaults.rrf_limit, 80, "N is carried as the fetch window");
 
@@ -24032,7 +23981,6 @@ mod pr3_cli_limits {
         assert_eq!(opts.reranker.as_deref(), Some("legacy"));
         assert!(opts.use_daemon);
         assert_eq!(opts.rerank_limit, None);
-        assert_eq!(opts.rerank_provider, None);
     }
 
     // ---- CLI parsing ----
@@ -24280,10 +24228,14 @@ struct RerankRequestContext {
 }
 
 /// Whether the P09 rerank window path is active for this search: `--rerank` was
-/// requested and both the per-page K and the backend were resolved. The closed
-/// path is exactly `false`.
+/// requested and the per-page K was resolved. The closed path is exactly
+/// `false`.
+///
+/// The rerank *backend* is resolved inside the window path, not here: a
+/// `--rerank` request with no configured rerank API profile must fail as a
+/// pre-request configuration error, not be silently skipped by this predicate.
 fn rerank_window_enabled(opts: &SemanticSearchOptions) -> bool {
-    opts.rerank && opts.rerank_limit.is_some() && (opts.rerank_provider.is_some() || opts.api.frozen.is_some())
+    opts.rerank && opts.rerank_limit.is_some()
 }
 
 /// The wire spelling the binding freezes for a vector candidate strategy.
@@ -24294,81 +24246,19 @@ fn vector_search_mode_wire(mode: crate::search::query::VectorSearchMode) -> &'st
     }
 }
 
-/// The effective endpoint origin for a rerank backend selection.
+/// Refuse a rerank request whose effective configuration names no rerank API
+/// profile.
 ///
-/// A local selection honours its existing service env override
-/// (`CASS_QWEN_RERANK_URL` for Qwen, `CASS_INFINITY_URL` for BGE) and otherwise
-/// binds the adapter's frozen default origin. A cloud selection always binds the
-/// fixed OpenRouter origin: there is deliberately no CLI or env endpoint
-/// override, so a test can never redirect a real credential.
-fn rerank_endpoint_origin(provider: crate::search::rerank::types::ProviderChoice) -> String {
-    use crate::search::rerank::types::ProviderChoice;
-    match provider {
-        ProviderChoice::Qwen3Local => dotenvy::var("CASS_QWEN_RERANK_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| crate::search::rerank::qwen::DEFAULT_ORIGIN.to_string()),
-        ProviderChoice::BgeLocal => dotenvy::var("CASS_INFINITY_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| crate::search::rerank::bge::DEFAULT_ORIGIN.to_string()),
-        ProviderChoice::OpenrouterQwen38b
-        | ProviderChoice::OpenrouterCohere4Fast
-        | ProviderChoice::OpenrouterVoyage25Lite => {
-            crate::search::rerank::openrouter::DEFAULT_ORIGIN.to_string()
-        }
-    }
-}
-
-/// Build the one rerank backend for `provider`, binding `origin` for a local
-/// selection and reading only `OPENROUTER_API_KEY` for a cloud one.
-///
-/// Construction sends no request for a local selection; a cloud selection
-/// refuses before a transport exists when its credential is missing.
-fn build_rerank_backend(
-    provider: crate::search::rerank::types::ProviderChoice,
-    origin: &str,
-) -> Result<
-    Box<dyn crate::search::rerank::types::RerankBackend>,
-    crate::search::rerank::types::RerankError,
-> {
-    build_rerank_backend_with_trace(provider, origin, None)
-}
-
-fn build_rerank_backend_with_trace(
-    provider: crate::search::rerank::types::ProviderChoice,
-    origin: &str,
-    trace: Option<std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>>,
-) -> Result<
-    Box<dyn crate::search::rerank::types::RerankBackend>,
-    crate::search::rerank::types::RerankError,
-> {
-    use crate::search::rerank::types::ProviderChoice;
-    match provider {
-        ProviderChoice::Qwen3Local => {
-            let backend = crate::search::rerank::qwen::QwenBackend::new(origin)?;
-            Ok(Box::new(match trace {
-                Some(trace) => backend.with_request_trace(trace),
-                None => backend,
-            }))
-        }
-        ProviderChoice::BgeLocal => {
-            let backend = crate::search::rerank::bge::BgeBackend::new(origin)?;
-            Ok(Box::new(match trace {
-                Some(trace) => backend.with_request_trace(trace),
-                None => backend,
-            }))
-        }
-        ProviderChoice::OpenrouterQwen38b
-        | ProviderChoice::OpenrouterCohere4Fast
-        | ProviderChoice::OpenrouterVoyage25Lite => {
-            let backend = crate::search::rerank::openrouter::OpenRouterBackend::from_env(provider)?;
-            Ok(Box::new(match trace {
-                Some(trace) => backend.with_request_trace(trace),
-                None => backend,
-            }))
-        }
-    }
+/// The legacy provider chain (`--rerank-provider`'s local Qwen/Infinity backends
+/// and the shared OpenRouter adapter) was retired with the model-API migration:
+/// the API client is the only rerank path. A `--rerank` request with no rerank
+/// profile is a pre-request configuration error — never a panic, and never a
+/// silent fallback to a retired backend.
+fn rerank_profile_required_error() -> CliError {
+    model_api_migration_error(
+        "reranking requires a configured rerank API profile".into(),
+        "Pass --api-config with a default_rerank profile (or --rerank-profile)".into(),
+    )
 }
 
 /// P09: assemble the frozen [`RequestBinding`] from the current request.
@@ -24797,8 +24687,7 @@ fn regression_request_evidence(
     let api_route = api_window_route(semantic, api_profile.as_ref(), mode)?;
     let configuration = api_profile.as_ref().map(|p| crate::search::model_api::runtime::configuration_snapshot(
         semantic.api.frozen.as_ref().expect("API selection has frozen configuration"), p)).transpose().map_err(regression_search_error)?;
-    let provider = api_profile.as_ref().map(|p| p.id.clone())
-        .or_else(|| semantic.rerank_provider.map(|p| p.as_str().to_owned()));
+    let provider = api_profile.as_ref().map(|p| p.id.clone());
     Ok(serde_json::json!({
         "model_api_route": api_route,
         "model_api_configuration": configuration,
@@ -25327,13 +25216,13 @@ fn run_cli_search(
     // relative time range.
     if let Some(cursor_str) = window_cursor.as_deref() {
         let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-        let provider = semantic_opts.rerank_provider;
         let api_profile = selected_api_rerank_profile(&semantic_opts)?;
-        let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.expect("legacy rerank provider").as_str().to_owned());
-        let endpoint = if let Some(profile) = &api_profile { profile.endpoint.as_str().to_owned() } else {
-            regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider.expect("legacy rerank provider")))
+        let Some(api_profile) = api_profile.as_ref() else {
+            return Err(rerank_profile_required_error());
         };
-        let route = api_window_route(&semantic_opts, api_profile.as_ref(), mode.unwrap_or_default())?;
+        let requested_profile = api_profile.id.clone();
+        let endpoint = api_profile.endpoint.as_str().to_owned();
+        let route = api_window_route(&semantic_opts, Some(api_profile), mode.unwrap_or_default())?;
         let binding = build_request_binding(
             query,
             &filters,
@@ -26192,14 +26081,14 @@ fn score_search_first_window(
     let mut window_continuable = false;
     let mut window_unavailable: Option<&'static str> = None;
     let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-    let provider = semantic_opts.rerank_provider;
     let api_profile = selected_api_rerank_profile(&semantic_opts)?;
-    let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.expect("legacy rerank provider").as_str().to_owned());
-    let requested_model = api_profile.as_ref().map(|p| p.model.clone()).unwrap_or_else(|| provider.expect("legacy rerank provider").request_model().to_owned());
-    let endpoint = if let Some(profile) = &api_profile { profile.endpoint.as_str().to_owned() } else {
-        regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider.expect("legacy rerank provider")))
+    let Some(api_profile) = api_profile.as_ref() else {
+        return Err(rerank_profile_required_error());
     };
-    let route = api_window_route(&semantic_opts, api_profile.as_ref(), mode.unwrap_or_default())?;
+    let requested_profile = api_profile.id.clone();
+    let requested_model = api_profile.model.clone();
+    let endpoint = api_profile.endpoint.as_str().to_owned();
+    let route = api_window_route(&semantic_opts, Some(api_profile), mode.unwrap_or_default())?;
     let binding = build_request_binding(
         query,
         &filters,
@@ -26355,31 +26244,18 @@ fn score_search_first_window(
                             .collect(),
                     );
                 }
-                let backend = if api_profile.is_some() { Ok(None) } else { (match regression.as_ref() {
-                    Some(run) => build_rerank_backend_with_trace(
-                        provider.expect("legacy rerank provider"),
-                        &endpoint,
-                        Some(run.trace.clone()),
-                    ),
-                    None => build_rerank_backend(provider.expect("legacy rerank provider"), &endpoint),
-                }).map(Some) };
-                match backend {
-                    Ok(backend) => {
-                        let call_started = Instant::now();
-                        let response = match backend {
-                            Some(backend) => backend.rerank(query, &documents),
-                            None => {
-                                let config = semantic_opts.api.frozen.as_ref().expect("API config frozen");
-                                let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver));
-                                let client = match regression.as_ref() {
-                                    Some(run) => client.with_rerank_trace(run.trace.clone()),
-                                    None => client,
-                                };
-                                crate::search::model_api::rerank_call::score(&client, &requested_profile, query, &documents,
-                                    !semantic_opts.api.no_model_fallback, &mut api_evidence)
-                            }
-                        };
-                        match response {
+                let call_started = Instant::now();
+                let response = {
+                    let config = semantic_opts.api.frozen.as_ref().expect("API config frozen");
+                    let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver));
+                    let client = match regression.as_ref() {
+                        Some(run) => client.with_rerank_trace(run.trace.clone()),
+                        None => client,
+                    };
+                    crate::search::model_api::rerank_call::score(&client, &requested_profile, query, &documents,
+                        !semantic_opts.api.no_model_fallback, &mut api_evidence)
+                };
+                match response {
                             Ok(response) => {
                                 duration_ms = response.duration_ms;
                                 // The call layer re-proves the completeness
@@ -26452,16 +26328,6 @@ fn score_search_first_window(
                                 failure_reason = Some(error.reason);
                                 http_status = error.http_status;
                             }
-                        }
-                    }
-                    Err(error) => {
-                        // Construction sent no request, so both counts are a
-                        // provable 0 and no time was spent calling.
-                        http_requests = Some(0);
-                        model_requests = Some(0);
-                        failure_reason = Some(error.reason);
-                        http_status = error.http_status;
-                    }
                 }
             }
             Ok(_) => {
@@ -50345,7 +50211,6 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
         "env_vars": [
             {"name": "CASS_IGNORE_SOURCES_CONFIG", "purpose": "test isolation"},
             {"name": "CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "purpose": "lexical backup retention limit"},
-            {"name": "CASS_SEMANTIC_EMBEDDER", "purpose": "force hash embedder even when ML model is installed"},
             {"name": "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT", "purpose": "test failpoint"},
             {"name": "CASS_TEST_DOCTOR_RENAME_FAILURE", "purpose": "test failpoint"}
             // Pass-11 fix: removed the previously-advertised
@@ -73958,10 +73823,11 @@ fn gather_onboarding_observation(
         .as_ref()
         .is_some_and(|cfg| cfg.remote_sources().next().is_some());
 
-    let model_dir = crate::search::model_manager::default_model_dir(data_dir);
-    let manifest = crate::search::model_manager::default_model_manifest();
+    // Semantic readiness is the DB-vector-domain state, not a local weight file:
+    // embedding is served exclusively by the configured external model API, and
+    // the retired local weight cache is no longer consulted.
     let semantic_model_present =
-        crate::search::model_download::check_model_installed(&model_dir, &manifest).is_ready();
+        crate::search::model_manager::probe_semantic_availability(data_dir, db_path).is_ready();
 
     // "Existing indexed DB" means a DB that actually carries content, so an
     // empty/just-created DB still routes the user to a first index.
@@ -81969,17 +81835,17 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_QWEN_RERANK_URL",
             None,
-            "Local Qwen rerank endpoint. Only loopback targets are accepted; proxies and redirects are disabled. Used by qwen3-local, the default when --rerank is enabled.",
+            "Retired. The local Qwen rerank backend was removed with the model-API migration; a model command that finds this set refuses with a migration error.",
         ),
         env_var_capability(
             "CASS_INFINITY_URL",
             None,
-            "Local Infinity endpoint for bge-local reranking and Infinity embeddings. Reranking accepts only loopback targets; proxies and redirects are disabled.",
+            "Retired. The local Infinity backend was removed with the model-API migration; a model command that finds this set refuses with a migration error.",
         ),
         env_var_capability(
             "OPENROUTER_API_KEY",
             None,
-            "Credential consumed only by an explicitly selected OpenRouter rerank provider. Missing credentials keep original order with missing_credentials; no backend switch.",
+            "Credential a profile may reference through api_key_env. Its presence alone never selects a backend and never changes routing.",
         ),
         env_var_capability(
             "CASS_SEARCH_LIMIT",
@@ -82030,7 +81896,7 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
             None,
-            "Select the semantic embedder/model implementation when configured.",
+            "Retired. Selecting a local embedder (e.g. hash) was removed with the model-API migration; a model command that finds this set refuses with a migration error.",
         ),
         env_var_capability(
             "CASS_SEMANTIC_BATCH_SIZE",
@@ -88284,79 +88150,62 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     );
 
     schemas.insert(
-        "models-status".to_string(),
+        "models-list".to_string(),
         json!({
             "type": "object",
-            "description": "cass models status --json: semantic-model acquisition + cache state.",
+            "description": "cass models list --json (and its alias `models status`): the configured HTTP model API profiles. Read-only; loads no local weight and makes no request.",
             "properties": {
-                "policy_quality_tier_embedder": { "type": "string" },
-                "active_registry_name": { "type": ["string", "null"] },
-                "lexical_fail_open": { "type": "boolean" },
-                "models": response_schema_opaque_object_array(),
-                "model_id": { "type": "string" },
-                "model_dir": { "type": "string" },
-                "installed": { "type": "boolean" },
-                "state": { "type": "string", "description": "not_acquired | downloading | ready | needs_update" },
-                "state_detail": { "type": "string" },
-                "next_step": { "type": "string" },
-                "revision": { "type": "string" },
-                "license": { "type": "string" },
-                "total_size_bytes": { "type": "integer" },
-                "installed_size_bytes": { "type": "integer" },
-                "observed_file_bytes": { "type": "integer" },
-                "policy_source": { "type": "string" },
-                "cache_lifecycle": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
-                },
-                "model_acquisition": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
-                },
-                "files": response_schema_opaque_object_array()
+                "schema": { "type": "string", "description": "cass.model-api-list.v1" },
+                "profiles": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "kind": { "type": "string", "description": "embedding | rerank" },
+                            "protocol": { "type": "string" },
+                            "model": { "type": "string" },
+                            "model_revision": { "type": "string", "description": "The revision the operator declares; not proof the client read the served weights." },
+                            "default": { "type": "boolean" },
+                            "endpoint": { "type": "string" },
+                            "scope": { "type": "string", "description": "loopback | remote" },
+                            "api_key_env": { "type": ["string", "null"], "description": "Credential variable name only; the value is never read." }
+                        },
+                        "required": ["id", "kind", "protocol", "model", "model_revision", "default", "endpoint", "scope"]
+                    }
+                }
             },
-            "required": ["policy_quality_tier_embedder", "lexical_fail_open", "models"]
+            "required": ["schema", "profiles"]
         }),
     );
 
     schemas.insert(
-        "models-verify".to_string(),
+        "models-check".to_string(),
         json!({
             "type": "object",
-            "description": "cass models verify --json: per-file SHA-256 verification of the installed semantic model.",
+            "description": "cass models check --profile <id> --json: the result of checking exactly one selected profile against exactly its own endpoint. The fallback is never used, no generation is registered and no readiness cache is touched.",
             "properties": {
-                "status": { "type": "string" },
-                "state_detail": { "type": "string" },
-                "next_step": { "type": "string" },
-                "lexical_fail_open": { "type": "boolean" },
-                "model_dir": { "type": "string" },
-                "all_valid": { "type": "boolean" },
-                "cache_lifecycle": response_schema_opaque_object(),
-                "model_acquisition": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Hardened acquisition contract (same shape as models-status.model_acquisition): state, runtime, source, cost_class, fingerprint, and skipped_network_reason proving verify never auto-downloads."
-                },
-                "error": { "type": ["string", "null"] }
+                "schema": { "type": "string", "description": "cass.model-api-check.v1" },
+                "profile_id": { "type": "string" },
+                "kind": { "type": "string", "description": "embedding | rerank" },
+                "requested_model": { "type": "string" },
+                "declared_revision": { "type": "string" },
+                "response_model": { "type": ["string", "null"] },
+                "response_revision": { "type": ["string", "null"] },
+                "revision_source": { "type": "string", "description": "service_reported | operator_declared" },
+                "mode": { "type": "string" },
+                "fallback_used": { "type": "boolean", "description": "Always false: one explicit profile is checked." },
+                "calls": response_schema_opaque_object_array(),
+                "effective_dimension": { "type": ["integer", "null"], "description": "Measured embedding dimension, for an embedding profile." },
+                "descriptor_sha256": { "type": ["string", "null"], "description": "Representation descriptor digest, for an embedding profile." },
+                "scored_count": { "type": ["integer", "null"], "description": "Documents scored, for a rerank profile." },
+                "usage": { "type": ["object", "null"], "description": "Usage the last service response reported, when it reported one." },
+                "error": {
+                    "type": ["object", "null"],
+                    "description": "Present only when a stage failed: {code, kind, message, http_status, retryable}. Every stage already attempted stays listed in `calls`."
+                }
             },
-            "required": ["status", "all_valid", "lexical_fail_open"]
-        }),
-    );
-
-    schemas.insert(
-        "models-check-update".to_string(),
-        json!({
-            "type": "object",
-            "description": "cass models check-update --json: compares installed model revision against the pinned registry revision.",
-            "properties": {
-                "update_available": { "type": "boolean" },
-                "reason": { "type": "string", "description": "model_not_installed | up_to_date | newer_revision_available | registry_check_failed" },
-                "current_revision": { "type": ["string", "null"] },
-                "latest_revision": { "type": ["string", "null"] }
-            },
-            "required": ["update_available", "reason"]
+            "required": ["schema", "profile_id"]
         }),
     );
 

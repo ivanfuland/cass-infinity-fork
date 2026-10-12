@@ -60,7 +60,6 @@ impl RegressionSearchRun {
             rrf_limit,
             rerank,
             page_size,
-            rerank_provider,
             ..
         } = command
         else {
@@ -103,7 +102,7 @@ impl RegressionSearchRun {
                 ..Default::default()
             },
             model: None,
-            rerank: rerank_limit.is_some(), rerank_limit, rerank_provider: *rerank_provider,
+            rerank: rerank_limit.is_some(), rerank_limit,
             ..Default::default()
         };
         if api.selected() && (*search_mode != SearchMode::Lexical || semantic.rerank) {
@@ -127,8 +126,7 @@ impl RegressionSearchRun {
             }
         }
         let rerank = rerank_limit;
-        let endpoint = api_reranker.as_ref().map(|p| p.endpoint.as_str().to_owned())
-            .or_else(|| rerank_provider.map(crate::rerank_endpoint_origin));
+        let endpoint = api_reranker.as_ref().map(|p| p.endpoint.as_str().to_owned());
         let request = crate::regression_request_evidence(
             &SearchFilters::default(), *search_mode, vector_search_mode.unwrap_or_default(),
             *rrf_limit as usize, None, &semantic, &crate::RerankRequestContext::default(), embedding_binding.as_ref(),

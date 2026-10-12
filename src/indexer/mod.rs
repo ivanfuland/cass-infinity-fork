@@ -5261,9 +5261,12 @@ fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
         // fork: 与 lib.rs backfill 路径写进 manifest 的 `infinity-bge-m3` 保持一致；
         // 否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
         "bge-m3" => "infinity-bge-m3".to_string(),
-        _ => crate::search::model_download::ModelManifest::minilm_v2()
-            .revision
-            .clone(),
+        // No local weight manifest supplies a revision any more: a semantic
+        // generation's identity and revision come from the API representation
+        // descriptor. For an id this mapping does not recognise, the neutral
+        // fallback is the id itself rather than a borrowed MiniLM revision,
+        // which would falsely claim the generation came from a local model.
+        other => other.to_string(),
     }
 }
 
@@ -25290,9 +25293,12 @@ mod tests {
             super::semantic_model_revision_for_embedder_id("fnv1a-384"),
             "hash"
         );
-        assert!(
-            !super::semantic_model_revision_for_embedder_id("minilm-384").is_empty(),
-            "minilm revision should resolve to ModelManifest::minilm_v2().revision"
+        // An id this mapping does not recognise falls back to the id itself
+        // (never a borrowed MiniLM revision, which would falsely claim a local
+        // model produced the generation).
+        assert_eq!(
+            super::semantic_model_revision_for_embedder_id("minilm-384"),
+            "minilm-384"
         );
     }
 

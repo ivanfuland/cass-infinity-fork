@@ -199,9 +199,6 @@ pub(crate) fn run_with_api_config(command: &RegressionInputCommand, api_config: 
                     reranker: None,
                     use_daemon: false,
                     rerank_limit: rerank.then_some(*rerank_limit as usize),
-                    // The retired local provider is never selected: a scored run
-                    // without a frozen model-API rerank profile is refused above.
-                    rerank_provider: None,
                 },
                 crate::RerankRequestContext::default(),
                 Some(crate::RegressionSearchExecution {
