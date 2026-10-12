@@ -49,6 +49,7 @@ pub(crate) mod lexical_rerank;
 pub(crate) mod liveness_fixtures;
 pub(crate) mod model_acquisition;
 pub mod model_api;
+pub mod generation_fingerprint;
 pub mod model_download;
 pub mod model_manager;
 pub mod pack_planner;

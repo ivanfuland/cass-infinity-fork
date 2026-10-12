@@ -12,11 +12,14 @@ FORK_DIR="${FORK_DIR:-$HOME/projects/cass-infinity-build}"
 ASUPERSYNC_REPO="https://github.com/Dicklesworthstone/asupersync"
 ASUPERSYNC_REV="e136c5da4547a44cec3201ada6d94325a7ca216b"
 ASUPERSYNC_DIR="$(dirname "$FORK_DIR")/asupersync"   # 必须是 FORK_DIR 的 ../asupersync sibling
-INSTALL_PATH="${INSTALL_PATH:-$HOME/.local/bin/cass-infinity}"
+INSTALL_PATH="${INSTALL_PATH:-}"
 FEATURES="qr,encryption,infinity"
 
 step() { printf '\n=== %s ===\n' "$1"; }
 die()  { printf 'FAIL[%s]: %s\n' "$1" "$2" >&2; exit 1; }
+
+# Require an explicit destination before cloning, fetching or building anything.
+[ -n "$INSTALL_PATH" ] || die install-path 'INSTALL_PATH is required; select an explicit candidate binary path'
 
 step "1/7 fork repo @ $FORK_REF"
 if [ ! -d "$FORK_DIR/.git" ]; then

@@ -25,7 +25,8 @@ use crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use crate::search::chunking::canonical_role;
 use crate::search::eligibility::{ExpectedChunk, expected_chunks, for_each_expected_chunk};
 use crate::search::frankensearch_types::cosine_similarity;
-use crate::search::infinity::{InfinityServedIdentity, fingerprint_matches};
+use crate::search::infinity::InfinityServedIdentity;
+use crate::search::generation_fingerprint::fingerprint_matches;
 use crate::search::model_api::{
     EndpointConfigIdentity, ModelApiBackfillReport, PrimaryEmbeddingCall, ProbeMeasurement,
     RepresentationDescriptor, ValidatedProfile,
@@ -781,13 +782,13 @@ fn clear_drain_events_for_test() {
 /// fingerprint`], which insists on its own live `InfinityConfig`/HTTP
 /// client -- audit check ⑪ must be exercisable with a deterministic mock
 /// embedder in tests, same as check ⑩). Same wire format:
-/// [`crate::search::infinity::FINGERPRINT_SENTINELS`] embedded in order,
+/// [`crate::search::generation_fingerprint::FINGERPRINT_SENTINELS`] embedded in order,
 /// concatenated as LE f32 bytes.
 fn compute_fresh_fingerprint_via(
     embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
     dim: usize,
 ) -> Result<Vec<u8>> {
-    let inputs: Vec<&str> = crate::search::infinity::FINGERPRINT_SENTINELS.to_vec();
+    let inputs: Vec<&str> = crate::search::generation_fingerprint::FINGERPRINT_SENTINELS.to_vec();
     let vectors = embedder(&inputs).map_err(|e| anyhow!("re-embedding fingerprint sentinels failed: {e}"))?;
     if vectors.len() != inputs.len() {
         bail!("fingerprint embedder returned {} vectors for {} sentinels", vectors.len(), inputs.len());
@@ -2598,7 +2599,7 @@ mod chunk_catchup_v5_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::chunking::CHUNKING_POLICY_VERSION;
-    use crate::search::infinity::FINGERPRINT_SENTINELS;
+    use crate::search::generation_fingerprint::FINGERPRINT_SENTINELS;
 
     const TS: i64 = 1_770_600_000_000;
     const DIM: usize = 4;

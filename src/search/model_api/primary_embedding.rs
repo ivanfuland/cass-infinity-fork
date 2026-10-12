@@ -37,11 +37,8 @@ use crate::storage::schema::f32_vector_to_le_blob;
 /// The three fixed public sentinel texts whose embeddings form a generation's
 /// fingerprint.
 ///
-/// These are the exact bytes the legacy Infinity path pinned in
-/// `crate::search::infinity::FINGERPRINT_SENTINELS`; they are re-stated here
-/// because that module is behind the `infinity` Cargo feature and this driver
-/// must not depend on it. A `cfg(feature = "infinity")` unit test below pins the
-/// two lists equal, so the two copies cannot drift.
+/// The API and legacy readers share the frozen text from
+/// `crate::search::generation_fingerprint::FINGERPRINT_SENTINELS`.
 ///
 /// Changing any sentence changes what every stored fingerprint means, so this is
 /// not meant to be edited casually.
@@ -52,11 +49,7 @@ use crate::storage::schema::f32_vector_to_le_blob;
 /// it; only the code marks that this batch was refused on width.
 pub const DIMENSION_DRIFT_CODE: &str = "DimensionDrift";
 
-pub const API_PROBE_SENTINELS: [&str; 3] = [
-    "The quick brown fox jumps over the lazy dog.",
-    "今天天气不错，我们去公园散步吧。",
-    "fn main() { println!(\"hello\"); }",
-];
+pub use crate::search::generation_fingerprint::FINGERPRINT_SENTINELS as API_PROBE_SENTINELS;
 
 /// Why one primary-endpoint embedding request could not be completed.
 #[derive(Debug, Clone, PartialEq)]
