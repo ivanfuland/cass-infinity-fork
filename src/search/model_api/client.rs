@@ -229,6 +229,21 @@ pub struct ApiClient {
     test_root: Option<Vec<u8>>,
 }
 
+/// Refuse a rerank input that cannot be scored: an empty or all-whitespace
+/// query, an empty document list, or a document that is empty or all
+/// whitespace.
+///
+/// The check runs before the first request and before any fallback decision, so
+/// a rejected input never reaches a service and never triggers a fallback.
+/// `trim` decides emptiness only: it never rewrites the query or the documents,
+/// and an unscoreable document fails the whole request instead of being dropped
+/// from a shortened list.
+fn rerank_input_is_unscoreable(query: &str, documents: &[String]) -> bool {
+    query.trim().is_empty()
+        || documents.is_empty()
+        || documents.iter().any(|document| document.trim().is_empty())
+}
+
 impl ApiClient {
     /// Freeze `config` and take `credentials` as the only credential source.
     pub fn new(config: ValidatedApiConfig, credentials: Box<dyn CredentialResolver>) -> Self {
@@ -360,7 +375,7 @@ impl ApiClient {
         documents: &[String],
     ) -> Result<RerankOutcome, ApiCallFailure> {
         let profile = self.profile_of_kind(profile_id, ProfileKind::Rerank)?;
-        if query.is_empty() || documents.is_empty() {
+        if rerank_input_is_unscoreable(query, documents) {
             return Err(self.bare_failure(ApiCallErrorCode::InvalidInput, Some(profile)));
         }
         let outcome = self.rerank_attempt(profile, query, documents, AttemptStage::Primary, None);
@@ -394,7 +409,7 @@ impl ApiClient {
         options: RerankOptions<'_>,
     ) -> Result<RerankOutcome, ApiCallFailure> {
         let primary = self.profile_of_kind(primary_id, ProfileKind::Rerank)?;
-        if query.is_empty() || documents.is_empty() {
+        if rerank_input_is_unscoreable(query, documents) {
             return Err(self.bare_failure(ApiCallErrorCode::InvalidInput, Some(primary)));
         }
         if options.cancelled() {
@@ -2462,5 +2477,79 @@ normalization = "l2"
         let text = embedding_with_models(&fixture.base(), Some(&fixture.base()));
         let failure = client(&text).probe_models("emb").expect_err("no data");
         assert_eq!(failure.error().code(), ApiCallErrorCode::InvalidResponse);
+    }
+
+    /// A rerank input that cannot be scored is refused before the first request
+    /// and before any fallback, so neither the primary nor the fallback service
+    /// is reached. The whole request fails; an unscoreable document is never
+    /// dropped to keep a shortened list.
+    #[test]
+    fn unscoreable_rerank_input_is_refused_before_any_request_or_fallback() {
+        let primary = HttpFixture::start(vec![Reply::ok(json!({"results": []}))]);
+        let fallback = HttpFixture::start(vec![Reply::ok(json!({"results": []}))]);
+        let client = client(&rerank_pair(&primary.base(), &fallback.base()));
+        let scoreable = || vec!["a scoreable document".to_string()];
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            ("", vec![]),
+            ("", scoreable()),
+            ("   ", scoreable()),
+            ("\u{3000}\t\n", scoreable()),
+            ("query", vec![]),
+            ("query", vec!["ok".to_string(), "\u{3000} ".to_string()]),
+            ("query", vec!["ok".to_string(), String::new()]),
+        ];
+        for (query, documents) in &cases {
+            let query = *query;
+            let documents = documents.clone();
+            let once = client
+                .rerank_once("local", query, &documents)
+                .expect_err("once must refuse an unscoreable input");
+            assert_eq!(
+                once.error().code(),
+                ApiCallErrorCode::InvalidInput,
+                "rerank_once query={query:?} documents={documents:?}"
+            );
+            let with_fallback = client
+                .rerank_with_fallback(
+                    "local",
+                    query,
+                    &documents,
+                    RerankOptions::with_fallback(true),
+                )
+                .expect_err("the fallback entry point must refuse the same input");
+            assert_eq!(
+                with_fallback.error().code(),
+                ApiCallErrorCode::InvalidInput,
+                "rerank_with_fallback query={query:?} documents={documents:?}"
+            );
+            assert!(with_fallback.attempts().is_empty());
+        }
+        assert_eq!(primary.hits(), 0, "a refused input sends no request");
+        assert_eq!(fallback.hits(), 0, "a refused input never falls back");
+    }
+
+    /// Whitespace is used to decide emptiness only: a padded but non-empty
+    /// input travels byte for byte.
+    #[test]
+    fn whitespace_around_a_valid_rerank_input_is_sent_byte_for_byte() {
+        let primary = HttpFixture::start(vec![Reply::ok(json!({
+            "model": "local-reranker",
+            "results": [{"index": 0, "relevance_score": 1.0}, {"index": 1, "relevance_score": 0.5}]
+        }))]);
+        let client = client(&rerank_pair(&primary.base(), "http://127.0.0.1:9"));
+        let query = "  padded query  ";
+        let documents = vec![
+            "  leading and trailing  ".to_string(),
+            "\tinner\twhitespace\t".to_string(),
+        ];
+        let outcome = client
+            .rerank_once("local", query, &documents)
+            .expect("a padded but non-empty input is scoreable");
+        assert_eq!(outcome.scores, vec![1.0, 0.5]);
+        let requests = primary.requests();
+        assert_eq!(requests.len(), 1);
+        let body = requests[0].body();
+        assert_eq!(body["query"], json!(query));
+        assert_eq!(body["documents"], json!(documents));
     }
 }
