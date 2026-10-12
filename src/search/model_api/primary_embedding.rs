@@ -669,6 +669,71 @@ mod page_writer_tests {
         assert_eq!(backup.fixture().hits(), 2);
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn backup_only_sqlite_backfill_activates_and_reuses_the_same_generation() {
+        use super::super::compatibility_bundle::tests::fallback_fixture;
+        use super::super::test_support::TlsFixture;
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::storage::api::{TxMode, StorageError};
+        use crate::storage::api_generation::open_api_generation_with_compatibility;
+        use crate::indexer::db_vector_catchup::run_api_primary_catchup_backfill;
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let client = ApiClient::new_with_test_root(config, Box::new(super::super::EnvCredentialResolver), backup.ca_pem().to_vec());
+        let mut call = PrimaryEmbeddingCall::new(client, profile.clone(), true).unwrap();
+        call.route.proof_sha256 = Some(proof.digest().into());
+        call.route.proof = Some(std::sync::Arc::new(proof));
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("db.sqlite");
+        let storage = crate::storage::sqlite::FrankenStorage::open(&path).unwrap();
+        let agent = storage.ensure_agent(&Agent { id:None, slug:"claude_code".into(), name:"fixture".into(), version:None, kind:AgentKind::Cli }).unwrap();
+        let texts = ["A synthetic document describes how to verify an embedding service response.",
+            "Another synthetic document describes atomic storage and preserving vector provenance."];
+        let messages = texts.iter().enumerate().map(|(idx,text)| Message {
+            excluded:None, id:None, idx:idx as i64, role:MessageRole::User, author:None,
+            created_at:Some(1000 + idx as i64), content:(*text).into(), extra_json:serde_json::Value::Null, snippets:vec![],
+        }).collect();
+        storage.insert_conversation_tree(agent, None, &Conversation {
+            id:None, agent_slug:"claude_code".into(), workspace:None, external_id:Some("backup-fixture".into()),
+            title:Some("backup fixture".into()), source_path:"/fixtures/backup.jsonl".into(),
+            started_at:Some(1000), ended_at:Some(1002), approx_tokens:None, metadata_json:serde_json::Value::Null,
+            messages, source_id:"local".into(), origin_host:None,
+        }).unwrap();
+        let probe = call.probe().unwrap();
+        let first = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
+        assert!(first.catchup.activated);
+        assert_eq!(first.catchup.chunks_embedded, 2);
+        assert_eq!(first.catchup.vec0_rows, 2);
+        assert_eq!(first.catchup.holes_after, 0);
+        assert!(first.model_api.fallback_used);
+        assert!(!call.audit_calls().is_empty(), "activation must run the real audit requests");
+        let id = first.catchup.generation_id;
+        let rows: i64 = storage.raw().query_row_map("SELECT COUNT(*) FROM message_chunks WHERE generation_id=?1",
+            &crate::storage::api::params![id], |row| row.get_typed(0)).unwrap();
+        assert_eq!(rows, 2);
+        let document_attempts = call.document_calls().len();
+        drop(storage);
+        let storage = crate::storage::sqlite::FrankenStorage::open(&path).unwrap();
+        let probe = call.probe().unwrap();
+        let second = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(second.catchup.generation_id, id);
+        assert!(second.catchup.reused_existing_generation);
+        assert_eq!(second.catchup.chunks_embedded, 0);
+        assert_eq!(call.document_calls().len(), document_attempts);
+        let verified = storage.raw().with_tx(TxMode::Deferred, |tx| open_api_generation_with_compatibility(
+            tx, id, &profile, call.route.proof.as_ref().unwrap()).map_err(StorageError::from)).unwrap();
+        assert_eq!(verified.provenance().contributors().len(), 1);
+        assert!(verified.primary_contributor().is_err());
+        assert_eq!(verified.provenance().contributors()[0].endpoint_config_sha256(),
+            super::super::EndpointConfigIdentity::from_profile(call.route.fallback.as_ref().unwrap()).unwrap().sha256());
+        let total_attempts = call.probe_calls().len() + call.document_calls().len() + call.audit_calls().len();
+        assert_eq!(primary.hits(), backup.fixture().hits());
+        assert_eq!(total_attempts, primary.hits() + backup.fixture().hits());
+    }
+
     #[test]
     fn only_a_complete_page_publishes_its_actual_writers() {
         let server = HttpFixture::start(vec![
