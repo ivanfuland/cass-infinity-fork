@@ -677,7 +677,7 @@ mod page_writer_tests {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use crate::storage::api::{TxMode, StorageError};
         use crate::storage::api_generation::open_api_generation_with_compatibility;
-        use crate::indexer::db_vector_catchup::run_api_primary_catchup_backfill;
+        use crate::indexer::db_vector_catchup::{run_api_primary_catchup_backfill, probe_api_backfill};
         let primary = HttpFixture::start(vec![Reply::status(503)]);
         let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
         let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
@@ -702,7 +702,7 @@ mod page_writer_tests {
             started_at:Some(1000), ended_at:Some(1002), approx_tokens:None, metadata_json:serde_json::Value::Null,
             messages, source_id:"local".into(), origin_host:None,
         }).unwrap();
-        let probe = call.probe().unwrap();
+        let probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| panic!("{error}"));
         let first = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
         assert!(first.catchup.activated);
         assert_eq!(first.catchup.chunks_embedded, 2);
@@ -717,7 +717,7 @@ mod page_writer_tests {
         let document_attempts = call.document_calls().len();
         drop(storage);
         let storage = crate::storage::sqlite::FrankenStorage::open(&path).unwrap();
-        let probe = call.probe().unwrap();
+        let probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| panic!("{error}"));
         let second = run_api_primary_catchup_backfill(&storage, 1, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(second.catchup.generation_id, id);
         assert!(second.catchup.reused_existing_generation);
@@ -732,6 +732,34 @@ mod page_writer_tests {
         let total_attempts = call.probe_calls().len() + call.document_calls().len() + call.audit_calls().len();
         assert_eq!(primary.hits(), backup.fixture().hits());
         assert_eq!(total_attempts, primary.hits() + backup.fixture().hits());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn historical_producer_missing_from_proof_blocks_probe_before_any_http() {
+        use super::super::compatibility_bundle::tests::{fallback_fixture, migration_fixture};
+        use super::super::test_support::TlsFixture;
+        use crate::storage::api::{TxMode, StorageError};
+        use crate::storage::api_generation::create_api_generation;
+        use crate::indexer::db_vector_catchup::probe_api_backfill;
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let client = ApiClient::new_with_test_root(config, Box::new(super::super::EnvCredentialResolver), backup.ca_pem().to_vec());
+        let mut call = PrimaryEmbeddingCall::new(client, profile, true).unwrap();
+        call.route.proof_sha256 = Some(proof.digest().into());
+        call.route.proof = Some(std::sync::Arc::new(proof));
+        let root = tempfile::tempdir().unwrap();
+        let storage = crate::storage::sqlite::FrankenStorage::open(&root.path().join("db.sqlite")).unwrap();
+        let (_, old) = migration_fixture(&[1,2], 1, None);
+        storage.raw().with_tx(TxMode::Immediate, |tx| create_api_generation(tx, &old[0], 2, &[1;24], 1)
+            .map_err(StorageError::from)).unwrap();
+        let error = probe_api_backfill(&storage, &call).err().expect("uncovered historical endpoint");
+        assert!(error.to_string().contains("CompatibilityRequired"));
+        assert!(call.probe_calls().is_empty());
+        assert_eq!(primary.hits(), 0);
+        assert_eq!(backup.fixture().hits(), 0);
     }
 
     #[test]

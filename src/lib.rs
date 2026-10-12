@@ -102883,7 +102883,7 @@ fn run_models_backfill_api(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::indexer::db_vector_catchup::{
-        ApiPrimaryBackfillError, run_api_primary_catchup_backfill,
+        ApiPrimaryBackfillError, run_api_primary_catchup_backfill, probe_api_backfill,
     };
     use crate::indexer::semantic::{SemanticBackfillSchedulerSignals, semantic_backfill_scheduler_decision};
     use crate::search::model_api::client::ApiClient;
@@ -102992,17 +102992,13 @@ fn run_models_backfill_api(
 
     // One fresh probe per command. It is the only place the generation's width
     // and fingerprint come from, and it is never cached across commands.
-    let probe = match call.probe() {
+    let probe = match probe_api_backfill(&storage, &call) {
         Ok(probe) => probe,
         Err(failure) => {
+            let compatibility_required = matches!(&failure, ApiPrimaryBackfillError::CompatibilityRequired { .. });
             return Err(api_backfill_failure_error(
-                failure.message(),
-                failure.is_compatibility_required(),
-                &profile,
-                &call,
-                structured,
-                &data_dir,
-                &db_path_for_open,
+                failure.to_string(), compatibility_required, &profile, &call,
+                structured, &data_dir, &db_path_for_open,
             ));
         }
     };

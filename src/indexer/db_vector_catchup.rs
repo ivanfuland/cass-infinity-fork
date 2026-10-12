@@ -1855,6 +1855,15 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
 /// that, not this ticket. A legacy (non-API) row is never an API candidate, so a
 /// previous Infinity generation keeps its active pointer while a new API
 /// candidate is built beside it.
+const ACTIVE_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
+         LIMIT 1";
+const PENDING_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND audit_status = 'pending' \
+         ORDER BY id DESC LIMIT 1";
+
 fn find_or_create_api_generation(
     conn: &Conn,
     call: &PrimaryEmbeddingCall,
@@ -1871,15 +1880,6 @@ fn find_or_create_api_generation(
     let embedder_id = descriptor.embedder_id();
     let dim = i64::try_from(dimension)
         .map_err(|_| anyhow!("api dimension {dimension} does not fit in i64"))?;
-
-    const ACTIVE_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
-         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
-           AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
-         LIMIT 1";
-    const PENDING_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
-         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
-           AND chunking_policy_version = ?4 AND audit_status = 'pending' \
-         ORDER BY id DESC LIMIT 1";
 
     conn.with_tx(TxMode::Immediate, |tx| {
         for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
@@ -1959,6 +1959,36 @@ impl fmt::Display for ApiPrimaryBackfillError {
             Self::Failed(error) => write!(f, "{error:#}"),
         }
     }
+}
+
+/// Verify every possible existing target before a probe may use the backup.
+/// The fingerprint is still measured live; proof metadata only supplies the
+/// expected space for this read-only preflight. Page/activation checks remain.
+pub fn probe_api_backfill(
+    storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
+    if let Some(proof) = &call.route().proof {
+        let descriptor = RepresentationDescriptor::from_profile(call.profile(), proof.primary_dimension() as u64)
+            .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
+        let id = descriptor.embedder_id();
+        let checked = storage.raw().with_tx_no_replay(TxMode::Deferred, |tx| {
+            for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
+                let candidate = tx.query_opt_map(sql, &params![id.as_str(), proof.primary_dimension() as i64,
+                    i64::from(descriptor.canonicalize_version()), i64::from(descriptor.chunking_version())],
+                    |row| row.get_typed::<i64>(0))?;
+                if let Some(candidate) = candidate { call.route().open_generation(tx, candidate)?; }
+            }
+            Ok(())
+        });
+        if checked.is_err() {
+            return Err(ApiPrimaryBackfillError::CompatibilityRequired {
+                message: "CompatibilityRequired: existing generation history was not admitted before probe; no model request sent".into(),
+            });
+        }
+    }
+    call.probe().map_err(|error| if error.is_compatibility_required() {
+        ApiPrimaryBackfillError::CompatibilityRequired { message: error.message() }
+    } else { ApiPrimaryBackfillError::Failed(anyhow!(error)) })
 }
 
 /// One API-primary catch-up run: the shared loop over an
