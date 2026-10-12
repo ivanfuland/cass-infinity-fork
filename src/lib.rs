@@ -7301,6 +7301,14 @@ async fn execute_cli(
                         ));
                     }
 
+                    let api_selection = cli.api_config.is_some() || embedding_profile.is_some() || rerank_profile.is_some()
+                        || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
+                    if api_selection && (rerank_provider.is_some() || reranker.is_some()) {
+                        return Err(model_api_migration_error(
+                            "legacy rerank selection cannot be combined with API configuration".into(),
+                            "Use --rerank-profile".into()));
+                    }
+
                     // `--reranker` is deprecated: it is still parsed for
                     // compatibility, but it never selects a backend and its
                     // value is never echoed. Combining it with the new
@@ -25026,6 +25034,7 @@ fn api_window_route(opts: &SemanticSearchOptions, profile: Option<&crate::search
     let embedding_config_sha256 = embedding.as_ref().map(|p| EndpointConfigIdentity::from_profile(p).map(|d| d.sha256())).transpose().map_err(map)?;
     Ok(Some(crate::search::rerank::window::ApiWindowRoute {
         rerank_profile: profile.id.clone(), rerank_route_sha256: route.sha256(),
+        fallback_profile: route.fallback_profile().map(str::to_owned), allow_fallback: !opts.api.no_model_fallback,
         embedding_profile: embedding.map(|p| p.id), embedding_config_sha256,
     }))
 }

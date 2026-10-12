@@ -2771,6 +2771,16 @@ fn api_rerank_window_pages_without_http_and_rejects_changed_instruction() {
         "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()];
     let first = assert_success(&cass(&args, &[]));
     assert_eq!(stub.requests().len(), 1, "{first}");
+    let sent = stub.requests()[0].body_json();
+    assert_eq!(sent["documents"].as_array().unwrap().len(), 3);
+    assert_eq!(sent["top_n"], 3);
+    assert_eq!(sent["instruct"], "first instruction");
+    let mut legacy = args.to_vec(); legacy.extend(["--rerank-provider", "qwen3-local"]);
+    let rejected = cass(&legacy, &[]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(stderr_text(&rejected).contains("ModelApiMigration"));
+    assert_eq!(stub.requests().len(), 1);
+
     assert_eq!(first["_meta"]["rerank"]["applied"], true, "{first}");
     assert_eq!(first["_meta"]["rerank"]["requested_model"], "example/dynamic-reranker");
     assert_eq!(first["_meta"]["rerank"]["model_api"]["realized_profile"], "ranker");
@@ -2779,8 +2789,20 @@ fn api_rerank_window_pages_without_http_and_rejects_changed_instruction() {
     let second = assert_success(&cass(&next, &[]));
     assert_eq!(second["_meta"]["rerank"]["cache_reused"], true);
     assert_eq!(stub.requests().len(), 1, "continuation sends no HTTP");
-    fs::write(&config, text.replace("first instruction", "different instruction")).unwrap();
-    let denied = cass(&next, &[]);
-    assert!(!denied.status.success(), "old cursor cannot use changed route config");
-    assert_eq!(stub.requests().len(), 1, "changed cursor is refused before HTTP");
+    for changed in [
+        text.replace("first instruction", "different instruction"),
+        text.replace("example/dynamic-reranker", "example/other-reranker"),
+        text.replace(&stub.endpoint(), &format!("{}/changed-path", stub.origin())),
+    ] {
+        fs::write(&config, changed).unwrap();
+        let denied = cass(&next, &[]);
+        assert!(!denied.status.success(), "old cursor cannot use changed route config");
+        assert_eq!(stub.requests().len(), 1, "changed cursor is refused before HTTP");
+    }
+    fs::write(&config, &text).unwrap();
+    drop(stub);
+    let offline = assert_success(&cass(&next, &[]));
+    assert_eq!(offline["_meta"]["rerank"]["cache_reused"], true);
+    assert_eq!(offline["_meta"]["rerank"]["http_requests"], 0);
+    assert_eq!(offline["hits"], second["hits"], "server shutdown does not change the frozen page");
 }
