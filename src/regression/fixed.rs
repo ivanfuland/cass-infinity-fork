@@ -20,8 +20,11 @@ use super::types::{
 };
 use crate::search::regression_trace::{RequestTrace, TextDigest};
 use crate::search::rerank::types::{
-    CallIdentity, ProviderChoice, RerankBackend, RerankError, stable_rank_order,
+    CallIdentity, ProviderChoice, RerankError, stable_rank_order,
 };
+
+#[cfg(test)]
+use crate::search::rerank::types::RerankBackend;
 
 const POOL_SIZE: usize = 200;
 const QIDS: [&str; 9] = [
@@ -436,6 +439,7 @@ pub(crate) struct WindowResult {
     pub(crate) question: Value,
     pub(crate) trace: RequestTrace,
     pub(crate) identity: Option<CallIdentity>,
+    pub(crate) api_rerank: Option<crate::search::rerank::window::ApiWindowRerank>,
     /// Only documents proven in an actual POST attempt enter label subjects.
     pub(crate) label_subjects: Vec<Value>,
     pub(crate) recovery: Value,
@@ -528,20 +532,27 @@ fn http_counts(trace: &RequestTrace) -> Value {
         "basis":if trace.requests.is_empty() {"not-called"} else {"observed-client"}})
 }
 
+#[cfg(test)]
 fn submitted_documents(
+    pool: &PreparedPool, documents: &[String], trace: &RequestTrace,
+) -> Result<bool> {
+    submitted_documents_with_limit(pool, documents, trace, 1)
+}
+
+fn submitted_documents_with_limit(
     pool: &PreparedPool,
     documents: &[String],
     trace: &RequestTrace,
+    maximum: usize,
 ) -> Result<bool> {
     let posts: Vec<_> = trace
         .requests
         .iter()
         .filter(|r| r.method == "POST")
         .collect();
-    ensure!(posts.len() <= 1, "REGRESSION_FIXED_SUBMISSION_MISMATCH");
-    let Some(post) = posts.first() else {
-        return Ok(false);
-    };
+    ensure!(posts.len() <= maximum, "REGRESSION_FIXED_SUBMISSION_MISMATCH");
+    if posts.is_empty() { return Ok(false); }
+    for post in posts {
     ensure!(
         post.query.as_ref() == Some(&TextDigest::of(&pool.window.query))
             && post.json_body_sha256.as_ref().is_some_and(|v| is_sha(v)),
@@ -561,6 +572,7 @@ fn submitted_documents(
             "REGRESSION_FIXED_SUBMISSION_MISMATCH"
         );
     }
+    }
     Ok(true)
 }
 
@@ -568,6 +580,7 @@ fn submitted_documents(
 /// Backend construction is lazy: an unscoreable pool makes zero factory/call
 /// requests. Every question owns its trace, including failures. The caller must
 /// retain all nine results and persist them in a fresh private run root.
+#[cfg(test)]
 pub(crate) fn score_window(
     pool: &PreparedPool,
     labels: &[LabelRecord],
@@ -576,10 +589,25 @@ pub(crate) fn score_window(
     provider: ProviderChoice,
     factory: impl FnOnce(Arc<Mutex<RequestTrace>>) -> Result<Box<dyn RerankBackend>>,
 ) -> Result<WindowResult> {
+    score_window_with_call(pool, labels, policy_sha, documents, Some(provider), None,
+        |trace, query, documents, _| {
+            let backend = factory(trace)?;
+            ensure!(backend.provider() == provider, "REGRESSION_FIXED_BACKEND_IDENTITY_MISMATCH");
+            backend.rerank(query, documents).map_err(anyhow::Error::new)
+        })
+}
+
+fn score_window_with_call(
+    pool: &PreparedPool, labels: &[LabelRecord], policy_sha: &str, documents: &[String],
+    provider: Option<ProviderChoice>, route: Option<&crate::search::rerank::window::ApiWindowRoute>,
+    call_model: impl FnOnce(Arc<Mutex<RequestTrace>>, &str, &[String], &mut Option<crate::search::rerank::window::ApiWindowRerank>) -> Result<crate::search::rerank::types::RerankResponse>,
+) -> Result<WindowResult> {
+    ensure!(provider.is_some() != route.is_some(), "REGRESSION_FIXED_BACKEND_IDENTITY_MISMATCH");
     let started = Instant::now();
     let mut slots = pool.original_slots(labels, policy_sha)?;
     let mut failure: Option<String> = None;
     let mut identity = None;
+    let mut api_rerank = None;
     let trace = Arc::new(Mutex::new(RequestTrace::default()));
     let mut scores = None;
     let mut response_http_requests = None;
@@ -602,15 +630,10 @@ pub(crate) fn score_window(
                 );
             }
             identity_before_ms = milliseconds(identity_started);
-            let backend = factory(trace.clone())?;
-            ensure!(
-                backend.provider() == provider,
-                "REGRESSION_FIXED_BACKEND_IDENTITY_MISMATCH"
-            );
             let score_started = Instant::now();
-            let response = backend.rerank(&pool.window.query, documents);
+            let response = call_model(trace.clone(), &pool.window.query, documents, &mut api_rerank);
             rerank_ms = milliseconds(score_started);
-            response.map_err(anyhow::Error::new)
+            response
         })();
         match call {
             Err(error) => failure = Some(failure_code(&error)),
@@ -619,15 +642,10 @@ pub(crate) fn score_window(
                 identity = Some(response.identity.clone());
                 if response.scores.len() != POOL_SIZE {
                     failure = Some("REGRESSION_FIXED_SCORE_COUNT_MISMATCH".into());
-                } else if response
-                    .identity
-                    .actual_provider
-                    .is_some_and(|p| p != provider)
-                    || response
-                        .identity
-                        .actual_model
-                        .as_deref()
-                        .is_some_and(|m| !provider.accepts_model(m))
+                } else if provider.is_some_and(|provider| {
+                    response.identity.actual_provider.is_some_and(|p| p != provider)
+                    || response.identity.actual_model.as_deref().is_some_and(|m| !provider.accepts_model(m))
+                })
                 {
                     failure = Some("REGRESSION_FIXED_BACKEND_IDENTITY_MISMATCH".into());
                 } else {
@@ -643,7 +661,9 @@ pub(crate) fn score_window(
         .lock()
         .map_err(|_| anyhow::anyhow!("REGRESSION_FIXED_TRACE_FAILED"))?
         .clone();
-    let submitted = match submitted_documents(pool, documents, &trace) {
+    let maximum = if route.is_some_and(|r| r.allow_fallback && r.fallback_profile.is_some()) { 2 } else { 1 };
+    let proof = crate::search::regression_trace::validate_model_attempts(&trace, route, api_rerank.as_ref(), failure.is_none());
+    let submitted = match proof.and_then(|_| submitted_documents_with_limit(pool, documents, &trace, maximum)) {
         Ok(value) => value,
         Err(_) => {
             failure = Some("REGRESSION_FIXED_SUBMISSION_MISMATCH".into());
@@ -655,10 +675,8 @@ pub(crate) fn score_window(
     }
     if failure.is_none()
         && (response_http_requests != Some(trace.requests.len())
-            || !trace.requests.iter().any(|r| {
-                r.method == "POST"
-                    && r.http_status
-                        .is_some_and(|status| (200..300).contains(&status))
+            || !trace.requests.iter().filter(|r| r.method == "POST").last().is_some_and(|r| {
+                r.http_status.is_some_and(|status| (200..300).contains(&status))
             }))
     {
         failure = Some("REGRESSION_FIXED_SUBMISSION_MISMATCH".into());
@@ -707,6 +725,7 @@ pub(crate) fn score_window(
         question,
         trace,
         identity,
+        api_rerank,
         label_subjects: subjects,
         recovery: pool.recovery_evidence(),
     })
@@ -756,12 +775,27 @@ pub(crate) fn collect_prepared(
         .collect()
 }
 
+#[cfg(test)]
 fn execute_prepared(
     pool: &PreparedPool,
     inputs: &ValidatedInputs,
     provider: ProviderChoice,
     read_registered: impl FnMut(&str) -> Result<Vec<u8>>,
     factory: impl FnOnce(Arc<Mutex<RequestTrace>>) -> Result<Box<dyn RerankBackend>>,
+) -> Result<WindowResult> {
+    execute_prepared_with_call(pool, inputs, Some(provider), None, read_registered,
+        |trace, query, documents, _| {
+            let backend = factory(trace)?;
+            ensure!(backend.provider() == provider, "REGRESSION_FIXED_BACKEND_IDENTITY_MISMATCH");
+            backend.rerank(query, documents).map_err(anyhow::Error::new)
+        })
+}
+
+fn execute_prepared_with_call(
+    pool: &PreparedPool, inputs: &ValidatedInputs, provider: Option<ProviderChoice>,
+    route: Option<&crate::search::rerank::window::ApiWindowRoute>,
+    read_registered: impl FnMut(&str) -> Result<Vec<u8>>,
+    call_model: impl FnOnce(Arc<Mutex<RequestTrace>>, &str, &[String], &mut Option<crate::search::rerank::window::ApiWindowRerank>) -> Result<crate::search::rerank::types::RerankResponse>,
 ) -> Result<WindowResult> {
     let started = Instant::now();
     let document_started = Instant::now();
@@ -772,22 +806,24 @@ fn execute_prepared(
     };
     let document_ms = milliseconds(document_started);
     let mut result = match documents {
-        Ok(documents) => score_window(
+        Ok(documents) => score_window_with_call(
             pool,
             &inputs.labels,
             &inputs.label_policy_sha256,
             &documents,
             provider,
-            factory,
+            route,
+            call_model,
         )?,
         Err(error) => {
-            let mut failed = score_window(
+            let mut failed = score_window_with_call(
                 pool,
                 &inputs.labels,
                 &inputs.label_policy_sha256,
                 &[],
                 provider,
-                |_| anyhow::bail!("REGRESSION_FIXED_DOCUMENT_IDENTITY_MISMATCH"),
+                route,
+                |_, _, _, _| anyhow::bail!("REGRESSION_FIXED_DOCUMENT_IDENTITY_MISMATCH"),
             )?;
             failed.question["failure_code"] = json!(failure_code(&error));
             failed
@@ -993,8 +1029,61 @@ fn preparation_failure(
 
 /// Production entry: input admission owns all filesystem reads and run-root
 /// creation. Provenance identifies this clean built executable, never git HEAD.
+pub(crate) enum FixedBackend {
+    Legacy { provider: ProviderChoice, endpoint: String },
+    Api {
+        config: crate::search::model_api::ValidatedApiConfig,
+        profile: crate::search::model_api::ValidatedProfile,
+        route: crate::search::rerank::window::ApiWindowRoute,
+    },
+}
+
+impl From<ProviderChoice> for FixedBackend {
+    fn from(provider: ProviderChoice) -> Self { Self::Legacy { provider, endpoint: crate::rerank_endpoint_origin(provider) } }
+}
+
+impl FixedBackend {
+    fn selected(api: &crate::search::regression_input::RegressionApiOptions, legacy: Option<ProviderChoice>) -> Result<Self> {
+        if !api.selected() { return Ok(legacy.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?.into()); }
+        ensure!(legacy.is_none(), "REGRESSION_MODEL_API_MIGRATION");
+        ensure!(api.embedding_profile.is_none(), "REQUEST_PROFILE_INVALID");
+        use crate::search::model_api::runtime;
+        runtime::ensure_no_retired_model_env(|key| std::env::var_os(key))?;
+        let config = runtime::load_config(api.config_path.as_deref(), |key| std::env::var_os(key))?;
+        let options = crate::SemanticSearchOptions {
+            api: crate::ApiSearchOptions { frozen: Some(config.clone()), rerank_profile: api.rerank_profile.clone(),
+                no_model_fallback: api.no_model_fallback, ..Default::default() },
+            rerank: true, ..Default::default()
+        };
+        let profile = crate::selected_api_rerank_profile(&options).map_err(|e| anyhow::anyhow!("{}: {}", e.kind, e.message))?
+            .ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?;
+        let route = crate::api_window_route(&options, Some(&profile), crate::search::query::SearchMode::Lexical)
+            .map_err(|e| anyhow::anyhow!(e.message))?.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?;
+        Ok(Self::Api { config, profile, route })
+    }
+    fn legacy(&self) -> Option<ProviderChoice> { match self { Self::Legacy { provider, .. } => Some(*provider), _ => None } }
+    fn route(&self) -> Option<&crate::search::rerank::window::ApiWindowRoute> { match self { Self::Api { route, .. } => Some(route), _ => None } }
+    fn profile_id(&self) -> String { match self { Self::Legacy { provider, .. } => provider.as_str().into(), Self::Api { profile, .. } => profile.id.clone() } }
+    fn origin(&self) -> String { match self { Self::Legacy { endpoint, .. } => endpoint.clone(), Self::Api { profile, .. } => profile.endpoint.url().origin().ascii_serialization() } }
+    fn declaration(&self) -> Result<Value> { match self {
+        Self::Legacy { .. } => Ok(Value::Null),
+        Self::Api { config, profile, .. } => Ok(crate::search::model_api::runtime::configuration_snapshot(config, profile)?),
+    } }
+    fn score(&self, trace: Arc<Mutex<RequestTrace>>, query: &str, documents: &[String], evidence: &mut Option<crate::search::rerank::window::ApiWindowRerank>) -> Result<crate::search::rerank::types::RerankResponse> {
+        match self {
+            Self::Legacy { provider, endpoint } => crate::build_rerank_backend_with_trace(*provider, endpoint, Some(trace))?
+                .rerank(query, documents).map_err(anyhow::Error::new),
+            Self::Api { config, profile, route } => {
+                let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)).with_rerank_trace(trace);
+                crate::search::model_api::rerank_call::score(&client, &profile.id, query, documents, route.allow_fallback, evidence).map_err(anyhow::Error::new)
+            }
+        }
+    }
+}
+
 pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
     let RegressionCommand::FixedCandidate {
+        api,
         input,
         pool_binding,
         pool_binding_sha256,
@@ -1012,12 +1101,13 @@ pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
     );
     let started = Instant::now();
     let provenance = RunProvenance::capture()?;
+    let backend = FixedBackend::selected(api, *rerank_provider)?;
     let validated = super::input::prepare_fixed(input, pool_binding, pool_binding_sha256)?;
     collect(
         &validated,
         pool_binding,
         pool_binding_sha256,
-        *rerank_provider,
+        backend,
         cutoffs,
         &provenance,
         started,
@@ -1035,7 +1125,7 @@ pub(crate) fn collect(
     validated: &ValidatedRun,
     pool_path: &Path,
     pool_sha: &str,
-    provider: ProviderChoice,
+    backend: impl Into<FixedBackend>,
     cutoffs: &[u32],
     provenance: &RunProvenance,
     started: Instant,
@@ -1051,10 +1141,12 @@ pub(crate) fn collect(
     );
     let root = &validated.paths.run_root;
     let inputs = &validated.inputs;
-    let endpoint = crate::rerank_endpoint_origin(provider);
+    let backend = backend.into();
+    let endpoint = backend.origin();
+    let provider = backend.profile_id();
     let argv_ref = write_private(root, "argv.json", &serde_json::to_value(&provenance.argv)?)?;
     let request = json!({"mode":"fixed-candidate","request_profile":"fixed-package-v1",
-        "rerank":true,"requested_provider":provider,"n":POOL_SIZE,"page_k":null,
+        "rerank":true,"requested_provider":provider,"model_api_route":backend.route(),"model_api_configuration":backend.declaration()?,"n":POOL_SIZE,"page_k":null,
         "search_mode":null,"vector_search_mode":null,"resolved_filters":{},"cutoffs":cutoffs,
         "configured_origin_sha256":digest(endpoint.as_bytes()),"pool_binding_file_sha256":pool_sha,
         "suite_sha256":inputs.suite_sha256,"input_manifest_sha256":inputs.input_manifest_sha256,
@@ -1079,15 +1171,10 @@ pub(crate) fn collect(
     let mut results = Vec::with_capacity(QIDS.len());
     for pool in &pools {
         let question_started = Instant::now();
-        let result = execute_prepared(
-            pool,
-            inputs,
-            provider,
+        let result = execute_prepared_with_call(
+            pool, inputs, backend.legacy(), backend.route(),
             |reference| super::input::read_registered_asset(inputs, reference),
-            |trace| {
-                crate::build_rerank_backend_with_trace(provider, &endpoint, Some(trace))
-                    .map_err(anyhow::Error::new)
-            },
+            |trace, query, documents, evidence| backend.score(trace, query, documents, evidence),
         );
         let mut result = match result {
             Ok(result) => result,
@@ -1113,7 +1200,7 @@ pub(crate) fn collect(
             &format!("fixed-trace-{qid}.json"),
             &json!({"qid":qid,"query_sha256":pool.window.query_sha256,
                 "ordered_pool_sha256":pool.ordered_pool_sha256,"transport":result.trace,
-                "identity":result.identity,"terminal":result.question["terminal"],
+                "identity":result.identity,"model_api":result.api_rerank,"terminal":result.question["terminal"],
                 "failure_code":result.question["failure_code"]}),
         )?;
         if let Some(subjects) = result.label_subject_cache(pool)? {
@@ -2041,6 +2128,7 @@ mod tests {
         fixture_file(&pool, &pool_bytes);
         PackageFixture {
             command: RegressionCommand::FixedCandidate {
+                api: Default::default(),
                 input: InputOptions {
                     suite,
                     suite_sha256: digest(&suite_bytes),
@@ -2053,11 +2141,112 @@ mod tests {
                 },
                 pool_binding: pool,
                 pool_binding_sha256: digest(&pool_bytes),
-                rerank_provider: ProviderChoice::BgeLocal,
+                rerank_provider: Some(ProviderChoice::BgeLocal),
                 cutoffs: vec![5, 10, 20],
             },
             _root: root,
         }
+    }
+
+    #[test]
+    fn api_fixed_candidate_nine_windows_preserve_inputs_and_configuration() {
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        let mut package = package_fixture("reverse");
+        let server = HttpFixture::start(vec![Reply::ok(json!({"model":"example/fixed-rank", "results":(0..POOL_SIZE).rev().map(|i| json!({"index":i,"relevance_score":i as f64})).collect::<Vec<_>>() }))]);
+        let config_path = package._root.path().join("api.toml");
+        fixture_file(&config_path, format!(r#"
+version=1
+default_rerank="rank"
+[profiles.rank]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/fixed-rank"
+model_revision="frozen-r1"
+"#, server.base()).as_bytes());
+        let RegressionCommand::FixedCandidate { api, input, pool_binding, pool_binding_sha256, rerank_provider, cutoffs } = &mut package.command else { unreachable!() };
+        api.config_path = Some(config_path.clone());
+        api.no_model_fallback = true;
+        *rerank_provider = None;
+        let backend = FixedBackend::selected(api, None).unwrap();
+        let validated = super::super::input::prepare_fixed(input, pool_binding, pool_binding_sha256).unwrap();
+        let started = Instant::now();
+        let provenance = RunProvenance::capture().unwrap();
+        fixture_file(&config_path, b"invalid after freeze");
+        let summary = collect(&validated, pool_binding, pool_binding_sha256, backend, cutoffs, &provenance, started, 0.0).unwrap();
+        assert_eq!(summary["terminal"], "SUCCESS");
+        let root = &validated.paths.run_root;
+        let report: Value = serde_json::from_slice(&std::fs::read(root.join("run.json")).unwrap()).unwrap();
+        assert_eq!(report["quality_status"], "NOT_EVALUATED");
+        let pools = prepare_pools(&validated.inputs, &read_windows(&validated.inputs).unwrap(),
+            &expected_pools(&super::super::input::read_pinned_json(pool_binding, pool_binding_sha256).unwrap(), &validated.inputs).unwrap()).unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 9);
+        for ((question, pool), request) in report["questions"].as_array().unwrap().iter().zip(&pools).zip(requests) {
+            assert_eq!(question["actual_n"], POOL_SIZE);
+            assert_eq!(question["cost"]["http"][0]["http_attempts"], 1);
+            let slots = question["slots"].as_array().unwrap();
+            assert_eq!(slots.len(), POOL_SIZE);
+            pool.verify_recovery(slots).unwrap();
+            let docs = pool.documents(|reference| super::super::input::read_registered_asset(&validated.inputs, reference)).unwrap();
+            assert_eq!(request.method(), "POST");
+            assert_eq!(request.body()["documents"], json!(docs));
+            assert_eq!(request.body()["query"], pool.window.query);
+            let trace: Value = serde_json::from_slice(&std::fs::read(root.join(format!("fixed-trace-{}.json", pool.window.qid))).unwrap()).unwrap();
+            assert_eq!(trace["model_api"]["realized_profile"], "rank");
+        }
+        let request: Value = serde_json::from_slice(&std::fs::read(root.join("request.json")).unwrap()).unwrap();
+        assert_eq!(request["model_api_configuration"]["primary"]["model_revision"], "frozen-r1");
+        assert_eq!(request["model_api_route"]["allow_fallback"], false);
+    }
+
+    #[test]
+    fn api_fixed_candidate_fallback_submits_the_same_complete_pool() {
+        use crate::search::model_api::{ApiClient, ApiConfig, EnvCredentialResolver};
+        use crate::search::model_api::test_support::{HttpFixture, TlsFixture, Reply};
+        let package = package_fixture("reverse");
+        let RegressionCommand::FixedCandidate { input, pool_binding, pool_binding_sha256, .. } = &package.command else { unreachable!() };
+        let inputs = super::super::input::validate_inputs(input).unwrap();
+        let pools = prepare_pools(&inputs, &read_windows(&inputs).unwrap(),
+            &expected_pools(&super::super::input::read_pinned_json(pool_binding, pool_binding_sha256).unwrap(), &inputs).unwrap()).unwrap();
+        let pool = &pools[0];
+        let docs = pool.documents(|reference| super::super::input::read_registered_asset(&inputs, reference)).unwrap();
+        let local = HttpFixture::start(vec![Reply::status(503)]);
+        let cloud = TlsFixture::start(vec![Reply::ok(json!({"results":(0..POOL_SIZE).map(|i| json!({"index":i,"relevance_score":i as f64})).collect::<Vec<_>>() }))]);
+        let config = ApiConfig::parse_toml(&format!(r#"
+version=1
+default_rerank="local"
+[profiles.local]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/local"
+model_revision="r1"
+fallback_profile="cloud"
+[profiles.cloud]
+kind="rerank"
+protocol="openrouter-rerank-v1"
+scope="remote"
+endpoint="{}"
+model="example/cloud"
+model_revision="r1"
+provider_only="fixed-provider"
+"#, local.base(), cloud.base())).unwrap();
+        let opts = crate::SemanticSearchOptions { api: crate::ApiSearchOptions { frozen: Some(config.clone()), ..Default::default() }, ..Default::default() };
+        let route = crate::api_window_route(&opts, config.profile("local"), crate::search::query::SearchMode::Lexical).unwrap().unwrap();
+        let result = score_window_with_call(pool, &inputs.labels, &inputs.label_policy_sha256, &docs, None, Some(&route),
+            |trace, query, documents, evidence| {
+                let client = ApiClient::new_with_test_root(config, Box::new(EnvCredentialResolver), cloud.ca_pem().to_vec()).with_rerank_trace(trace);
+                crate::search::model_api::rerank_call::score(&client, "local", query, documents, true, evidence).map_err(anyhow::Error::new)
+            }).unwrap();
+        assert_eq!(result.question["terminal"], "SUCCESS");
+        assert_eq!(result.question["cost"]["http"][0]["http_attempts"], 2);
+        assert_eq!(result.api_rerank.as_ref().unwrap().realized_profile.as_deref(), Some("cloud"));
+        pool.verify_recovery(result.question["slots"].as_array().unwrap()).unwrap();
+        assert_eq!(local.requests()[0].body()["documents"], json!(docs));
+        assert_eq!(cloud.fixture().requests()[0].body()["documents"], json!(docs));
     }
 
     fn archive_fixture(from: &Path, to: &Path) {

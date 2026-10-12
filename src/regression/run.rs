@@ -303,12 +303,11 @@ pub(crate) fn validate_retrieval(
 
 pub(crate) fn run_with_api_config(command: &RegressionCommand, path: Option<&std::path::Path>) -> Result<Value> {
     let mut command = command.clone();
-    if let RegressionCommand::FullSearch { api, .. } = &mut command {
-        if let Some(path) = path { api.config_path = Some(path.to_path_buf()); }
-    }
-    if matches!(&command, RegressionCommand::FixedCandidate { .. })
-        && (path.is_some() || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some()) {
-        bail!("REGRESSION_MODEL_API_MIGRATION");
+    match &mut command {
+        RegressionCommand::FullSearch { api, .. } | RegressionCommand::FixedCandidate { api, .. } => {
+            if let Some(path) = path { api.config_path = Some(path.to_path_buf()); }
+        }
+        _ => {}
     }
     run(&command)
 }

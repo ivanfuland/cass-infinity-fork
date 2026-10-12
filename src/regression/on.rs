@@ -1324,6 +1324,7 @@ mod tests {
             (gets, posts)
         });
         let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let evidence = dotenvy::var("CASS_S2_05_EVIDENCE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| temporary.path().to_path_buf());

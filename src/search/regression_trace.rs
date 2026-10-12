@@ -276,6 +276,63 @@ pub(crate) fn verify_submitted_slots(
     Ok(())
 }
 
+/// Shared proof of which model requests could produce a complete result.
+pub(crate) fn validate_model_attempts(
+    trace: &RequestTrace,
+    route: Option<&crate::search::rerank::window::ApiWindowRoute>,
+    api_rerank: Option<&crate::search::rerank::window::ApiWindowRerank>,
+    applied: bool,
+) -> anyhow::Result<()> {
+    use anyhow::bail;
+    let posts: Vec<_> = trace.requests.iter().filter(|r| r.method == "POST").collect();
+    if route.is_some() && posts.len() != trace.requests.len() { bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH"); }
+    if trace.model_requests.is_some() { bail!("TRACE_MODEL_EXECUTION_UNPROVEN"); }
+    for post in &posts {
+        if !post.json_body_sha256.as_ref().is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            bail!("TRACE_MISSING_SUBMITTED_TEXT");
+        }
+    }
+        let maximum = if route.is_some_and(|r| r.allow_fallback && r.fallback_profile.is_some()) { 2 } else { 1 };
+        if posts.len() > maximum || (applied && posts.is_empty()) {
+            bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
+        }
+        match (route, api_rerank) {
+            (Some(route), Some(api)) => {
+                let attempts = &api.attempts;
+                if api.primary_profile != route.rerank_profile || attempts.len() > maximum
+                    || attempts.first().is_some_and(|a| a.profile != route.rerank_profile)
+                    || attempts.get(1).is_some_and(|a| Some(&a.profile) != route.fallback_profile.as_ref()) {
+                    bail!("TRACE_WINDOW_REQUEST_MISMATCH");
+                }
+                let sent: Vec<_> = attempts.iter().filter(|a| a.network_attempted).collect();
+                if sent.len() != posts.len() || sent.iter().zip(&posts).any(|(a,p)| a.http_status != p.http_status) {
+                    bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
+                }
+                if attempts.len() == 2 {
+                    let first = &attempts[0];
+                    let eligible = match first.http_status {
+                        Some(status) => [408,429,500,502,503,504].contains(&status),
+                        None => matches!(first.error_code.as_deref(), Some("timeout" | "connection_refused" | "connection_interrupted" | "network_unavailable")),
+                    };
+                    if !eligible || first.error_code.is_none() || api.fallback_reason != first.error_code {
+                        bail!("TRACE_WINDOW_REQUEST_MISMATCH");
+                    }
+                }
+                if applied {
+                    let winner = attempts.last().ok_or_else(|| anyhow::anyhow!("TRACE_SCORING_RESPONSE_UNPROVEN"))?;
+                    if api.realized_profile.as_ref() != Some(&winner.profile) || winner.error_code.is_some()
+                        || api.fallback_used != (attempts.len() == 2) {
+                        bail!("TRACE_SCORING_RESPONSE_UNPROVEN");
+                    }
+                } else if api.realized_profile.is_some() || api.fallback_used { bail!("TRACE_SCORING_RESPONSE_UNPROVEN"); }
+            }
+            (Some(_), None) if !posts.is_empty() || applied => bail!("TRACE_SCORING_RESPONSE_UNPROVEN"),
+            (None, Some(_)) => bail!("TRACE_WINDOW_REQUEST_MISMATCH"),
+            _ => {}
+        }
+    Ok(())
+}
+
 /// Stored inside the private window. The existing hit wire format stays intact.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -363,44 +420,7 @@ impl WindowEvidence {
         let route = self.request.get("model_api_route").filter(|v| !v.is_null())
             .map(|v| serde_json::from_value::<crate::search::rerank::window::ApiWindowRoute>(v.clone()))
             .transpose().map_err(|_| anyhow::anyhow!("TRACE_WINDOW_REQUEST_MISMATCH"))?;
-        let maximum = if route.as_ref().is_some_and(|r| r.allow_fallback && r.fallback_profile.is_some()) { 2 } else { 1 };
-        if posts.len() > maximum || (applied && posts.is_empty()) {
-            bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
-        }
-        match (&route, &self.api_rerank) {
-            (Some(route), Some(api)) => {
-                let attempts = &api.attempts;
-                if api.primary_profile != route.rerank_profile || attempts.len() > maximum
-                    || attempts.first().is_some_and(|a| a.profile != route.rerank_profile)
-                    || attempts.get(1).is_some_and(|a| Some(&a.profile) != route.fallback_profile.as_ref()) {
-                    bail!("TRACE_WINDOW_REQUEST_MISMATCH");
-                }
-                let sent: Vec<_> = attempts.iter().filter(|a| a.network_attempted).collect();
-                if sent.len() != posts.len() || sent.iter().zip(&posts).any(|(a,p)| a.http_status != p.http_status) {
-                    bail!("TRACE_SCORING_REQUEST_COUNT_MISMATCH");
-                }
-                if attempts.len() == 2 {
-                    let first = &attempts[0];
-                    let eligible = match first.http_status {
-                        Some(status) => [408,429,500,502,503,504].contains(&status),
-                        None => matches!(first.error_code.as_deref(), Some("timeout" | "connection_refused" | "connection_interrupted" | "network_unavailable")),
-                    };
-                    if !eligible || first.error_code.is_none() || api.fallback_reason != first.error_code {
-                        bail!("TRACE_WINDOW_REQUEST_MISMATCH");
-                    }
-                }
-                if applied {
-                    let winner = attempts.last().ok_or_else(|| anyhow::anyhow!("TRACE_SCORING_RESPONSE_UNPROVEN"))?;
-                    if api.realized_profile.as_ref() != Some(&winner.profile) || winner.error_code.is_some()
-                        || api.fallback_used != (attempts.len() == 2) {
-                        bail!("TRACE_SCORING_RESPONSE_UNPROVEN");
-                    }
-                } else if api.realized_profile.is_some() || api.fallback_used { bail!("TRACE_SCORING_RESPONSE_UNPROVEN"); }
-            }
-            (Some(_), None) if !posts.is_empty() || applied => bail!("TRACE_SCORING_RESPONSE_UNPROVEN"),
-            (None, Some(_)) => bail!("TRACE_WINDOW_REQUEST_MISMATCH"),
-            _ => {}
-        }
+        validate_model_attempts(&self.transport, route.as_ref(), self.api_rerank.as_ref(), applied)?;
         for (index, post) in posts.iter().enumerate() {
             let docs = post
                 .documents

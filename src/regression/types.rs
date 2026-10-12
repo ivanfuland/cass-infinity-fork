@@ -100,13 +100,15 @@ pub enum RegressionCommand {
     /// Validate the frozen package. Reranking is a later stage.
     FixedCandidate {
         #[command(flatten)]
+        api: crate::search::regression_input::RegressionApiOptions,
+        #[command(flatten)]
         input: InputOptions,
         #[arg(long)]
         pool_binding: PathBuf,
         #[arg(long)]
         pool_binding_sha256: String,
         #[arg(long, value_enum)]
-        rerank_provider: crate::search::rerank::types::ProviderChoice,
+        rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
         #[arg(long, value_delimiter = ',', default_value = "5,10,20")]
         cutoffs: Vec<u32>,
     },

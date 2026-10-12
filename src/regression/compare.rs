@@ -2034,13 +2034,14 @@ mod tests {
                     run_id: "fixed".into(),
                 };
                 let fixed_command = RegressionCommand::FixedCandidate {
+                    api: Default::default(),
                     input: fixed_input.clone(),
                     pool_binding: prepared["pool"].as_str().context("pool")?.into(),
                     pool_binding_sha256: prepared["pool_sha256"]
                         .as_str()
                         .context("pool SHA")?
                         .into(),
-                    rerank_provider: crate::search::rerank::types::ProviderChoice::BgeLocal,
+                    rerank_provider: Some(crate::search::rerank::types::ProviderChoice::BgeLocal),
                     cutoffs: vec![5, 10, 20],
                 };
                 super::super::fixed::run(&fixed_command)?;

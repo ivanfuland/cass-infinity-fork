@@ -3504,10 +3504,11 @@ mod tests {
             },
         };
         let command = super::super::types::RegressionCommand::FixedCandidate {
+            api: Default::default(),
             input: input.clone(),
             pool_binding: PathBuf::from(text("pool")?),
             pool_binding_sha256: text("pool_sha256")?.into(),
-            rerank_provider: crate::search::rerank::types::ProviderChoice::BgeLocal,
+            rerank_provider: Some(crate::search::rerank::types::ProviderChoice::BgeLocal),
             cutoffs: vec![5, 10, 20],
         };
         let produced = super::super::fixed::run(&command)?;

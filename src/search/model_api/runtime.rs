@@ -258,6 +258,17 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+/// A reproducible configuration declaration without credential values.
+pub(crate) fn configuration_snapshot(config: &ValidatedApiConfig, primary: &ValidatedProfile) -> Result<serde_json::Value, ConfigError> {
+    let declaration = |profile: &ValidatedProfile| -> Result<serde_json::Value, ConfigError> {
+        let identity = super::EndpointConfigIdentity::from_profile(profile)?;
+        Ok(serde_json::from_slice(&identity.canonical_bytes()).expect("canonical call configuration is JSON"))
+    };
+    let fallback = primary.fallback_profile.as_deref().and_then(|id| config.profile(id));
+    Ok(serde_json::json!({"primary_profile":primary.id,"primary":declaration(primary)?,
+        "fallback_profile":primary.fallback_profile,"fallback":fallback.map(declaration).transpose()?}))
+}
+
 /// The one production credential source: the process environment.
 ///
 /// The client asks it for a profile's `api_key_env` name and receives the

@@ -24799,10 +24799,13 @@ fn regression_request_evidence(
     }
     let api_profile = if semantic.rerank { selected_api_rerank_profile(semantic)? } else { None };
     let api_route = api_window_route(semantic, api_profile.as_ref(), mode)?;
+    let configuration = api_profile.as_ref().map(|p| crate::search::model_api::runtime::configuration_snapshot(
+        semantic.api.frozen.as_ref().expect("API selection has frozen configuration"), p)).transpose().map_err(regression_search_error)?;
     let provider = api_profile.as_ref().map(|p| p.id.clone())
         .or_else(|| semantic.rerank_provider.map(|p| p.as_str().to_owned()));
     Ok(serde_json::json!({
         "model_api_route": api_route,
+        "model_api_configuration": configuration,
         "mode": search_mode_canonical_str(mode),
         "vector_search_mode": vector_search_mode_wire(vector_mode),
         "resolved_filters": filters,

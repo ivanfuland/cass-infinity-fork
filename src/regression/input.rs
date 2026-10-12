@@ -1376,10 +1376,11 @@ mod tests {
 
     fn command(fixture: &Fixture) -> RegressionCommand {
         RegressionCommand::FixedCandidate {
+            api: Default::default(),
             input: fixture.input.clone(),
             pool_binding: fixture.pool.clone(),
             pool_binding_sha256: fixture.pool_sha.clone(),
-            rerank_provider: crate::search::rerank::types::ProviderChoice::Qwen3Local,
+            rerank_provider: Some(crate::search::rerank::types::ProviderChoice::Qwen3Local),
             cutoffs: vec![5, 10, 20],
         }
     }
