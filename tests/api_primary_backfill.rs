@@ -2120,7 +2120,7 @@ fn corrupt_representation_record(db_path: &Path) {
 }
 
 #[test]
-fn the_branch_is_chosen_by_presence_not_by_resolvability() {
+fn api_backfill_requires_configuration_for_every_selection_shape() {
     let (_dir, data_dir) = scratch();
     let storage = build_db(
         &data_dir,
@@ -2150,9 +2150,9 @@ fn the_branch_is_chosen_by_presence_not_by_resolvability() {
         let _ = FrankenStorage::open(&outside_db).expect("open outside db");
     }
 
-    // Control: with no selection at all the legacy branch runs, so `--db`
-    // outside `--data-dir` is the legacy usage refusal.
-    let legacy = cass(
+    // Missing API configuration is refused before any database work, even
+    // when the supplied database path would also fail later validation.
+    let absent = cass(
         &[
             "models",
             "backfill",
@@ -2165,14 +2165,14 @@ fn the_branch_is_chosen_by_presence_not_by_resolvability() {
         &[],
     );
     assert_eq!(
-        legacy.status.code(),
+        absent.status.code(),
         Some(2),
-        "the legacy branch's own refusal"
+        "missing configuration is a usage refusal"
     );
     assert_eq!(
-        error_envelope(&legacy)["error"]["kind"],
-        "usage",
-        "no selection must reach the legacy branch"
+        error_envelope(&absent)["error"]["kind"],
+        "ModelApiConfiguration",
+        "no selection must never reactivate the retired legacy branch"
     );
 
     // An empty environment value is still a selection: it must not silently fall
@@ -2871,4 +2871,14 @@ fn compatibility_capture_cli_publishes_private_pinned_files_and_never_overwrites
     #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(fs::metadata(&output).unwrap().permissions().mode()&0o777,0o700);}
     let repeated=cass(&args,&[]);assert!(!repeated.status.success());
     assert_eq!(server.requests().len(),12);assert_eq!(manifest_bytes,fs::read(output.join("capture-manifest.json")).unwrap());
+}
+
+#[test]
+fn absent_api_configuration_cannot_fall_through_to_a_legacy_backend() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("not-created");
+    let output = cass(&argv(&args_without_config(&data)), &[]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr_text(&output));
+    assert!(stderr_text(&output).contains("ModelApiConfiguration"));
+    assert!(!data.exists(), "missing configuration must fail before database or lock creation");
 }

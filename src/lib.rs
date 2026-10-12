@@ -102604,22 +102604,6 @@ fn run_models_verify(
     Ok(())
 }
 
-fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_manifest::TierKind> {
-    use crate::search::semantic_manifest::TierKind;
-
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "fast" => Ok(TierKind::Fast),
-        "quality" => Ok(TierKind::Quality),
-        other => Err(CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!("Unknown semantic tier '{other}'."),
-            hint: Some("Use --tier fast or --tier quality".into()),
-            retryable: false,
-        }),
-    }
-}
-
 fn resolve_semantic_index_embedder(raw: &str) -> String {
     let requested = raw.trim();
     if !matches!(requested, "fastembed" | "minilm") {
@@ -103074,7 +103058,7 @@ fn run_models_backfill_api(
         println!("  Generation: {}", report.generation_id);
         println!("  Profile: {}", profile.id);
         println!("  Embedder: {}", report.embedder_id);
-        println!("  Embedded (this run): {}", report.embedded_inserted);
+        println!("  Embedded chunks (this run): {}", report.chunks_embedded);
         println!("  Holes remaining: {}", report.holes_after);
         println!("  Activated: {}", report.activated);
         if !report.cleanup_failures.is_empty() {
@@ -103165,329 +103149,73 @@ fn run_models_backfill(
     db_override: Option<PathBuf>,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
-    use crate::indexer::semantic::{
-        SemanticBackfillSchedulerSignals, SemanticIndexer, semantic_backfill_scheduler_decision,
-    };
-    use crate::search::model_api::runtime;
-    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-    use crate::search::semantic_manifest::TierKind;
-    use crate::storage::sqlite::FrankenStorage;
-    use colored::Colorize;
-
     if batch_conversations == 0 {
-        return Err(CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: "--batch-conversations must be greater than zero".to_string(),
-            hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
-            retryable: false,
-        });
+        return Err(CliError::usage("--batch-conversations must be greater than zero", None));
     }
-
-    // API02D: an explicit `--embedding-profile`, or an API configuration named
-    // on `--api-config` or `CASS_API_CONFIG`, selects the API-only path. It
-    // never falls back to the legacy local backend, so a selected-but-broken
-    // configuration is a configuration error rather than a silent switch.
-    //
-    // The decision is made on the *presence* of the selection and never on
-    // whether the selected path happens to resolve: `resolve_config_path`
-    // reports `None` for an empty environment value, so deciding on its result
-    // let `CASS_API_CONFIG=''` fall through to the legacy backend instead of
-    // reporting the configuration error the contract requires. The content is
-    // read and validated later, inside the API branch.
-    let api_branch = embedding_profile.is_some()
-        || api_config_path.is_some()
-        || std::env::var_os(runtime::API_CONFIG_ENV).is_some();
-    if api_branch {
-        return run_models_backfill_api(
-            embedding_profile,
-            embedder_override,
-            tier_raw,
-            no_model_fallback,
-            batch_conversations,
-            scheduled,
-            api_config_path,
-            data_dir_override,
-            db_override,
-            output_format,
-        );
-    }
-
-    let tier = parse_models_backfill_tier(tier_raw.unwrap_or("fast"))?;
-    let (data_dir, db_path_for_open) = resolve_models_backfill_db(data_dir_override, db_override)?;
-    let _index_run_lock_guard = acquire_models_backfill_lock(&data_dir, &db_path_for_open)?;
-
-    let embedder_type = embedder_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| match tier {
-            TierKind::Fast => "hash".to_string(),
-            // R1-W3-N2: default to `infinity` under this build's actual
-            // feature (fastembed/ONNX is retired here) so a bare `cass
-            // models backfill` (no `--embedder`) reaches the DB vector
-            // domain instead of immediately hitting the "embedder
-            // 'fastembed' is retired" error below.
-            TierKind::Quality => {
-                if cfg!(feature = "infinity") { "infinity".to_string() } else { "fastembed".to_string() }
-            }
-        });
-    let embedder_type = resolve_semantic_index_embedder(&embedder_type);
-    let embedder_valid = embedder_type == "hash"
-        || (cfg!(feature = "infinity") && embedder_type == "infinity")
-        || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .is_some();
-    if !embedder_valid {
-        return Err(CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!("Unknown embedder '{}'.", embedder_type),
-            hint: Some(
-                "Use --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
-                    .into(),
-            ),
-            retryable: false,
-        });
-    }
-
-    let scheduler_decision = if scheduled {
-        let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-        let signals = SemanticBackfillSchedulerSignals::from_env();
-        Some(semantic_backfill_scheduler_decision(
-            &policy,
-            batch_conversations,
-            &signals,
-        ))
-    } else {
-        None
-    };
-
-    if let Some(decision) = scheduler_decision.as_ref()
-        && !decision.should_run()
-    {
-        let status = decision.state.as_str();
-        let next_step = decision.reason.next_step();
-        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-            if matches!(fmt, RobotFormat::Sessions) {
-                RobotFormat::Compact
-            } else {
-                fmt
-            }
-        });
-
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": status,
-                    "next_step": next_step,
-                    "tier": tier.as_str(),
-                    "embedder_id": embedder_type,
-                    "data_dir": data_dir.display().to_string(),
-                    "db_path": db_path_for_open.display().to_string(),
-                    "batch_conversations_limit": batch_conversations,
-                    "scheduler": decision,
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!("{}", "Semantic backfill scheduler".bold());
-            println!("  Status: {}", status);
-            println!("  Tier: {}", tier.as_str());
-            println!("  Embedder: {}", embedder_type);
-            println!("  Capacity: {}%", decision.current_capacity_pct);
-            println!(
-                "  Next eligible after: {} ms",
-                decision.next_eligible_after_ms
-            );
-            println!();
-            println!("{}", next_step);
-        }
-
-        return Ok(());
-    }
-
-    let storage = FrankenStorage::open_writer(&db_path_for_open).map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::Storage.kind_str(),
-        message: format!("Failed to open cass database {}: {e}", db_path_for_open.display()),
-        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
-        retryable: true,
-    })?;
-
-    // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
-    // longer builds a .fsvi file -- it drains the DB vector domain's
-    // `chunk_holes` via the same catch-up `cass index --semantic` uses
-    // (ingest-time hooks already register a hole per new message; this
-    // drains them + does a genesis-eligibility rescan as a self-healing
-    // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
-    // tiers still use the fsvi path below until Step1's dependency removal
-    // forces their disposition.
-    if embedder_type == "infinity" {
-        #[cfg(feature = "infinity")]
-        {
-            let batch_size = SemanticIndexer::new("infinity", None)
-                .map_err(|e| CliError {
-                    code: 20,
-                    kind: CliErrorKind::Model.kind_str(),
-                    message: format!("Failed to initialize infinity embedder: {e}"),
-                    hint: Some(
-                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
-                            .into(),
-                    ),
-                    retryable: true,
-                })?
-                .batch_size();
-            // T8 (plan v5.1, task book #92): `cass models backfill` drains
-            // the chunk domain, matching `index --semantic`'s wiring --
-            // the retired v4 message-granularity engine T11 deleted is no
-            // longer reachable from anywhere.
-            let infinity_config = crate::search::infinity::InfinityConfig::from_env();
-            let (identity, fingerprint) =
-                crate::search::infinity::probe_identity_and_fingerprint(&infinity_config).map_err(|e| CliError {
-                    code: 20,
-                    kind: CliErrorKind::Model.kind_str(),
-                    message: format!("Infinity identity+fingerprint probe failed: {e}"),
-                    hint: Some(
-                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
-                            .into(),
-                    ),
-                    retryable: true,
-                })?;
-            let embedder = crate::search::infinity::InfinityEmbedder::new().map_err(|e| CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!("Failed to construct infinity embedder: {e}"),
-                hint: None,
-                retryable: true,
-            })?;
-            let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
-                use crate::search::embedder::Embedder as _;
-                embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
-            };
-            let ownership_seed = FrankenStorage::now_millis() as u64;
-            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
-                &storage,
-                batch_size,
-                &identity,
-                crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
-                crate::search::chunking::CHUNKING_POLICY_VERSION,
-                &fingerprint,
-                &embed_fn,
-                ownership_seed,
-            )
-            .map_err(|e| CliError {
-                code: 5,
-                kind: CliErrorKind::SemanticBackfill.kind_str(),
-                message: format!("DB vector domain catch-up failed: {e:#}"),
-                hint: Some(
-                    "Retry the command; the catch-up is idempotent (chunk_holes-driven)"
-                        .into(),
-                ),
-                retryable: true,
-            })?;
-
-            let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-                if matches!(fmt, RobotFormat::Sessions) {
-                    RobotFormat::Compact
-                } else {
-                    fmt
-                }
-            });
-            if structured_format.is_some() {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": if report.activated { "published" } else { "in_progress" },
-                        "next_step": if report.activated {
-                            "semantic tier is ready"
-                        } else {
-                            "rerun the same command to continue draining chunk_holes"
-                        },
-                        "tier": "quality",
-                        "embedder_id": report.embedder_id,
-                        "data_dir": data_dir.display().to_string(),
-                        "db_path": db_path_for_open.display().to_string(),
-                        "generation_id": report.generation_id,
-                        "reused_existing_generation": report.reused_existing_generation,
-                        "eligible_seeded": report.eligible_seeded,
-                        "embedded_inserted": report.embedded_inserted,
-                        "stale_skipped": report.stale_skipped,
-                        "holes_before": report.holes_before,
-                        "holes_after": report.holes_after,
-                        "activated": report.activated,
-                        // R3-6: previously discarded entirely (only
-                        // `cleanup_deleted_generation_ids` was ever computed
-                        // downstream of this report, and nothing surfaced
-                        // even that) -- a candidate-level delete failure or
-                        // the orphan-scan query itself failing (sentinel
-                        // `generation_id=0`) is real operational signal a
-                        // structured-output consumer must be able to see.
-                        "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
-                            "generation_id": generation_id,
-                            "error": detail,
-                        })).collect::<Vec<_>>(),
-                    }))
-                    .unwrap_or_default()
-                );
-            } else {
-                println!("{}", "Semantic backfill (DB vector domain)".bold());
-                println!("  Generation: {}", report.generation_id);
-                println!("  Embedder: {}", report.embedder_id);
-                println!("  Embedded (this run): {}", report.embedded_inserted);
-                println!("  Holes remaining: {}", report.holes_after);
-                println!("  Activated: {}", report.activated);
-                if !report.cleanup_failures.is_empty() {
-                    println!("  Cleanup failures: {}", report.cleanup_failures.len());
-                    for (generation_id, detail) in &report.cleanup_failures {
-                        println!("    - generation {generation_id}: {detail}");
-                    }
-                }
-            }
-            return Ok(());
-        }
-        #[cfg(not(feature = "infinity"))]
-        {
-            return Err(CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: "embedder 'infinity' requires the `infinity` build feature".to_string(),
-                hint: Some("Rebuild with --features infinity".into()),
-                retryable: false,
-            });
-        }
-    }
-
-    Err(CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!(
-            "embedder '{embedder_type}' is retired (W3-5, frankensearch/fsvi removed); use --embedder infinity"
-        ),
-        hint: Some("Rebuild with --features infinity and rerun with --embedder infinity".into()),
-        retryable: false,
-    })
+    run_models_backfill_api(
+        embedding_profile, embedder_override, tier_raw, no_model_fallback,
+        batch_conversations, scheduled, api_config_path,
+        data_dir_override, db_override, output_format,
+    )
 }
 
 #[cfg(test)]
-mod w3_5_models_backfill_infinity_wiring_tests {
+mod api_models_backfill_wiring_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::storage::sqlite::FrankenStorage;
     use tempfile::TempDir;
 
-    /// W3-5 wiring proof (task book #63, advisor ruling: "先接线后拆除"):
-    /// `cass models backfill --embedder infinity` must reach the same
-    /// DB-vector-domain catch-up (`db_vector_catchup::
-    /// run_db_vector_catchup_backfill`) that `cass index --semantic` now
-    /// uses, not the retired fsvi path -- positive proof the capability
-    /// silently disappearing (the risk this wiring commit exists to close)
-    /// did not happen. Requires a live Infinity at CASS_INFINITY_URL
-    /// (127.0.0.1:7997 default); run explicitly with `--ignored`.
+    struct BackfillFixture {
+        _service: crate::search::model_api::test_support::HttpFixture,
+        config_dir: TempDir,
+    }
+
+    impl BackfillFixture {
+        fn new() -> Self {
+            use crate::search::model_api::test_support::{HttpFixture, Reply};
+            let service = HttpFixture::start(vec![Reply::Embeddings(8)]);
+            let config_dir = TempDir::new().unwrap();
+            std::fs::write(config_dir.path().join("models.toml"), format!(r#"version=1
+default_embedding="test"
+[profiles.test]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="{}"
+model="example/embedding"
+model_revision="fixture-r1"
+normalization="l2"
+"#, service.base())).unwrap();
+            Self { _service: service, config_dir }
+        }
+
+        fn run(&self, data_dir: &Path, db: Option<PathBuf>) -> CliResult<()> {
+            crate::run_models_backfill(None, None, None, false, 100, false,
+                Some(&self.config_dir.path().join("models.toml")), Some(data_dir.to_path_buf()), db, None)
+        }
+    }
+
+    fn run_fixture_backfill(data_dir: &Path, db: Option<PathBuf>) -> CliResult<()> {
+        BackfillFixture::new().run(data_dir, db)
+    }
+
+    fn seed_path_fixture(storage: &FrankenStorage) {
+        let agent = storage.ensure_agent(&Agent { id:None, slug:"claude_code".into(), name:"fixture".into(), version:None, kind:AgentKind::Cli }).unwrap();
+        storage.insert_conversation_tree(agent, None, &Conversation {
+            id:None, agent_slug:"claude_code".into(), workspace:None, external_id:Some("path-fixture".into()),
+            title:None, source_path:"/fixtures/path.jsonl".into(), started_at:Some(1000), ended_at:Some(1000),
+            approx_tokens:None, metadata_json:serde_json::Value::Null,
+            messages:vec![Message { excluded:None, id:None, idx:0, role:MessageRole::User, author:None,
+                created_at:Some(1000), content:"A synthetic document verifies database path resolution during API backfill.".into(),
+                extra_json:serde_json::Value::Null, snippets:vec![] }],
+            source_id:"local".into(), origin_host:None,
+        }).unwrap();
+    }
+
+    /// The API CLI entry must populate the existing SQLite vector domain.
     #[test]
-    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
-    #[cfg(feature = "infinity")]
-    fn cli_models_backfill_infinity_reaches_db_vector_domain_catchup() {
+    fn cli_models_backfill_api_reaches_db_vector_domain_catchup() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -103547,19 +103275,8 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                 .expect("seed conversation");
         }
 
-        run_models_backfill(
-            Some("quality"),
-            Some("infinity"),
-            None,
-            false,
-            10_000,
-            false,
-            None,
-            Some(data_dir.clone()),
-            Some(db_path.clone()),
-            None,
-        )
-        .expect("cass models backfill --embedder infinity must reach the DB vector domain");
+        run_fixture_backfill(&data_dir, Some(db_path.clone()))
+            .expect("API backfill must reach the DB vector domain");
 
         let storage = FrankenStorage::open_readonly(&db_path).unwrap();
         let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
@@ -103607,7 +103324,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         )
         .expect("test setup: acquiring the lock first must succeed");
 
-        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), None, None);
+        let result = run_fixture_backfill(&data_dir, None);
         let err = result.expect_err("models backfill must refuse to run while another index run holds the lock");
         assert_eq!(err.code, 7, "lock-busy must use the same exit code run_index uses (IndexBusy), not a bespoke one: {err:?}");
         assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
@@ -103633,7 +103350,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             let _ = FrankenStorage::open(&outside_db).unwrap();
         }
 
-        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), Some(outside_db.clone()), None);
+        let result = run_fixture_backfill(&data_dir, Some(outside_db.clone()));
         let err = result.expect_err("a --db outside --data-dir must be rejected");
         assert_eq!(err.code, 2, "data_dir/db_path mismatch must be a usage error: {err:?}");
         assert_eq!(err.kind, CliErrorKind::Usage.kind_str());
@@ -103645,10 +103362,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
     /// canonicalized, so the link's target was compared against the
     /// unresolved `data_dir` join and the same request was rejected as a
     /// `--db`/`data_dir` mismatch (code 2) purely for having said it out
-    /// loud. `--tier fast` is the `hash` embedder, retired by W3-5, so
-    /// reaching that error (code 20) -- which happens after the path check,
-    /// the lock, and opening the database -- is the evidence the path check
-    /// accepted the symlinked db.
+    /// loud. Both forms now complete through an isolated API service.
     #[test]
     fn models_backfill_accepts_explicit_db_that_is_a_symlink_to_the_data_dir_db() {
         let dir = TempDir::new().unwrap();
@@ -103656,26 +103370,23 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let real_db = data_dir.join("real.db");
         {
-            let _ = FrankenStorage::open(&real_db).unwrap();
+            let storage = FrankenStorage::open(&real_db).unwrap();
+            seed_path_fixture(&storage);
         }
         let linked_db = data_dir.join("agent_search.db");
         std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
 
-        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), Some(linked_db.clone()), None);
-        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence that the explicit --db was accepted");
-        assert_eq!(
-            err.code, 20,
-            "an explicit --db naming the data_dir's own (symlinked) database must not be rejected as a --db/--data-dir mismatch: {err:?}"
-        );
+        let api = BackfillFixture::new();
+        let result = api.run(&data_dir, Some(linked_db.clone()));
+        result.expect("explicit symlinked database must be accepted by API backfill");
 
         // The implicit form (no --db) is the behaviour the explicit form has
         // to match -- it resolves the same symlink through
         // `expected_db_path`. Asserted here too so a future reordering that
         // canonicalizes only after the `db_path` match cannot pass this
         // test: it would break this direction instead.
-        let implicit = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), None, None);
-        let implicit_err = implicit.expect_err("same retired embedder, reached via the default db path");
-        assert_eq!(implicit_err.code, 20, "the implicit (no --db) form must keep working against a symlinked agent_search.db: {implicit_err:?}");
+        let implicit = api.run(&data_dir, None);
+        implicit.expect("implicit symlinked database must be accepted by API backfill");
     }
 
     /// R7-5 (#124, control-plane adversarial review of #123). The doctor
@@ -103727,7 +103438,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         .unwrap();
         lock_file.flush().unwrap();
 
-        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), None, None);
+        let result = run_fixture_backfill(&data_dir, None);
         let err = result.expect_err(
             "a held doctor mutation lock must stop the open; a canonicalized path must not be what the storage layer is given",
         );
@@ -103785,7 +103496,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         .unwrap();
         lock_file.flush().unwrap();
 
-        let explicit = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(data_dir.clone()), Some(real_db), None);
+        let explicit = run_fixture_backfill(&data_dir, Some(real_db));
         let err = explicit.expect_err(
             "a held doctor mutation lock must stop the open even when --db names the symlink's target; deriving the lock from the caller's alias is what lets this form skip it",
         );
@@ -103802,18 +103513,8 @@ mod w3_5_models_backfill_infinity_wiring_tests {
 
     /// T4 mission #122a (C, Step 3 case ③): `--data-dir` with no `--db`
     /// must operate on *that* data_dir's own database, not the process-
-    /// global default (`default_db_path()`) -- R1-N6. `--tier fast`
-    /// (hash embedder) is used deliberately, not as a stand-in embedder:
-    /// W3-5 retired the hash/fastembed fsvi path entirely (see the
-    /// unconditional "embedder '{embedder_type}' is retired" `Err` this
-    /// function falls through to below its `embedder_type == "infinity"`
-    /// branch), so this call is expected to fail there -- but only
-    /// *after* resolving data_dir/db_path, opening the side database via
-    /// `FrankenStorage::open_writer`, and acquiring the lock, all of
-    /// which happen earlier in the function. Reaching that specific
-    /// "retired" error (code 20), not `IndexMissing` (3) or the mismatch
-    /// `Usage` error (2) case ② covers, is itself the proof this call
-    /// really operated on the side database rather than the default.
+    /// global default (`default_db_path()`). A successful isolated API run and
+    /// the preserved sentinel verify which database was opened.
     #[test]
     fn models_backfill_default_db_path_is_derived_from_data_dir_not_global_default() {
         let dir = TempDir::new().unwrap();
@@ -103841,11 +103542,11 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                 origin_host: None,
             };
             storage.insert_conversation_tree(agent_id, None, &conv).expect("seed sentinel conversation into the side db");
+            seed_path_fixture(&storage);
         }
 
-        let result = run_models_backfill(Some("fast"), None, None, false, 100, false, None, Some(side_dir.clone()), None, None);
-        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence of which db got opened");
-        assert_eq!(err.code, 20, "must reach the retired-embedder error, proving data_dir/db_path resolution and lock acquisition both succeeded against the side db first: {err:?}");
+        let result = run_fixture_backfill(&side_dir, None);
+        result.expect("API backfill must open the selected data directory");
 
         let lock_path = side_dir.join("index-run.lock");
         assert!(lock_path.is_file(), "index-run.lock must have been created under --data-dir, not wherever the global default would be: {}", lock_path.display());
