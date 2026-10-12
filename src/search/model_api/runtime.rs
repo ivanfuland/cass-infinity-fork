@@ -405,7 +405,11 @@ pub fn load_config_with(
         return Err(RuntimeError::missing_config());
     };
     let text = read(selected.path()).map_err(|_| RuntimeError::unreadable_config())?;
-    ApiConfig::parse_toml(&text).map_err(|error| RuntimeError::invalid_config(&error))
+    let mut config = ApiConfig::parse_toml(&text).map_err(|error| RuntimeError::invalid_config(&error))?;
+    let absolute = if selected.path().is_absolute() { selected.path().to_path_buf() }
+        else { std::env::current_dir().map_err(|_| RuntimeError::unreadable_config())?.join(selected.path()) };
+    config.set_source_directory(absolute.parent().ok_or_else(RuntimeError::unreadable_config)?.to_path_buf());
+    Ok(config)
 }
 
 /// Select one profile by its configured id.
@@ -866,6 +870,28 @@ model_revision = "rev-2"
             "expected the validator code, got {}",
             error.message()
         );
+    }
+
+    #[test]
+    fn compatibility_paths_follow_the_selected_toml_directory() {
+        let text=r#"version=1
+[profiles.embed]
+kind="embedding"
+protocol="openai-embeddings-v1"
+endpoint="http://127.0.0.1:1/embedding"
+scope="loopback"
+model="example/embedding"
+model_revision="r1"
+normalization="l2"
+fallback_compatibility_file="proofs/current.json"
+"#;
+        let config=load_config_with(Some(Path::new("/tmp/config-area/models.toml")),env_of(&[]), |_|Ok(text.into())).unwrap();
+        let profile=config.profile("embed").unwrap();
+        assert_eq!(config.compatibility_path(profile).unwrap(),Some(PathBuf::from("/tmp/config-area/proofs/current.json")));
+        let memory_only=ApiConfig::parse_toml(text).unwrap();
+        assert!(memory_only.compatibility_path(memory_only.profile("embed").unwrap()).is_err(),"no implicit cwd for a parser-only configuration");
+        assert_eq!(super::super::EndpointConfigIdentity::from_profile(profile).unwrap().sha256(),
+            super::super::EndpointConfigIdentity::from_profile(memory_only.profile("embed").unwrap()).unwrap().sha256());
     }
 
     #[test]

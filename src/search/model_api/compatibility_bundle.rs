@@ -125,6 +125,7 @@ pub(crate) fn read_regular(path: &std::path::Path) -> Result<Vec<u8>, Error> {
 pub(crate) struct CheckedBundle {
     header: Bundle,
     digest: String,
+    original_json: String,
     captures: HashMap<String, CheckedCapture>,
 }
 impl CheckedBundle {
@@ -201,12 +202,26 @@ impl CheckedBundle {
             let actual=compare_pair(&fixture,left,right)?;
             if !matching_summary(&claim.result,&actual) { return Err(Error::EvidenceMismatch); }
         }
-        Ok(Self { header,digest:sha(bytes),captures })
+        Ok(Self { header,digest:sha(bytes),original_json:String::from_utf8(bytes.to_vec()).map_err(|_|Error::InvalidEvidence)?,captures })
     }
     pub(crate) fn digest(&self)->&str { &self.digest }
+    pub(crate) fn original_json(&self)->&str { &self.original_json }
+    pub(crate) fn capture_profile(&self, pin:&str)->Option<&ValidatedProfile> { self.captures.get(pin).map(|c|&c.profile) }
+    pub(crate) fn selected_capture(&self, endpoint_sha:&str)->Option<&str> {
+        [&self.header.primary_capture_sha256,self.header.fallback_capture_sha256.as_ref().unwrap_or(&self.header.primary_capture_sha256)]
+            .into_iter().find(|pin|self.captures.get(pin.as_str()).is_some_and(|c|c.endpoint_sha256==endpoint_sha)).map(String::as_str)
+    }
     pub(crate) fn header(&self)->&Bundle { &self.header }
     /// A historical capture pin is never replaced by a fresh sample from the
     /// same endpoint. `None` is only for the original pure-primary record.
+    pub(crate) fn member_matches(&self, member:&Member)->bool {
+        let Some(capture)=self.captures.get(&member.capture.sha256) else {return false;};
+        let Ok(config)=EndpointConfigIdentity::from_profile(&capture.profile) else {return false;};
+        capture.endpoint_sha256==member.endpoint_config_sha256 && capture.sources()==&member.sources
+            && capture.sources().token_counter_artifact_sha256==member.token_receipt.sha256
+            && config.canonical_bytes()==member.call_configuration_json.as_bytes()
+    }
+
     pub(crate) fn covers(&self, endpoint_sha:&str, historical_capture_sha:Option<&str>) -> bool {
         match historical_capture_sha {
             Some(pin)=>self.captures.get(pin).is_some_and(|c| c.endpoint_sha256==endpoint_sha),
@@ -216,7 +231,7 @@ impl CheckedBundle {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use super::super::compatibility_archive::Capture;
     use super::super::compatibility_archive::tests::{archive, fixture};
@@ -269,6 +284,23 @@ mod tests {
     fn read(bundle:&Bundle,files:&HashMap<String,Vec<u8>>,primary:&ValidatedProfile)->Result<CheckedBundle,Error> {
         CheckedBundle::read(&serde_json::to_vec(bundle).unwrap(),primary,None,|pin| files.get(&pin.name).cloned().ok_or(Error::EvidenceMismatch))
     }
+    pub(crate) fn migration_fixture(ports:&[u16],current:usize,fresh:Option<u16>)->(CheckedBundle,Vec<ValidatedProfile>) {
+        let (bytes,f)=fixture();
+        let archives=ports.iter().map(|port| {
+            let mut capture=archive(&f,*port);
+            if fresh==Some(*port) {capture.profile_toml.push('\n');}
+            capture
+        }).collect();
+        let (mut header,files,_)=package(archives,bytes,false);
+        let profiles:Vec<_>=header.members.iter().map(|member| {
+            let capture:Capture=serde_json::from_slice(files.get(&member.capture.name).unwrap()).unwrap();
+            super::super::ApiConfig::parse_toml(&capture.profile_toml).unwrap().profiles().next().unwrap().clone()
+        }).collect();
+        header.primary_capture_sha256=header.members[current].capture.sha256.clone();
+        let proof=read(&header,&files,&profiles[current]).unwrap();
+        (proof,profiles)
+    }
+
     #[test]
     fn loader_reads_pinned_files_and_refuses_replaced_content() {
         let (bytes,f)=fixture();

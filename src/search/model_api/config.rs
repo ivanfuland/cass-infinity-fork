@@ -374,12 +374,26 @@ impl ValidatedProfile {
 /// A parsed and fully validated model-service configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidatedApiConfig {
+    source_directory: Option<std::path::PathBuf>,
     profiles: BTreeMap<String, ValidatedProfile>,
     default_embedding: Option<String>,
     default_rerank: Option<String>,
 }
 
 impl ValidatedApiConfig {
+    pub(crate) fn set_source_directory(&mut self, directory: std::path::PathBuf) {
+        self.source_directory = Some(directory);
+    }
+
+    /// Resolve only the explicitly named proof. Parsing TOML never reads it.
+    pub(crate) fn compatibility_path(&self, profile: &ValidatedProfile) -> Result<Option<std::path::PathBuf>, ConfigError> {
+        let Some(path) = profile.embedding().and_then(|e| e.fallback_compatibility_file.as_deref()) else { return Ok(None); };
+        let path = std::path::Path::new(path);
+        if path.is_absolute() { return Ok(Some(path.to_path_buf())); }
+        let base = self.source_directory.as_ref().ok_or_else(|| ConfigError::at(ConfigErrorCode::InvalidValue,"fallback_compatibility_file"))?;
+        Ok(Some(base.join(path)))
+    }
+
     /// The schema version every validated document carries.
     pub const VERSION: i64 = SUPPORTED_VERSION;
 
@@ -482,6 +496,7 @@ impl ApiConfig {
         )?;
 
         Ok(ValidatedApiConfig {
+            source_directory: None,
             profiles,
             default_embedding,
             default_rerank,
@@ -644,14 +659,8 @@ fn parse_profile(id: &str, table: &TomlTable) -> Result<ValidatedProfile, Config
                 return Err(invalid("request_dimensions"));
             }
         }
-        // The compatibility-evidence path only means something on the primary
-        // profile of a fallback pair.
-        if embedding.fallback_compatibility_file.is_some() && fallback_profile.is_none() {
-            return Err(ConfigError::at(
-                ConfigErrorCode::InvalidFallback,
-                "fallback_compatibility_file",
-            ));
-        }
+        // A proof may also authorize a primary endpoint migration without a
+        // fallback route. Its contents are checked at runtime, never here.
     }
 
     Ok(ValidatedProfile {
@@ -2399,13 +2408,12 @@ normalization = "l2"
     }
 
     #[test]
-    fn rejects_a_compatibility_file_without_a_fallback() {
-        let text = wrapped(&embedding_profile(
-            "fallback_compatibility_file = \"/tmp/compat.json\"\n",
-        ));
-        let error = reject(&text);
-        assert_eq!(error.code(), ConfigErrorCode::InvalidFallback);
-        assert_eq!(error.field(), Some("fallback_compatibility_file"));
+    fn compatibility_file_can_authorize_primary_endpoint_migration() {
+        let text = wrapped(&embedding_profile("fallback_compatibility_file = \"/tmp/compat.json\"\n"));
+        let config = parse(&text);
+        let profile = config.profiles().next().unwrap();
+        assert!(profile.fallback_profile.is_none());
+        assert_eq!(config.compatibility_path(profile).unwrap(), Some(std::path::PathBuf::from("/tmp/compat.json")));
     }
 
     #[test]

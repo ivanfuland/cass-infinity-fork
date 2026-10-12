@@ -50,8 +50,7 @@ pub enum ConfigErrorCode {
     KindMismatch,
     /// The `fallback_profile` graph is malformed: a non-loopback primary, a
     /// non-remote target, a self reference, a target that itself declares a
-    /// fallback, a missing cloud provider restriction, or a fallback field on a
-    /// profile that declares no fallback.
+    /// fallback, or a missing cloud provider restriction.
     InvalidFallback,
     /// A rerank primary and its fallback do not agree on the instruction under
     /// the strict `Option<String>` rule.

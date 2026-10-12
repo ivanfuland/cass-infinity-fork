@@ -23,22 +23,13 @@
 //! never edits or removes an older generation, and never accepts a caller's word
 //! that a record is compatible. The endpoint digest it stores is recomputed from
 //! the profile it is handed; the digest is never taken from the caller. There is
-//! no fallback-record update path and no public flag a caller could set to
-//! declare a record trustworthy.
+//! no public flag a caller can set to declare a record trustworthy.
 //!
-//! Only the **pure primary** case exists in version 1: exactly one contributor,
-//! whose two compatibility-evidence fields are null. A record that names more
-//! than one contributor, or that carries compatibility evidence, is *recognised
-//! and refused* with [`ApiGenerationErrorCode::UnsupportedContributors`] or
-//! [`ApiGenerationErrorCode::CompatibilityRequired`]. Refusing it is not the
-//! same as calling it corrupt, so its bytes are left exactly as they were on
-//! disk for the successor ticket that will learn to read them.
-//!
-//! "Refused, not interpreted" is taken literally: the compatibility-evidence
-//! header is never parsed into a value at all. A legal header may contain a
-//! number no `f64` holds (`1e400`, a 400-digit integer) or any other structure
-//! this build has no business reading, and none of that makes the source record
-//! malformed.
+//! The plain opener remains primary-only. The proof-aware opener verifies each
+//! recorded contributor and its original capture against a fully checked bundle.
+//! Registering a writer only appends evidence in the caller's transaction.
+//! Unknown future headers remain opaque and cannot be rewritten; their JSON
+//! may contain numbers such as `1e400` without becoming a corrupt record.
 //!
 //! ## Why the rejection codes are closed
 //!
@@ -308,21 +299,10 @@ impl From<ApiGenerationError> for StorageError {
 // Provenance record
 // ---------------------------------------------------------------------------
 
-/// One contributor to a generation's representation space.
-///
-/// The ten fields are the primary profile's own call and representation facts,
-/// plus the two compatibility-evidence fields a cross-endpoint contributor must
-/// fill in. In version 1 only the pure primary contributor exists, so both
-/// compatibility fields are null; a later ticket extends the reader, and this
-/// constructor does not fabricate them.
-///
-/// The header is deliberately *presence only*, not a parsed value: the spec calls
-/// it the complete secret-free header of a versioned evidence document, and this
-/// ticket has no license to interpret it — not even enough to hold its numbers.
-/// A header that is well-formed JSON but contains `1e400`, or an integer wider
-/// than `f64`, is still a header, and calling the record corrupt over it would be
-/// wrong. So the decoder records that a header is there and materializes none of
-/// it; whether the evidence it heads may be admitted is a successor's decision.
+/// One producer of vectors in the generation's canonical representation space.
+/// The original primary has null compatibility fields. Other entries preserve
+/// the complete evidence JSON in a versioned lossless envelope. Unknown future
+/// envelopes are retained as raw JSON and refused without rewriting them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiGenerationContributor {
     compatibility_evidence_header: Option<HeaderPresent>,
@@ -363,18 +343,16 @@ impl ApiGenerationContributor {
     }
 
     /// Whether this contributor carries a cross-endpoint compatibility-evidence
-    /// header. Always `false` in version 1.
+    /// header. Presence alone never grants admission.
     ///
-    /// A read-only predicate, never a flag a caller may set: nothing here can
-    /// make a contributor admissible. The header itself is not materialized —
-    /// see the type's own documentation — so there is no value to hand out, and
-    /// a record that carries one is refused as pending admission.
+    /// A read-only predicate; callers must use the proof-aware opener before
+    /// using a generation that carries compatibility evidence.
     pub const fn has_compatibility_evidence_header(&self) -> bool {
         self.compatibility_evidence_header.is_some()
     }
 
     /// The cross-endpoint compatibility-evidence digest, when this contributor
-    /// carries one. Always `None` in version 1.
+    /// carries one; the original primary has no such digest.
     pub fn compatibility_evidence_sha256(&self) -> Option<&str> {
         self.compatibility_evidence_sha256.as_deref()
     }
@@ -422,11 +400,9 @@ impl ApiGenerationContributor {
 
     fn wire(&self) -> ContributorWire<'_> {
         ContributorWire {
-            // Always null: `canonical_bytes` refuses to encode a record that
-            // carries a header, so this encoder only ever runs on a
-            // pure-primary record. The stored bytes of anything else are never
-            // rewritten from here.
-            compatibility_evidence_header: None,
+            // Known envelopes preserve exact evidence bytes; unknown formats
+            // are refused by canonical_bytes before reaching this serializer.
+            compatibility_evidence_header: self.compatibility_evidence_header.as_ref().map(|h|h.0.as_ref()),
             compatibility_evidence_sha256: self.compatibility_evidence_sha256.as_deref(),
             document_prefix: &self.document_prefix,
             endpoint_config_sha256: &self.endpoint_config_sha256,
@@ -514,21 +490,13 @@ impl ApiGenerationProvenance {
 
     /// The canonical bytes: one compact JSON object, ASCII-ordered, no newline.
     ///
-    /// Refuses when a contributor carries a compatibility-evidence header. This
-    /// build does not materialize that header, so encoding the record would
-    /// silently drop it — and dropping evidence is exactly what must not happen
-    /// to a record read from storage. A record that carries one is read,
-    /// classified and left alone; its bytes are never rewritten from here.
+    /// Unknown evidence formats are refused. A known envelope preserves the
+    /// exact original proof JSON and checks its SHA before serialization.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, ApiGenerationError> {
-        if self
-            .contributors
-            .iter()
-            .any(ApiGenerationContributor::has_compatibility_evidence_header)
-        {
-            return Err(ApiGenerationError::at(
-                ApiGenerationErrorCode::CompatibilityRequired,
-                "compatibility_evidence_header",
-            ));
+        for contributor in &self.contributors {
+            if let Some(header)=&contributor.compatibility_evidence_header {
+                header.known(contributor.compatibility_evidence_sha256.as_deref())?;
+            }
         }
         serde_json::to_vec(&self.wire()).map_err(|_| {
             ApiGenerationError::at(ApiGenerationErrorCode::InvalidRecord, "canonical_bytes")
@@ -676,12 +644,10 @@ impl ApiGenerationContributor {
 
 /// The contributor exactly as it is written, in canonical key order.
 ///
-/// The header is always written as an explicit null: only the pure-primary
-/// writer exists in this version, and `canonical_bytes` refuses any record that
-/// carries a header rather than re-encoding it without one.
+/// Null for the original primary; known lossless proof envelopes otherwise.
 #[derive(Serialize)]
 struct ContributorWire<'a> {
-    compatibility_evidence_header: Option<&'a str>,
+    compatibility_evidence_header: Option<&'a serde_json::value::RawValue>,
     compatibility_evidence_sha256: Option<&'a str>,
     document_prefix: &'a str,
     endpoint_config_sha256: &'a str,
@@ -702,25 +668,42 @@ struct ProvenanceWire<'a> {
     version: i64,
 }
 
-/// The bare fact that a contributor carries a compatibility-evidence header.
-///
-/// "This version may not interpret the header" has to include "may not parse its
-/// numbers": `{"future_value": 1e400}` is legal JSON that no `f64` can hold, so
-/// decoding it into a `serde_json::Value` would fail and report a perfectly
-/// well-formed source record as corrupt. Instead the value is skipped at the
-/// lexer level, which validates the JSON *structure* — brackets, commas, escapes,
-/// terminators — without converting any number into anything. Nothing of the
-/// header is materialized, so nothing of it can be rewritten.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HeaderPresent;
-
+/// Raw JSON preserves unknown future headers without interpreting large numbers.
+/// Known headers carry the exact evidence-file text so its original SHA remains
+/// checkable after storage, including formatting and trailing whitespace.
+#[derive(Clone)]
+struct HeaderPresent(Box<serde_json::value::RawValue>);
+impl fmt::Debug for HeaderPresent {
+    fn fmt(&self, f:&mut fmt::Formatter<'_>)->fmt::Result { f.write_str("CompatibilityHeader(<redacted>)") }
+}
+impl PartialEq for HeaderPresent { fn eq(&self, other:&Self)->bool { self.0.get()==other.0.get() } }
+impl Eq for HeaderPresent {}
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompatibilityHeader {
+    schema: String,
+    evidence_json: String,
+}
+impl HeaderPresent {
+    fn from_checked(proof:&crate::search::model_api::compatibility_bundle::CheckedBundle)->Result<Self,ApiGenerationError> {
+        let bytes=serde_json::to_string(&CompatibilityHeader{schema:"cass.api-compatibility-header.v1".into(),evidence_json:proof.original_json().into()})
+            .map_err(|_|ApiGenerationError::plain(ApiGenerationErrorCode::InvalidProvenance))?;
+        serde_json::value::RawValue::from_string(bytes).map(Self)
+            .map_err(|_|ApiGenerationError::plain(ApiGenerationErrorCode::InvalidProvenance))
+    }
+    fn known(&self, digest:Option<&str>)->Result<crate::search::model_api::compatibility_bundle::Bundle,ApiGenerationError> {
+        let refused=||ApiGenerationError::plain(ApiGenerationErrorCode::CompatibilityRequired);
+        let envelope:CompatibilityHeader=serde_json::from_str(self.0.get()).map_err(|_|refused())?;
+        if envelope.schema!="cass.api-compatibility-header.v1" || envelope.evidence_json.len()>16*1024*1024
+            || digest!=Some(hex::encode(Sha256::digest(envelope.evidence_json.as_bytes())).as_str()) { return Err(refused()); }
+        let header:crate::search::model_api::compatibility_bundle::Bundle=serde_json::from_str(&envelope.evidence_json).map_err(|_|refused())?;
+        if header.version!=1 || header.verifier!=crate::search::model_api::compatibility_bundle::VERIFIER_VERSION || header.conclusion!="compatible" {return Err(refused());}
+        Ok(header)
+    }
+}
 impl<'de> Deserialize<'de> for HeaderPresent {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        serde::de::IgnoredAny::deserialize(deserializer)?;
-        Ok(HeaderPresent)
+    fn deserialize<D:Deserializer<'de>>(deserializer:D)->Result<Self,D::Error> {
+        Box::<serde_json::value::RawValue>::deserialize(deserializer).map(Self)
     }
 }
 
@@ -1248,6 +1231,20 @@ pub fn open_api_generation(
     generation_id: i64,
     profile: &ValidatedProfile,
 ) -> Result<VerifiedPrimaryGeneration, ApiGenerationError> {
+    open_generation_checked(tx, generation_id, profile, None)
+}
+
+pub(crate) fn open_api_generation_with_compatibility(
+    tx:&Tx, generation_id:i64, profile:&ValidatedProfile,
+    proof:&crate::search::model_api::compatibility_bundle::CheckedBundle,
+)->Result<VerifiedPrimaryGeneration,ApiGenerationError> {
+    open_generation_checked(tx,generation_id,profile,Some(proof))
+}
+
+fn open_generation_checked(
+    tx:&Tx, generation_id:i64, profile:&ValidatedProfile,
+    proof:Option<&crate::search::model_api::compatibility_bundle::CheckedBundle>,
+)->Result<VerifiedPrimaryGeneration,ApiGenerationError> {
     if generation_id < 1 {
         return Err(ApiGenerationError::at(
             ApiGenerationErrorCode::InvalidRecord,
@@ -1294,15 +1291,90 @@ pub fn open_api_generation(
         ));
     }
 
-    let contributor = provenance.single_primary_contributor()?;
-    check_contributor_against_descriptor(contributor, record.descriptor())?;
-    check_descriptor_against_profile(record.descriptor(), profile)?;
-    check_contributor_against_profile(contributor, profile)?;
+    if let Some(proof)=proof {
+        check_provenance_with_compatibility(&provenance,&record,profile,proof)?;
+    } else {
+        let contributor = provenance.single_primary_contributor()?;
+        check_contributor_against_descriptor(contributor, record.descriptor())?;
+        check_descriptor_against_profile(record.descriptor(), profile)?;
+        check_contributor_against_profile(contributor, profile)?;
+    }
 
     Ok(VerifiedPrimaryGeneration {
         record,
         provenance,
     })
+}
+
+fn compatibility_required()->ApiGenerationError {
+    ApiGenerationError::plain(ApiGenerationErrorCode::CompatibilityRequired)
+}
+
+fn check_provenance_with_compatibility(
+    provenance:&ApiGenerationProvenance, record:&RepresentationRecord, primary:&ValidatedProfile,
+    proof:&crate::search::model_api::compatibility_bundle::CheckedBundle,
+)->Result<(),ApiGenerationError> {
+    let first=provenance.contributors.first().ok_or_else(||ApiGenerationError::plain(ApiGenerationErrorCode::InvalidProvenance))?;
+    if first.compatibility_evidence_header.is_some() || first.compatibility_evidence_sha256.is_some() {return Err(compatibility_required());}
+    check_contributor_against_descriptor(first,record.descriptor())?;
+    check_descriptor_against_profile(record.descriptor(),primary)?;
+    let primary_sha=EndpointConfigIdentity::from_profile(primary).map_err(ApiGenerationError::from_config)?.sha256();
+    let header=proof.header();
+    if header.primary_descriptor_sha256!=record.descriptor_sha256()
+        || !header.members.iter().any(|m|m.capture.sha256==header.primary_capture_sha256 && m.endpoint_config_sha256==primary_sha) {
+        return Err(compatibility_required());
+    }
+    let mut seen=std::collections::HashSet::new();
+    for (index,contributor) in provenance.contributors.iter().enumerate() {
+        if !seen.insert((contributor.endpoint_config_sha256.as_str(),contributor.compatibility_evidence_sha256.as_deref())) {
+            return Err(ApiGenerationError::plain(ApiGenerationErrorCode::InvalidProvenance));
+        }
+        let profile=if let Some(raw)=&contributor.compatibility_evidence_header {
+            let old=raw.known(contributor.compatibility_evidence_sha256.as_deref())?;
+            if old.primary_descriptor_sha256!=record.descriptor_sha256() || old.fixture.sha256!=header.fixture.sha256 {return Err(compatibility_required());}
+            // Keep the old canonical anchor as well as the actual producer.
+            let anchor=old.members.iter().find(|m|m.capture.sha256==old.primary_capture_sha256).ok_or_else(compatibility_required)?;
+            if !proof.member_matches(anchor) {return Err(compatibility_required());}
+            let mut producer=old.members.iter().filter(|m|m.endpoint_config_sha256==contributor.endpoint_config_sha256
+                && (m.capture.sha256==old.primary_capture_sha256 || Some(&m.capture.sha256)==old.fallback_capture_sha256.as_ref()));
+            let selected=producer.next().ok_or_else(compatibility_required)?;
+            if producer.next().is_some() || !proof.member_matches(selected) {return Err(compatibility_required());}
+            proof.capture_profile(&selected.capture.sha256).ok_or_else(compatibility_required)?
+        } else {
+            if index!=0 || contributor.compatibility_evidence_sha256.is_some() {return Err(compatibility_required());}
+            let member=header.members.iter().find(|m|m.endpoint_config_sha256==contributor.endpoint_config_sha256).ok_or_else(compatibility_required)?;
+            proof.capture_profile(&member.capture.sha256).ok_or_else(compatibility_required)?
+        };
+        let descriptor=RepresentationDescriptor::from_profile(profile,record.descriptor().effective_dimension()).map_err(ApiGenerationError::from_profile_identity)?;
+        check_contributor_against_descriptor(contributor,&descriptor)?;
+        check_contributor_against_profile(contributor,profile)?;
+    }
+    Ok(())
+}
+
+/// Add the backend that actually produced this page, in the caller's write
+/// transaction. A page error rolls this metadata back together with its rows.
+pub(crate) fn register_api_contribution(
+    tx:&Tx,generation_id:i64,primary:&ValidatedProfile,writer:&ValidatedProfile,
+    proof:&crate::search::model_api::compatibility_bundle::CheckedBundle,
+)->Result<(),ApiGenerationError> {
+    let verified=open_api_generation_with_compatibility(tx,generation_id,primary,proof)?;
+    let endpoint=EndpointConfigIdentity::from_profile(writer).map_err(ApiGenerationError::from_config)?;
+    let selected=proof.selected_capture(&endpoint.sha256()).ok_or_else(compatibility_required)?;
+    if proof.capture_profile(selected).is_none() {return Err(compatibility_required());}
+    let mut provenance=verified.provenance;
+    if provenance.contributors.len()==1 && provenance.contributors[0].endpoint_config_sha256==endpoint.sha256() {return Ok(());}
+    if provenance.contributors.iter().any(|c| c.endpoint_config_sha256==endpoint.sha256() && c.compatibility_evidence_sha256.as_deref()==Some(proof.digest())) {return Ok(());}
+    let descriptor=RepresentationDescriptor::from_profile(writer,verified.record.descriptor().effective_dimension()).map_err(ApiGenerationError::from_profile_identity)?;
+    let mut contributor=ApiGenerationContributor::primary(&descriptor,writer,&endpoint)?;
+    contributor.compatibility_evidence_header=Some(HeaderPresent::from_checked(proof)?);
+    contributor.compatibility_evidence_sha256=Some(proof.digest().into());
+    provenance.contributors.push(contributor);
+    let bytes=provenance.canonical_bytes()?;
+    let text=String::from_utf8(bytes).map_err(|_|ApiGenerationError::plain(ApiGenerationErrorCode::InvalidProvenance))?;
+    let changed=tx.execute("UPDATE meta SET value=?1 WHERE key=?2",&params![text,provenance.meta_key()]).map_err(ApiGenerationError::Storage)?;
+    if changed!=1 {return Err(ApiGenerationError::plain(ApiGenerationErrorCode::InvalidRecord));}
+    Ok(())
 }
 
 /// The representation record must agree with the row it names.
@@ -1450,4 +1522,50 @@ pub fn provenance_meta_key(generation_id: i64) -> String {
 /// The meta-key stem of a generation representation record.
 pub fn representation_meta_key(generation_id: i64) -> String {
     format!("{REPRESENTATION_KEY_STEM}:v{REPRESENTATION_RECORD_VERSION}:{generation_id}")
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::search::model_api::compatibility_bundle::tests::migration_fixture;
+    use crate::storage::api::{TxMode, StorageError};
+
+    #[test]
+    fn contribution_and_page_failure_share_the_callers_transaction() {
+        let root=tempfile::tempdir().unwrap();
+        let storage=crate::storage::sqlite::FrankenStorage::open(&root.path().join("db.sqlite")).unwrap();
+        let (proof,profiles)=migration_fixture(&[1,2],1,None);
+        let id=storage.raw().with_tx(TxMode::Immediate,|tx| create_api_generation(tx,&profiles[0],2,&[1;24],1).map_err(StorageError::from)).unwrap();
+        let before=storage.raw().with_tx(TxMode::Deferred,|tx| read_meta(tx,&provenance_meta_key(id)).map_err(StorageError::from)).unwrap();
+        let failed:Result<(),StorageError>=storage.raw().with_tx(TxMode::Immediate,|tx| {
+            register_api_contribution(tx,id,&profiles[1],&profiles[1],&proof).map_err(StorageError::from)?;
+            Err(StorageError::Other{code:None,detail:"synthetic vector page failure".into()})
+        });
+        assert!(failed.is_err());
+        assert_eq!(before,storage.raw().with_tx(TxMode::Deferred,|tx| read_meta(tx,&provenance_meta_key(id)).map_err(StorageError::from)).unwrap());
+        storage.raw().with_tx(TxMode::Immediate,|tx| register_api_contribution(tx,id,&profiles[1],&profiles[1],&proof).map_err(StorageError::from)).unwrap();
+        let verified=storage.raw().with_tx(TxMode::Deferred,|tx| open_api_generation_with_compatibility(tx,id,&profiles[1],&proof).map_err(StorageError::from)).unwrap();
+        assert_eq!(verified.provenance().contributors().len(),2);
+        let stored=&verified.provenance().contributors()[1];
+        assert_eq!(stored.compatibility_evidence_sha256(),Some(proof.digest()));
+        assert_eq!(stored.compatibility_evidence_header.as_ref().unwrap().known(Some(proof.digest())).unwrap().primary_descriptor_sha256,verified.descriptor_sha256());
+    }
+
+    #[test]
+    fn old_capture_cannot_be_replaced_by_new_sampling_at_the_same_endpoint() {
+        let root=tempfile::tempdir().unwrap();
+        let storage=crate::storage::sqlite::FrankenStorage::open(&root.path().join("db.sqlite")).unwrap();
+        let (first,profiles)=migration_fixture(&[1,2],1,None);
+        let id=storage.raw().with_tx(TxMode::Immediate,|tx| create_api_generation(tx,&profiles[0],2,&[1;24],1).map_err(StorageError::from)).unwrap();
+        storage.raw().with_tx(TxMode::Immediate,|tx| register_api_contribution(tx,id,&profiles[1],&profiles[1],&first).map_err(StorageError::from)).unwrap();
+        let (missing,missing_profiles)=migration_fixture(&[1,3],1,None);
+        assert!(storage.raw().with_tx(TxMode::Deferred,|tx| open_api_generation_with_compatibility(tx,id,&missing_profiles[1],&missing).map_err(StorageError::from)).is_err());
+        let (fresh,fresh_profiles)=migration_fixture(&[1,2,3],2,Some(2));
+        assert!(storage.raw().with_tx(TxMode::Deferred,|tx| open_api_generation_with_compatibility(tx,id,&fresh_profiles[2],&fresh).map_err(StorageError::from)).is_err());
+        let (complete,complete_profiles)=migration_fixture(&[1,2,3],2,None);
+        storage.raw().with_tx(TxMode::Immediate,|tx| register_api_contribution(tx,id,&complete_profiles[2],&complete_profiles[2],&complete).map_err(StorageError::from)).unwrap();
+        let verified=storage.raw().with_tx(TxMode::Deferred,|tx| open_api_generation_with_compatibility(tx,id,&complete_profiles[2],&complete).map_err(StorageError::from)).unwrap();
+        assert_eq!(verified.provenance().contributors().len(),3);
+        assert_eq!(verified.provenance().contributors()[1].compatibility_evidence_sha256(),Some(first.digest()),"old evidence remains intact");
+    }
 }
