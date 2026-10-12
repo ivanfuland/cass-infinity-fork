@@ -107007,11 +107007,16 @@ model_revision="r1"
             // follow a successful score cannot create its directory.
             std::fs::write(blocked_cache_root.join("cache"), b"blocked").unwrap();
         });
-        let result = search(
+        let config = rerank_api_config(root.path(), &origin);
+        let result = search_with_api(
             execution(context, &expected, &pin, &manifest, Some(origin)),
             true,
             3,
             None,
+            ApiSearchOptions {
+                config_path: Some(config),
+                ..Default::default()
+            },
         );
         assert_eq!(
             worker.join().unwrap()["documents"].as_array().unwrap().len(),
