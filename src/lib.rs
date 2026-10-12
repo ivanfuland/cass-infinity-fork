@@ -522,6 +522,9 @@ pub enum Commands {
         /// Embedding API profile; defaults to the configured default_embedding.
         #[arg(long)]
         embedding_profile: Option<String>,
+        /// Rerank API profile; defaults to the configured default_rerank.
+        #[arg(long, requires = "rerank")]
+        rerank_profile: Option<String>,
         /// Disable the explicitly configured cloud fallback for this request.
         #[arg(long)]
         no_model_fallback: bool,
@@ -7278,6 +7281,7 @@ async fn execute_cli(
                     mode,
                     vector_search_mode,
                     embedding_profile,
+                    rerank_profile,
                     no_model_fallback,
                     model,
                     rerank,
@@ -7402,6 +7406,7 @@ async fn execute_cli(
                         frozen: None,
                         config_path: cli.api_config.clone(),
                         embedding_profile,
+                        rerank_profile,
                         no_model_fallback,
                     };
 
@@ -22647,6 +22652,7 @@ pub struct ApiSearchOptions {
     frozen: Option<crate::search::model_api::ValidatedApiConfig>,
     pub config_path: Option<PathBuf>,
     pub embedding_profile: Option<String>,
+    pub rerank_profile: Option<String>,
     pub no_model_fallback: bool,
 }
 
@@ -24377,7 +24383,8 @@ fn build_request_binding(
     embedding_model: Option<&str>,
     rrf_limit: usize,
     rerank_limit: usize,
-    provider: crate::search::rerank::types::ProviderChoice,
+    provider: &str,
+    api_route: Option<crate::search::rerank::window::ApiWindowRoute>,
     endpoint: &str,
     aggregate: Option<&[String]>,
     explain: bool,
@@ -24404,7 +24411,8 @@ fn build_request_binding(
         embedding_model: embedding_model.map(str::to_string),
         rrf_limit,
         rerank_limit,
-        provider,
+        provider: provider.to_owned(),
+        api_route,
         endpoint: endpoint.to_string(),
         aggregate: aggregate.map(|values| values.to_vec()),
         explain,
@@ -24423,8 +24431,9 @@ fn build_request_binding(
 /// and serializes as `null` rather than being guessed.
 #[derive(Debug, Clone)]
 struct RerankWindowMeta {
-    requested_provider: crate::search::rerank::types::ProviderChoice,
-    requested_model: &'static str,
+    model_api: Option<crate::search::rerank::window::ApiWindowRerank>,
+    requested_provider: String,
+    requested_model: String,
     actual_provider: Option<crate::search::rerank::types::ProviderChoice>,
     actual_model: Option<String>,
     serving_provider: Option<String>,
@@ -24450,6 +24459,7 @@ impl RerankWindowMeta {
     /// The `_meta.rerank` JSON object, with the post-budget `returned_count`.
     fn to_json(&self, returned_count: usize) -> serde_json::Value {
         serde_json::json!({
+            "model_api": self.model_api,
             "requested_provider": self.requested_provider,
             "requested_model": self.requested_model,
             "actual_provider": self.actual_provider,
@@ -24990,6 +25000,36 @@ fn execute_search_retrieval(
     })
 }
 
+fn selected_api_rerank_profile(opts: &SemanticSearchOptions) -> CliResult<Option<crate::search::model_api::ValidatedProfile>> {
+    use crate::search::model_api::{ProfileKind, runtime};
+    let Some(config) = opts.api.frozen.as_ref() else { return Ok(None); };
+    let id = opts.api.rerank_profile.as_deref().or_else(|| config.default_profile_id(ProfileKind::Rerank))
+        .ok_or_else(|| model_api_runtime_error(runtime::RuntimeError::configuration(
+            "no rerank API profile is selected", Some("Set default_rerank or pass --rerank-profile".into()))))?;
+    let profile = runtime::profile_by_id(config, id).map_err(model_api_runtime_error)?;
+    if profile.kind != ProfileKind::Rerank {
+        return Err(model_api_runtime_error(runtime::RuntimeError::configuration(
+            "selected API profile is not a reranker", None)));
+    }
+    Ok(Some(profile.clone()))
+}
+
+fn api_window_route(opts: &SemanticSearchOptions, profile: Option<&crate::search::model_api::ValidatedProfile>, mode: crate::search::query::SearchMode)
+    -> CliResult<Option<crate::search::rerank::window::ApiWindowRoute>> {
+    use crate::search::model_api::{EndpointConfigIdentity, RerankRouteIdentity};
+    let Some(profile) = profile else { return Ok(None); };
+    let config = opts.api.frozen.as_ref().expect("API selection freezes config");
+    let map = |_| CliError::usage("invalid model API route identity", None);
+    let route = RerankRouteIdentity::from_config(config, &profile.id, !opts.api.no_model_fallback).map_err(map)?;
+    let embedding = if mode == crate::search::query::SearchMode::Lexical { None }
+        else { Some(select_api_embedding_profile(config, opts.api.embedding_profile.as_deref())?) };
+    let embedding_config_sha256 = embedding.as_ref().map(|p| EndpointConfigIdentity::from_profile(p).map(|d| d.sha256())).transpose().map_err(map)?;
+    Ok(Some(crate::search::rerank::window::ApiWindowRoute {
+        rerank_profile: profile.id.clone(), rerank_route_sha256: route.sha256(),
+        embedding_profile: embedding.map(|p| p.id), embedding_config_sha256,
+    }))
+}
+
 fn api_query_compatibility_error(error: &anyhow::Error) -> Option<CliError> {
     let failure = error.chain().find_map(|cause| cause.downcast_ref::<
         crate::search::model_api::query_embedding::QueryApiFailure>())?;
@@ -25053,6 +25093,7 @@ fn run_cli_search(
 
     let api_selected = semantic_opts.api.config_path.is_some()
         || semantic_opts.api.embedding_profile.is_some()
+        || semantic_opts.api.rerank_profile.is_some()
         || std::env::var_os(crate::search::model_api::runtime::API_CONFIG_ENV).is_some();
     if api_selected && (mode != Some(SearchMode::Lexical) || semantic_opts.rerank) {
         reject_retired_model_env()?;
@@ -25068,6 +25109,7 @@ fn run_cli_search(
             select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
         }
         semantic_opts.api.frozen = Some(config);
+        if semantic_opts.rerank { selected_api_rerank_profile(&semantic_opts)?; }
     }
 
     // Start timing for robot_meta elapsed_ms
@@ -25304,10 +25346,12 @@ fn run_cli_search(
         let provider = semantic_opts
             .rerank_provider
             .expect("rerank_window_enabled guarantees a provider");
-        let endpoint = regression
-            .as_ref()
-            .and_then(|run| run.endpoint.clone())
-            .unwrap_or_else(|| rerank_endpoint_origin(provider));
+        let api_profile = selected_api_rerank_profile(&semantic_opts)?;
+        let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.as_str().to_owned());
+        let endpoint = if let Some(profile) = &api_profile { profile.endpoint.as_str().to_owned() } else {
+            regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider))
+        };
+        let route = api_window_route(&semantic_opts, api_profile.as_ref(), mode.unwrap_or_default())?;
         let binding = build_request_binding(
             query,
             &filters,
@@ -25317,7 +25361,8 @@ fn run_cli_search(
             effective_model.as_deref(),
             limit_val,
             rerank_k,
-            provider,
+            &requested_profile,
+        route,
             &endpoint,
             aggregate.as_deref(),
             explain,
@@ -25494,8 +25539,9 @@ fn run_cli_search(
         };
 
         let meta = RerankWindowMeta {
-            requested_provider: snapshot.request_binding.provider,
-            requested_model: snapshot.request_binding.provider.request_model(),
+            model_api: snapshot.rerank.model_api.clone(),
+            requested_provider: snapshot.request_binding.provider.clone(),
+            requested_model: snapshot.rerank.requested_model.clone(),
             actual_provider: snapshot.rerank.identity.actual_provider,
             actual_model: snapshot.rerank.identity.actual_model.clone(),
             serving_provider: snapshot.rerank.identity.serving_provider.clone(),
@@ -26322,10 +26368,13 @@ fn score_search_first_window(
     let provider = semantic_opts
         .rerank_provider
         .expect("rerank_window_enabled guarantees a provider");
-    let endpoint = regression
-        .as_ref()
-        .and_then(|run| run.endpoint.clone())
-        .unwrap_or_else(|| rerank_endpoint_origin(provider));
+    let api_profile = selected_api_rerank_profile(&semantic_opts)?;
+    let requested_profile = api_profile.as_ref().map(|p| p.id.clone()).unwrap_or_else(|| provider.as_str().to_owned());
+    let requested_model = api_profile.as_ref().map(|p| p.model.clone()).unwrap_or_else(|| provider.request_model().to_owned());
+    let endpoint = if let Some(profile) = &api_profile { profile.endpoint.as_str().to_owned() } else {
+        regression.as_ref().and_then(|run| run.endpoint.clone()).unwrap_or_else(|| rerank_endpoint_origin(provider))
+    };
+    let route = api_window_route(&semantic_opts, api_profile.as_ref(), mode.unwrap_or_default())?;
     let binding = build_request_binding(
         query,
         &filters,
@@ -26335,7 +26384,8 @@ fn score_search_first_window(
         effective_model.as_deref(),
         limit_val,
         rerank_k,
-        provider,
+        &requested_profile,
+        route,
         &endpoint,
         aggregate.as_deref(),
         explain,
@@ -26428,6 +26478,7 @@ fn score_search_first_window(
         .transpose()
         .map_err(regression_search_error)?;
 
+    let mut api_evidence = None;
     let mut identity = crate::search::rerank::types::CallIdentity {
         actual_provider: None,
         actual_model: None,
@@ -26478,18 +26529,27 @@ fn score_search_first_window(
                             .collect(),
                     );
                 }
-                let backend = match regression.as_ref() {
+                let backend = if api_profile.is_some() { Ok(None) } else { (match regression.as_ref() {
                     Some(run) => build_rerank_backend_with_trace(
                         provider,
                         &endpoint,
                         Some(run.trace.clone()),
                     ),
                     None => build_rerank_backend(provider, &endpoint),
-                };
+                }).map(Some) };
                 match backend {
                     Ok(backend) => {
                         let call_started = Instant::now();
-                        match backend.rerank(query, &documents) {
+                        let response = match backend {
+                            Some(backend) => backend.rerank(query, &documents),
+                            None => {
+                                let config = semantic_opts.api.frozen.as_ref().expect("API config frozen");
+                                let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver));
+                                crate::search::model_api::rerank_call::score(&client, &requested_profile, query, &documents,
+                                    !semantic_opts.api.no_model_fallback, &mut api_evidence)
+                            }
+                        };
+                        match response {
                             Ok(response) => {
                                 duration_ms = response.duration_ms;
                                 // The call layer re-proves the completeness
@@ -26724,6 +26784,13 @@ fn score_search_first_window(
         }
     }
 
+    if let Some(evidence) = &api_evidence {
+        let sent = evidence.attempts.iter().filter(|a| a.network_attempted).count();
+        http_requests = Some(sent);
+        model_requests = Some(sent);
+        duration_ms = evidence.attempts.iter().map(|a| a.duration_ms).sum();
+    }
+
     // A window is only continuable when the first lookup is a clean, frozen
     // success and the snapshot saves. Otherwise the current page is still
     // delivered but carries no cursor and a short reason.
@@ -26753,8 +26820,9 @@ fn score_search_first_window(
                 "display": frozen_display.to_json(),
             }),
             rerank: crate::search::rerank::window::WindowRerankMeta {
-                requested_provider: provider,
-                requested_model: provider.request_model().to_string(),
+                model_api: api_evidence.clone(),
+                requested_provider: requested_profile.clone(),
+                requested_model: requested_model.clone(),
                 identity: identity.clone(),
                 applied: rerank_applied,
                 failure_reason,
@@ -26794,8 +26862,9 @@ fn score_search_first_window(
 
     let window_display_state = Some(frozen_display);
     let window_meta = Some(RerankWindowMeta {
-        requested_provider: provider,
-        requested_model: provider.request_model(),
+        model_api: api_evidence.clone(),
+        requested_provider: requested_profile,
+        requested_model,
         actual_provider: identity.actual_provider,
         actual_model: identity.actual_model.clone(),
         serving_provider: identity.serving_provider.clone(),
@@ -31044,8 +31113,9 @@ mod pr9_candidate_meta_output_tests {
             offset: usize::from(cache_reused) * 2,
             continuable: false,
             meta: super::RerankWindowMeta {
-                requested_provider: ProviderChoice::BgeLocal,
-                requested_model: ProviderChoice::BgeLocal.request_model(),
+                model_api: None,
+                requested_provider: ProviderChoice::BgeLocal.as_str().to_owned(),
+                requested_model: ProviderChoice::BgeLocal.request_model().to_owned(),
                 actual_provider: applied.then_some(ProviderChoice::BgeLocal),
                 actual_model: applied.then(|| ProviderChoice::BgeLocal.request_model().to_string()),
                 serving_provider: None,

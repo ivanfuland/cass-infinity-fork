@@ -488,7 +488,8 @@ pub struct CheckCall {
 ///
 /// Every field is `null` unless the service returned a finite, non-negative
 /// number. No value is derived or estimated.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CheckUsage {
     /// `prompt_tokens`, when reported.
     pub prompt_tokens: Option<u64>,

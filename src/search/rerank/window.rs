@@ -62,11 +62,11 @@ use crate::search::query::{SearchFilters, SearchHit, SearchResult};
 use crate::sources::provenance::SourceFilter;
 
 /// The frozen on-disk schema tag for a rerank window file.
-pub const WINDOW_SCHEMA: &str = "cass.rerank-window.v1";
+pub const WINDOW_SCHEMA: &str = "cass.rerank-window.v2";
 
 /// The frozen cursor payload version. Version 1 is the old `offset`/`limit`
 /// cursor this module deliberately does not accept.
-const CURSOR_VERSION: u64 = 2;
+const CURSOR_VERSION: u64 = 3;
 
 /// Directory (relative to the data root) that holds this module's windows.
 const WINDOW_DIR_RELATIVE: &str = "cache/rerank-windows";
@@ -111,6 +111,7 @@ const BINDING_KEYS: &[&str] = &[
     "rrf_limit",
     "rerank_limit",
     "provider",
+    "api_route",
     "endpoint",
     "aggregate",
     "explain",
@@ -122,6 +123,7 @@ const BINDING_KEYS: &[&str] = &[
 const TIME_KEYS: &[&str] = &["days", "today", "yesterday", "week", "since", "until"];
 
 const RERANK_KEYS: &[&str] = &[
+    "model_api",
     "requested_provider",
     "requested_model",
     "identity",
@@ -266,6 +268,17 @@ pub struct TimeSelectors {
     pub until: Option<String>,
 }
 
+/// Exact configuration identity for API-backed frozen results. Credentials
+/// themselves never enter these digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiWindowRoute {
+    pub rerank_profile: String,
+    pub rerank_route_sha256: String,
+    pub embedding_profile: Option<String>,
+    pub embedding_config_sha256: Option<String>,
+}
+
 /// The frozen request identity of the first lookup.
 ///
 /// Collection-valued fields are compared order-insensitively by
@@ -285,7 +298,8 @@ pub struct RequestBinding {
     pub embedding_model: Option<String>,
     pub rrf_limit: usize,
     pub rerank_limit: usize,
-    pub provider: ProviderChoice,
+    pub provider: String,
+    pub api_route: Option<ApiWindowRoute>,
     pub endpoint: String,
     pub aggregate: Option<Vec<String>>,
     pub explain: bool,
@@ -325,16 +339,67 @@ impl RequestBinding {
             return Err(WindowError::InvalidInput);
         }
 
+        if out.provider.is_empty() || out.provider.len() > 64
+            || !out.provider.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            return Err(WindowError::InvalidInput);
+        }
+        if let Some(route) = &out.api_route {
+            let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if route.rerank_profile != out.provider || !digest(&route.rerank_route_sha256)
+                || route.embedding_profile.is_some() != route.embedding_config_sha256.is_some()
+                || route.embedding_config_sha256.as_ref().is_some_and(|sha| !digest(sha)) {
+                return Err(WindowError::InvalidInput);
+            }
+        }
         out.endpoint = normalize_endpoint(&out.endpoint)?;
         Ok(out)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiWindowAttempt {
+    pub profile: String,
+    pub network_attempted: bool,
+    pub http_status: Option<u16>,
+    pub error_code: Option<String>,
+    pub duration_ms: u64,
+    pub response_model: Option<String>,
+    pub response_revision: Option<String>,
+    pub serving_provider: Option<String>,
+    pub usage: Option<crate::search::model_api::runtime::CheckUsage>,
+}
+
+impl From<&crate::search::model_api::ApiAttempt> for ApiWindowAttempt {
+    fn from(attempt: &crate::search::model_api::ApiAttempt) -> Self {
+        Self {
+            profile: attempt.profile_id.clone(), network_attempted: attempt.network_attempted,
+            http_status: attempt.http_status, error_code: attempt.error_code.map(str::to_owned),
+            duration_ms: attempt.duration_ms,
+            response_model: attempt.identity.response_model.clone(),
+            response_revision: attempt.identity.response_revision.clone(),
+            serving_provider: attempt.identity.provider.clone(),
+            usage: crate::search::model_api::runtime::CheckUsage::from_observed(attempt.identity.usage.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiWindowRerank {
+    pub primary_profile: String,
+    pub realized_profile: Option<String>,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub attempts: Vec<ApiWindowAttempt>,
 }
 
 /// Identity and completeness evidence of the rerank call that produced the
 /// window's ordering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowRerankMeta {
-    pub requested_provider: ProviderChoice,
+    pub model_api: Option<ApiWindowRerank>,
+    pub requested_provider: String,
     pub requested_model: String,
     pub identity: CallIdentity,
     pub applied: bool,
@@ -1115,7 +1180,7 @@ fn validate_content(
     }
 
     if let Some(actual) = rerank.identity.actual_provider {
-        if actual != rerank.requested_provider {
+        if actual.as_str() != rerank.requested_provider {
             return Err(WindowError::InvalidInput);
         }
     }
@@ -1564,7 +1629,8 @@ mod tests {
             embedding_model: Some("bge-m3".to_string()),
             rrf_limit: n,
             rerank_limit: k,
-            provider: ProviderChoice::Qwen3Local,
+            provider: ProviderChoice::Qwen3Local.as_str().to_owned(),
+            api_route: None,
             endpoint: "http://127.0.0.1:8000/v1/rerank?x=1".to_string(),
             aggregate: Some(vec!["agent".to_string(), "workspace".to_string()]),
             explain: true,
@@ -1666,7 +1732,8 @@ mod tests {
             explanation: Some(json!({"rrf": {"k": 60}})),
             retrieval_status: json!({"mode": "hybrid", "partial": false}),
             rerank: WindowRerankMeta {
-                requested_provider: ProviderChoice::Qwen3Local,
+                model_api: None,
+                requested_provider: ProviderChoice::Qwen3Local.as_str().to_owned(),
                 requested_model: ProviderChoice::Qwen3Local.request_model().to_string(),
                 identity: CallIdentity {
                     actual_provider: Some(ProviderChoice::Qwen3Local),
@@ -1926,7 +1993,7 @@ mod tests {
         limits.rerank_limit = 4;
         variants.push(limits);
         let mut provider = snap.request_binding.clone();
-        provider.provider = ProviderChoice::BgeLocal;
+        provider.provider = ProviderChoice::BgeLocal.as_str().to_owned();
         variants.push(provider);
         let mut endpoint = snap.request_binding.clone();
         endpoint.endpoint = "http://127.0.0.1:9999".to_string();

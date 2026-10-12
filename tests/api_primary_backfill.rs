@@ -2745,3 +2745,42 @@ fn api_query_configuration_is_checked_before_database_work() {
         "--data-dir", data_dir.to_str().unwrap(), "--api-config", missing_config.to_str().unwrap()], &[]);
     assert_success(&lexical);
 }
+
+#[test]
+fn api_rerank_window_pages_without_http_and_rejects_changed_instruction() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &[
+        "synthetic document alpha with enough detail to score",
+        "synthetic document beta with other detail to score",
+        "synthetic document gamma with distinct detail to score",
+    ]);
+    let embed = Stub::start(healthy_responder(8, 0));
+    let stub = Stub::start(|request, _| {
+        let body = request.body_json();
+        let docs = body["documents"].as_array().expect("whole rerank document window");
+        let rows: Vec<_> = (0..docs.len()).map(|i| serde_json::json!({"index": i, "relevance_score": i as f64})).collect();
+        (200, serde_json::json!({"model":"example/dynamic-reranker", "results":rows}).to_string())
+    });
+    let config = data_dir.join("models.toml");
+    let mut text = format!("version=1\ndefault_embedding=\"local8\"\ndefault_rerank=\"ranker\"\n[profiles.ranker]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"{}\"\nmodel=\"example/dynamic-reranker\"\nmodel_revision=\"r1\"\ninstruction=\"first instruction\"\n", stub.endpoint());
+    text.push_str(&embedding_profile_block("local8", &embed.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, ""));
+    fs::write(&config, &text).unwrap();
+    assert_success(&run_backfill(&data_dir, &config, None, &[]));
+    let args = ["search", "synthetic", "--mode", "lexical", "--json", "--robot-meta",
+        "--rerank", "--rrf-limit", "3", "--rerank-limit", "1", "--rerank-profile", "ranker",
+        "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap()];
+    let first = assert_success(&cass(&args, &[]));
+    assert_eq!(stub.requests().len(), 1, "{first}");
+    assert_eq!(first["_meta"]["rerank"]["applied"], true, "{first}");
+    assert_eq!(first["_meta"]["rerank"]["requested_model"], "example/dynamic-reranker");
+    assert_eq!(first["_meta"]["rerank"]["model_api"]["realized_profile"], "ranker");
+    let cursor = first["_meta"]["next_cursor"].as_str().expect("next cursor");
+    let mut next = args.to_vec(); next.extend(["--cursor", cursor]);
+    let second = assert_success(&cass(&next, &[]));
+    assert_eq!(second["_meta"]["rerank"]["cache_reused"], true);
+    assert_eq!(stub.requests().len(), 1, "continuation sends no HTTP");
+    fs::write(&config, text.replace("first instruction", "different instruction")).unwrap();
+    let denied = cass(&next, &[]);
+    assert!(!denied.status.success(), "old cursor cannot use changed route config");
+    assert_eq!(stub.requests().len(), 1, "changed cursor is refused before HTTP");
+}
