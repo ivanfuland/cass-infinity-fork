@@ -106738,7 +106738,8 @@ model_revision="r1"
             regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
         let before = std::fs::read(&db).unwrap();
         let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
-        let (origin, worker) = server(200);
+        let (origin, worker) = api_rerank_fixture_until_idle();
+        let config = rerank_api_config(root.path(), &origin);
         let run = execution(
             context.clone(),
             &expected,
@@ -106747,20 +106748,20 @@ model_revision="r1"
             Some(origin.clone()),
         );
         let binding = run.binding.clone();
-        search(run, true, 3, None).unwrap();
+        search_with_api(run, true, 3, None, ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() }).unwrap();
         let received = worker.join().unwrap();
         let proof = evidence(&run_root);
         assert_eq!(proof.retrieval.len(), 7);
         assert_eq!(proof.final_slots, proof.retrieval); // All model scores tie.
-        assert_eq!(proof.transport.requests.len(), 2);
+        assert_eq!(proof.transport.requests.len(), 1);
         assert_eq!(proof.transport.model_requests, None);
         assert_eq!(
-            proof.transport.requests[1].query.as_ref(),
+            proof.transport.requests[0].query.as_ref(),
             Some(&crate::search::regression_trace::TextDigest::of(
                 received["query"].as_str().unwrap()
             ))
         );
-        for (actual, document) in proof.transport.requests[1]
+        for (actual, document) in proof.transport.requests[0]
             .documents
             .as_ref()
             .unwrap()
@@ -106789,7 +106790,7 @@ model_revision="r1"
         )
         .unwrap();
         let trace = Arc::new(Mutex::new(Default::default()));
-        search(
+        search_with_api(
             RegressionSearchExecution {
                 context: context.clone(),
                 verified: Some(regression_binding::VerifiedSearch {
@@ -106806,6 +106807,7 @@ model_revision="r1"
             true,
             3,
             Some(cursor),
+            ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
         )
         .unwrap();
         let cursor = BASE64_STANDARD.encode(
@@ -106817,7 +106819,7 @@ model_revision="r1"
             context.clone(),
         )
         .unwrap();
-        search(
+        search_with_api(
             RegressionSearchExecution {
                 context: context.clone(),
                 verified: Some(regression_binding::VerifiedSearch {
@@ -106834,6 +106836,7 @@ model_revision="r1"
             true,
             3,
             Some(cursor),
+            ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
         )
         .unwrap();
         assert!(trace.lock().unwrap().requests.is_empty());
@@ -106899,7 +106902,7 @@ model_revision="r1"
             context.clone(),
         )
         .unwrap();
-        let error = search(
+        let error = search_with_api(
             RegressionSearchExecution {
                 context,
                 verified: Some(regression_binding::VerifiedSearch {
@@ -106916,6 +106919,7 @@ model_revision="r1"
             true,
             3,
             Some(legacy_cursor),
+            ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
         )
         .unwrap_err();
         assert_eq!(error.message, "TRACE_WINDOW_MISSING");
@@ -106946,12 +106950,14 @@ model_revision="r1"
             let case_root = root.path().join(format!("http-{status}-run"));
             private_dir(&case_root);
             let context = Arc::new(RegressionIoContext::open(&db, &case_root).unwrap());
-            let (origin, worker) = server(status);
-            let result = search(
+            let (origin, worker) = api_rerank_fixture_status(status);
+            let config = rerank_api_config(root.path(), &origin);
+            let result = search_with_api(
                 execution(context, &expected, &pin, &manifest, Some(origin)),
                 true,
                 5,
                 None,
+                ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
             );
             if status == 200 {
                 result.unwrap();
@@ -106969,11 +106975,11 @@ model_revision="r1"
             let proof = evidence(&case_root);
             assert_eq!(proof.applied, status == 200);
             assert_eq!(
-                proof.transport.requests[1].http_status,
+                proof.transport.requests[0].http_status,
                 if status == 0 { None } else { Some(status) }
             );
             assert_eq!(
-                proof.transport.requests[1].state,
+                proof.transport.requests[0].state,
                 if status == 0 {
                     "attempted-delivery-unknown"
                 } else {
@@ -106986,7 +106992,16 @@ model_revision="r1"
         let invalid_root = root.path().join("not-sent-run");
         private_dir(&invalid_root);
         let context = Arc::new(RegressionIoContext::open(&db, &invalid_root).unwrap());
-        search(
+        let invalid_config = {
+            let path = root.path().join("invalid-api.toml");
+            std::fs::write(
+                &path,
+                "version=1\ndefault_rerank=\"rank\"\n[profiles.rank]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"invalid-origin\"\nmodel=\"BAAI/bge-reranker-v2-m3\"\nmodel_revision=\"r1\"\n",
+            )
+            .unwrap();
+            path
+        };
+        search_with_api(
             execution(
                 context,
                 &expected,
@@ -106997,6 +107012,7 @@ model_revision="r1"
             true,
             5,
             None,
+            ApiSearchOptions { config_path: Some(invalid_config), ..Default::default() },
         )
         .unwrap_err();
         let proof = evidence(&invalid_root);
@@ -107036,6 +107052,243 @@ model_revision="r1"
         }));
     }
 
+    /// Serve exactly one `rerank-json-v1` POST for the model-API path, and run
+    /// `on_request` after the request is read but before the response is
+    /// written. Returns the captured request body.
+    ///
+    /// The retired local provider needed a separate identity GET before its
+    /// POST; the API client issues a single POST, so this fixture is the one
+    /// the migrated tests use.
+    fn api_rerank_fixture(
+        on_request: impl FnOnce() + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return serde_json::Value::Null;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut part = [0u8; 4096];
+            let captured = loop {
+                let n = stream.read(&mut part).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&part[..n]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let length = header
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            on_request();
+            let count = captured["documents"].as_array().unwrap().len();
+            let body = serde_json::json!({
+                "model": "BAAI/bge-reranker-v2-m3",
+                "results": (0..count)
+                    .map(|i| serde_json::json!({"index": i, "relevance_score": 1.0}))
+                    .collect::<Vec<_>>()
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            captured
+        });
+        (origin, worker)
+    }
+
+    /// Serve exactly one `rerank-json-v1` POST and answer it with `status`
+    /// (0 means: read the request, then close without a response). Returns the
+    /// captured request body, so a caller can assert what was sent even for a
+    /// failed delivery.
+    fn api_rerank_fixture_status(status: u16) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return serde_json::Value::Null;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut part = [0u8; 4096];
+            let captured = loop {
+                let n = stream.read(&mut part).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&part[..n]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let length = header
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            if status == 0 {
+                // Delivery attempted, no response observed.
+                return captured;
+            }
+            let count = captured["documents"].as_array().unwrap().len();
+            let body = if status == 200 {
+                serde_json::json!({
+                    "model": "BAAI/bge-reranker-v2-m3",
+                    "results": (0..count)
+                        .map(|i| serde_json::json!({"index": i, "relevance_score": 1.0}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string()
+            } else {
+                serde_json::json!({"error": "synthetic fixture failure"}).to_string()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            captured
+        });
+        (origin, worker)
+    }
+
+    /// Serve `rerank-json-v1` POSTs until the fixture sees no request for two
+    /// seconds, returning the last captured request body. Use this when a test
+    /// issues several searches against the same origin.
+    fn api_rerank_fixture_until_idle() -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut last = serde_json::Value::Null;
+            let mut idle_since = std::time::Instant::now();
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if idle_since.elapsed() > Duration::from_secs(2) {
+                            return last;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                idle_since = std::time::Instant::now();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut part = [0u8; 4096];
+                let captured = loop {
+                    let n = stream.read(&mut part).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&part[..n]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &bytes[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                let count = captured["documents"].as_array().unwrap().len();
+                let body = serde_json::json!({
+                    "model": "BAAI/bge-reranker-v2-m3",
+                    "results": (0..count)
+                        .map(|i| serde_json::json!({"index": i, "relevance_score": 1.0}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                last = captured;
+            }
+        });
+        (origin, worker)
+    }
+
+    /// Write a frozen model-API config whose single rerank profile targets the
+    /// loopback fixture `origin`. Local inference is retired, so a semantic or
+    /// rerank regression run must select its provider through this config.
+    fn rerank_api_config(root: &std::path::Path, origin: &str) -> std::path::PathBuf {
+        let path = root.join("api.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "version=1\n\
+                 default_rerank=\"rank\"\n\
+                 [profiles.rank]\n\
+                 kind=\"rerank\"\n\
+                 protocol=\"rerank-json-v1\"\n\
+                 scope=\"loopback\"\n\
+                 endpoint=\"{origin}\"\n\
+                 model=\"BAAI/bge-reranker-v2-m3\"\n\
+                 model_revision=\"fixture-r1\"\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn regression_pipeline_rejects_source_manifest_change_during_http() {
         let (root, db, run_root, manifest) =
@@ -107044,12 +107297,17 @@ model_revision="r1"
             regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
         let before = std::fs::read(&db).unwrap();
         let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
-        let (origin, worker) = server_with_manifest_change(200, Some(manifest.clone()));
-        let error = search(
+        let manifest_for_server = manifest.clone();
+        let (origin, worker) = api_rerank_fixture(move || {
+            std::fs::write(&manifest_for_server, b"changed synthetic source manifest\n").unwrap();
+        });
+        let config = rerank_api_config(root.path(), &origin);
+        let error = search_with_api(
             execution(context, &expected, &pin, &manifest, Some(origin)),
             true,
             3,
             None,
+            ApiSearchOptions { config_path: Some(config), ..Default::default() },
         )
         .unwrap_err();
         assert_eq!(error.message, "BINDING_SOURCE_CHANGED");
