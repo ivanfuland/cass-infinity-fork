@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-cass-fork.sh — 从零 bootstrap CASS-on-Infinity fork 的可运行 release 二进制。
+# setup-cass-fork.sh — 从零 bootstrap CASS API-only fork 的可运行 release 二进制。
 # 幂等：重复跑安全。新机可直接跑（自动 clone fork + asupersync）。
 set -euo pipefail
 
@@ -12,11 +12,14 @@ FORK_DIR="${FORK_DIR:-$HOME/projects/cass-infinity-build}"
 ASUPERSYNC_REPO="https://github.com/Dicklesworthstone/asupersync"
 ASUPERSYNC_REV="e136c5da4547a44cec3201ada6d94325a7ca216b"
 ASUPERSYNC_DIR="$(dirname "$FORK_DIR")/asupersync"   # 必须是 FORK_DIR 的 ../asupersync sibling
-INSTALL_PATH="${INSTALL_PATH:-$HOME/.local/bin/cass-infinity}"
-FEATURES="qr,encryption,infinity"
+INSTALL_PATH="${INSTALL_PATH:-}"
+FEATURES="qr,encryption"
 
 step() { printf '\n=== %s ===\n' "$1"; }
 die()  { printf 'FAIL[%s]: %s\n' "$1" "$2" >&2; exit 1; }
+
+# Require an explicit destination before cloning, fetching or building anything.
+[ -n "$INSTALL_PATH" ] || die install-path 'INSTALL_PATH is required; select an explicit candidate binary path'
 
 step "1/7 fork repo @ $FORK_REF"
 if [ ! -d "$FORK_DIR/.git" ]; then
@@ -90,5 +93,5 @@ if [ -e "$INSTALL_PATH" ]; then cp -a "$INSTALL_PATH" "$INSTALL_PATH.prev"; fi
 step "7/7 install (atomic via temp+mv)"
 mkdir -p "$(dirname "$INSTALL_PATH")"
 cp "$BIN" "$INSTALL_PATH.tmp" && mv -f "$INSTALL_PATH.tmp" "$INSTALL_PATH"
-printf '\nOK: ONNX-free CASS-on-Infinity installed -> %s\n' "$INSTALL_PATH"
+printf '\nOK: ONNX-free CASS API-only installed -> %s\n' "$INSTALL_PATH"
 "$INSTALL_PATH" --version

@@ -25,7 +25,7 @@ fn artifact(root: &Path, path: &Path) -> Result<Value> {
     )
 }
 
-fn counts(trace: &regression_trace::RequestTrace, mode: SearchMode) -> Vec<Value> {
+fn counts(trace: &regression_trace::RequestTrace, mode: SearchMode, embedding: Option<Value>) -> Vec<Value> {
     let responses = trace
         .requests
         .iter()
@@ -35,7 +35,7 @@ fn counts(trace: &regression_trace::RequestTrace, mode: SearchMode) -> Vec<Value
         json!({"scope":"rerank-http-v1","http_attempts":trace.requests.len(),"http_response_observed":responses,"delivery_unknown":trace.requests.len()-responses,"model_executions":if trace.requests.is_empty() {Some(0)} else {None},"basis":if trace.requests.is_empty() {"not-called"} else {"observed-client"}}),
     ];
     if mode != SearchMode::Lexical {
-        result.push(json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"}));
+        result.push(embedding.unwrap_or_else(|| json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"})));
     }
     result
 }
@@ -104,7 +104,7 @@ fn score_question(
 ) -> Result<OnQuestion> {
     let started = Instant::now();
     let root = &run.validated.paths.run_root;
-    let (k, provider) = run
+    let k = run
         .rerank
         .ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?;
     let raw = run.search_window(&window.query)?;
@@ -125,14 +125,7 @@ fn score_question(
             .clone()
             .ok_or_else(|| anyhow::anyhow!("AGGREGATE_INPUT_MISSING"))?,
     };
-    let semantic = crate::SemanticSearchOptions {
-        model: (run.mode != SearchMode::Lexical).then(|| "bge-m3".into()),
-        rerank: true,
-        reranker: None,
-        use_daemon: false,
-        rerank_limit: Some(k),
-        rerank_provider: Some(provider),
-    };
+    let semantic = run.semantic.clone();
     let mut capture = crate::FirstWindowCapture::default();
     let score_started = Instant::now();
     let outcome = crate::score_search_first_window(
@@ -317,7 +310,7 @@ fn score_question(
         &json!({"schema":"cass.regression-label-subjects.v1","qid":window.qid,"query":{"utf8":window.query,"sha256":query.sha256,"utf8_bytes":query.utf8_bytes},"label_policy_sha256":run.validated.inputs.label_policy_sha256,"candidates":subjects}),
     )?;
     let actual_n = slots.len();
-    let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n<run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n==run.n,"rerank_applied":snapshot.rerank.applied,"ordered_pool_sha256":null,"slots":slots,"pages":pages,"window_evidence":artifact(root,&evidence_path)?,"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode==SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":raw.identity_before_ms,"identity_after_ms":raw.identity_after_ms,"retrieval_ms":raw.retrieval_ms,"rerank_client_ms":rerank_ms,"model_execution_ms":null,"paging_ms":paging_ms,"question_total_ms":milliseconds(started),"http":counts(&evidence.transport,run.mode),"resource_measurements":[]}});
+    let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n<run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n==run.n,"rerank_applied":snapshot.rerank.applied,"ordered_pool_sha256":null,"slots":slots,"pages":pages,"window_evidence":artifact(root,&evidence_path)?,"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode==SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":raw.identity_before_ms,"identity_after_ms":raw.identity_after_ms,"retrieval_ms":raw.retrieval_ms,"rerank_client_ms":rerank_ms,"model_execution_ms":null,"paging_ms":paging_ms,"question_total_ms":milliseconds(started),"http":counts(&evidence.transport,run.mode,run.embedding_cost(false)),"resource_measurements":[]}});
     write_private(root, &format!("question-{}.json", window.qid), &question)?;
     Ok(OnQuestion {
         question,
@@ -413,9 +406,10 @@ pub(crate) fn collect(
     let quantile = |p: f64| {
         (!sorted.is_empty()).then(|| sorted[(p * sorted.len() as f64).ceil() as usize - 1])
     };
+    run.persist_embedding_calls()?;
     let mut writes = private_files(root)?;
     writes.push("run.json".into());
-    let (k, _) = run
+    let k = run
         .rerank
         .ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?;
     let mut totals = failed_transport;
@@ -427,7 +421,7 @@ pub(crate) fn collect(
         totals.requests.extend(evidence.transport.requests);
     }
     let after=succeeded.then(||json!({"basis":"equal-physical-db-and-source-generation-policy","inventory_digests":"reused-initial-not-independently-reexported","database_sha256":run.binding.database_sha256,"source_manifest_sha256":run.binding.source_manifest_sha256,"wal_bytes":0,"generation_unchanged":true,"policies_unchanged":true,"shared_maintenance_lease_held":true}));
-    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()),"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded {Some(&run.binding)} else {None},"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":summary_identity(&identities),"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":true,"n":run.n,"page_k":k,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|p|p.to_str()),"run_relative_path":root.file_name().and_then(|p|p.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(&totals,run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
+    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()),"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded {Some(&run.binding)} else {None},"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":summary_identity(&identities),"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":true,"n":run.n,"page_k":k,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|p|p.to_str()),"run_relative_path":root.file_name().and_then(|p|p.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(&totals,run.mode,run.embedding_cost(true))},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
     write_private(root, "run.json", &output)?;
     if let Some(code) = failure {
         bail!("{code}");
@@ -631,113 +625,20 @@ mod tests {
         }
     }
 
-    fn long_search_fixture(
-        count: usize,
-        embedder_id: &str,
-        dimension: usize,
-    ) -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        std::path::PathBuf,
-    ) {
-        use crate::connectors::{NormalizedConversation, NormalizedMessage};
-        use crate::storage::api::{Conn, Profile, params};
-        use crate::storage::sqlite::FrankenStorage;
-        let conversation = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: Some("synthetic-session".into()),
-            title: Some("retrieval".into()),
-            workspace: None,
-            source_path: "synthetic.jsonl".into(),
-            started_at: Some(10),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: None,
-                created_at: Some(20),
-                content: format!("retrieval 初始锚点。\n{}", "后续中文合成段落 ".repeat(8000)),
-                extra: serde_json::json!({}),
-                snippets: vec![],
-                invocations: vec![],
-            }],
-        };
-        let conversations: Vec<_> = (0..count)
-            .map(|index| {
-                let mut item = conversation.clone();
-                if count > 1 {
-                    item.external_id = Some(format!("synthetic-session-{index}"));
-                    item.source_path = format!("synthetic-{index}.jsonl").into();
-                    item.messages[0]
-                        .content
-                        .push_str(&format!(" Synthetic case {index}."));
-                }
-                item
-            })
-            .collect();
-        let (root, original) =
-            crate::search::query::tests::seed_conversations_for_search_client(&conversations)
-                .unwrap();
-        let input = root.path().join("input");
-        fs::create_dir(&input).unwrap();
-        let db = input.join("agent_search.db");
-        fs::rename(original, &db).unwrap();
-        let storage = FrankenStorage::open(&db).unwrap();
-        storage.rebuild_lex_domain_from_db(None).unwrap();
-        drop(storage);
-        let writer = Conn::open_writable(&db, Profile::Production).unwrap();
-        let messages: Vec<(i64, i64, String)> = writer
-            .query_all_map(
-                "SELECT id,conversation_id,content FROM messages ORDER BY id",
-                &[],
-                |r| Ok((r.get_typed(0)?, r.get_typed(1)?, r.get_typed(2)?)),
-            )
-            .unwrap();
-        let mut vector = vec![0.0; dimension];
-        vector[0] = 1.0;
-        let embedding = crate::storage::schema::f32_vector_to_le_blob(&vector);
-        let generation = writer.with_tx_no_replay(crate::storage::api::TxMode::Immediate, |tx| {
-            let id = crate::storage::schema::create_embedding_generation(tx,embedder_id,dimension as i64,3,1,&[1,2,3],10)?;
-            for (mid, cid, content) in &messages {
-                for chunk in crate::search::eligibility::expected_chunks(*mid, *cid, "user", content) {
-                    tx.execute("INSERT INTO message_chunks(generation_id,message_id,conversation_id,chunk_idx,byte_start,byte_end,content_hash,embedding,norm,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,10)",
-                        &params![id,*mid,*cid,i64::from(chunk.chunk_idx),chunk.byte_start as i64,chunk.byte_end as i64,chunk.content_hash.clone(),embedding.clone()])?;
-                }
-            }
-            tx.execute("UPDATE embedding_generations SET is_active=1,audit_status='passed' WHERE id=?1",&params![id])?;
-            Ok(id)
-        }).unwrap();
-        crate::storage::vector_domain::rebuild_vec0_table_for_generation(
-            &writer,
-            generation,
-            dimension as i64,
-        )
-        .unwrap();
-        writer
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
-            .unwrap();
-        drop(writer);
-        let run = root.path().join("run");
-        fs::create_dir(&run).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
-        let manifest = root.path().join("source-manifest.txt");
-        fs::write(&manifest, b"synthetic source-content manifest\n").unwrap();
-        (root, db, run, manifest)
-    }
-
     fn command(
         n: u32,
         k: u32,
         count: usize,
         fault: &str,
+        api_config: &std::path::Path,
     ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
         let f = fixture(if fault == "empty-query" { fault } else { "" });
         assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
+        // Local inference is retired: a semantic window can only bind to a
+        // generation the frozen model API built, so the long-document fixture
+        // for the neighbour case comes from the same explicit configuration.
         let (data, database, _, source_manifest) = if fault == "neighbour" {
-            long_search_fixture(count, "BAAI/bge-m3", 1024)
+            regression_binding::tests::searchable_long_fixture_with_api_embedding(count, api_config)
         } else {
             regression_binding::tests::searchable_fixture_with_count(count)
         };
@@ -747,6 +648,11 @@ mod tests {
         let bytes=serde_json::to_vec(&json!({"schema":"cass.regression-source-receipt.v1","producer_id":"cass.pr9.verify-corpus","verification_policy":"cass.pr9.corpus-content-stable-file-v1","producer_source_sha256":digest(b"synthetic-producer"),"source_manifest_sha256":file_digest(&source_manifest).unwrap(),"expected_file_count":5049,"checked":5049,"passed":true,"exit_code":0,"failure_count":0,"raw_evidence_sha256":digest(b"synthetic-evidence")})).unwrap();
         std::fs::write(&source_producer_receipt, &bytes).unwrap();
         let cmd = RegressionCommand::FullSearch {
+            api: crate::search::regression_input::RegressionApiOptions {
+                config_path: Some(api_config.to_path_buf()),
+                no_model_fallback: true,
+                ..Default::default()
+            },
             input: f.input.clone(),
             database,
             expected_binding,
@@ -764,7 +670,7 @@ mod tests {
             rrf_limit: n,
             rerank: RerankSwitch::On,
             page_size: Some(k),
-            rerank_provider: Some(crate::search::rerank::types::ProviderChoice::BgeLocal),
+            rerank_provider: None,
             cutoffs: vec![5, 10, 20],
         };
         (f, data, cmd)
@@ -815,7 +721,7 @@ mod tests {
             serde_json::from_value(value["request_binding"].clone()).unwrap();
         let offset = q["pages"][1]["offset"].as_u64().unwrap() as usize;
         let cursor = base64::prelude::BASE64_STANDARD.encode(
-            serde_json::to_vec(&json!({"version":2,"window_id":id,"offset":offset})).unwrap(),
+            serde_json::to_vec(&json!({"version":3,"window_id":id,"offset":offset})).unwrap(),
         );
         let store = WindowStore::open_existing(root, WindowPolicy::default()).unwrap();
         load_verified_page(
@@ -931,7 +837,7 @@ mod tests {
             )
             .unwrap();
             let cursor = base64::prelude::BASE64_STANDARD.encode(
-                serde_json::to_vec(&json!({"version":2,"window_id":new_id,"offset":offset}))
+                serde_json::to_vec(&json!({"version":3,"window_id":new_id,"offset":offset}))
                     .unwrap(),
             );
             assert!(
@@ -959,7 +865,12 @@ mod tests {
         let k = config["k"].as_u64().unwrap() as u32;
         let count = config["count"].as_u64().unwrap() as usize;
         let fault = config.get("fault").and_then(Value::as_str).unwrap_or("");
-        let (f, _data, cmd) = command(n, k, count, fault);
+        // Local inference is retired: this child runs under the explicit model
+        // API configuration its parent froze, never a legacy provider variable.
+        let api_config = std::path::PathBuf::from(
+            dotenvy::var("CASS_S2_05_API_CONFIG").expect("parent must pass the frozen api config"),
+        );
+        let (f, _data, cmd) = command(n, k, count, fault, &api_config);
         let sources = [f.input.suite.clone(), _data.path().to_path_buf()];
         let before: Vec<_> = sources
             .iter()
@@ -1288,6 +1199,9 @@ mod tests {
                     write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
                     continue;
                 }
+                // Kept as a regression guard: the frozen model API names its
+                // identity in the configuration, so this probe must never be
+                // reached and the caller asserts a zero count.
                 let (status, response) = if path == "/models" {
                     gets += 1;
                     if server_fault == "model-mismatch" {
@@ -1321,7 +1235,15 @@ mod tests {
                         } else {
                             len
                         };
-                        ("200 OK",json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":if server_fault=="neighbour" {i as f64} else {1.0}})).collect::<Vec<_>>()}).to_string())
+                        // The frozen model API checks identity on the scoring
+                        // response itself, so the mismatch fault travels there
+                        // instead of on the retired `GET /models` probe.
+                        let model = if server_fault == "model-mismatch" {
+                            "synthetic-other-model"
+                        } else {
+                            "BAAI/bge-reranker-v2-m3"
+                        };
+                        ("200 OK",json!({"model":model,"results":(0..total).map(|i|json!({"index":if server_fault=="duplicate" {0} else if server_fault=="out-of-range" {len} else {i},"relevance_score":if server_fault=="neighbour" {i as f64} else {1.0}})).collect::<Vec<_>>()}).to_string())
                     }
                 };
                 write!(stream,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).unwrap();
@@ -1329,6 +1251,7 @@ mod tests {
             (gets, posts)
         });
         let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let evidence = dotenvy::var("CASS_S2_05_EVIDENCE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| temporary.path().to_path_buf());
@@ -1338,6 +1261,36 @@ mod tests {
             format!("-{fault}")
         };
         let output = evidence.join(format!("n{n}-k{k}-count{count}{suffix}"));
+        // Local inference is retired: freeze the explicit model API the child
+        // runs under, on the same owned loopback origin, instead of the legacy
+        // `CASS_INFINITY_URL` provider variable.
+        let api_root = tempfile::tempdir().unwrap();
+        let api_config = api_root.path().join("api.toml");
+        fs::write(
+            &api_config,
+            format!(
+                "version=1\n\
+                 default_embedding=\"embed\"\n\
+                 default_rerank=\"rank\"\n\
+                 [profiles.embed]\n\
+                 kind=\"embedding\"\n\
+                 protocol=\"openai-embeddings-v1\"\n\
+                 scope=\"loopback\"\n\
+                 endpoint=\"{origin}/embeddings\"\n\
+                 model=\"BAAI/bge-m3\"\n\
+                 model_revision=\"fixture-r1\"\n\
+                 normalization=\"l2\"\n\
+                 expected_dimension=1024\n\
+                 [profiles.rank]\n\
+                 kind=\"rerank\"\n\
+                 protocol=\"rerank-json-v1\"\n\
+                 scope=\"loopback\"\n\
+                 endpoint=\"{origin}/rerank\"\n\
+                 model=\"BAAI/bge-reranker-v2-m3\"\n\
+                 model_revision=\"fixture-r1\"\n"
+            ),
+        )
+        .unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1348,7 +1301,7 @@ mod tests {
                 "CASS_S2_05_CHILD",
                 json!({"n":n,"k":k,"count":count,"output":output,"fault":fault}).to_string(),
             )
-            .env("CASS_INFINITY_URL", origin)
+            .env("CASS_S2_05_API_CONFIG", &api_config)
             .output()
             .unwrap();
         stop.store(true, Ordering::Release);
@@ -1363,19 +1316,13 @@ mod tests {
             || fault == "page-guards"
             || fault == "neighbour"
             || fault == "os-readonly";
-        assert_eq!(
-            gets,
-            if fault == "empty-query" {
-                0
-            } else if successful {
-                9
-            } else {
-                1
-            }
-        );
+        // The frozen model API carries its identity in the configuration: it
+        // never probes with the retired `GET /models`, so every observed request
+        // is a real scoring POST on the one configured endpoint.
+        assert_eq!(gets, 0, "the model API must not send a legacy identity GET");
         assert_eq!(
             posts.len(),
-            if fault == "empty-query" || fault == "model-mismatch" {
+            if fault == "empty-query" {
                 0
             } else if successful {
                 9
@@ -1395,6 +1342,55 @@ mod tests {
     fn first_on_window_has_complete_pages_and_one_scoring_post_per_query() {
         window_case(7, 3, 9);
     }
+    #[test]
+    fn api_full_search_nine_windows_uses_one_frozen_configuration() {
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        let server = HttpFixture::start(vec![Reply::ok(json!({"model":"example/api-rank", "results":(0..200).map(|i| json!({"index":i,"relevance_score":i as f64})).collect::<Vec<_>>() }))]);
+        // The frozen configuration enters the fixture as an explicit API
+        // selection; the retired legacy provider selection is not retained.
+        let config_root = tempfile::tempdir().unwrap();
+        let config = config_root.path().join("api.toml");
+        fs::write(&config, format!(r#"
+version=1
+default_rerank="rank"
+[profiles.rank]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/api-rank"
+model_revision="r1"
+"#, server.base())).unwrap();
+        let (_f, _data, cmd) = command(200, 10, 200, "", &config);
+        let RegressionCommand::FullSearch { database, .. } = &cmd else { unreachable!() };
+        let db = database.clone();
+        let before = fs::read(&db).unwrap();
+        let started = Instant::now();
+        let provenance = RunProvenance::capture().unwrap();
+        let validated = super::super::input::prepare_full(&cmd).unwrap();
+        let owner = RegressionSearchRun::activate(validated, &cmd).unwrap();
+        fs::write(&config, "deliberately invalid after activation").unwrap();
+        let summary = collect(&owner, &provenance, started, 0.0).unwrap();
+        assert_eq!(summary["terminal"], "SUCCESS", "{summary}");
+        let result: Value = serde_json::from_slice(&fs::read(owner.validated.paths.run_root.join("run.json")).unwrap()).unwrap();
+        assert_eq!(result["terminal"], "SUCCESS", "{result}");
+        assert_eq!(result["quality_status"], "NOT_EVALUATED");
+        let questions = result["questions"].as_array().unwrap();
+        assert_eq!(questions.len(), 9);
+        assert_eq!(server.hits(), 9);
+        for question in questions {
+            assert_eq!(question["actual_n"], 200);
+            assert_eq!(question["pages"].as_array().unwrap().len(), 20);
+            assert_eq!(question["cost"]["http"][0]["http_attempts"], 1);
+            assert!(question["cost"]["http"][0]["model_executions"].is_null());
+        }
+        for request in server.requests() {
+            assert_eq!(request.method(), "POST");
+            assert_eq!(request.body()["documents"].as_array().unwrap().len(), 200);
+        }
+        assert_eq!(before, fs::read(db).unwrap());
+    }
+
     #[test]
     fn full_n200_k5_collects_nine_complete_forty_page_windows() {
         window_case(200, 5, 201);

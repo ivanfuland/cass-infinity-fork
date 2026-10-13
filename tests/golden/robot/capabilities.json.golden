@@ -133,9 +133,28 @@
       "description": "Disable wrapping entirely",
       "arg_type": "flag",
       "required": false
+    },
+    {
+      "name": "api-config",
+      "description": "Path to the versioned model-service API configuration (TOML); overrides CASS_API_CONFIG",
+      "arg_type": "option",
+      "value_type": "path",
+      "required": false
     }
   ],
   "commands": [
+    {
+      "name": "regression",
+      "description": "Validate pinned regression inputs without retrieval or evaluation",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "regression-input",
+      "description": "Inspect or verify frozen retrieval regression inputs without repair",
+      "arguments": [],
+      "has_json_output": false
+    },
     {
       "name": "tui",
       "description": "Launch interactive TUI",
@@ -320,11 +339,27 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (infinity, hash; `fastembed` requires the `semantic` build feature, retired in this build -- R1-W3-N2: defaults to `infinity` under the `infinity` feature so a bare `cass index --semantic` reaches the DB vector domain instead of the retired default)",
+          "description": "retired local backend selector; use --embedding-profile",
           "arg_type": "option",
           "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "embedding-profile",
+          "description": "embedding profile from the model API configuration",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "no-model-fallback",
+          "description": "disable the configured model fallback for this command",
+          "arg_type": "flag",
           "required": false,
-          "default": "infinity"
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "data-dir",
@@ -564,16 +599,33 @@
         },
         {
           "name": "rerank-provider",
-          "description": "Rerank backend selection. Requires --rerank. Exactly one of qwen3-local (the default when omitted), bge-local, openrouter-qwen3-8b, openrouter-cohere-4-fast, openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage error. Nothing is read from env or config; omitting it never selects a cloud backend",
+          "description": "Retired rerank backend selection. The local and OpenRouter rerank backends were removed with the model-API migration, so any supplied value is refused with a migration error before any request. The backend now comes from the configured rerank API profile (`--rerank-profile` with `--api-config`)",
           "arg_type": "option",
-          "value_type": "enum",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "embedding-profile",
+          "description": "Embedding API profile; defaults to the configured default_embedding",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "rerank-profile",
+          "description": "Rerank API profile; defaults to the configured default_rerank",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "no-model-fallback",
+          "description": "Disable the explicitly configured cloud fallback for this request",
+          "arg_type": "flag",
           "required": false,
           "enum_values": [
-            "qwen3-local",
-            "bge-local",
-            "openrouter-qwen3-8b",
-            "openrouter-cohere-4-fast",
-            "openrouter-voyage-2.5-lite"
+            "true",
+            "false"
           ]
         },
         {
@@ -794,14 +846,14 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Retired local embedding-model selector. The local backend was removed with the model-API migration, so a supplied value is refused with a migration error before any request. Embedding is served by the configured API profile (`--api-config` with `--embedding-profile`)",
           "arg_type": "option",
           "value_type": "string",
           "required": false
         },
         {
           "name": "rerank",
-          "description": "Enable complete-window reranking (off by default). Default: qwen3-local, N=200 candidates, K=5 results per page",
+          "description": "Enable complete-window reranking (off by default). Default: N=200 candidates, K=5 results per page; the backend is the configured rerank API profile (--rerank-profile)",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -812,14 +864,14 @@
         },
         {
           "name": "reranker",
-          "description": "Deprecated reranker selector. Use --rerank-provider instead",
+          "description": "Retired reranker selector. A supplied value is refused with a migration error before any request; the backend comes from the configured rerank API profile (`--rerank-profile`)",
           "arg_type": "option",
           "value_type": "string",
           "required": false
         },
         {
           "name": "daemon",
-          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
+          "description": "Retired daemon-inference selector. Warm local-model inference was removed with the model-API migration, so this flag is refused with a migration error before any request",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -830,7 +882,7 @@
         },
         {
           "name": "no-daemon",
-          "description": "Disable daemon usage even if available (force direct inference)",
+          "description": "No effect on the API-only build: it selects no model and enables no local inference, so there is no daemon for it to disable. Retained for compatibility",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -3456,31 +3508,31 @@
       "code": "15",
       "meaning": "semantic or embedder unavailable",
       "retryable": "yes",
-      "agent_action": "Install/verify models or continue with lexical fallback when acceptable."
+      "agent_action": "Configure an embedding profile with --api-config and run 'cass models check'; continue with lexical fallback when acceptable."
     },
     {
       "code": "20-21",
-      "meaning": "model acquisition failure",
+      "meaning": "retired: model acquisition failure",
       "retryable": "maybe",
-      "agent_action": "Check err.kind and err.hint; retry download or use --from-file."
+      "agent_action": "Retired with the model-API migration; no active path returns this code and no local model is acquired. Configure an external profile with --api-config."
     },
     {
       "code": "22",
-      "meaning": "I/O during model handling",
+      "meaning": "retired: I/O during model handling",
       "retryable": "maybe",
-      "agent_action": "Verify model cache permissions and available disk before retrying."
+      "agent_action": "Retired with the model-API migration; no local model cache I/O path remains."
     },
     {
       "code": "23",
-      "meaning": "download failure",
+      "meaning": "retired: download failure",
       "retryable": "yes",
-      "agent_action": "Retry with network available or install from a local model directory."
+      "agent_action": "Retired with the model-API migration; cass downloads no model weights."
     },
     {
       "code": "24",
-      "meaning": "I/O during model verify/install",
+      "meaning": "retired: I/O during model verify/install",
       "retryable": "maybe",
-      "agent_action": "Fix filesystem permissions or disk space, then retry."
+      "agent_action": "Retired with the model-API migration; no local model verify/install path remains."
     }
   ],
   "env_vars": [
@@ -3519,16 +3571,20 @@
       "description": "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml."
     },
     {
+      "name": "CASS_API_CONFIG",
+      "description": "Path to the versioned model-service API configuration (TOML). The --api-config flag overrides it; model commands refuse without one."
+    },
+    {
       "name": "CASS_QWEN_RERANK_URL",
-      "description": "Local Qwen rerank endpoint. Only loopback targets are accepted; proxies and redirects are disabled. Used by qwen3-local, the default when --rerank is enabled."
+      "description": "Retired. The local Qwen rerank backend was removed with the model-API migration; a model command that finds this set refuses with a migration error."
     },
     {
       "name": "CASS_INFINITY_URL",
-      "description": "Local Infinity endpoint for bge-local reranking and Infinity embeddings. Reranking accepts only loopback targets; proxies and redirects are disabled."
+      "description": "Retired. The local Infinity backend was removed with the model-API migration; a model command that finds this set refuses with a migration error."
     },
     {
       "name": "OPENROUTER_API_KEY",
-      "description": "Credential consumed only by an explicitly selected OpenRouter rerank provider. Missing credentials keep original order with missing_credentials; no backend switch."
+      "description": "Credential a profile may reference through api_key_env. Its presence alone never selects a backend and never changes routing."
     },
     {
       "name": "CASS_SEARCH_LIMIT",
@@ -3575,7 +3631,7 @@
     },
     {
       "name": "CASS_SEMANTIC_EMBEDDER",
-      "description": "Select the semantic embedder/model implementation when configured."
+      "description": "Retired. Selecting a local embedder (e.g. hash) was removed with the model-API migration; a model command that finds this set refuses with a migration error."
     },
     {
       "name": "CASS_SEMANTIC_BATCH_SIZE",
@@ -3729,10 +3785,9 @@
       "intent": "Understand or repair semantic-search readiness.",
       "first_command": "cass models status --json",
       "follow_up_commands": [
-        "cass models verify --json",
-        "cass models install --model minilm",
-        "cass models install --from-file <dir> --model minilm",
-        "cass models backfill"
+        "cass models list --json",
+        "cass models check --profile <id> --json",
+        "cass models backfill --api-config <file>"
       ],
       "parse_contract": "Parse installed, available, cache_dir, verification status, and err.kind.",
       "note": "Models are opt-in; lexical fallback is valid while the model is absent."

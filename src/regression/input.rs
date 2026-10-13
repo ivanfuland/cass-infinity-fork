@@ -754,6 +754,7 @@ fn write_private(path: &Path, value: &Value) -> Result<()> {
 pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
     // Never expose a source pathname, JSON fragment, query or candidate.
     const CODES: &[&str] = &[
+        "REGRESSION_MODEL_API_MIGRATION",
         "SOURCE_PRODUCER_UNPROVEN",
         "SOURCE_RECEIPT_DIGEST_MISMATCH",
         "SOURCE_RECEIPT_INVALID",
@@ -1066,6 +1067,7 @@ pub(crate) fn prepare_full(command: &RegressionCommand) -> Result<ValidatedRun> 
 
 fn validate_full_profile(command: &RegressionCommand) -> Result<()> {
     let RegressionCommand::FullSearch {
+        api,
         search_mode,
         vector_search_mode,
         rrf_limit,
@@ -1079,6 +1081,7 @@ fn validate_full_profile(command: &RegressionCommand) -> Result<()> {
         bail!("REQUEST_PROFILE_INVALID");
     };
     validate_cutoffs(cutoffs)?;
+    require(!(api.selected() && rerank_provider.is_some()), "REGRESSION_MODEL_API_MIGRATION")?;
     let lexical = *search_mode == crate::search::query::SearchMode::Lexical;
     require(
         *rrf_limit > 0 && lexical == vector_search_mode.is_none(),
@@ -1086,9 +1089,14 @@ fn validate_full_profile(command: &RegressionCommand) -> Result<()> {
     )?;
     require(
         match rerank {
-            RerankSwitch::Off => page_size.is_none() && rerank_provider.is_none(),
+            RerankSwitch::Off => page_size.is_none() && rerank_provider.is_none() && api.rerank_profile.is_none(),
+            // The local rerank provider is retired: a scored window must name
+            // its service in a frozen model-API configuration. The legacy
+            // selection no longer satisfies this profile, so a production run
+            // without an API config is refused instead of reaching the old
+            // service path.
             RerankSwitch::On => {
-                page_size.is_some_and(|k| k > 0 && k <= *rrf_limit) && rerank_provider.is_some()
+                page_size.is_some_and(|k| k > 0 && k <= *rrf_limit) && api.selected()
             }
         },
         "REQUEST_PROFILE_INVALID",
@@ -1373,10 +1381,11 @@ mod tests {
 
     fn command(fixture: &Fixture) -> RegressionCommand {
         RegressionCommand::FixedCandidate {
+            api: Default::default(),
             input: fixture.input.clone(),
             pool_binding: fixture.pool.clone(),
             pool_binding_sha256: fixture.pool_sha.clone(),
-            rerank_provider: crate::search::rerank::types::ProviderChoice::Qwen3Local,
+            rerank_provider: Some(crate::search::rerank::types::ProviderChoice::Qwen3Local),
             cutoffs: vec![5, 10, 20],
         }
     }
@@ -1424,6 +1433,7 @@ mod tests {
         let expected_binding = data.join("expected.json");
         fs::write(&expected_binding, &expected_bytes).unwrap();
         RegressionCommand::FullSearch {
+            api: Default::default(),
             input: f.input.clone(),
             database,
             expected_binding,

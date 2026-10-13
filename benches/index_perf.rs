@@ -90,6 +90,7 @@ fn bench_index_full(c: &mut Criterion) {
     writeln!(f, "{{\"role\":\"assistant\",\"content\":\"world\"}}").unwrap();
 
     let opts = IndexOptions {
+        model_api: None,
         no_ingest: false,
         full: true,
         force_rebuild: true,
@@ -156,6 +157,7 @@ fn bench_streaming_vs_batch(c: &mut Criterion) {
         let _ = index_dir(&data_dir);
 
         let base_opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: true,
@@ -223,6 +225,7 @@ fn bench_channel_overhead(c: &mut Criterion) {
     let _ = index_dir(&data_dir);
 
     let opts = IndexOptions {
+        model_api: None,
         no_ingest: false,
         full: true,
         force_rebuild: true,
@@ -334,6 +337,7 @@ fn bench_ingest_with_responsiveness(c: &mut Criterion) {
         let _ = index_dir(&data_dir);
 
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: true,
@@ -405,6 +409,7 @@ fn bench_card_defaults_ab(c: &mut Criterion) {
         let _ = index_dir(&data_dir);
 
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: true,

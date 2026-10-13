@@ -254,9 +254,16 @@ fn surface_command(
             ));
         }
         "introspect" => vec!["introspect", "--json"],
-        "models-check-update" => vec!["models", "check-update", "--json"],
-        "models-status" => vec!["models", "status", "--json"],
-        "models-verify" => vec!["models", "verify", "--json"],
+        // Semantic mapping (model-API migration): `models-status`,
+        // `models-verify` and `models-check-update` advertised the retired local
+        // weight-cache surfaces and were replaced by `models-list` and
+        // `models-check`. Producing those payloads needs a real model-API
+        // configuration file (and, for `check`, a live endpoint), which this
+        // offline shape-coverage harness has no fixture for; they are covered
+        // end-to-end against a real config and a loopback stub in
+        // `tests/api_model_commands.rs`. The caller skips these two surfaces
+        // explicitly (see `introspect_response_schemas_cover_runtime_json_shapes`).
+        "models-list" | "models-check" => return None,
         "pack" => {
             return Some((
                 vec![
@@ -381,7 +388,10 @@ fn introspect_response_schemas_cover_runtime_json_shapes() -> Result<(), Box<dyn
     for (surface, advertised_schema) in response_schemas {
         let Some((args, expect_status)) = surface_command(surface, test_home.path(), &demo_data)
         else {
-            if surface.starts_with("doctor-") {
+            // doctor-* schemas are documentation-only contracts with no single
+            // runtime command; models-list / models-check need a real model-API
+            // config (see the note in `surface_command`).
+            if surface.starts_with("doctor-") || matches!(surface.as_str(), "models-list" | "models-check") {
                 continue;
             }
             panic!("no runtime command sample mapped for introspect response schema {surface}");

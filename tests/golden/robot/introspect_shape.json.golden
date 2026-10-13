@@ -44,30 +44,7 @@
           "arguments": {
             "type": "array",
             "items": {
-              "type": "object",
-              "properties": {
-                "name": {
-                  "type": "string"
-                },
-                "description": {
-                  "type": "string"
-                },
-                "arg_type": {
-                  "type": "string"
-                },
-                "required": {
-                  "type": "boolean"
-                },
-                "default": {
-                  "type": "string"
-                },
-                "enum_values": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              }
+              "type": "unknown"
             }
           },
           "has_json_output": {
@@ -55023,7 +55000,7 @@
             }
           }
         },
-        "models-check-update": {
+        "models-check": {
           "type": "object",
           "properties": {
             "type": {
@@ -55035,15 +55012,7 @@
             "properties": {
               "type": "object",
               "properties": {
-                "update_available": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "reason": {
+                "schema": {
                   "type": "object",
                   "properties": {
                     "type": {
@@ -55054,51 +55023,7 @@
                     }
                   }
                 },
-                "current_revision": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  }
-                },
-                "latest_revision": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "required": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          }
-        },
-        "models-status": {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string"
-            },
-            "description": {
-              "type": "string"
-            },
-            "properties": {
-              "type": "object",
-              "properties": {
-                "policy_quality_tier_embedder": {
+                "profile_id": {
                   "type": "object",
                   "properties": {
                     "type": {
@@ -55106,7 +55031,34 @@
                     }
                   }
                 },
-                "active_registry_name": {
+                "kind": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "requested_model": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "declared_revision": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "response_model": {
                   "type": "object",
                   "properties": {
                     "type": {
@@ -55117,7 +55069,29 @@
                     }
                   }
                 },
-                "lexical_fail_open": {
+                "response_revision": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
+                "revision_source": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "mode": {
                   "type": "object",
                   "properties": {
                     "type": {
@@ -55125,7 +55099,18 @@
                     }
                   }
                 },
-                "models": {
+                "fallback_used": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "calls": {
                   "type": "object",
                   "properties": {
                     "type": {
@@ -55144,241 +55129,56 @@
                     }
                   }
                 },
-                "model_id": {
+                "effective_dimension": {
                   "type": "object",
                   "properties": {
                     "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "model_dir": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "installed": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "state": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    },
-                    "description": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "state_detail": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "next_step": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "revision": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "license": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "total_size_bytes": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "installed_size_bytes": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "observed_file_bytes": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "policy_source": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "cache_lifecycle": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    },
-                    "additionalProperties": {
-                      "type": "boolean"
-                    },
-                    "description": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "model_acquisition": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    },
-                    "additionalProperties": {
-                      "type": "boolean"
-                    },
-                    "description": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "files": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    },
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "type": {
-                          "type": "string"
-                        },
-                        "additionalProperties": {
-                          "type": "boolean"
-                        }
+                      "type": "array",
+                      "items": {
+                        "type": "string"
                       }
-                    }
-                  }
-                }
-              }
-            },
-            "required": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            }
-          }
-        },
-        "models-verify": {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string"
-            },
-            "description": {
-              "type": "string"
-            },
-            "properties": {
-              "type": "object",
-              "properties": {
-                "status": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "state_detail": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "next_step": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "lexical_fail_open": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "model_dir": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "all_valid": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
-                    }
-                  }
-                },
-                "cache_lifecycle": {
-                  "type": "object",
-                  "properties": {
-                    "type": {
-                      "type": "string"
                     },
-                    "additionalProperties": {
-                      "type": "boolean"
+                    "description": {
+                      "type": "string"
                     }
                   }
                 },
-                "model_acquisition": {
+                "descriptor_sha256": {
                   "type": "object",
                   "properties": {
                     "type": {
-                      "type": "string"
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     },
-                    "additionalProperties": {
-                      "type": "boolean"
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "scored_count": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "usage": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     },
                     "description": {
                       "type": "string"
@@ -55392,6 +55192,156 @@
                       "type": "array",
                       "items": {
                         "type": "string"
+                      }
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "required": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "models-list": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string"
+            },
+            "description": {
+              "type": "string"
+            },
+            "properties": {
+              "type": "object",
+              "properties": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "profiles": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": {
+                          "type": "string"
+                        },
+                        "properties": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "kind": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                },
+                                "description": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "protocol": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "model": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "model_revision": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                },
+                                "description": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "default": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "endpoint": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "scope": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                },
+                                "description": {
+                                  "type": "string"
+                                }
+                              }
+                            },
+                            "api_key_env": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                },
+                                "description": {
+                                  "type": "string"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        "required": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
                       }
                     }
                   }
@@ -57728,17 +57678,301 @@
                             "properties": {
                               "type": "object",
                               "properties": {
+                                "model_api": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "properties": {
+                                      "type": "object",
+                                      "properties": {
+                                        "primary_profile": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "pattern": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "realized_profile": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            },
+                                            "pattern": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "fallback_used": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            }
+                                          }
+                                        },
+                                        "fallback_reason": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "array",
+                                              "items": {
+                                                "type": "string"
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "attempts": {
+                                          "type": "object",
+                                          "properties": {
+                                            "type": {
+                                              "type": "string"
+                                            },
+                                            "items": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "string"
+                                                },
+                                                "properties": {
+                                                  "type": "object",
+                                                  "properties": {
+                                                    "profile": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "string"
+                                                        },
+                                                        "pattern": {
+                                                          "type": "string"
+                                                        }
+                                                      }
+                                                    },
+                                                    "network_attempted": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "string"
+                                                        }
+                                                      }
+                                                    },
+                                                    "http_status": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "minimum": {
+                                                          "type": "integer"
+                                                        },
+                                                        "maximum": {
+                                                          "type": "integer"
+                                                        }
+                                                      }
+                                                    },
+                                                    "error_code": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "duration_ms": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "string"
+                                                        },
+                                                        "minimum": {
+                                                          "type": "integer"
+                                                        }
+                                                      }
+                                                    },
+                                                    "response_model": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "response_revision": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "serving_provider": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    },
+                                                    "usage": {
+                                                      "type": "object",
+                                                      "properties": {
+                                                        "type": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        },
+                                                        "properties": {
+                                                          "type": "object",
+                                                          "properties": {
+                                                            "prompt_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "input_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "total_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "completion_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "output_tokens": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                },
+                                                                "minimum": {
+                                                                  "type": "integer"
+                                                                }
+                                                              }
+                                                            },
+                                                            "cost": {
+                                                              "type": "object",
+                                                              "properties": {
+                                                                "type": {
+                                                                  "type": "array",
+                                                                  "items": {
+                                                                    "type": "string"
+                                                                  }
+                                                                }
+                                                              }
+                                                            }
+                                                          }
+                                                        },
+                                                        "required": {
+                                                          "type": "array",
+                                                          "items": {
+                                                            "type": "string"
+                                                          }
+                                                        }
+                                                      }
+                                                    }
+                                                  }
+                                                },
+                                                "required": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "required": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
                                 "requested_provider": {
                                   "type": "object",
                                   "properties": {
                                     "type": {
                                       "type": "string"
                                     },
-                                    "enum": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "string"
-                                      }
+                                    "pattern": {
+                                      "type": "string"
                                     }
                                   }
                                 },
@@ -59966,17 +60200,301 @@
             "properties": {
               "type": "object",
               "properties": {
+                "model_api": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "primary_profile": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "pattern": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "realized_profile": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "pattern": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "fallback_used": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "fallback_reason": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "attempts": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "type": {
+                                  "type": "string"
+                                },
+                                "properties": {
+                                  "type": "object",
+                                  "properties": {
+                                    "profile": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        },
+                                        "pattern": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "network_attempted": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        }
+                                      }
+                                    },
+                                    "http_status": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "minimum": {
+                                          "type": "integer"
+                                        },
+                                        "maximum": {
+                                          "type": "integer"
+                                        }
+                                      }
+                                    },
+                                    "error_code": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "duration_ms": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "string"
+                                        },
+                                        "minimum": {
+                                          "type": "integer"
+                                        }
+                                      }
+                                    },
+                                    "response_model": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "response_revision": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "serving_provider": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    },
+                                    "usage": {
+                                      "type": "object",
+                                      "properties": {
+                                        "type": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        },
+                                        "properties": {
+                                          "type": "object",
+                                          "properties": {
+                                            "prompt_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "input_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "total_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "completion_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "output_tokens": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                },
+                                                "minimum": {
+                                                  "type": "integer"
+                                                }
+                                              }
+                                            },
+                                            "cost": {
+                                              "type": "object",
+                                              "properties": {
+                                                "type": {
+                                                  "type": "array",
+                                                  "items": {
+                                                    "type": "string"
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        },
+                                        "required": {
+                                          "type": "array",
+                                          "items": {
+                                            "type": "string"
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                },
+                                "required": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "string"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "required": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
                 "requested_provider": {
                   "type": "object",
                   "properties": {
                     "type": {
                       "type": "string"
                     },
-                    "enum": {
-                      "type": "array",
-                      "items": {
-                        "type": "string"
-                      }
+                    "pattern": {
+                      "type": "string"
                     }
                   }
                 },

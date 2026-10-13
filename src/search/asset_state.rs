@@ -22,7 +22,7 @@ use crate::indexer::lexical_storage_fingerprint_for_db;
 use crate::storage::sqlite::LexDomainRebuildMarkerState;
 use crate::search::vector_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::FastEmbedder;
+use crate::search::model_identity;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
     SemanticAvailability, probe_hash_semantic_availability, probe_semantic_availability,
@@ -802,10 +802,18 @@ fn semantic_preference_surface(
     preference: SemanticPreference,
 ) -> SemanticPreferenceSurface {
     match preference {
+        // The effective semantic identity now comes from the API representation
+        // descriptor, so the surface must not claim a local backend by name
+        // (`fastembed` was a local ONNX model this build no longer ships).
+        // `external` is a neutral role marker, not a model identity; the real
+        // model/revision/dimension are reported from the descriptor elsewhere.
         SemanticPreference::DefaultModel => SemanticPreferenceSurface {
-            preferred_backend: "fastembed",
+            preferred_backend: "external",
             model_dir: active_policy_model_dir(data_dir),
         },
+        // Only reachable when a retired `CASS_SEMANTIC_EMBEDDER=hash` override is
+        // still in force (the var is refused by model commands); kept as the
+        // honest name for that preference rather than re-labelled.
         SemanticPreference::HashFallback => SemanticPreferenceSurface {
             preferred_backend: "hash",
             model_dir: None,
@@ -979,13 +987,13 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
 
 fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
-    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+    let embedder_name = model_identity::canonical_name(&policy.quality_tier_embedder)?;
+    model_identity::runtime_model_dir_for(data_dir, embedder_name)
 }
 
 fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
-    let embedder_name = FastEmbedder::canonical_name(embedder_id)?;
-    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+    let embedder_name = model_identity::canonical_name(embedder_id)?;
+    model_identity::runtime_model_dir_for(data_dir, embedder_name)
 }
 
 fn semantic_tier_queryable(
@@ -1492,7 +1500,7 @@ fn semantic_embedder_id(
         SemanticAvailability::HashFallback => Some(HashEmbedder::default().id().to_string()),
         _ => match preference {
             SemanticPreference::DefaultModel => {
-                Some(FastEmbedder::embedder_id_static().to_string())
+                Some(model_identity::embedder_id_static().to_string())
             }
             SemanticPreference::HashFallback => Some(HashEmbedder::default().id().to_string()),
         },
@@ -1557,28 +1565,33 @@ fn semantic_hint(
     preference: SemanticPreference,
 ) -> Option<String> {
     let hint = match (preference, availability) {
+        // The retired `--embedder` selection is refused, so the hint must name
+        // the API path instead: a configured embedding profile drives the build.
         (SemanticPreference::HashFallback, SemanticAvailability::IndexMissing { .. }) => {
-            "Run 'cass index --semantic --embedder hash' to build the hash vector index; lexical search remains available without semantic assets"
+            "Run 'cass models backfill --api-config <file> --embedding-profile <id>' to build the vector domain; lexical search remains available without semantic assets"
         }
         (SemanticPreference::HashFallback, SemanticAvailability::LoadFailed { .. })
         | (SemanticPreference::HashFallback, SemanticAvailability::DatabaseUnavailable { .. }) => {
-            "Run 'cass index --semantic --embedder hash' after the database is healthy; lexical search remains available"
+            "Run 'cass models backfill --api-config <file> --embedding-profile <id>' after the database is healthy; lexical search remains available"
         }
         (SemanticPreference::HashFallback, _) => {
-            "Run 'cass index --semantic --embedder hash' to build the hash vector index; lexical search remains available"
+            "Run 'cass models backfill --api-config <file> --embedding-profile <id>' to build the vector domain; lexical search remains available"
         }
+        // These availability variants are no longer produced on the API-only
+        // path (nothing installs or loads a local weight). The hint points at the
+        // configuration surface that replaces them.
         (_, SemanticAvailability::NotInstalled)
         | (_, SemanticAvailability::NeedsConsent)
         | (_, SemanticAvailability::ModelMissing { .. }) => {
-            "Run 'cass models install' and then 'cass index --semantic'; lexical search remains available without the model"
+            "Configure an embedding profile with --api-config (see 'cass models list') and run 'cass models check'; lexical search remains available without it"
         }
         (_, SemanticAvailability::IndexMissing { .. })
         | (_, SemanticAvailability::UpdateAvailable { .. })
         | (_, SemanticAvailability::IndexBuilding { .. }) => {
-            "Run 'cass index --semantic' to build or refresh vector assets; lexical search remains available"
+            "Run 'cass index --semantic --api-config <file>' to build or refresh vector assets; lexical search remains available"
         }
         (_, SemanticAvailability::Downloading { .. }) | (_, SemanticAvailability::Verifying) => {
-            "Wait for the semantic model installation to finish; lexical search remains available"
+            "Wait for the semantic asset build to finish; lexical search remains available"
         }
         (_, SemanticAvailability::Disabled { .. }) => {
             "Semantic search is disabled by policy; lexical search remains available, or re-enable semantic search"
@@ -2713,20 +2726,16 @@ mod tests {
     #[test]
     fn semantic_preference_surface_preserves_backend_and_model_dir_projection() {
         let data_dir = Path::new("/tmp/cass");
-        // R1-W3-N2 fallout: `active_policy_model_dir` -> `FastEmbedder::
-        // canonical_name(&policy.quality_tier_embedder)` returns `None`
-        // for the infinity-routing names ("infinity"/"bge-m3") -- correct
-        // behavior, not a bug, DEFAULT_QUALITY_TIER_EMBEDDER's default
-        // under `infinity` is `is_infinity_embedder_name`-shaped, and the
-        // Infinity-served model lives on a remote HTTP service with no
-        // on-disk FastEmbed directory to project a path for at all.
-        let default_model_dir = if cfg!(feature = "infinity") {
-            None
-        } else {
-            Some(FastEmbedder::default_model_dir(data_dir))
-        };
+        // `active_policy_model_dir` resolves the policy default embedder name
+        // through `model_identity::canonical_name`. The default is the DB
+        // vector domain's routing name, which is not a canonical local model,
+        // so there is no on-disk cache directory to project.
+        let default_model_dir = None;
         let cases = [
-            (SemanticPreference::DefaultModel, "fastembed", default_model_dir),
+            // The role marker is neutral now: the effective model identity comes
+            // from the API representation descriptor, not from a local backend
+            // name (`fastembed` was a local ONNX model this build no longer ships).
+            (SemanticPreference::DefaultModel, "external", default_model_dir),
             (SemanticPreference::HashFallback, "hash", None),
         ];
 
@@ -2746,13 +2755,13 @@ mod tests {
         std::fs::write(vector_dir.join("vector.fast.idx"), b"fast").expect("write fast tier");
         std::fs::write(vector_dir.join("vector.quality.idx"), b"quality")
             .expect("write quality tier");
-        let hnsw_path = hnsw_index_path(temp.path(), FastEmbedder::embedder_id_static());
+        let hnsw_path = hnsw_index_path(temp.path(), model_identity::embedder_id_static());
         std::fs::write(&hnsw_path, b"hnsw").expect("write hnsw");
 
         let state = semantic_state_from_availability(
             temp.path(),
             &SemanticAvailability::Ready {
-                embedder_id: FastEmbedder::embedder_id_static().to_string(),
+                embedder_id: model_identity::embedder_id_static().to_string(),
             },
             SemanticPreference::DefaultModel,
             None,
@@ -2763,7 +2772,7 @@ mod tests {
         assert!(state.hnsw_ready);
         assert_eq!(
             state.embedder_id.as_deref(),
-            Some(FastEmbedder::embedder_id_static())
+            Some(model_identity::embedder_id_static())
         );
     }
 

@@ -1,4 +1,3 @@
-#[cfg(feature = "infinity")]
 pub mod db_vector_catchup;
 pub mod exclusion;
 pub(crate) mod lexical_generation;
@@ -66,10 +65,8 @@ use crate::storage::sqlite::{
     LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE, StatsAggregator, StatsDelta,
     historical_table_exists, seed_canonical_from_best_historical_bundle,
 };
-use semantic::{EmbeddingInput, SemanticIndexer};
+use semantic::EmbeddingInput;
 use semantic_progress::{SemanticFinalizeProgressEmitter, SemanticProgressSink};
-
-use crate::search::semantic_manifest::TierKind as SemanticTierKind;
 
 #[cfg(test)]
 use std::iter::Peekable;
@@ -949,6 +946,9 @@ pub struct IndexingStats {
     /// `None` when this run didn't request semantic indexing at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub semantic_activated: Option<bool>,
+    /// Actual model attempts from the latest semantic pass, retained on failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_api: Option<serde_json::Value>,
     /// R4-4: `DbVectorCatchupReport::cleanup_failures` from the same
     /// `run_semantic_db_vector_catchup` call, previously discarded at
     /// that call's `Ok(report.activated)` return -- `cass models
@@ -1608,6 +1608,8 @@ fn active_rebuild_json_optional_u64(is_rebuilding: bool, value: Option<u64>) -> 
 
 #[derive(Clone)]
 pub struct IndexOptions {
+    /// Frozen model API configuration, reused across watch cycles.
+    pub model_api: Option<Arc<crate::search::model_api::index_embedding::IndexEmbeddingSetup>>,
     pub full: bool,
     pub force_rebuild: bool,
     pub watch: bool,
@@ -1623,7 +1625,7 @@ pub struct IndexOptions {
     /// watermark must not advance (this is T12 v2's exam-hall mode: the
     /// corpus must be byte-identical before and after).
     pub no_ingest: bool,
-    /// Embedder ID to use for semantic indexing (hash, fastembed).
+    /// Progress label; semantic runs replace it with the selected API profile ID.
     pub embedder: String,
     pub progress: Option<Arc<IndexingProgress>>,
     /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
@@ -5239,29 +5241,18 @@ fn system_time_to_epoch_millis(time: SystemTime) -> Option<i64> {
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn semantic_tier_for_embedder_id(embedder_id: &str) -> Option<SemanticTierKind> {
-    match embedder_id {
-        // fork: Infinity 的 `bge-m3`（src/search/infinity.rs EMBEDDER_ID）与上游 `minilm-384`
-        // 同属 quality tier。少了这一行，`index --semantic --watch-once` 的**增量追加**路径会以
-        // "semantic watch-once cannot publish unknown embedder tier for bge-m3" 失败，
-        // 于是只能退回 `models backfill` 的全量重建——每加一条会话就重嵌整个语料。
-        "bge-m3" | "minilm-384" => Some(SemanticTierKind::Quality),
-        "fnv1a-384" => Some(SemanticTierKind::Fast),
-        _ => None,
-    }
-}
-
-fn semantic_model_revision_for_embedder_id(embedder_id: &str) -> String {
-    match embedder_id {
-        "fnv1a-384" => "hash".to_string(),
-        // fork: 与 lib.rs backfill 路径写进 manifest 的 `infinity-bge-m3` 保持一致；
-        // 否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
-        "bge-m3" => "infinity-bge-m3".to_string(),
-        _ => crate::search::model_download::ModelManifest::minilm_v2()
-            .revision
-            .clone(),
-    }
-}
+// `semantic_tier_for_embedder_id` and `semantic_model_revision_for_embedder_id`
+// were removed here. They were the local-model tier/revision routing table --
+// a hardcoded `bge-m3`/`minilm-384` -> tier map and a `minilm_v2` revision
+// fallback -- and after the model-API migration neither had any production
+// caller left in the crate (verified against the base commit: only their own
+// definitions and unit tests referenced them). A semantic generation's tier,
+// model and revision now come from the API representation descriptor, so an
+// unknown embedder id must be an explicit absence, never a fabricated tier or a
+// revision borrowed from a local weight manifest. The four unit tests that
+// pinned the deleted maps are removed with them; their API-path equivalent
+// (descriptor-derived identity) is covered by tests/api_primary_backfill.rs and
+// the model-API unit tests.
 
 fn count_total_messages_exact(storage: &FrankenStorage) -> Result<usize> {
     let total_messages: i64 = storage
@@ -10096,52 +10087,23 @@ struct SemanticDbVectorCatchupOutcome {
     cleanup_failures: Vec<(i64, String)>,
 }
 
-#[cfg(feature = "infinity")]
 fn run_semantic_db_vector_catchup(
-    opts: &IndexOptions,
-    caller: &str,
+    opts: &IndexOptions, caller: &str,
 ) -> Result<SemanticDbVectorCatchupOutcome> {
     memprobe_point("run_semantic_db_vector_catchup", "holes", "start");
-    if opts.embedder != "infinity" {
-        anyhow::bail!(
-            "{caller}: --embedder {} is retired (W3-5, frankensearch/fsvi removed); \
-             use --embedder infinity",
-            opts.embedder
-        );
-    }
-    let storage = FrankenStorage::open_writer(&opts.db_path).with_context(|| {
-        format!(
-            "opening writer storage for DB-vector-domain catch-up: {}",
-            opts.db_path.display()
-        )
-    })?;
-    let batch_size = SemanticIndexer::new("infinity", None)?.batch_size();
-
-    // T8 (plan v5.1, task book #92): `cass index --semantic` drains the
-    // chunk domain (`chunk_holes` -> `message_chunks`) -- the retired v4
-    // message-granularity engine T11 deleted is no longer reachable from
-    // anywhere.
-    let infinity_config = crate::search::infinity::InfinityConfig::from_env();
-    let (identity, fingerprint) = crate::search::infinity::probe_identity_and_fingerprint(&infinity_config)
-        .map_err(|e| anyhow::anyhow!("{caller}: infinity identity+fingerprint probe failed: {e}"))?;
-    let embedder = crate::search::infinity::InfinityEmbedder::new()
-        .map_err(|e| anyhow::anyhow!("{caller}: failed to construct infinity embedder: {e}"))?;
-    let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
-        use crate::search::embedder::Embedder as _;
-        embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
-    };
+    let setup = opts.model_api.as_ref().ok_or_else(|| anyhow::anyhow!("embedding API configuration was not frozen"))?;
+    let call = setup.call()?;
+    let storage = FrankenStorage::open_writer(&opts.db_path)?;
     let ownership_seed = FrankenStorage::now_millis() as u64;
-    let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
-        &storage,
-        batch_size,
-        &identity,
-        crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
-        crate::search::chunking::CHUNKING_POLICY_VERSION,
-        &fingerprint,
-        &embed_fn,
-        ownership_seed,
-    )
-    .map_err(|e| anyhow::anyhow!("{caller}: db vector catchup failed: {e:#}"))?;
+    let result = db_vector_catchup::probe_api_backfill(&storage, &call).and_then(|probe| {
+        db_vector_catchup::run_api_primary_catchup_backfill(
+            &storage, semantic::resolved_default_batch_size(), &call, call.profile(), &probe, ownership_seed)
+    });
+    if let Some(progress) = &opts.progress {
+        if let Ok(mut stats) = progress.stats.lock() { stats.model_api = Some(call.diagnostic()); }
+    }
+    let outcome = result.map_err(|error| anyhow::anyhow!("{caller}: {error}"))?;
+    let report = outcome.catchup;
     tracing::info!(
         caller,
         generation_id = report.generation_id,
@@ -10173,17 +10135,6 @@ fn run_semantic_db_vector_catchup(
         activated: report.activated,
         cleanup_failures: report.cleanup_failures,
     })
-}
-
-#[cfg(not(feature = "infinity"))]
-fn run_semantic_db_vector_catchup(
-    _opts: &IndexOptions,
-    caller: &str,
-) -> Result<SemanticDbVectorCatchupOutcome> {
-    anyhow::bail!(
-        "{caller}: semantic indexing requires the `infinity` feature (fsvi-backed semantic \
-         indexing was retired in W3-5); rebuild with --features infinity"
-    );
 }
 
 /// R2-B1 (任务书 #119a): an actionable message for the `scan_had_errors`
@@ -10224,10 +10175,16 @@ fn scan_had_errors_bail_message(opts: &IndexOptions, context: &str) -> String {
 }
 
 pub fn run_index(
-    opts: IndexOptions,
+    mut opts: IndexOptions,
     event_channel: Option<(Sender<IndexerEvent>, Receiver<IndexerEvent>)>,
 ) -> Result<()> {
     let _progress_reset = RunIndexProgressReset::new(opts.progress.clone());
+    if opts.semantic {
+        if opts.model_api.is_none() {
+            opts.model_api = Some(Arc::new(crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(None, None, true)?));
+        }
+        opts.embedder = opts.model_api.as_ref().expect("semantic API frozen").profile_id().to_owned();
+    }
     // mission #116⑥: run_index 入口归零 meta 三键计数器 -- "watch 模式每 cycle
     // 视为一次 run" 的归零边界见 watch 循环内 `ingest_watch_batch_with_oom_split`
     // 前的同名调用。
@@ -21835,6 +21792,7 @@ pub mod persist {
             db_path: std::path::PathBuf,
         ) -> crate::indexer::IndexOptions {
             crate::indexer::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 force_rebuild: false,
@@ -23555,6 +23513,7 @@ mod tests {
         }
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -25213,6 +25172,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).expect("storage");
         ensure_fts_schema(&storage);
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: false,
@@ -25268,60 +25228,17 @@ mod tests {
         );
     }
 
-    /// Regression for issue #203: the direct `cass index --semantic`
-    /// path must classify embedder ids onto the right manifest tier so
-    /// the published artifact lands where `cass status` looks for it.
-    #[test]
-    fn semantic_tier_for_embedder_id_maps_known_ids() {
-        assert_eq!(
-            super::semantic_tier_for_embedder_id("minilm-384"),
-            Some(super::SemanticTierKind::Quality)
-        );
-        assert_eq!(
-            super::semantic_tier_for_embedder_id("fnv1a-384"),
-            Some(super::SemanticTierKind::Fast)
-        );
-        assert_eq!(super::semantic_tier_for_embedder_id("unknown"), None);
-    }
-
-    /// fork: Infinity 的 `bge-m3` 必须映射到 quality tier。不映射会让
-    /// `index --semantic --watch-once` 的**增量追加**路径以
-    /// "semantic watch-once cannot publish unknown embedder tier for bge-m3" 失败，
-    /// 只能退回 `models backfill` 的全量重建——每加一条会话就把整个语料重嵌一遍
-    /// （实测 176669 doc / ~2h，而追加只需 ~16s）。
-    #[test]
-    fn semantic_tier_for_embedder_id_maps_infinity_bge_m3_to_quality() {
-        assert_eq!(
-            super::semantic_tier_for_embedder_id("bge-m3"),
-            Some(super::SemanticTierKind::Quality),
-            "bge-m3 must resolve to the quality tier or the incremental append path bails"
-        );
-    }
-
-    /// fork: `bge-m3` 的 model_revision 必须与 lib.rs backfill 路径写进 manifest 的
-    /// `infinity-bge-m3` 一致；否则 watch-once 发布的 manifest 会带上 minilm 的 revision。
-    #[test]
-    fn semantic_model_revision_for_embedder_id_maps_bge_m3_to_infinity_revision() {
-        assert_eq!(
-            super::semantic_model_revision_for_embedder_id("bge-m3"),
-            "infinity-bge-m3"
-        );
-    }
-
-    /// Regression for issue #203: hash embedder must report a stable
-    /// "hash" model_revision so the manifest record matches what
-    /// `run_backfill_batch` writes for the same embedder.
-    #[test]
-    fn semantic_model_revision_for_embedder_id_known_ids() {
-        assert_eq!(
-            super::semantic_model_revision_for_embedder_id("fnv1a-384"),
-            "hash"
-        );
-        assert!(
-            !super::semantic_model_revision_for_embedder_id("minilm-384").is_empty(),
-            "minilm revision should resolve to ModelManifest::minilm_v2().revision"
-        );
-    }
+    // The four tests that used to live here
+    // (`semantic_tier_for_embedder_id_maps_known_ids`,
+    // `semantic_tier_for_embedder_id_maps_infinity_bge_m3_to_quality`,
+    // `semantic_model_revision_for_embedder_id_maps_bge_m3_to_infinity_revision`,
+    // `semantic_model_revision_for_embedder_id_known_ids`) pinned the
+    // local-model tier/revision routing table. That table is deleted with the
+    // model-API migration -- a semantic generation's tier/model/revision come
+    // from the API representation descriptor -- so the tests are removed with
+    // it rather than kept asserting a mapping no code performs. The API-path
+    // equivalent (descriptor-derived identity) is covered by
+    // `tests/api_primary_backfill.rs` and the model-API unit tests.
 
     /// Regression test for issue #201: `staged_*` progress fields must
     /// surface as JSON `null` when the lexical rebuild pipeline isn't
@@ -30222,6 +30139,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30310,6 +30228,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30367,6 +30286,7 @@ mod tests {
         let progress = std::sync::Arc::new(super::IndexingProgress::default());
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30428,6 +30348,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30494,6 +30415,7 @@ mod tests {
         let db_path = data_dir.join("db.sqlite");
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30566,6 +30488,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let db_path = data_dir.join("db.sqlite");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -30646,6 +30569,7 @@ mod tests {
 
         let result = run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -30724,6 +30648,7 @@ mod tests {
 
         run_index(
             super::IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 watch: false,
@@ -32251,6 +32176,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path)?;
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32335,6 +32261,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32380,6 +32307,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32443,6 +32371,7 @@ mod tests {
         ensure_fts_schema(&storage);
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32528,6 +32457,7 @@ mod tests {
         );
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -32581,6 +32511,7 @@ mod tests {
             ensure_fts_schema(&storage);
             let progress = Arc::new(IndexingProgress::default());
             let opts = IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: false,
                 force_rebuild: false,
@@ -32663,6 +32594,7 @@ mod tests {
         let storage = FrankenStorage::open(&db_path).unwrap();
         let progress = Arc::new(IndexingProgress::default());
         let opts = IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             force_rebuild: false,
@@ -33931,6 +33863,7 @@ mod tests {
         watch_once_paths: Option<Vec<std::path::PathBuf>>,
     ) -> IndexOptions {
         IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             force_rebuild: false,
@@ -34516,6 +34449,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34588,6 +34522,7 @@ mod tests {
         .unwrap();
 
         let opts = |watch_once_path: PathBuf| super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34644,6 +34579,7 @@ mod tests {
         std::fs::write(&session, initial).unwrap();
 
         let opts = |data_dir: &Path, session: &Path| super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34702,7 +34638,21 @@ mod tests {
         session: &Path,
         progress: Arc<IndexingProgress>,
     ) -> super::IndexOptions {
+        let config = data_dir.join("watch-models.toml");
+        std::fs::write(&config, r#"version=1
+default_embedding="watch-test"
+[profiles.watch-test]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="http://127.0.0.1:1/v1/embeddings"
+model="example/watch-test"
+model_revision="fixture-r1"
+normalization="l2"
+"#).unwrap();
+        let setup = crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(Some(&config), None, false).unwrap();
         super::IndexOptions {
+            model_api: Some(Arc::new(setup)),
             no_ingest: false,
             full: false,
             watch: false,
@@ -34711,7 +34661,7 @@ mod tests {
             db_path: data_dir.join("db.sqlite"),
             data_dir: data_dir.to_path_buf(),
             semantic: true,
-            embedder: "hash".to_string(),
+            embedder: "watch-test".to_string(),
             progress: Some(progress),
             watch_interval_secs: 30,
         }
@@ -34770,6 +34720,7 @@ mod tests {
         // populated (F1's fix covers this path) -- exactly why the next
         // step reverts it, rather than trusting that as the test's proof.
         let seed_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34831,6 +34782,7 @@ mod tests {
         // The real dispatch this bug lived in:
         // `should_try_readonly_canonical_force_rebuild`'s exact condition.
         let force_rebuild_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34937,6 +34889,7 @@ mod tests {
         // normal watch-once entry point (not a direct storage call) so the
         // `--full` run below starts from a real populated-DB state.
         let seed_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -34970,6 +34923,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let full_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             watch: false,
@@ -35047,6 +35001,7 @@ mod tests {
         let _workers_guard = set_env("CASS_TANTIVY_REBUILD_WORKERS", "1");
 
         let seed_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -35083,6 +35038,7 @@ mod tests {
         }
 
         let full_opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: true,
             watch: false,
@@ -35494,6 +35450,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -35581,6 +35538,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35665,6 +35623,7 @@ mod tests {
         let _small_gate_guard = set_env("CASS_WATCH_OOM_SMALL_CONVERSATION_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35732,6 +35691,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35856,6 +35816,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -35967,6 +35928,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36044,6 +36006,7 @@ mod tests {
         let _reserve_guard = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36125,6 +36088,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36212,6 +36176,7 @@ mod tests {
         let _reserve = set_env("CASS_WATCH_OOM_REAL_PRESSURE_RESERVE_BYTES", "0");
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "0");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36301,6 +36266,7 @@ mod tests {
 
         let _window = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "600");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36448,6 +36414,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36520,6 +36487,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -36612,6 +36580,7 @@ mod tests {
         let _active_guard = set_env("CASS_TEST_ACTIVE_SESSION_SOURCE_PATHS", &active_paths);
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -36695,6 +36664,7 @@ mod tests {
 
         let _window_guard = set_env("CASS_ACTIVE_SESSION_RECENT_WRITE_WINDOW_SECS", "3600");
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36820,6 +36790,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: true,
@@ -36933,6 +36904,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -36986,6 +36958,7 @@ mod tests {
         std::fs::write(&amp_file, "not valid json").unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37070,6 +37043,7 @@ mod tests {
 
         let progress = Arc::new(super::IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37138,6 +37112,7 @@ mod tests {
 
         let progress = Arc::new(IndexingProgress::default());
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37209,6 +37184,7 @@ mod tests {
         .unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -37329,6 +37305,7 @@ mod tests {
         save_watch_state(&data_dir, &persisted_state).unwrap();
 
         let opts = super::IndexOptions {
+            model_api: None,
             no_ingest: false,
             full: false,
             watch: false,
@@ -40407,7 +40384,6 @@ mod tests {
     /// = "requires a live Infinity service..."]` tests in tests/w3_5_n3_
     /// generation_reuse.rs hit the same constraint for the same reason).
     #[test]
-    #[cfg(feature = "infinity")]
     fn cleanup_failure_from_a_real_scan_failure_maps_into_stats_and_its_json() {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("agent_search.db");

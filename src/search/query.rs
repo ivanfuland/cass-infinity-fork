@@ -2180,6 +2180,7 @@ impl QueryCache {
 }
 
 struct SemanticSearchState {
+    api_binding: Option<crate::search::model_api::query_embedding::QueryGenerationBinding>,
     context_token: Arc<()>,
     embedder: Arc<dyn Embedder>,
     roles: Option<HashSet<u8>>,
@@ -2188,6 +2189,7 @@ struct SemanticSearchState {
 
 #[derive(Clone)]
 struct SemanticCandidateContext {
+    api_binding: Option<crate::search::model_api::query_embedding::QueryGenerationBinding>,
     roles: Option<HashSet<u8>>,
 }
 
@@ -3632,6 +3634,44 @@ impl SearchClient {
         embedder: Arc<dyn Embedder>,
         roles: Option<HashSet<u8>>,
     ) -> Result<()> {
+        self.set_bound_semantic_context(embedder, roles, None)
+    }
+
+    pub fn set_api_semantic_context(
+        &self,
+        client: Arc<crate::search::model_api::ApiClient>,
+        profile: crate::search::model_api::ValidatedProfile,
+        allow_fallback: bool,
+    ) -> Result<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>> {
+        let route=crate::search::model_api::embedding_route::EmbeddingRoute::load(client.config(),&profile,allow_fallback);
+        self.set_api_frozen_semantic_context(client, route)
+    }
+
+    pub(crate) fn set_api_frozen_semantic_context(
+        &self, client: Arc<crate::search::model_api::ApiClient>,
+        route: crate::search::model_api::embedding_route::EmbeddingRoute,
+    ) -> Result<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>> {
+        use crate::search::model_api::query_embedding::{ApiQueryEmbedder, QueryGenerationBinding};
+        let allow_fallback = route.allow_fallback;
+        let binding = {
+            let guard = self.sqlite_guard()?;
+            let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
+            conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+                QueryGenerationBinding::open_routed(tx, route)
+            })?.ok_or_else(|| anyhow::Error::new(crate::search::model_api::query_embedding::QueryGenerationUnavailable))?
+        };
+        let embedder = Arc::new(ApiQueryEmbedder::new(client, binding.clone(), allow_fallback)?);
+        self.set_bound_semantic_context(embedder.clone(),
+            Some(HashSet::from([ROLE_USER, crate::search::vector_index::ROLE_ASSISTANT])), Some(binding))?;
+        Ok(embedder)
+    }
+
+    fn set_bound_semantic_context(
+        &self,
+        embedder: Arc<dyn Embedder>,
+        roles: Option<HashSet<u8>>,
+        api_binding: Option<crate::search::model_api::query_embedding::QueryGenerationBinding>,
+    ) -> Result<()> {
         let capacity = NonZeroUsize::new(100).ok_or_else(|| anyhow!("invalid cache size"))?;
         let context_token = Arc::new(());
         let embedder_id = embedder.id().to_string();
@@ -3640,6 +3680,7 @@ impl SearchClient {
             .lock()
             .map_err(|_| anyhow!("semantic lock poisoned"))?;
         *state_guard = Some(SemanticSearchState {
+            api_binding,
             context_token,
             embedder,
             roles,
@@ -3669,7 +3710,7 @@ impl SearchClient {
 
     fn semantic_query_embedding(&self, canonical: &str) -> Result<SemanticQueryEmbedding> {
         loop {
-            let (embedder, context_token) = {
+            let (embedder, context_token, api_binding, cached) = {
                 let mut guard = self
                     .semantic
                     .lock()
@@ -3677,24 +3718,25 @@ impl SearchClient {
                 let state = guard.as_mut().ok_or_else(|| {
                     anyhow!("semantic search unavailable (no embedder or vector index)")
                 })?;
-                if let Some(hit) = state
-                    .query_cache
-                    .get_cached(state.embedder.as_ref(), canonical)
-                {
-                    return Ok(SemanticQueryEmbedding {
-                        context_token: Arc::clone(&state.context_token),
-                        vector: hit,
-                    });
-                }
-                (
-                    Arc::clone(&state.embedder),
-                    Arc::clone(&state.context_token),
-                )
+                let cached = state.query_cache.get_cached(state.embedder.as_ref(), canonical);
+                (Arc::clone(&state.embedder), Arc::clone(&state.context_token),
+                    state.api_binding.clone(), cached)
             };
+            if let Some(binding) = api_binding {
+                if let Some(context) = &self.regression { context.verify_input()?; }
+                let guard = self.sqlite_guard()?;
+                let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
+                conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+                    binding.verify_active(tx)
+                })?;
+            }
+            if let Some(vector) = cached {
+                return Ok(SemanticQueryEmbedding { context_token, vector });
+            }
 
             let embedding = embedder
                 .embed_sync(canonical)
-                .map_err(|e| anyhow!("embedding failed: {e}"))?;
+                .map_err(anyhow::Error::new)?;
 
             let mut guard = self
                 .semantic
@@ -4038,7 +4080,7 @@ impl SearchClient {
         strategy: VectorSearchMode,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
-            fetch_limit, database_path, strategy, None)
+            fetch_limit, database_path, strategy, None, None)
     }
 
     fn search_db_vector_domain_with_context(
@@ -4050,6 +4092,7 @@ impl SearchClient {
         database_path: Option<&Path>,
         strategy: VectorSearchMode,
         regression: Option<&super::regression_io::RegressionIoContext>,
+        api_binding: Option<&crate::search::model_api::query_embedding::QueryGenerationBinding>,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
         // R1-W3-B6/N1/B9 (inherited from the retired v4 path, still true
         // of this vec0 build): sqlite-vec's vec0 KNN implementation hard-
@@ -4089,6 +4132,10 @@ impl SearchClient {
                     ),
                 });
             };
+
+            if let Some(binding) = api_binding {
+                binding.verify(tx, generation_id)?;
+            }
 
             let row_count: i64 = tx.query_row_map(
                 "SELECT count(*) FROM message_chunks WHERE generation_id = ?1",
@@ -4504,6 +4551,21 @@ impl SearchClient {
         filters: &SearchFilters,
         request: SemanticCandidateSearchRequest,
     ) -> Result<(Vec<VectorSearchResult>, CandidateMeta)> {
+        if let Some(binding) = &context.api_binding {
+            if let Some(context) = &self.regression { context.verify_input()?; }
+            let mut guard = self.sqlite_guard()?;
+            let conn = guard.as_ref().ok_or_else(|| anyhow!("API search requires a database"))?;
+            let result = Self::search_db_vector_domain_with_context(
+                conn, embedding, filters, context.roles.as_ref(), request.fetch_limit,
+                self.sqlite_path.as_deref(), self.vector_search_mode,
+                self.regression.as_deref(), Some(binding),
+            );
+            if let Some(context) = &self.regression { context.verify_input()?; }
+            if result.as_ref().err().is_some_and(|e| e.to_string().contains("vector_database_changed")) {
+                *guard = None;
+            }
+            return result;
+        }
         self.search_vector_candidates(embedding, filters, context.roles.as_ref(), request.fetch_limit)
     }
 
@@ -4523,7 +4585,7 @@ impl SearchClient {
         if let Some(context) = &self.regression { context.verify_input()?; }
         let result = if let Some(context) = self.regression.as_deref() {
             Self::search_db_vector_domain_with_context(conn, embedding, filters, default_roles,
-                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode, Some(context))
+                fetch_limit, self.sqlite_path.as_deref(), self.vector_search_mode, Some(context), None)
         } else if self.vector_search_mode == VectorSearchMode::Exact {
             Self::search_db_vector_domain(conn, embedding, filters, default_roles, fetch_limit)
         } else {
@@ -4617,6 +4679,7 @@ impl SearchClient {
                     })?;
                     (
                         SemanticCandidateContext {
+                            api_binding: state.api_binding.clone(),
                             roles: state.roles.clone(),
                         },
                         Arc::clone(&state.context_token),
@@ -5098,6 +5161,11 @@ impl SearchClient {
     /// keep propagating as a hard error -- fail-open only covers the two
     /// conditions plan v5.1 names, not "any semantic failure whatsoever".
     fn is_semantic_fail_open_condition(err: &anyhow::Error) -> bool {
+        if let Some(failure) = err.chain().find_map(|cause| {
+            cause.downcast_ref::<crate::search::model_api::query_embedding::QueryApiFailure>()
+        }) {
+            return failure.allow_lexical;
+        }
         let msg = err.to_string();
         msg.contains("vector_domain_state=absent")
             || msg.contains("vector_domain_state=building")
@@ -7029,17 +7097,11 @@ pub(crate) mod tests {
     const ISOLATED_QUERY_CHILD: &str = "CASS_TEST_ISOLATED_QUERY_CHILD";
 
     fn isolated_query_child_output(name: &str) -> std::process::Output {
-        let previous_url = std::env::var_os("CASS_INFINITY_URL");
         let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
         command
             .args(["--exact", name, "--nocapture", "--format", "pretty", "--color", "never"])
             .env(ISOLATED_QUERY_CHILD, name);
-        if name == "search::query::tests::hybrid_fails_open_when_infinity_unreachable" {
-            command.env("CASS_INFINITY_URL", "http://127.0.0.1:1");
-        }
-        let output = command.output().expect("run isolated query test");
-        assert_eq!(std::env::var_os("CASS_INFINITY_URL"), previous_url, "child must preserve parent Infinity URL");
-        output
+        command.output().expect("run isolated query test")
     }
 
     fn isolated_query_child_passed(output: &std::process::Output, name: &str) -> bool {
@@ -7896,61 +7958,6 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    /// T9 part 2 (mission #93/#93b Step 1): `search_hybrid` must also fail
-    /// open when Infinity itself is unreachable -- a real `InfinityEmbedder`
-    /// pointed at a dead port, not a fixture double, so the actual
-    /// `http_embed` -> `"embeddings request failed:"` error text is what
-    /// `is_semantic_fail_open_condition` has to match.
-    #[test]
-    #[cfg(feature = "infinity")]
-    fn hybrid_fails_open_when_infinity_unreachable() -> Result<()> {
-        if !in_isolated_query_child("hybrid_fails_open_when_infinity_unreachable") {
-            return Ok(());
-        }
-        let conv = NormalizedConversation {
-            agent_slug: "codex".into(),
-            external_id: None,
-            title: Some("lexical only".into()),
-            workspace: None,
-            source_path: std::path::PathBuf::from("/tmp/lexical-only-unreachable.jsonl"),
-            started_at: Some(1_700_000_000_000),
-            ended_at: None,
-            metadata: serde_json::json!({}),
-            messages: vec![NormalizedMessage {
-                idx: 0,
-                role: "user".into(),
-                author: Some("me".into()),
-                created_at: Some(1_700_000_000_000),
-                content: "hello infinity world".into(),
-                extra: serde_json::json!({}),
-                snippets: Vec::new(),
-                invocations: Vec::new(),
-            }],
-        };
-        let (dir, db_path) = seed_conversations_for_search_client(&[conv])?;
-        let client = SearchClient::open(dir.path(), Some(&db_path))?.expect("index present");
-
-        // The parent binds the dead local port only in this child process.
-        // Keep the real constructor and unreachable HTTP fail-open path.
-        let embedder_result = crate::search::infinity::InfinityEmbedder::new();
-        let embedder = embedder_result.expect("constructing the embedder itself does not touch the network");
-        client.set_semantic_context(Arc::new(embedder), None)?;
-
-        let result = client.search_hybrid(
-            "hello",
-            "hello infinity world",
-            SearchFilters::default(),
-            5,
-            0,
-            0,
-            FieldMask::FULL,
-        )?;
-
-        assert!(result.semantic_degraded, "an unreachable Infinity must fail open, not error");
-        assert!(result.candidates.is_none());
-        assert!(!result.hits.is_empty(), "the lexical leg alone must still return the seeded message");
-        Ok(())
-    }
 
     /// T9 part 2 (mission #93/#93b Step 1, advisor 2026-09-04 addendum):
     /// `hydrate_semantic_hits_with_ids`'s `HYDRATE_ID_BATCH_ROWS`-sized

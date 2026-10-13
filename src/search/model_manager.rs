@@ -1,36 +1,46 @@
-//! Semantic model management (local-only detection).
+//! Semantic readiness detection for the API-only search build.
 //!
-//! This module wires the FastEmbed MiniLM embedder into semantic search by:
-//! - validating the local model files
-//! - loading the vector index
-//! - building filter maps from the SQLite database
-//! - detecting model version mismatches
+//! This module reports whether semantic search can run by reading state that
+//! does not depend on a local model:
+//! - the DB vector domain (`embedding_generations`): active generation, audit
+//!   status, dimension, chunk counts
+//! - the vector-index path layout
+//! - the retired hash-fallback preference, which is only reachable when the
+//!   retired `CASS_SEMANTIC_EMBEDDER` variable is still set
 //!
-//! It does **not** download models. Missing files are surfaced as availability
-//! states so the UI can guide the user. Downloads are handled by [`model_download`].
+//! It does **not** download, install or load a local model: embedding is served
+//! exclusively by the configured external model API (`--api-config`), and the
+//! effective model/revision/dimension come from the API representation
+//! descriptor. The former FastEmbed/MiniLM wiring was retired with the model-API
+//! migration, so no local weight file is validated here any more.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::search::embedder::Embedder;
-use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
-use crate::search::model_download::{
-    ModelAcquisitionPolicy, ModelCacheState, ModelManifest, classify_model_cache,
-    classify_model_cache_metadata,
-};
-use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+use crate::search::model_identity;
 use crate::search::vector_index::{ROLE_ASSISTANT, ROLE_USER, vector_index_path};
 use crate::storage::api::params;
 use crate::storage::sqlite::FrankenStorage;
 
 /// Unified TUI state machine for semantic search availability.
 ///
-/// This enum tracks the full lifecycle of semantic search from the user's perspective:
-/// - Model installation flow (NotInstalled → NeedsConsent → Downloading → Verifying → Ready)
+/// On the API-only build nothing installs, downloads or loads a local weight,
+/// so the installation variants (`NotInstalled`, `NeedsConsent`,
+/// `Downloading`, `Verifying`) are retained legacy representations only: they
+/// keep existing state-machine consumers compiling and can still be reported,
+/// but no production path drives them as an executable download flow.
+/// `HashFallback` is different -- [`probe_hash_semantic_availability`] still
+/// returns it for a hash tier -- but it likewise never provides the API-only
+/// semantic inference path; it names the legacy hash representation. The
+/// states the API-only build produces for real semantic search are the index
+/// states and the diagnostic/error states.
+///
 /// - Index building flow (Ready → IndexBuilding → Ready)
-/// - User preferences (HashFallback, Disabled)
+/// - Legacy installation states (Downloading, Verifying, NotInstalled, NeedsConsent)
+/// - Legacy hash representation (HashFallback)
 /// - Error states (LoadFailed, ModelMissing, etc.)
 #[derive(Debug, Clone)]
 pub enum SemanticAvailability {
@@ -41,14 +51,15 @@ pub enum SemanticAvailability {
     // TUI-centric states for user flow
     // =========================================================================
     /// Model not installed - semantic not available.
-    /// TUI should show option to download or use hash fallback.
+    /// Legacy state: no production path installs a local model any more.
     NotInstalled,
 
     /// User needs to consent before downloading model.
-    /// TUI should show consent dialog.
+    /// Legacy state: no production path starts a local model download any more.
     NeedsConsent,
 
     /// Model download in progress.
+    /// Legacy state retained for existing consumers; never produced by the API-only build.
     Downloading {
         /// Progress percentage (0-100).
         progress_pct: u8,
@@ -59,6 +70,7 @@ pub enum SemanticAvailability {
     },
 
     /// Verifying downloaded model (SHA256 check).
+    /// Legacy state retained for existing consumers; never produced by the API-only build.
     Verifying,
 
     /// Index is being built or rebuilt.
@@ -72,7 +84,10 @@ pub enum SemanticAvailability {
         total_items: u64,
     },
 
-    /// User opted for hash-based fallback (no ML model).
+    /// Hash-based fallback (no ML model).
+    /// Legacy representation for a hash tier: still returned by
+    /// [`probe_hash_semantic_availability`], but it never provides the
+    /// API-only semantic inference path.
     HashFallback,
 
     /// Semantic search disabled by policy or user.
@@ -120,17 +135,18 @@ impl SemanticAvailability {
         matches!(self, SemanticAvailability::IndexBuilding { .. })
     }
 
-    /// Check if a download is in progress.
+    /// Check if a download is in progress (legacy state; see the enum docs).
     pub fn is_downloading(&self) -> bool {
         matches!(self, SemanticAvailability::Downloading { .. })
     }
 
-    /// Check if user consent is needed.
+    /// Check if user consent is needed (legacy state; see the enum docs).
     pub fn needs_consent(&self) -> bool {
         matches!(self, SemanticAvailability::NeedsConsent)
     }
 
-    /// Check if hash fallback is active.
+    /// Check if the legacy hash representation is active (still returned for a
+    /// hash tier; see the enum docs).
     pub fn is_hash_fallback(&self) -> bool {
         matches!(self, SemanticAvailability::HashFallback)
     }
@@ -276,35 +292,16 @@ pub struct SemanticSetup {
     pub context: Option<SemanticContext>,
 }
 
-/// Load semantic context with optional version mismatch checking.
-///
-/// If `check_for_updates` is true, this function will check if the installed
-/// model version matches the manifest and return `UpdateAvailable` if they differ.
-pub fn load_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_semantic_context_for_embedder(data_dir, db_path, active_policy_embedder_name())
-}
-
-pub fn load_semantic_context_for_embedder(
-    data_dir: &Path,
-    db_path: &Path,
-    embedder_name: &str,
-) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, true, embedder_name)
-}
-
-/// Probe semantic availability without loading the embedder, vector index, or
+/// Probe semantic availability without loading an embedder, vector index, or
 /// DB-backed filter maps. Status/health surfaces use this to report readiness
-/// cheaply; actual semantic search still calls `load_semantic_context`.
-pub(crate) fn probe_semantic_availability(data_dir: &Path, db_path: &Path) -> SemanticAvailability {
-    probe_semantic_availability_for_embedder(data_dir, db_path, active_policy_embedder_name())
-}
-
-/// `true` for the Infinity-served embedder's own names (`bge-m3`/`infinity`
-/// -- the same pair `lib.rs`'s CLI dispatch matches on to route to
-/// [`load_infinity_semantic_context`]). Every other name is a FastEmbed
-/// model.
-fn is_infinity_embedder_name(embedder_name: &str) -> bool {
-    matches!(embedder_name, "bge-m3" | "infinity")
+/// cheaply.
+///
+/// In-process semantic tiers (ONNX/fastembed and the local Infinity HTTP
+/// engine) are retired: embedding is served exclusively by the configured
+/// external model API, so readiness is exactly the DB-vector-domain state read
+/// from `embedding_generations`.
+pub(crate) fn probe_semantic_availability(_data_dir: &Path, db_path: &Path) -> SemanticAvailability {
+    probe_db_vector_domain_availability(db_path)
 }
 
 /// DB-vector-domain-aware availability probe (W3-4 Step2-1): reads
@@ -521,46 +518,6 @@ pub(crate) fn probe_db_vector_domain_status(db_path: &Path) -> Option<DbVectorDo
     })
 }
 
-pub(crate) fn probe_semantic_availability_for_embedder(
-    data_dir: &Path,
-    db_path: &Path,
-    embedder_name: &str,
-) -> SemanticAvailability {
-    if is_infinity_embedder_name(embedder_name) {
-        return probe_db_vector_domain_availability(db_path);
-    }
-    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
-    let Some(config) = FastEmbedder::config_for(canonical_name) else {
-        return SemanticAvailability::LoadFailed {
-            context: format!("unknown semantic embedder: {embedder_name}"),
-        };
-    };
-    let Some(model_dir) = FastEmbedder::runtime_model_dir_for(data_dir, canonical_name) else {
-        return SemanticAvailability::LoadFailed {
-            context: format!("no model directory mapping for semantic embedder: {embedder_name}"),
-        };
-    };
-    let manifest =
-        ModelManifest::for_embedder(canonical_name).unwrap_or_else(ModelManifest::minilm_v2);
-    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
-    let cache_report = classify_model_cache_metadata(&model_dir, &manifest, &acquisition_policy);
-
-    if let Some(availability) =
-        semantic_availability_from_cache_state(&model_dir, &cache_report.state, true)
-    {
-        return availability;
-    }
-
-    let index_path = vector_index_path(data_dir, &config.embedder_id);
-    if !index_path.is_file() {
-        return SemanticAvailability::IndexMissing { index_path };
-    }
-
-    SemanticAvailability::Ready {
-        embedder_id: config.embedder_id,
-    }
-}
 
 /// Probe hash semantic availability without opening the DB or vector index.
 pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvailability {
@@ -573,294 +530,10 @@ pub(crate) fn probe_hash_semantic_availability(data_dir: &Path) -> SemanticAvail
     }
 }
 
-/// Load hash-based semantic context.
-///
-/// W3-5: the legacy fsvi vector-index loading this used to open (monolithic
-/// + sharded) has been retired as a builder-without-reader (search-side
-/// consumption of `.fsvi` files was already cut in 3f7aa054), and there is
-/// no DB-vector-domain writer for the hash embedder either -- `models
-/// backfill --embedder hash` was itself retired in 4064e8fc. There is no
-/// substrate left to report `Ready` against, so this now always reports the
-/// index as missing rather than pretend a stale on-disk `.fsvi` file (which
-/// this build can no longer open) is usable.
-pub fn load_hash_semantic_context(data_dir: &Path, _db_path: &Path) -> SemanticSetup {
-    let embedder = HashEmbedder::default();
-    let index_path = vector_index_path(data_dir, embedder.id());
-    SemanticSetup {
-        availability: SemanticAvailability::IndexMissing { index_path },
-        context: None,
-    }
-}
 
-/// Load Infinity-backed semantic context (M4-pre spike).
-///
-/// Uses the HTTP `InfinityEmbedder` (bge-m3, 1024-dim) — no local model
-/// files / ONNX / cache-state machinery. The query is embedded via the
-/// daemon path (Infinity) at search time; this in-proc embedder supplies
-/// the matching id/dimension.
-///
-/// W3-5: DB-vector-domain (`embedding_generations`/`message_chunks`) is
-/// the sole substrate now -- the legacy fsvi-file path this used to fall
-/// back to (behind `CASS_SEMANTIC_USE_FSVI`) is retired along with the
-/// escape hatch itself, for the same builder-without-reader reason as
-/// [`load_hash_semantic_context`].
-#[cfg(feature = "infinity")]
-pub fn load_infinity_semantic_context(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    let _ = data_dir;
-    load_infinity_semantic_context_with_probe(
-        crate::search::infinity::InfinityEmbedder::new(),
-        || probe_db_vector_domain_availability(db_path),
-    )
-}
 
-#[cfg(feature = "infinity")]
-fn load_infinity_semantic_context_with_probe(
-    embedder: crate::search::embedder::EmbedderResult<crate::search::infinity::InfinityEmbedder>,
-    probe: impl FnOnce() -> SemanticAvailability,
-) -> SemanticSetup {
-    let embedder = match embedder {
-        Ok(e) => e,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("infinity embedder: {err}"),
-                },
-                context: None,
-            };
-        }
-    };
 
-    match probe() {
-        SemanticAvailability::Ready { embedder_id } => {
-            let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
-            SemanticSetup {
-                availability: SemanticAvailability::Ready { embedder_id },
-                context: Some(SemanticContext {
-                    embedder: Arc::new(embedder) as Arc<dyn Embedder>,
-                    roles,
-                }),
-            }
-        }
-        other => SemanticSetup {
-            availability: other,
-            context: None,
-        },
-    }
-}
 
-/// Build the existing HTTP embedder while all generation reads use the lease.
-/// Construction sends no request. A model/dimension mismatch fails before a
-/// private query can be embedded.
-#[cfg(feature = "infinity")]
-pub(crate) fn load_infinity_semantic_context_for_regression(
-    context: &crate::search::regression_io::RegressionIoContext,
-    config: &crate::search::infinity::InfinityConfig,
-) -> anyhow::Result<SemanticSetup> {
-    anyhow::ensure!(
-        config.embed_model == "BAAI/bge-m3",
-        "REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH"
-    );
-    context.verify_input()?;
-    let setup = {
-        let connection = context.connection()?;
-        let setup = load_infinity_semantic_context_with_probe(
-            crate::search::infinity::InfinityEmbedder::from_config(config.clone()),
-            || probe_db_vector_domain_availability_with_connection(&connection, context.database()),
-        );
-        if let Some(semantic) = setup.context.as_ref() {
-            let (id, dimension): (String, i64) = connection.query_row_map(
-                "SELECT embedder_id,dim FROM embedding_generations WHERE is_active=1",
-                &[],
-                |r| Ok((r.get_typed(0)?, r.get_typed(1)?)),
-            )?;
-            anyhow::ensure!(
-                id == semantic.embedder.model_name()
-                    && dimension == semantic.embedder.dimension() as i64,
-                "REGRESSION_EMBEDDER_GENERATION_MISMATCH"
-            );
-        }
-        setup
-    };
-    context.verify_input()?;
-    Ok(setup)
-}
-
-/// Load semantic context without version checking.
-///
-/// Use this when you've already acknowledged an update and want to load
-/// the model anyway.
-pub fn load_semantic_context_no_version_check(data_dir: &Path, db_path: &Path) -> SemanticSetup {
-    load_semantic_context_inner(data_dir, db_path, false, active_policy_embedder_name())
-}
-
-fn load_semantic_context_inner(
-    data_dir: &Path,
-    db_path: &Path,
-    check_for_updates: bool,
-    embedder_name: &str,
-) -> SemanticSetup {
-    let canonical_name = FastEmbedder::canonical_name(embedder_name).unwrap_or("minilm");
-    let Some(config) = FastEmbedder::config_for(canonical_name) else {
-        return SemanticSetup {
-            availability: SemanticAvailability::LoadFailed {
-                context: format!("unknown semantic embedder: {embedder_name}"),
-            },
-            context: None,
-        };
-    };
-    let Some(model_dir) = FastEmbedder::runtime_model_dir_for(data_dir, canonical_name) else {
-        return SemanticSetup {
-            availability: SemanticAvailability::LoadFailed {
-                context: format!(
-                    "no model directory mapping for semantic embedder: {embedder_name}"
-                ),
-            },
-            context: None,
-        };
-    };
-    let manifest =
-        ModelManifest::for_embedder(canonical_name).unwrap_or_else(ModelManifest::minilm_v2);
-    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&semantic_policy);
-    let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
-
-    if let Some(availability) =
-        semantic_availability_from_cache_state(&model_dir, &cache_report.state, check_for_updates)
-    {
-        return SemanticSetup {
-            availability,
-            context: None,
-        };
-    }
-
-    // W3-5: the legacy fsvi vector-index loading this used to open
-    // (monolithic + sharded) has been retired as a builder-without-reader,
-    // and DB-vector-domain has no writer for non-infinity FastEmbed models
-    // either -- `cass index --semantic` was cut over to infinity-only in
-    // 4745367f. Model cache validation above still gives a real diagnostic
-    // (not installed / downloading / verifying / update available); once
-    // the model itself is acquired, there is simply no vector substrate
-    // left for it to search against.
-    let index_path = vector_index_path(data_dir, &config.embedder_id);
-    let _ = db_path;
-    SemanticSetup {
-        availability: SemanticAvailability::IndexMissing { index_path },
-        context: None,
-    }
-}
-
-/// R1-W3-N2: pulled out of [`active_policy_embedder_name`] so it's
-/// directly unit-testable without going through `SemanticPolicy::resolve`
-/// (which reads process env and would make a test of this exact
-/// canonicalization hermetically unsafe under parallel test execution).
-///
-/// This used to be `FastEmbedder::canonical_name(name).unwrap_or("minilm")`
-/// unconditionally, which only recognizes FastEmbed model aliases -- an
-/// infinity-routing name (`"infinity"`/`"bge-m3"`, `is_infinity_embedder_
-/// name` above) always fell through to `None` there and got silently
-/// mangled back to `"minilm"` by the `.unwrap_or`. That made it impossible
-/// for `DEFAULT_QUALITY_TIER_EMBEDDER = "infinity"` (under the `infinity`
-/// feature) to ever actually reach `load_semantic_context`/`probe_
-/// semantic_availability`'s `is_infinity_embedder_name` routing check --
-/// the plumbing to route to the DB vector domain by default already
-/// existed, this was the one place quietly discarding the name before it
-/// got there.
-fn canonicalize_active_embedder_name(quality_tier_embedder: &str) -> &'static str {
-    if is_infinity_embedder_name(quality_tier_embedder) {
-        return "infinity";
-    }
-    FastEmbedder::canonical_name(quality_tier_embedder).unwrap_or("minilm")
-}
-
-fn active_policy_embedder_name() -> &'static str {
-    let semantic_policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    canonicalize_active_embedder_name(&semantic_policy.quality_tier_embedder)
-}
-
-fn semantic_availability_from_cache_state(
-    model_dir: &Path,
-    state: &ModelCacheState,
-    check_for_updates: bool,
-) -> Option<SemanticAvailability> {
-    match state {
-        ModelCacheState::Acquired { .. }
-        | ModelCacheState::PreseededLocal { .. }
-        | ModelCacheState::MirrorSourced { .. } => None,
-        ModelCacheState::IncompatibleVersion {
-            current_revision,
-            expected_revision,
-        } if check_for_updates => Some(SemanticAvailability::UpdateAvailable {
-            embedder_id: FastEmbedder::embedder_id_static().to_string(),
-            current_revision: current_revision.clone(),
-            latest_revision: expected_revision.clone(),
-        }),
-        ModelCacheState::IncompatibleVersion { .. } => None,
-        ModelCacheState::NotAcquired {
-            missing_files,
-            needs_consent,
-        } => {
-            if *needs_consent {
-                Some(SemanticAvailability::NeedsConsent)
-            } else {
-                Some(SemanticAvailability::ModelMissing {
-                    model_dir: model_dir.to_path_buf(),
-                    missing_files: missing_files.clone(),
-                })
-            }
-        }
-        ModelCacheState::Acquiring {
-            bytes_present,
-            total_bytes,
-            ..
-        } => {
-            let progress_pct = if *total_bytes == 0 {
-                0
-            } else {
-                ((*bytes_present as f64 / *total_bytes as f64) * 100.0).min(100.0) as u8
-            };
-            Some(SemanticAvailability::Downloading {
-                progress_pct,
-                bytes_downloaded: *bytes_present,
-                total_bytes: *total_bytes,
-            })
-        }
-        ModelCacheState::ChecksumMismatch {
-            file,
-            expected,
-            actual,
-        } => Some(SemanticAvailability::LoadFailed {
-            context: format!(
-                "model checksum mismatch for {file}: expected {expected}, got {actual}"
-            ),
-        }),
-        ModelCacheState::DisabledByPolicy { reason } => Some(SemanticAvailability::Disabled {
-            reason: reason.clone(),
-        }),
-        ModelCacheState::BudgetBlocked {
-            required_bytes,
-            max_bytes,
-        } => Some(SemanticAvailability::Disabled {
-            reason: format!(
-                "semantic model requires {required_bytes} bytes but policy allows {max_bytes}"
-            ),
-        }),
-        ModelCacheState::QuarantinedCorrupt {
-            marker_path,
-            reason,
-        } => Some(SemanticAvailability::LoadFailed {
-            context: format!(
-                "model cache quarantined at {}: {reason}",
-                marker_path.display()
-            ),
-        }),
-        ModelCacheState::OfflineBlocked { missing_files } => Some(SemanticAvailability::Disabled {
-            reason: format!(
-                "offline and semantic model is not acquired: missing {}",
-                missing_files.join(", ")
-            ),
-        }),
-    }
-}
 
 
 /// Delete the vector index to force a rebuild.
@@ -874,7 +547,7 @@ fn semantic_availability_from_cache_state(
 /// `Ok(false)` if the index didn't exist.
 /// `Err(_)` if deletion failed.
 pub fn delete_vector_index_for_rebuild(data_dir: &Path) -> std::io::Result<bool> {
-    let index_path = vector_index_path(data_dir, FastEmbedder::embedder_id_static());
+    let index_path = vector_index_path(data_dir, model_identity::embedder_id_static());
 
     if index_path.is_file() {
         std::fs::remove_file(&index_path)?;
@@ -884,14 +557,12 @@ pub fn delete_vector_index_for_rebuild(data_dir: &Path) -> std::io::Result<bool>
     }
 }
 
-/// Get the model directory path for the default MiniLM model.
+/// Get the model directory path for the retired default MiniLM model.
+///
+/// Retained only as a path helper for legacy read surfaces; no local weight is
+/// ever loaded from here on the API-only path.
 pub fn default_model_dir(data_dir: &Path) -> PathBuf {
-    FastEmbedder::default_model_dir(data_dir)
-}
-
-/// Get the model manifest for the default MiniLM model.
-pub fn default_model_manifest() -> ModelManifest {
-    ModelManifest::minilm_v2()
+    model_identity::default_model_dir(data_dir)
 }
 
 #[cfg(test)]
@@ -900,27 +571,6 @@ mod tests {
     use tempfile::tempdir;
     use crate::storage::api::{TxMode, params};
     use crate::storage::schema;
-
-    /// R1-W3-N2: `canonicalize_active_embedder_name` must preserve the two
-    /// infinity-routing names, not push them through `FastEmbedder::
-    /// canonical_name` (which knows nothing about them and always mangled
-    /// them to `"minilm"` pre-fix, silently defeating `DEFAULT_QUALITY_
-    /// TIER_EMBEDDER = "infinity"` under the `infinity` feature).
-    #[test]
-    fn canonicalize_active_embedder_name_preserves_infinity_routing_names() {
-        assert_eq!(canonicalize_active_embedder_name("infinity"), "infinity");
-        assert_eq!(canonicalize_active_embedder_name("bge-m3"), "infinity");
-    }
-
-    /// Every other name must still canonicalize through FastEmbed as
-    /// before -- the fix must not widen what counts as an infinity name.
-    #[test]
-    fn canonicalize_active_embedder_name_still_canonicalizes_fastembed_aliases() {
-        assert_eq!(canonicalize_active_embedder_name("fastembed"), "minilm");
-        assert_eq!(canonicalize_active_embedder_name("minilm"), "minilm");
-        assert_eq!(canonicalize_active_embedder_name("snowflake-arctic-s-384"), "snowflake-arctic-s");
-        assert_eq!(canonicalize_active_embedder_name("totally-unknown-model"), "minilm");
-    }
 
     type AvailabilityTuiCase = (
         SemanticAvailability,
@@ -1075,10 +725,10 @@ mod tests {
     }
 
     #[test]
-    fn probe_semantic_availability_for_embedder_reports_absent_for_bge_m3_on_an_empty_library() {
+    fn probe_semantic_availability_reports_absent_for_an_empty_library() {
         let dir = tempdir().unwrap();
         let db_path = empty_db(dir.path());
-        let availability = probe_semantic_availability_for_embedder(dir.path(), &db_path, "bge-m3");
+        let availability = probe_semantic_availability(dir.path(), &db_path);
         assert!(
             matches!(availability, SemanticAvailability::IndexMissing { .. }),
             "expected IndexMissing (absent), got {availability:?}"
@@ -1118,10 +768,10 @@ mod tests {
     }
 
     #[test]
-    fn probe_semantic_availability_for_embedder_reports_building_for_bge_m3_pre_audit() {
+    fn probe_semantic_availability_reports_building_for_an_active_pre_audit_generation() {
         let dir = tempdir().unwrap();
         let db_path = db_with_active_pending_generation(dir.path());
-        let availability = probe_semantic_availability_for_embedder(dir.path(), &db_path, "bge-m3");
+        let availability = probe_semantic_availability(dir.path(), &db_path);
         assert!(
             matches!(availability, SemanticAvailability::IndexBuilding { .. }),
             "expected IndexBuilding, got {availability:?}"
@@ -1246,128 +896,5 @@ mod tests {
         assert!(!status.any_generation);
     }
 
-    #[cfg(feature = "infinity")]
-    #[test]
-    fn load_infinity_semantic_context_reports_building_structured_state_pre_audit() {
-        let dir = tempdir().unwrap();
-        let db_path = db_with_active_pending_generation(dir.path());
-        let setup = load_infinity_semantic_context(dir.path(), &db_path);
-        assert!(setup.context.is_none(), "a not-yet-certified generation must never hand back a context");
-        assert!(
-            matches!(setup.availability, SemanticAvailability::IndexBuilding { .. }),
-            "expected IndexBuilding, got {:?}",
-            setup.availability
-        );
-    }
-
-    #[cfg(feature = "infinity")]
-    #[test]
-    fn load_infinity_semantic_context_reports_absent_structured_error_for_an_empty_library() {
-        let dir = tempdir().unwrap();
-        let db_path = empty_db(dir.path());
-        let setup = load_infinity_semantic_context(dir.path(), &db_path);
-        assert!(setup.context.is_none(), "an absent domain must never hand back a context");
-        assert!(
-            matches!(setup.availability, SemanticAvailability::IndexMissing { .. }),
-            "expected IndexMissing (absent), got {:?}",
-            setup.availability
-        );
-    }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "infinity"))]
-mod regression_semantic_loader_tests {
-    use super::*;
-    use crate::search::{regression_binding, regression_io::RegressionIoContext};
-
-    #[test]
-    fn regression_semantic_loader_rejects_mismatched_generation_without_requests() {
-        let (_root, database, run_root, _) = regression_binding::tests::searchable_fixture();
-        let context = RegressionIoContext::open(&database, &run_root).unwrap();
-        assert!(
-            load_infinity_semantic_context_for_regression(
-                &context,
-                &crate::search::infinity::InfinityConfig::from_env_with(|_| None)
-            )
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("REGRESSION_EMBEDDER_GENERATION_MISMATCH")
-        );
-        assert!(std::fs::read_dir(run_root).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn regression_semantic_loader_rejects_alias_generation_and_same_dimension_other_model() {
-        let (_root, database, run_root, _) =
-            regression_binding::tests::searchable_fixture_with_embedding(7, "bge-m3", 1024);
-        let context = RegressionIoContext::open(&database, &run_root).unwrap();
-        let mut config = crate::search::infinity::InfinityConfig::from_env_with(|_| None);
-        assert!(
-            load_infinity_semantic_context_for_regression(&context, &config)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("REGRESSION_EMBEDDER_GENERATION_MISMATCH")
-        );
-        config.embed_model = "synthetic-other-model-1024".into();
-        assert!(
-            load_infinity_semantic_context_for_regression(&context, &config)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH")
-        );
-        assert!(std::fs::read_dir(run_root).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn regression_semantic_loader_readonly_child() -> anyhow::Result<()> {
-        let Some(database) = std::env::var_os("CASS_REGRESSION_LOADER_DATABASE") else {
-            return Ok(());
-        };
-        let run_root = std::env::var_os("CASS_REGRESSION_LOADER_RUN").unwrap();
-        let context = RegressionIoContext::open(Path::new(&database), Path::new(&run_root))?;
-        context.admit_index_run()?;
-        let setup = load_infinity_semantic_context_for_regression(
-            &context,
-            &crate::search::infinity::InfinityConfig::from_env(),
-        )?;
-        let semantic = setup.context.unwrap();
-        assert_eq!(semantic.embedder.id(), "bge-m3");
-        assert_eq!(semantic.embedder.dimension(), 1024);
-        assert_eq!(
-            semantic.roles,
-            Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]))
-        );
-        assert!(std::fs::read_dir(run_root)?.next().is_none());
-        println!("READONLY_SEMANTIC_LOADER_NO_REQUESTS");
-        Ok(())
-    }
-
-    #[test]
-    fn regression_semantic_loader_uses_existing_connection_on_os_readonly_input() {
-        let (_root, database, run_root, _) =
-            regression_binding::tests::searchable_fixture_with_embedding(7, "BAAI/bge-m3", 1024);
-        let before = std::fs::read(&database).unwrap();
-        let output = std::process::Command::new("/usr/bin/bwrap")
-            .args(["--ro-bind", "/", "/", "--bind"]).arg(&run_root).arg(&run_root)
-            .args(["--unshare-net", "--proc", "/proc", "--dev", "/dev"])
-            .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "search::model_manager::regression_semantic_loader_tests::regression_semantic_loader_readonly_child", "--nocapture"])
-            .env("CASS_REGRESSION_LOADER_DATABASE", &database).env("CASS_REGRESSION_LOADER_RUN", &run_root)
-            .output().unwrap();
-        assert!(
-            output.status.success(),
-            "{} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .contains("READONLY_SEMANTIC_LOADER_NO_REQUESTS")
-        );
-        assert_eq!(before, std::fs::read(database).unwrap());
-        assert!(std::fs::read_dir(run_root).unwrap().next().is_none());
-    }
-}

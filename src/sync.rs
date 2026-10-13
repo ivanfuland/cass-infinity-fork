@@ -26,7 +26,7 @@
 //!   holes without touching the corpus, so a corrupt `sources.toml` must not
 //!   be able to fail it — and it never reaches the mirror stage either.
 //! - **Preconditions are explicit and typed.** Old schema, a config that
-//!   does not load, an unreachable Infinity, and a contended
+//!   does not load, an unreachable embedding API, and a contended
 //!   `index-run.lock` are each identified by construction — the lock by
 //!   `IndexRunLockBusy`'s type — instead of by pattern-matching an `anyhow`
 //!   string after the fact.
@@ -60,6 +60,7 @@ use crate::sources::config::{SourceDefinition, SourcesConfig};
 use crate::sources::sync::{SyncEngine, SyncReport as TransferReport, mirror_path_under};
 use crate::storage::api::Conn;
 use crate::storage::schema::{CURRENT_SCHEMA_VERSION, read_user_version};
+use crate::storage::sqlite::FrankenStorage;
 
 /// Wire schema tag for the `cass sync` report object.
 pub const SYNC_SCHEMA: &str = "cass.sync.v1";
@@ -71,7 +72,7 @@ pub const EXIT_READY: i32 = 0;
 /// identify further.
 pub const EXIT_INTERNAL: i32 = 1;
 /// A clearly identified precondition is not satisfied (old schema, invalid
-/// config, unreachable Infinity probe). Nothing was indexed.
+/// config, unreachable embedding API probe). Nothing was indexed.
 pub const EXIT_PRECONDITION: i32 = 2;
 /// Partial completion: lexical is usable but semantic is not activated, or a
 /// configured mirror failed.
@@ -135,6 +136,12 @@ pub struct SyncReport {
     pub stages: Vec<SyncStage>,
     pub mirror: MirrorSection,
     pub index: IndexSection,
+    /// The semantic preflight's own request evidence — the one generic synthetic
+    /// probe this round sends before any side effect. Always present; `null`
+    /// until the round actually reaches model-configuration loading, and
+    /// `outcome: "ok"` stays even when a later stage fails, because it states a
+    /// preflight-stage fact and no more.
+    pub semantic_preflight: Option<SyncSemanticPreflight>,
     /// `IndexingStats::semantic_activated` of the one index run, or `null`
     /// when this run never got as far as indexing.
     pub semantic_activated: Option<bool>,
@@ -153,6 +160,44 @@ pub struct SyncError {
     /// Kebab-case kind, from the same vocabulary as the CLI error envelope.
     pub kind: &'static str,
     pub message: String,
+}
+
+/// The semantic preflight's own request evidence.
+///
+/// The probe is a real request the round makes before any side effect, and its
+/// evidence has to survive even when the round then refuses and never reaches
+/// the indexer — otherwise "probing is counted separately from document
+/// batches" (spec §5.2) has no place to land.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncSemanticPreflight {
+    /// The selected **primary** embedding profile's ID, or `null` when the round
+    /// never got as far as loading a configuration. This names the profile the
+    /// route was built from, not the producer that answered: the actual producer
+    /// of each request (primary or fallback) is only in the per-call evidence
+    /// below.
+    pub profile: Option<String>,
+    /// `"ok"` when the probe answered, `"failed"` when the preflight refused.
+    pub outcome: &'static str,
+    /// The call's request evidence, in the same shape `index.stats.model_api`
+    /// already carries: its probe/document/audit calls with the HTTP status and
+    /// usage actually observed (a field the service did not report stays
+    /// `null`). `null` when no call was constructed. A refused probe that never
+    /// left the process keeps an empty `probe_calls`; nothing is invented.
+    pub model_api: Option<serde_json::Value>,
+    /// The refusal, when `outcome` is `"failed"`.
+    pub error: Option<SyncError>,
+}
+
+impl SyncSemanticPreflight {
+    /// A refusal reached before any embedding call existed.
+    fn before_call(profile: Option<String>, error: SyncError) -> Self {
+        Self {
+            profile,
+            outcome: "failed",
+            model_api: None,
+            error: Some(error),
+        }
+    }
 }
 
 /// One of the round's four stages.
@@ -237,9 +282,10 @@ pub fn run_sync(
     no_ingest: bool,
     no_mirror: bool,
     structured: bool,
+    api_config: Option<PathBuf>,
 ) -> Result<(), CliError> {
     let data_dir = data_dir_override.unwrap_or_else(crate::default_data_dir);
-    let mut report = execute(db_override, data_dir.clone(), no_ingest, no_mirror);
+    let mut report = execute(db_override, data_dir.clone(), no_ingest, no_mirror, api_config);
 
     // The fourth stage, and what its window can honestly be.
     //
@@ -320,6 +366,7 @@ fn execute(
     data_dir: PathBuf,
     no_ingest: bool,
     no_mirror: bool,
+    api_config: Option<PathBuf>,
 ) -> SyncReport {
     let started = Utc::now_stamp();
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
@@ -343,6 +390,7 @@ fn execute(
             started: false,
             stats: None,
         },
+        semantic_preflight: None,
         semantic_activated: None,
         partial_reasons: Vec::new(),
         complete: false,
@@ -352,7 +400,7 @@ fn execute(
 
     // ---- preflight (read-only; no index has started yet) ----------------
     //
-    // Order: config, schema, Infinity. All three are "the run could not
+    // Order: config, archive, embedding API. All three are "the run could not
     // meaningfully start" checks, so the report can say `index.started =
     // false` truthfully for each of them.
     //
@@ -377,22 +425,37 @@ fn execute(
             }
         }
     };
-    if let Some(err) = preflight_schema(&db_path) {
-        return finish(
-            report,
-            EXIT_PRECONDITION,
-            Some(err),
-            preflight_failed(started.clone()),
-        );
-    }
-    if let Some(err) = preflight_semantic() {
-        return finish(
-            report,
-            EXIT_PRECONDITION,
-            Some(err),
-            preflight_failed(started.clone()),
-        );
-    }
+    // One read-only classification of the archive path, reused by the semantic
+    // preflight below. An archive this binary must not open in place — an
+    // incompatible version, or an existing file that is not a readable archive
+    // at all — is refused here, before any side effect, and is never quietly
+    // treated as "no archive" (which would let a fallback probe skip the
+    // archive's compatibility admission).
+    let archive = match classify_archive(&db_path) {
+        ArchiveReadiness::Refused(err) => {
+            return finish(
+                report,
+                EXIT_PRECONDITION,
+                Some(err),
+                preflight_failed(started.clone()),
+            );
+        }
+        ready => ready,
+    };
+    let (semantic_result, semantic_evidence) =
+        preflight_semantic(api_config.as_deref(), &db_path, &archive);
+    report.semantic_preflight = Some(semantic_evidence);
+    let semantic_setup = match semantic_result {
+        Ok(setup) => setup,
+        Err(err) => {
+            return finish(
+                report,
+                EXIT_PRECONDITION,
+                Some(err),
+                preflight_failed(started.clone()),
+            );
+        }
+    };
     // The `preflight` stage's window is the whole read-only probe block above;
     // it is closed here, before the first thing with a side effect.
     let preflight = closed_stage(STAGE_PREFLIGHT, started, STAGE_OK);
@@ -450,6 +513,7 @@ fn execute(
     let index_started = Utc::now_stamp();
     let progress = Arc::new(IndexingProgress::default());
     let opts = IndexOptions {
+        model_api: Some(Arc::clone(&semantic_setup)),
         full: false,
         force_rebuild: false,
         watch: false,
@@ -458,7 +522,7 @@ fn execute(
         data_dir,
         semantic: true,
         no_ingest,
-        embedder: "infinity".to_string(),
+        embedder: semantic_setup.profile_id().to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
     };
@@ -936,18 +1000,68 @@ fn preflight_config() -> Result<SourcesConfig, SyncError> {
     }
 }
 
-/// Reject a database whose `user_version` this binary cannot open in place.
+/// How the canonical archive path stands relative to this binary.
 ///
-/// Rebuild-only is the project-wide contract (v5 onward): every version
-/// below current is rejected, and so is a newer one this binary would
-/// silently mis-read. A `user_version = 0` *empty* file is left alone — that
-/// is what a fresh install looks like, and `run_index` will initialize it.
-fn preflight_schema(db_path: &Path) -> Option<SyncError> {
-    if !db_path.exists() {
-        return None;
+/// `execute` decides this once, before any side effect, and hands the same
+/// answer to the semantic preflight, rather than each step re-deriving it (and
+/// two derivations drifting apart).
+enum ArchiveReadiness {
+    /// Absent, a fresh empty file, or a non-regular path (`run_index` owns
+    /// building or failing on those): no archive to consult.
+    Uninitialized,
+    /// A current-schema archive, safe to open read-only.
+    Current,
+    /// A path this binary must not open in place: an incompatible schema
+    /// version, or an existing regular file that is not a readable archive.
+    Refused(SyncError),
+}
+
+/// Classify the archive path without ever creating or writing it.
+///
+/// Rebuild-only is the project-wide contract (v5 onward): every version below
+/// current is rejected, and so is a newer one this binary would silently
+/// mis-read. A `user_version = 0` *empty* database is left alone — that is what
+/// a fresh install looks like, and `run_index` will initialize it.
+///
+/// A regular file that exists but cannot be read as an archive is **refused**,
+/// never treated as "no archive": presenting an existing file the round cannot
+/// verify as if it were empty would let a fallback probe run without the
+/// archive's compatibility admission (spec §6.4). Only a genuinely absent path
+/// or a read-confirmed `user_version = 0` empty database is buildable — the
+/// freshness is decided by reading the file through SQLite, not by its size, so
+/// WAL-side content is never ignored. A `stat` that fails for any reason other
+/// than "not found" is likewise a refusal, not a fresh install. A non-regular
+/// path (for example a directory) is left to `run_index`, which has always been
+/// the thing that reports that as an internal index failure.
+fn classify_archive(db_path: &Path) -> ArchiveReadiness {
+    match std::fs::metadata(db_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ArchiveReadiness::Uninitialized;
+        }
+        Err(err) => {
+            return ArchiveReadiness::Refused(SyncError {
+                kind: CliErrorKind::Io.kind_str(),
+                message: format!("cannot inspect {}: {err}", db_path.display()),
+            });
+        }
+        // A directory (or any other non-regular path) where the database
+        // belongs is not an archive this preflight can classify.
+        Ok(meta) if !meta.is_file() => return ArchiveReadiness::Uninitialized,
+        Ok(_) => {}
     }
-    let conn = Conn::open_read(db_path).ok()?;
-    let version = read_user_version(&conn).ok()?;
+    let Ok(conn) = Conn::open_read(db_path) else {
+        return ArchiveReadiness::Refused(archive_unreadable(
+            db_path,
+            "it could not be opened read-only",
+        ));
+    };
+    let Ok(version) = read_user_version(&conn) else {
+        let _ = conn.close();
+        return ArchiveReadiness::Refused(archive_unreadable(
+            db_path,
+            "it did not yield a schema version",
+        ));
+    };
     let empty = conn
         .query_row_map("SELECT count(*) FROM sqlite_master;", &[], |row| {
             row.get_typed::<i64>(0)
@@ -957,13 +1071,13 @@ fn preflight_schema(db_path: &Path) -> Option<SyncError> {
     let _ = conn.close();
 
     if version == CURRENT_SCHEMA_VERSION {
-        return None;
+        return ArchiveReadiness::Current;
     }
     if version == 0 && empty {
-        // Fresh, un-initialized database file: `run_index` will build it.
-        return None;
+        // A fresh, un-initialized database file: `run_index` will build it.
+        return ArchiveReadiness::Uninitialized;
     }
-    Some(SyncError {
+    ArchiveReadiness::Refused(SyncError {
         kind: CliErrorKind::RebuildError.kind_str(),
         message: format!(
             "database {} is at schema version {version}, but this build requires \
@@ -973,54 +1087,129 @@ fn preflight_schema(db_path: &Path) -> Option<SyncError> {
     })
 }
 
-/// Probe the semantic backend before indexing.
-///
-/// `run_index --semantic` probes Infinity itself and returns an `anyhow`
-/// error whose text is the only signal; classifying *that* string after the
-/// fact is the pattern the spec bans. Probing here — with the same
-/// purpose-built probe, whose own doc comment already calls a missing
-/// identity a precondition failure — makes "Infinity is unreachable" a
-/// typed exit 2 by construction.
-///
-/// Infinity *is* the semantic backend in this fork — the fsvi/ONNX tier was
-/// retired in W3-5 (`src/indexer/mod.rs`'s `#[cfg(not(feature =
-/// "infinity"))]` arm says the same thing to `run_index`). The two arms below
-/// are therefore the same precondition reached two ways, not a degraded
-/// fallback: a build without the feature has no probe to run, so it fails
-/// here, before the mirror stage and before the index, rather than compiling
-/// the call away or letting the round report success.
-#[cfg(feature = "infinity")]
-fn preflight_semantic() -> Option<SyncError> {
-    let config = crate::search::infinity::InfinityConfig::from_env();
-    match crate::search::infinity::probe_served_embed_identity(&config) {
-        Ok(_) => None,
-        Err(err) => Some(SyncError {
-            kind: CliErrorKind::SemanticUnavailable.kind_str(),
-            message: format!(
-                "Infinity at {} did not answer the embed-identity probe: {err}",
-                config.base_url
-            ),
-        }),
+/// An existing file that is not a usable archive, named with the same
+/// rebuild-only remedy the schema refusal carries.
+fn archive_unreadable(db_path: &Path, why: &str) -> SyncError {
+    SyncError {
+        kind: CliErrorKind::RebuildError.kind_str(),
+        message: format!(
+            "database {} exists but is not a readable archive ({why}); this build \
+             cannot use it in place, which is rebuild-only",
+            db_path.display()
+        ),
     }
 }
 
-/// The same precondition for a build compiled without the `infinity` feature.
+/// Freeze and validate the semantic backend before indexing.
 ///
-/// There is nothing to probe and no semantic tier this build could activate,
-/// so `cass sync` — which requires semantic readiness — cannot start a round
-/// at all. Same kind and same exit code as an unreachable Infinity; the
-/// fixed message points at the build rather than at a server, because
-/// retrying the network cannot fix it.
-#[cfg(not(feature = "infinity"))]
-fn preflight_semantic() -> Option<SyncError> {
-    Some(SyncError {
+/// `cass sync` requires semantic readiness. Both in-process semantic tiers this
+/// fork ever had — the fsvi/ONNX embedder (retired W3-5) and the local Infinity
+/// HTTP engine (retired with this build) — are gone; embedding is served
+/// exclusively by the configured external model API. This preflight loads the
+/// frozen API configuration and its embedding route **once**, before any side
+/// effect, then sends **one real, generic synthetic probe** to that route, and
+/// only then returns the same snapshot for the indexer to reuse. So the mirror
+/// set and the vectors are produced against one configuration, and — this is
+/// the point — an unreachable, wrong-identity or wrong-width endpoint is a
+/// precondition failure (exit 2) raised before the mirror stage and before the
+/// index, exactly as an unreachable backend always was; the round then reports
+/// `index.started = false` truthfully and never creates or touches a database.
+///
+/// The probe is the same one `models backfill` takes: three synthetic sentinels
+/// across the frozen route, with its requests counted separately from document
+/// batches (spec §5.2). It may reach the declared fallback only when the
+/// archive's existing generations are admitted under the route's compatibility
+/// proof (spec §6.4), so an existing archive is handed to it opened read-only;
+/// a fresh archive has no history and relies on the proof the route already read
+/// and validated.
+///
+/// `archive` is the classification `execute` already made: a `Refused` archive
+/// is surfaced (never treated as "no archive"), and an `Uninitialized` one is
+/// consulted only as "there is nothing here yet".
+///
+/// Returns the setup the indexer reuses **and** the preflight's own request
+/// evidence, so a refusal still leaves the one probe it made (or the fact that
+/// it never constructed a call) in the report.
+fn preflight_semantic(
+    api_config: Option<&Path>,
+    db_path: &Path,
+    archive: &ArchiveReadiness,
+) -> (
+    Result<Arc<crate::search::model_api::index_embedding::IndexEmbeddingSetup>, SyncError>,
+    SyncSemanticPreflight,
+) {
+    let setup = match crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(
+        api_config, None, true,
+    ) {
+        Ok(setup) => setup,
+        Err(err) => {
+            let error = semantic_precondition(format!(
+                "the configured embedding API profile is not usable: {err}"
+            ));
+            return (
+                Err(error.clone()),
+                SyncSemanticPreflight::before_call(None, error),
+            );
+        }
+    };
+    let call = match setup.call() {
+        Ok(call) => call,
+        Err(err) => {
+            let error = semantic_precondition(format!(
+                "the configured embedding API profile is not usable: {err}"
+            ));
+            return (
+                Err(error.clone()),
+                SyncSemanticPreflight::before_call(Some(setup.profile_id().to_string()), error),
+            );
+        }
+    };
+    // Every outcome from here on is a fact about *this* call, so the evidence
+    // is built from the call itself: `diagnostic()` keeps the observed HTTP
+    // status and usage per attempt, and an attempt that never left the process
+    // simply shows no probe call.
+    let evidence = |outcome: &'static str, error: Option<SyncError>| SyncSemanticPreflight {
+        profile: Some(call.profile().id.clone()),
+        outcome,
+        model_api: Some(call.diagnostic()),
+        error,
+    };
+    let existing = match archive {
+        ArchiveReadiness::Current => match FrankenStorage::open_readonly(db_path) {
+            Ok(storage) => Some(storage),
+            Err(err) => {
+                let error = semantic_precondition(format!(
+                    "the canonical archive could not be opened read-only for the semantic \
+                     preflight: {err:#}"
+                ));
+                return (Err(error.clone()), evidence("failed", Some(error)));
+            }
+        },
+        ArchiveReadiness::Uninitialized => None,
+        // `execute` refuses this before calling here. Refuse it again rather
+        // than assume a previous pass handled it: a refusal must never become
+        // "no archive" and let the probe run.
+        ArchiveReadiness::Refused(err) => {
+            return (Err(err.clone()), evidence("failed", Some(err.clone())));
+        }
+    };
+    match crate::indexer::db_vector_catchup::probe_api_preflight(existing.as_ref(), &call) {
+        Ok(_) => (Ok(Arc::new(setup)), evidence("ok", None)),
+        Err(err) => {
+            let error = semantic_precondition(format!(
+                "the configured embedding API profile did not answer a synthetic probe: {err}"
+            ));
+            (Err(error.clone()), evidence("failed", Some(error)))
+        }
+    }
+}
+
+/// The one precondition failure shape every semantic-backend refusal shares.
+fn semantic_precondition(message: String) -> SyncError {
+    SyncError {
         kind: CliErrorKind::SemanticUnavailable.kind_str(),
-        message: "this build has no semantic backend: it was compiled without the \
-                  `infinity` feature, and the fsvi/ONNX semantic tier was retired in \
-                  W3-5; rebuild with --no-default-features --features \
-                  qr,encryption,infinity to run `cass sync`"
-            .to_string(),
-    })
+        message,
+    }
 }
 
 // ---------------------------------------------------------------------------

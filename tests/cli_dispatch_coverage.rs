@@ -1598,47 +1598,49 @@ fn sources_artifact_manifest_verify_existing_json_rejects_corrupt_artifact() {
 // Models subcommand tests
 // =============================================================================
 
+// Semantic mapping (model-API migration): `models status` used to emit the local
+// model-cache payload (`lexical_fail_open`, `cache_lifecycle`, `next_step`,
+// `state`, `models[]`). It is now an alias of `models list` (the configured HTTP
+// model API profiles), so with no `--api-config` it is a configuration refusal.
+// `tests/api_model_commands.rs` covers the real profile listing against a real
+// config file; this test pins the no-config refusal.
+/// The stable `error.kind` from a `--json` refusal envelope on stderr, or an
+/// empty string when the stream carries no envelope.
+fn stderr_error_kind(stderr: &str) -> String {
+    stderr
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 #[test]
-fn models_status_json_outputs_structure() {
+fn models_status_json_without_config_refuses() {
     let tmp = TempDir::new().unwrap();
 
     let mut cmd = base_cmd(tmp.path());
     cmd.args(["models", "status", "--json"]);
 
-    let output = cmd.assert().success().get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Should output valid JSON
-    let json: Value = serde_json::from_str(stdout.trim()).expect("valid models status json");
+    let output = cmd.assert().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Pin the kind: an unrelated exit-2 failure must not pass for this refusal.
     assert_eq!(
-        json["lexical_fail_open"].as_bool(),
-        Some(true),
-        "models status should report lexical fail-open behavior"
-    );
-    assert!(
-        json.get("cache_lifecycle").is_some(),
-        "models status JSON should include cache lifecycle details: {json}"
-    );
-    assert!(
-        json.get("next_step").is_some(),
-        "models status JSON should include next-step guidance: {json}"
-    );
-    assert!(
-        json["state"].as_str().is_some(),
-        "models status JSON should include a machine-readable state: {json}"
-    );
-    // Keep the older loose structure check for compatibility with callers.
-    assert!(
-        json.get("installed").is_some()
-            || json.get("models").is_some()
-            || json.get("status").is_some()
-            || json.is_object(),
-        "models status JSON should have status information"
+        stderr_error_kind(&stderr),
+        "ModelApiConfiguration",
+        "models status must refuse as the API configuration error; stderr: {stderr}"
     );
 }
 
 #[test]
-fn models_verify_json_with_no_model() {
+fn models_verify_json_with_no_model_is_a_migration_refusal() {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -1652,9 +1654,15 @@ fn models_verify_json_with_no_model() {
         data_dir.to_str().unwrap(),
     ]);
 
-    // May succeed with empty or fail - either is acceptable
-    let output = cmd.assert().get_output().clone();
-    let _stdout = String::from_utf8_lossy(&output.stdout);
+    // Local weight verification was retired: the command refuses with a
+    // migration error rather than inspecting a local model directory.
+    let output = cmd.assert().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr_error_kind(&stderr),
+        "ModelApiMigration",
+        "models verify must refuse as the migration error; stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -1666,7 +1674,11 @@ fn models_help_shows_subcommands() {
         .stdout(contains("status"))
         .stdout(contains("install"))
         .stdout(contains("verify"))
-        .stdout(contains("remove"));
+        .stdout(contains("remove"))
+        // The retired local subcommands stay listed (so a script can still find
+        // them and get the migration error) but are described as retired rather
+        // than advertised as working local-model operations.
+        .stdout(contains("Retired"));
 }
 
 #[test]

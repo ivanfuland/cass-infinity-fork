@@ -1729,6 +1729,7 @@ fn inline_analytics_badges_match_detail_modal_metrics() {
         elapsed_ms: 7,
         suggestions: vec![],
         wildcard_fallback: false,
+        semantic_degraded: false,
         append: false,
     });
 

@@ -189,6 +189,21 @@ pub struct ErrorResponse {
     pub retry_after_ms: Option<u64>,
 }
 
+/// Legacy job request fields retained for decoding and explicit migration errors.
+#[derive(Debug, Clone)]
+pub struct EmbeddingJobConfig {
+    /// database path named by the legacy request
+    pub db_path: String,
+    /// retired local index path
+    pub index_path: String,
+    /// retired two-pass selection
+    pub two_tier: bool,
+    /// retired fast-pass model declaration
+    pub fast_model: Option<String>,
+    /// retired quality-pass model declaration
+    pub quality_model: Option<String>,
+}
+
 /// Error codes for daemon errors.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ErrorCode {

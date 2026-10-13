@@ -75,9 +75,28 @@
       "description": "Disable wrapping entirely",
       "arg_type": "flag",
       "required": false
+    },
+    {
+      "name": "api-config",
+      "description": "Path to the versioned model-service API configuration (TOML); overrides CASS_API_CONFIG",
+      "arg_type": "option",
+      "value_type": "path",
+      "required": false
     }
   ],
   "commands": [
+    {
+      "name": "regression",
+      "description": "Validate pinned regression inputs without retrieval or evaluation",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "regression-input",
+      "description": "Inspect or verify frozen retrieval regression inputs without repair",
+      "arguments": [],
+      "has_json_output": false
+    },
     {
       "name": "tui",
       "description": "Launch interactive TUI",
@@ -262,11 +281,27 @@
         },
         {
           "name": "embedder",
-          "description": "Embedder to use for semantic indexing (infinity, hash; `fastembed` requires the `semantic` build feature, retired in this build -- R1-W3-N2: defaults to `infinity` under the `infinity` feature so a bare `cass index --semantic` reaches the DB vector domain instead of the retired default)",
+          "description": "retired local backend selector; use --embedding-profile",
           "arg_type": "option",
           "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "embedding-profile",
+          "description": "embedding profile from the model API configuration",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "no-model-fallback",
+          "description": "disable the configured model fallback for this command",
+          "arg_type": "flag",
           "required": false,
-          "default": "infinity"
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "data-dir",
@@ -506,16 +541,33 @@
         },
         {
           "name": "rerank-provider",
-          "description": "Rerank backend selection. Requires --rerank. Exactly one of qwen3-local (the default when omitted), bge-local, openrouter-qwen3-8b, openrouter-cohere-4-fast, openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage error. Nothing is read from env or config; omitting it never selects a cloud backend",
+          "description": "Retired rerank backend selection. The local and OpenRouter rerank backends were removed with the model-API migration, so any supplied value is refused with a migration error before any request. The backend now comes from the configured rerank API profile (`--rerank-profile` with `--api-config`)",
           "arg_type": "option",
-          "value_type": "enum",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "embedding-profile",
+          "description": "Embedding API profile; defaults to the configured default_embedding",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "rerank-profile",
+          "description": "Rerank API profile; defaults to the configured default_rerank",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
+        },
+        {
+          "name": "no-model-fallback",
+          "description": "Disable the explicitly configured cloud fallback for this request",
+          "arg_type": "flag",
           "required": false,
           "enum_values": [
-            "qwen3-local",
-            "bge-local",
-            "openrouter-qwen3-8b",
-            "openrouter-cohere-4-fast",
-            "openrouter-voyage-2.5-lite"
+            "true",
+            "false"
           ]
         },
         {
@@ -736,14 +788,14 @@
         },
         {
           "name": "model",
-          "description": "Embedding model to use for semantic search. Available models depend on what's been downloaded. Use `cass models --list` to see available options",
+          "description": "Retired local embedding-model selector. The local backend was removed with the model-API migration, so a supplied value is refused with a migration error before any request. Embedding is served by the configured API profile (`--api-config` with `--embedding-profile`)",
           "arg_type": "option",
           "value_type": "string",
           "required": false
         },
         {
           "name": "rerank",
-          "description": "Enable complete-window reranking (off by default). Default: qwen3-local, N=200 candidates, K=5 results per page",
+          "description": "Enable complete-window reranking (off by default). Default: N=200 candidates, K=5 results per page; the backend is the configured rerank API profile (--rerank-profile)",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -754,14 +806,14 @@
         },
         {
           "name": "reranker",
-          "description": "Deprecated reranker selector. Use --rerank-provider instead",
+          "description": "Retired reranker selector. A supplied value is refused with a migration error before any request; the backend comes from the configured rerank API profile (`--rerank-profile`)",
           "arg_type": "option",
           "value_type": "string",
           "required": false
         },
         {
           "name": "daemon",
-          "description": "Use daemon for warm model inference (faster repeated queries). If daemon is unavailable, falls back to direct inference",
+          "description": "Retired daemon-inference selector. Warm local-model inference was removed with the model-API migration, so this flag is refused with a migration error before any request",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -772,7 +824,7 @@
         },
         {
           "name": "no-daemon",
-          "description": "Disable daemon usage even if available (force direct inference)",
+          "description": "No effect on the API-only build: it selects no model and enables no local inference, so there is no daemon for it to disable. Retained for compatibility",
           "arg_type": "flag",
           "required": false,
           "default": "false",
@@ -29102,161 +29154,162 @@
         }
       }
     },
-    "models-check-update": {
+    "models-check": {
       "type": "object",
-      "description": "cass models check-update --json: compares installed model revision against the pinned registry revision.",
+      "description": "cass models check --profile <id> --json: the result of checking exactly one selected profile against exactly its own endpoint. The fallback is never used, no generation is registered and no readiness cache is touched.",
       "properties": {
-        "update_available": {
-          "type": "boolean"
-        },
-        "reason": {
+        "schema": {
           "type": "string",
-          "description": "model_not_installed | up_to_date | newer_revision_available | registry_check_failed"
+          "description": "cass.model-api-check.v1"
         },
-        "current_revision": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "latest_revision": {
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "update_available",
-        "reason"
-      ]
-    },
-    "models-status": {
-      "type": "object",
-      "description": "cass models status --json: semantic-model acquisition + cache state.",
-      "properties": {
-        "policy_quality_tier_embedder": {
+        "profile_id": {
           "type": "string"
         },
-        "active_registry_name": {
+        "kind": {
+          "type": "string",
+          "description": "embedding | rerank"
+        },
+        "requested_model": {
+          "type": "string"
+        },
+        "declared_revision": {
+          "type": "string"
+        },
+        "response_model": {
           "type": [
             "string",
             "null"
           ]
         },
-        "lexical_fail_open": {
-          "type": "boolean"
+        "response_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "models": {
+        "revision_source": {
+          "type": "string",
+          "description": "service_reported | operator_declared"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "fallback_used": {
+          "type": "boolean",
+          "description": "Always false: one explicit profile is checked."
+        },
+        "calls": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": true
           }
         },
-        "model_id": {
-          "type": "string"
+        "effective_dimension": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Measured embedding dimension, for an embedding profile."
         },
-        "model_dir": {
-          "type": "string"
+        "descriptor_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Representation descriptor digest, for an embedding profile."
         },
-        "installed": {
-          "type": "boolean"
+        "scored_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Documents scored, for a rerank profile."
         },
-        "state": {
-          "type": "string",
-          "description": "not_acquired | downloading | ready | needs_update"
-        },
-        "state_detail": {
-          "type": "string"
-        },
-        "next_step": {
-          "type": "string"
-        },
-        "revision": {
-          "type": "string"
-        },
-        "license": {
-          "type": "string"
-        },
-        "total_size_bytes": {
-          "type": "integer"
-        },
-        "installed_size_bytes": {
-          "type": "integer"
-        },
-        "observed_file_bytes": {
-          "type": "integer"
-        },
-        "policy_source": {
-          "type": "string"
-        },
-        "cache_lifecycle": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
-        },
-        "model_acquisition": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
-        },
-        "files": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": true
-          }
-        }
-      },
-      "required": [
-        "policy_quality_tier_embedder",
-        "lexical_fail_open",
-        "models"
-      ]
-    },
-    "models-verify": {
-      "type": "object",
-      "description": "cass models verify --json: per-file SHA-256 verification of the installed semantic model.",
-      "properties": {
-        "status": {
-          "type": "string"
-        },
-        "state_detail": {
-          "type": "string"
-        },
-        "next_step": {
-          "type": "string"
-        },
-        "lexical_fail_open": {
-          "type": "boolean"
-        },
-        "model_dir": {
-          "type": "string"
-        },
-        "all_valid": {
-          "type": "boolean"
-        },
-        "cache_lifecycle": {
-          "type": "object",
-          "additionalProperties": true
-        },
-        "model_acquisition": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "Hardened acquisition contract (same shape as models-status.model_acquisition): state, runtime, source, cost_class, fingerprint, and skipped_network_reason proving verify never auto-downloads."
+        "usage": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Usage the last service response reported, when it reported one."
         },
         "error": {
           "type": [
-            "string",
+            "object",
             "null"
-          ]
+          ],
+          "description": "Present only when a stage failed: {code, kind, message, http_status, retryable}. Every stage already attempted stays listed in `calls`."
         }
       },
       "required": [
-        "status",
-        "all_valid",
-        "lexical_fail_open"
+        "schema",
+        "profile_id"
+      ]
+    },
+    "models-list": {
+      "type": "object",
+      "description": "cass models list --json (and its alias `models status`): the configured HTTP model API profiles. Read-only; loads no local weight and makes no request.",
+      "properties": {
+        "schema": {
+          "type": "string",
+          "description": "cass.model-api-list.v1"
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "description": "embedding | rerank"
+              },
+              "protocol": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "model_revision": {
+                "type": "string",
+                "description": "The revision the operator declares; not proof the client read the served weights."
+              },
+              "default": {
+                "type": "boolean"
+              },
+              "endpoint": {
+                "type": "string"
+              },
+              "scope": {
+                "type": "string",
+                "description": "loopback | remote"
+              },
+              "api_key_env": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Credential variable name only; the value is never read."
+              }
+            },
+            "required": [
+              "id",
+              "kind",
+              "protocol",
+              "model",
+              "model_revision",
+              "default",
+              "endpoint",
+              "scope"
+            ]
+          }
+        }
+      },
+      "required": [
+        "schema",
+        "profiles"
       ]
     },
     "pack": {
@@ -30247,15 +30300,163 @@
             "rerank": {
               "type": "object",
               "properties": {
+                "model_api": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "properties": {
+                    "primary_profile": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                    },
+                    "realized_profile": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                    },
+                    "fallback_used": {
+                      "type": "boolean"
+                    },
+                    "fallback_reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "attempts": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "profile": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                          },
+                          "network_attempted": {
+                            "type": "boolean"
+                          },
+                          "http_status": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ],
+                            "minimum": 100,
+                            "maximum": 599
+                          },
+                          "error_code": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "duration_ms": {
+                            "type": "integer",
+                            "minimum": 0
+                          },
+                          "response_model": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "response_revision": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "serving_provider": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "usage": {
+                            "type": [
+                              "object",
+                              "null"
+                            ],
+                            "properties": {
+                              "prompt_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "input_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "total_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "completion_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "output_tokens": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ],
+                                "minimum": 0
+                              },
+                              "cost": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "prompt_tokens",
+                              "input_tokens",
+                              "total_tokens",
+                              "completion_tokens",
+                              "output_tokens",
+                              "cost"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "profile",
+                          "network_attempted",
+                          "http_status",
+                          "error_code",
+                          "duration_ms",
+                          "response_model",
+                          "response_revision",
+                          "serving_provider",
+                          "usage"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "primary_profile",
+                    "realized_profile",
+                    "fallback_used",
+                    "fallback_reason",
+                    "attempts"
+                  ]
+                },
                 "requested_provider": {
                   "type": "string",
-                  "enum": [
-                    "qwen3-local",
-                    "bge-local",
-                    "openrouter-qwen3-8b",
-                    "openrouter-cohere-4-fast",
-                    "openrouter-voyage-2.5-lite"
-                  ]
+                  "pattern": "^[A-Za-z0-9._-]{1,64}$"
                 },
                 "requested_model": {
                   "type": "string"
@@ -30402,6 +30603,7 @@
                 }
               },
               "required": [
+                "model_api",
                 "requested_provider",
                 "requested_model",
                 "actual_provider",
@@ -31329,15 +31531,163 @@
     "search-rerank-meta": {
       "type": "object",
       "properties": {
+        "model_api": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "primary_profile": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,64}$"
+            },
+            "realized_profile": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[A-Za-z0-9._-]{1,64}$"
+            },
+            "fallback_used": {
+              "type": "boolean"
+            },
+            "fallback_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "attempts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "profile": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9._-]{1,64}$"
+                  },
+                  "network_attempted": {
+                    "type": "boolean"
+                  },
+                  "http_status": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 100,
+                    "maximum": 599
+                  },
+                  "error_code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "duration_ms": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "response_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "response_revision": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "serving_provider": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "usage": {
+                    "type": [
+                      "object",
+                      "null"
+                    ],
+                    "properties": {
+                      "prompt_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "input_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "total_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "completion_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "output_tokens": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ],
+                        "minimum": 0
+                      },
+                      "cost": {
+                        "type": [
+                          "number",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "prompt_tokens",
+                      "input_tokens",
+                      "total_tokens",
+                      "completion_tokens",
+                      "output_tokens",
+                      "cost"
+                    ]
+                  }
+                },
+                "required": [
+                  "profile",
+                  "network_attempted",
+                  "http_status",
+                  "error_code",
+                  "duration_ms",
+                  "response_model",
+                  "response_revision",
+                  "serving_provider",
+                  "usage"
+                ]
+              }
+            }
+          },
+          "required": [
+            "primary_profile",
+            "realized_profile",
+            "fallback_used",
+            "fallback_reason",
+            "attempts"
+          ]
+        },
         "requested_provider": {
           "type": "string",
-          "enum": [
-            "qwen3-local",
-            "bge-local",
-            "openrouter-qwen3-8b",
-            "openrouter-cohere-4-fast",
-            "openrouter-voyage-2.5-lite"
-          ]
+          "pattern": "^[A-Za-z0-9._-]{1,64}$"
         },
         "requested_model": {
           "type": "string"
@@ -31484,6 +31834,7 @@
         }
       },
       "required": [
+        "model_api",
         "requested_provider",
         "requested_model",
         "actual_provider",

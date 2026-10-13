@@ -172,25 +172,10 @@ fn handle_fatal_error(err: coding_agent_search::CliError) -> ! {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Check for AVX2 support before anything else. The prebuilt ONNX Runtime
-    // binary linked by semantic builds can execute AVX2 instructions during
-    // startup on x86_64, which crashes pre-AVX2 hosts with SIGILL/STATUS_ILLEGAL_INSTRUCTION.
-    #[cfg(all(target_arch = "x86_64", feature = "semantic"))]
-    {
-        if !std::arch::is_x86_feature_detected!("avx2") {
-            eprintln!(
-                "Error: Your CPU does not support AVX2 instructions, which are required by this semantic-enabled cass build.\n\
-                 \n\
-                 The ONNX Runtime dependency used for semantic search is not safe on pre-AVX2 x86_64 CPUs.\n\
-                 For Sandy Bridge, Ivy Bridge, AMD FX/Phenom/Athlon, or other pre-AVX2 hosts,\n\
-                 install the matching cass -baseline artifact instead.\n\
-                 \n\
-                 Without AVX2, the process would crash with a SIGILL (illegal instruction) signal.\n\
-                 Please run this build on a machine with AVX2, or use the baseline artifact."
-            );
-            std::process::exit(1);
-        }
-    }
+    // No AVX2 preflight is needed any more: the prebuilt Microsoft ONNX Runtime
+    // (the only component that could execute AVX2 during static init and crash
+    // pre-AVX2 hosts with SIGILL/STATUS_ILLEGAL_INSTRUCTION) is no longer
+    // linked. Local inference is retired, so this binary runs on any x86_64 CPU.
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();

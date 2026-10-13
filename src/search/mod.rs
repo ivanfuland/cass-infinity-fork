@@ -3,16 +3,13 @@
 //! This module provides the search infrastructure for cass, including:
 //!
 //! - **[`query`]**: Query parsing, execution, and caching for FTS5-based full-text search.
-//! - **[`embedder`]**: Embedder trait for semantic search (hash and ML implementations).
-//! - **[`embedder_registry`]**: Embedder registry for model selection (bd-2mbe).
+//! - **[`embedder`]**: Embedder trait for semantic search (hash and API implementations).
 //! - **[`hash_embedder`]**: FNV-1a feature hashing embedder (deterministic fallback).
-//! - **[`fastembed_embedder`]**: FastEmbed-backed ML embedder (MiniLM).
+//! - **[`model_api`]**: The HTTP model API client and configuration; the only model
+//!   call path. Local weight download/load was retired with the model-API migration.
 //! - **[`reranker`]**: Reranker trait for cross-encoder reranking of search results.
-//! - **[`reranker_registry`]**: Reranker registry for model selection with bake-off support.
-//! - **[`fastembed_reranker`]**: FastEmbed-backed cross-encoder reranker (ms-marco-MiniLM-L-6-v2).
 //! - **[`daemon_client`]**: Daemon client wrappers for warm embedder/reranker (bd-1lps).
-//! - **[`model_manager`]**: Semantic model detection + context wiring (no downloads).
-//! - **[`model_download`]**: Model download system with consent, verification, and atomic install.
+//! - **[`model_manager`]**: Semantic readiness detection + context wiring (no downloads).
 //! - **[`policy`]**: Semantic policy contract: model defaults, tiers, budgets, invalidation.
 //! - **[`semantic_manifest`]**: Durable semantic asset manifests, backlog ledger, and checkpoints.
 //! - **[`canonicalize`]**: Text preprocessing for consistent embedding input.
@@ -29,9 +26,7 @@ pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;
 pub mod eligibility;
 pub mod embedder;
-pub mod embedder_registry;
-pub mod fastembed_embedder;
-pub mod fastembed_reranker;
+pub mod model_identity;
 pub(crate) mod fleet_cheap_probes;
 pub(crate) mod frankensearch_daemon;
 pub(crate) mod frankensearch_hash_embedder;
@@ -41,14 +36,12 @@ pub mod hash_embedder;
 pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;
-#[cfg(feature = "infinity")]
-pub mod infinity;
 pub(crate) mod index_provenance;
 pub mod lexical_index_health;
 pub(crate) mod lexical_rerank;
 pub(crate) mod liveness_fixtures;
-pub(crate) mod model_acquisition;
-pub mod model_download;
+pub mod model_api;
+pub mod generation_fingerprint;
 pub mod model_manager;
 pub mod pack_planner;
 pub mod policy;
@@ -70,7 +63,6 @@ pub(crate) mod regression_input;
 pub(crate) mod regression_trace;
 pub mod rerank;
 pub mod reranker;
-pub mod reranker_registry;
 pub mod runtime_optimizations;
 pub(crate) mod salvage_ledger;
 pub(crate) mod search_mode_metadata;

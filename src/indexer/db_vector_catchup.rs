@@ -17,6 +17,7 @@
 //! to chunk-granularity holes and generation fingerprinting.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -24,11 +25,30 @@ use crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION;
 use crate::search::chunking::canonical_role;
 use crate::search::eligibility::{ExpectedChunk, expected_chunks, for_each_expected_chunk};
 use crate::search::frankensearch_types::cosine_similarity;
-use crate::search::infinity::{InfinityServedIdentity, fingerprint_matches};
+use crate::search::generation_fingerprint::fingerprint_matches;
+use crate::search::model_api::{
+    EndpointConfigIdentity, ModelApiBackfillReport, PrimaryEmbeddingCall, ProbeMeasurement,
+    RepresentationDescriptor, ValidatedProfile,
+};
 use crate::storage::api::{Conn, StorageError, Tx, TxMode, params};
+use crate::storage::api_generation::{create_api_generation, create_api_generation_with_producers, register_api_contribution};
 use crate::storage::schema::{self, ChunkRow};
 use crate::storage::sqlite::FrankenStorage;
 use crate::storage::vector_domain;
+
+/// A served embedding identity: the model id a generation is keyed on and its
+/// vector width.
+///
+/// This is the model-independent identity the v5 generation lookup matches on.
+/// It was previously borrowed from the retired Infinity HTTP module; it now
+/// lives here because the (generic, closure-driven) catch-up loop still keys
+/// generations by `(model_id, dimension)`.
+pub struct ServedEmbeddingIdentity {
+    /// The `embedding_generations.embedder_id` this identity writes and matches.
+    pub model_id: String,
+    /// The embedding width.
+    pub dimension: usize,
+}
 
 /// T4 mission #122a (D), spec §五 "ownership oracle cosine 阈值": the
 /// activation audit's fresh-vs-stored ownership check (`run_activation_
@@ -599,7 +619,7 @@ fn load_message_once(storage: &FrankenStorage, message_id: i64) -> Result<(i64, 
 /// this fix.
 fn find_reusable_or_create_generation(
     conn: &Conn,
-    identity: &InfinityServedIdentity,
+    identity: &ServedEmbeddingIdentity,
     canonicalize_version: u32,
     chunking_policy_version: u32,
     fingerprint: &[u8],
@@ -771,17 +791,18 @@ fn clear_drain_events_for_test() {
 }
 
 /// Re-derive a fresh generation fingerprint through the injected
-/// `embedder` closure (not [`crate::search::infinity::compute_generation_
-/// fingerprint`], which insists on its own live `InfinityConfig`/HTTP
-/// client -- audit check ⑪ must be exercisable with a deterministic mock
-/// embedder in tests, same as check ⑩). Same wire format:
-/// [`crate::search::infinity::FINGERPRINT_SENTINELS`] embedded in order,
+/// `embedder` closure (not the live endpoint probe
+/// [`crate::search::model_api::primary_embedding::PrimaryEmbeddingCall::probe`],
+/// which insists on its own endpoint client -- audit check ⑪ must be
+/// exercisable with a deterministic mock embedder in tests, same as check
+/// ⑩). Same wire format:
+/// [`crate::search::generation_fingerprint::FINGERPRINT_SENTINELS`] embedded in order,
 /// concatenated as LE f32 bytes.
 fn compute_fresh_fingerprint_via(
     embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
     dim: usize,
 ) -> Result<Vec<u8>> {
-    let inputs: Vec<&str> = crate::search::infinity::FINGERPRINT_SENTINELS.to_vec();
+    let inputs: Vec<&str> = crate::search::generation_fingerprint::FINGERPRINT_SENTINELS.to_vec();
     let vectors = embedder(&inputs).map_err(|e| anyhow!("re-embedding fingerprint sentinels failed: {e}"))?;
     if vectors.len() != inputs.len() {
         bail!("fingerprint embedder returned {} vectors for {} sentinels", vectors.len(), inputs.len());
@@ -1442,9 +1463,10 @@ fn switch_guard_in_tx(tx: &Tx, generation_id: i64, pre_audit_chunk_count: i64) -
 /// `identity`/`fingerprint` are caller-supplied (not probed internally)
 /// so this function -- and everything it calls -- is fully exercisable
 /// against a deterministic mock `embedder` in tests, with zero live
-/// Infinity dependency; the real CLI call sites probe them once via
-/// [`crate::search::infinity::probe_identity_and_fingerprint`] and pass
-/// the results straight through.
+/// endpoint dependency; the real CLI call sites probe them once via
+/// [`crate::search::model_api::primary_embedding::PrimaryEmbeddingCall::probe`]
+/// (see [`probe_api_backfill`] in this module) and pass the results
+/// straight through.
 ///
 /// Task book #98 Step 2: `#[cfg(test)]`-only wall-clock hook for the
 /// reverse-reconciliation pass below -- compiled out entirely (zero
@@ -1646,22 +1668,591 @@ fn scan_expected_snapshot(storage: &FrankenStorage) -> Result<(Vec<ExpectedChunk
     Ok((all_expected, expected_by_message))
 }
 
+// =============================================================================
+// API02D: the neutral engine seam the shared catch-up loop drives.
+//
+// The loop below (find-or-create the generation -> drain `chunk_holes` in
+// key-paged batches -> stage/move/vec0 -> reverse-reconcile -> activate) is
+// identical whichever embedding backend supplies the vectors. Two backends
+// exist: the legacy Infinity entry, a thin wrapper over this function's original
+// arguments, and the API-primary entry that writes and re-verifies an API
+// generation record (spec §§6.1-6.2). This trait is that seam -- deliberately
+// private, with deliberately exactly two implementations. It is not a plugin
+// framework and grants no third backend.
+// =============================================================================
+
+trait CatchupEngine {
+    /// The `embedding_generations.embedder_id` this engine writes and matches.
+    fn embedder_id(&self) -> String;
+    /// The embedding width.
+    fn dimension(&self) -> usize;
+    /// Embed one logical page of document texts for the drain.
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String>;
+    /// Embed the activation audit's own verification inputs.
+    ///
+    /// The audit runs the same HTTP implementation and the same failure rules as
+    /// the drain; only the evidence bucket differs, so an audit request is never
+    /// reported as a document batch.
+    fn embed_for_audit(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String>;
+    /// Resolve the generation to write into, creating it when no reusable one
+    /// exists. Returns `(generation_id, reused_existing, holes_seeded)`.
+    fn find_or_create_generation(
+        &self,
+        conn: &Conn,
+        now_ms: i64,
+        all_expected: &[ExpectedChunk],
+    ) -> Result<(i64, bool, u64)>;
+    /// Re-verify this engine's generation identity inside one page's write
+    /// transaction. Any failure must abort that whole page.
+    fn verify_page_identity(&self, tx: &Tx, generation_id: i64, has_new_vectors: bool) -> Result<(), StorageError>;
+    /// The activation-time guard, run inside `switch_active_generation`'s own
+    /// transaction.
+    fn activation_guard(
+        &self,
+        tx: &Tx,
+        generation_id: i64,
+        pre_audit_chunk_count: i64,
+    ) -> Result<(), StorageError>;
+    /// Whether this run's tail may prune orphaned generations.
+    fn allows_orphan_cleanup(&self) -> bool;
+}
+
+/// The legacy Infinity engine: the original arguments, unchanged.
+struct InfinityCatchupEngine<'a> {
+    identity: &'a ServedEmbeddingIdentity,
+    canonicalize_version: u32,
+    chunking_version: u32,
+    fingerprint: &'a [u8],
+    embedder: &'a dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
+}
+
+impl CatchupEngine for InfinityCatchupEngine<'_> {
+    fn embedder_id(&self) -> String {
+        self.identity.model_id.clone()
+    }
+
+    fn dimension(&self) -> usize {
+        self.identity.dimension
+    }
+
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        (self.embedder)(texts)
+    }
+
+    fn embed_for_audit(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        (self.embedder)(texts)
+    }
+
+    fn find_or_create_generation(
+        &self,
+        conn: &Conn,
+        now_ms: i64,
+        all_expected: &[ExpectedChunk],
+    ) -> Result<(i64, bool, u64)> {
+        find_reusable_or_create_generation(
+            conn,
+            self.identity,
+            self.canonicalize_version,
+            self.chunking_version,
+            self.fingerprint,
+            now_ms,
+            all_expected,
+        )
+    }
+
+    fn verify_page_identity(&self, _tx: &Tx, _generation_id: i64, _has_new_vectors: bool) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    fn activation_guard(
+        &self,
+        tx: &Tx,
+        generation_id: i64,
+        pre_audit_chunk_count: i64,
+    ) -> Result<(), StorageError> {
+        switch_guard_in_tx(tx, generation_id, pre_audit_chunk_count)
+    }
+
+    fn allows_orphan_cleanup(&self) -> bool {
+        true
+    }
+}
+
+/// The API-primary engine: one frozen profile plus its embedding driver.
+///
+/// Unlike the legacy engine, every generation it matches must reopen through
+/// `open_api_generation` in the same transaction as the lookup, and every page
+/// it writes must re-verify that record before any row lands.
+struct ApiPrimaryCatchupEngine<'a> {
+    call: &'a PrimaryEmbeddingCall,
+    profile: &'a ValidatedProfile,
+    embedder_id: String,
+    dimension: usize,
+    canonicalize_version: u32,
+    chunking_version: u32,
+    fingerprint: &'a [u8],
+}
+
+impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
+    fn embedder_id(&self) -> String {
+        self.embedder_id.clone()
+    }
+
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn embed(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        self.call.embed_documents(texts).map_err(|e| e.message())
+    }
+
+    fn embed_for_audit(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
+        self.call.embed_for_audit(texts).map_err(|e| e.message())
+    }
+
+    fn find_or_create_generation(
+        &self,
+        conn: &Conn,
+        now_ms: i64,
+        all_expected: &[ExpectedChunk],
+    ) -> Result<(i64, bool, u64)> {
+        find_or_create_api_generation(
+            conn,
+            self.call,
+            self.dimension,
+            self.canonicalize_version,
+            self.chunking_version,
+            self.fingerprint,
+            now_ms,
+            all_expected,
+        )
+    }
+
+    fn verify_page_identity(&self, tx: &Tx, generation_id: i64, has_new_vectors: bool) -> Result<(), StorageError> {
+        self.call.route().open_generation(tx, generation_id)?;
+        // This hook runs inside the same transaction that writes the vector page.
+        // A relocated primary must retain its proof with the vectors it produced.
+        if let Some(proof) = self.call.route().proof.as_ref().filter(|_| has_new_vectors) {
+            for writer in self.call.page_writers() {
+                register_api_contribution(tx, generation_id, self.profile, &writer, proof)
+                    .map_err(StorageError::from)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn activation_guard(
+        &self,
+        tx: &Tx,
+        generation_id: i64,
+        pre_audit_chunk_count: i64,
+    ) -> Result<(), StorageError> {
+        self.call.route().open_generation(tx, generation_id)?;
+        switch_guard_in_tx(tx, generation_id, pre_audit_chunk_count)
+    }
+
+    fn allows_orphan_cleanup(&self) -> bool {
+        // Spec §"代际与事务接线": the API path must not enable the automatic
+        // tail cleanup this ticket, so a candidate generation it just built and
+        // has not activated yet can never be pruned. The final cleanup contract
+        // is another ticket's; the legacy entry keeps its own behavior.
+        false
+    }
+}
+
+/// Find or create the API generation this profile and fingerprint describe.
+///
+/// The lookup and the verification share one transaction with the create, so a
+/// candidate can never be reused without its two meta records and its row having
+/// been reopened against the running profile in the same snapshot. A row that
+/// carries this exact API identity but whose records are missing, malformed or
+/// described by a moved endpoint is refused outright rather than papered over by
+/// quietly creating a replacement — the successor's admission is what clears
+/// that, not this ticket. A legacy (non-API) row is never an API candidate, so a
+/// previous Infinity generation keeps its active pointer while a new API
+/// candidate is built beside it.
+const ACTIVE_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
+         LIMIT 1";
+const PENDING_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
+         WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
+           AND chunking_policy_version = ?4 AND audit_status = 'pending' \
+         ORDER BY id DESC LIMIT 1";
+
+fn find_or_create_api_generation(
+    conn: &Conn,
+    call: &PrimaryEmbeddingCall,
+    dimension: usize,
+    canonicalize_version: u32,
+    chunking_version: u32,
+    fingerprint: &[u8],
+    now_ms: i64,
+    all_expected: &[ExpectedChunk],
+) -> Result<(i64, bool, u64)> {
+    let profile = call.profile();
+    let descriptor = RepresentationDescriptor::from_profile(profile, dimension as u64)
+        .map_err(|e| anyhow!("the selected API embedding profile has no usable representation identity: {e}"))?;
+    let embedder_id = descriptor.embedder_id();
+    let dim = i64::try_from(dimension)
+        .map_err(|_| anyhow!("api dimension {dimension} does not fit in i64"))?;
+
+    conn.with_tx(TxMode::Immediate, |tx| {
+        for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
+            let candidate = tx.query_opt_map(
+                sql,
+                &params![
+                    embedder_id.as_str(),
+                    dim,
+                    i64::from(canonicalize_version),
+                    i64::from(chunking_version)
+                ],
+                |row| Ok((row.get_typed::<i64>(0)?, row.get_typed::<Vec<u8>>(1)?)),
+            )?;
+            let Some((candidate_id, stored_fingerprint)) = candidate else {
+                continue;
+            };
+            // The row carries this exact API identity (embedder id, dimension,
+            // both pipeline versions), so it claims to be this space: the stored
+            // record must prove it *before* the fingerprint rule is consulted.
+            // A missing, malformed or relocated record is refused outright here
+            // — never bypassed by a fingerprint mismatch that would quietly
+            // build a replacement beside it.
+            call.route().open_generation(tx, candidate_id)?;
+            if fingerprint_matches(&stored_fingerprint, fingerprint, dimension) {
+                return Ok((candidate_id, true, 0u64));
+            }
+            // The record is sound but the served weights differ from this run's
+            // probe, so the existing fingerprint rule says build a new
+            // generation beside this one rather than reuse vectors that belong
+            // to another fingerprint. Keep looking: a pending candidate from the
+            // current service instance may still match.
+        }
+
+        let producers = call.probe_writers();
+        let used_backup = producers.iter().any(|writer| writer.id != profile.id);
+        let generation_id = if used_backup {
+            let proof = call.route().proof.as_ref().ok_or_else(|| StorageError::Other {
+                code: None, detail: "CompatibilityRequired".into(),
+            })?;
+            create_api_generation_with_producers(tx, profile, dimension as u64, fingerprint, now_ms, &producers, proof)
+        } else {
+            create_api_generation(tx, profile, dimension as u64, fingerprint, now_ms)
+        }.map_err(StorageError::from)?;
+        let holes: Vec<(i64, u32)> = all_expected
+            .iter()
+            .map(|c| (c.message_id, c.chunk_idx))
+            .collect();
+        let outcome = schema::seed_chunk_holes(tx, generation_id, &holes, now_ms, "generation_seed")?;
+        Ok((generation_id, false, outcome.rows_inserted))
+    })
+    .map_err(anyhow::Error::from)
+}
+
+/// What one API-primary catch-up run produced.
+pub struct ApiPrimaryBackfillOutcome {
+    /// The existing backfill report shape.
+    pub catchup: DbVectorCatchupReport,
+    /// The `model_api` object printed beside it.
+    pub model_api: ModelApiBackfillReport,
+}
+
+/// Why an API-primary catch-up run did not finish.
+pub enum ApiPrimaryBackfillError {
+    /// The primary failed in the frozen eligible set while a fallback was
+    /// declared and not disabled, and no verified cross-endpoint compatibility
+    /// evidence exists (spec §6.4). No vector was written and nothing was sent
+    /// to the fallback.
+    CompatibilityRequired { message: String },
+    /// Any other failure, verbatim.
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for ApiPrimaryBackfillError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompatibilityRequired { message } => f.write_str(message),
+            Self::Failed(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+/// The dimensions of the archive's own live generations. Used by
+/// [`refuse_unopenable_archive`], which has no declared dimension to pin its
+/// candidate with. A legacy (non-API) generation simply never matches this
+/// route's identity, and a dimension the profile cannot describe is skipped
+/// rather than turned into a refusal.
+const ARCHIVE_LIVE_DIMENSIONS_SQL: &str = "SELECT DISTINCT dim FROM embedding_generations \
+     WHERE (is_active = 1 AND audit_status != 'failed') OR audit_status = 'pending' ORDER BY dim";
+
+/// One identity's live candidates, inside an already-open read-only transaction.
+///
+/// The single place the candidate query and its bound parameters are written, so
+/// the proof admission and the proof-less archive check cannot drift apart.
+fn live_candidates_for(
+    tx: &Tx, id: &str, dimension: u64, canonicalize: u32, chunking: u32,
+) -> Result<Vec<i64>, StorageError> {
+    let mut candidates = Vec::new();
+    for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
+        let candidate = tx.query_opt_map(sql, &params![id, dimension as i64,
+            i64::from(canonicalize), i64::from(chunking)],
+            |row| row.get_typed::<i64>(0))?;
+        if let Some(candidate) = candidate { candidates.push(candidate); }
+    }
+    Ok(candidates)
+}
+
+/// Refuse to probe when the archive's existing active/pending generations are
+/// not admitted under the route's compatibility proof (spec §6.4): a fallback
+/// must never be reached while an existing generation is unadmitted. Read-only —
+/// it opens generations inside a deferred, no-replay transaction and never
+/// writes. Shared by [`probe_api_backfill`] and [`probe_api_preflight`] so the
+/// two callers enforce the identical rule instead of two copies drifting apart.
+///
+/// This is the **proof** arm only, and it stays byte-for-byte what
+/// `models backfill` has always done: with no proof there is no declared
+/// dimension and nothing to compare, so the check is a no-op and a record
+/// rejection surfaces later, from the catch-up itself, with its own
+/// classification and request count. [`probe_api_preflight`] adds the
+/// proof-less archive check separately, because `cass sync` — not
+/// `models backfill` — is the command that must refuse before any side effect.
+fn admit_existing_primary_generations(
+    storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<(), ApiPrimaryBackfillError> {
+    let Some(proof) = &call.route().proof else {
+        return Ok(());
+    };
+    let descriptor = RepresentationDescriptor::from_profile(call.profile(), proof.primary_dimension() as u64)
+        .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
+    let id = descriptor.embedder_id();
+    let checked = storage.raw().with_tx_no_replay(TxMode::Deferred, |tx| {
+        for candidate in live_candidates_for(tx, &id, proof.primary_dimension() as u64,
+            descriptor.canonicalize_version(), descriptor.chunking_version())? {
+            call.route().open_generation(tx, candidate)?;
+        }
+        Ok(())
+    });
+    if checked.is_err() {
+        return Err(ApiPrimaryBackfillError::CompatibilityRequired {
+            message: "CompatibilityRequired: existing generation history was not admitted before probe; no model request sent".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a **proof-less** route whose archive already holds a live generation
+/// of the very space this route describes, when that generation cannot be
+/// opened.
+///
+/// Without a proof the route has no declared dimension, so the archive's own
+/// live dimensions are enumerated and this route's identity re-derived at each.
+/// A generation this route cannot open — for example one a previous fallback
+/// contribution shaped and the since-removed proof no longer covers — can never
+/// be reused or extended, so `cass sync` must stop here, before the mirror stage
+/// and before `run_index`, instead of mirroring and indexing and only then
+/// reporting the incompatibility.
+///
+/// The rejection keeps the code the record itself carried:
+/// `CompatibilityRequired` when the record needs cross-endpoint evidence, and
+/// every other code as a plain failure, so a malformed record is never
+/// relabelled as a compatibility problem. Read-only, like the admission above.
+fn refuse_unopenable_archive(
+    storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<(), ApiPrimaryBackfillError> {
+    let dimensions: Vec<u64> = storage
+        .raw()
+        .with_tx_no_replay(TxMode::Deferred, |tx| {
+            tx.query_all_map(ARCHIVE_LIVE_DIMENSIONS_SQL, &[], |row| row.get_typed::<i64>(0))
+        })
+        .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?
+        .into_iter()
+        .filter_map(|dim| u64::try_from(dim).ok())
+        .collect();
+    let mut identities = Vec::with_capacity(dimensions.len());
+    for dimension in dimensions {
+        if let Ok(descriptor) = RepresentationDescriptor::from_profile(call.profile(), dimension) {
+            identities.push((
+                descriptor.embedder_id(),
+                dimension,
+                descriptor.canonicalize_version(),
+                descriptor.chunking_version(),
+            ));
+        }
+    }
+    if identities.is_empty() {
+        return Ok(());
+    }
+    let rejection = storage
+        .raw()
+        .with_tx_no_replay(TxMode::Deferred, |tx| {
+            for (id, dimension, canonicalize, chunking) in &identities {
+                for candidate in live_candidates_for(tx, id, *dimension, *canonicalize, *chunking)? {
+                    if let Err(error) = crate::storage::api_generation::open_api_generation(
+                        tx, candidate, call.profile(),
+                    ) {
+                        return Ok(Some(error));
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .map_err(|error| ApiPrimaryBackfillError::Failed(anyhow!(error)))?;
+    match rejection {
+        None => Ok(()),
+        Some(error)
+            if error.code() == crate::storage::api_generation::ApiGenerationErrorCode::CompatibilityRequired =>
+        {
+            Err(ApiPrimaryBackfillError::CompatibilityRequired {
+                message: "CompatibilityRequired: the archive holds a generation this route cannot \
+                          open without cross-endpoint compatibility evidence; no model request sent"
+                    .into(),
+            })
+        }
+        Some(error) => Err(ApiPrimaryBackfillError::Failed(anyhow!(error))),
+    }
+}
+
+/// Verify every possible existing target before a probe may use the backup.
+/// The fingerprint is still measured live; proof metadata only supplies the
+/// expected space for this read-only preflight. Page/activation checks remain.
+pub fn probe_api_backfill(
+    storage: &FrankenStorage, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
+    call.invalidate_probe();
+    admit_existing_primary_generations(storage, call)?;
+    call.probe().map_err(|error| if error.is_compatibility_required() {
+        ApiPrimaryBackfillError::CompatibilityRequired { message: error.message() }
+    } else { ApiPrimaryBackfillError::Failed(anyhow!(error)) })
+}
+
+/// One fresh, generic synthetic probe for a command that must decide
+/// reachability **before** it touches the archive (`cass sync`'s semantic
+/// preflight).
+///
+/// `existing_database` is the canonical archive opened **read-only**, or `None`
+/// when the path holds no current-schema archive yet. When an archive is
+/// present, the same historical admission `probe_api_backfill` enforces runs
+/// first, so a fallback cannot be reached while an existing generation is
+/// unadmitted; on top of it, a route **without** a proof additionally checks the
+/// archive's own generations with [`refuse_unopenable_archive`], because this
+/// command must refuse before it mirrors or indexes. A fresh archive has no
+/// generation history, so the compatibility proof `EmbeddingRoute::load` already
+/// read and validated is the whole fallback admission. No write transaction is
+/// opened either way, so a failed probe leaves an existing archive unchanged and
+/// a missing one uncreated.
+pub fn probe_api_preflight(
+    existing_database: Option<&FrankenStorage>, call: &PrimaryEmbeddingCall,
+) -> std::result::Result<ProbeMeasurement, ApiPrimaryBackfillError> {
+    call.invalidate_probe();
+    if let Some(storage) = existing_database {
+        admit_existing_primary_generations(storage, call)?;
+        // `models backfill` opens a writer up front and has no "refuse before a
+        // side effect" contract, so its proof-less path is left exactly as it
+        // was. `cass sync` does have that contract, so the archive's own
+        // generations are checked here as well — the extra check lives only on
+        // this entry.
+        if call.route().proof.is_none() {
+            refuse_unopenable_archive(storage, call)?;
+        }
+    }
+    call.probe().map_err(|error| if error.is_compatibility_required() {
+        ApiPrimaryBackfillError::CompatibilityRequired { message: error.message() }
+    } else { ApiPrimaryBackfillError::Failed(anyhow!(error)) })
+}
+
+/// One API-primary catch-up run: the shared loop over an
+/// [`ApiPrimaryCatchupEngine`].
+///
+/// `probe` is the measurement this command already took from the endpoint; its
+/// dimension fixes the generation's representation identity and its fingerprint
+/// fixes the served-weights check. The call's own probe and document evidence
+/// stays readable on `call` even when this function returns an error.
+pub fn run_api_primary_catchup_backfill(
+    storage: &FrankenStorage,
+    batch_size: usize,
+    call: &PrimaryEmbeddingCall,
+    profile: &ValidatedProfile,
+    probe: &ProbeMeasurement,
+    ownership_seed: u64,
+) -> std::result::Result<ApiPrimaryBackfillOutcome, ApiPrimaryBackfillError> {
+    let descriptor = RepresentationDescriptor::from_profile(profile, probe.dimension as u64)
+        .map_err(|e| {
+            ApiPrimaryBackfillError::Failed(anyhow!(
+                "the selected API embedding profile has no usable representation identity: {e}"
+            ))
+        })?;
+    let endpoint = EndpointConfigIdentity::from_profile(profile).map_err(|e| {
+        ApiPrimaryBackfillError::Failed(anyhow!(
+            "the selected API embedding profile has no usable call identity: {e}"
+        ))
+    })?;
+    let engine = ApiPrimaryCatchupEngine {
+        call,
+        profile,
+        embedder_id: descriptor.embedder_id(),
+        dimension: probe.dimension,
+        canonicalize_version: descriptor.canonicalize_version(),
+        chunking_version: descriptor.chunking_version(),
+        fingerprint: &probe.fingerprint,
+    };
+
+    match run_catchup_with_engine(storage, batch_size, &engine, ownership_seed) {
+        Ok(catchup) => Ok(ApiPrimaryBackfillOutcome {
+            catchup,
+            model_api: call.model_api_report(descriptor.sha256(), endpoint.sha256()),
+        }),
+        Err(error) => {
+            if call
+                .last_failure()
+                .is_some_and(|failure| failure.is_compatibility_required())
+            {
+                Err(ApiPrimaryBackfillError::CompatibilityRequired {
+                    message: format!("{error:#}"),
+                })
+            } else {
+                Err(ApiPrimaryBackfillError::Failed(error))
+            }
+        }
+    }
+}
+
+/// Drive one full v5 chunk-domain catch-up run against the legacy Infinity
+/// identity. Thin wrapper over [`run_catchup_with_engine`]; behavior is
+/// unchanged from before API02D split the loop from its engine.
 #[allow(clippy::too_many_arguments)]
 pub fn run_db_vector_catchup_backfill(
     storage: &FrankenStorage,
     batch_size: usize,
-    identity: &InfinityServedIdentity,
+    identity: &ServedEmbeddingIdentity,
     canonicalize_version: u32,
     chunking_policy_version: u32,
     fingerprint: &[u8],
     embedder: &dyn Fn(&[&str]) -> std::result::Result<Vec<Vec<f32>>, String>,
     ownership_seed: u64,
 ) -> Result<DbVectorCatchupReport> {
+    let engine = InfinityCatchupEngine {
+        identity,
+        canonicalize_version,
+        chunking_version: chunking_policy_version,
+        fingerprint,
+        embedder,
+    };
+    run_catchup_with_engine(storage, batch_size, &engine, ownership_seed)
+}
+
+/// The shared loop. See [`run_db_vector_catchup_backfill`]'s original doc
+/// comment (below) for the phase-by-phase description.
+fn run_catchup_with_engine<E: CatchupEngine>(
+    storage: &FrankenStorage,
+    batch_size: usize,
+    engine: &E,
+    ownership_seed: u64,
+) -> Result<DbVectorCatchupReport> {
     if batch_size == 0 {
         bail!("batch_size must be > 0");
     }
-    let dim = i64::try_from(identity.dimension)
-        .map_err(|_| anyhow!("infinity dimension {} does not fit in i64", identity.dimension))?;
+    let dim = i64::try_from(engine.dimension())
+        .map_err(|_| anyhow!("embedding dimension {} does not fit in i64", engine.dimension()))?;
     let now_ms = FrankenStorage::now_millis();
 
     // T10.5: moved up from immediately after generation resolution (was
@@ -1674,15 +2265,8 @@ pub fn run_db_vector_catchup_backfill(
     // the reverse-reconciliation pass at the end of this function).
     let (all_expected, expected_by_message) = scan_expected_snapshot(storage)?;
 
-    let (generation_id, reused_existing_generation, holes_seeded) = find_reusable_or_create_generation(
-        storage.raw(),
-        identity,
-        canonicalize_version,
-        chunking_policy_version,
-        fingerprint,
-        now_ms,
-        &all_expected,
-    )?;
+    let (generation_id, reused_existing_generation, holes_seeded) =
+        engine.find_or_create_generation(storage.raw(), now_ms, &all_expected)?;
     // Idempotent (`CREATE VIRTUAL TABLE IF NOT EXISTS`): a no-op for a
     // reused generation, and the one place a brand-new generation's vec0
     // table actually gets created (T8 populates it incrementally via
@@ -1834,13 +2418,13 @@ pub fn run_db_vector_catchup_backfill(
 
         if !pending_embed.is_empty() {
             let texts: Vec<&str> = pending_embed.iter().map(|(_, _, _, _, t)| t.as_str()).collect();
-            let vectors = embedder(&texts).map_err(|e| anyhow!("batched embedding of {} chunk(s) failed: {e}", texts.len()))?;
+            let vectors = engine.embed(&texts).map_err(|e| anyhow!("batched embedding of {} chunk(s) failed: {e}", texts.len()))?;
             if vectors.len() != pending_embed.len() {
                 bail!("embedder returned {} vector(s) for {} input(s) (batched embed)", vectors.len(), pending_embed.len());
             }
             for ((message_id, chunk_idx, conversation_id, span, _text), vector) in pending_embed.into_iter().zip(vectors) {
-                if vector.len() != identity.dimension {
-                    bail!("embedder returned dim {} != expected {} for message {message_id} chunk_idx {chunk_idx}", vector.len(), identity.dimension);
+                if vector.len() != engine.dimension() {
+                    bail!("embedder returned dim {} != expected {} for message {message_id} chunk_idx {chunk_idx}", vector.len(), engine.dimension());
                 }
                 let norm = schema::l2_norm(&vector) as f32;
                 batch_rows.push(ChunkRow {
@@ -1863,6 +2447,12 @@ pub fn run_db_vector_catchup_backfill(
         storage
             .raw()
             .with_tx(TxMode::Immediate, |tx| {
+                // API02D: re-verify this engine's generation identity inside the
+                // very transaction that writes, before any row lands. A record
+                // that no longer opens against the running profile (or was
+                // never written) aborts this whole page, so no vector can be
+                // staged under a generation whose identity stopped being true.
+                engine.verify_page_identity(tx, generation_id, !batch_rows.is_empty())?;
                 if !batch_rows.is_empty() {
                     schema::stage_chunk_rows_in_tx(tx, batch_id, &batch_rows)?;
                 }
@@ -1956,7 +2546,13 @@ pub fn run_db_vector_catchup_backfill(
     )?;
     let mut activated = false;
     if holes_after == 0 {
-        let audit_report = activate_generation(storage, generation_id, embedder, ownership_seed)
+        // The full T8 activation audit runs on every run that can activate,
+        // including a repeat run of an already-complete generation. No flag,
+        // `is_active` value or "no new holes" state may substitute for it: an
+        // active generation can have been demoted to pending by a write since,
+        // and its stored vectors can be wrong even when its identity matches.
+        let audit_embed = |texts: &[&str]| engine.embed_for_audit(texts);
+        let audit_report = activate_generation(storage, generation_id, &audit_embed, ownership_seed)
             .context("running the T8 v5 activation audit before activating a chunk-domain generation")?;
         // Task book #98 Step 1/4: the R1-B8 exact-content-twin tolerance
         // this task book added to checks ③/⑩ has no other observable
@@ -1988,7 +2584,7 @@ pub fn run_db_vector_catchup_backfill(
             );
         }
         schema::switch_active_generation(storage.raw(), generation_id, FrankenStorage::now_millis(), |tx| {
-            switch_guard_in_tx(tx, generation_id, audit_report.chunk_count)
+            engine.activation_guard(tx, generation_id, audit_report.chunk_count)
         })
         .context("activating v5 chunk-domain generation")?;
         activated = true;
@@ -2007,7 +2603,15 @@ pub fn run_db_vector_catchup_backfill(
     // scan-level failure are folded into `.failures`), so there is no
     // `?`/`.context(...)` left here to lose this run's already-committed
     // activation to a housekeeping failure.
-    let cleanup_outcome = cleanup_orphaned_generations(storage, FrankenStorage::now_millis());
+    //
+    // API02D: the API-primary engine returns `false` here, so this run never
+    // prunes a candidate it just built (spec §"代际与事务接线"). The legacy
+    // engine keeps the unconditional tail call above verbatim.
+    let cleanup_outcome = if engine.allows_orphan_cleanup() {
+        cleanup_orphaned_generations(storage, FrankenStorage::now_millis())
+    } else {
+        Ok(GenerationCleanupOutcome::default())
+    };
     let (cleanup_deleted_generation_ids, cleanup_failures) = match cleanup_outcome {
         Ok(outcome) => (outcome.deleted_ids, outcome.failures),
         Err(e) => (Vec::new(), vec![(0, format!("cleanup_orphaned_generations errored: {e}"))]),
@@ -2016,7 +2620,7 @@ pub fn run_db_vector_catchup_backfill(
     Ok(DbVectorCatchupReport {
         generation_id,
         reused_existing_generation,
-        embedder_id: identity.model_id.clone(),
+        embedder_id: engine.embedder_id(),
         dim,
         eligible_seeded: 0,
         embedded_inserted: 0,
@@ -2162,7 +2766,7 @@ mod chunk_catchup_v5_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::chunking::CHUNKING_POLICY_VERSION;
-    use crate::search::infinity::FINGERPRINT_SENTINELS;
+    use crate::search::generation_fingerprint::FINGERPRINT_SENTINELS;
 
     const TS: i64 = 1_770_600_000_000;
     const DIM: usize = 4;
@@ -2234,8 +2838,8 @@ mod chunk_catchup_v5_tests {
         out
     }
 
-    fn mock_identity() -> InfinityServedIdentity {
-        InfinityServedIdentity { model_id: "mock-embedder-t8".to_string(), dimension: DIM }
+    fn mock_identity() -> ServedEmbeddingIdentity {
+        ServedEmbeddingIdentity { model_id: "mock-embedder-t8".to_string(), dimension: DIM }
     }
 
     fn insert_conversation(storage: &FrankenStorage, external_id: &str, contents: &[&str]) -> Vec<i64> {
@@ -3883,239 +4487,303 @@ mod chunk_catchup_v5_tests {
         assert!(!plan_details.iter().any(|d| d.contains("SCAN chunk_holes")), "must not fall back to a chunk_holes table SCAN: {plan_details:?}");
     }
 
-    /// Live proof (real Infinity at 127.0.0.1:7997): a real chunk-domain
-    /// backfill run must actually activate, using the real production
-    /// embedder wrapper (`InfinityEmbedder::embed_batch_sync`) instead of
-    /// the deterministic mock every other test in this module uses.
-    /// `#[ignore]`d -- run explicitly with `--ignored`.
-    #[test]
-    #[ignore]
-    fn fingerprint_live_chunk_backfill_activates() {
-        use crate::search::embedder::Embedder as _;
-        use crate::search::infinity::{InfinityConfig, InfinityEmbedder, probe_identity_and_fingerprint};
-        let dir = tempfile::TempDir::new().unwrap();
-        let storage = open_storage(&dir.path().join("db.sqlite"));
+}
+/// API03G: the `cass sync` semantic preflight's own production entry,
+/// [`probe_api_preflight`], driven against a **read-only** SQLite handle and the
+/// existing TLS fallback fixtures.
+///
+/// These are in-crate tests on purpose. `ApiClient::new_with_test_root` is a
+/// `cfg(test)` trust root and no production trust switch may be added for it, so
+/// the TLS half of the fallback contract cannot be driven from the CLI
+/// integration suite. They supplement -- they do not replace -- the real-CLI
+/// coverage in `tests/api_sync_preflight.rs`, and they are not a CLI run or a
+/// real-cloud drill.
+///
+/// The handle handed to the preflight is always the one
+/// `FrankenStorage::open_readonly` returns, on the same path a writer just
+/// finished with. That is what makes "the preflight writes nothing" a structural
+/// fact rather than a comparison of a few columns: a read-only connection
+/// cannot write at all.
+#[cfg(all(test, not(windows)))]
+mod api03g_sync_preflight_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
-        let config = InfinityConfig::from_env();
-        let (identity, fingerprint) = probe_identity_and_fingerprint(&config).expect("live infinity identity+fingerprint probe");
-        let embedder = InfinityEmbedder::new().expect("live infinity embedder");
-        let embed_fn = |texts: &[&str]| embedder.embed_batch_sync(texts).map_err(|e| e.to_string());
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::search::model_api::compatibility_bundle::tests::{
+        fallback_fixture, migration_fixture,
+    };
+    use crate::search::model_api::embedding_route::EmbeddingRoute;
+    use crate::search::model_api::primary_embedding::PrimaryEmbeddingCall;
+    use crate::search::model_api::test_support::{HttpFixture, Reply, TlsFixture};
+    use crate::search::model_api::{ApiClient, EnvCredentialResolver};
+    use crate::storage::api::{StorageError, TxMode};
+    use crate::storage::api_generation::create_api_generation;
+    use crate::storage::sqlite::FrankenStorage;
 
-        // Create the (pending) generation + its vec0 table directly --
-        // not via a genesis backfill call on zero messages -- for the same
-        // reason `genesis()` above does (③'s positive-check has no anchor
-        // to pick with nothing embedded yet; a real corpus is never
-        // actually empty in production).
-        let generation_id = storage
-            .raw()
-            .with_tx(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation(tx, &identity.model_id, i64::try_from(identity.dimension).unwrap(), CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &fingerprint, TS)
-            })
-            .unwrap();
-        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, i64::try_from(identity.dimension).unwrap()).unwrap();
+    use super::{probe_api_backfill, probe_api_preflight, run_api_primary_catchup_backfill};
 
-        insert_conversation(&storage, "t8-live", &["a real message about how vec0 chunk-domain catch-up should behave against a live Infinity service"]);
-        let report = run_db_vector_catchup_backfill(&storage, 32, &identity, CANONICALIZE_PIPELINE_VERSION, CHUNKING_POLICY_VERSION, &fingerprint, &embed_fn, 7).unwrap();
-        assert_eq!(report.generation_id, generation_id);
-        assert!(report.activated, "a real live drain of one small message must activate cleanly: {report:?}");
-        assert!(report.chunks_embedded >= 1);
+    /// Open the same archive read-only, the way `cass sync`'s preflight does.
+    fn readonly(path: &std::path::Path) -> FrankenStorage {
+        FrankenStorage::open_readonly(path).expect("open the archive read-only")
     }
 
-    /// mission #92 Step 4/5 (T-R's own v5 positive fixture source, per
-    /// control plane 2026-09-04): a synthetic 200-conversation corpus,
-    /// drained through the *real* candidate release binary (via the run
-    /// root wrapper, `$CASS_WRAP index --semantic`) against a real
-    /// Infinity, must activate cleanly with a zero-failure audit and
-    /// `ownership_checked == 200`. `#[ignore]`d, run with `--ignored`.
-    ///
-    /// No run-root path is hardcoded here (PUBLIC repo constraint,
-    /// control plane 2026-09-04): the data dir comes from
-    /// `CASS_W4_SYNTH_DIR` (falls back to an ephemeral tempdir if unset,
-    /// so the test still runs standalone) and the wrapper binary from
-    /// `CASS_WRAP` -- both set by whoever invokes this test, not baked
-    /// into the source.
-    ///
-    /// The 200 conversations are seeded via the production write path
-    /// directly (`insert_conversation_tree`) -- "走生产写入路径建库" -- not
-    /// via any CLI ingest command (there is no source file to scan); only
-    /// the *semantic* step goes through the real CLI subprocess. The
-    /// generation is pre-created (same reason `genesis()`/the single-
-    /// message live test above do it) via the exact same `probe_identity_
-    /// and_fingerprint` call the CLI subprocess will independently make
-    /// against the same live Infinity -- both resolve to the same
-    /// identity+fingerprint bytes, so the subprocess's own generation
-    /// lookup reuses this pre-created row (tier ① of `find_reusable_or_
-    /// create_generation`) instead of creating a second one.
-    #[test]
-    #[ignore]
-    fn live_synth_200_v5_backfill_via_real_binary() {
-        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use crate::search::infinity::{InfinityConfig, InfinityEmbedder, probe_identity_and_fingerprint};
-
-        let synth_dir_env = std::env::var("CASS_W4_SYNTH_DIR").ok();
-        let _tempdir_keepalive;
-        let synth_dir: std::path::PathBuf = match &synth_dir_env {
-            Some(dir) => {
-                std::fs::create_dir_all(dir).expect("create CASS_W4_SYNTH_DIR");
-                _tempdir_keepalive = None;
-                std::path::PathBuf::from(dir)
-            }
-            None => {
-                let t = tempfile::TempDir::new().unwrap();
-                let p = t.path().to_path_buf();
-                _tempdir_keepalive = Some(t);
-                p
-            }
-        };
-        let db_path = synth_dir.join("agent_search.db");
-
-        let config = InfinityConfig::from_env();
-        let (identity, fingerprint) = probe_identity_and_fingerprint(&config).expect("live infinity identity+fingerprint probe");
-
-        let storage = FrankenStorage::open(&db_path).expect("open synth db");
-        let generation_id = storage
+    /// Every generation row, for a before/after comparison that does not depend
+    /// on row order.
+    fn generation_rows(storage: &FrankenStorage) -> Vec<String> {
+        storage
             .raw()
-            .with_tx(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation(
-                    tx,
-                    &identity.model_id,
-                    i64::try_from(identity.dimension).unwrap(),
-                    CANONICALIZE_PIPELINE_VERSION,
-                    CHUNKING_POLICY_VERSION,
-                    &fingerprint,
-                    TS,
-                )
-            })
-            .unwrap();
-        vector_domain::create_vec0_table_for_generation(storage.raw(), generation_id, i64::try_from(identity.dimension).unwrap()).unwrap();
+            .query_all_map(
+                "SELECT id || '|' || embedder_id || '|' || dim || '|' || is_active || '|' \
+                 || audit_status || '|' || canonicalize_version || '|' || chunking_policy_version \
+                 || '|' || hex(fingerprint) FROM embedding_generations ORDER BY id",
+                &[],
+                |row| row.get_typed::<String>(0),
+            )
+            .expect("read generations")
+    }
 
-        let agent_id = storage
-            .ensure_agent(&Agent { id: None, slug: "claude_code".into(), name: "Claude Code".into(), version: Some("1.0".into()), kind: AgentKind::Cli })
-            .unwrap();
-        for i in 0..200 {
-            let conv = Conversation {
+    fn seed_messages(storage: &FrankenStorage, texts: &[&str]) {
+        let agent = storage
+            .ensure_agent(&Agent {
                 id: None,
-                agent_slug: "claude_code".into(),
-                workspace: None,
-                external_id: Some(format!("t8-synth200-{i}")),
-                title: Some("T8 synth-200-v5 fixture".into()),
-                source_path: std::path::PathBuf::from(format!("/fixtures/synth200-{i}.jsonl")),
-                started_at: Some(TS),
-                ended_at: Some(TS + 1),
-                approx_tokens: None,
-                metadata_json: serde_json::Value::Null,
-                messages: vec![Message {
-                    excluded: None,
+                slug: "claude_code".into(),
+                name: "fixture".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure agent");
+        let messages: Vec<Message> = texts
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| Message {
+                excluded: None,
+                id: None,
+                idx: idx as i64,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_000 + idx as i64),
+                content: (*text).into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            })
+            .collect();
+        storage
+            .insert_conversation_tree(
+                agent,
+                None,
+                &Conversation {
                     id: None,
-                    idx: 0,
-                    role: MessageRole::User,
-                    author: None,
-                    created_at: Some(TS),
-                    content: format!("synthetic T-R fixture message number {i} with distinct real content for chunk-domain backfill"),
-                    extra_json: serde_json::Value::Null,
-                    snippets: vec![],
-                }],
-                source_id: "local".into(),
-                origin_host: None,
-            };
-            storage.insert_conversation_tree(agent_id, None, &conv).expect("insert synth conversation");
+                    agent_slug: "claude_code".into(),
+                    workspace: None,
+                    external_id: Some("api03g-preflight".into()),
+                    title: Some("api03g preflight".into()),
+                    source_path: "/fixtures/api03g-preflight.jsonl".into(),
+                    started_at: Some(1_700_000_000),
+                    ended_at: Some(1_700_000_002),
+                    approx_tokens: None,
+                    metadata_json: serde_json::Value::Null,
+                    messages,
+                    source_id: "local".into(),
+                    origin_host: None,
+                },
+            )
+            .expect("insert fixture conversation");
+    }
+
+    /// A primary endpoint, a TLS backup, and the frozen route built from the
+    /// compatibility fixture. `with_proof` installs the checked bundle the
+    /// fixture produced -- what the production loader would have read from
+    /// `fallback_compatibility_file` -- and the returned flag records whether it
+    /// was installed, so a caller can pin the arm it is testing.
+    fn fallback_call(
+        primary: &str,
+        backup: &TlsFixture,
+        with_proof: bool,
+    ) -> (PrimaryEmbeddingCall, bool) {
+        let (config, proof) = fallback_fixture(primary, &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let mut route = EmbeddingRoute::load(&config, &profile, true);
+        if with_proof {
+            route.proof_sha256 = Some(proof.digest().into());
+            route.proof = Some(Arc::new(proof));
         }
-        drop(storage);
-
-        let wrapper = std::env::var("CASS_WRAP").expect("CASS_WRAP env var must point at the run-root wrapper script (no path hardcoded in source)");
-        // control plane 2026-09-04 (root-cause correction): cass's built-in
-        // agent source discovery walks HOME (`~/.codex`, `~/.claude`, ...)
-        // directly, unaffected by XDG_CONFIG_HOME -- an inherited real HOME
-        // makes `index` (even scoped to an isolated CASS_DATA_DIR) discover
-        // and ingest the *real* local corpus. `CASS_W4_TEST_HOME` (an
-        // empty, run-root-scoped directory the caller creates) must be
-        // passed explicitly; no path is hardcoded in source.
-        let test_home = std::env::var("CASS_W4_TEST_HOME").expect("CASS_W4_TEST_HOME env var must point at an empty run-root-scoped HOME (no path hardcoded in source)");
-        // `$RUN_ROOT/cass-candidate` is T12's own setup-cass-fork.sh output
-        // position (sha-asserted there) -- this test must not pre-occupy
-        // it, so it points the wrapper at this run's own release build via
-        // the wrapper's CASS_CAND_BIN override instead.
-        let cand_bin = std::env::var("CASS_CAND_BIN").unwrap_or_else(|_| "/tmp/cc-cass-pr4-target/release/cass".to_string());
-
-        // Dry run first (no --semantic): proves HOME isolation actually
-        // worked -- the streaming-ingest summary must report exactly the
-        // 200 synthetic conversations/messages just seeded, not a real
-        // local corpus, before any Infinity call is ever made.
-        let dry_run = std::process::Command::new(&wrapper)
-            .arg("index")
-            .env("CASS_DATA_DIR", &synth_dir)
-            .env("HOME", &test_home)
-            .env("CASS_CAND_BIN", &cand_bin)
-            .output()
-            .expect("spawn $CASS_WRAP index (dry run, no --semantic)");
-        assert!(
-            dry_run.status.success(),
-            "dry-run `index` must exit 0: stdout={} stderr={}",
-            String::from_utf8_lossy(&dry_run.stdout),
-            String::from_utf8_lossy(&dry_run.stderr)
+        let installed = route.proof.is_some();
+        let client = ApiClient::new_with_test_root(
+            config,
+            Box::new(EnvCredentialResolver),
+            backup.ca_pem().to_vec(),
         );
-        // HOME isolation proof: the 200 conversations were seeded directly
-        // via the production write path (not by `index` scanning source
-        // files), so a correctly-isolated `index` run finds *zero* new
-        // conversations to discover from disk -- `total_conversations=0`
-        // is the *positive* signal here, not a fluke; a real-corpus leak
-        // (this test's original failure mode) would instead show
-        // `discovered=true` for at least one connector and a large
-        // nonzero total_conversations/total_messages count.
-        let dry_run_stderr = String::from_utf8_lossy(&dry_run.stderr);
-        assert!(
-            dry_run_stderr.contains("total_conversations=0 total_messages=0"),
-            "HOME isolation must be proven BEFORE any Infinity call: expected zero newly-discovered conversations (the 200 fixture rows were seeded directly, not via source-file ingest), got: {dry_run_stderr}"
+        let call = PrimaryEmbeddingCall::from_frozen_route(client, route)
+            .unwrap_or_else(|error| panic!("frozen route: {error}"));
+        (call, installed)
+    }
+
+    /// A valid, admitted proof lets the preflight reach the declared backup when
+    /// the primary refuses.
+    #[test]
+    fn valid_proof_reaches_the_tls_backup_and_writes_nothing() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        assert!(has_proof, "this arm must carry the checked bundle");
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+        // Create the archive with a writer, then hand the preflight only the
+        // read-only handle.
+        FrankenStorage::open(&db_path).expect("create the archive").close().expect("close");
+        let storage = readonly(&db_path);
+        let before = generation_rows(&storage);
+
+        let probe = match probe_api_preflight(Some(&storage), &call) {
+            Ok(probe) => probe,
+            Err(error) => panic!("an admitted backup must be allowed to answer the probe: {error}"),
+        };
+        assert_eq!(probe.dimension, 2);
+
+        // The real producer and the per-attempt HTTP facts, as observed.
+        let calls = call.probe_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one primary attempt, then one backup attempt: {calls:?}"
         );
-        assert!(
-            !dry_run_stderr.contains("discovered=true"),
-            "no connector may discover a real local corpus once HOME is isolated: {dry_run_stderr}"
-        );
-        let seeded_message_count: i64 = FrankenStorage::open_readonly(&db_path)
-            .expect("reopen synth db read-only to confirm the 200 fixture rows survived the dry run")
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
-            .unwrap();
-        assert_eq!(seeded_message_count, 200, "the 200 directly-seeded messages must still be present after the dry run");
+        assert_eq!(calls[0].profile_id, "primary");
+        assert_eq!(calls[0].http_status, Some(503));
+        assert_eq!(calls[1].profile_id, "backup");
+        assert_eq!(calls[1].http_status, Some(200));
+        assert!(calls[1].network_attempted);
+        assert_eq!(calls[1].response_model, None, "the fixture reports no model");
+        assert_eq!(calls[1].serving_provider, None);
+        assert_eq!(primary.hits(), 1);
+        assert_eq!(backup.fixture().hits(), 1);
 
-        let output = std::process::Command::new(&wrapper)
-            .arg("index")
-            .arg("--semantic")
-            .env("CASS_DATA_DIR", &synth_dir)
-            .env("HOME", &test_home)
-            .env("CASS_CAND_BIN", &cand_bin)
-            .output()
-            .expect("spawn $CASS_WRAP index --semantic");
-        assert!(
-            output.status.success(),
-            "real candidate binary `index --semantic` must exit 0: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_eq!(generation_rows(&storage), before);
+        assert!(before.is_empty());
+    }
 
-        let storage = FrankenStorage::open_readonly(&db_path).expect("reopen synth db read-only");
-        let (active_generation_id, audit_status): (i64, String) = storage
-            .raw()
-            .query_row_map("SELECT id, audit_status FROM embedding_generations WHERE is_active = 1", &[], |row| Ok((row.get_typed(0)?, row.get_typed(1)?)))
-            .expect("an active generation must exist after a successful CLI run");
-        assert_eq!(active_generation_id, generation_id, "the CLI subprocess must have reused the pre-created generation (identity+fingerprint match), not created a second one");
-        assert_eq!(audit_status, "passed");
+    /// A generation this route cannot open is refused before any request, so a
+    /// proof that does not cover the archive's history never reaches the cloud.
+    #[test]
+    fn uncovered_history_refuses_before_any_http() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        assert!(has_proof);
 
-        let embedder = InfinityEmbedder::new().expect("live infinity embedder for the re-verification audit");
-        use crate::search::embedder::Embedder as _;
-        let embed_fn = |texts: &[&str]| embedder.embed_batch_sync(texts).map_err(|e| e.to_string());
-        let report = run_activation_audit(&storage, generation_id, 500, None, Some(&embed_fn), 200, 12345).expect("re-audit the CLI-produced generation");
-        assert!(report.passed, "the CLI-produced generation must re-audit clean: {report:?}");
-        assert_eq!(report.hash_mismatch, 0, "⑧: {report:?}");
-        assert_eq!(report.span_mismatch, 0, "⑨ span: {report:?}");
-        assert_eq!(report.completeness_missing, 0, "⑨ completeness missing: {report:?}");
-        assert_eq!(report.completeness_extra, 0, "⑨ completeness extra: {report:?}");
-        assert_eq!(report.ownership_failed, 0, "⑩: {report:?}");
-        assert!(report.fingerprint_ok, "⑪: {report:?}");
-        assert_eq!(report.ownership_checked, 200, "min(200, chunk_count) must be 200 for a 200-message, one-chunk-each corpus: {report:?}");
-
-        if synth_dir_env.is_some() {
-            eprintln!("live_synth_200_v5_backfill_via_real_binary: synth-200-v5 library left at {} (not cleaned up)", synth_dir.display());
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        {
+            let writer = FrankenStorage::open(&db_path).expect("create the archive");
+            writer
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+                })
+                .expect("seed an uncovered historical generation");
+            writer.close().expect("close the writer");
         }
+        let storage = readonly(&db_path);
+        let before = generation_rows(&storage);
+
+        let error = match probe_api_preflight(Some(&storage), &call) {
+            Ok(_) => panic!("an uncovered historical generation must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("CompatibilityRequired"),
+            "the refusal must name the compatibility requirement: {error}"
+        );
+        assert!(
+            call.probe_calls().is_empty(),
+            "a refused admission must record no probe attempt: {:?}",
+            call.probe_calls()
+        );
+        assert_eq!(primary.hits(), 0, "no request may be sent for a refused admission");
+        assert_eq!(backup.fixture().hits(), 0);
+        assert_eq!(generation_rows(&storage), before);
+    }
+
+    /// The risk lead, measured on **one** pair of endpoints: build a generation
+    /// through the backup, then flip the *same* primary from refusing to
+    /// healthy and remove only the proof. Nothing but the proof differs, so a
+    /// refusal here is attributable to the missing proof and not to endpoint
+    /// drift.
+    ///
+    /// The preflight must refuse before the mirror stage and before `run_index`,
+    /// instead of letting the round mirror and index and only then report the
+    /// incompatibility. It is asserted rather than assumed: if the preflight
+    /// answers here instead, the risk lead is confirmed.
+    #[test]
+    fn missing_proof_over_a_backup_built_generation_is_refused_before_any_http() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+
+        // One primary service, refusing while the backup builds, healthy after.
+        let healed = Arc::new(AtomicBool::new(false));
+        let primary = HttpFixture::start(vec![Reply::Conditional(
+            Arc::clone(&healed),
+            Box::new(Reply::status(503)),
+            Box::new(Reply::Embeddings(2)),
+        )]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+
+        // ---- build phase: a real generation whose only contributor is the backup
+        {
+            let writer = FrankenStorage::open(&db_path).expect("create the archive");
+            seed_messages(
+                &writer,
+                &[
+                    "A synthetic document describes how to verify an embedding service response.",
+                    "Another synthetic document describes atomic storage and provenance.",
+                ],
+            );
+            let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+            assert!(has_proof, "the build phase needs the proof");
+            let profile = call.profile().clone();
+            let probe = probe_api_backfill(&writer, &call)
+                .unwrap_or_else(|error| panic!("probe: {error}"));
+            let outcome =
+                run_api_primary_catchup_backfill(&writer, 1, &call, &profile, &probe, 42)
+                    .unwrap_or_else(|error| panic!("backup-only catch-up: {error}"));
+            assert!(outcome.catchup.activated);
+            assert!(outcome.model_api.fallback_used, "the build must have used the backup");
+            writer.close().expect("close the writer");
+        }
+        let hits_before = (primary.hits(), backup.fixture().hits());
+        assert!(hits_before.0 > 0 && hits_before.1 > 0, "the build must have hit both");
+
+        // ---- verify phase: same endpoints, healthy primary, *no* proof
+        healed.store(true, Ordering::SeqCst);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, false);
+        assert!(!has_proof, "this arm must have no proof");
+
+        let storage = readonly(&db_path);
+        let before = generation_rows(&storage);
+        assert!(
+            before.iter().any(|row| row.contains("api:")),
+            "the fixture must hold an API generation: {before:?}"
+        );
+
+        let error = match probe_api_preflight(Some(&storage), &call) {
+            Ok(_) => panic!(
+                "risk lead confirmed: with no proof, a backup-built generation is refused only \
+                 after the round would have mirrored and indexed; the preflight must refuse here"
+            ),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("CompatibilityRequired"),
+            "the refusal must name the compatibility requirement: {error}"
+        );
+        assert!(call.probe_calls().is_empty(), "{:?}", call.probe_calls());
+        assert_eq!(
+            (primary.hits(), backup.fixture().hits()),
+            hits_before,
+            "a refused preflight may not send anything, on either endpoint"
+        );
+        assert_eq!(generation_rows(&storage), before);
     }
 }

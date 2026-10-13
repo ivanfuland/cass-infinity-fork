@@ -84,8 +84,8 @@ case: ready_semantic_absent
 ✓ Search ready
   Search usable now: yes
   Why: All derived search assets are converged; results are complete and current.
-  Missing/stale: semantic refinement unavailable (semantic=absent); results are lexical-only until a model is installed
-  Safest next step: semantic tier absent; install the model for hybrid refinement (lexical works now) → `cass models install`
+  Missing/stale: semantic refinement unavailable (semantic=absent); results are lexical-only until an embedding API profile is configured
+  Safest next step: semantic tier absent; configure an embedding API profile for hybrid refinement (lexical works now) → `cass models check --profile <id>`
   State codes: class=ready db=available lexical=ready semantic=absent source=complete archive_risk=none binary=current next=install_semantic_model
 
 ========================================

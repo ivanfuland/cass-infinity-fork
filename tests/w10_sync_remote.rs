@@ -48,26 +48,24 @@
 //! 9. `concurrent_rounds_append_one_intact_line_each` — the same contract
 //!    across four real `cass sync` processes appending at once.
 //!
-//! What a build configuration can run, and why the gate is
-//! `all(unix, feature = "infinity")` rather than just `unix`:
+//! What a build configuration can run, and why the gate is `unix`:
 //!
 //! * The eight cross-thread/cross-process cases that drive the real binary
 //!   (`cass sync`, the stand-in `ssh`/`rsync` on a private `PATH`) expect the
-//!   round to get past the semantic precondition — which a build without the
-//!   `infinity` feature can never do (it exits 2 by construction, see
-//!   `src/sync.rs::preflight_semantic`). Leaving them Unix-only made them
-//!   *run* under `--features qr,encryption` and fail; that was a test gap, not
-//!   a product one.
+//!   round to get past the semantic precondition, which now needs a configured
+//!   embedding API profile (see `src/sync.rs::preflight_semantic`). They are
+//!   Unix-only for the private `PATH` and process signalling the fixture
+//!   relies on; the former `infinity` feature gate was retired with the
+//!   model-API migration.
 //! * The log-writer cases, the status case and the decision-table case call
 //!   only feature-independent functions, so they run in every configuration,
-//!   Windows and no-Infinity included.
+//!   Windows included.
 //!
-//! The dead-code and unused-import allowance therefore covers exactly the two
-//! configurations where the fixture is genuinely unreachable —
-//! `not(all(unix, feature = "infinity"))` — and no other, so the full build
-//! still reports an unused item if one appears.
+//! The dead-code and unused-import allowance therefore covers exactly the
+//! non-Unix configuration where the fixture is genuinely unreachable, and no
+//! other, so the Unix build still reports an unused item if one appears.
 
-#![cfg_attr(not(all(unix, feature = "infinity")), allow(dead_code, unused_imports))]
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 mod util;
 
@@ -557,7 +555,7 @@ fn db_scalar(db_path: &Path, sql: &str) -> i64 {
         .unwrap_or_else(|e| panic!("query {sql:?}: {e}"))
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 fn mode_of(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -587,7 +585,7 @@ origin_host = "cass-bad"
 paths = ["~/.claude/projects"]
 "#;
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn remote_sources_mirror_then_index_once() {
     let fixture = Fixture::new();
@@ -724,7 +722,7 @@ fn remote_sources_mirror_then_index_once() {
 // M2 — zero transfer, no sources, and a lying "Ok"
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn zero_transfer_and_no_sources_still_ingest() {
     let stub = StubInfinity::start();
@@ -863,7 +861,7 @@ paths = ["{REMOTE_PATH}", "~/.codex/sessions"]
 // M2 — a transfer that claims success without materialising its root
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn a_successful_transfer_without_its_root_is_exit_1() {
     let fixture = Fixture::new();
@@ -918,7 +916,7 @@ paths = ["{REMOTE_PATH}"]
 // M3 — the lock is a typed precondition, and it never wraps the mirror
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn a_held_index_lock_is_exit_2() {
     use fs2::FileExt;
@@ -1007,7 +1005,7 @@ paths = ["{REMOTE_PATH}"]
     );
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn an_unreachable_infinity_is_exit_2() {
     let fixture = Fixture::new();
@@ -1046,7 +1044,7 @@ fn an_unreachable_infinity_is_exit_2() {
 // M3 — the run log
 // ---------------------------------------------------------------------------
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn the_run_log_matches_stdout_byte_for_byte() {
     let fixture = Fixture::new();
@@ -1124,7 +1122,7 @@ fn the_run_log_matches_stdout_byte_for_byte() {
     }
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn a_log_that_cannot_be_written_only_warns() {
     let fixture = Fixture::new();
@@ -1476,7 +1474,7 @@ fn many_failing_sources(count: usize) -> String {
     body
 }
 
-#[cfg(all(unix, feature = "infinity"))]
+#[cfg(unix)]
 #[test]
 fn concurrent_rounds_append_one_intact_line_each() {
     // The cross-process half of the log contract: four separate `cass sync`

@@ -109,14 +109,39 @@ fn assert_usage_error(env: &Env, args: &[&str]) {
     );
 }
 
+/// The stable `error.kind` from a JSON refusal envelope, or an empty string when
+/// the output carries no envelope.
+fn stderr_error_kind(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with('{'))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .and_then(|envelope| {
+            envelope
+                .get("error")
+                .and_then(|error| error.get("kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// The arguments got past argument validation.
+///
+/// A refusal from the model API shares exit code 2 with a usage error, so the
+/// discriminator is the error `kind`: `usage` means the arguments themselves
+/// were rejected, anything else (e.g. `ModelApiConfiguration`) means parsing and
+/// validation passed and the command failed later.
 fn assert_not_usage_error(env: &Env, args: &[&str]) -> Output {
     let out = run(env, args);
-    assert_ne!(
-        code(&out),
-        2,
-        "expected {args:?} to get past argument validation; got usage error\n{}",
-        combined(&out)
-    );
+    if code(&out) == 2 {
+        assert_ne!(
+            stderr_error_kind(&combined(&out)),
+            "usage",
+            "expected {args:?} to get past argument validation; got a usage error\n{}",
+            combined(&out)
+        );
+    }
     out
 }
 
@@ -157,7 +182,12 @@ fn search_help_lists_new_flags_and_provider_values() {
 
     assert!(help.contains("--rrf-limit"), "help missing --rrf-limit:\n{help}");
     assert!(help.contains("--rerank-limit"), "help missing --rerank-limit:\n{help}");
+    // The `--rerank-provider` flag survives so a legacy script still parses and
+    // gets a migration error, but the local/OpenRouter backend names are no
+    // longer advertised as choices: the backend now comes from a configured
+    // rerank API profile.
     assert!(help.contains("--rerank-provider"), "help missing --rerank-provider:\n{help}");
+    assert!(help.contains("--rerank-profile"), "help missing --rerank-profile:\n{help}");
     for provider in [
         "qwen3-local",
         "bge-local",
@@ -165,8 +195,15 @@ fn search_help_lists_new_flags_and_provider_values() {
         "openrouter-cohere-4-fast",
         "openrouter-voyage-2.5-lite",
     ] {
-        assert!(help.contains(provider), "help missing provider {provider}:\n{help}");
+        assert!(
+            !help.contains(provider),
+            "help must not advertise the retired rerank provider {provider}:\n{help}"
+        );
     }
+    assert!(
+        help.contains("Retired"),
+        "the rerank-provider help entry should say the selection is retired:\n{help}"
+    );
 
     // The legacy search count flags must not be listed as usable flags: no help
     // line starts with an indented `--limit`/`--max-results` flag entry.
@@ -396,8 +433,6 @@ fn invalid_window_arguments_are_usage_errors() {
         &["search", "q", "--rerank", "--rrf-limit", "10", "--rerank-limit", "11"],
         // N < 5 with K omitted (default K=5) while rerank is on
         &["search", "q", "--rerank", "--rrf-limit", "3"],
-        // unknown provider value
-        &["search", "q", "--rerank", "--rerank-provider", "nope"],
         // reranker + provider conflict
         &[
             "search",
@@ -416,11 +451,40 @@ fn invalid_window_arguments_are_usage_errors() {
     }
 }
 
+/// A retired or unknown `--rerank-provider` value is no longer a *usage* error.
+///
+/// The flag is a free-form string so clap advertises no retired spellings:
+/// parsing succeeds, the value is preserved, and the dispatch refuses it with a
+/// migration error before any database or network work. The end-to-end form of
+/// this expectation (exit 2, `ModelApiMigration`, no data dir created) is pinned
+/// by `tests/api_primary_backfill.rs::search_retires_local_selectors_before_any_database_work`.
+#[test]
+fn retired_rerank_provider_value_is_a_migration_refusal() {
+    let env = Env::new();
+    let out = assert_not_usage_error(
+        &env,
+        &["search", "q", "--json", "--rerank", "--rerank-provider", "nope"],
+    );
+    assert_eq!(code(&out), 2, "{}", combined(&out));
+    assert_eq!(
+        stderr_error_kind(&combined(&out)),
+        "ModelApiMigration",
+        "a retired provider value must be refused as a migration error: {}",
+        combined(&out)
+    );
+}
+
 #[test]
 fn valid_window_arguments_get_past_validation() {
     let env = Env::new();
     assert_not_usage_error(&env, &["search", "q", "--json", "--rrf-limit", "30"]);
-    assert_not_usage_error(
+
+    // A rerank window with N/K and no model configuration gets past argument
+    // validation: the run fails later, in the rerank profile lookup, with the
+    // explicit configuration refusal that names --api-config / --rerank-profile.
+    // (Both a usage error and this configuration error report exit code 2, so
+    // the discriminating check is the refusal text, not the code.)
+    let out = run(
         &env,
         &[
             "search",
@@ -431,9 +495,12 @@ fn valid_window_arguments_get_past_validation() {
             "30",
             "--rerank-limit",
             "5",
-            "--rerank-provider",
-            "bge-local",
         ],
+    );
+    let text = combined(&out);
+    assert!(
+        text.contains("--api-config") || text.contains("--rerank-profile"),
+        "expected the rerank profile configuration refusal; got:\n{text}"
     );
 }
 
@@ -506,7 +573,14 @@ fn window_precedence_cli_over_env_over_config() {
         .args(["--color=never", "search", "q", "--json", "--rerank"])
         .output()
         .expect("run cass");
-    assert_ne!(code(&out), 2, "env must override config: {}", combined(&out));
+    // N=30 clears the K<=N check; the remaining refusal, if any, is the model
+    // API configuration, not a usage error.
+    assert_ne!(
+        stderr_error_kind(&combined(&out)),
+        "usage",
+        "env must override config: {}",
+        combined(&out)
+    );
 
     // CLI over env: N=30 from CLI -> past validation even though env says 3.
     let env = Env::new();
@@ -523,7 +597,12 @@ fn window_precedence_cli_over_env_over_config() {
         ])
         .output()
         .expect("run cass");
-    assert_ne!(code(&out), 2, "CLI must override env: {}", combined(&out));
+    assert_ne!(
+        stderr_error_kind(&combined(&out)),
+        "usage",
+        "CLI must override env: {}",
+        combined(&out)
+    );
 }
 
 // --------------------------------------------------------------------------

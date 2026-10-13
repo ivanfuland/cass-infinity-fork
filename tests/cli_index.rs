@@ -70,29 +70,21 @@ fn index_parses_semantic_flags() -> Result<(), String> {
             semantic, embedder, ..
         }) => {
             assert!(semantic, "semantic flag should be true");
-            assert_eq!(embedder, "fastembed");
+            assert_eq!(embedder.as_deref(), Some("fastembed"));
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),
     }
 }
 
-/// R1-W3-N2: `fastembed` requires the `semantic`/ONNX build feature,
-/// retired in this build (W3-5, ORT-free `--features qr,encryption,
-/// infinity`). Defaulting a bare `cass index --semantic` to it meant it
-/// deterministically hit `run_semantic_db_vector_catchup`'s "embedder
-/// fastembed is retired... use --embedder infinity" bail under this
-/// build's actual feature set -- the default itself was the retired
-/// choice. Feature-conditional so a hypothetical build with `semantic`
-/// (not `infinity`) still gets the old default.
+/// Semantic indexing selects its default profile from explicit API configuration.
 #[test]
-fn index_default_embedder_matches_this_builds_working_semantic_path() -> Result<(), String> {
+fn index_does_not_select_a_hardcoded_embedder() -> Result<(), String> {
     let cli = parse_cli_ok(["cass", "index", "--semantic"], "parse index flags");
 
-    let expected = if cfg!(feature = "infinity") { "infinity" } else { "fastembed" };
     match cli.command {
         Some(Commands::Index { embedder, .. }) => {
-            assert_eq!(embedder, expected);
+            assert!(embedder.is_none());
             Ok(())
         }
         other => Err(format!("expected index command, got {other:?}")),

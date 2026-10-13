@@ -136,12 +136,12 @@ pub(crate) fn private_files(root: &Path) -> Result<Vec<String>> {
     Ok(files)
 }
 
-fn counts(mode: SearchMode) -> Vec<Value> {
+fn counts(mode: SearchMode, embedding: Option<Value>) -> Vec<Value> {
     let mut values = vec![
         json!({"scope":"rerank-http-v1","http_attempts":0,"http_response_observed":0,"delivery_unknown":0,"model_executions":0,"basis":"not-called"}),
     ];
     if mode != SearchMode::Lexical {
-        values.push(json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"}));
+        values.push(embedding.unwrap_or_else(|| json!({"scope":"embedding-http","http_attempts":null,"http_response_observed":null,"delivery_unknown":null,"model_executions":null,"basis":"unknown"})));
     }
     values
 }
@@ -224,7 +224,7 @@ pub(crate) fn collect(
                 let total = milliseconds(start);
                 times.push(total);
                 let actual_n = slots.len();
-                let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n < run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n == run.n,"rerank_applied":false,"ordered_pool_sha256":null,"slots":slots,"pages":[],"window_evidence":{"relative_path":evidence_relative,"sha256":file_digest(&search.evidence_path)?},"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode == SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":search.evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":search.identity_before_ms,"identity_after_ms":search.identity_after_ms,"retrieval_ms":search.retrieval_ms,"rerank_client_ms":0.0,"model_execution_ms":null,"paging_ms":0.0,"question_total_ms":total,"http":counts(run.mode),"resource_measurements":[]}});
+                let question = json!({"qid":window.qid,"query_sha256":window.query_sha256,"requested_n":run.n,"actual_n":actual_n,"pool_complete":true,"terminal":if actual_n < run.n {"SHORT_WINDOW"} else {"SUCCESS"},"full_requested_n_claim":actual_n == run.n,"rerank_applied":false,"ordered_pool_sha256":null,"slots":slots,"pages":[],"window_evidence":{"relative_path":evidence_relative,"sha256":file_digest(&search.evidence_path)?},"partial":false,"timed_out":false,"failure_code":null,"lexical_statistics_status":if run.mode == SearchMode::Semantic {"NOT_USED"} else {"USED"},"lexical_statistics_sha256":search.evidence.lexical_statistics_sha256,"cost":{"identity_before_ms":search.identity_before_ms,"identity_after_ms":search.identity_after_ms,"retrieval_ms":search.retrieval_ms,"rerank_client_ms":0.0,"model_execution_ms":null,"paging_ms":0.0,"question_total_ms":total,"http":counts(run.mode, run.embedding_cost(false)),"resource_measurements":[]}});
                 let relative = format!("question-{}.json", window.qid);
                 write_private(root, &relative, &question)?;
                 writes.push(relative);
@@ -250,6 +250,7 @@ pub(crate) fn collect(
     } else {
         "SUCCESS"
     };
+    run.persist_embedding_calls()?;
     let after = succeeded.then(|| json!({"basis":"equal-physical-db-and-source-generation-policy","inventory_digests":"reused-initial-not-independently-reexported","database_sha256":run.binding.database_sha256,"source_manifest_sha256":run.binding.source_manifest_sha256,"wal_bytes":0,"generation_unchanged":true,"policies_unchanged":true,"shared_maintenance_lease_held":true}));
     let mut sorted = times.clone();
     sorted.sort_by(f64::total_cmp);
@@ -259,7 +260,7 @@ pub(crate) fn collect(
     };
     writes = private_files(root)?;
     writes.push("run.json".into());
-    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode)},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
+    let output = json!({"schema":"cass.regression-run.v1","run_id":root.file_name().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"mode":"full-search","terminal":terminal,"quality_status":if succeeded {"NOT_EVALUATED"} else {"FAILED"},"failure_code":failure,"source_commit":provenance.source_commit,"binary_sha256":provenance.binary_sha256,"argv_sha256":argv_ref["sha256"],"suite_sha256":run.validated.inputs.suite_sha256,"query_manifest_sha256":digest(&query_manifest_bytes(&run.validated.inputs.windows)?),"labels_sha256":run.validated.inputs.labels_sha256,"label_policy_sha256":run.validated.inputs.label_policy_sha256,"question_count":9,"suite_candidate_slots":1800,"source_identity":{"source_manifest_sha256":run.binding.source_manifest_sha256,"source_checked":5049,"source_producer_receipt_sha256":run.validated.source_receipt_sha256,"message_text_sha256":run.binding.message_text_sha256,"chunk_text_sha256":run.binding.chunk_text_sha256,"canonicalize_version":run.binding.canonicalize_version,"chunking_policy_version":run.binding.chunking_policy_version,"statistics_policy":run.binding.statistics_policy},"expected_binding_file_sha256":run.validated.expected_binding_file_sha256,"expected_binding":run.validated.expected_binding,"observed_before":run.binding,"observed_after":if succeeded { Some(&run.binding) } else { None },"fixed_input_manifest_sha256":null,"fixed_windows_file_sha256":null,"backend_identity":{"provider":null,"actual_model":null,"model_revision":null,"endpoint_origin_sha256":null,"server_template_policy":null,"document_assembly_policy":null,"client_submission_policy":null},"request":{"search_mode":crate::search_mode_canonical_str(run.mode),"vector_search_mode":run.vector_mode.map(crate::vector_search_mode_wire),"rerank":false,"n":run.n,"page_k":null,"resolved_filters":run.request["resolved_filters"],"request_profile":"d5-fixed-filters-v1","request_evidence_sha256":request_ref["sha256"]},"output":{"private_root":root.parent().and_then(|s|s.to_str()).ok_or_else(||anyhow::anyhow!("REGRESSION_REPORT_WRITE_FAILED"))?,"run_relative_path":root.file_name().and_then(|s|s.to_str()),"root_mode":"0700","file_mode":"0600","symlink_free":true,"fresh":true,"outside_input_and_repo":true,"writes_relative_paths":writes},"questions":questions,"cost":{"all_run_ms":milliseconds(started),"identity_before_ms":identity_before_ms,"identity_after_ms":identity_after_ms,"sample_count":times.len(),"mean_question_ms":mean,"p50_question_ms":quantile(0.5),"p95_question_ms":quantile(0.95),"quantile_method":"nearest-rank","counts":counts(run.mode, run.embedding_cost(true))},"claims":{"dataset":"development-regression-9-small-sample","attribution":"observed-comparison","fts_vec_correctness":"NOT_VERIFIED","pure_engine":false},"after_verification":after});
     write_private(root, "run.json", &output)?;
     if let Some(code) = failure {
         bail!("{code}");
@@ -459,6 +460,69 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn api_full_search_semantic_nine_questions_records_actual_query_costs() {
+        use crate::search::model_api::{ApiConfig, ApiClient, EnvCredentialResolver, PrimaryEmbeddingCall};
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        let (_f, data, mut cmd) = full_fixture_mode(7, 7, SearchMode::Semantic, Some(crate::search::query::VectorSearchMode::Exact));
+        let server = HttpFixture::start(vec![Reply::Embeddings(8)]);
+        let text = format!(r#"
+version=1
+default_embedding="embed"
+[profiles.embed]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="{}"
+model="example/api-embed"
+model_revision="r1"
+normalization="l2"
+query_prefix="Query: "
+"#, server.base());
+        let config_path = data.path().join("api.toml");
+        fs::write(&config_path, &text).unwrap();
+        let config = ApiConfig::parse_toml(&text).unwrap();
+        let profile = config.profile("embed").unwrap().clone();
+        let RegressionCommand::FullSearch { api, database, source_manifest, expected_binding, expected_binding_sha256, .. } = &mut cmd else { unreachable!() };
+        api.config_path = Some(config_path.clone());
+        let storage = crate::storage::sqlite::FrankenStorage::open(database).unwrap();
+        let call = PrimaryEmbeddingCall::new(ApiClient::new(config, Box::new(EnvCredentialResolver)), profile.clone(), false).unwrap();
+        let probe = call.probe().unwrap();
+        let built = crate::indexer::db_vector_catchup::run_api_primary_catchup_backfill(&storage, 64, &call, &profile, &probe, 42).unwrap_or_else(|error| panic!("{error}"));
+        assert!(built.catchup.activated);
+        storage.raw().execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;").unwrap();
+        drop(storage);
+        let expected_root = data.path().join("api-expected");
+        fs::create_dir(&expected_root).unwrap();
+        let (expected, pin) = regression_binding::tests::prepare_expected(&expected_root, database, source_manifest);
+        *expected_binding = expected;
+        *expected_binding_sha256 = pin;
+        let db = database.clone();
+        let before = fs::read(&db).unwrap();
+        let before_calls = server.hits();
+        let started = Instant::now();
+        let provenance = RunProvenance::capture().unwrap();
+        let owner = RegressionSearchRun::activate(super::super::input::prepare_full(&cmd).unwrap(), &cmd).unwrap();
+        fs::write(config_path, "invalid after activation").unwrap();
+        let summary = collect(&owner, &provenance, started, 0.0).unwrap();
+        assert_eq!(summary["terminal"], "SUCCESS", "{summary}");
+        let result: Value = serde_json::from_slice(&fs::read(owner.validated.paths.run_root.join("run.json")).unwrap()).unwrap();
+        assert_eq!(result["terminal"], "SUCCESS", "{result}");
+        assert_eq!(result["questions"].as_array().unwrap().len(), 9);
+        let observed = server.hits() - before_calls;
+        assert!(observed > 0);
+        let reported = result["cost"]["counts"][1]["http_attempts"].as_u64().unwrap();
+        assert_eq!(reported, observed as u64);
+        assert_eq!(result["questions"].as_array().unwrap().iter().map(|q| q["cost"]["http"][1]["http_attempts"].as_u64().unwrap()).sum::<u64>(), reported);
+        assert_eq!(result["quality_status"], "NOT_EVALUATED");
+        for request in &server.requests()[before_calls..] {
+            assert!(request.body()["input"][0].as_str().unwrap().starts_with("Query: "));
+        }
+        assert_eq!(before, fs::read(db).unwrap());
+        let calls: Value = serde_json::from_slice(&fs::read(owner.validated.paths.run_root.join("api-embedding-calls.json")).unwrap()).unwrap();
+        assert_eq!(calls["calls"].as_array().unwrap().len(), observed);
+    }
+
     fn full_fixture(n: u32, count: usize) -> (Fixture, tempfile::TempDir, RegressionCommand) {
         full_fixture_mode(n, count, SearchMode::Lexical, None)
     }
@@ -483,6 +547,51 @@ pub(super) mod tests {
         let bytes = serde_json::to_vec(&json!({"schema":"cass.regression-source-receipt.v1","producer_id":"cass.pr9.verify-corpus","verification_policy":"cass.pr9.corpus-content-stable-file-v1","producer_source_sha256":digest(b"synthetic-producer"),"source_manifest_sha256":manifest_sha,"expected_file_count":5049,"checked":5049,"passed":true,"exit_code":0,"failure_count":0,"raw_evidence_sha256":digest(b"synthetic-evidence")})).unwrap();
         fs::write(&source_producer_receipt, &bytes).unwrap();
         let cmd = RegressionCommand::FullSearch {
+            api: Default::default(),
+            input: f.input.clone(),
+            database,
+            expected_binding,
+            expected_binding_sha256,
+            source_manifest,
+            source_producer_receipt,
+            source_producer_receipt_sha256: digest(&bytes),
+            search_mode: mode,
+            vector_search_mode: vector,
+            rrf_limit: n,
+            rerank: RerankSwitch::Off,
+            page_size: None,
+            rerank_provider: None,
+            cutoffs: vec![5, 10, 20],
+        };
+        (f, data, cmd)
+    }
+
+    /// Like [`full_fixture_mode`], but the fixture's vector generation is built
+    /// through the frozen model API named by `config`, so a semantic or hybrid
+    /// run can bind to it. Local inference is retired.
+    pub(in crate::regression) fn api_full_fixture_mode(
+        n: u32,
+        count: usize,
+        mode: SearchMode,
+        vector: Option<crate::search::query::VectorSearchMode>,
+        search_config: &std::path::Path,
+        build_config: &std::path::Path,
+    ) -> (Fixture, tempfile::TempDir, RegressionCommand) {
+        let f = fixture("");
+        assert_eq!(file_digest(&f.pool).unwrap(), f.pool_sha);
+        let (data, database, _run, source_manifest) =
+            regression_binding::tests::searchable_fixture_with_api_embedding(count, build_config);
+        let (expected_binding, expected_binding_sha256) =
+            regression_binding::tests::prepare_expected(data.path(), &database, &source_manifest);
+        let manifest_sha = file_digest(&source_manifest).unwrap();
+        let source_producer_receipt = data.path().join("source-receipt.json");
+        let bytes = serde_json::to_vec(&json!({"schema":"cass.regression-source-receipt.v1","producer_id":"cass.pr9.verify-corpus","verification_policy":"cass.pr9.corpus-content-stable-file-v1","producer_source_sha256":digest(b"synthetic-producer"),"source_manifest_sha256":manifest_sha,"expected_file_count":5049,"checked":5049,"passed":true,"exit_code":0,"failure_count":0,"raw_evidence_sha256":digest(b"synthetic-evidence")})).unwrap();
+        fs::write(&source_producer_receipt, &bytes).unwrap();
+        let cmd = RegressionCommand::FullSearch {
+            api: crate::search::regression_input::RegressionApiOptions {
+                config_path: Some(search_config.to_path_buf()),
+                ..Default::default()
+            },
             input: f.input.clone(),
             database,
             expected_binding,
@@ -811,12 +920,15 @@ pub(super) mod tests {
         }
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn semantic_fake_http_child() {
         let Ok(mode) = dotenvy::var("CASS_S2_04_SEMANTIC_CHILD") else {
             return;
         };
+        let Ok(config) = dotenvy::var("CASS_S2_04_API_CONFIG") else {
+            return;
+        };
+        let config = std::path::PathBuf::from(config);
         let mode = if mode == "semantic" {
             SearchMode::Semantic
         } else {
@@ -827,18 +939,23 @@ pub(super) mod tests {
         } else {
             crate::search::query::VectorSearchMode::Exact
         };
-        let (_f, _data, cmd) = full_fixture_mode(5, 12, mode, Some(vector));
+        let (_f, _data, cmd) = api_full_fixture_mode(5, 12, mode, Some(vector), &config, &config);
         let result = super::run(&cmd).unwrap();
         let run_root = _f.input.output.output_root.join(&_f.input.output.run_id);
         assert_eq!(result["terminal"], "SUCCESS");
         let report: Value =
             serde_json::from_slice(&fs::read(run_root.join("run.json")).unwrap()).unwrap();
+        // The semantic leg is served exclusively by the isolated fake embedding
+        // HTTP now: the rerank bucket is never called, the embedding bucket sees
+        // the isolated request(s), and no local model ever executes (the retired
+        // provider reported the embedding leg under a different scope).
         assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
-        assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
+        assert_eq!(report["cost"]["counts"][1]["http_attempts"], 1);
+        assert_eq!(report["cost"]["counts"][1]["http_response_observed"], 1);
+        assert!(report["cost"]["counts"][1]["model_executions"].is_null());
         assert!(report["questions"][0]["cost"]["model_execution_ms"].is_null());
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn semantic_and_hybrid_off_use_only_isolated_fake_embedding_http() {
         use std::net::TcpListener;
@@ -852,6 +969,29 @@ pub(super) mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let origin = format!("http://{}", listener.local_addr().unwrap());
+                // Freeze the embedding profile the child runs under. Local
+                // inference is retired, so this explicit API config replaces the
+                // retired `CASS_INFINITY_URL` provider selection.
+                let api_config = tempfile::NamedTempFile::new().unwrap();
+                {
+                    use std::io::Write as _;
+                    write!(
+                        api_config.as_file(),
+                        "version=1\n\
+                         default_embedding=\"main\"\n\
+                         [profiles.main]\n\
+                         kind=\"embedding\"\n\
+                         protocol=\"openai-embeddings-v1\"\n\
+                         scope=\"loopback\"\n\
+                         endpoint=\"{origin}/embeddings\"\n\
+                         model=\"BAAI/bge-m3\"\n\
+                         model_revision=\"fixture-r1\"\n\
+                         normalization=\"l2\"\n\
+                         expected_dimension=1024\n"
+                    )
+                    .unwrap();
+                }
+                let api_config = api_config.into_temp_path();
                 let stop = Arc::new(AtomicBool::new(false));
                 let done = stop.clone();
                 let worker = std::thread::spawn(move || {
@@ -916,8 +1056,7 @@ pub(super) mod tests {
                     ])
                     .env("CASS_S2_04_SEMANTIC_CHILD", mode)
                     .env("CASS_S2_04_VECTOR_CHILD", vector_mode)
-                    .env("CASS_INFINITY_URL", &origin)
-                    .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+                    .env("CASS_S2_04_API_CONFIG", &api_config)
                     .env("NO_PROXY", "127.0.0.1,localhost")
                     .env("no_proxy", "127.0.0.1,localhost")
                     .output()
@@ -926,8 +1065,9 @@ pub(super) mod tests {
                 let paths = worker.join().unwrap();
                 assert!(
                     output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stdout)
+                    "child stdout:\n{}\nchild stderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(!paths.is_empty());
                 assert!(paths.iter().all(|p| p == "/embeddings"));
@@ -1008,13 +1148,32 @@ pub(super) mod tests {
             search_mode,
             vector_search_mode,
             rrf_limit,
+            api,
             ..
         } = command
         else {
             unreachable!()
         };
-        let mut argv = vec![
-            "cass".into(),
+        let mut argv = vec!["cass".into()];
+        // The frozen model API config selected by the caller must travel with the
+        // rebuilt argv: local inference is retired, so a semantic or rerank run
+        // has no other way to name its endpoint.
+        if let Some(config) = api.config_path.as_ref() {
+            argv.push("--api-config".into());
+            argv.push(config.display().to_string());
+        }
+        if let Some(profile) = api.embedding_profile.as_ref() {
+            argv.push("--embedding-profile".into());
+            argv.push(profile.clone());
+        }
+        if let Some(profile) = api.rerank_profile.as_ref() {
+            argv.push("--rerank-profile".into());
+            argv.push(profile.clone());
+        }
+        if api.no_model_fallback {
+            argv.push("--no-model-fallback".into());
+        }
+        argv.extend([
             "regression".into(),
             "full-search".into(),
             "--suite".into(),
@@ -1047,7 +1206,7 @@ pub(super) mod tests {
             rrf_limit.to_string(),
             "--rerank".into(),
             "off".into(),
-        ];
+        ]);
 
         if let Some(vector) = vector_search_mode {
             argv.extend([
@@ -1220,7 +1379,6 @@ pub(super) mod tests {
         }
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn embedding_transport_failure_child() {
         let Ok(mode) = dotenvy::var("CASS_S2_04_FAILURE_CHILD") else {
@@ -1234,12 +1392,25 @@ pub(super) mod tests {
                 } else {
                     SearchMode::Hybrid
                 };
-                let (f, _data, command) = full_fixture_mode(
+                // One endpoint throughout: the parent's service answers healthy
+                // embeddings until this child signals that the generation is
+                // built, then switches to the fault. endpoint / profile /
+                // descriptor never change.
+                let config = PathBuf::from(
+                    dotenvy::var("CASS_S2_04_API_CONFIG").expect("parent must pass the api config"),
+                );
+                let (f, _data, command) = api_full_fixture_mode(
                     5,
                     12,
                     mode,
                     Some(crate::search::query::VectorSearchMode::Exact),
+                    &config,
+                    &config,
                 );
+                let marker = PathBuf::from(
+                    dotenvy::var("CASS_S2_04_BUILD_DONE").expect("parent must pass the build marker"),
+                );
+                std::fs::write(&marker, b"built").expect("signal build completion");
                 let error = full_cli(&command).unwrap_err();
                 assert_eq!(error.code, 2);
                 let root = f.input.output.output_root.join(&f.input.output.run_id);
@@ -1252,7 +1423,16 @@ pub(super) mod tests {
                 assert!(report["observed_after"].is_null());
                 assert!(report["after_verification"].is_null());
                 assert_eq!(report["cost"]["counts"][0]["model_executions"], 0);
-                assert!(report["cost"]["counts"][1]["http_attempts"].is_null());
+                // The embedding leg now runs over HTTP, so a transport fault is
+                // recorded as an attempted request on that bucket (the retired
+                // provider reported the leg under a different scope), and no
+                // local model ever executes.
+                assert!(
+                    !report["cost"]["counts"][1]["http_attempts"].is_null(),
+                    "a transport fault must be recorded as an attempted request: {}",
+                    report["cost"]["counts"][1]
+                );
+                assert!(report["cost"]["counts"][1]["model_executions"].is_null());
                 archive_run(
                     &root,
                     &PathBuf::from(dotenvy::var("CASS_S2_04_FAILURE_EVIDENCE").unwrap())
@@ -1267,7 +1447,6 @@ pub(super) mod tests {
         std::process::exit(rc);
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn aggregate_semantic_hybrid_http500_invalid_response_disconnect_are_failed() {
         use std::net::TcpListener;
@@ -1281,6 +1460,35 @@ pub(super) mod tests {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let origin = format!("http://{}", listener.local_addr().unwrap());
+                // The child builds its generation against a healthy endpoint of
+                // its own and runs the search against this faulty one.
+                let failure_api_config = tempfile::NamedTempFile::new().unwrap();
+                {
+                    use std::io::Write as _;
+                    write!(
+                        failure_api_config.as_file(),
+                        "version=1\n\
+                         default_embedding=\"main\"\n\
+                         [profiles.main]\n\
+                         kind=\"embedding\"\n\
+                         protocol=\"openai-embeddings-v1\"\n\
+                         scope=\"loopback\"\n\
+                         endpoint=\"{origin}/embeddings\"\n\
+                         model=\"BAAI/bge-m3\"\n\
+                         model_revision=\"fixture-r1\"\n\
+                         normalization=\"l2\"\n\
+                         expected_dimension=1024\n"
+                    )
+                    .unwrap();
+                }
+                let failure_api_config = failure_api_config.into_temp_path();
+                // The marker is absent until the child finishes building the
+                // generation; the service answers healthy embeddings until then.
+                let marker_dir = tempfile::tempdir().unwrap();
+                let build_done_path = marker_dir.path().join("built");
+                let build_done_watch = build_done_path.clone();
+                let fault_served = Arc::new(AtomicBool::new(false));
+                let fault_served_watch = fault_served.clone();
                 let stop = Arc::new(AtomicBool::new(false));
                 let done = stop.clone();
                 let worker = std::thread::spawn(move || {
@@ -1297,6 +1505,7 @@ pub(super) mod tests {
                         stream
                             .set_read_timeout(Some(Duration::from_secs(5)))
                             .unwrap();
+                        let mut parsed_body: Value = Value::Null;
                         let mut bytes = Vec::new();
                         let mut buffer = [0; 4096];
                         loop {
@@ -1322,14 +1531,23 @@ pub(super) mod tests {
                                         .to_string();
                                     assert_eq!(path, "/embeddings");
                                     paths.push(path);
-                                    let body: Value =
+                                    parsed_body =
                                         serde_json::from_slice(&bytes[end + 4..end + 4 + length])
                                             .unwrap();
-                                    assert_eq!(body["model"], "BAAI/bge-m3");
+                                    assert_eq!(parsed_body["model"], "BAAI/bge-m3");
                                     break;
                                 }
                             }
                         }
+                        if !build_done_watch.exists() {
+                            let inputs = parsed_body["input"].as_array().unwrap();
+                            let mut embedding = vec![0.0; 1024];
+                            embedding[0] = 1.0;
+                            let body = serde_json::json!({"data": inputs.iter().enumerate().map(|(i,_)| json!({"index":i,"embedding":embedding})).collect::<Vec<_>>()}).to_string();
+                            write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                            continue;
+                        }
+                        fault_served_watch.store(true, Ordering::Release);
                         if fault == "disconnect" {
                             drop(stream);
                             continue;
@@ -1362,8 +1580,8 @@ pub(super) mod tests {
                     ])
                     .env("CASS_S2_04_FAILURE_CHILD", mode)
                     .env("CASS_S2_04_FAILURE_EVIDENCE", &case)
-                    .env("CASS_INFINITY_URL", origin)
-                    .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+                    .env("CASS_S2_04_API_CONFIG", &failure_api_config)
+                    .env("CASS_S2_04_BUILD_DONE", &build_done_path)
                     .env("NO_PROXY", "127.0.0.1,localhost")
                     .env("no_proxy", "127.0.0.1,localhost")
                     .output()
@@ -1377,6 +1595,11 @@ pub(super) mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
                 assert!(!paths.is_empty());
+                assert!(
+                    fault_served.load(Ordering::Acquire),
+                    "the faulty response must actually have been served: a config precondition \
+                     failure would also exit 2 without reaching this endpoint"
+                );
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 assert!(stdout.contains("FAILED_CLI_RC=2"));
                 assert!(!stdout.contains("retrieval"));
@@ -1389,7 +1612,6 @@ pub(super) mod tests {
             }
         }
     }
-    #[cfg(feature = "infinity")]
     #[test]
     fn exact_partial_aggregate_child() {
         if dotenvy::var("CASS_S2_04_PARTIAL_CHILD").is_err() {
@@ -1404,11 +1626,20 @@ pub(super) mod tests {
         let _reset = ResetBudget;
         crate::search::query::set_exact_scan_row_budget_for_test(10);
         let started = Instant::now();
-        let (_f, _data, command) = full_fixture_mode(
+        // Local inference is retired: the semantic generation must be built
+        // through the frozen model API the parent froze, so the partial result
+        // can only come from the exact-scan budget, never a missing config.
+        let config = PathBuf::from(
+            dotenvy::var("CASS_S2_04_PARTIAL_API_CONFIG")
+                .expect("parent must pass the frozen api config"),
+        );
+        let (_f, _data, command) = api_full_fixture_mode(
             5000,
             4200,
             SearchMode::Semantic,
             Some(crate::search::query::VectorSearchMode::Exact),
+            &config,
+            &config,
         );
         let validated = crate::regression::input::prepare_full(&command).unwrap();
         let run = RegressionSearchRun::activate(validated, &command).unwrap();
@@ -1460,7 +1691,6 @@ pub(super) mod tests {
         println!("REAL_PARTIAL_AGGREGATE_REJECTED_CODE=REGRESSION_PARTIAL_RESULTS");
     }
 
-    #[cfg(feature = "infinity")]
     #[test]
     fn aggregate_exact_budget_partial_is_rejected_in_isolated_child() {
         use std::net::TcpListener;
@@ -1531,6 +1761,27 @@ pub(super) mod tests {
         };
         fs::create_dir(&case).unwrap();
         fs::set_permissions(&case, fs::Permissions::from_mode(0o700)).unwrap();
+        // Local inference is retired: freeze the explicit model API the child
+        // runs under, on this owned loopback origin, instead of the legacy
+        // `CASS_INFINITY_URL` provider variables.
+        let api_config = case.join("api.toml");
+        fs::write(
+            &api_config,
+            format!(
+                "version=1\n\
+                 default_embedding=\"main\"\n\
+                 [profiles.main]\n\
+                 kind=\"embedding\"\n\
+                 protocol=\"openai-embeddings-v1\"\n\
+                 scope=\"loopback\"\n\
+                 endpoint=\"{origin}/embeddings\"\n\
+                 model=\"BAAI/bge-m3\"\n\
+                 model_revision=\"fixture-r1\"\n\
+                 normalization=\"l2\"\n\
+                 expected_dimension=1024\n"
+            ),
+        )
+        .unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1539,8 +1790,7 @@ pub(super) mod tests {
             ])
             .env("CASS_S2_04_PARTIAL_CHILD", "1")
             .env("CASS_S2_04_PARTIAL_EVIDENCE", &case)
-            .env("CASS_INFINITY_URL", origin)
-            .env("CASS_INFINITY_EMBED_MODEL", "BAAI/bge-m3")
+            .env("CASS_S2_04_PARTIAL_API_CONFIG", &api_config)
             .env("NO_PROXY", "127.0.0.1,localhost")
             .env("no_proxy", "127.0.0.1,localhost")
             .output()

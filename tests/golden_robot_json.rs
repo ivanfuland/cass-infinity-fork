@@ -27,8 +27,12 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -58,6 +62,15 @@ fn cass_cmd(test_home: &std::path::Path) -> Command {
         // Keep resource-policy goldens stable across hosts; dynamic default
         // scaling is covered by responsiveness unit tests.
         .env("CASS_RESPONSIVENESS_MAX_INFLIGHT_BYTES", "536870912");
+    // Model-dependent commands refuse outright when any retired model-selection
+    // variable is present, *including set to the empty string*
+    // (src/search/model_api/runtime.rs::RETIRED_MODEL_ENV_VARS). A developer or
+    // CI shell that still exports one of them would otherwise turn every search
+    // golden red for a reason that has nothing to do with this repository. Clear
+    // them on the child only; the ambient environment is left untouched.
+    for retired in coding_agent_search::search::model_api::runtime::RETIRED_MODEL_ENV_VARS {
+        cmd.env_remove(retired);
+    }
     cmd
 }
 
@@ -129,11 +142,17 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     )
     .expect("write failed seed wal");
 
-    // W2-6 Task丙②: `expected_index_dir` (Tantivy) is retired, but the
-    // `<data_dir>/index/` directory convention itself is still alive --
-    // `.lexical-publish-backups` and generation-quarantine bookkeeping still
-    // live there (src/doctor_chokepoint.rs, src/indexer/staging_reclaim.rs).
-    let index_path = data_dir.join("index");
+    // W2-6 Task丙②: the Tantivy generation under `expected_index_dir` is
+    // retired, but the directory the readers actually resolve is not. The
+    // quarantine surfaces (`diag --quarantine`, `doctor`, `status`) call
+    // `expected_index_dir(data_dir)` and then take its *parent* to find
+    // `.lexical-publish-backups` and the generation manifests
+    // (src/lib.rs::collect_diag_quarantine_report_inner,
+    // ::diag_lexical_manifest_scan_root; src/doctor_chokepoint.rs;
+    // src/indexer/staging_reclaim.rs). Seeding `<data_dir>/index` directly
+    // skipped one level, so the fixture landed in a directory no reader
+    // ever opens and every quarantine report collapsed to 0/0.
+    let index_path = coding_agent_search::indexer::expected_index_dir(&data_dir);
     std::fs::create_dir_all(&index_path).expect("create expected index dir");
     let retained_publish_dir = index_path
         .parent()
@@ -165,43 +184,410 @@ fn seed_diag_quarantine_fixture(test_home: &std::path::Path) -> PathBuf {
     data_dir
 }
 
-fn safe_fixture_destination(dst_root: &Path, rel: &Path) -> io::Result<PathBuf> {
-    let mut dst = dst_root.to_path_buf();
-    for component in rel.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(part) => dst.push(part),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "fixture path escaped source root",
-                ));
-            }
-        }
+/// Assert that a quarantine report really describes the seeded isolation
+/// fixture.
+///
+/// The snapshot comparison on its own cannot notice a report that collapsed to
+/// zero: an all-empty report would simply be frozen as the new contract, and
+/// every consumer (`diag --quarantine`, `doctor`, `status`) would keep passing
+/// while the fixture stopped asserting anything — which is exactly how a
+/// fixture that wrote to the wrong directory stayed green once. These are the
+/// seed's own totals, so they fail before any golden is consulted.
+fn assert_seeded_quarantine_totals(report: &Value, surface: &str) {
+    let summary = &report["quarantine"]["summary"];
+    for (field, expected) in [
+        ("failed_seed_bundle_count", 2u64),
+        ("retained_publish_backup_count", 2),
+        ("lexical_generation_count", 1),
+        ("lexical_quarantined_generation_count", 1),
+        ("lexical_quarantined_shard_count", 1),
+    ] {
+        assert_eq!(
+            summary[field].as_u64(),
+            Some(expected),
+            "{surface} must report the seeded {field}={expected}, not a collapsed report: {summary}"
+        );
     }
-    Ok(dst)
+    assert_eq!(
+        summary["lexical_generation_build_state_counts"]["failed"].as_u64(),
+        Some(1),
+        "{surface} must report the seeded quarantined generation as failed: {summary}"
+    );
+    assert_eq!(
+        summary["lexical_generation_publish_state_counts"]["quarantined"].as_u64(),
+        Some(1),
+        "{surface} must report the seeded generation as quarantined: {summary}"
+    );
 }
 
-fn isolated_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("search_demo_data");
-    let dst_root = test_home.join("search_demo_data");
-    for entry in WalkDir::new(&src) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(&src)?;
-        let dst = safe_fixture_destination(&dst_root, rel)?;
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&dst)?;
-        } else {
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
+// ---------------------------------------------------------------------------
+// A genuinely current-schema demo archive
+// ---------------------------------------------------------------------------
+//
+// `tests/fixtures/search_demo_data/agent_search.db` is frozen at
+// `user_version = 1` and is asserted against byte-for-byte by a couple of dozen
+// integration targets; it is a read-only historical artifact and must not be
+// rewritten, and simply raising its `user_version` would forge a rebuild the
+// archive never had. It also can no longer be opened by the CLI at all:
+// `ensure_readonly_schema_current` rejects any database below
+// `CURRENT_SCHEMA_VERSION` with exit 9 / kind `db-open`.
+//
+// The search and stats goldens below therefore build their own archive through
+// today's production write path (the same shape
+// `tests/cli_robot.rs::isolated_search_demo_data_for_current_workspace` uses),
+// carrying the *same logical corpus* the checked-in fixture records: two
+// conversations, six messages, one `aider` agent. Whatever `user_version` the
+// archive ends up with is what `FrankenStorage::open` wrote.
+
+/// Seed a current-schema archive under `test_home/search_demo_data` and return
+/// that data dir.
+///
+/// Conversation 1 is the repo-root aider transcript (2 messages; the second
+/// carries the `hello` token the search goldens query for). Conversation 2 is
+/// the `tests/fixtures/aider` transcript (4 messages). Titles, timestamps,
+/// workspace paths and message bodies mirror the checked-in fixture so the
+/// frozen payloads keep the same meaning.
+fn current_schema_search_demo_data(test_home: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    use coding_agent_search::model::types::{
+        Agent, AgentKind, Conversation, Message, MessageRole,
+    };
+
+    let repo_root = env!("CARGO_MANIFEST_DIR");
+    let data_dir = test_home.join("search_demo_data");
+    fs::create_dir_all(&data_dir)?;
+    let db_path = data_dir.join("agent_search.db");
+    let storage = coding_agent_search::storage::sqlite::FrankenStorage::open(&db_path)?;
+    // State the schema the archive really carries. Raising a fixture's
+    // `user_version` by hand would forge exactly this claim, so it is asserted
+    // from what the production open path wrote, not from a constant.
+    assert_eq!(
+        storage.schema_version()?,
+        coding_agent_search::storage::sqlite::CURRENT_SCHEMA_VERSION,
+        "the rebuilt demo archive must be at the current schema"
+    );
+
+    let agent_id = storage.ensure_agent(&Agent {
+        id: None,
+        slug: "aider".into(),
+        name: "aider".into(),
+        version: None,
+        kind: AgentKind::Cli,
+    })?;
+    let root_workspace_id = storage.ensure_workspace(Path::new(repo_root), None)?;
+    let fixture_workspace_path = format!("{repo_root}/tests/fixtures/aider");
+    let fixture_workspace_id =
+        storage.ensure_workspace(Path::new(&fixture_workspace_path), None)?;
+
+    storage.insert_conversation_tree(
+        agent_id,
+        Some(root_workspace_id),
+        &Conversation {
+            id: None,
+            agent_slug: "aider".into(),
+            workspace: None,
+            external_id: Some(format!("{repo_root}/.aider.chat.history.md")),
+            title: Some("Aider Chat: coding_agent_session_search".into()),
+            source_path: PathBuf::from(format!("{repo_root}/.aider.chat.history.md")),
+            started_at: Some(1_764_619_673_394),
+            ended_at: Some(1_764_619_673_394),
+            approx_tokens: None,
+            metadata_json: Value::Null,
+            messages: vec![
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::System,
+                    author: Some("system".into()),
+                    created_at: None,
+                    content: "# aider chat started at 2025-12-01 20:07:47".into(),
+                    extra_json: Value::Null,
+                    snippets: vec![],
+                },
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::User,
+                    author: Some("user".into()),
+                    created_at: None,
+                    content: "/data/projects/coding_agent_session_search/.venv/bin/aider --no-git --message hello world\nUsing openrouter/deepseek/deepseek-r1:free model with API key from environment.\nAider v0.86.1\nModel: openrouter/deepseek/deepseek-r1:free with diff edit format, prompt cache, infinite output\nGit repo: none\nRepo-map: disabled\nhttps://aider.chat/HISTORY.html#release-notes".into(),
+                    extra_json: Value::Null,
+                    snippets: vec![],
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        },
+    )?;
+
+    storage.insert_conversation_tree(
+        agent_id,
+        Some(fixture_workspace_id),
+        &Conversation {
+            id: None,
+            agent_slug: "aider".into(),
+            workspace: None,
+            external_id: Some(format!("{fixture_workspace_path}/.aider.chat.history.md")),
+            title: Some("Aider Chat: aider".into()),
+            source_path: PathBuf::from(format!("{fixture_workspace_path}/.aider.chat.history.md")),
+            started_at: Some(1_764_621_401_399),
+            ended_at: Some(1_764_621_401_399),
+            approx_tokens: None,
+            metadata_json: Value::Null,
+            messages: vec![
+                Message { excluded: None, id: None, idx: 0, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "/add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 1, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Added src/main.rs to the chat.\n\n#### /add src/main.rs".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 2, role: MessageRole::User, author: Some("user".into()), created_at: None, content: "Please refactor.".into(), extra_json: Value::Null, snippets: vec![] },
+                Message { excluded: None, id: None, idx: 3, role: MessageRole::Agent, author: Some("assistant".into()), created_at: None, content: "Sure, here is the code.".into(), extra_json: Value::Null, snippets: vec![] },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        },
+    )?;
+
+    eprintln!(
+        "demo archive: db={} schema_version={}",
+        db_path.display(),
+        storage.schema_version()?
+    );
+    Ok(data_dir)
+}
+
+/// Publish the derived lexical assets a search needs.
+///
+/// The archive above is written through the storage layer, which fills the
+/// conversation/message tables but not the `lex_docs` / `fts_lex` search
+/// domain. `cass index --full` is the sanctioned path for building it
+/// (`cass` refuses to answer a search whose lexical domain was never
+/// published). No model configuration is involved: this is the lexical half
+/// only, so no embedding profile is selected and no request leaves the process.
+fn publish_search_derived_assets(
+    test_home: &Path,
+    data_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let output = cass_cmd(test_home)
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--data-dir",
+            data_dir.to_str().ok_or("non-utf8 data dir")?,
+        ])
+        .output()
+        .expect("run cass index --full");
+    if !output.status.success() {
+        return Err(format!(
+            "cass index --full exited {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Frozen model API configuration and its loopback service
+// ---------------------------------------------------------------------------
+//
+// The default search intent is hybrid-preferred, and the API-only contract
+// refuses a model-dependent command that has no configuration at all
+// (`freeze_search_model_api` -> exit 2 / kind `ModelApiConfiguration`). A test
+// that wants to pin the *default* result structure therefore has to supply a
+// real, valid configuration and a real endpoint. It must not narrow the search
+// to `--mode lexical` (that would drop the default-mode contract) and it must
+// not reach any real service.
+//
+// The profile below is synthetic and public: a loopback origin owned by this
+// test, fixed model/revision strings, no credential. The service answers fixed
+// JSON and records every request it received, so a test can state how many
+// requests the search actually carried.
+
+const STUB_EMBED_MODEL: &str = "example/synthetic-embed";
+const STUB_EMBED_REVISION: &str = "rev-synthetic-1";
+const STUB_EMBED_DIMENSION: usize = 8;
+
+/// One HTTP request the loopback service answered.
+#[derive(Clone, Debug)]
+struct StubRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+/// A minimal loopback HTTP service that answers every request with JSON and
+/// keeps what it was sent.
+struct ModelApiStub {
+    origin: String,
+    seen: Arc<Mutex<Vec<StubRequest>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ModelApiStub {
+    fn start() -> ModelApiStub {
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .expect("bind model API stub");
+        let addr = listener.local_addr().expect("stub local_addr");
+        listener
+            .set_nonblocking(true)
+            .expect("stub nonblocking listener");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let seen_thread = Arc::clone(&seen);
+        let stop_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Some(request) = read_stub_request(stream.try_clone().expect("clone"))
+                        {
+                            {
+                                let mut guard = seen_thread.lock().expect("stub lock");
+                                guard.push(request.clone());
+                            }
+                            let body = stub_answer(&request);
+                            let _ = write_stub_response(stream, 200, &body);
+                        }
+                    }
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
             }
-            fs::copy(entry.path(), &dst)?;
+        });
+
+        ModelApiStub {
+            origin: format!("http://{addr}"),
+            seen,
+            stop,
+            handle: Some(handle),
         }
     }
-    Ok(dst_root)
+
+    fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// `METHOD /path` for every request answered so far, in arrival order.
+    fn recorded(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .expect("stub lock")
+            .iter()
+            .map(|request| format!("{} {}", request.method, request.path))
+            .collect()
+    }
+}
+
+impl Drop for ModelApiStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One embedding per requested input, all of the same fixed width.
+fn stub_answer(request: &StubRequest) -> String {
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let count = body["input"].as_array().map_or(0, Vec::len);
+    let data: Vec<Value> = (0..count)
+        .map(|index| {
+            json!({
+                "index": index,
+                "embedding": vec![0.25_f64; STUB_EMBED_DIMENSION],
+            })
+        })
+        .collect();
+    json!({ "model": STUB_EMBED_MODEL, "data": data }).to_string()
+}
+
+fn read_stub_request(mut stream: TcpStream) -> Option<StubRequest> {
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok()?;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        let Some(headers_end) = find_subslice(&buffer, b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&buffer[..headers_end]).to_string();
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let body_start = headers_end + 4;
+        if buffer.len() < body_start + content_length {
+            continue;
+        }
+        let mut parts = head.lines().next().unwrap_or_default().split(' ');
+        return Some(StubRequest {
+            method: parts.next().unwrap_or_default().to_string(),
+            path: parts.next().unwrap_or_default().to_string(),
+            body: buffer[body_start..body_start + content_length].to_vec(),
+        });
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn write_stub_response(mut stream: TcpStream, status: u16, body: &str) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    let _ = stream.shutdown(Shutdown::Write);
+    Ok(())
+}
+
+/// Write the frozen, version-1 model API configuration the search goldens use,
+/// pointing its only profile at the loopback service owned by this test.
+fn write_frozen_model_api_config(
+    test_home: &Path,
+    origin: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let path = test_home.join("frozen-model-api.toml");
+    fs::write(
+        &path,
+        format!(
+            "version = 1\n\
+             default_embedding = \"golden-loopback\"\n\
+             \n\
+             [profiles.golden-loopback]\n\
+             kind = \"embedding\"\n\
+             protocol = \"openai-embeddings-v1\"\n\
+             endpoint = \"{origin}/v1/embeddings\"\n\
+             scope = \"loopback\"\n\
+             model = \"{STUB_EMBED_MODEL}\"\n\
+             model_revision = \"{STUB_EMBED_REVISION}\"\n\
+             normalization = \"l2\"\n"
+        ),
+    )?;
+    Ok(path)
 }
 
 fn json_value_schema(value: &Value) -> Value {
@@ -1239,33 +1625,91 @@ fn capabilities_shape_matches_golden() {
     assert_golden("robot/capabilities_shape.json.golden", &canonical);
 }
 
-#[test]
-fn models_status_json_matches_golden() {
-    // `cass models status --json` reads XDG_DATA_HOME for the model cache
-    // directory. In our isolated test home the cache is always empty, so
-    // the output is deterministic: state=not_installed across every field.
-    // Absolute paths inside the payload (`model_dir`, `files[].actual_path`)
-    // get scrubbed by `scrub_robot_json` → `[TEST_HOME]` prefix.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let scrubbed = capture_robot_json(
-        test_home.path(),
-        &["models", "status", "--json"],
-        ExpectStatus::ExitOk,
-    );
-    assert_golden("robot/models_status.json.golden", &scrubbed);
+// Semantic mapping (model-API migration): the former `models_status_json` /
+// `models_status_shape` goldens pinned the local model-cache payload
+// (`model_acquisition`, `cache_lifecycle`, `files[]`, `cass models install`
+// next-steps). That surface was retired -- `cass models status` is now an alias
+// of `cass models list` and reports the configured HTTP model API profiles, and
+// the local download/acquisition contract no longer exists. The retired goldens
+// are removed; the surviving contract (a configuration refusal with no config,
+// and the real profile listing with one) is asserted here and in
+// `tests/api_model_commands.rs`, which drives the real CLI against a real
+// config file.
+/// The stable `error.kind` / `error.code` a `--json` refusal puts on stderr.
+///
+/// Pinning the kind (not just the exit code) is what makes the refusal proof
+/// meaningful: any other failure that also exits 2 — a usage error, a different
+/// configuration problem, a crash — must not be able to masquerade as the
+/// intended migration/configuration refusal.
+fn stderr_error_kind_code(out: &std::process::Output, label: &str) -> (String, i64) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or_else(|| panic!("{label}: no JSON error envelope on stderr; stderr: {stderr}"));
+    let envelope: serde_json::Value = serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("{label}: stderr envelope is not JSON: {e}; line: {line}"));
+    let error = envelope
+        .get("error")
+        .unwrap_or_else(|| panic!("{label}: envelope has no `error` object: {envelope}"));
+    let kind = error
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{label}: error has no string `kind`: {error}"))
+        .to_string();
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| panic!("{label}: error has no integer `code`: {error}"));
+    (kind, code)
 }
 
 #[test]
-fn models_status_shape_matches_golden() {
+fn models_status_without_a_model_api_config_refuses() {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let status = capture_robot_json_value(
-        test_home.path(),
-        &["models", "status", "--json"],
-        ExpectStatus::ExitOk,
+    let out = cass_cmd(test_home.path())
+        .args(["models", "status", "--json"])
+        .output()
+        .expect("run cass models status --json");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "models status with no --api-config must be a configuration refusal; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&status)).expect("pretty-print JSON");
-    assert_golden("robot/models_status_shape.json.golden", &canonical);
+    let (kind, code) = stderr_error_kind_code(&out, "models status");
+    assert_eq!(kind, "ModelApiConfiguration", "the refusal must be the API configuration error");
+    assert_eq!(code, 2, "the envelope code must mirror the exit code");
+}
+
+#[test]
+fn retired_models_verify_and_check_update_refuse_as_migration_errors() {
+    // `models verify` / `models check-update` addressed the local weight cache.
+    // They now refuse with a migration error instead of inspecting a local model
+    // directory. The `kind` is pinned so an unrelated exit-2 failure cannot pass
+    // for the intended refusal.
+    let test_home = tempfile::tempdir().expect("create temp home");
+    for args in [
+        ["models", "verify", "--json"],
+        ["models", "check-update", "--json"],
+    ] {
+        let out = cass_cmd(test_home.path())
+            .args(args)
+            .output()
+            .expect("run a retired models subcommand");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?} must be a migration refusal; stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let (kind, code) = stderr_error_kind_code(&out, &format!("{args:?}"));
+        assert_eq!(kind, "ModelApiMigration", "{args:?} must refuse as a migration error");
+        assert_eq!(code, 2, "{args:?} envelope code must mirror the exit code");
+    }
 }
 
 #[test]
@@ -1484,6 +1928,7 @@ fn diag_quarantine_json_matches_golden() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
         panic!("diag --quarantine stdout is not JSON: {err}\nstdout:\n{stdout}")
     });
+    assert_seeded_quarantine_totals(&parsed, "cass diag --quarantine --json");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/diag_quarantine.json.golden", &scrubbed);
@@ -1513,6 +1958,7 @@ fn doctor_quarantine_json_matches_golden() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("doctor stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    assert_seeded_quarantine_totals(&parsed, "cass doctor --json");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/doctor_quarantine.json.golden", &scrubbed);
@@ -1542,6 +1988,7 @@ fn status_quarantine_json_matches_golden() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("status stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    assert_seeded_quarantine_totals(&parsed, "cass status --json");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/status_quarantine.json.golden", &scrubbed);
@@ -1571,6 +2018,7 @@ fn status_quarantine_full_json_matches_golden() {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("status stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    assert_seeded_quarantine_totals(&parsed, "cass status --json (full)");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/status_quarantine_full.json.golden", &scrubbed);
@@ -1699,12 +2147,11 @@ fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     // `coding_agent_session_search-zefv4`: the error envelope has been
     // pinned (stats_missing_db* goldens) but the success envelope had no
     // freeze — regressions to a field name or a new mandatory key on
-    // the common-case happy-path would pass CI silently. Seeds the
-    // existing search_demo_data fixture (324 KB canonical DB with a
-    // known conversation/message count), invokes `cass stats --json`,
-    // and freezes the scrubbed envelope.
+    // the common-case happy-path would pass CI silently. Seeds the demo
+    // corpus (2 conversations / 6 messages) at the current schema, invokes
+    // `cass stats --json`, and freezes the scrubbed envelope.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
+    let data_dir = current_schema_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -1724,6 +2171,16 @@ fn stats_json_happy_path_matches_golden() -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("stats happy-path envelope is JSON");
+    // The frozen envelope is only meaningful over a populated archive: an
+    // empty data dir would satisfy every key and freeze a zero report.
+    assert_eq!(
+        parsed["conversations"], serde_json::json!(2),
+        "the demo corpus must still contribute 2 conversations: {parsed}"
+    );
+    assert_eq!(
+        parsed["messages"], serde_json::json!(6),
+        "the demo corpus must still contribute 6 messages: {parsed}"
+    );
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/stats_full_payload.json.golden", &scrubbed);
@@ -1737,7 +2194,7 @@ fn stats_json_happy_path_shape_matches_golden() -> Result<(), Box<dyn Error>> {
     // mask structural regressions. json_value_schema diff tolerates
     // value changes; keys + types must hold.
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
+    let data_dir = current_schema_search_demo_data(test_home.path())?;
     let out = cass_cmd(test_home.path())
         .args([
             "stats",
@@ -2037,17 +2494,33 @@ fn pack_introspect_contract_matrix_is_current() {
     }
 }
 
-#[test]
-fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
+/// Run the default-intent `cass search hello --json --rrf-limit 2` the two
+/// search goldens freeze, against a current-schema demo archive with published
+/// lexical assets and a valid (loopback) model API configuration.
+///
+/// The default intent — hybrid-preferred, not `--mode lexical` — is the whole
+/// point of these two cases: they pin what a caller who names no mode gets
+/// back. Narrowing them to lexical would drop that contract, and removing the
+/// API configuration would only re-test the refusal, so both stay.
+#[allow(clippy::type_complexity)]
+fn run_default_search_over_demo_corpus()
+-> Result<(tempfile::TempDir, serde_json::Value, String), Box<dyn Error>> {
     let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
-    let output = cass_cmd(test_home.path())
+    let home = test_home.path().to_path_buf();
+    let stub = ModelApiStub::start();
+    let data_dir = current_schema_search_demo_data(&home)?;
+    publish_search_derived_assets(&home, &data_dir)?;
+    let api_config = write_frozen_model_api_config(&home, stub.origin())?;
+
+    let output = cass_cmd(&home)
         .args([
             "search",
             "hello",
             "--json",
             "--rrf-limit",
             "2",
+            "--api-config",
+            api_config.to_str().expect("utf8 config path"),
             "--data-dir",
             data_dir.to_str().expect("utf8 path"),
         ])
@@ -2063,6 +2536,29 @@ fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
     let stdout = String::from_utf8(output.stdout).expect("utf8 stdout");
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|err| panic!("search stdout is not JSON: {err}\nstdout:\n{stdout}"));
+    // A frozen envelope is only a contract if the search actually returned the
+    // corpus' hit: an empty result set would freeze just as happily.
+    assert_eq!(
+        parsed["total_matches"],
+        serde_json::json!(1),
+        "the demo corpus must still answer `hello` with exactly one match: {parsed}"
+    );
+    assert_eq!(
+        parsed["hits"].as_array().map(Vec::len),
+        Some(1),
+        "the demo corpus must still answer `hello` with exactly one hit: {parsed}"
+    );
+    // What the loopback service actually received is evidence the caller
+    // states, so hand it back rather than letting the service go unreported.
+    let receipt = format!("model_api_stub_requests={:?}", stub.recorded());
+    drop(stub);
+    Ok((test_home, parsed, receipt))
+}
+
+#[test]
+fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
+    let (test_home, parsed, receipt) = run_default_search_over_demo_corpus()?;
+    eprintln!("{receipt}");
     let canonical = serde_json::to_string_pretty(&parsed).expect("pretty-print JSON");
     let scrubbed = scrub_robot_json(&canonical, test_home.path());
     assert_golden("robot/search_robot.json.golden", &scrubbed);
@@ -2071,29 +2567,8 @@ fn search_robot_json_matches_golden() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn search_robot_shape_matches_golden() -> Result<(), Box<dyn Error>> {
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let data_dir = isolated_search_demo_data(test_home.path())?;
-    let output = cass_cmd(test_home.path())
-        .args([
-            "search",
-            "hello",
-            "--json",
-            "--rrf-limit",
-            "2",
-            "--data-dir",
-            data_dir.to_str().expect("utf8 path"),
-        ])
-        .output()
-        .expect("run cass search --json");
-    assert!(
-        output.status.success(),
-        "cass search --json exited non-zero: status={:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("valid search JSON");
+    let (_test_home, parsed, receipt) = run_default_search_over_demo_corpus()?;
+    eprintln!("{receipt}");
     let canonical =
         serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
     assert_golden("robot/search_robot_shape.json.golden", &canonical);
@@ -2273,61 +2748,10 @@ fn sessions_json_missing_db_error_envelope_shape_matches_golden() {
     assert_golden("robot/sessions_missing_db_shape.json.golden", &canonical);
 }
 
-#[test]
-fn models_verify_json_not_acquired_shape_matches_golden() {
-    // Empty data_dir ⇒ model is not acquired, `cass models verify
-    // --json` emits the stable not_acquired envelope on stdout with
-    // exit 0. Shape golden pins: status, state_detail, next_step,
-    // lexical_fail_open, model_dir, all_valid, cache_lifecycle
-    // (nested), error.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let out = cass_cmd(test_home.path())
-        .args([
-            "models",
-            "verify",
-            "--json",
-            "--data-dir",
-            test_home.path().to_str().expect("utf8 path"),
-        ])
-        .output()
-        .expect("run cass models verify --json");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|err| panic!("models verify stdout is not JSON: {err}\nstdout:\n{stdout}"));
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
-    assert_golden(
-        "robot/models_verify_not_acquired_shape.json.golden",
-        &canonical,
-    );
-}
-
-#[test]
-fn models_check_update_json_not_installed_shape_matches_golden() {
-    // Empty data_dir ⇒ `cass models check-update --json` returns
-    // `reason=model_not_installed` with current_revision=null +
-    // latest_revision=<pinned sha>. Shape golden pins the 4-field
-    // envelope so a regression that renamed/removed any field would
-    // trip CI.
-    let test_home = tempfile::tempdir().expect("create temp home");
-    let out = cass_cmd(test_home.path())
-        .args([
-            "models",
-            "check-update",
-            "--json",
-            "--data-dir",
-            test_home.path().to_str().expect("utf8 path"),
-        ])
-        .output()
-        .expect("run cass models check-update --json");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|err| {
-        panic!("models check-update stdout is not JSON: {err}\nstdout:\n{stdout}")
-    });
-    let canonical =
-        serde_json::to_string_pretty(&json_value_schema(&parsed)).expect("pretty-print JSON");
-    assert_golden(
-        "robot/models_check_update_not_installed_shape.json.golden",
-        &canonical,
-    );
-}
+// The former `models_verify_not_acquired_shape` / `models_check_update_not_installed_shape`
+// goldens pinned the local weight-cache lifecycle (`status`, `state_detail`,
+// `next_step`, `cache_lifecycle`, `all_valid`, `reason=model_not_installed`).
+// Those subcommands were retired with the model-API migration and now refuse
+// with a migration error (exit 2), which is asserted by
+// `retired_models_verify_and_check_update_refuse_as_migration_errors` above; the
+// goldens are removed rather than kept alive with a fake payload.

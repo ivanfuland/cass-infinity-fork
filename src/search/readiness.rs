@@ -678,8 +678,8 @@ impl DerivedAssetTruthTable {
             SemanticReadinessState::Absent => {
                 return SafeNextCommand::new(
                     A::InstallSemanticModel,
-                    Some("cass models install"),
-                    "semantic tier absent; install the model for hybrid refinement (lexical works now)",
+                    Some("cass models check --profile <id>"),
+                    "semantic tier absent; configure an embedding API profile for hybrid refinement (lexical works now)",
                 );
             }
             SemanticReadinessState::Backfilling => {

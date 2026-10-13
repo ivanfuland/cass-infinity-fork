@@ -285,6 +285,15 @@ pub struct Cli {
     #[arg(long, value_enum, global = true)]
     pub robot_format: Option<RobotFormat>,
 
+    /// Path to the versioned model-service API configuration (TOML)
+    ///
+    /// Takes precedence over the `CASS_API_CONFIG` environment variable. A
+    /// command that needs a model reads the file once, before any request; a
+    /// command that names no file and finds no variable reports a missing
+    /// configuration instead of guessing a path.
+    #[arg(long, global = true, value_hint = ValueHint::FilePath)]
+    pub api_config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -394,14 +403,15 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         ingest: bool,
 
-        /// Embedder to use for semantic indexing (infinity, hash; `fastembed`
-        /// requires the `semantic` build feature, retired in this build --
-        /// R1-W3-N2: defaults to `infinity` under the `infinity` feature so
-        /// a bare `cass index --semantic` reaches the DB vector domain
-        /// instead of the retired default)
-        #[cfg_attr(feature = "infinity", arg(long, default_value = "infinity"))]
-        #[cfg_attr(not(feature = "infinity"), arg(long, default_value = "fastembed"))]
-        embedder: String,
+        /// retired local backend selector; use --embedding-profile
+        #[arg(long)]
+        embedder: Option<String>,
+        /// embedding profile from the model API configuration
+        #[arg(long, requires = "semantic")]
+        embedding_profile: Option<String>,
+        /// disable the configured model fallback for this command
+        #[arg(long, requires = "semantic")]
+        no_model_fallback: bool,
 
         /// Override data dir (index + db). Defaults to platform data dir.
         #[arg(long)]
@@ -502,14 +512,25 @@ pub enum Commands {
         /// env/config K values are ignored when --rerank is off.
         #[arg(long)]
         rerank_limit: Option<usize>,
-        /// Rerank backend selection. Requires --rerank. Exactly one of
-        /// qwen3-local (the default when omitted), bge-local,
-        /// openrouter-qwen3-8b, openrouter-cohere-4-fast,
-        /// openrouter-voyage-2.5-lite. Selecting one without --rerank is a usage
-        /// error. Nothing is read from env or config; omitting it never selects a
-        /// cloud backend.
-        #[arg(long, value_enum)]
-        rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
+        /// Retired rerank backend selection. The local and OpenRouter rerank
+        /// backends were removed with the model-API migration, so any supplied
+        /// value is refused with a migration error before any request. The
+        /// backend now comes from the configured rerank API profile
+        /// (`--rerank-profile` with `--api-config`).
+        ///
+        /// Taken as a free-form string on purpose: a `value_enum` would make
+        /// clap advertise the retired spellings as valid choices in `--help`.
+        #[arg(long)]
+        rerank_provider: Option<String>,
+        /// Embedding API profile; defaults to the configured default_embedding.
+        #[arg(long)]
+        embedding_profile: Option<String>,
+        /// Rerank API profile; defaults to the configured default_rerank.
+        #[arg(long, requires = "rerank")]
+        rerank_profile: Option<String>,
+        /// Disable the explicitly configured cloud fallback for this request.
+        #[arg(long)]
+        no_model_fallback: bool,
         /// Offset for pagination (start at Nth result)
         #[arg(long, default_value_t = 0)]
         offset: usize,
@@ -601,27 +622,35 @@ pub enum Commands {
         // ==========================================================================
         // Model / Reranker / Daemon flags (bd-3bbv)
         // ==========================================================================
-        /// Embedding model to use for semantic search.
-        /// Available models depend on what's been downloaded.
-        /// Use `cass models --list` to see available options.
+        /// Retired local embedding-model selector. The local backend was
+        /// removed with the model-API migration, so a supplied value is
+        /// refused with a migration error before any request. Embedding is
+        /// served by the configured API profile (`--api-config` with
+        /// `--embedding-profile`).
         #[arg(long)]
         model: Option<String>,
 
         /// Enable complete-window reranking (off by default).
-        /// Default: qwen3-local, N=200 candidates, K=5 results per page.
+        /// Default: N=200 candidates, K=5 results per page; the backend is the
+        /// configured rerank API profile (--rerank-profile).
         #[arg(long, default_value_t = false)]
         rerank: bool,
 
-        /// Deprecated reranker selector. Use --rerank-provider instead.
+        /// Retired reranker selector. A supplied value is refused with a
+        /// migration error before any request; the backend comes from the
+        /// configured rerank API profile (`--rerank-profile`).
         #[arg(long)]
         reranker: Option<String>,
 
-        /// Use daemon for warm model inference (faster repeated queries).
-        /// If daemon is unavailable, falls back to direct inference.
+        /// Retired daemon-inference selector. Warm local-model inference was
+        /// removed with the model-API migration, so this flag is refused with
+        /// a migration error before any request.
         #[arg(long, default_value_t = false)]
         daemon: bool,
 
-        /// Disable daemon usage even if available (force direct inference).
+        /// No effect on the API-only build: it selects no model and enables no
+        /// local inference, so there is no daemon for it to disable. Retained
+        /// for compatibility.
         #[arg(long, default_value_t = false)]
         no_daemon: bool,
 
@@ -2470,33 +2499,37 @@ pub enum IngestCommand {
 /// Subcommands for managing semantic search models
 #[derive(Subcommand, Debug, Clone)]
 pub enum ModelsCommand {
-    /// Show model installation status
+    /// Capture both rounds of an explicitly pinned compatibility fixture.
+    CaptureCompatibility(crate::search::model_api::compatibility_tools::CaptureArgs),
+    /// Recompute compatibility from pinned capture manifests without network I/O.
+    VerifyCompatibility(crate::search::model_api::compatibility_tools::VerifyArgs),
+    /// Show configured HTTP model profiles (read-only, no HTTP)
     Status {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// Download and install the semantic search model
+    /// Retired local install command; returns API migration guidance
     Install {
-        /// Model to install (default: all-minilm-l6-v2)
-        #[arg(long, default_value = "all-minilm-l6-v2")]
-        model: String,
-        /// Custom HTTP(S) mirror base URL for downloading
+        /// legacy local model selector (command is retired)
+        #[arg(long)]
+        model: Option<String>,
+        /// legacy mirror flag (no download is performed)
         #[arg(long, conflicts_with = "from_file")]
         mirror: Option<String>,
-        /// Install from local model directory (for air-gapped environments)
+        /// legacy local source flag (files are not read)
         #[arg(long, conflicts_with = "mirror")]
         from_file: Option<PathBuf>,
-        /// Skip confirmation prompt
+        /// legacy confirmation flag (no local model action is performed)
         #[arg(long, short = 'y')]
         yes: bool,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Verify model integrity (SHA256 checksums)
+    /// Retired local verification command; returns API migration guidance
     Verify {
-        /// Attempt to repair corrupted files
+        /// legacy repair flag (files are not changed)
         #[arg(long)]
         repair: bool,
         /// Override data dir
@@ -2508,12 +2541,21 @@ pub enum ModelsCommand {
     },
     /// Run one bounded semantic backfill batch from the canonical DB
     Backfill {
-        /// Semantic tier to backfill: fast or quality
-        #[arg(long, default_value = "fast")]
-        tier: String,
-        /// Embedder implementation: hash or fastembed
+        /// Semantic tier to backfill: fast or quality (legacy local model routing;
+        /// not accepted on the API-only path)
+        #[arg(long)]
+        tier: Option<String>,
+        /// Embedder implementation: hash or fastembed (legacy local backend;
+        /// not accepted on the API-only path)
         #[arg(long)]
         embedder: Option<String>,
+        /// Embedding profile id from the model API configuration. Selects the
+        /// API-only path; defaults to the configuration's `default_embedding`.
+        #[arg(long)]
+        embedding_profile: Option<String>,
+        /// Disable the configured fallback for this command
+        #[arg(long)]
+        no_model_fallback: bool,
         /// Maximum canonical conversations to process in this batch
         #[arg(long, default_value_t = 64)]
         batch_conversations: usize,
@@ -2530,23 +2572,52 @@ pub enum ModelsCommand {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// Remove model files to free disk space
+    /// Retired local removal command; existing model files are not changed
     Remove {
-        /// Model to remove (default: all-minilm-l6-v2)
-        #[arg(long, default_value = "all-minilm-l6-v2")]
-        model: String,
-        /// Skip confirmation prompt
+        /// legacy local model selector (command is retired)
+        #[arg(long)]
+        model: Option<String>,
+        /// legacy confirmation flag (no local model action is performed)
         #[arg(long, short = 'y')]
         yes: bool,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
-    /// Check for model updates
+    /// Retired local update check; use configured model API profiles
     CheckUpdate {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// List the configured model API profiles (read-only, no HTTP)
+    ///
+    /// Reads the versioned model-service configuration named by --api-config or
+    /// CASS_API_CONFIG. Lists every profile by id, ascending, with its kind,
+    /// protocol, model, declared revision, endpoint and scope. It opens no
+    /// database, loads no weight and makes no request. A credential variable is
+    /// named, never read.
+    List {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Check one explicitly selected profile against its own endpoint
+    ///
+    /// The profile is named by id and its kind comes from the configuration, so
+    /// no kind is guessed from a name. Exactly the selected endpoint is
+    /// checked: the fallback is never used, even when the profile declares one.
+    /// An embedding profile is probed with one query and one document built
+    /// from a fixed public synthetic text; a rerank profile is probed with two
+    /// fixed public synthetic documents. No private corpus is sent and the
+    /// metadata endpoint is not fetched.
+    Check {
+        /// Profile id to check (required)
+        #[arg(long)]
+        profile: String,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -4511,6 +4582,8 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
             | "display"
             | "data-dir"
             | "data_dir"
+            | "api-config"
+            | "api_config"
             | "days"
             | "since"
             | "until"
@@ -5357,6 +5430,7 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
         "preview",
         "port",
         "config",
+        "api-config",
         "validate-config",
         "example-config",
         "skip-install",
@@ -5479,7 +5553,7 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
     let global_with_value = |s: &str| {
         matches!(
             s,
-            "--color" | "--progress" | "--wrap" | "--db" | "--trace-file"
+            "--color" | "--progress" | "--wrap" | "--db" | "--trace-file" | "--api-config"
         )
     };
 
@@ -5501,6 +5575,8 @@ fn normalize_args(raw: Vec<String>) -> CliResult<(Vec<String>, Option<String>)> 
             || s == "-v"
             || s == "--trace-file"
             || s.starts_with("--trace-file=")
+            || s == "--api-config"
+            || s.starts_with("--api-config=")
             || s == "--robot-help"
     };
 
@@ -6017,11 +6093,20 @@ fn format_missing_subcommand_error(args: &[String]) -> String {
             ],
         ),
         "models" => (
-            &["status", "install", "verify", "remove", "check-update"],
             &[
-                "cass models status --json",
-                "cass models install --model all-minilm-l6-v2",
-                "cass models verify --json",
+                "status",
+                "list",
+                "check",
+                "backfill",
+                "install",
+                "verify",
+                "remove",
+                "check-update",
+            ],
+            &[
+                "cass models list --json",
+                "cass models check --profile <id> --json",
+                "cass models backfill --json",
             ],
         ),
         "import" => (
@@ -6910,6 +6995,17 @@ async fn execute_cli(
         Commands::Regression { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
+            // The local rerank provider is retired for the production backtest:
+            // a run names its scoring service in a frozen model-API
+            // configuration. The legacy selection is refused here, before any
+            // input is read and before any request, instead of falling back to
+            // the retired service path.
+            if legacy_rerank_provider_selected(action) {
+                return Err(model_api_migration_error(
+                    "the legacy rerank-provider selection is retired for the backtest".into(),
+                    "Pass --api-config with --rerank-profile instead".into(),
+                ));
+            }
             if matches!(action, regression::RegressionCommand::Compare { .. }) {
                 let outcome = regression::run::run_compare(action).map_err(|error| CliError {
                     code: 2,
@@ -6936,7 +7032,7 @@ async fn execute_cli(
                     });
                 }
             } else {
-                let result = regression::run::run(action).map_err(|error| CliError {
+                let result = regression::run::run_with_api_config(action, cli.api_config.as_deref()).map_err(|error| CliError {
                     code: 2, kind: CliErrorKind::Usage.kind_str(),
                     message: regression::run::error_code(&error).to_string(),
                     hint: None, retryable: false,
@@ -6947,7 +7043,7 @@ async fn execute_cli(
         Commands::RegressionInput { action } => {
             search::regression_input::reject_global_paths(cli.db.is_some(), cli.trace_file.is_some())
                 .map_err(|_| CliError::usage("REGRESSION_INPUT_REQUIRES_LOCAL_ARGUMENTS", None))?;
-            let result = search::regression_input::run(action).map_err(|error| CliError {
+            let result = search::regression_input::run_with_api_config(action, cli.api_config.as_deref()).map_err(|error| CliError {
                 code: 2, kind: CliErrorKind::Usage.kind_str(),
                 message: search::regression_input::error_code(&error).to_string(),
                 hint: None, retryable: false,
@@ -7070,7 +7166,7 @@ async fn execute_cli(
                     let run_result = if let Some(path) = asciicast {
                         tui_asciicast::run_tui_with_asciicast(&path, !once)
                     } else {
-                        ui::app::run_tui_ftui(inline_config, macro_config, Some(tui_data_dir))
+                        ui::app::run_tui_ftui(inline_config, macro_config, Some(tui_data_dir), cli.api_config.clone())
                     };
 
                     if let Err(e) = run_result {
@@ -7122,6 +7218,8 @@ async fn execute_cli(
                     no_ingest,
                     ingest,
                     embedder,
+                    embedding_profile,
+                    no_model_fallback,
                     idempotency_key,
                     json,
                     progress_interval_ms,
@@ -7151,6 +7249,13 @@ async fn execute_cli(
                     } else {
                         IngestMode::Implicit
                     };
+                    if embedder.is_some() {
+                        return Err(model_api_migration_error("--embedder is retired".into(), "Use --embedding-profile with --api-config".into()));
+                    }
+                    let model_api = if semantic {
+                        Some(std::sync::Arc::new(crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(
+                            cli.api_config.as_deref(), embedding_profile.as_deref(), !no_model_fallback).map_err(model_api_runtime_error)?))
+                    } else { None };
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_index_with_data(
                         cli.db.clone(),
@@ -7163,7 +7268,7 @@ async fn execute_cli(
                         semantic,
                         no_ingest,
                         ingest_mode,
-                        embedder,
+                        model_api,
                         progress,
                         structured_format,
                         idempotency_key,
@@ -7184,7 +7289,14 @@ async fn execute_cli(
                     no_mirror,
                 } => {
                     let structured = resolve_subcommand_structured_format(cli, json).is_some();
-                    sync::run_sync(cli.db.clone(), data_dir, no_ingest, no_mirror, structured)?;
+                    sync::run_sync(
+                        cli.db.clone(),
+                        data_dir,
+                        no_ingest,
+                        no_mirror,
+                        structured,
+                        cli.api_config.clone(),
+                    )?;
                 }
                 Commands::Search {
                     query,
@@ -7219,6 +7331,9 @@ async fn execute_cli(
                     sessions_from,
                     mode,
                     vector_search_mode,
+                    embedding_profile,
+                    rerank_profile,
+                    no_model_fallback,
                     model,
                     rerank,
                     reranker,
@@ -7237,30 +7352,16 @@ async fn execute_cli(
                         ));
                     }
 
-                    // `--reranker` is deprecated: it is still parsed for
-                    // compatibility, but it never selects a backend and its
-                    // value is never echoed. Combining it with the new
-                    // `--rerank-provider` is an explicit conflict rather than a
-                    // silent preference for one of them.
-                    if reranker.is_some() {
-                        if rerank_provider.is_some() {
-                            return Err(CliError::usage(
-                                "--reranker cannot be combined with --rerank-provider",
-                                Some(
-                                    "--rerank-provider now selects the rerank backend; drop --reranker."
-                                        .to_string(),
-                                ),
-                            ));
-                        }
-                        eprintln!(
-                            "Warning: --reranker is deprecated and no longer selects a rerank backend; use --rerank-provider"
-                        );
+                    if model.is_some() || daemon || rerank_provider.is_some() || reranker.is_some() {
+                        return Err(model_api_migration_error(
+                            "legacy model, daemon, and rerank-provider selections are retired".into(),
+                            "Use --api-config with --embedding-profile or --rerank-profile".into()));
                     }
 
                     // Resolve configurable search defaults (#303 + PR3 windows)
                     // in one pass: timeout/mode as before, plus the window limits
                     // N/K and the rerank provider. This MUST run before
-                    // `refresh_index_inline` so an invalid window/provider
+                    // `refresh_index_inline` so an invalid window
                     // argument fails before any ingest, DB or model work starts.
                     let defaults = resolve_search_window_defaults(
                         timeout,
@@ -7268,7 +7369,6 @@ async fn execute_cli(
                         rerank,
                         rrf_limit,
                         rerank_limit,
-                        rerank_provider,
                     )?;
 
                     // PR9 09a: `--vector-search-mode` is an independent
@@ -7326,17 +7426,26 @@ async fn execute_cli(
                         }
                     }
 
-                    if refresh {
-                        refresh_index_inline(cli.db.clone(), data_dir.clone());
-                    }
-
-                    let semantic_opts = semantic_search_options_from_defaults(
+                    let mut semantic_opts = semantic_search_options_from_defaults(
                         model.clone(),
                         rerank,
                         reranker.clone(),
                         daemon && !no_daemon,
                         &defaults,
                     );
+
+                    semantic_opts.api = ApiSearchOptions {
+                        frozen: None,
+                        embedding_route: None,
+                        config_path: cli.api_config.clone(),
+                        embedding_profile,
+                        rerank_profile,
+                        no_model_fallback,
+                    };
+                    freeze_search_model_api(&mut semantic_opts, defaults.mode, dry_run)?;
+                    if refresh && !dry_run {
+                        refresh_index_inline(cli.db.clone(), data_dir.clone());
+                    }
 
                     // Only pass through robot_format when it was explicitly
                     // requested (CLI flag or env var). Returning `None` here
@@ -19399,7 +19508,7 @@ fn state_meta_json_inner(
                 available: false,
                 can_search: false,
                 fallback_mode: Some("lexical"),
-                preferred_backend: "fastembed",
+                preferred_backend: "external",
                 embedder_id: None,
                 vector_index_path: None,
                 model_dir: None,
@@ -19456,7 +19565,7 @@ fn state_meta_json_inner(
         assets.semantic.quality_tier_published = false;
         assets.semantic.semantic_only_search_available = false;
         assets.semantic.hint = Some(
-            "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'."
+            "Run 'cass index --full' first. Optional later: configure a model API profile with --api-config (see 'cass models list') and run 'cass index --semantic'."
                 .to_string(),
         );
         assets.semantic.fast_tier = Default::default();
@@ -19713,12 +19822,13 @@ fn state_meta_json_inner(
             "hnsw_path": semantic.hnsw_path.as_ref().map(|path| path.display().to_string()),
             "hnsw_ready": semantic.hnsw_ready,
             "progressive_ready": semantic.progressive_ready,
-            // cass#256: surface whether this binary was built with the
-            // `semantic` Cargo feature. `false` means the prebuilt
-            // Microsoft ONNX Runtime is NOT linked (the baseline build
-            // for pre-AVX2 CPUs); semantic search modes will return an
-            // explicit error and hybrid degrades to lexical.
-            "feature_compiled_in": cfg!(feature = "semantic"),
+            // cass#256: whether the retired in-process `semantic` (ONNX)
+            // feature was compiled in. It is permanently `false` now: local
+            // inference is retired, the prebuilt Microsoft ONNX Runtime is
+            // never linked, and semantic search is served exclusively by the
+            // configured external model API (hybrid still degrades to lexical
+            // when no API profile is configured).
+            "feature_compiled_in": false,
             // Sub-fix 3 for cass#257 — additive fields that report
             // quality-tier readiness independently of the
             // progressive/hybrid stack so `--mode semantic` consumers
@@ -21565,6 +21675,16 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Models(ModelsCommand::VerifyCompatibility(args)) => {
+            resolve_subcommand_structured_format(cli, args.json).is_some()
+        }
+        Commands::Models(ModelsCommand::CaptureCompatibility(args)) => {
+            resolve_subcommand_structured_format(cli, args.json).is_some()
+        }
+        Commands::Models(ModelsCommand::List { json })
+        | Commands::Models(ModelsCommand::Check { json, .. }) => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Fleet(FleetCommand::UpgradeRehearsal { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -21828,7 +21948,7 @@ fn print_robot_help(wrap: WrapConfig) -> CliResult<()> {
         "",
         "OUTPUT:",
         "  --robot | --json   Machine-readable JSON output (auto-quiet enabled)",
-        "  --rerank enables qwen3-local by default (N=200/K=5); select --rerank-provider explicitly to change backend.",
+        "  --rerank requires a configured rerank API profile (--api-config / --rerank-profile); N=200/K=5 by default. The retired --rerank-provider selection is refused.",
         "  Search uses --rrf-limit N and --rerank-limit K; legacy search --limit is refused. Pack --limit is unchanged.",
         "  _meta.rerank is present in JSON/compact/JSONL/TOON when enabled, without --robot-meta; score and rerank_score are separate.",
         "  Cursor pages repeat query/N/K/provider/filters and reuse the window without another model call.",
@@ -21857,7 +21977,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "    --workspace W     Filter by workspace path".to_string(),
             "    --rrf-limit N     Candidate window N before pagination. Default: 200 with --rerank; without --rerank an omitted N keeps the legacy unbounded fetch (internal 0). Explicit 0 is rejected.".to_string(),
             "    --rerank-limit K  Per-page count K when --rerank is on (default 5; must be >=1 and <=N; explicit 0 rejected)".to_string(),
-            "    --rerank-provider P  Rerank backend when --rerank is on: qwen3-local (default when omitted) | bge-local | openrouter-qwen3-8b | openrouter-cohere-4-fast | openrouter-voyage-2.5-lite".to_string(),
+            "    --rerank-provider P  Retired. The local/OpenRouter rerank backends were removed; a supplied value is refused with a migration error. Use --rerank-profile with --api-config.".to_string(),
             "    --offset N        Pagination offset (default: 0)".to_string(),
             "    --json | --robot  JSON output for automation".to_string(),
             "    --fields F1,F2    Select specific fields in hits (reduces token usage)".to_string(),
@@ -21962,12 +22082,10 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).".to_string(),
             "  cass api-version [--json]        Show crate_version + api_version + contract_version.".to_string(),
             "  cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).".to_string(),
-            "  cass models status [--json]      Semantic model acquisition + cache state.".to_string(),
-            "  cass models install [--from-file DIR] [--model NAME]  Download + install embedder (minilm | snowflake-arctic-s | nomic-embed).".to_string(),
-            "  cass models remove [--model NAME]  Remove an installed semantic model from disk.".to_string(),
-            "  cass models verify [--json]      Per-file SHA-256 verification of the installed model.".to_string(),
-            "  cass models check-update [--json]  Compare installed revision against the pinned registry revision.".to_string(),
-            "  cass models backfill             Re-embed conversations against a newly acquired model.".to_string(),
+            "  cass models list [--json]        List configured model API profiles (alias: models status).".to_string(),
+            "  cass models check --profile ID [--json]  Check one configured model API profile against its endpoint.".to_string(),
+            "  cass models backfill [--json]   Build/refresh the semantic vector domain (requires --api-config).".to_string(),
+            "  cass models install|verify|remove|check-update  Retired; local weight management refuses with a migration error.".to_string(),
             "  cass expand <path> --line N [-C CONTEXT] [--json]  Show messages around a specific line in a session.".to_string(),
             "  cass resume <path> [--shell]     Resolve a session path into its native-harness resume command.".to_string(),
             "  cass timeline [--since DATE] [--until DATE] [--json]  Activity timeline over a time range.".to_string(),
@@ -21990,13 +22108,14 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  TUI_HEADLESS=1                           skip update prompt".to_string(),
             "  CASS_DATA_DIR                            override data dir".to_string(),
             "  CASS_DB_PATH                             override db path".to_string(),
+            "  CASS_API_CONFIG                          path to the versioned model-service API configuration; --api-config overrides it".to_string(),
             "  CASS_OUTPUT_FORMAT=json|jsonl|compact|sessions|toon  default structured output".to_string(),
             "  CASS_SEARCH_TIMEOUT_MS=<N>               default `cass search`/`pack` timeout in ms (--timeout overrides; 0=none)".to_string(),
             "  CASS_RRF_LIMIT=<N>                       default search rrf candidate window N (--rrf-limit overrides)".to_string(),
             "  CASS_RERANK_LIMIT=<K>                    default search per-page rerank count K (--rerank-limit overrides)".to_string(),
-            "  CASS_QWEN_RERANK_URL                     qwen3-local endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
-            "  CASS_INFINITY_URL                        bge-local rerank endpoint; reranking accepts only loopback, without proxies/redirects".to_string(),
-            "  OPENROUTER_API_KEY                       consumed only by an explicit OpenRouter rerank selection; never selects a cloud backend by itself".to_string(),
+            "  CASS_QWEN_RERANK_URL                     retired; a model command that finds it set refuses with a migration error".to_string(),
+            "  CASS_INFINITY_URL                        retired; a model command that finds it set refuses with a migration error".to_string(),
+            "  OPENROUTER_API_KEY                       credential usable only via a profile's api_key_env; its presence never selects a backend".to_string(),
             "  CASS_SEARCH_LIMIT=<N>                    legacy pack default limit (--limit overrides); rejected by `cass search` (use CASS_RRF_LIMIT)".to_string(),
             "  CASS_SEARCH_MODE=lexical|semantic|hybrid default search/pack mode (--mode overrides)".to_string(),
             "  TOON_DEFAULT_FORMAT=toon|json            fallback structured output for all tools".to_string(),
@@ -22087,7 +22206,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "exit-codes:".to_string(),
             " 0 ok | 1 health-failed | 2 usage | 3 missing index/db | 4 network | 5 data-corrupt | 6 incompatible-version | 7 lock/busy | 8 partial | 9 unknown".to_string(),
             " 10 config|timeout | 11 config | 12 source|ssh | 13 mapping|not_found | 14 io|mapping | 15 semantic-unavailable|embedder-unavailable".to_string(),
-            " 20-21 model | 22 io | 23 download | 24 io".to_string(),
+            " 20-24 retired: former local model acquisition/download I/O; no active path returns them".to_string(),
             " NOTE: codes >= 10 cover domain-specific failures (sources/models/semantic/analytics).".to_string(),
             "       Use `err.kind` from the JSON envelope as the canonical identifier — kinds are".to_string(),
             "       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,".to_string(),
@@ -22327,12 +22446,12 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
         RobotTopic::Guide | RobotTopic::Contracts | RobotTopic::Examples
     ) {
         lines.extend([
-            "  Rerank is off by default. --rerank uses qwen3-local with N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.".to_string(),
-            "  Choose --rerank-provider qwen3-local|bge-local|openrouter-qwen3-8b|openrouter-cohere-4-fast|openrouter-voyage-2.5-lite. --provider still filters the session source.".to_string(),
+            "  Rerank is off by default. --rerank requires a configured rerank API profile and uses N=200/K=5. --rrf-limit N and --rerank-limit K are independent; all actual N candidates are scored before the K-result page is displayed.".to_string(),
+            "  The retired --rerank-provider spellings (qwen3-local|bge-local|openrouter-*) are refused before any request. --provider still filters the session source.".to_string(),
             "  score keeps its search meaning. rerank_score is separate and null when unscored; minimal/summary omit it unless explicitly added. JSON/compact/JSONL/TOON carry _meta.rerank without --robot-meta.".to_string(),
             "  Failure keeps original order and K-result paging; failure_reason is a short code, not response text. No automatic backend switch. Actual identity and unproven counts stay null.".to_string(),
-            "  First page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json".to_string(),
-            "  Next page: cass search \"auth error\" --mode lexical --agent codex --rerank --rerank-provider bge-local --rrf-limit 200 --rerank-limit 5 --json --cursor \"<next_cursor>\"".to_string(),
+            "  First page: cass search \"auth error\" --mode lexical --agent codex --rerank --api-config <file> --rerank-profile <id> --rrf-limit 200 --rerank-limit 5 --json".to_string(),
+            "  Next page: cass search \"auth error\" --mode lexical --agent codex --rerank --api-config <file> --rerank-profile <id> --rrf-limit 200 --rerank-limit 5 --json --cursor \"<next_cursor>\"".to_string(),
             "  Repeat the original query, N/K, provider and filters. Only display fields and content/token budgets may change. Pages reuse a fixed window; current model requests and duration are zero, first-call facts remain. A reduced page advances by its delivered count.".to_string(),
         ]);
     }
@@ -22567,12 +22686,24 @@ pub struct TimeFilter {
     pub until: Option<i64>,
 }
 
+/// Explicit API selections for a search command.
+#[derive(Debug, Clone, Default)]
+pub struct ApiSearchOptions {
+    frozen: Option<crate::search::model_api::ValidatedApiConfig>,
+    embedding_route: Option<crate::search::model_api::embedding_route::EmbeddingRoute>,
+    pub config_path: Option<PathBuf>,
+    pub embedding_profile: Option<String>,
+    pub rerank_profile: Option<String>,
+    pub no_model_fallback: bool,
+}
+
 /// Semantic search options from CLI flags (bd-3bbv)
 ///
 /// These options control model selection, reranking, and daemon usage
 /// for semantic search operations.
 #[derive(Debug, Clone, Default)]
 pub struct SemanticSearchOptions {
+    pub api: ApiSearchOptions,
     /// Embedding model to use (overrides config/default)
     pub model: Option<String>,
     /// Enable reranking of results
@@ -22580,17 +22711,13 @@ pub struct SemanticSearchOptions {
     /// Reranker model to use (if rerank is enabled)
     ///
     /// Deprecated: parsed for compatibility but never selects a backend. The
-    /// rerank backend now comes from [`Self::rerank_provider`].
+    /// rerank backend now comes from the configured model API rerank profile.
     pub reranker: Option<String>,
     /// Use daemon for warm model inference
     pub use_daemon: bool,
     /// Per-page rerank window K. Resolved by the search defaults bridge; `None`
     /// when reranking is off. Carried through to the rerank stage (P09).
     pub rerank_limit: Option<usize>,
-    /// Selected rerank backend. `Some` only when reranking is on (defaulting to
-    /// `qwen3-local`); `None` when reranking is off. Carried through to the
-    /// rerank stage (P09).
-    pub rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
 impl TimeFilter {
@@ -23452,8 +23579,7 @@ fn resolve_search_defaults(
 }
 
 /// Resolved `cass search` defaults: `--timeout`/`--mode` (same resolution as
-/// [`resolve_search_defaults`]) plus the P08a window limits N/K and the
-/// CLI-only rerank provider selection.
+/// [`resolve_search_defaults`]) plus the P08a window limits N/K.
 #[derive(Debug)]
 struct SearchWindowDefaults {
     timeout_ms: Option<u64>,
@@ -23463,14 +23589,12 @@ struct SearchWindowDefaults {
     rrf_limit: usize,
     /// Per-page rerank window K, present only when reranking is enabled.
     rerank_limit: Option<usize>,
-    /// Selected rerank backend, present only when reranking is enabled.
-    rerank_provider: Option<crate::search::rerank::types::ProviderChoice>,
 }
 
 /// Map the resolved search defaults onto the [`SemanticSearchOptions`] carried
 /// into the search engine. Extracted from the dispatch so the mapping (which
-/// propagates the per-page rerank window K and the selected backend) is
-/// unit-testable without opening a database.
+/// propagates the per-page rerank window K) is unit-testable without opening a
+/// database.
 fn semantic_search_options_from_defaults(
     model: Option<String>,
     rerank: bool,
@@ -23479,12 +23603,12 @@ fn semantic_search_options_from_defaults(
     defaults: &SearchWindowDefaults,
 ) -> SemanticSearchOptions {
     SemanticSearchOptions {
+        api: ApiSearchOptions::default(),
         model,
         rerank,
         reranker,
         use_daemon,
         rerank_limit: defaults.rerank_limit,
-        rerank_provider: defaults.rerank_provider,
     }
 }
 
@@ -23495,7 +23619,6 @@ struct SearchWindowInputs<'a> {
     rerank: bool,
     cli_rrf: Option<usize>,
     cli_rerank: Option<usize>,
-    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
     cli_timeout: Option<u64>,
     cli_mode: Option<crate::search::query::SearchMode>,
     env_timeout: Option<&'a str>,
@@ -23515,17 +23638,17 @@ struct SearchWindowInputs<'a> {
 /// `search_defaults::resolve_window_limits`, so a legacy `[search].limit` or
 /// `CASS_SEARCH_LIMIT` is a migration error instead of a silent fetch bound.
 ///
-/// The rerank provider is a pure CLI selection: it requires `--rerank`,
-/// defaults to the local Qwen backend when omitted, and never reads env or
-/// config. Every error is produced here, before the DB is opened, before any
-/// refresh/ingest, and before any model request.
+/// Every error is produced here, before the DB is opened, before any
+/// refresh/ingest, and before any model request. The rerank backend is no
+/// longer chosen here: the retired `--rerank-provider` selection is refused in
+/// the dispatch, and the backend now comes from the configured model API rerank
+/// profile.
 fn resolve_search_window_defaults(
     cli_timeout: Option<u64>,
     cli_mode: Option<crate::search::query::SearchMode>,
     rerank: bool,
     cli_rrf: Option<usize>,
     cli_rerank: Option<usize>,
-    cli_provider: Option<crate::search::rerank::types::ProviderChoice>,
 ) -> CliResult<SearchWindowDefaults> {
     use crate::search_defaults as sd;
 
@@ -23546,7 +23669,6 @@ fn resolve_search_window_defaults(
         rerank,
         cli_rrf,
         cli_rerank,
-        cli_provider,
         cli_timeout,
         cli_mode,
         env_timeout: env_timeout.as_deref(),
@@ -23563,22 +23685,7 @@ fn resolve_search_window_defaults(
 fn resolve_search_window_defaults_from(
     inputs: SearchWindowInputs<'_>,
 ) -> CliResult<SearchWindowDefaults> {
-    use crate::search::rerank::types::ProviderChoice;
     use crate::search_defaults as sd;
-
-    // The provider only exists when reranking is on. An explicit selection with
-    // --rerank off is a usage error, not a silently ignored flag.
-    if !inputs.rerank && inputs.cli_provider.is_some() {
-        return Err(CliError::usage(
-            "--rerank-provider requires --rerank",
-            Some("Enable --rerank to select a rerank backend, or drop --rerank-provider.".to_string()),
-        ));
-    }
-    let rerank_provider = if inputs.rerank {
-        Some(inputs.cli_provider.unwrap_or(ProviderChoice::Qwen3Local))
-    } else {
-        None
-    };
 
     let (timeout, _t_src) =
         sd::resolve_timeout_ms(inputs.cli_timeout, inputs.env_timeout, inputs.config.timeout_ms)
@@ -23623,7 +23730,6 @@ fn resolve_search_window_defaults_from(
         mode,
         rrf_limit: resolved.rrf_limit,
         rerank_limit: resolved.rerank_limit,
-        rerank_provider,
     })
 }
 
@@ -23640,7 +23746,6 @@ mod pr3_cli_limits {
     //! subprocess-isolated environment.
 
     use super::*;
-    use crate::search::rerank::types::ProviderChoice;
     use crate::search_defaults::SearchDefaults;
 
     fn base_inputs(config: &SearchDefaults) -> SearchWindowInputs<'_> {
@@ -23648,7 +23753,6 @@ mod pr3_cli_limits {
             rerank: false,
             cli_rrf: None,
             cli_rerank: None,
-            cli_provider: None,
             cli_timeout: None,
             cli_mode: None,
             env_timeout: None,
@@ -23703,32 +23807,32 @@ mod pr3_cli_limits {
             .expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 0, "rerank off keeps the legacy no-window sentinel");
         assert_eq!(resolved.rerank_limit, None);
-        assert_eq!(resolved.rerank_provider, None);
     }
 
+    // The rerank *backend* is no longer resolved from the CLI here: the retired
+    // `--rerank-provider` selection is refused in the dispatch (see
+    // `tests/pr3_cli_limits.rs`), and the backend now comes from the configured
+    // model API rerank profile. These cases pin the window limits only.
     #[test]
-    fn on_omitted_defaults_are_200_5_qwen() {
+    fn on_omitted_defaults_are_200_5() {
         let config = SearchDefaults::default();
         let mut inputs = base_inputs(&config);
         inputs.rerank = true;
         let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 200);
         assert_eq!(resolved.rerank_limit, Some(5));
-        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
     }
 
     #[test]
-    fn explicit_n_k_provider_propagate_field_by_field() {
+    fn explicit_n_k_propagate_field_by_field() {
         let config = SearchDefaults::default();
         let mut inputs = base_inputs(&config);
         inputs.rerank = true;
         inputs.cli_rrf = Some(50);
         inputs.cli_rerank = Some(3);
-        inputs.cli_provider = Some(ProviderChoice::BgeLocal);
         let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 50);
         assert_eq!(resolved.rerank_limit, Some(3));
-        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::BgeLocal));
     }
 
     #[test]
@@ -23739,29 +23843,6 @@ mod pr3_cli_limits {
         let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         assert_eq!(resolved.rrf_limit, 7);
         assert_eq!(resolved.rerank_limit, None);
-        assert_eq!(resolved.rerank_provider, None);
-    }
-
-    #[test]
-    fn provider_with_rerank_off_is_a_usage_error() {
-        let config = SearchDefaults::default();
-        let mut inputs = base_inputs(&config);
-        inputs.cli_provider = Some(ProviderChoice::OpenrouterQwen38b);
-        let err = resolve_search_window_defaults_from(inputs).expect_err("must reject");
-        assert_eq!(err.code, 2);
-        assert!(err.message.contains("--rerank-provider"), "{}", err.message);
-    }
-
-    #[test]
-    fn provider_is_not_read_from_env_or_config() {
-        // Env has no provider input at all, and config carries none, so an
-        // enabled rerank with no CLI selection must land on qwen3-local.
-        let config = SearchDefaults::default();
-        let mut inputs = base_inputs(&config);
-        inputs.rerank = true;
-        inputs.env_rrf = Some("300");
-        let resolved = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
-        assert_eq!(resolved.rerank_provider, Some(ProviderChoice::Qwen3Local));
     }
 
     #[test]
@@ -23885,19 +23966,17 @@ mod pr3_cli_limits {
     // ---- dispatch mapping ----
 
     #[test]
-    fn semantic_options_carry_k_and_provider_only_when_on() {
+    fn semantic_options_carry_k_only_when_on() {
         let config = SearchDefaults::default();
 
         let mut inputs = base_inputs(&config);
         inputs.rerank = true;
         inputs.cli_rrf = Some(80);
         inputs.cli_rerank = Some(4);
-        inputs.cli_provider = Some(ProviderChoice::OpenrouterCohere4Fast);
         let defaults = resolve_search_window_defaults_from(inputs).expect("defaults resolve");
         let opts =
             semantic_search_options_from_defaults(None, true, None, false, &defaults);
         assert_eq!(opts.rerank_limit, Some(4));
-        assert_eq!(opts.rerank_provider, Some(ProviderChoice::OpenrouterCohere4Fast));
         assert!(opts.rerank);
         assert_eq!(defaults.rrf_limit, 80, "N is carried as the fetch window");
 
@@ -23914,7 +23993,6 @@ mod pr3_cli_limits {
         assert_eq!(opts.reranker.as_deref(), Some("legacy"));
         assert!(opts.use_daemon);
         assert_eq!(opts.rerank_limit, None);
-        assert_eq!(opts.rerank_provider, None);
     }
 
     // ---- CLI parsing ----
@@ -23946,7 +24024,9 @@ mod pr3_cli_limits {
         assert!(rerank);
         assert_eq!(rrf_limit, Some(10));
         assert_eq!(rerank_limit, Some(3));
-        assert_eq!(rerank_provider, Some(ProviderChoice::BgeLocal));
+        // The retired selection is parsed as a free-form string (so clap does
+        // not advertise its spellings) and refused later by the dispatch.
+        assert_eq!(rerank_provider.as_deref(), Some("bge-local"));
     }
 
     #[test]
@@ -23966,9 +24046,15 @@ mod pr3_cli_limits {
         assert_eq!(rerank_provider, None);
     }
 
+    /// The retired `--rerank-provider` is a free-form string now, so an unknown
+    /// or legacy value still parses (clap advertises no retired spellings) and
+    /// is preserved verbatim for the dispatch to refuse. The end-to-end refusal
+    /// (exit 2, `ModelApiMigration`, no database touched) is pinned by
+    /// `tests/api_primary_backfill.rs::search_retires_local_selectors_before_any_database_work`
+    /// and `tests/pr3_cli_limits.rs::retired_rerank_provider_value_is_a_migration_refusal`.
     #[test]
-    fn unknown_provider_is_a_usage_error() {
-        let err = parse_err(&[
+    fn unknown_provider_value_is_parsed_for_later_refusal() {
+        let cmd = search_fields(&[
             "cass",
             "search",
             "q",
@@ -23976,7 +24062,10 @@ mod pr3_cli_limits {
             "--rerank-provider",
             "not-a-provider",
         ]);
-        assert_eq!(err.code, 2);
+        let Commands::Search { rerank_provider, .. } = cmd else {
+            unreachable!()
+        };
+        assert_eq!(rerank_provider.as_deref(), Some("not-a-provider"));
     }
 
     #[test]
@@ -23988,8 +24077,11 @@ mod pr3_cli_limits {
         assert_eq!(agent, vec!["codex".to_string()]);
     }
 
+    /// `--model` no longer selects an embedder: it parses as a free-form string
+    /// and the dispatch refuses it with a migration error. Parsing must still
+    /// preserve the value so that refusal can name it.
     #[test]
-    fn search_model_still_selects_the_embedder() {
+    fn search_model_is_parsed_for_later_refusal() {
         let cmd = search_fields(&["cass", "search", "q", "--model", "bge-m3"]);
         let Commands::Search { model, .. } = cmd else {
             unreachable!()
@@ -24162,10 +24254,14 @@ struct RerankRequestContext {
 }
 
 /// Whether the P09 rerank window path is active for this search: `--rerank` was
-/// requested and both the per-page K and the backend were resolved. The closed
-/// path is exactly `false`.
+/// requested and the per-page K was resolved. The closed path is exactly
+/// `false`.
+///
+/// The rerank *backend* is resolved inside the window path, not here: a
+/// `--rerank` request with no configured rerank API profile must fail as a
+/// pre-request configuration error, not be silently skipped by this predicate.
 fn rerank_window_enabled(opts: &SemanticSearchOptions) -> bool {
-    opts.rerank && opts.rerank_limit.is_some() && opts.rerank_provider.is_some()
+    opts.rerank && opts.rerank_limit.is_some()
 }
 
 /// The wire spelling the binding freezes for a vector candidate strategy.
@@ -24176,104 +24272,19 @@ fn vector_search_mode_wire(mode: crate::search::query::VectorSearchMode) -> &'st
     }
 }
 
-/// The effective endpoint origin for a rerank backend selection.
+/// Refuse a rerank request whose effective configuration names no rerank API
+/// profile.
 ///
-/// A local selection honours its existing service env override
-/// (`CASS_QWEN_RERANK_URL` for Qwen, `CASS_INFINITY_URL` for BGE) and otherwise
-/// binds the adapter's frozen default origin. A cloud selection always binds the
-/// fixed OpenRouter origin: there is deliberately no CLI or env endpoint
-/// override, so a test can never redirect a real credential.
-fn rerank_endpoint_origin(provider: crate::search::rerank::types::ProviderChoice) -> String {
-    use crate::search::rerank::types::ProviderChoice;
-    match provider {
-        ProviderChoice::Qwen3Local => dotenvy::var("CASS_QWEN_RERANK_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| crate::search::rerank::qwen::DEFAULT_ORIGIN.to_string()),
-        ProviderChoice::BgeLocal => dotenvy::var("CASS_INFINITY_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| crate::search::rerank::bge::DEFAULT_ORIGIN.to_string()),
-        ProviderChoice::OpenrouterQwen38b
-        | ProviderChoice::OpenrouterCohere4Fast
-        | ProviderChoice::OpenrouterVoyage25Lite => {
-            crate::search::rerank::openrouter::DEFAULT_ORIGIN.to_string()
-        }
-    }
-}
-
-/// The effective embedding-model selection the semantic loader will use: the
-/// CLI `--model` when given, else `CASS_SEMANTIC_EMBEDDER` resolved exactly as
-/// that loader resolves it (the literal `hash`, or a canonical FastEmbedder
-/// name). It reads no registry, builds no client and sends no request, so the
-/// first lookup's retrieval and both sides of the frozen binding consume one
-/// identical value. An unsupported env string yields `None`, exactly as the
-/// loader treats it -- it never invents a model.
-fn effective_embedding_model(cli_model: Option<&str>) -> Option<String> {
-    if let Some(model) = cli_model {
-        return Some(model.to_string());
-    }
-    dotenvy::var("CASS_SEMANTIC_EMBEDDER")
-        .ok()
-        .and_then(|value| {
-            if value.trim().eq_ignore_ascii_case("hash") {
-                Some("hash".to_string())
-            } else {
-                crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
-                    .map(str::to_string)
-            }
-        })
-}
-
-/// Build the one rerank backend for `provider`, binding `origin` for a local
-/// selection and reading only `OPENROUTER_API_KEY` for a cloud one.
-///
-/// Construction sends no request for a local selection; a cloud selection
-/// refuses before a transport exists when its credential is missing.
-fn build_rerank_backend(
-    provider: crate::search::rerank::types::ProviderChoice,
-    origin: &str,
-) -> Result<
-    Box<dyn crate::search::rerank::types::RerankBackend>,
-    crate::search::rerank::types::RerankError,
-> {
-    build_rerank_backend_with_trace(provider, origin, None)
-}
-
-fn build_rerank_backend_with_trace(
-    provider: crate::search::rerank::types::ProviderChoice,
-    origin: &str,
-    trace: Option<std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>>,
-) -> Result<
-    Box<dyn crate::search::rerank::types::RerankBackend>,
-    crate::search::rerank::types::RerankError,
-> {
-    use crate::search::rerank::types::ProviderChoice;
-    match provider {
-        ProviderChoice::Qwen3Local => {
-            let backend = crate::search::rerank::qwen::QwenBackend::new(origin)?;
-            Ok(Box::new(match trace {
-                Some(trace) => backend.with_request_trace(trace),
-                None => backend,
-            }))
-        }
-        ProviderChoice::BgeLocal => {
-            let backend = crate::search::rerank::bge::BgeBackend::new(origin)?;
-            Ok(Box::new(match trace {
-                Some(trace) => backend.with_request_trace(trace),
-                None => backend,
-            }))
-        }
-        ProviderChoice::OpenrouterQwen38b
-        | ProviderChoice::OpenrouterCohere4Fast
-        | ProviderChoice::OpenrouterVoyage25Lite => {
-            let backend = crate::search::rerank::openrouter::OpenRouterBackend::from_env(provider)?;
-            Ok(Box::new(match trace {
-                Some(trace) => backend.with_request_trace(trace),
-                None => backend,
-            }))
-        }
-    }
+/// The legacy provider chain (`--rerank-provider`'s local Qwen/Infinity backends
+/// and the shared OpenRouter adapter) was retired with the model-API migration:
+/// the API client is the only rerank path. A `--rerank` request with no rerank
+/// profile is a pre-request configuration error — never a panic, and never a
+/// silent fallback to a retired backend.
+fn rerank_profile_required_error() -> CliError {
+    model_api_migration_error(
+        "reranking requires a configured rerank API profile".into(),
+        "Pass --api-config with a default_rerank profile (or --rerank-profile)".into(),
+    )
 }
 
 /// P09: assemble the frozen [`RequestBinding`] from the current request.
@@ -24292,7 +24303,8 @@ fn build_request_binding(
     embedding_model: Option<&str>,
     rrf_limit: usize,
     rerank_limit: usize,
-    provider: crate::search::rerank::types::ProviderChoice,
+    provider: &str,
+    api_route: Option<crate::search::rerank::window::ApiWindowRoute>,
     endpoint: &str,
     aggregate: Option<&[String]>,
     explain: bool,
@@ -24319,7 +24331,8 @@ fn build_request_binding(
         embedding_model: embedding_model.map(str::to_string),
         rrf_limit,
         rerank_limit,
-        provider,
+        provider: provider.to_owned(),
+        api_route,
         endpoint: endpoint.to_string(),
         aggregate: aggregate.map(|values| values.to_vec()),
         explain,
@@ -24338,8 +24351,9 @@ fn build_request_binding(
 /// and serializes as `null` rather than being guessed.
 #[derive(Debug, Clone)]
 struct RerankWindowMeta {
-    requested_provider: crate::search::rerank::types::ProviderChoice,
-    requested_model: &'static str,
+    model_api: Option<crate::search::rerank::window::ApiWindowRerank>,
+    requested_provider: String,
+    requested_model: String,
     actual_provider: Option<crate::search::rerank::types::ProviderChoice>,
     actual_model: Option<String>,
     serving_provider: Option<String>,
@@ -24365,6 +24379,7 @@ impl RerankWindowMeta {
     /// The `_meta.rerank` JSON object, with the post-budget `returned_count`.
     fn to_json(&self, returned_count: usize) -> serde_json::Value {
         serde_json::json!({
+            "model_api": self.model_api,
             "requested_provider": self.requested_provider,
             "requested_model": self.requested_model,
             "actual_provider": self.actual_provider,
@@ -24694,7 +24709,14 @@ fn regression_request_evidence(
             values.sort_by_key(serde_json::Value::to_string);
         }
     }
+    let api_profile = if semantic.rerank { selected_api_rerank_profile(semantic)? } else { None };
+    let api_route = api_window_route(semantic, api_profile.as_ref(), mode)?;
+    let configuration = api_profile.as_ref().map(|p| crate::search::model_api::runtime::configuration_snapshot(
+        semantic.api.frozen.as_ref().expect("API selection has frozen configuration"), p)).transpose().map_err(regression_search_error)?;
+    let provider = api_profile.as_ref().map(|p| p.id.clone());
     Ok(serde_json::json!({
+        "model_api_route": api_route,
+        "model_api_configuration": configuration,
         "mode": search_mode_canonical_str(mode),
         "vector_search_mode": vector_search_mode_wire(vector_mode),
         "resolved_filters": filters,
@@ -24708,7 +24730,7 @@ fn regression_request_evidence(
         "client_submission_policy": semantic.rerank.then_some("verbatim-query-documents-v1"),
         "server_template_policy": serde_json::Value::Null,
         "rerank_limit": semantic.rerank_limit,
-        "rerank_provider": semantic.rerank_provider,
+        "rerank_provider": provider,
         "time_selectors": rerank.time_selectors,
         "daemon": rerank.daemon,
         "no_daemon": rerank.no_daemon,
@@ -24757,40 +24779,11 @@ fn execute_search_retrieval(
                 }
             })?,
         SearchMode::Semantic => {
-            // cass#256: in the `-baseline` build (the `semantic` Cargo
-            // feature is disabled), `--mode semantic` returns a clear
-            // CLI envelope rather than reaching code that would expect a
-            // working ORT runtime. Hybrid degrades to lexical via the
-            // existing fail-open path; lexical-only mode is unaffected.
-            #[cfg(not(any(feature = "semantic", feature = "infinity")))]
-            {
-                // Suppress unused-binding warnings in the baseline arm:
-                // every input is consumed by the documented error envelope.
-                let _ = (
-                    &filters,
-                    query,
-                    search_limit,
-                    search_offset,
-                );
-                let _ = client;
-                Err::<crate::search::query::SearchResult, CliError>(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message:
-                        "semantic search is not available in this build (cass was built without the `semantic` Cargo feature; this is the `-baseline` artifact for pre-AVX2 CPUs; cass#256)"
-                            .to_string(),
-                    hint: Some(
-                        "Re-run with `--mode lexical` (or omit `--mode` and accept the default hybrid-preferred mode, which fails open to lexical), or install the full release artifact (e.g. `cass-windows-amd64.zip` / `cass-linux-amd64.tar.gz`) on a host with AVX2 support."
-                            .to_string(),
-                    ),
-                    retryable: false,
-                })?
-            }
-            #[cfg(any(feature = "semantic", feature = "infinity"))]
             {
                 let (hits, candidate_meta) = client
                     .search_semantic_with_meta(query, filters.clone(), search_limit, search_offset, search_field_mask)
                     .map_err(|e| {
+                        if let Some(error) = api_query_compatibility_error(&e) { return error; }
                         let err_str = e.to_string();
                         if err_str.contains("unavailable")
                             || err_str.contains("no embedder")
@@ -24843,6 +24836,7 @@ fn execute_search_retrieval(
                 result
             }
             Err(e) => {
+                if let Some(error) = api_query_compatibility_error(&e) { return Err(error); }
                 let err_str = e.to_string();
                 if hybrid_fail_open
                     && (err_str.contains("unavailable") || err_str.contains("no embedder"))
@@ -24903,6 +24897,97 @@ fn execute_search_retrieval(
     })
 }
 
+fn selected_api_rerank_profile(opts: &SemanticSearchOptions) -> CliResult<Option<crate::search::model_api::ValidatedProfile>> {
+    use crate::search::model_api::{ProfileKind, runtime};
+    let Some(config) = opts.api.frozen.as_ref() else { return Ok(None); };
+    let id = opts.api.rerank_profile.as_deref().or_else(|| config.default_profile_id(ProfileKind::Rerank))
+        .ok_or_else(|| model_api_runtime_error(runtime::RuntimeError::configuration(
+            "no rerank API profile is selected", Some("Set default_rerank or pass --rerank-profile".into()))))?;
+    let profile = runtime::profile_by_id(config, id).map_err(model_api_runtime_error)?;
+    if profile.kind != ProfileKind::Rerank {
+        return Err(model_api_runtime_error(runtime::RuntimeError::configuration(
+            "selected API profile is not a reranker", None)));
+    }
+    Ok(Some(profile.clone()))
+}
+
+fn api_window_route(opts: &SemanticSearchOptions, profile: Option<&crate::search::model_api::ValidatedProfile>, mode: crate::search::query::SearchMode)
+    -> CliResult<Option<crate::search::rerank::window::ApiWindowRoute>> {
+    use crate::search::model_api::{EndpointConfigIdentity, RerankRouteIdentity};
+    let Some(profile) = profile else { return Ok(None); };
+    let config = opts.api.frozen.as_ref().expect("API selection freezes config");
+    let map = |_| CliError::usage("invalid model API route identity", None);
+    let route = RerankRouteIdentity::from_config(config, &profile.id, !opts.api.no_model_fallback).map_err(map)?;
+    let embedding = if mode == crate::search::query::SearchMode::Lexical { None }
+        else { Some(select_api_embedding_profile(config, opts.api.embedding_profile.as_deref())?) };
+    let embedding_config_sha256 = embedding.as_ref().map(|p| EndpointConfigIdentity::from_profile(p).map(|d| d.sha256())).transpose().map_err(map)?;
+    Ok(Some(crate::search::rerank::window::ApiWindowRoute {
+        rerank_profile: profile.id.clone(), rerank_route_sha256: route.sha256(),
+        fallback_profile: route.fallback_profile().map(str::to_owned), allow_fallback: !opts.api.no_model_fallback,
+        embedding_route_sha256: if embedding.is_some() {
+            Some(opts.api.embedding_route.as_ref().ok_or_else(|| CliError::usage("embedding route was not frozen", None))?.identity_sha256())
+        } else { None },
+        embedding_profile: embedding.map(|p| p.id), embedding_config_sha256,
+    }))
+}
+
+/// Freeze API selections before refresh or search can touch storage.
+fn freeze_search_model_api(
+    semantic_opts: &mut SemanticSearchOptions,
+    mode: Option<crate::search::query::SearchMode>,
+    dry_run: bool,
+) -> CliResult<()> {
+    use crate::search::query::SearchMode;
+    if semantic_opts.model.is_some() || semantic_opts.use_daemon {
+        return Err(model_api_migration_error(
+            "legacy model and daemon selection are retired".into(),
+            "Use --embedding-profile with --api-config".into()));
+    }
+    // Pure query analysis and explicit lexical searches need no model service.
+    if !dry_run && (mode != Some(SearchMode::Lexical) || semantic_opts.rerank) {
+        reject_retired_model_env()?;
+        let config = match semantic_opts.api.frozen.clone() {
+            Some(config) => config,
+            None => crate::search::model_api::runtime::load_config(
+                semantic_opts.api.config_path.as_deref(), |key| std::env::var_os(key))
+                .map_err(model_api_runtime_error)?,
+        };
+        if mode != Some(SearchMode::Lexical) && semantic_opts.api.embedding_route.is_none() {
+            let profile = select_api_embedding_profile(&config, semantic_opts.api.embedding_profile.as_deref())?;
+            semantic_opts.api.embedding_route = Some(crate::search::model_api::embedding_route::EmbeddingRoute::load(
+                &config, &profile, !semantic_opts.api.no_model_fallback));
+        }
+        semantic_opts.api.frozen = Some(config);
+        if semantic_opts.rerank { selected_api_rerank_profile(&semantic_opts)?; }
+    }
+
+    Ok(())
+}
+
+fn api_regression_embedding_binding(conn: &crate::storage::api::Conn, route: &crate::search::model_api::embedding_route::EmbeddingRoute) -> anyhow::Result<serde_json::Value> {
+    let profile = &route.primary;
+    let call = crate::search::model_api::EndpointConfigIdentity::from_profile(profile)?;
+    Ok(conn.with_tx_no_replay(crate::storage::api::TxMode::Deferred, |tx| {
+        let id = tx.query_row_map("SELECT id FROM embedding_generations WHERE is_active = 1 AND audit_status = 'passed'", &[], |row| row.get_typed::<i64>(0))?;
+        let verified = route.open_generation(tx, id)?;
+        Ok(serde_json::json!({"profile":profile.id,"requested_model":profile.model,"declared_revision":profile.model_revision,
+            "endpoint_config_sha256":call.sha256(),"embedding_route_sha256":route.identity_sha256(),"descriptor_sha256":verified.descriptor_sha256(),
+            "generation_id":id,"dimension":verified.descriptor().effective_dimension()}))
+    })?)
+}
+
+fn api_query_compatibility_error(error: &anyhow::Error) -> Option<CliError> {
+    let failure = error.chain().find_map(|cause| cause.downcast_ref::<
+        crate::search::model_api::query_embedding::QueryApiFailure>())?;
+    (failure.code == "CompatibilityRequired").then(|| CliError {
+        code: 15,
+        kind: CliErrorKind::SemanticUnavailable.kind_str(),
+        message: "CompatibilityRequired: embedding primary unavailable; cloud compatibility is not verified".into(),
+        hint: Some("Verify the configured fallback or explicitly request lexical search".into()),
+        retryable: true,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_cli_search(
     query: &str,
@@ -24935,15 +25020,10 @@ fn run_cli_search(
     sessions_from: Option<String>,
     mode: Option<crate::search::query::SearchMode>,
     vector_search_mode: Option<crate::search::query::VectorSearchMode>,
-    semantic_opts: SemanticSearchOptions,
+    mut semantic_opts: SemanticSearchOptions,
     rerank_ctx: RerankRequestContext,
     mut regression: Option<RegressionSearchExecution>,
 ) -> CliResult<()> {
-    #[cfg(feature = "infinity")]
-    use crate::search::model_manager::load_infinity_semantic_context;
-    use crate::search::model_manager::{
-        load_hash_semantic_context, load_semantic_context, load_semantic_context_for_embedder,
-    };
     use crate::search::query::{
         QueryExplanation, SearchClient, SearchClientOptions, SearchFilters, SearchMode,
     };
@@ -24952,39 +25032,19 @@ fn run_cli_search(
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    freeze_search_model_api(&mut semantic_opts, mode, dry_run)?;
+
     // Start timing for robot_meta elapsed_ms
     let start_time = Instant::now();
-    if regression.is_some() && mode != Some(SearchMode::Lexical) {
-        #[cfg(not(feature = "infinity"))]
-        return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
-        if !matches!(semantic_opts.model.as_deref(), Some("bge-m3" | "infinity"))
-            || semantic_opts.use_daemon
-        {
-            return Err(CliError::usage("REGRESSION_SEMANTIC_NOT_INTEGRATED", None));
+    let mut regression_embedding_binding: Option<serde_json::Value> = None;
+
+    if let (Some(run), Some(_)) = (regression.as_ref(), semantic_opts.api.frozen.as_ref()) {
+        if mode != Some(SearchMode::Lexical) {
+            let route = semantic_opts.api.embedding_route.as_ref().expect("semantic route frozen");
+            let conn = run.context.connection().map_err(regression_search_error)?;
+            regression_embedding_binding = Some(api_regression_embedding_binding(&conn, route).map_err(regression_search_error)?);
         }
     }
-    #[cfg(feature = "infinity")]
-    let regression_embedding_config = if regression.is_some() && mode != Some(SearchMode::Lexical) {
-        let config = crate::search::infinity::InfinityConfig::from_env();
-        if config.embed_model != "BAAI/bge-m3" {
-            return Err(regression_search_error(
-                "REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH",
-            ));
-        }
-        Some(config)
-    } else {
-        None
-    };
-    #[cfg(feature = "infinity")]
-    let regression_embedding_binding = regression_embedding_config.as_ref().map(|config| serde_json::json!({
-        "requested_model": config.embed_model,
-        "origin_sha256": crate::search::regression_trace::TextDigest::of(&config.base_url).sha256,
-        "dimension": config.expected_dim,
-        "timeout_ms": config.timeout.as_millis() as u64,
-        "max_batch": config.max_batch,
-    }));
-    #[cfg(not(feature = "infinity"))]
-    let regression_embedding_binding: Option<serde_json::Value> = None;
 
     let data_dir = regression
         .as_ref()
@@ -25046,9 +25106,8 @@ fn run_cli_search(
     // decides which family is accepted, so neither can be silently mis-read as
     // the other.
     let rerank_on = rerank_window_enabled(&semantic_opts);
-    // One effective embedding selection, shared by the retrieval and by both
-    // sides of the frozen binding.
-    let effective_model = effective_embedding_model(semantic_opts.model.as_deref());
+    // API embedding identity is carried by the frozen route, not a legacy model selector.
+    let effective_model: Option<String> = None;
     let mut limit_val = *limit;
     let mut offset_val = *offset;
     let mut window_cursor: Option<String> = None;
@@ -25183,13 +25242,13 @@ fn run_cli_search(
     // relative time range.
     if let Some(cursor_str) = window_cursor.as_deref() {
         let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-        let provider = semantic_opts
-            .rerank_provider
-            .expect("rerank_window_enabled guarantees a provider");
-        let endpoint = regression
-            .as_ref()
-            .and_then(|run| run.endpoint.clone())
-            .unwrap_or_else(|| rerank_endpoint_origin(provider));
+        let api_profile = selected_api_rerank_profile(&semantic_opts)?;
+        let Some(api_profile) = api_profile.as_ref() else {
+            return Err(rerank_profile_required_error());
+        };
+        let requested_profile = api_profile.id.clone();
+        let endpoint = api_profile.endpoint.as_str().to_owned();
+        let route = api_window_route(&semantic_opts, Some(api_profile), mode.unwrap_or_default())?;
         let binding = build_request_binding(
             query,
             &filters,
@@ -25199,7 +25258,8 @@ fn run_cli_search(
             effective_model.as_deref(),
             limit_val,
             rerank_k,
-            provider,
+            &requested_profile,
+        route,
             &endpoint,
             aggregate.as_deref(),
             explain,
@@ -25376,8 +25436,9 @@ fn run_cli_search(
         };
 
         let meta = RerankWindowMeta {
-            requested_provider: snapshot.request_binding.provider,
-            requested_model: snapshot.request_binding.provider.request_model(),
+            model_api: snapshot.rerank.model_api.clone(),
+            requested_provider: snapshot.request_binding.provider.clone(),
+            requested_model: snapshot.rerank.requested_model.clone(),
             actual_provider: snapshot.rerank.identity.actual_provider,
             actual_model: snapshot.rerank.identity.actual_model.clone(),
             serving_provider: snapshot.rerank.identity.serving_provider.clone(),
@@ -25573,160 +25634,19 @@ fn run_cli_search(
     let mut mode_meta = SearchModeMeta::new(mode.unwrap_or_default(), mode.is_none());
     let hybrid_fail_open = regression.is_none() && mode_meta.fail_open_on_semantic_unavailable();
 
-    if matches!(
-        mode_meta.requested,
-        SearchMode::Semantic | SearchMode::Hybrid
-    ) {
-        use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
-
-        // Use embedder registry for model selection (bd-2mbe)
-        let registry = EmbedderRegistry::new(&data_dir);
-        let env_model = dotenvy::var("CASS_SEMANTIC_EMBEDDER")
-            .ok()
-            .and_then(|value| {
-                if value.trim().eq_ignore_ascii_case("hash") {
-                    Some("hash")
-                } else {
-                    crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
-                }
-            });
-        let requested_model = semantic_opts.model.as_deref().or(env_model);
-
-        // Validate requested model if specified
-        if let Some(model_name) = semantic_opts.model.as_deref()
-            && let Err(e) = registry.validate(model_name)
-        {
-            return Err(CliError {
-                code: 15,
-                kind: CliErrorKind::EmbedderUnavailable.kind_str(),
-                message: format!("Embedder validation failed: {e}"),
-                hint: Some("Run 'cass models list' to see available embedders".to_string()),
-                retryable: false,
-            });
-        }
-
-        // Determine which embedder to use
-        let embedder_info = match requested_model {
-            Some(name) => registry.get(name),
-            None => Some(registry.best_available()),
-        };
-        let prefer_hash = embedder_info.is_some_and(|e| e.name == HASH_EMBEDDER);
-
-        // M4-pre spike: route the bge-m3 / infinity embedder through the
-        // Infinity HTTP context loader (no ONNX / model-file machinery).
-        #[cfg(feature = "infinity")]
-        let setup_infinity = if matches!(requested_model, Some("bge-m3") | Some("infinity")) {
-            Some(match regression.as_ref() {
-                Some(run) => {
-                    crate::search::model_manager::load_infinity_semantic_context_for_regression(
-                        &run.context,
-                        regression_embedding_config
-                            .as_ref()
-                            .expect("regression semantic configuration frozen before search"),
-                    )
-                    .map_err(regression_search_error)?
-                }
-                None => load_infinity_semantic_context(&data_dir, &db_path),
-            })
-        } else {
-            None
-        };
-        #[cfg(not(feature = "infinity"))]
-        let setup_infinity: Option<crate::search::model_manager::SemanticSetup> = None;
-
-        let setup = if let Some(setup_infinity) = setup_infinity {
-            setup_infinity
-        } else if prefer_hash {
-            load_hash_semantic_context(&data_dir, &db_path)
-        } else if let Some(model_name) = requested_model {
-            load_semantic_context_for_embedder(&data_dir, &db_path, model_name)
-        } else {
-            load_semantic_context(&data_dir, &db_path)
-        };
-
-        if let Some(context) = setup.context {
-            let embedder = context.embedder;
-            let roles = context.roles;
-
-            let embedder: Arc<dyn crate::search::embedder::Embedder> = if semantic_opts.use_daemon {
-                use crate::search::daemon_client::{DaemonFallbackEmbedder, DaemonRetryConfig};
-
-                #[cfg(unix)]
-                {
-                    // M4-pre spike: route query embedding through Infinity HTTP
-                    // when built with `--features infinity` (baseline is ORT-free,
-                    // so the UDS daemon's ONNX embedder is unavailable anyway).
-                    #[cfg(feature = "infinity")]
-                    let daemon: Arc<
-                        dyn crate::search::daemon_client::DaemonClient,
-                    > = match crate::search::infinity::InfinityDaemonClient::new() {
-                        Ok(c) => Arc::new(c),
-                        Err(_) => Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                            "infinity-unavailable",
-                        )),
-                    };
-                    #[cfg(not(feature = "infinity"))]
-                    let daemon = crate::daemon::client::try_connect()
-                        .map(|d| d as Arc<dyn crate::search::daemon_client::DaemonClient>)
-                        .unwrap_or_else(|| {
-                            Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                                "daemon-unconfigured",
-                            ))
-                        });
-                    let config = DaemonRetryConfig::from_env();
-                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                }
-                #[cfg(not(unix))]
-                {
-                    let daemon = Arc::new(crate::search::daemon_client::NoopDaemonClient::new(
-                        "daemon-unconfigured",
-                    ));
-                    let config = DaemonRetryConfig::from_env();
-                    Arc::new(DaemonFallbackEmbedder::new(daemon, embedder, config))
-                }
-            } else {
-                embedder
-            };
-
-            if let Err(err) = client.set_semantic_context(embedder, roles) {
-                let hint = if prefer_hash {
-                    "Run 'cass index --semantic --embedder hash' to rebuild the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
-                        .to_string()
-                } else {
-                    "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
-                        .to_string()
-                };
-                if hybrid_fail_open {
-                    mode_meta.fall_back_to_lexical(format!("semantic context rejected: {err}"));
-                    let _ = client.clear_semantic_context();
-                } else {
-                    return Err(CliError {
-                        code: 15,
-                        kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                        message: format!("Semantic search not available: {err}"),
-                        hint: Some(hint),
-                        retryable: false,
-                    });
-                }
-            }
-        } else {
-            let _ = client.clear_semantic_context();
-            let summary = setup.availability.summary();
-            let hint = if prefer_hash {
-                "Run 'cass index --semantic --embedder hash' to build the hash vector index, or omit --mode semantic when lexical evidence is acceptable"
-                    .to_string()
-            } else {
-                "Run 'cass models install' and then 'cass index --semantic', or omit --mode semantic when lexical evidence is acceptable"
-                    .to_string()
-            };
-            if hybrid_fail_open {
-                mode_meta.fall_back_to_lexical(format!("semantic context unavailable: {summary}"));
+    if matches!(mode_meta.requested, SearchMode::Semantic | SearchMode::Hybrid) {
+        let config = semantic_opts.api.frozen.as_ref().expect("semantic API configuration frozen");
+        let api_client = Arc::new(crate::search::model_api::ApiClient::new(
+            config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver)));
+        let route = semantic_opts.api.embedding_route.clone().expect("semantic route frozen");
+        if let Err(error) = client.set_api_frozen_semantic_context(api_client, route) {
+            if hybrid_fail_open && error.is::<crate::search::model_api::query_embedding::QueryGenerationUnavailable>() {
+                mode_meta.fall_back_to_lexical("API generation is absent or not audited");
             } else {
                 return Err(CliError {
-                    code: 15,
-                    kind: CliErrorKind::SemanticUnavailable.kind_str(),
-                    message: format!("Semantic search not available: {summary}"),
-                    hint: Some(hint),
+                    code: 15, kind: CliErrorKind::SemanticUnavailable.kind_str(),
+                    message: "API generation identity is unavailable or incompatible".into(),
+                    hint: Some("Build and audit a generation with the selected API profile".into()),
                     retryable: false,
                 });
             }
@@ -26187,13 +26107,14 @@ fn score_search_first_window(
     let mut window_continuable = false;
     let mut window_unavailable: Option<&'static str> = None;
     let rerank_k = semantic_opts.rerank_limit.unwrap_or(0);
-    let provider = semantic_opts
-        .rerank_provider
-        .expect("rerank_window_enabled guarantees a provider");
-    let endpoint = regression
-        .as_ref()
-        .and_then(|run| run.endpoint.clone())
-        .unwrap_or_else(|| rerank_endpoint_origin(provider));
+    let api_profile = selected_api_rerank_profile(&semantic_opts)?;
+    let Some(api_profile) = api_profile.as_ref() else {
+        return Err(rerank_profile_required_error());
+    };
+    let requested_profile = api_profile.id.clone();
+    let requested_model = api_profile.model.clone();
+    let endpoint = api_profile.endpoint.as_str().to_owned();
+    let route = api_window_route(&semantic_opts, Some(api_profile), mode.unwrap_or_default())?;
     let binding = build_request_binding(
         query,
         &filters,
@@ -26203,7 +26124,8 @@ fn score_search_first_window(
         effective_model.as_deref(),
         limit_val,
         rerank_k,
-        provider,
+        &requested_profile,
+        route,
         &endpoint,
         aggregate.as_deref(),
         explain,
@@ -26261,6 +26183,7 @@ fn score_search_first_window(
                 &window_result.hits,
             )?;
             Ok::<_, anyhow::Error>(crate::search::regression_trace::WindowEvidence {
+                api_rerank: None,
                 schema: "cass.regression-window-trace.v2".into(),
                 request: regression_request_evidence(
                     &filters,
@@ -26296,6 +26219,7 @@ fn score_search_first_window(
         .transpose()
         .map_err(regression_search_error)?;
 
+    let mut api_evidence = None;
     let mut identity = crate::search::rerank::types::CallIdentity {
         actual_provider: None,
         actual_model: None,
@@ -26346,18 +26270,18 @@ fn score_search_first_window(
                             .collect(),
                     );
                 }
-                let backend = match regression.as_ref() {
-                    Some(run) => build_rerank_backend_with_trace(
-                        provider,
-                        &endpoint,
-                        Some(run.trace.clone()),
-                    ),
-                    None => build_rerank_backend(provider, &endpoint),
+                let call_started = Instant::now();
+                let response = {
+                    let config = semantic_opts.api.frozen.as_ref().expect("API config frozen");
+                    let client = crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver));
+                    let client = match regression.as_ref() {
+                        Some(run) => client.with_rerank_trace(run.trace.clone()),
+                        None => client,
+                    };
+                    crate::search::model_api::rerank_call::score(&client, &requested_profile, query, &documents,
+                        !semantic_opts.api.no_model_fallback, &mut api_evidence)
                 };
-                match backend {
-                    Ok(backend) => {
-                        let call_started = Instant::now();
-                        match backend.rerank(query, &documents) {
+                match response {
                             Ok(response) => {
                                 duration_ms = response.duration_ms;
                                 // The call layer re-proves the completeness
@@ -26430,16 +26354,6 @@ fn score_search_first_window(
                                 failure_reason = Some(error.reason);
                                 http_status = error.http_status;
                             }
-                        }
-                    }
-                    Err(error) => {
-                        // Construction sent no request, so both counts are a
-                        // provable 0 and no time was spent calling.
-                        http_requests = Some(0);
-                        model_requests = Some(0);
-                        failure_reason = Some(error.reason);
-                        http_status = error.http_status;
-                    }
                 }
             }
             Ok(_) => {
@@ -26462,6 +26376,7 @@ fn score_search_first_window(
 
     if let (Some(run), Some(evidence)) = (regression.as_ref(), regression_evidence.as_mut()) {
         evidence.transport = run.trace.lock().map_err(regression_search_error)?.clone();
+        evidence.api_rerank = api_evidence.clone();
         evidence.applied = rerank_applied;
         evidence.failure_reason = failure_reason.map(|reason| reason.as_str().to_string());
         evidence
@@ -26592,6 +26507,13 @@ fn score_search_first_window(
         }
     }
 
+    if let Some(evidence) = &api_evidence {
+        let sent = evidence.attempts.iter().filter(|a| a.network_attempted).count();
+        http_requests = Some(sent);
+        model_requests = Some(sent);
+        duration_ms = evidence.attempts.iter().map(|a| a.duration_ms).sum();
+    }
+
     // A window is only continuable when the first lookup is a clean, frozen
     // success and the snapshot saves. Otherwise the current page is still
     // delivered but carries no cursor and a short reason.
@@ -26621,8 +26543,9 @@ fn score_search_first_window(
                 "display": frozen_display.to_json(),
             }),
             rerank: crate::search::rerank::window::WindowRerankMeta {
-                requested_provider: provider,
-                requested_model: provider.request_model().to_string(),
+                model_api: api_evidence.clone(),
+                requested_provider: requested_profile.clone(),
+                requested_model: requested_model.clone(),
                 identity: identity.clone(),
                 applied: rerank_applied,
                 failure_reason,
@@ -26662,8 +26585,9 @@ fn score_search_first_window(
 
     let window_display_state = Some(frozen_display);
     let window_meta = Some(RerankWindowMeta {
-        requested_provider: provider,
-        requested_model: provider.request_model(),
+        model_api: api_evidence.clone(),
+        requested_provider: requested_profile,
+        requested_model,
         actual_provider: identity.actual_provider,
         actual_model: identity.actual_model.clone(),
         serving_provider: identity.serving_provider.clone(),
@@ -30912,8 +30836,9 @@ mod pr9_candidate_meta_output_tests {
             offset: usize::from(cache_reused) * 2,
             continuable: false,
             meta: super::RerankWindowMeta {
-                requested_provider: ProviderChoice::BgeLocal,
-                requested_model: ProviderChoice::BgeLocal.request_model(),
+                model_api: None,
+                requested_provider: ProviderChoice::BgeLocal.as_str().to_owned(),
+                requested_model: ProviderChoice::BgeLocal.request_model().to_owned(),
                 actual_provider: applied.then_some(ProviderChoice::BgeLocal),
                 actual_model: applied.then(|| ProviderChoice::BgeLocal.request_model().to_string()),
                 serving_provider: None,
@@ -35831,7 +35756,7 @@ fn doctor_human_semantic_fallback_summary(
     }
 
     Some(format!(
-        "Semantic search: {}. This is derived-search state, not archive damage; cass will not download models during doctor. Next optional command: cass models install --json, then cass index --semantic --json.",
+        "Semantic search: {}. This is derived-search state, not archive damage; cass never downloads or installs models during doctor. Next optional step: configure an embedding profile with --api-config, verify it with cass models check, then run cass index --semantic --json.",
         derived_semantic_assets.recommended_action
     ))
 }
@@ -39151,7 +39076,7 @@ fn doctor_semantic_recommended_action(
     }
     match availability {
         "not_installed" | "needs_consent" | "model_missing" => {
-            "cass models status --json; install explicitly with cass models install --json or cass models install --from-file <dir> --json, then run cass index --semantic --json".to_string()
+            "cass models list --json; configure an embedding profile with --api-config, verify it with cass models check --profile <id> --json, then run cass index --semantic --json".to_string()
         }
         "index_missing" | "update_available" | "index_building" => {
             "cass index --semantic --json, or keep using lexical search".to_string()
@@ -39272,7 +39197,7 @@ fn doctor_build_derived_semantic_asset_report(
     }
     .to_string();
     let skipped_auto_download_reason = (!semantic_ready).then(|| {
-        "doctor never downloads semantic models; model acquisition requires explicit cass models install or --from-file".to_string()
+        "doctor never downloads or installs semantic models; semantic assets come from a model API profile configured with --api-config".to_string()
     });
 
     let model_status = if !archive_db_usable {
@@ -39515,11 +39440,9 @@ mod doctor_derived_semantic_asset_tests {
         assert!(!report.auto_download_allowed);
         assert!(!report.auto_download_attempted);
         assert!(!report.model_cache.safe_to_rebuild);
-        assert!(
-            report
-                .recommended_action
-                .contains("cass models install --json")
-        );
+        // Local installation is retired; the recommended action points at the
+        // configured model API profile instead.
+        assert!(report.recommended_action.contains("cass models check"));
     }
 
     #[test]
@@ -39538,8 +39461,8 @@ mod doctor_derived_semantic_asset_tests {
             doctor_human_semantic_fallback_summary(&report).expect("semantic fallback copy");
 
         assert!(summary.contains("not archive damage"));
-        assert!(summary.contains("cass will not download models during doctor"));
-        assert!(summary.contains("cass models install --json"));
+        assert!(summary.contains("never downloads or installs models during doctor"));
+        assert!(summary.contains("cass models check"));
         assert!(summary.contains("cass index --semantic --json"));
     }
 
@@ -50312,7 +50235,6 @@ fn run_doctor_emit_capabilities(structured_format: Option<RobotFormat>) -> CliRe
         "env_vars": [
             {"name": "CASS_IGNORE_SOURCES_CONFIG", "purpose": "test isolation"},
             {"name": "CASS_LEXICAL_PUBLISH_BACKUP_RETENTION", "purpose": "lexical backup retention limit"},
-            {"name": "CASS_SEMANTIC_EMBEDDER", "purpose": "force hash embedder even when ML model is installed"},
             {"name": "CASS_TEST_DOCTOR_CANDIDATE_PROMOTION_FAILPOINT", "purpose": "test failpoint"},
             {"name": "CASS_TEST_DOCTOR_RENAME_FAILURE", "purpose": "test failpoint"}
             // Pass-11 fix: removed the previously-advertised
@@ -73925,10 +73847,11 @@ fn gather_onboarding_observation(
         .as_ref()
         .is_some_and(|cfg| cfg.remote_sources().next().is_some());
 
-    let model_dir = crate::search::model_manager::default_model_dir(data_dir);
-    let manifest = crate::search::model_manager::default_model_manifest();
+    // Semantic readiness is the DB-vector-domain state, not a local weight file:
+    // embedding is served exclusively by the configured external model API, and
+    // the retired local weight cache is no longer consulted.
     let semantic_model_present =
-        crate::search::model_download::check_model_installed(&model_dir, &manifest).is_ready();
+        crate::search::model_manager::probe_semantic_availability(data_dir, db_path).is_ready();
 
     // "Existing indexed DB" means a DB that actually carries content, so an
     // empty/just-created DB still routes the user to a first index.
@@ -76226,6 +76149,51 @@ mod cli_read_db_tests {
         );
     }
 
+    /// API03 final-surface S2: the asset-inspection *failure* branch must
+    /// report the neutral `external` preferred backend, matching the normal
+    /// path in `asset_state::semantic_preference_surface`, and must keep the
+    /// underlying failure status and reason. Before this fix the branch
+    /// hardcoded the retired `fastembed` backend name.
+    ///
+    /// A real file with an invalid SQLite header drives it: the status probe
+    /// opens it lazily (`opened=true`, no `open_error`), but the lexical
+    /// fingerprint pass runs a real query and fails, which sends
+    /// `inspect_search_assets` into its error arm. `state_meta_json_for_status`
+    /// pins `include_counts=false`, so reach the branch through the full form
+    /// with counts enabled.
+    #[test]
+    fn status_state_asset_inspection_failure_uses_neutral_backend() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("agent_search.db");
+        let file = std::fs::File::create(&db_path).expect("create placeholder");
+        file.set_len(64 * 1024).expect("grow placeholder");
+        drop(file);
+
+        let state = state_meta_json_full(temp.path(), &db_path, 60, true, Some(true), false, true);
+        let semantic = state
+            .get("semantic")
+            .and_then(serde_json::Value::as_object)
+            .expect("semantic state");
+        assert_eq!(
+            semantic.get("status").and_then(|v| v.as_str()),
+            Some("error"),
+            "the failure branch must keep the error status: {semantic:?}"
+        );
+        assert_eq!(
+            semantic.get("preferred_backend").and_then(|v| v.as_str()),
+            Some("external"),
+            "the failure branch must report the neutral backend, not the retired fastembed name: {semantic:?}"
+        );
+        assert!(
+            semantic
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("asset inspection failed"),
+            "the failure branch must preserve the raw failure reason: {semantic:?}"
+        );
+    }
+
     /// T8 (plan v5.1, task book #92) "status JSON 同名字段；golden 更新":
     /// the real `cass status` JSON (not just `DbVectorDomainStatus`'s own
     /// serde shape) must carry `chunk_count`/`chunking_policy_version`
@@ -76644,22 +76612,6 @@ mod cli_read_db_tests {
             std::env::set_var(key, value);
         }
         EnvGuard { key, previous }
-    }
-
-    #[test]
-    #[serial]
-    fn semantic_index_embedder_policy_env_overrides_fastembed_default() {
-        let _embedder = set_env("CASS_SEMANTIC_EMBEDDER", "snowflake-arctic-s");
-
-        assert_eq!(
-            resolve_semantic_index_embedder("fastembed"),
-            "snowflake-arctic-s"
-        );
-        assert_eq!(
-            resolve_semantic_index_embedder("minilm"),
-            "snowflake-arctic-s"
-        );
-        assert_eq!(resolve_semantic_index_embedder("hash"), "hash");
     }
 
     #[test]
@@ -79791,6 +79743,7 @@ pub(crate) fn run_doctor_impl(
                 needs_rebuild = true;
             } else {
                 let index_opts = indexer::IndexOptions {
+                    model_api: None,
                     no_ingest: false,
                     // When the database is missing or corrupted, doctor must
                     // rebuild from source sessions using the full path rather
@@ -79802,7 +79755,10 @@ pub(crate) fn run_doctor_impl(
                     db_path: db_path.clone(),
                     data_dir: data_dir.clone(),
                     semantic: false,
-                    embedder: "fastembed".to_string(),
+                    // `embedder` is only read on semantic runs (it is the
+                    // progress label); this lexical-only rebuild uses a
+                    // neutral value rather than a retired backend name.
+                    embedder: "lexical".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
                 };
@@ -81753,6 +81709,17 @@ fn build_global_flag_schemas() -> Vec<ArgumentSchema> {
             enum_values: None,
             repeatable: None,
         },
+        ArgumentSchema {
+            name: "api-config".to_string(),
+            short: None,
+            description: "Path to the versioned model-service API configuration (TOML); overrides CASS_API_CONFIG".to_string(),
+            arg_type: "option".to_string(),
+            value_type: Some("path".to_string()),
+            required: false,
+            default: None,
+            enum_values: None,
+            repeatable: None,
+        },
     ]
 }
 
@@ -81861,31 +81828,31 @@ fn build_exit_code_capabilities() -> Vec<ExitCodeCapability> {
             "15",
             "semantic or embedder unavailable",
             "yes",
-            "Install/verify models or continue with lexical fallback when acceptable.",
+            "Configure an embedding profile with --api-config and run 'cass models check'; continue with lexical fallback when acceptable.",
         ),
         exit_code_capability(
             "20-21",
-            "model acquisition failure",
+            "retired: model acquisition failure",
             "maybe",
-            "Check err.kind and err.hint; retry download or use --from-file.",
+            "Retired with the model-API migration; no active path returns this code and no local model is acquired. Configure an external profile with --api-config.",
         ),
         exit_code_capability(
             "22",
-            "I/O during model handling",
+            "retired: I/O during model handling",
             "maybe",
-            "Verify model cache permissions and available disk before retrying.",
+            "Retired with the model-API migration; no local model cache I/O path remains.",
         ),
         exit_code_capability(
             "23",
-            "download failure",
+            "retired: download failure",
             "yes",
-            "Retry with network available or install from a local model directory.",
+            "Retired with the model-API migration; cass downloads no model weights.",
         ),
         exit_code_capability(
             "24",
-            "I/O during model verify/install",
+            "retired: I/O during model verify/install",
             "maybe",
-            "Fix filesystem permissions or disk space, then retry.",
+            "Retired with the model-API migration; no local model verify/install path remains.",
         ),
     ]
 }
@@ -81933,19 +81900,24 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
             "Default search per-page rerank count K (used only when --rerank is on). The --rerank-limit flag overrides; also [search].rerank_limit in ~/.config/cass/cass.toml.",
         ),
         env_var_capability(
+            "CASS_API_CONFIG",
+            None,
+            "Path to the versioned model-service API configuration (TOML). The --api-config flag overrides it; model commands refuse without one.",
+        ),
+        env_var_capability(
             "CASS_QWEN_RERANK_URL",
             None,
-            "Local Qwen rerank endpoint. Only loopback targets are accepted; proxies and redirects are disabled. Used by qwen3-local, the default when --rerank is enabled.",
+            "Retired. The local Qwen rerank backend was removed with the model-API migration; a model command that finds this set refuses with a migration error.",
         ),
         env_var_capability(
             "CASS_INFINITY_URL",
             None,
-            "Local Infinity endpoint for bge-local reranking and Infinity embeddings. Reranking accepts only loopback targets; proxies and redirects are disabled.",
+            "Retired. The local Infinity backend was removed with the model-API migration; a model command that finds this set refuses with a migration error.",
         ),
         env_var_capability(
             "OPENROUTER_API_KEY",
             None,
-            "Credential consumed only by an explicitly selected OpenRouter rerank provider. Missing credentials keep original order with missing_credentials; no backend switch.",
+            "Credential a profile may reference through api_key_env. Its presence alone never selects a backend and never changes routing.",
         ),
         env_var_capability(
             "CASS_SEARCH_LIMIT",
@@ -81996,7 +81968,7 @@ fn build_env_var_capabilities() -> Vec<EnvVarCapability> {
         env_var_capability(
             "CASS_SEMANTIC_EMBEDDER",
             None,
-            "Select the semantic embedder/model implementation when configured.",
+            "Retired. Selecting a local embedder (e.g. hash) was removed with the model-API migration; a model command that finds this set refuses with a migration error.",
         ),
         env_var_capability(
             "CASS_SEMANTIC_BATCH_SIZE",
@@ -82177,10 +82149,9 @@ fn build_workflow_capabilities() -> Vec<WorkflowCapability> {
             "Understand or repair semantic-search readiness.",
             "cass models status --json",
             &[
-                "cass models verify --json",
-                "cass models install --model minilm",
-                "cass models install --from-file <dir> --model minilm",
-                "cass models backfill",
+                "cass models list --json",
+                "cass models check --profile <id> --json",
+                "cass models backfill --api-config <file>",
             ],
             "Parse installed, available, cache_dir, verification status, and err.kind.",
             "Models are opt-in; lexical fallback is valid while the model is absent.",
@@ -86475,6 +86446,132 @@ fn response_schema_root_cause_attribution() -> serde_json::Value {
     })
 }
 
+/// Schema for one configured model-API profile id.
+///
+/// A profile id is an operator-chosen name in the API-only configuration, not
+/// one of the legacy [`crate::search::rerank::types::ProviderChoice`]
+/// selections, so a fixed enum here would refuse every legal profile an
+/// operator writes. The constraint is the configuration's own rule
+/// (`search::model_api::config::is_valid_profile_id`: 1–64 bytes over
+/// `[A-Za-z0-9._-]`).
+fn response_schema_profile_id() -> serde_json::Value {
+    serde_json::json!({"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"})
+}
+
+/// The same schema, also admitting `null`: the wire field is optional even
+/// though every property inside it is required once it is present.
+fn response_schema_nullable(mut schema: serde_json::Value) -> serde_json::Value {
+    let mut kinds = match schema["type"].take() {
+        serde_json::Value::String(name) => vec![serde_json::Value::String(name)],
+        serde_json::Value::Array(items) => items,
+        other => unreachable!("schema type is a string or an array, got {other}"),
+    };
+    kinds.push(serde_json::Value::String("null".to_string()));
+    schema["type"] = serde_json::Value::Array(kinds);
+    schema
+}
+
+/// Require every property of a schema that describes a
+/// `#[serde(deny_unknown_fields)]` struct: such a struct always serializes all
+/// of its fields, so none of them is optional on the wire.
+fn require_all_properties(schema: &mut serde_json::Value) {
+    let keys: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("schema properties")
+        .keys()
+        .cloned()
+        .collect();
+    schema["required"] = serde_json::json!(keys);
+}
+
+/// Usage one model-API stage reported, mirroring
+/// `search::model_api::runtime::CheckUsage`.
+fn response_schema_api_usage() -> serde_json::Value {
+    let tokens = serde_json::json!({"type": ["integer", "null"], "minimum": 0});
+    let mut schema = response_schema_object([
+        ("prompt_tokens", tokens.clone()),
+        ("input_tokens", tokens.clone()),
+        ("total_tokens", tokens.clone()),
+        ("completion_tokens", tokens.clone()),
+        ("output_tokens", tokens.clone()),
+        ("cost", serde_json::json!({"type": ["number", "null"]})),
+    ]);
+    require_all_properties(&mut schema);
+    schema
+}
+
+/// One model-API attempt recorded inside a window, mirroring
+/// `search::rerank::window::ApiWindowAttempt`.
+fn response_schema_api_window_attempt() -> serde_json::Value {
+    let mut schema = response_schema_object([
+        ("profile", response_schema_profile_id()),
+        (
+            "network_attempted",
+            serde_json::json!({"type": "boolean"}),
+        ),
+        (
+            "http_status",
+            serde_json::json!({"type": ["integer", "null"], "minimum": 100, "maximum": 599}),
+        ),
+        (
+            "error_code",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "duration_ms",
+            serde_json::json!({"type": "integer", "minimum": 0}),
+        ),
+        (
+            "response_model",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "response_revision",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "serving_provider",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "usage",
+            response_schema_nullable(response_schema_api_usage()),
+        ),
+    ]);
+    require_all_properties(&mut schema);
+    schema
+}
+
+/// The API-only rerank evidence a window carries, mirroring
+/// `search::rerank::window::ApiWindowRerank`. Absent (`null`) whenever the
+/// window was not produced by an API-backed rerank.
+fn response_schema_api_window_rerank() -> serde_json::Value {
+    let mut schema = response_schema_object([
+        ("primary_profile", response_schema_profile_id()),
+        (
+            "realized_profile",
+            serde_json::json!({
+                "type": ["string", "null"],
+                "pattern": "^[A-Za-z0-9._-]{1,64}$",
+            }),
+        ),
+        ("fallback_used", serde_json::json!({"type": "boolean"})),
+        (
+            "fallback_reason",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "attempts",
+            serde_json::json!({
+                "type": "array",
+                "items": response_schema_api_window_attempt(),
+            }),
+        ),
+    ]);
+    require_all_properties(&mut schema);
+    schema
+}
+
 fn response_schema_rerank_meta() -> serde_json::Value {
     use crate::search::rerank::types::ProviderChoice;
     let providers = serde_json::json!([
@@ -86491,9 +86588,10 @@ fn response_schema_rerank_meta() -> serde_json::Value {
         .push(serde_json::Value::Null);
     let mut schema = response_schema_object([
         (
-            "requested_provider",
-            serde_json::json!({"type": "string", "enum": providers}),
+            "model_api",
+            response_schema_nullable(response_schema_api_window_rerank()),
         ),
+        ("requested_provider", response_schema_profile_id()),
         ("requested_model", serde_json::json!({"type": "string"})),
         (
             "actual_provider",
@@ -86561,7 +86659,7 @@ fn response_schema_rerank_meta() -> serde_json::Value {
             serde_json::json!({"type": ["integer", "null"], "minimum": 0}),
         );
     }
-    schema["required"] = serde_json::json!(properties.keys().cloned().collect::<Vec<_>>());
+    require_all_properties(&mut schema);
     schema
 }
 
@@ -88250,79 +88348,62 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
     );
 
     schemas.insert(
-        "models-status".to_string(),
+        "models-list".to_string(),
         json!({
             "type": "object",
-            "description": "cass models status --json: semantic-model acquisition + cache state.",
+            "description": "cass models list --json (and its alias `models status`): the configured HTTP model API profiles. Read-only; loads no local weight and makes no request.",
             "properties": {
-                "policy_quality_tier_embedder": { "type": "string" },
-                "active_registry_name": { "type": ["string", "null"] },
-                "lexical_fail_open": { "type": "boolean" },
-                "models": response_schema_opaque_object_array(),
-                "model_id": { "type": "string" },
-                "model_dir": { "type": "string" },
-                "installed": { "type": "boolean" },
-                "state": { "type": "string", "description": "not_acquired | downloading | ready | needs_update" },
-                "state_detail": { "type": "string" },
-                "next_step": { "type": "string" },
-                "revision": { "type": "string" },
-                "license": { "type": "string" },
-                "total_size_bytes": { "type": "integer" },
-                "installed_size_bytes": { "type": "integer" },
-                "observed_file_bytes": { "type": "integer" },
-                "policy_source": { "type": "string" },
-                "cache_lifecycle": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Opaque lifecycle block describing cache state, missing files, and consent status."
-                },
-                "model_acquisition": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Hardened acquisition contract: state (absent|partial_download|ready|checksum_mismatch|quarantined_corrupt|budget_blocked|offline_blocked|disabled_by_policy|baseline_no_semantic|incompatible_runtime|runtime_load_failed), runtime, source, cost_class, expected_download_bytes, fallback_mode, next_step, next_command, state_detail, rollback_guidance, fingerprint{revision,content_digest,marker_token}, and skipped_network_reason (the typed proof cass never auto-downloads outside `cass models install`)."
-                },
-                "files": response_schema_opaque_object_array()
+                "schema": { "type": "string", "description": "cass.model-api-list.v1" },
+                "profiles": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "kind": { "type": "string", "description": "embedding | rerank" },
+                            "protocol": { "type": "string" },
+                            "model": { "type": "string" },
+                            "model_revision": { "type": "string", "description": "The revision the operator declares; not proof the client read the served weights." },
+                            "default": { "type": "boolean" },
+                            "endpoint": { "type": "string" },
+                            "scope": { "type": "string", "description": "loopback | remote" },
+                            "api_key_env": { "type": ["string", "null"], "description": "Credential variable name only; the value is never read." }
+                        },
+                        "required": ["id", "kind", "protocol", "model", "model_revision", "default", "endpoint", "scope"]
+                    }
+                }
             },
-            "required": ["policy_quality_tier_embedder", "lexical_fail_open", "models"]
+            "required": ["schema", "profiles"]
         }),
     );
 
     schemas.insert(
-        "models-verify".to_string(),
+        "models-check".to_string(),
         json!({
             "type": "object",
-            "description": "cass models verify --json: per-file SHA-256 verification of the installed semantic model.",
+            "description": "cass models check --profile <id> --json: the result of checking exactly one selected profile against exactly its own endpoint. The fallback is never used, no generation is registered and no readiness cache is touched.",
             "properties": {
-                "status": { "type": "string" },
-                "state_detail": { "type": "string" },
-                "next_step": { "type": "string" },
-                "lexical_fail_open": { "type": "boolean" },
-                "model_dir": { "type": "string" },
-                "all_valid": { "type": "boolean" },
-                "cache_lifecycle": response_schema_opaque_object(),
-                "model_acquisition": {
-                    "type": "object",
-                    "additionalProperties": true,
-                    "description": "Hardened acquisition contract (same shape as models-status.model_acquisition): state, runtime, source, cost_class, fingerprint, and skipped_network_reason proving verify never auto-downloads."
-                },
-                "error": { "type": ["string", "null"] }
+                "schema": { "type": "string", "description": "cass.model-api-check.v1" },
+                "profile_id": { "type": "string" },
+                "kind": { "type": "string", "description": "embedding | rerank" },
+                "requested_model": { "type": "string" },
+                "declared_revision": { "type": "string" },
+                "response_model": { "type": ["string", "null"] },
+                "response_revision": { "type": ["string", "null"] },
+                "revision_source": { "type": "string", "description": "service_reported | operator_declared" },
+                "mode": { "type": "string" },
+                "fallback_used": { "type": "boolean", "description": "Always false: one explicit profile is checked." },
+                "calls": response_schema_opaque_object_array(),
+                "effective_dimension": { "type": ["integer", "null"], "description": "Measured embedding dimension, for an embedding profile." },
+                "descriptor_sha256": { "type": ["string", "null"], "description": "Representation descriptor digest, for an embedding profile." },
+                "scored_count": { "type": ["integer", "null"], "description": "Documents scored, for a rerank profile." },
+                "usage": { "type": ["object", "null"], "description": "Usage the last service response reported, when it reported one." },
+                "error": {
+                    "type": ["object", "null"],
+                    "description": "Present only when a stage failed: {code, kind, message, http_status, retryable}. Every stage already attempted stays listed in `calls`."
+                }
             },
-            "required": ["status", "all_valid", "lexical_fail_open"]
-        }),
-    );
-
-    schemas.insert(
-        "models-check-update".to_string(),
-        json!({
-            "type": "object",
-            "description": "cass models check-update --json: compares installed model revision against the pinned registry revision.",
-            "properties": {
-                "update_available": { "type": "boolean" },
-                "reason": { "type": "string", "description": "model_not_installed | up_to_date | newer_revision_available | registry_check_failed" },
-                "current_revision": { "type": ["string", "null"] },
-                "latest_revision": { "type": ["string", "null"] }
-            },
-            "required": ["update_available", "reason"]
+            "required": ["schema", "profile_id"]
         }),
     );
 
@@ -89691,6 +89772,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let progress = Arc::new(indexer::IndexingProgress::default());
     let opts = indexer::IndexOptions {
+        model_api: None,
         no_ingest: false,
         full: false,
         force_rebuild: false,
@@ -89699,7 +89781,10 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         db_path,
         data_dir,
         semantic: false,
-        embedder: "fastembed".to_string(),
+        // `embedder` is only read on semantic runs (it is the progress label);
+        // this lexical-only refresh uses a neutral value rather than a retired
+        // backend name.
+        embedder: "lexical".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
     };
@@ -89853,7 +89938,7 @@ fn run_index_with_data(
     semantic: bool,
     no_ingest: bool,
     ingest_mode: IngestMode,
-    embedder: String,
+    model_api: Option<std::sync::Arc<crate::search::model_api::index_embedding::IndexEmbeddingSetup>>,
     progress: ProgressResolved,
     output_format: Option<RobotFormat>,
     idempotency_key: Option<String>,
@@ -89865,7 +89950,7 @@ fn run_index_with_data(
 
     let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-    let embedder = resolve_semantic_index_embedder(&embedder);
+    let embedder = model_api.as_ref().map(|setup| setup.profile_id()).unwrap_or("api").to_owned();
 
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
         if matches!(fmt, RobotFormat::Sessions) {
@@ -89887,6 +89972,7 @@ fn run_index_with_data(
         semantic.hash(&mut hasher);
         no_ingest.hash(&mut hasher);
         embedder.hash(&mut hasher);
+        model_api.as_ref().map(|setup| setup.identity_sha256()).hash(&mut hasher);
         robot_trace_ingest.hash(&mut hasher);
         format!("{}", data_dir.display()).hash(&mut hasher);
         hasher.finish()
@@ -90097,6 +90183,7 @@ fn run_index_with_data(
     let index_progress = std::sync::Arc::new(indexer::IndexingProgress::default());
 
     let opts = IndexOptions {
+        model_api,
         full,
         force_rebuild,
         watch,
@@ -90468,6 +90555,9 @@ fn run_index_with_data(
         );
         if let Some(fmt) = structured_format {
             let mut payload = cli_error_json_payload(err, elapsed_ms);
+            if let Ok(stats) = index_progress.stats.lock() {
+                if let Some(model_api) = &stats.model_api { payload["model_api"] = model_api.clone(); }
+            }
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
             }
@@ -100290,7 +100380,7 @@ fn run_sources_sync(
             false,          // semantic
             false,          // no_ingest
             IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
-            "fastembed".to_string(),
+            None, // no model configuration for lexical ingestion
             progress,
             output_format,
             None,  // idempotency_key
@@ -100444,7 +100534,7 @@ fn run_sources_reingest(
         false,                  // semantic
         false,                  // no_ingest
         IngestMode::ExplicitIngest, // ingest_mode (no --semantic here)
-        "fastembed".to_string(),
+        None, // no model configuration for lexical ingestion
         progress,
         output_format,
         None,  // idempotency_key
@@ -100705,34 +100795,38 @@ fn run_sources_setup(opts: sources::setup::SetupOptions) -> CliResult<()> {
 /// Handle models subcommands
 fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
     match cmd {
+        ModelsCommand::VerifyCompatibility(args) => {
+            reject_retired_model_env()?;
+            let config = crate::search::model_api::runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key)).map_err(model_api_runtime_error)?;
+            let report = crate::search::model_api::compatibility_tools::verify_to_directory(&config, &args)
+                .map_err(|error| CliError::usage(error.to_string(), Some("Use complete pinned captures and a fresh output directory".into())))?;
+            println!("{}", serde_json::to_string(&report).map_err(|_|CliError::unknown("compatibility proof encoding failed"))?);
+            Ok(())
+        }
+        ModelsCommand::CaptureCompatibility(args) => {
+            reject_retired_model_env()?;
+            let config = crate::search::model_api::runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key)).map_err(model_api_runtime_error)?;
+            let client = crate::search::model_api::ApiClient::new(config, Box::new(crate::search::model_api::EnvCredentialResolver));
+            let report = crate::search::model_api::compatibility_tools::capture_to_directory(&client, &args)
+                .map_err(|error| CliError::usage(error.to_string(), Some("Use pinned regular input files and a new output directory".into())))?;
+            let failed = report["status"] != "captured";
+            println!("{}", serde_json::to_string(&report).map_err(|_|CliError::unknown("compatibility capture encoding failed"))?);
+            if failed { return Err(CliError {code:1,kind:"model-api-compatibility-capture",message:"Compatibility capture failed; private failure report retained".into(),hint:None,retryable:false}); }
+            Ok(())
+        }
         ModelsCommand::Status { json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_models_status(structured_format)
+            run_models_list(cli, structured_format)
         }
-        ModelsCommand::Install {
-            model,
-            mirror,
-            from_file,
-            yes,
-            data_dir,
-        } => run_models_install(
-            &model,
-            mirror.as_deref(),
-            from_file.as_deref(),
-            yes,
-            data_dir,
-        ),
-        ModelsCommand::Verify {
-            repair,
-            data_dir,
-            json,
-        } => {
-            let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_models_verify(repair, data_dir, structured_format)
-        }
+        ModelsCommand::Install { .. } | ModelsCommand::Verify { .. }
+        | ModelsCommand::Remove { .. } | ModelsCommand::CheckUpdate { .. } => Err(model_api_migration_error(
+            "local model installation, repair, removal, and update checks are retired".into(),
+            "Configure external HTTP services with --api-config; use models list or models check".into())),
         ModelsCommand::Backfill {
             tier,
             embedder,
+            embedding_profile,
+            no_model_fallback,
             batch_conversations,
             scheduled,
             data_dir,
@@ -100741,25 +100835,230 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
         } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_models_backfill(
-                &tier,
+                tier.as_deref(),
                 embedder.as_deref(),
+                embedding_profile.as_deref(),
+                no_model_fallback,
                 batch_conversations,
                 scheduled,
+                cli.api_config.as_deref(),
                 data_dir,
                 db.or_else(|| cli.db.clone()),
                 structured_format,
             )
         }
-        ModelsCommand::Remove {
-            model,
-            yes,
-            data_dir,
-        } => run_models_remove(&model, yes, data_dir),
-        ModelsCommand::CheckUpdate { data_dir, json } => {
+        ModelsCommand::List { json } => {
             let structured_format = resolve_subcommand_structured_format(cli, json);
-            run_models_check_update(structured_format, data_dir)
+            run_models_list(cli, structured_format)
+        }
+        ModelsCommand::Check { profile, json } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_models_check(cli, &profile, structured_format)
         }
     }
+}
+
+/// Map a model-API runtime refusal onto the CLI error envelope.
+fn model_api_runtime_error(err: crate::search::model_api::runtime::RuntimeError) -> CliError {
+    CliError {
+        code: err.code(),
+        kind: err.kind_str(),
+        message: err.message().to_string(),
+        hint: err.hint().map(|hint| hint.to_string()),
+        retryable: err.retryable(),
+    }
+}
+
+/// Refuse a model command that still carries a retired model-selection
+/// variable, before any configuration is read or request is sent.
+///
+/// The read is `std::env::var_os`, not a dotfile-loading helper: this boundary
+/// only reports what the process was actually started with, and presence
+/// includes an empty or non-UTF-8 value.
+fn reject_retired_model_env() -> CliResult<()> {
+    crate::search::model_api::runtime::ensure_no_retired_model_env(|key| std::env::var_os(key))
+        .map_err(model_api_runtime_error)
+}
+
+/// The process-environment credential source, and the only one a command uses.
+fn model_api_credential_resolver() -> Box<dyn crate::search::model_api::client::CredentialResolver> {
+    Box::new(crate::search::model_api::runtime::EnvCredentialResolver)
+}
+
+/// Normalize a structured format for a model API command.
+///
+/// `sessions` is a search-only projection; every other command renders it as
+/// compact JSON.
+fn model_api_structured_format(output_format: Option<RobotFormat>) -> Option<RobotFormat> {
+    output_format.map(|fmt| match fmt {
+        RobotFormat::Sessions => RobotFormat::Compact,
+        other => other,
+    })
+}
+
+/// `cass models list`: list the configured model API profiles.
+///
+/// Pure read of the configuration file. No database is opened and no request
+/// is sent, so it succeeds on a host with no endpoint running and no credential
+/// variable set.
+fn run_models_list(cli: &Cli, output_format: Option<RobotFormat>) -> CliResult<()> {
+    use crate::search::model_api::runtime;
+
+    reject_retired_model_env()?;
+    let config = runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key))
+        .map_err(model_api_runtime_error)?;
+    let listings = runtime::list_profiles(&config);
+
+    if let Some(fmt) = model_api_structured_format(output_format) {
+        let payload = serde_json::json!({
+            "schema": runtime::LIST_SCHEMA,
+            "profiles": listings,
+        });
+        return output_structured_value(payload, fmt);
+    }
+
+    use colored::Colorize;
+
+    println!("Model API Profiles");
+    println!("==================");
+    println!();
+    if listings.is_empty() {
+        println!("No profiles are configured.");
+        return Ok(());
+    }
+    for row in &listings {
+        let marker = if row.is_default {
+            "default".bold().to_string()
+        } else {
+            "       ".to_string()
+        };
+        println!("{}  {} ({})", marker, row.id, row.kind);
+        println!("  Protocol:   {}", row.protocol);
+        println!("  Model:      {}", row.model);
+        println!("  Revision:   {}", row.model_revision);
+        println!("  Endpoint:   {} ({})", row.endpoint, row.scope);
+        match &row.api_key_env {
+            Some(variable) => println!("  Credential: ${variable} (name only; value never read)"),
+            None => println!("  Credential: none"),
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// `cass models check --profile <ID>`: check exactly one selected profile.
+///
+/// The selected profile's own endpoint is the only one contacted. The
+/// fallback is never used, so a declared fallback cannot turn the check green,
+/// and the check neither proves cross-endpoint compatibility nor touches a
+/// readiness cache or a generation.
+fn run_models_check(
+    cli: &Cli,
+    profile_id: &str,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::search::model_api::client::ApiClient;
+    use crate::search::model_api::runtime;
+
+    reject_retired_model_env()?;
+    let config = runtime::load_config(cli.api_config.as_deref(), |key| std::env::var_os(key))
+        .map_err(model_api_runtime_error)?;
+    // Validate the id against the document before the client takes ownership,
+    // so an unknown id is a configuration refusal (code 2), not a check result.
+    let profile = runtime::profile_by_id(&config, profile_id)
+        .map_err(model_api_runtime_error)?
+        .clone();
+    let client = ApiClient::new(config, model_api_credential_resolver());
+
+    let run = runtime::run_profile_check(&client, &profile);
+    let mut payload = serde_json::to_value(&run.report).unwrap_or_default();
+    let schema = runtime::CHECK_SCHEMA;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("schema".to_string(), serde_json::Value::from(schema));
+    }
+
+    match run.failure {
+        None => {
+            if let Some(fmt) = model_api_structured_format(output_format) {
+                return output_structured_value(payload, fmt);
+            }
+            print_model_api_check_summary(&run.report);
+            Ok(())
+        }
+        Some(failure) => {
+            // The machine diagnostic keeps every attempt already made, so a
+            // failed stage is never silently dropped.
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "error".to_string(),
+                    serde_json::json!({
+                        "code": 1,
+                        "kind": runtime::RuntimeErrorKind::Check.as_str(),
+                        "message": failure.code,
+                        "http_status": failure.http_status,
+                        "retryable": false,
+                    }),
+                );
+            }
+            if output_format.is_some() {
+                return Err(CliError {
+                    code: 1,
+                    kind: runtime::RuntimeErrorKind::Check.as_str(),
+                    message: payload.to_string(),
+                    hint: None,
+                    retryable: false,
+                });
+            }
+            Err(model_api_runtime_error(runtime::RuntimeError::check(
+                failure.code,
+            )))
+        }
+    }
+}
+
+/// The human-readable summary of a successful profile check.
+fn print_model_api_check_summary(report: &crate::search::model_api::runtime::CheckReport) {
+    use colored::Colorize;
+
+    println!("Model API Check");
+    println!("===============");
+    println!();
+    println!("Profile:    {} ({})", report.profile_id, report.kind);
+    println!("Requested:  {} @ {}", report.requested_model, report.declared_revision);
+    match &report.response_revision {
+        Some(revision) => println!("Reported:   {} @ {revision}", report.response_model.as_deref().unwrap_or("(unnamed)")),
+        None => println!("Reported:   no service identity ({})", report.revision_source),
+    }
+    println!("Mode:       {} (fallback_used=false)", report.mode);
+    for call in &report.calls {
+        match call.error_code {
+            Some(code) => println!(
+                "  {}: {} in {} ms",
+                call.stage.bold(),
+                code.red(),
+                call.duration_ms
+            ),
+            None => println!(
+                "  {}: http {} in {} ms",
+                call.stage.bold(),
+                call.http_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                call.duration_ms
+            ),
+        }
+    }
+    if let Some(dimension) = report.effective_dimension {
+        println!("Dimension:  {dimension}");
+    }
+    if let Some(digest) = &report.descriptor_sha256 {
+        println!("Descriptor: {digest}");
+    }
+    if let Some(scored) = report.scored_count {
+        println!("Scored:     {scored}");
+    }
+    println!();
+    println!("Only the selected profile was contacted; no fallback request was made.");
 }
 
 /// Dispatch the `cass fleet` subcommand group (bead sc8sp).
@@ -101222,946 +101521,44 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
     );
 }
 
-/// Show semantic model installation status.
+/// A model-command refusal that migrates a retired local model selection onto
+/// the API profile path.
 ///
-/// Reports on every embedder cass knows about (currently `minilm`,
-/// `snowflake-arctic-s`, `nomic-embed`), not just the compiled-in default.
-/// The "active" model is the one resolved from policy
-/// (`quality_tier_embedder`) — that is what `cass index` and `cass search`
-/// will actually use.
-fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{
-        ModelAcquisitionPolicy, ModelManifest, classify_model_cache, model_file_path,
-    };
-    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-
-    let data_dir = default_data_dir();
-    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
-
-    // Hardened model-acquisition contract (bead 0qxwg): cheap host loadability
-    // (never loads ONNX — safe on any host) folded with the on-disk policy
-    // inputs the filesystem-only probe needs. The same inputs drive every
-    // model's `model_acquisition` block so the report cannot drift per model.
-    let acq_runtime = crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host();
-    let acq_policy_inputs = crate::search::model_acquisition::OnDiskPolicyInputs {
-        policy_enabled: acquisition_policy.downloads_enabled,
-        offline: acquisition_policy.offline,
-        budget_max_bytes: acquisition_policy.max_model_bytes,
-    };
-
-    // Canonicalize the policy's quality_tier_embedder to a registry name.
-    // The policy stores short aliases (e.g. "snowflake", "minilm") while
-    // ModelManifest::for_embedder expects registry names — match both.
-    let policy_embedder = policy.quality_tier_embedder.as_str();
-    let active_registry_name = match policy_embedder {
-        "minilm" | "all-minilm-l6-v2" | "fastembed" | "minilm-384" => Some("minilm"),
-        "snowflake"
-        | "snowflake-arctic-s"
-        | "snowflake-arctic-embed-s"
-        | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
-        "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
-            Some("nomic-embed")
+/// The kind is the shared `ModelApiMigration`, so a script can branch on it
+/// exactly as it branches on the retired environment variables' refusal.
+/// Whether a backtest command still selects the retired local rerank provider.
+///
+/// The production entry refuses such a command before it reads any input, so a
+/// backtest can never reach the retired rerank service path from the CLI.
+fn legacy_rerank_provider_selected(action: &regression::RegressionCommand) -> bool {
+    match action {
+        regression::RegressionCommand::FullSearch { rerank_provider, .. }
+        | regression::RegressionCommand::FixedCandidate { rerank_provider, .. } => {
+            rerank_provider.is_some()
         }
-        "hash" => None, // hash fallback — no model files
-        _ => None,
-    };
-
-    // Per-model status snapshot.
-    struct ModelStatus {
-        registry_name: &'static str,
-        manifest: ModelManifest,
-        model_dir: PathBuf,
-        cache_report: crate::search::model_download::ModelCacheReport,
-        total_size: u64,
-        installed_size: u64,
-        files: Vec<serde_json::Value>,
-        /// Hardened model-acquisition projection (state, runtime, source,
-        /// cost_class, skipped_network_reason, next_command, fingerprint, …).
-        acquisition: serde_json::Value,
-    }
-
-    let known: &[&str] = &["minilm", "snowflake-arctic-s", "nomic-embed"];
-    let mut statuses: Vec<ModelStatus> = Vec::with_capacity(known.len());
-    for name in known {
-        let Some(manifest) = ModelManifest::for_embedder(name) else {
-            continue;
-        };
-        let model_dir = if active_registry_name == Some(*name) {
-            FastEmbedder::runtime_model_dir_for(&data_dir, name)
-        } else {
-            FastEmbedder::model_dir_for(&data_dir, name)
-        };
-        let Some(model_dir) = model_dir else {
-            continue;
-        };
-        let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
-        let total_size = manifest.total_size();
-        let mut installed_size: u64 = 0;
-        let mut file_info: Vec<serde_json::Value> = Vec::with_capacity(manifest.files.len());
-        for mfile in &manifest.files {
-            let file_path = model_file_path(&model_dir, mfile);
-            let exists = file_path.is_some();
-            let size = if let Some(path) = file_path.as_ref() {
-                path.metadata().map(|m| m.len()).unwrap_or(0)
-            } else {
-                0
-            };
-            if exists {
-                installed_size += size;
-            }
-            file_info.push(serde_json::json!({
-                "name": mfile.name,
-                "local_name": mfile.local_name(),
-                "actual_path": file_path.as_ref().map(|path| path.display().to_string()),
-                "expected_size": mfile.size,
-                "actual_size": size,
-                "exists": exists,
-                "size_match": exists && size == mfile.size,
-            }));
-        }
-        let acquisition = crate::search::model_acquisition::live_acquisition_block(
-            &model_dir,
-            &manifest,
-            acq_runtime,
-            acq_policy_inputs,
-            name,
-        );
-        statuses.push(ModelStatus {
-            registry_name: name,
-            manifest,
-            model_dir,
-            cache_report,
-            total_size,
-            installed_size,
-            files: file_info,
-            acquisition,
-        });
-    }
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    let active_status =
-        active_registry_name.and_then(|name| statuses.iter().find(|s| s.registry_name == name));
-
-    if let Some(_fmt) = structured_format {
-        let models_json: Vec<serde_json::Value> = statuses
-            .iter()
-            .map(|s| {
-                serde_json::json!({
-                    "registry_name": s.registry_name,
-                    "model_id": s.manifest.id,
-                    "model_dir": s.model_dir.display().to_string(),
-                    "active": active_registry_name == Some(s.registry_name),
-                    "installed": s.cache_report.is_usable(),
-                    "state": s.cache_report.state_code(),
-                    "state_detail": s.cache_report.state.summary(),
-                    "next_step": s.cache_report.state.next_step(),
-                    "revision": s.manifest.revision,
-                    "license": s.manifest.license,
-                    "total_size_bytes": s.total_size,
-                    "installed_size_bytes": s.cache_report.installed_size_bytes,
-                    "observed_file_bytes": s.installed_size,
-                    "policy_source": s.cache_report.policy_source.as_str(),
-                    "cache_lifecycle": &s.cache_report,
-                    "model_acquisition": &s.acquisition,
-                    "files": s.files,
-                })
-            })
-            .collect();
-
-        // Top-level fields describe the *active* model — preserves the
-        // original single-model JSON shape for any consumer that reads
-        // `model_id` etc. directly. When the policy selects "hash" (or
-        // an unrecognized name) there is no active model, so these
-        // fields are omitted from the top level — consumers should
-        // treat their absence as "no embedder model in use" and fall
-        // back to `policy_quality_tier_embedder` + `models[*]` to see
-        // the full picture.
-        let active_json = active_status.map(|s| {
-            serde_json::json!({
-                "model_id": s.manifest.id,
-                "model_dir": s.model_dir.display().to_string(),
-                "installed": s.cache_report.is_usable(),
-                "state": s.cache_report.state_code(),
-                "state_detail": s.cache_report.state.summary(),
-                "next_step": s.cache_report.state.next_step(),
-                "revision": s.manifest.revision,
-                "license": s.manifest.license,
-                "total_size_bytes": s.total_size,
-                "installed_size_bytes": s.cache_report.installed_size_bytes,
-                "observed_file_bytes": s.installed_size,
-                "policy_source": s.cache_report.policy_source.as_str(),
-                "cache_lifecycle": &s.cache_report,
-                "model_acquisition": &s.acquisition,
-                "files": &s.files,
-            })
-        });
-
-        let mut output = serde_json::json!({
-            "policy_quality_tier_embedder": policy_embedder,
-            "active_registry_name": active_registry_name,
-            "lexical_fail_open": true,
-            "models": models_json,
-        });
-        if let (Some(active), Some(obj)) = (active_json, output.as_object_mut())
-            && let Some(active_obj) = active.as_object()
-        {
-            for (k, v) in active_obj {
-                obj.insert(k.clone(), v.clone());
-            }
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-    } else {
-        use colored::Colorize;
-
-        println!("Semantic Search Model Status");
-        println!("============================");
-        println!();
-        println!("Active embedder (quality tier): {}", policy_embedder);
-        if active_registry_name.is_none() && policy_embedder != "hash" {
-            println!(
-                "  {} unrecognized embedder name; cass will fall back to hash-only.",
-                "⚠".yellow()
-            );
-        }
-        if policy_embedder == "hash" {
-            println!("  No ONNX model is in use; semantic search runs in hash-fallback mode.");
-        }
-        println!(
-            "Override with: CASS_SEMANTIC_EMBEDDER={{minilm|snowflake-arctic-s|nomic-embed|hash}}"
-        );
-        println!("Fail-open: lexical search remains available.");
-        println!();
-
-        for s in &statuses {
-            let is_active = active_registry_name == Some(s.registry_name);
-            let header = format!(
-                "{} {} ({})",
-                if is_active { "▶" } else { " " },
-                s.manifest.id,
-                s.manifest.license
-            );
-            println!(
-                "{}",
-                if is_active {
-                    header.bold().to_string()
-                } else {
-                    header
-                }
-            );
-            println!(
-                "  Revision: {}",
-                s.manifest
-                    .revision
-                    .get(..12)
-                    .unwrap_or(&s.manifest.revision)
-            );
-            println!("  Location: {}", s.model_dir.display());
-            let total_size_mb = s.total_size as f64 / 1_048_576.0;
-            println!("  Size:     {:.1} MB", total_size_mb);
-            let status_str = match s.cache_report.state_code() {
-                "acquired" | "preseeded_local" | "mirror_sourced" => {
-                    s.cache_report.state.summary().green().to_string()
-                }
-                "acquiring" => s.cache_report.state.summary().cyan().to_string(),
-                "not_acquired" | "offline_blocked" | "budget_blocked" | "disabled_by_policy" => {
-                    s.cache_report.state.summary().yellow().to_string()
-                }
-                _ => s.cache_report.state.summary().red().to_string(),
-            };
-            println!("  Status:   {}", status_str);
-
-            print!("  Files:    ");
-            let installed = s
-                .files
-                .iter()
-                .filter(|f| f["size_match"].as_bool().unwrap_or(false))
-                .count();
-            let partial = s
-                .files
-                .iter()
-                .filter(|f| {
-                    f["exists"].as_bool().unwrap_or(false)
-                        && !f["size_match"].as_bool().unwrap_or(false)
-                })
-                .count();
-            let missing = s.files.len() - installed - partial;
-            println!(
-                "{} ok / {} partial / {} missing",
-                installed, partial, missing
-            );
-            if let Some(next_step) = s.cache_report.state.next_step() {
-                println!("  Next:     {}", next_step);
-            }
-            println!();
-        }
-
-        if active_status.is_none() && policy_embedder != "hash" {
-            println!(
-                "{}: active embedder '{}' has no manifest registered. \
-                 Use 'cass models install --model <name>' to install one of the supported embedders.",
-                "⚠".yellow(),
-                policy_embedder
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Resolve a CLI-supplied semantic model name (or alias) to the canonical
-/// registry name used by `ModelManifest::for_embedder` and
-/// `FastEmbedder::model_dir_for`. Mirrors the alias map in
-/// `src/daemon/worker.rs::resolve_embedder_kind` so the CLI surface accepts
-/// the same names the daemon worker honors. Bead:
-/// `coding_agent_session_search-v3of1`.
-fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
-    match model_name.to_ascii_lowercase().as_str() {
-        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
-        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
-            Ok("snowflake-arctic-s")
-        }
-        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
-        "ms-marco" | "ms-marco-minilm" | "ms-marco-minilm-l-6-v2" | "ms-marco-minilm-l6-v2" => {
-            Ok("ms-marco")
-        }
-        "jina-reranker-turbo" | "jina-reranker-v1-turbo" | "jina-reranker-v1-turbo-en" => {
-            Ok("jina-reranker-turbo")
-        }
-        _ => Err(CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!(
-                "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed. Rerankers: ms-marco, jina-reranker-turbo.",
-                model_name
-            ),
-            hint: Some("Use 'cass models status' to see available models".into()),
-            retryable: false,
-        }),
+        _ => false,
     }
 }
 
-/// Returns the on-disk model directory for either an embedder or a reranker.
-///
-/// `registry_name` must be a canonical name returned by `resolve_cli_model_name`.
-/// Embedders are routed through `FastEmbedder::model_dir_for`; rerankers use
-/// `<data_dir>/models/<manifest.id>` so install layout matches the directory
-/// `FastEmbedReranker` reads at startup.
-fn resolve_model_install_dir(
-    data_dir: &Path,
-    registry_name: &str,
-) -> CliResult<(PathBuf, crate::search::model_download::ModelManifest)> {
-    use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::ModelManifest;
-
-    if let Some(manifest) = ModelManifest::for_embedder(registry_name) {
-        let model_dir =
-            FastEmbedder::model_dir_for(data_dir, registry_name).ok_or_else(|| CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!(
-                    "no model directory mapping for registered embedder '{}'",
-                    registry_name
-                ),
-                hint: None,
-                retryable: false,
-            })?;
-        return Ok((model_dir, manifest));
-    }
-
-    if let Some(manifest) = ModelManifest::for_reranker(registry_name) {
-        let model_dir = data_dir.join("models").join(&manifest.id);
-        return Ok((model_dir, manifest));
-    }
-
-    Err(CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!(
-            "no manifest registered for model '{}' (neither embedder nor reranker)",
-            registry_name
-        ),
-        hint: None,
+fn model_api_migration_error(message: String, hint: String) -> CliError {
+    CliError {
+        code: 2,
+        kind: crate::search::model_api::runtime::RuntimeErrorKind::Migration.as_str(),
+        message,
+        hint: Some(hint),
         retryable: false,
-    })
-}
-
-/// Download and install the semantic search model
-fn run_models_install(
-    model_name: &str,
-    mirror: Option<&str>,
-    from_file: Option<&Path>,
-    skip_confirm: bool,
-    data_dir_override: Option<PathBuf>,
-) -> CliResult<()> {
-    use crate::search::model_download::{
-        ModelDownloader, check_model_installed, normalize_mirror_base_url,
-    };
-    use colored::Colorize;
-    use indicatif::{ProgressBar, ProgressStyle};
-
-    let registry_name = resolve_cli_model_name(model_name)?;
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let (model_dir, manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
-    let mirror_base_url = mirror
-        .map(normalize_mirror_base_url)
-        .transpose()
-        .map_err(|error| CliError {
-            code: 21,
-            kind: CliErrorKind::Model.kind_str(),
-            message: error.to_string(),
-            hint: Some(
-                "Use an absolute http(s) mirror base URL such as https://mirror.example/cache"
-                    .into(),
-            ),
-            retryable: false,
-        })?;
-
-    // Install from local directory (for air-gapped environments)
-    if let Some(source_path) = from_file {
-        use crate::search::model_download::compute_sha256;
-
-        if !source_path.is_dir() {
-            return Err(CliError {
-                code: 21,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!(
-                    "--from-file path is not a directory: {}",
-                    source_path.display()
-                ),
-                hint: Some(
-                    "Provide a directory containing model files (model.onnx, tokenizer.json, etc.)"
-                        .into(),
-                ),
-                retryable: false,
-            });
-        }
-
-        println!(
-            "Installing model from local directory: {}",
-            source_path.display()
-        );
-
-        // Verify all required files exist and match checksums
-        for mfile in &manifest.files {
-            let local_name = mfile.local_name();
-            let src = source_path.join(local_name);
-            if !src.is_file() {
-                return Err(CliError {
-                    code: 21,
-                    kind: CliErrorKind::Model.kind_str(),
-                    message: format!(
-                        "Required file '{}' not found in {}",
-                        local_name,
-                        source_path.display()
-                    ),
-                    hint: Some(format!(
-                        "Expected files: {}",
-                        manifest
-                            .files
-                            .iter()
-                            .map(|f| f.local_name().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                    retryable: false,
-                });
-            }
-
-            // Verify SHA256
-            println!("  Verifying {}...", local_name);
-            let actual_hash = compute_sha256(&src).map_err(|e| CliError {
-                code: 22,
-                kind: CliErrorKind::Io.kind_str(),
-                message: format!("Failed to hash {}: {}", local_name, e),
-                hint: None,
-                retryable: false,
-            })?;
-            if actual_hash != mfile.sha256 {
-                return Err(CliError {
-                    code: 21,
-                    kind: CliErrorKind::Model.kind_str(),
-                    message: format!(
-                        "SHA256 mismatch for '{}': expected {}, got {}",
-                        local_name, mfile.sha256, actual_hash
-                    ),
-                    hint: Some(
-                        "The file may be corrupted or from a different model version".into(),
-                    ),
-                    retryable: false,
-                });
-            }
-        }
-
-        // All verified -- copy to model directory
-        std::fs::create_dir_all(&model_dir).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to create model directory: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
-
-        for mfile in &manifest.files {
-            let local_name = mfile.local_name();
-            let src = source_path.join(local_name);
-            let dst = model_dir.join(local_name);
-            std::fs::copy(&src, &dst).map_err(|e| CliError {
-                code: 22,
-                kind: CliErrorKind::Io.kind_str(),
-                message: format!("Failed to copy {}: {}", local_name, e),
-                hint: None,
-                retryable: false,
-            })?;
-        }
-
-        // Write verified marker. The hardened marker records the install
-        // source provenance (`from-file`), the local source path, and the
-        // model fingerprint so an air-gapped install is auditable and
-        // distinguishable from a network download (bead
-        // cass-fleet-resilience-20260608-uojcg.5.5). Byte-compatible with the
-        // legacy reader: `revision=` stays first and unknown lines are ignored.
-        let marker_path = model_dir.join(crate::search::model_acquisition::VERIFIED_MARKER_NAME);
-        let content = crate::search::model_acquisition::VerifiedMarker::for_from_file(
-            &manifest,
-            source_path,
-            chrono::Utc::now().to_rfc3339(),
-        )
-        .render();
-        std::fs::write(&marker_path, content).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to write verified marker: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
-
-        println!();
-        println!(
-            "{} Model installed successfully from local files!",
-            "✓".green()
-        );
-        println!("  Location: {}", model_dir.display());
-        return Ok(());
-    }
-
-    // Check current state — pass the resolved manifest so the
-    // file-presence check matches the model the user asked to install
-    // (bead coding_agent_session_search-odbnh).
-    let state = check_model_installed(&model_dir, &manifest);
-    if state.is_ready() {
-        println!("{} Model is already installed and verified.", "✓".green());
-        println!("  Location: {}", model_dir.display());
-        return Ok(());
-    }
-
-    let total_size = manifest.total_size();
-    let total_size_mb = total_size as f64 / 1_048_576.0;
-
-    // Confirm download unless -y flag
-    if !skip_confirm {
-        println!("Semantic Search Model Installation");
-        println!("===================================");
-        println!();
-        println!("Model:   {} ({})", manifest.id, manifest.license);
-        println!("Size:    {:.1} MB", total_size_mb);
-        if let Some(mirror_url) = mirror_base_url.as_deref() {
-            println!("Source:  Mirror ({mirror_url})");
-            println!("Repo:    {}", manifest.repo);
-        } else {
-            println!("Source:  HuggingFace ({})", manifest.repo);
-        }
-        println!();
-        if mirror_base_url.is_some() {
-            println!("This will download the model from the configured mirror.");
-        } else {
-            println!("This will download the model from HuggingFace.");
-        }
-        print!("Continue? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).ok();
-        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
-            println!("Cancelled.");
-            return Ok(());
-        }
-    }
-
-    // Create model directory parent
-    if let Some(parent) = model_dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CliError {
-            code: 22,
-            kind: CliErrorKind::Io.kind_str(),
-            message: format!("Failed to create model directory: {}", e),
-            hint: None,
-            retryable: false,
-        })?;
-    }
-
-    println!();
-    println!("Downloading model files...");
-
-    // Set up progress bar
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> "),
-    );
-
-    let downloader = ModelDownloader::new(model_dir.clone());
-    let pb_clone = pb.clone();
-    let manifest_clone = manifest.clone();
-    let mirror_base_url_clone = mirror_base_url.clone();
-
-    // Run download on a fresh OS thread so the model downloader owns its
-    // dedicated asupersync runtime and blocking file writes.
-    let result = std::thread::spawn(move || {
-        downloader.download_with_mirror(
-            &manifest_clone,
-            mirror_base_url_clone.as_deref(),
-            Some(std::sync::Arc::new(move |progress| {
-                pb_clone.set_position(progress.total_bytes);
-            })),
-        )
-    })
-    .join()
-    .map_err(|_| {
-        pb.abandon_with_message("Download failed");
-        CliError {
-            code: 23,
-            kind: CliErrorKind::Download.kind_str(),
-            message: "Model download thread panicked".to_string(),
-            hint: Some("Retry the command; if it persists, report the panic output.".into()),
-            retryable: true,
-        }
-    })?;
-
-    match result {
-        Ok(()) => {
-            pb.finish_with_message("Download complete");
-            println!();
-            println!("{} Model installed successfully!", "✓".green());
-            println!("  Location: {}", model_dir.display());
-            println!();
-            println!("Semantic search is now available. Run 'cass search' to try it out.");
-            Ok(())
-        }
-        Err(e) => {
-            pb.abandon_with_message("Download failed");
-            let err_str = e.to_string();
-            let looks_like_windows_tcp_race = cfg!(windows)
-                || err_str.contains("10057")
-                || err_str.contains("socket is not connected")
-                || err_str.contains("WSAENOTCONN");
-
-            if looks_like_windows_tcp_race {
-                eprintln!();
-                eprintln!(
-                    "{} Known issue on Windows: asupersync's TLS client can attempt to write \
-                     before the TCP connect completes (see cass#193).",
-                    "!".yellow()
-                );
-                eprintln!(
-                    "Workaround: download the files manually and install with --from-file.\n"
-                );
-                eprintln!("--- bash / Git Bash / MSYS2 ---");
-                eprintln!(
-                    "{}",
-                    manifest.air_gap_bash_script(mirror_base_url.as_deref())
-                );
-                eprintln!("--- PowerShell ---");
-                eprintln!(
-                    "{}",
-                    manifest.air_gap_powershell_script(mirror_base_url.as_deref())
-                );
-            }
-
-            Err(CliError {
-                code: 23,
-                kind: CliErrorKind::Download.kind_str(),
-                message: format!("Model download failed: {}", e),
-                hint: Some(if looks_like_windows_tcp_race {
-                    "Use the air-gap script printed above, then re-run with --from-file".into()
-                } else if mirror_base_url.is_some() {
-                    "Check your mirror URL, connectivity, and try again".into()
-                } else {
-                    "Check your network connection and try again".into()
-                }),
-                retryable: true,
-            })
-        }
     }
 }
 
-/// Verify model file integrity
-fn run_models_verify(
-    repair: bool,
-    data_dir_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{
-        ModelAcquisitionPolicy, ModelManifest, classify_model_cache, compute_sha256,
-        model_file_path,
-    };
-    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-    use colored::Colorize;
-
-    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
-    let manifest = ModelManifest::minilm_v2();
-    let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let acquisition_policy = ModelAcquisitionPolicy::from_semantic_policy(&policy);
-    let cache_report = classify_model_cache(&model_dir, &manifest, &acquisition_policy);
-
-    // Hardened model-acquisition projection (bead 0qxwg): the same probe-based
-    // block `cass models status` emits, so verify and status agree. The probe
-    // is filesystem-only — `skipped_network_reason` proves verify never
-    // auto-downloads. `probe_cheap_host()` never loads ONNX, so it is safe even
-    // on a corrupt/incompatible cache.
-    let acquisition_block = crate::search::model_acquisition::live_acquisition_block(
-        &model_dir,
-        &manifest,
-        crate::search::model_acquisition::RuntimeLoadability::probe_cheap_host(),
-        crate::search::model_acquisition::OnDiskPolicyInputs {
-            policy_enabled: acquisition_policy.downloads_enabled,
-            offline: acquisition_policy.offline,
-            budget_max_bytes: acquisition_policy.max_model_bytes,
-        },
-        "all-minilm-l6-v2",
-    );
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if !model_dir.is_dir() {
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": cache_report.state_code(),
-                    "state_detail": cache_report.state.summary(),
-                    "next_step": cache_report.state.next_step(),
-                    "lexical_fail_open": true,
-                    "model_dir": model_dir.display().to_string(),
-                    "all_valid": false,
-                    "cache_lifecycle": &cache_report,
-                    "model_acquisition": &acquisition_block,
-                    "error": "model directory does not exist",
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!("{} {}", "✗".red(), cache_report.state.summary());
-            println!("  Expected location: {}", model_dir.display());
-            println!();
-            if let Some(next_step) = cache_report.state.next_step() {
-                println!("{}", next_step);
-            }
-        }
-        return Ok(());
-    }
-
-    let mut results: Vec<serde_json::Value> = Vec::new();
-    let mut all_valid = true;
-    let mut files_to_repair: Vec<String> = Vec::new();
-
-    let is_robot = structured_format.is_some();
-    if !is_robot {
-        println!("Verifying model files...");
-        println!();
-    }
-
-    for mfile in &manifest.files {
-        let file_path = model_file_path(&model_dir, mfile);
-        let exists = file_path.is_some();
-
-        let (valid, actual_hash, error) = if let Some(path) = file_path.as_ref() {
-            match compute_sha256(path) {
-                Ok(hash) => {
-                    let matches = hash == mfile.sha256;
-                    (matches, Some(hash), None)
-                }
-                Err(e) => (false, None, Some(e.to_string())),
-            }
-        } else {
-            (false, None, Some("File not found".to_string()))
-        };
-
-        if !valid {
-            all_valid = false;
-            files_to_repair.push(mfile.local_name().to_string());
-        }
-
-        results.push(serde_json::json!({
-            "file": mfile.name,
-            "local_name": mfile.local_name(),
-            "actual_path": file_path.as_ref().map(|path| path.display().to_string()),
-            "exists": exists,
-            "valid": valid,
-            "expected_sha256": mfile.sha256,
-            "actual_sha256": actual_hash,
-            "error": error,
-        }));
-
-        if !is_robot {
-            let status = if valid {
-                "✓".green().to_string()
-            } else {
-                "✗".red().to_string()
-            };
-            println!("  {} {}", status, mfile.name);
-            if let Some(ref err) = error {
-                println!("      Error: {}", err);
-            } else if !valid {
-                println!(
-                    "      Expected: {}",
-                    mfile.sha256.get(..16).unwrap_or(&mfile.sha256)
-                );
-                if let Some(ref actual) = actual_hash {
-                    println!("      Got:      {}", actual.get(..16).unwrap_or(actual));
-                }
-            }
-        }
-    }
-
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "model_dir": model_dir.display().to_string(),
-                "status": cache_report.state_code(),
-                "state_detail": cache_report.state.summary(),
-                "next_step": cache_report.state.next_step(),
-                "lexical_fail_open": true,
-                "all_valid": all_valid,
-                "cache_lifecycle": &cache_report,
-                "model_acquisition": &acquisition_block,
-                "files": results,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        println!();
-        if all_valid {
-            println!("{} All model files verified successfully.", "✓".green());
-        } else {
-            println!(
-                "{} {} file(s) failed verification.",
-                "✗".red(),
-                files_to_repair.len()
-            );
-            if repair {
-                println!();
-                println!("Repairing by re-downloading model files...");
-                println!();
-                // Actually perform the repair by re-running install
-                return run_models_install("all-minilm-l6-v2", None, None, true, data_dir_override);
-            } else {
-                println!();
-                println!("To repair corrupted files, run:");
-                println!("  cass models verify --repair");
-                println!("Or reinstall:");
-                println!("  cass models install -y");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_models_backfill_tier(raw: &str) -> CliResult<crate::search::semantic_manifest::TierKind> {
-    use crate::search::semantic_manifest::TierKind;
-
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "fast" => Ok(TierKind::Fast),
-        "quality" => Ok(TierKind::Quality),
-        other => Err(CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!("Unknown semantic tier '{other}'."),
-            hint: Some("Use --tier fast or --tier quality".into()),
-            retryable: false,
-        }),
-    }
-}
-
-fn resolve_semantic_index_embedder(raw: &str) -> String {
-    let requested = raw.trim();
-    if !matches!(requested, "fastembed" | "minilm") {
-        return requested.to_string();
-    }
-
-    let policy = crate::search::policy::SemanticPolicy::resolve(
-        &crate::search::policy::CliSemanticOverrides::default(),
-    );
-    if policy
-        .quality_tier_embedder
-        .trim()
-        .eq_ignore_ascii_case("hash")
-    {
-        return "hash".to_string();
-    }
-    let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
-        &policy.quality_tier_embedder,
-    ) else {
-        return requested.to_string();
-    };
-    if policy_embedder == "minilm" {
-        requested.to_string()
-    } else {
-        policy_embedder.to_string()
-    }
-}
-
-fn run_models_backfill(
-    tier_raw: &str,
-    embedder_override: Option<&str>,
-    batch_conversations: usize,
-    scheduled: bool,
+/// Resolve the `data_dir`-scoped database `models backfill` operates on.
+///
+/// Extracted from the legacy path verbatim so both branches share one
+/// resolution and one set of refusals: a `--db` outside `--data-dir` is a usage
+/// error, and a missing database is `IndexMissing`.
+fn resolve_models_backfill_db(
     data_dir_override: Option<PathBuf>,
     db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    use crate::indexer::semantic::{
-        SemanticBackfillSchedulerSignals, SemanticIndexer, semantic_backfill_scheduler_decision,
-    };
-    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
-    use crate::search::semantic_manifest::TierKind;
-    use crate::storage::sqlite::FrankenStorage;
-    use colored::Colorize;
-
-    if batch_conversations == 0 {
-        return Err(CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: "--batch-conversations must be greater than zero".to_string(),
-            hint: Some("Use a small positive batch such as --batch-conversations 64".into()),
-            retryable: false,
-        });
-    }
-
-    let tier = parse_models_backfill_tier(tier_raw)?;
+) -> CliResult<(PathBuf, PathBuf)> {
     // T4 mission #122a (C, R2-01/R3-F3/R1-N12): canonicalize `data_dir` up
     // front so both the mismatch check below and the lock file path
     // (`acquire_index_run_lock` keys its lock file off `data_dir`) see the
@@ -102240,23 +101637,28 @@ fn run_models_backfill(
             retryable: true,
         });
     }
+    Ok((data_dir, db_path_for_open))
+}
 
-    // T4 mission #122a (C, spec §四.4): take the same `index-run.lock`
-    // `cass index`/`watch` take, keyed off this same canonicalized
-    // `data_dir` -- held for the rest of this function (dropped on every
-    // return path, including the scheduler-skip early return below) so a
-    // concurrent `cass index --semantic` (or another `models backfill`)
-    // can't drain the same chunk_holes generation at the same time.
-    // Lock-busy uses the exact same code/message `run_index` itself
-    // produces on contention (`ActiveIndexRunDetails::to_cli_error()`,
-    // code 7, `IndexBusy`) -- control-plane ruling 2026-09-11: spec's
-    // originally-drafted "exit 2" for this case was a drafting error (it
-    // never checked what `run_index` actually does), not an intentional
-    // divergence; "exit 2" is correct only for the `--db`/`data_dir`
-    // mismatch case just above, which is a genuinely different failure.
-    let _index_run_lock_guard = crate::indexer::acquire_index_run_lock(
-        &data_dir,
-        &db_path_for_open,
+/// Take the same `index-run.lock` `cass index`/`watch` take, keyed off the
+/// canonicalized `data_dir`.
+///
+/// T4 mission #122a (C, spec §四.4): a concurrent `cass index --semantic` (or
+/// another `models backfill`) must not drain the same `chunk_holes` generation
+/// at the same time. Lock-busy uses the exact code/message `run_index` itself
+/// produces on contention (`ActiveIndexRunDetails::to_cli_error()`, code 7,
+/// `IndexBusy`) -- control-plane ruling 2026-09-11: spec's originally-drafted
+/// "exit 2" for this case was a drafting error (it never checked what
+/// `run_index` actually does), not an intentional divergence; "exit 2" is
+/// correct only for the `--db`/`data_dir` mismatch case, which is a genuinely
+/// different failure.
+fn acquire_models_backfill_lock(
+    data_dir: &Path,
+    db_path_for_open: &Path,
+) -> CliResult<crate::indexer::IndexRunLockGuard> {
+    crate::indexer::acquire_index_run_lock(
+        data_dir,
+        db_path_for_open,
         crate::search::asset_state::SearchMaintenanceMode::Index,
     )
     .map_err(|err| {
@@ -102266,8 +101668,8 @@ fn run_models_backfill(
             .collect::<Vec<_>>()
             .join(" | ");
         if error_chain_indicates_active_cass_index(&chain) {
-            let details = active_index_run_details(&data_dir, &db_path_for_open)
-                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(&data_dir, &db_path_for_open));
+            let details = active_index_run_details(data_dir, db_path_for_open)
+                .unwrap_or_else(|| ActiveIndexRunDetails::without_owner(data_dir, db_path_for_open));
             return details.to_cli_error();
         }
         CliError {
@@ -102277,178 +101679,128 @@ fn run_models_backfill(
             hint: None,
             retryable: true,
         }
-    })?;
+    })
+}
 
-    let embedder_type = embedder_override
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| match tier {
-            TierKind::Fast => "hash".to_string(),
-            // R1-W3-N2: default to `infinity` under this build's actual
-            // feature (fastembed/ONNX is retired here) so a bare `cass
-            // models backfill` (no `--embedder`) reaches the DB vector
-            // domain instead of immediately hitting the "embedder
-            // 'fastembed' is retired" error below.
-            TierKind::Quality => {
-                if cfg!(feature = "infinity") { "infinity".to_string() } else { "fastembed".to_string() }
-            }
-        });
-    let embedder_type = resolve_semantic_index_embedder(&embedder_type);
-    let embedder_valid = embedder_type == "hash"
-        || (cfg!(feature = "infinity") && embedder_type == "infinity")
-        || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .is_some();
-    if !embedder_valid {
-        return Err(CliError {
-            code: 20,
-            kind: CliErrorKind::Model.kind_str(),
-            message: format!("Unknown embedder '{}'.", embedder_type),
-            hint: Some(
-                "Use --embedder hash, --embedder fastembed, or a registered model name such as snowflake-arctic-s"
-                    .into(),
-            ),
-            retryable: false,
-        });
-    }
+/// Select the embedding profile an API-path `models backfill` runs against.
+///
+/// `--embedding-profile` wins; otherwise the configuration's
+/// `default_embedding`. The id never decides a model: the profile's own
+/// document does. A rerank profile is refused as a configuration error.
+fn select_api_embedding_profile(
+    config: &crate::search::model_api::ValidatedApiConfig,
+    embedding_profile: Option<&str>,
+) -> CliResult<crate::search::model_api::ValidatedProfile> {
+    use crate::search::model_api::runtime::{self, RuntimeError};
+    use crate::search::model_api::ProfileKind;
 
-    let scheduler_decision = if scheduled {
-        let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-        let signals = SemanticBackfillSchedulerSignals::from_env();
-        Some(semantic_backfill_scheduler_decision(
-            &policy,
-            batch_conversations,
-            &signals,
-        ))
-    } else {
-        None
-    };
-
-    if let Some(decision) = scheduler_decision.as_ref()
-        && !decision.should_run()
-    {
-        let status = decision.state.as_str();
-        let next_step = decision.reason.next_step();
-        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-            if matches!(fmt, RobotFormat::Sessions) {
-                RobotFormat::Compact
-            } else {
-                fmt
-            }
-        });
-
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": status,
-                    "next_step": next_step,
-                    "tier": tier.as_str(),
-                    "embedder_id": embedder_type,
-                    "data_dir": data_dir.display().to_string(),
-                    "db_path": db_path_for_open.display().to_string(),
-                    "batch_conversations_limit": batch_conversations,
-                    "scheduler": decision,
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!("{}", "Semantic backfill scheduler".bold());
-            println!("  Status: {}", status);
-            println!("  Tier: {}", tier.as_str());
-            println!("  Embedder: {}", embedder_type);
-            println!("  Capacity: {}%", decision.current_capacity_pct);
-            println!(
-                "  Next eligible after: {} ms",
-                decision.next_eligible_after_ms
-            );
-            println!();
-            println!("{}", next_step);
-        }
-
-        return Ok(());
-    }
-
-    let storage = FrankenStorage::open_writer(&db_path_for_open).map_err(|e| CliError {
-        code: 5,
-        kind: CliErrorKind::Storage.kind_str(),
-        message: format!("Failed to open cass database {}: {e}", db_path_for_open.display()),
-        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
-        retryable: true,
-    })?;
-
-    // W3-5: frankensearch/fsvi retired. The infinity-backed quality tier no
-    // longer builds a .fsvi file -- it drains the DB vector domain's
-    // `chunk_holes` via the same catch-up `cass index --semantic` uses
-    // (ingest-time hooks already register a hole per new message; this
-    // drains them + does a genesis-eligibility rescan as a self-healing
-    // safety net -- W3-5 task book #63 advisor ruling). hash/fastembed
-    // tiers still use the fsvi path below until Step1's dependency removal
-    // forces their disposition.
-    if embedder_type == "infinity" {
-        #[cfg(feature = "infinity")]
-        {
-            let batch_size = SemanticIndexer::new("infinity", None)
-                .map_err(|e| CliError {
-                    code: 20,
-                    kind: CliErrorKind::Model.kind_str(),
-                    message: format!("Failed to initialize infinity embedder: {e}"),
-                    hint: Some(
-                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
-                            .into(),
-                    ),
-                    retryable: true,
-                })?
-                .batch_size();
-            // T8 (plan v5.1, task book #92): `cass models backfill` drains
-            // the chunk domain, matching `index --semantic`'s wiring --
-            // the retired v4 message-granularity engine T11 deleted is no
-            // longer reachable from anywhere.
-            let infinity_config = crate::search::infinity::InfinityConfig::from_env();
-            let (identity, fingerprint) =
-                crate::search::infinity::probe_identity_and_fingerprint(&infinity_config).map_err(|e| CliError {
-                    code: 20,
-                    kind: CliErrorKind::Model.kind_str(),
-                    message: format!("Infinity identity+fingerprint probe failed: {e}"),
-                    hint: Some(
-                        "Check CASS_INFINITY_* env vars and that the Infinity service is reachable"
-                            .into(),
-                    ),
-                    retryable: true,
+    let profile = match embedding_profile {
+        Some(id) => runtime::profile_by_id(config, id)
+            .map_err(model_api_runtime_error)?
+            .clone(),
+        None => {
+            let id = config
+                .default_profile_id(ProfileKind::Embedding)
+                .ok_or_else(|| {
+                    model_api_runtime_error(RuntimeError::configuration(
+                        "no default embedding profile is configured".to_string(),
+                        Some(
+                            "Set default_embedding in the model API configuration, or pass \
+                             --embedding-profile <ID>."
+                                .to_string(),
+                        ),
+                    ))
                 })?;
-            let embedder = crate::search::infinity::InfinityEmbedder::new().map_err(|e| CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: format!("Failed to construct infinity embedder: {e}"),
-                hint: None,
-                retryable: true,
-            })?;
-            let embed_fn = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
-                use crate::search::embedder::Embedder as _;
-                embedder.embed_batch_sync(texts).map_err(|e| e.to_string())
-            };
-            let ownership_seed = FrankenStorage::now_millis() as u64;
-            let report = crate::indexer::db_vector_catchup::run_db_vector_catchup_backfill(
-                &storage,
-                batch_size,
-                &identity,
-                crate::search::canonicalize::CANONICALIZE_PIPELINE_VERSION,
-                crate::search::chunking::CHUNKING_POLICY_VERSION,
-                &fingerprint,
-                &embed_fn,
-                ownership_seed,
-            )
-            .map_err(|e| CliError {
-                code: 5,
-                kind: CliErrorKind::SemanticBackfill.kind_str(),
-                message: format!("DB vector domain catch-up failed: {e:#}"),
-                hint: Some(
-                    "Retry the command; the catch-up is idempotent (chunk_holes-driven)"
-                        .into(),
-                ),
-                retryable: true,
-            })?;
+            runtime::profile_by_id(config, id)
+                .map_err(model_api_runtime_error)?
+                .clone()
+        }
+    };
+    if profile.kind != ProfileKind::Embedding {
+        return Err(model_api_runtime_error(RuntimeError::configuration(
+            "the selected model API profile is not an embedding profile".to_string(),
+            Some(
+                "Pass --embedding-profile with an embedding profile id; run `cass models list \
+                 --json` to see them."
+                    .to_string(),
+            ),
+        )));
+    }
+    Ok(profile)
+}
 
+/// `cass models backfill` on the API-only path (spec §§5.3-5.4, 6.1-6.2).
+///
+/// Selected by an explicit `--embedding-profile` or by a named API
+/// configuration. It reuses the legacy branch's `data_dir`/`--db` resolution,
+/// index-run lock and scheduler gate, then runs the shared chunk-domain
+/// catch-up loop over one frozen API embedding profile: one fresh probe fixes
+/// the generation's width and fingerprint, document batches are embedded at the
+/// admitted primary or backup endpoint, and the generation's API record is written and
+/// re-verified inside the same transaction as its rows.
+#[allow(clippy::too_many_arguments)]
+fn run_models_backfill_api(
+    embedding_profile: Option<&str>,
+    embedder_override: Option<&str>,
+    tier_raw: Option<&str>,
+    no_model_fallback: bool,
+    batch_conversations: usize,
+    scheduled: bool,
+    api_config_path: Option<&Path>,
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::indexer::db_vector_catchup::{
+        ApiPrimaryBackfillError, run_api_primary_catchup_backfill, probe_api_backfill,
+    };
+    use crate::indexer::semantic::{SemanticBackfillSchedulerSignals, semantic_backfill_scheduler_decision};
+    use crate::search::model_api::client::ApiClient;
+    use crate::search::model_api::primary_embedding::PrimaryEmbeddingCall;
+    use crate::search::model_api::runtime::{self, RuntimeError};
+    use crate::search::policy::{CliSemanticOverrides, SemanticPolicy};
+    use crate::storage::sqlite::FrankenStorage;
+    use colored::Colorize;
+
+    // Every retired model-selection input is refused before the database is
+    // opened and before any request, including `--embedder` and a non-default
+    // `--tier` on this path. `--tier fast` is the old default value and stays
+    // accepted; any other explicit tier is a selection this path cannot honour.
+    reject_retired_model_env()?;
+    if embedder_override.is_some() {
+        return Err(model_api_migration_error(
+            "--embedder selects a retired local model backend".to_string(),
+            "Drop --embedder and select an embedding profile with --embedding-profile (or the \
+             configuration's default_embedding)."
+                .to_string(),
+        ));
+    }
+    if let Some(raw) = tier_raw.map(str::trim).filter(|raw| !raw.is_empty())
+        && raw != "fast"
+    {
+        return Err(model_api_migration_error(
+            "--tier selects the retired local two-tier model routing".to_string(),
+            "Drop --tier and select an embedding profile with --embedding-profile (or the \
+             configuration's default_embedding)."
+                .to_string(),
+        ));
+    }
+    let config = runtime::load_config(api_config_path, |key| std::env::var_os(key))
+        .map_err(model_api_runtime_error)?;
+    let profile = select_api_embedding_profile(&config, embedding_profile)?;
+
+    let (data_dir, db_path_for_open) = resolve_models_backfill_db(data_dir_override, db_override)?;
+    let _index_run_lock_guard = acquire_models_backfill_lock(&data_dir, &db_path_for_open)?;
+
+    if scheduled {
+        let decision = semantic_backfill_scheduler_decision(
+            &SemanticPolicy::resolve(&CliSemanticOverrides::default()),
+            batch_conversations,
+            &SemanticBackfillSchedulerSignals::from_env(),
+        );
+        if !decision.should_run() {
+            let status = decision.state.as_str();
+            let next_step = decision.reason.next_step();
             let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
                 if matches!(fmt, RobotFormat::Sessions) {
                     RobotFormat::Compact
@@ -102460,96 +101812,295 @@ fn run_models_backfill(
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "status": if report.activated { "published" } else { "in_progress" },
-                        "next_step": if report.activated {
-                            "semantic tier is ready"
-                        } else {
-                            "rerun the same command to continue draining chunk_holes"
-                        },
-                        "tier": "quality",
-                        "embedder_id": report.embedder_id,
+                        "status": status,
+                        "next_step": next_step,
+                        "tier": "api",
+                        "primary_profile": profile.id,
                         "data_dir": data_dir.display().to_string(),
                         "db_path": db_path_for_open.display().to_string(),
-                        "generation_id": report.generation_id,
-                        "reused_existing_generation": report.reused_existing_generation,
-                        "eligible_seeded": report.eligible_seeded,
-                        "embedded_inserted": report.embedded_inserted,
-                        "stale_skipped": report.stale_skipped,
-                        "holes_before": report.holes_before,
-                        "holes_after": report.holes_after,
-                        "activated": report.activated,
-                        // R3-6: previously discarded entirely (only
-                        // `cleanup_deleted_generation_ids` was ever computed
-                        // downstream of this report, and nothing surfaced
-                        // even that) -- a candidate-level delete failure or
-                        // the orphan-scan query itself failing (sentinel
-                        // `generation_id=0`) is real operational signal a
-                        // structured-output consumer must be able to see.
-                        "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
-                            "generation_id": generation_id,
-                            "error": detail,
-                        })).collect::<Vec<_>>(),
+                        "batch_conversations_limit": batch_conversations,
+                        "scheduler": decision,
                     }))
                     .unwrap_or_default()
                 );
             } else {
-                println!("{}", "Semantic backfill (DB vector domain)".bold());
-                println!("  Generation: {}", report.generation_id);
-                println!("  Embedder: {}", report.embedder_id);
-                println!("  Embedded (this run): {}", report.embedded_inserted);
-                println!("  Holes remaining: {}", report.holes_after);
-                println!("  Activated: {}", report.activated);
-                if !report.cleanup_failures.is_empty() {
-                    println!("  Cleanup failures: {}", report.cleanup_failures.len());
-                    for (generation_id, detail) in &report.cleanup_failures {
-                        println!("    - generation {generation_id}: {detail}");
-                    }
-                }
+                println!("{}", "Semantic backfill scheduler".bold());
+                println!("  Status: {}", status);
+                println!("  Profile: {}", profile.id);
+                println!("  Capacity: {}%", decision.current_capacity_pct);
+                println!("  Next eligible after: {} ms", decision.next_eligible_after_ms);
+                println!();
+                println!("{}", next_step);
             }
             return Ok(());
         }
-        #[cfg(not(feature = "infinity"))]
-        {
-            return Err(CliError {
-                code: 20,
-                kind: CliErrorKind::Model.kind_str(),
-                message: "embedder 'infinity' requires the `infinity` build feature".to_string(),
-                hint: Some("Rebuild with --features infinity".into()),
-                retryable: false,
-            });
-        }
     }
 
-    Err(CliError {
-        code: 20,
-        kind: CliErrorKind::Model.kind_str(),
-        message: format!(
-            "embedder '{embedder_type}' is retired (W3-5, frankensearch/fsvi removed); use --embedder infinity"
-        ),
-        hint: Some("Rebuild with --features infinity and rerun with --embedder infinity".into()),
-        retryable: false,
-    })
+    let storage = FrankenStorage::open_writer(&db_path_for_open).map_err(|e| CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("Failed to open cass database {}: {e}", db_path_for_open.display()),
+        hint: Some("Run 'cass health --json' to inspect the archive database".into()),
+        retryable: true,
+    })?;
+
+    // One client and one embedding call carry the whole build. The
+    // configuration is frozen here; a later file change cannot alter this run.
+    let client = ApiClient::new(config, model_api_credential_resolver());
+    let call = PrimaryEmbeddingCall::new(client, profile.clone(), !no_model_fallback)
+        .map_err(|error| model_api_runtime_error(RuntimeError::invalid_config(&error)))?;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+    let structured = structured_format.is_some();
+
+    // One fresh probe per command. It is the only place the generation's width
+    // and fingerprint come from, and it is never cached across commands.
+    let probe = match probe_api_backfill(&storage, &call) {
+        Ok(probe) => probe,
+        Err(failure) => {
+            let compatibility_required = matches!(&failure, ApiPrimaryBackfillError::CompatibilityRequired { .. });
+            return Err(api_backfill_failure_error(
+                failure.to_string(), compatibility_required, &profile, &call,
+                structured, &data_dir, &db_path_for_open,
+            ));
+        }
+    };
+
+    let ownership_seed = FrankenStorage::now_millis() as u64;
+    let batch_size = batch_conversations.max(1);
+    let outcome = match run_api_primary_catchup_backfill(
+        &storage,
+        batch_size,
+        &call,
+        &profile,
+        &probe,
+        ownership_seed,
+    ) {
+        Ok(outcome) => outcome,
+        Err(ApiPrimaryBackfillError::CompatibilityRequired { message }) => {
+            return Err(api_backfill_failure_error(
+                message,
+                true,
+                &profile,
+                &call,
+                structured,
+                &data_dir,
+                &db_path_for_open,
+            ));
+        }
+        Err(ApiPrimaryBackfillError::Failed(error)) => {
+            return Err(api_backfill_failure_error(
+                format!("{error:#}"),
+                false,
+                &profile,
+                &call,
+                structured,
+                &data_dir,
+                &db_path_for_open,
+            ));
+        }
+    };
+
+    let report = outcome.catchup;
+    if structured {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": if report.activated { "published" } else { "in_progress" },
+                "next_step": if report.activated {
+                    "semantic tier is ready"
+                } else {
+                    "rerun the same command to continue draining chunk_holes"
+                },
+                "tier": "api",
+                "embedder_id": report.embedder_id,
+                "data_dir": data_dir.display().to_string(),
+                "db_path": db_path_for_open.display().to_string(),
+                "generation_id": report.generation_id,
+                "reused_existing_generation": report.reused_existing_generation,
+                "eligible_seeded": report.eligible_seeded,
+                "embedded_inserted": report.embedded_inserted,
+                "stale_skipped": report.stale_skipped,
+                "holes_before": report.holes_before,
+                "holes_after": report.holes_after,
+                "activated": report.activated,
+                "cleanup_failures": report.cleanup_failures.iter().map(|(generation_id, detail)| serde_json::json!({
+                    "generation_id": generation_id,
+                    "error": detail,
+                })).collect::<Vec<_>>(),
+                "model_api": outcome.model_api,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("{}", "Semantic backfill (API embedding)".bold());
+        println!("  Generation: {}", report.generation_id);
+        println!("  Profile: {}", profile.id);
+        println!("  Embedder: {}", report.embedder_id);
+        println!("  Embedded chunks (this run): {}", report.chunks_embedded);
+        println!("  Holes remaining: {}", report.holes_after);
+        println!("  Activated: {}", report.activated);
+        if !report.cleanup_failures.is_empty() {
+            println!("  Cleanup failures: {}", report.cleanup_failures.len());
+            for (generation_id, detail) in &report.cleanup_failures {
+                println!("    - generation {generation_id}: {detail}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The CLI refusal for a failed API-path backfill.
+///
+/// A compatibility-required failure reports `semantic-unavailable` (code 15);
+/// every other failure keeps the legacy `semantic-backfill` shape (code 5). In
+/// structured mode the message carries the requests already made, so a machine
+/// consumer sees exactly how far the run got.
+#[allow(clippy::too_many_arguments)]
+fn api_backfill_failure_error(
+    message: String,
+    compatibility_required: bool,
+    profile: &crate::search::model_api::ValidatedProfile,
+    call: &crate::search::model_api::PrimaryEmbeddingCall,
+    structured: bool,
+    data_dir: &Path,
+    db_path_for_open: &Path,
+) -> CliError {
+    let (code, kind, hint) = if compatibility_required {
+        (
+            15,
+            CliErrorKind::SemanticUnavailable.kind_str(),
+            "Verify compatibility evidence covering the selected route and stored generation history, \
+             or restore a compatible configuration.",
+        )
+    } else {
+        (
+            5,
+            CliErrorKind::SemanticBackfill.kind_str(),
+            "Retry the command; the catch-up is idempotent (chunk_holes-driven)",
+        )
+    };
+    let message = if structured {
+        // A `{`-leading message is printed whole as a pre-formatted document
+        // (src/main.rs), so this document must carry the same `error` object the
+        // standard envelope does -- `{code, kind, message, hint, retryable}` --
+        // with the diagnostic's own fields beside it. A machine consumer then
+        // locates both failure classes and a configuration refusal the same way,
+        // by `/error/code`, and the CLI's own exit code equals that number.
+        serde_json::json!({
+            "status": "failed",
+            "tier": "api",
+            "primary_profile": profile.id,
+            "data_dir": data_dir.display().to_string(),
+            "db_path": db_path_for_open.display().to_string(),
+            "compatibility_required": compatibility_required,
+            "error": {
+                "code": code,
+                "kind": kind,
+                "message": message,
+                "hint": hint,
+                "retryable": !compatibility_required,
+            },
+            "model_api": call.diagnostic(),
+        })
+        .to_string()
+    } else {
+        message
+    };
+    CliError {
+        code,
+        kind,
+        message,
+        hint: Some(hint.to_string()),
+        retryable: !compatibility_required,
+    }
+}
+
+fn run_models_backfill(
+    tier_raw: Option<&str>,
+    embedder_override: Option<&str>,
+    embedding_profile: Option<&str>,
+    no_model_fallback: bool,
+    batch_conversations: usize,
+    scheduled: bool,
+    api_config_path: Option<&Path>,
+    data_dir_override: Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    if batch_conversations == 0 {
+        return Err(CliError::usage("--batch-conversations must be greater than zero", None));
+    }
+    run_models_backfill_api(
+        embedding_profile, embedder_override, tier_raw, no_model_fallback,
+        batch_conversations, scheduled, api_config_path,
+        data_dir_override, db_override, output_format,
+    )
 }
 
 #[cfg(test)]
-mod w3_5_models_backfill_infinity_wiring_tests {
+mod api_models_backfill_wiring_tests {
     use super::*;
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::storage::sqlite::FrankenStorage;
     use tempfile::TempDir;
 
-    /// W3-5 wiring proof (task book #63, advisor ruling: "先接线后拆除"):
-    /// `cass models backfill --embedder infinity` must reach the same
-    /// DB-vector-domain catch-up (`db_vector_catchup::
-    /// run_db_vector_catchup_backfill`) that `cass index --semantic` now
-    /// uses, not the retired fsvi path -- positive proof the capability
-    /// silently disappearing (the risk this wiring commit exists to close)
-    /// did not happen. Requires a live Infinity at CASS_INFINITY_URL
-    /// (127.0.0.1:7997 default); run explicitly with `--ignored`.
+    struct BackfillFixture {
+        _service: crate::search::model_api::test_support::HttpFixture,
+        config_dir: TempDir,
+    }
+
+    impl BackfillFixture {
+        fn new() -> Self {
+            use crate::search::model_api::test_support::{HttpFixture, Reply};
+            let service = HttpFixture::start(vec![Reply::Embeddings(8)]);
+            let config_dir = TempDir::new().unwrap();
+            std::fs::write(config_dir.path().join("models.toml"), format!(r#"version=1
+default_embedding="test"
+[profiles.test]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="{}"
+model="example/embedding"
+model_revision="fixture-r1"
+normalization="l2"
+"#, service.base())).unwrap();
+            Self { _service: service, config_dir }
+        }
+
+        fn run(&self, data_dir: &Path, db: Option<PathBuf>) -> CliResult<()> {
+            crate::run_models_backfill(None, None, None, false, 100, false,
+                Some(&self.config_dir.path().join("models.toml")), Some(data_dir.to_path_buf()), db, None)
+        }
+    }
+
+    fn run_fixture_backfill(data_dir: &Path, db: Option<PathBuf>) -> CliResult<()> {
+        BackfillFixture::new().run(data_dir, db)
+    }
+
+    fn seed_path_fixture(storage: &FrankenStorage) {
+        let agent = storage.ensure_agent(&Agent { id:None, slug:"claude_code".into(), name:"fixture".into(), version:None, kind:AgentKind::Cli }).unwrap();
+        storage.insert_conversation_tree(agent, None, &Conversation {
+            id:None, agent_slug:"claude_code".into(), workspace:None, external_id:Some("path-fixture".into()),
+            title:None, source_path:"/fixtures/path.jsonl".into(), started_at:Some(1000), ended_at:Some(1000),
+            approx_tokens:None, metadata_json:serde_json::Value::Null,
+            messages:vec![Message { excluded:None, id:None, idx:0, role:MessageRole::User, author:None,
+                created_at:Some(1000), content:"A synthetic document verifies database path resolution during API backfill.".into(),
+                extra_json:serde_json::Value::Null, snippets:vec![] }],
+            source_id:"local".into(), origin_host:None,
+        }).unwrap();
+    }
+
+    /// The API CLI entry must populate the existing SQLite vector domain.
     #[test]
-    #[ignore = "requires a live Infinity service at 127.0.0.1:7997 (CASS_INFINITY_URL)"]
-    #[cfg(feature = "infinity")]
-    fn cli_models_backfill_infinity_reaches_db_vector_domain_catchup() {
+    fn cli_models_backfill_api_reaches_db_vector_domain_catchup() {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
@@ -102609,16 +102160,8 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                 .expect("seed conversation");
         }
 
-        run_models_backfill(
-            "quality",
-            Some("infinity"),
-            10_000,
-            false,
-            Some(data_dir.clone()),
-            Some(db_path.clone()),
-            None,
-        )
-        .expect("cass models backfill --embedder infinity must reach the DB vector domain");
+        run_fixture_backfill(&data_dir, Some(db_path.clone()))
+            .expect("API backfill must reach the DB vector domain");
 
         let storage = FrankenStorage::open_readonly(&db_path).unwrap();
         let active = crate::storage::schema::active_generation_id(storage.raw()).unwrap();
@@ -102666,7 +102209,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         )
         .expect("test setup: acquiring the lock first must succeed");
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let result = run_fixture_backfill(&data_dir, None);
         let err = result.expect_err("models backfill must refuse to run while another index run holds the lock");
         assert_eq!(err.code, 7, "lock-busy must use the same exit code run_index uses (IndexBusy), not a bespoke one: {err:?}");
         assert_eq!(err.kind, CliErrorKind::IndexBusy.kind_str());
@@ -102692,7 +102235,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             let _ = FrankenStorage::open(&outside_db).unwrap();
         }
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(outside_db.clone()), None);
+        let result = run_fixture_backfill(&data_dir, Some(outside_db.clone()));
         let err = result.expect_err("a --db outside --data-dir must be rejected");
         assert_eq!(err.code, 2, "data_dir/db_path mismatch must be a usage error: {err:?}");
         assert_eq!(err.kind, CliErrorKind::Usage.kind_str());
@@ -102704,10 +102247,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
     /// canonicalized, so the link's target was compared against the
     /// unresolved `data_dir` join and the same request was rejected as a
     /// `--db`/`data_dir` mismatch (code 2) purely for having said it out
-    /// loud. `--tier fast` is the `hash` embedder, retired by W3-5, so
-    /// reaching that error (code 20) -- which happens after the path check,
-    /// the lock, and opening the database -- is the evidence the path check
-    /// accepted the symlinked db.
+    /// loud. Both forms now complete through an isolated API service.
     #[test]
     fn models_backfill_accepts_explicit_db_that_is_a_symlink_to_the_data_dir_db() {
         let dir = TempDir::new().unwrap();
@@ -102715,26 +102255,23 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         let real_db = data_dir.join("real.db");
         {
-            let _ = FrankenStorage::open(&real_db).unwrap();
+            let storage = FrankenStorage::open(&real_db).unwrap();
+            seed_path_fixture(&storage);
         }
         let linked_db = data_dir.join("agent_search.db");
         std::os::unix::fs::symlink(&real_db, &linked_db).unwrap();
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(linked_db.clone()), None);
-        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence that the explicit --db was accepted");
-        assert_eq!(
-            err.code, 20,
-            "an explicit --db naming the data_dir's own (symlinked) database must not be rejected as a --db/--data-dir mismatch: {err:?}"
-        );
+        let api = BackfillFixture::new();
+        let result = api.run(&data_dir, Some(linked_db.clone()));
+        result.expect("explicit symlinked database must be accepted by API backfill");
 
         // The implicit form (no --db) is the behaviour the explicit form has
         // to match -- it resolves the same symlink through
         // `expected_db_path`. Asserted here too so a future reordering that
         // canonicalizes only after the `db_path` match cannot pass this
         // test: it would break this direction instead.
-        let implicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
-        let implicit_err = implicit.expect_err("same retired embedder, reached via the default db path");
-        assert_eq!(implicit_err.code, 20, "the implicit (no --db) form must keep working against a symlinked agent_search.db: {implicit_err:?}");
+        let implicit = api.run(&data_dir, None);
+        implicit.expect("implicit symlinked database must be accepted by API backfill");
     }
 
     /// R7-5 (#124, control-plane adversarial review of #123). The doctor
@@ -102786,7 +102323,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         .unwrap();
         lock_file.flush().unwrap();
 
-        let result = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), None, None);
+        let result = run_fixture_backfill(&data_dir, None);
         let err = result.expect_err(
             "a held doctor mutation lock must stop the open; a canonicalized path must not be what the storage layer is given",
         );
@@ -102844,7 +102381,7 @@ mod w3_5_models_backfill_infinity_wiring_tests {
         .unwrap();
         lock_file.flush().unwrap();
 
-        let explicit = run_models_backfill("fast", None, 100, false, Some(data_dir.clone()), Some(real_db), None);
+        let explicit = run_fixture_backfill(&data_dir, Some(real_db));
         let err = explicit.expect_err(
             "a held doctor mutation lock must stop the open even when --db names the symlink's target; deriving the lock from the caller's alias is what lets this form skip it",
         );
@@ -102861,18 +102398,8 @@ mod w3_5_models_backfill_infinity_wiring_tests {
 
     /// T4 mission #122a (C, Step 3 case ③): `--data-dir` with no `--db`
     /// must operate on *that* data_dir's own database, not the process-
-    /// global default (`default_db_path()`) -- R1-N6. `--tier fast`
-    /// (hash embedder) is used deliberately, not as a stand-in embedder:
-    /// W3-5 retired the hash/fastembed fsvi path entirely (see the
-    /// unconditional "embedder '{embedder_type}' is retired" `Err` this
-    /// function falls through to below its `embedder_type == "infinity"`
-    /// branch), so this call is expected to fail there -- but only
-    /// *after* resolving data_dir/db_path, opening the side database via
-    /// `FrankenStorage::open_writer`, and acquiring the lock, all of
-    /// which happen earlier in the function. Reaching that specific
-    /// "retired" error (code 20), not `IndexMissing` (3) or the mismatch
-    /// `Usage` error (2) case ② covers, is itself the proof this call
-    /// really operated on the side database rather than the default.
+    /// global default (`default_db_path()`). A successful isolated API run and
+    /// the preserved sentinel verify which database was opened.
     #[test]
     fn models_backfill_default_db_path_is_derived_from_data_dir_not_global_default() {
         let dir = TempDir::new().unwrap();
@@ -102900,11 +102427,11 @@ mod w3_5_models_backfill_infinity_wiring_tests {
                 origin_host: None,
             };
             storage.insert_conversation_tree(agent_id, None, &conv).expect("seed sentinel conversation into the side db");
+            seed_path_fixture(&storage);
         }
 
-        let result = run_models_backfill("fast", None, 100, false, Some(side_dir.clone()), None, None);
-        let err = result.expect_err("the 'hash' embedder tier is retired (W3-5); reaching that specific error is this test's evidence of which db got opened");
-        assert_eq!(err.code, 20, "must reach the retired-embedder error, proving data_dir/db_path resolution and lock acquisition both succeeded against the side db first: {err:?}");
+        let result = run_fixture_backfill(&side_dir, None);
+        result.expect("API backfill must open the selected data directory");
 
         let lock_path = side_dir.join("index-run.lock");
         assert!(lock_path.is_file(), "index-run.lock must have been created under --data-dir, not wherever the global default would be: {}", lock_path.display());
@@ -102920,188 +102447,6 @@ mod w3_5_models_backfill_infinity_wiring_tests {
             .unwrap();
         assert_eq!(sentinel_count, 1, "the side db's own sentinel session must still be there and readable -- confirms this call opened *this* file, not some other data_dir's database");
     }
-}
-
-/// Remove model files
-fn run_models_remove(
-    model_name: &str,
-    skip_confirm: bool,
-    data_dir_override: Option<PathBuf>,
-) -> CliResult<()> {
-    use colored::Colorize;
-
-    let registry_name = resolve_cli_model_name(model_name)?;
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let (model_dir, _manifest) = resolve_model_install_dir(&data_dir, registry_name)?;
-
-    if !model_dir.is_dir() {
-        println!("{} Model is not installed.", "✗".yellow());
-        println!("  Expected location: {}", model_dir.display());
-        return Ok(());
-    }
-
-    // Calculate size
-    let mut total_size: u64 = 0;
-    if let Ok(entries) = std::fs::read_dir(&model_dir) {
-        for entry in entries.flatten() {
-            if let Ok(metadata) = entry.metadata() {
-                total_size += metadata.len();
-            }
-        }
-    }
-    let size_mb = total_size as f64 / 1_048_576.0;
-
-    if !skip_confirm {
-        println!("Remove Semantic Search Model");
-        println!("============================");
-        println!();
-        println!("Model:    {}", model_name);
-        println!("Location: {}", model_dir.display());
-        println!("Size:     {:.1} MB", size_mb);
-        println!();
-        println!("This will remove all model files. Semantic search will be unavailable");
-        println!("until the model is reinstalled.");
-        print!("Continue? [y/N] ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).ok();
-        if !input.trim().eq_ignore_ascii_case("y") && !input.trim().eq_ignore_ascii_case("yes") {
-            println!("Cancelled.");
-            return Ok(());
-        }
-    }
-
-    // Remove the directory
-    std::fs::remove_dir_all(&model_dir).map_err(|e| CliError {
-        code: 24,
-        kind: CliErrorKind::Io.kind_str(),
-        message: format!("Failed to remove model directory: {}", e),
-        hint: Some("Check file permissions".into()),
-        retryable: false,
-    })?;
-
-    println!();
-    println!("{} Model removed successfully.", "✓".green());
-    println!("  Freed {:.1} MB", size_mb);
-    println!();
-    println!("To reinstall, run:");
-    println!("  cass models install");
-
-    Ok(())
-}
-
-/// Check for model updates
-fn run_models_check_update(
-    output_format: Option<RobotFormat>,
-    data_dir_override: Option<PathBuf>,
-) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
-    use crate::search::model_download::{
-        ModelManifest, ModelState, check_model_installed, check_version_mismatch,
-    };
-    use colored::Colorize;
-
-    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
-    let model_dir = FastEmbedder::default_model_dir(&data_dir);
-    let manifest = ModelManifest::minilm_v2();
-
-    // bead coding_agent_session_search-odbnh: pass the resolved manifest
-    // so the file-presence check matches the installed model's layout.
-    let state = check_model_installed(&model_dir, &manifest);
-
-    if !state.is_ready() {
-        let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-            if matches!(fmt, RobotFormat::Sessions) {
-                RobotFormat::Compact
-            } else {
-                fmt
-            }
-        });
-
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "update_available": false,
-                    "reason": "model_not_installed",
-                    "current_revision": null,
-                    "latest_revision": manifest.revision,
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!("{} Model is not installed.", "✗".yellow());
-            println!(
-                "  Latest revision: {}",
-                manifest.revision.get(..12).unwrap_or(&manifest.revision)
-            );
-            println!();
-            println!("To install, run:");
-            println!("  cass models install");
-        }
-        return Ok(());
-    }
-
-    // Check for version mismatch
-    let update_info = check_version_mismatch(&model_dir, &manifest);
-
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(ModelState::UpdateAvailable {
-        current_revision,
-        latest_revision,
-    }) = update_info
-    {
-        if let Some(_fmt) = structured_format {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "update_available": true,
-                    "current_revision": current_revision,
-                    "latest_revision": latest_revision,
-                }))
-                .unwrap_or_default()
-            );
-        } else {
-            println!("{} Update available!", "⚠".yellow());
-            println!(
-                "  Current: {}",
-                current_revision.get(..12).unwrap_or(&current_revision)
-            );
-            println!(
-                "  Latest:  {}",
-                latest_revision.get(..12).unwrap_or(&latest_revision)
-            );
-            println!();
-            println!("To update, run:");
-            println!("  cass models install");
-        }
-    } else if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "update_available": false,
-                "current_revision": manifest.revision,
-                "latest_revision": manifest.revision,
-            }))
-            .unwrap_or_default()
-        );
-    } else {
-        println!("{} Model is up to date.", "✓".green());
-        println!(
-            "  Revision: {}",
-            manifest.revision.get(..12).unwrap_or(&manifest.revision)
-        );
-    }
-
-    Ok(())
 }
 
 fn run_agents_command(action: AgentsAction, cli: &Cli) -> CliResult<()> {
@@ -103818,13 +103163,14 @@ fn run_daemon(
     max_connections: Option<usize>,
     data_dir: Option<PathBuf>,
 ) -> CliResult<()> {
-    use crate::daemon::{ModelDaemon, ModelManager};
+    use crate::daemon::ModelDaemon;
 
-    let data_dir = data_dir.unwrap_or_else(default_data_dir);
+    if data_dir.is_some() {
+        return Err(model_api_migration_error("daemon local model directories are retired".into(),
+            "Use --api-config with HTTP model profiles".into()));
+    }
     let config = resolved_daemon_config(socket, idle_timeout, max_connections);
-
-    let models = ModelManager::new(&data_dir);
-    let daemon = ModelDaemon::new(config, models);
+    let daemon = ModelDaemon::new(config);
 
     daemon.run().map_err(|e| CliError {
         code: 9,
@@ -105088,165 +104434,6 @@ mod mirror_restore_deep_verify_flag_tests {
 // but unimplemented and has been removed from the pages CLI surface
 // (bead adyyt). Any future attachment-bundling work will add a new
 // flag with end-to-end implementation + fresh tests at that time.
-
-#[cfg(test)]
-mod cli_models_resolution_tests {
-    use super::*;
-
-    /// `coding_agent_session_search-v3of1`: `cass models install` and
-    /// `cass models remove` previously hardcoded
-    /// `if model_name != "all-minilm-l6-v2"` (with comment "Only support
-    /// the default model for now"), rejecting all other registered
-    /// embedders even though `EmbedderRegistry`, `ModelManifest::for_embedder`,
-    /// `FastEmbedder::model_dir_for`, and the daemon worker
-    /// (commit cf85b403) all know about `snowflake-arctic-s` and
-    /// `nomic-embed`. This test pins the post-fix contract: every
-    /// registry-known name (including aliases honored by
-    /// `daemon::worker::resolve_embedder_kind`) must resolve to its
-    /// canonical registry name; only genuinely unknown names error.
-    #[test]
-    fn resolve_cli_model_name_accepts_every_registered_embedder_alias() {
-        for (alias, expected_canonical) in [
-            ("all-minilm-l6-v2", "minilm"),
-            ("minilm", "minilm"),
-            ("minilm-384", "minilm"),
-            ("fastembed", "minilm"),
-            ("MINILM", "minilm"),
-            ("snowflake-arctic-s", "snowflake-arctic-s"),
-            ("snowflake-arctic-s-384", "snowflake-arctic-s"),
-            ("snowflake-arctic-embed-s", "snowflake-arctic-s"),
-            ("Snowflake-Arctic-S", "snowflake-arctic-s"),
-            ("nomic-embed", "nomic-embed"),
-            ("nomic-embed-768", "nomic-embed"),
-            ("nomic-embed-text-v1.5", "nomic-embed"),
-            ("NOMIC-EMBED", "nomic-embed"),
-        ] {
-            assert_eq!(
-                resolve_cli_model_name(alias).expect("registered alias must resolve"),
-                expected_canonical,
-                "registered alias {alias:?} must resolve to canonical name {expected_canonical:?}"
-            );
-        }
-    }
-
-    /// `coding_agent_session_search-v3of1`: unknown names must be rejected
-    /// with code=20, kind="model", and a hint pointing at `cass models status`.
-    /// Pre-fix message was "Only 'all-minilm-l6-v2' is supported."; post-fix
-    /// must list all registered names so operators discover snowflake/nomic.
-    #[test]
-    fn resolve_cli_model_name_rejects_unknown_with_useful_hint() {
-        let err =
-            resolve_cli_model_name("e5-large-v2").expect_err("unknown model must be rejected");
-        assert_eq!(err.code, 20);
-        assert_eq!(err.kind, "model");
-        assert!(
-            err.message.contains("Unknown model 'e5-large-v2'"),
-            "error must name the rejected input; got {message:?}",
-            message = err.message
-        );
-        assert!(
-            err.message.contains("snowflake-arctic-s")
-                && err.message.contains("nomic-embed")
-                && err.message.contains("all-minilm-l6-v2"),
-            "error must list all 3 supported models so operators discover non-default options; \
-             got {message:?}",
-            message = err.message
-        );
-        assert_eq!(
-            err.hint.as_deref(),
-            Some("Use 'cass models status' to see available models")
-        );
-        assert!(!err.retryable);
-    }
-
-    /// `coding_agent_session_search-v3of1`: every name that
-    /// `resolve_cli_model_name` returns MUST be a name that both
-    /// `ModelManifest::for_embedder` and `FastEmbedder::model_dir_for`
-    /// accept. Otherwise install/remove would resolve the alias and
-    /// then crash at the manifest/dir lookup. This is the cross-module
-    /// contract that the original hardcoded `all-minilm-l6-v2` check
-    /// silently maintained — making it explicit prevents drift.
-    #[test]
-    fn every_resolved_canonical_name_has_manifest_and_dir_mapping() {
-        use crate::search::fastembed_embedder::FastEmbedder;
-        use crate::search::model_download::ModelManifest;
-
-        let probe_data_dir = std::path::Path::new("/tmp/cass-v3of1-probe");
-        for canonical in ["minilm", "snowflake-arctic-s", "nomic-embed"] {
-            assert!(
-                ModelManifest::for_embedder(canonical).is_some(),
-                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
-                 ModelManifest registered"
-            );
-            assert!(
-                FastEmbedder::model_dir_for(probe_data_dir, canonical).is_some(),
-                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
-                 FastEmbedder::model_dir_for mapping"
-            );
-        }
-    }
-
-    /// Reranker aliases must round-trip through `resolve_cli_model_name`
-    /// and `resolve_model_install_dir` so `cass models install --model
-    /// ms-marco` actually lands the files where `FastEmbedReranker` looks
-    /// for them. Without this contract the resolver accepts the alias,
-    /// the install path ships the bytes, and the daemon still logs
-    /// "reranker model directory not found" because the manifest `id`
-    /// drifted from the loader's hard-coded directory name.
-    #[test]
-    fn reranker_aliases_resolve_and_install_path_matches_loader_dir() {
-        use crate::search::model_download::ModelManifest;
-        use crate::search::reranker_registry::RERANKERS;
-
-        for (alias, canonical) in [
-            ("ms-marco", "ms-marco"),
-            ("ms-marco-minilm", "ms-marco"),
-            ("ms-marco-minilm-l-6-v2", "ms-marco"),
-            ("ms-marco-minilm-l6-v2", "ms-marco"),
-            ("MS-MARCO", "ms-marco"),
-            ("jina-reranker-turbo", "jina-reranker-turbo"),
-            ("jina-reranker-v1-turbo-en", "jina-reranker-turbo"),
-        ] {
-            assert_eq!(
-                resolve_cli_model_name(alias).expect("reranker alias must resolve"),
-                canonical,
-                "reranker alias {alias:?} must resolve to {canonical:?}"
-            );
-            assert!(
-                ModelManifest::for_reranker(canonical).is_some(),
-                "canonical reranker {canonical:?} must have a ModelManifest registered"
-            );
-        }
-
-        // The install path uses `manifest.id` as the directory name. That
-        // name MUST equal the last path segment of the loader's
-        // `RegisteredReranker::model_dir`, otherwise install delivers
-        // files to one location and the loader reads from another —
-        // the exact bug that left "WARN Failed to load reranker" on
-        // every fresh daemon start (cass#242).
-        let probe = std::path::Path::new("/tmp/cass-reranker-probe");
-        for canonical in ["ms-marco", "jina-reranker-turbo"] {
-            let manifest = ModelManifest::for_reranker(canonical)
-                .unwrap_or_else(|| panic!("{canonical} manifest must be registered"));
-            let registered = RERANKERS
-                .iter()
-                .find(|r| r.name == canonical)
-                .unwrap_or_else(|| panic!("{canonical} must be in RERANKERS"));
-            let loader_dir = registered
-                .model_dir(probe)
-                .unwrap_or_else(|| panic!("{canonical} must have a model_dir"));
-            let loader_dir_name = loader_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_else(|| panic!("{canonical} model_dir must have a final segment"));
-            assert_eq!(
-                manifest.id, loader_dir_name,
-                "{canonical} manifest.id must match the loader's model_dir name so install and \
-                 loader agree on the on-disk directory"
-            );
-        }
-    }
-}
 
 // ===========================================================================
 // Task E3 · mirror-relink
@@ -107406,11 +106593,16 @@ mod regression_search_orchestration_tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    fn search(
+    fn search(run: RegressionSearchExecution, rerank: bool, k: usize, cursor: Option<String>) -> CliResult<()> {
+        search_with_api(run, rerank, k, cursor, ApiSearchOptions::default())
+    }
+
+    fn search_with_api(
         run: RegressionSearchExecution,
         rerank: bool,
         k: usize,
         cursor: Option<String>,
+        api: ApiSearchOptions,
     ) -> CliResult<()> {
         run_cli_search(
             "retrieval",
@@ -107444,13 +106636,12 @@ mod regression_search_orchestration_tests {
             Some(crate::search::query::SearchMode::Lexical),
             None,
             SemanticSearchOptions {
+                api,
                 model: None,
                 rerank,
                 reranker: None,
                 use_daemon: false,
                 rerank_limit: rerank.then_some(k),
-                rerank_provider: rerank
-                    .then_some(crate::search::rerank::types::ProviderChoice::BgeLocal),
             },
             RerankRequestContext::default(),
             Some(run),
@@ -107484,80 +106675,6 @@ mod regression_search_orchestration_tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    fn server(status: u16) -> (String, std::thread::JoinHandle<serde_json::Value>) {
-        server_with_manifest_change(status, None)
-    }
-
-    fn server_with_manifest_change(
-        status: u16,
-        manifest: Option<PathBuf>,
-    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
-        server_with_output_change(status, manifest, None)
-    }
-
-    fn server_with_output_change(
-        status: u16,
-        manifest: Option<PathBuf>,
-        blocked_cache_root: Option<PathBuf>,
-    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", listener.local_addr().unwrap());
-        let worker = std::thread::spawn(move || {
-            let mut captured = serde_json::Value::Null;
-            for step in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let mut part = [0u8; 4096];
-                loop {
-                    let n = stream.read(&mut part).unwrap();
-                    assert!(n > 0);
-                    bytes.extend_from_slice(&part[..n]);
-                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                        let header = String::from_utf8_lossy(&bytes[..end]);
-                        let length = header
-                            .lines()
-                            .filter_map(|line| line.split_once(':'))
-                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
-                            .unwrap_or(0);
-                        if bytes.len() >= end + 4 + length {
-                            if step == 1 {
-                                captured =
-                                    serde_json::from_slice(&bytes[end + 4..end + 4 + length])
-                                        .unwrap();
-                            }
-                            break;
-                        }
-                    }
-                }
-                let body = if step == 0 {
-                    serde_json::json!({"data":[{"id":"BAAI/bge-reranker-v2-m3"}]})
-                } else {
-                    let count = captured["documents"].as_array().unwrap().len();
-                    serde_json::json!({"model":"BAAI/bge-reranker-v2-m3","results":(0..count).map(|i| serde_json::json!({"index":i,"relevance_score":1.0})).collect::<Vec<_>>()})
-                }.to_string();
-                if step == 1 {
-                    if let Some(path) = manifest.as_ref() {
-                        std::fs::write(path, b"changed synthetic source manifest\n").unwrap();
-                    }
-                    if let Some(path) = blocked_cache_root.as_ref() {
-                        std::fs::write(path.join("cache"), b"blocked").unwrap();
-                    }
-                }
-                let response_status = if step == 0 { 200 } else { status };
-                if step == 1 && status == 0 {
-                    continue;
-                }
-                write!(stream, "HTTP/1.1 {response_status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
-            }
-            captured
-        });
-        (origin, worker)
-    }
-
     fn evidence(root: &std::path::Path) -> WindowEvidence {
         let path = std::fs::read_dir(root)
             .unwrap()
@@ -107573,6 +106690,46 @@ mod regression_search_orchestration_tests {
     }
 
     #[test]
+    fn regression_api_window_records_real_posts_and_preserves_frozen_database() {
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        let (root, db, run_root, manifest) = regression_binding::tests::searchable_fixture_with_count(7);
+        let (expected, pin) = regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
+        let before = std::fs::read(&db).unwrap();
+        let server = HttpFixture::start(vec![Reply::ok(serde_json::json!({
+            "model":"example/api-rank", "results":(0..7).map(|i| serde_json::json!({"index":i,"relevance_score":i as f64})).collect::<Vec<_>>()
+        }))]);
+        let config = root.path().join("api.toml");
+        std::fs::write(&config, format!(r#"
+version=1
+default_rerank="rank"
+[profiles.rank]
+kind="rerank"
+protocol="rerank-json-v1"
+scope="loopback"
+endpoint="{}"
+model="example/api-rank"
+model_revision="r1"
+"#, server.base())).unwrap();
+        let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
+        let run = execution(context.clone(), &expected, &pin, &manifest, None);
+        let binding = run.binding.clone();
+        search_with_api(run, true, 3, None, ApiSearchOptions { config_path: Some(config), ..Default::default() }).unwrap();
+        let proof = evidence(&run_root);
+        assert_eq!(server.hits(), 1);
+        assert_eq!(proof.transport.requests.len(), 1);
+        assert_eq!(proof.transport.model_requests, None);
+        assert_eq!(proof.final_slots.iter().map(|s| s.input_slot).collect::<Vec<_>>(), vec![6,5,4,3,2,1,0]);
+        assert_eq!(proof.api_rerank.as_ref().unwrap().realized_profile.as_deref(), Some("rank"));
+        assert_eq!(proof.request["rerank_provider"], "rank");
+        assert!(proof.request["model_api_route"]["rerank_route_sha256"].as_str().is_some());
+        assert_eq!(proof.transport.requests[0].documents.as_ref().unwrap().len(), 7);
+        assert_eq!(proof.transport.requests[0].query.as_ref().unwrap(), &crate::search::regression_trace::TextDigest::of("retrieval"));
+        assert_eq!(before, std::fs::read(&db).unwrap());
+        assert_eq!(proof.binding, binding);
+        context.verify_input().unwrap();
+    }
+
+    #[test]
     fn regression_existing_pipeline_preserves_seven_slots_and_cursor_without_second_http_call() {
         let (root, db, run_root, manifest) =
             regression_binding::tests::searchable_fixture_with_count(7);
@@ -107580,7 +106737,8 @@ mod regression_search_orchestration_tests {
             regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
         let before = std::fs::read(&db).unwrap();
         let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
-        let (origin, worker) = server(200);
+        let (origin, worker) = api_rerank_fixture_until_idle();
+        let config = rerank_api_config(root.path(), &origin);
         let run = execution(
             context.clone(),
             &expected,
@@ -107589,20 +106747,20 @@ mod regression_search_orchestration_tests {
             Some(origin.clone()),
         );
         let binding = run.binding.clone();
-        search(run, true, 3, None).unwrap();
+        search_with_api(run, true, 3, None, ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() }).unwrap();
         let received = worker.join().unwrap();
         let proof = evidence(&run_root);
         assert_eq!(proof.retrieval.len(), 7);
         assert_eq!(proof.final_slots, proof.retrieval); // All model scores tie.
-        assert_eq!(proof.transport.requests.len(), 2);
+        assert_eq!(proof.transport.requests.len(), 1);
         assert_eq!(proof.transport.model_requests, None);
         assert_eq!(
-            proof.transport.requests[1].query.as_ref(),
+            proof.transport.requests[0].query.as_ref(),
             Some(&crate::search::regression_trace::TextDigest::of(
                 received["query"].as_str().unwrap()
             ))
         );
-        for (actual, document) in proof.transport.requests[1]
+        for (actual, document) in proof.transport.requests[0]
             .documents
             .as_ref()
             .unwrap()
@@ -107622,7 +106780,7 @@ mod regression_search_orchestration_tests {
             .unwrap();
         let id = path.file_stem().unwrap().to_str().unwrap();
         let cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":3}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":id,"offset":3}))
                 .unwrap(),
         );
         let client = crate::search::query::SearchClient::open_for_regression(
@@ -107631,7 +106789,7 @@ mod regression_search_orchestration_tests {
         )
         .unwrap();
         let trace = Arc::new(Mutex::new(Default::default()));
-        search(
+        search_with_api(
             RegressionSearchExecution {
                 context: context.clone(),
                 verified: Some(regression_binding::VerifiedSearch {
@@ -107648,10 +106806,11 @@ mod regression_search_orchestration_tests {
             true,
             3,
             Some(cursor),
+            ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
         )
         .unwrap();
         let cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":6}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":id,"offset":6}))
                 .unwrap(),
         );
         let client = crate::search::query::SearchClient::open_for_regression(
@@ -107659,7 +106818,7 @@ mod regression_search_orchestration_tests {
             context.clone(),
         )
         .unwrap();
-        search(
+        search_with_api(
             RegressionSearchExecution {
                 context: context.clone(),
                 verified: Some(regression_binding::VerifiedSearch {
@@ -107676,6 +106835,7 @@ mod regression_search_orchestration_tests {
             true,
             3,
             Some(cursor),
+            ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
         )
         .unwrap();
         assert!(trace.lock().unwrap().requests.is_empty());
@@ -107709,7 +106869,7 @@ mod regression_search_orchestration_tests {
         )
         .unwrap();
         let cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":id,"offset":3}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":id,"offset":3}))
                 .unwrap(),
         );
         let (mut old, _) = store
@@ -107733,7 +106893,7 @@ mod regression_search_orchestration_tests {
             .save(&old, crate::storage::sqlite::FrankenStorage::now_millis())
             .unwrap();
         let legacy_cursor = BASE64_STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!({"version":2,"window_id":legacy_id,"offset":3}))
+            serde_json::to_vec(&serde_json::json!({"version":3,"window_id":legacy_id,"offset":3}))
                 .unwrap(),
         );
         let client = crate::search::query::SearchClient::open_for_regression(
@@ -107741,7 +106901,7 @@ mod regression_search_orchestration_tests {
             context.clone(),
         )
         .unwrap();
-        let error = search(
+        let error = search_with_api(
             RegressionSearchExecution {
                 context,
                 verified: Some(regression_binding::VerifiedSearch {
@@ -107758,6 +106918,7 @@ mod regression_search_orchestration_tests {
             true,
             3,
             Some(legacy_cursor),
+            ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
         )
         .unwrap_err();
         assert_eq!(error.message, "TRACE_WINDOW_MISSING");
@@ -107788,12 +106949,14 @@ mod regression_search_orchestration_tests {
             let case_root = root.path().join(format!("http-{status}-run"));
             private_dir(&case_root);
             let context = Arc::new(RegressionIoContext::open(&db, &case_root).unwrap());
-            let (origin, worker) = server(status);
-            let result = search(
+            let (origin, worker) = api_rerank_fixture_status(status);
+            let config = rerank_api_config(root.path(), &origin);
+            let result = search_with_api(
                 execution(context, &expected, &pin, &manifest, Some(origin)),
                 true,
                 5,
                 None,
+                ApiSearchOptions { config_path: Some(config.clone()), ..Default::default() },
             );
             if status == 200 {
                 result.unwrap();
@@ -107811,11 +106974,11 @@ mod regression_search_orchestration_tests {
             let proof = evidence(&case_root);
             assert_eq!(proof.applied, status == 200);
             assert_eq!(
-                proof.transport.requests[1].http_status,
+                proof.transport.requests[0].http_status,
                 if status == 0 { None } else { Some(status) }
             );
             assert_eq!(
-                proof.transport.requests[1].state,
+                proof.transport.requests[0].state,
                 if status == 0 {
                     "attempted-delivery-unknown"
                 } else {
@@ -107828,7 +106991,23 @@ mod regression_search_orchestration_tests {
         let invalid_root = root.path().join("not-sent-run");
         private_dir(&invalid_root);
         let context = Arc::new(RegressionIoContext::open(&db, &invalid_root).unwrap());
-        search(
+        let invalid_config = {
+            let path = root.path().join("invalid-api.toml");
+            std::fs::write(
+                &path,
+                "version=1\ndefault_rerank=\"rank\"\n[profiles.rank]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\nendpoint=\"http://not-loopback.invalid:1/v1/rerank\"\nmodel=\"BAAI/bge-reranker-v2-m3\"\nmodel_revision=\"r1\"\n",
+            )
+            .unwrap();
+            path
+        };
+        // The endpoint is refused when the frozen config loads, i.e. before the
+        // run reaches any HTTP stage: the request is never sent, no evidence
+        // window is written, and the run root stays empty. A merely unreachable
+        // (connection-refused) endpoint is a different outcome — that one *is*
+        // attempted and recorded — so this guard keeps the "zero sends"
+        // semantics the retired local provider expressed with an unparseable
+        // origin.
+        let error = search_with_api(
             execution(
                 context,
                 &expected,
@@ -107839,12 +107018,26 @@ mod regression_search_orchestration_tests {
             true,
             5,
             None,
+            ApiSearchOptions { config_path: Some(invalid_config), ..Default::default() },
         )
         .unwrap_err();
-        let proof = evidence(&invalid_root);
-        assert!(!proof.applied);
-        assert!(proof.failure_reason.is_some());
-        assert!(proof.transport.requests.is_empty());
+        assert!(
+            !error.message.is_empty(),
+            "a refused endpoint must surface a typed regression error"
+        );
+        let has_evidence_window = std::fs::read_dir(&invalid_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("regression-search-")
+            });
+        assert!(
+            !has_evidence_window,
+            "a config-time refusal must not write an evidence window: nothing was sent"
+        );
         assert_eq!(before, std::fs::read(db).unwrap());
     }
     #[test]
@@ -107855,12 +107048,23 @@ mod regression_search_orchestration_tests {
             regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
         let before = std::fs::read(&db).unwrap();
         let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
-        let (origin, worker) = server_with_output_change(200, None, Some(run_root.clone()));
-        let result = search(
+        let blocked_cache_root = run_root.clone();
+        let (origin, worker) = api_rerank_fixture(move || {
+            // The scoring POST is read and about to be answered; a file now
+            // occupies the cache directory path, so the window write that must
+            // follow a successful score cannot create its directory.
+            std::fs::write(blocked_cache_root.join("cache"), b"blocked").unwrap();
+        });
+        let config = rerank_api_config(root.path(), &origin);
+        let result = search_with_api(
             execution(context, &expected, &pin, &manifest, Some(origin)),
             true,
             3,
             None,
+            ApiSearchOptions {
+                config_path: Some(config),
+                ..Default::default()
+            },
         );
         assert_eq!(
             worker.join().unwrap()["documents"].as_array().unwrap().len(),
@@ -107878,6 +107082,243 @@ mod regression_search_orchestration_tests {
         }));
     }
 
+    /// Serve exactly one `rerank-json-v1` POST for the model-API path, and run
+    /// `on_request` after the request is read but before the response is
+    /// written. Returns the captured request body.
+    ///
+    /// The retired local provider needed a separate identity GET before its
+    /// POST; the API client issues a single POST, so this fixture is the one
+    /// the migrated tests use.
+    fn api_rerank_fixture(
+        on_request: impl FnOnce() + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return serde_json::Value::Null;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut part = [0u8; 4096];
+            let captured = loop {
+                let n = stream.read(&mut part).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&part[..n]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let length = header
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            on_request();
+            let count = captured["documents"].as_array().unwrap().len();
+            let body = serde_json::json!({
+                "model": "BAAI/bge-reranker-v2-m3",
+                "results": (0..count)
+                    .map(|i| serde_json::json!({"index": i, "relevance_score": 1.0}))
+                    .collect::<Vec<_>>()
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            captured
+        });
+        (origin, worker)
+    }
+
+    /// Serve exactly one `rerank-json-v1` POST and answer it with `status`
+    /// (0 means: read the request, then close without a response). Returns the
+    /// captured request body, so a caller can assert what was sent even for a
+    /// failed delivery.
+    fn api_rerank_fixture_status(status: u16) -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return serde_json::Value::Null;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut part = [0u8; 4096];
+            let captured = loop {
+                let n = stream.read(&mut part).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&part[..n]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let length = header
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<serde_json::Value>(
+                            &bytes[end + 4..end + 4 + length],
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            if status == 0 {
+                // Delivery attempted, no response observed.
+                return captured;
+            }
+            let count = captured["documents"].as_array().unwrap().len();
+            let body = if status == 200 {
+                serde_json::json!({
+                    "model": "BAAI/bge-reranker-v2-m3",
+                    "results": (0..count)
+                        .map(|i| serde_json::json!({"index": i, "relevance_score": 1.0}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string()
+            } else {
+                serde_json::json!({"error": "synthetic fixture failure"}).to_string()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            captured
+        });
+        (origin, worker)
+    }
+
+    /// Serve `rerank-json-v1` POSTs until the fixture sees no request for two
+    /// seconds, returning the last captured request body. Use this when a test
+    /// issues several searches against the same origin.
+    fn api_rerank_fixture_until_idle() -> (String, std::thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut last = serde_json::Value::Null;
+            let mut idle_since = std::time::Instant::now();
+            loop {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if idle_since.elapsed() > Duration::from_secs(2) {
+                            return last;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                idle_since = std::time::Instant::now();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut part = [0u8; 4096];
+                let captured = loop {
+                    let n = stream.read(&mut part).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&part[..n]);
+                    if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .map(|(_, v)| v.trim().parse::<usize>().unwrap())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + length {
+                            break serde_json::from_slice::<serde_json::Value>(
+                                &bytes[end + 4..end + 4 + length],
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                let count = captured["documents"].as_array().unwrap().len();
+                let body = serde_json::json!({
+                    "model": "BAAI/bge-reranker-v2-m3",
+                    "results": (0..count)
+                        .map(|i| serde_json::json!({"index": i, "relevance_score": 1.0}))
+                        .collect::<Vec<_>>()
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                last = captured;
+            }
+        });
+        (origin, worker)
+    }
+
+    /// Write a frozen model-API config whose single rerank profile targets the
+    /// loopback fixture `origin`. Local inference is retired, so a semantic or
+    /// rerank regression run must select its provider through this config.
+    fn rerank_api_config(root: &std::path::Path, origin: &str) -> std::path::PathBuf {
+        let path = root.join("api.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "version=1\n\
+                 default_rerank=\"rank\"\n\
+                 [profiles.rank]\n\
+                 kind=\"rerank\"\n\
+                 protocol=\"rerank-json-v1\"\n\
+                 scope=\"loopback\"\n\
+                 endpoint=\"{origin}\"\n\
+                 model=\"BAAI/bge-reranker-v2-m3\"\n\
+                 model_revision=\"fixture-r1\"\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn regression_pipeline_rejects_source_manifest_change_during_http() {
         let (root, db, run_root, manifest) =
@@ -107886,12 +107327,17 @@ mod regression_search_orchestration_tests {
             regression_binding::tests::prepare_expected(root.path(), &db, &manifest);
         let before = std::fs::read(&db).unwrap();
         let context = Arc::new(RegressionIoContext::open(&db, &run_root).unwrap());
-        let (origin, worker) = server_with_manifest_change(200, Some(manifest.clone()));
-        let error = search(
+        let manifest_for_server = manifest.clone();
+        let (origin, worker) = api_rerank_fixture(move || {
+            std::fs::write(&manifest_for_server, b"changed synthetic source manifest\n").unwrap();
+        });
+        let config = rerank_api_config(root.path(), &origin);
+        let error = search_with_api(
             execution(context, &expected, &pin, &manifest, Some(origin)),
             true,
             3,
             None,
+            ApiSearchOptions { config_path: Some(config), ..Default::default() },
         )
         .unwrap_err();
         assert_eq!(error.message, "BINDING_SOURCE_CHANGED");
@@ -107907,7 +107353,7 @@ mod regression_search_orchestration_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux", feature = "infinity"))]
+#[cfg(all(test, target_os = "linux"))]
 mod regression_semantic_pipeline_child {
     use super::*;
 
@@ -107933,6 +107379,7 @@ mod regression_semantic_pipeline_child {
         let window_root =
             std::env::var_os("CASS_REGRESSION_SEMANTIC_WINDOW_ROOT").map(PathBuf::from);
         crate::search::regression_input::run(&crate::RegressionInputCommand::Search {
+            api: Default::default(),
             input: crate::search::regression_input::FrozenInputArgs {
                 database: path("database"),
                 run_root: path("run_root"),

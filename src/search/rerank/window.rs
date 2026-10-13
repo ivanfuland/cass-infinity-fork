@@ -62,11 +62,11 @@ use crate::search::query::{SearchFilters, SearchHit, SearchResult};
 use crate::sources::provenance::SourceFilter;
 
 /// The frozen on-disk schema tag for a rerank window file.
-pub const WINDOW_SCHEMA: &str = "cass.rerank-window.v1";
+pub const WINDOW_SCHEMA: &str = "cass.rerank-window.v2";
 
 /// The frozen cursor payload version. Version 1 is the old `offset`/`limit`
 /// cursor this module deliberately does not accept.
-const CURSOR_VERSION: u64 = 2;
+const CURSOR_VERSION: u64 = 3;
 
 /// Directory (relative to the data root) that holds this module's windows.
 const WINDOW_DIR_RELATIVE: &str = "cache/rerank-windows";
@@ -111,6 +111,7 @@ const BINDING_KEYS: &[&str] = &[
     "rrf_limit",
     "rerank_limit",
     "provider",
+    "api_route",
     "endpoint",
     "aggregate",
     "explain",
@@ -122,6 +123,7 @@ const BINDING_KEYS: &[&str] = &[
 const TIME_KEYS: &[&str] = &["days", "today", "yesterday", "week", "since", "until"];
 
 const RERANK_KEYS: &[&str] = &[
+    "model_api",
     "requested_provider",
     "requested_model",
     "identity",
@@ -148,6 +150,8 @@ const VECTOR_IDENTITY_KEYS: &[&str] = &[
     "fingerprint",
     "revision",
     "instance_id",
+    "api_descriptor_sha256",
+    "api_provenance_record_sha256",
 ];
 
 const CURSOR_KEYS: &[&str] = &["version", "window_id", "offset"];
@@ -266,6 +270,20 @@ pub struct TimeSelectors {
     pub until: Option<String>,
 }
 
+/// Exact configuration identity for API-backed frozen results. Credentials
+/// themselves never enter these digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiWindowRoute {
+    pub rerank_profile: String,
+    pub rerank_route_sha256: String,
+    pub fallback_profile: Option<String>,
+    pub allow_fallback: bool,
+    pub embedding_profile: Option<String>,
+    pub embedding_config_sha256: Option<String>,
+    pub embedding_route_sha256: Option<String>,
+}
+
 /// The frozen request identity of the first lookup.
 ///
 /// Collection-valued fields are compared order-insensitively by
@@ -285,7 +303,8 @@ pub struct RequestBinding {
     pub embedding_model: Option<String>,
     pub rrf_limit: usize,
     pub rerank_limit: usize,
-    pub provider: ProviderChoice,
+    pub provider: String,
+    pub api_route: Option<ApiWindowRoute>,
     pub endpoint: String,
     pub aggregate: Option<Vec<String>>,
     pub explain: bool,
@@ -325,16 +344,71 @@ impl RequestBinding {
             return Err(WindowError::InvalidInput);
         }
 
+        if out.provider.is_empty() || out.provider.len() > 64
+            || !out.provider.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            return Err(WindowError::InvalidInput);
+        }
+        if let Some(route) = &out.api_route {
+            let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if route.rerank_profile != out.provider || !digest(&route.rerank_route_sha256)
+                || route.embedding_profile.is_some() != route.embedding_config_sha256.is_some()
+                || route.embedding_profile.is_some() != route.embedding_route_sha256.is_some()
+                || route.embedding_route_sha256.as_ref().is_some_and(|sha| !digest(sha))
+                || route.embedding_config_sha256.as_ref().is_some_and(|sha| !digest(sha)) {
+                return Err(WindowError::InvalidInput);
+            }
+        } else if out.provider.parse::<ProviderChoice>().is_err() {
+            return Err(WindowError::InvalidInput);
+        }
         out.endpoint = normalize_endpoint(&out.endpoint)?;
         Ok(out)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiWindowAttempt {
+    pub profile: String,
+    pub network_attempted: bool,
+    pub http_status: Option<u16>,
+    pub error_code: Option<String>,
+    pub duration_ms: u64,
+    pub response_model: Option<String>,
+    pub response_revision: Option<String>,
+    pub serving_provider: Option<String>,
+    pub usage: Option<crate::search::model_api::runtime::CheckUsage>,
+}
+
+impl From<&crate::search::model_api::ApiAttempt> for ApiWindowAttempt {
+    fn from(attempt: &crate::search::model_api::ApiAttempt) -> Self {
+        Self {
+            profile: attempt.profile_id.clone(), network_attempted: attempt.network_attempted,
+            http_status: attempt.http_status, error_code: attempt.error_code.map(str::to_owned),
+            duration_ms: attempt.duration_ms,
+            response_model: attempt.identity.response_model.clone(),
+            response_revision: attempt.identity.response_revision.clone(),
+            serving_provider: attempt.identity.provider.clone(),
+            usage: crate::search::model_api::runtime::CheckUsage::from_observed(attempt.identity.usage.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiWindowRerank {
+    pub primary_profile: String,
+    pub realized_profile: Option<String>,
+    pub fallback_used: bool,
+    pub fallback_reason: Option<String>,
+    pub attempts: Vec<ApiWindowAttempt>,
 }
 
 /// Identity and completeness evidence of the rerank call that produced the
 /// window's ordering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowRerankMeta {
-    pub requested_provider: ProviderChoice,
+    pub model_api: Option<ApiWindowRerank>,
+    pub requested_provider: String,
     pub requested_model: String,
     pub identity: CallIdentity,
     pub applied: bool,
@@ -374,6 +448,8 @@ pub struct VectorIdentity {
     pub fingerprint: Vec<u8>,
     pub revision: i64,
     pub instance_id: String,
+    pub api_descriptor_sha256: Option<String>,
+    pub api_provenance_record_sha256: Option<String>,
 }
 
 /// Cross-process index identity.
@@ -837,17 +913,11 @@ pub fn capture_index_stamp(db_path: &Path) -> Result<IndexStamp, WindowError> {
         schema_version,
         db_file: db_before,
         wal: wal_before,
-        vector: vector.map(|snapshot| VectorIdentity {
-            generation_id: snapshot.generation_id,
-            dim: snapshot.dim,
-            fingerprint: snapshot.fingerprint,
-            revision: snapshot.revision,
-            instance_id: snapshot.instance_id,
-        }),
+        vector,
     })
 }
 
-fn read_index_metadata(conn: &crate::storage::api::Conn) -> Result<(i64, Option<crate::storage::vector_domain::VectorSnapshot>), WindowError> {
+fn read_index_metadata(conn: &crate::storage::api::Conn) -> Result<(i64, Option<VectorIdentity>), WindowError> {
     let schema_version =
         crate::storage::schema::read_user_version(&conn).map_err(|_| WindowError::Corrupt)?;
 
@@ -860,7 +930,27 @@ fn read_index_metadata(conn: &crate::storage::api::Conn) -> Result<(i64, Option<
             )?;
             match active {
                 Some(generation_id) => {
-                    crate::storage::vector_domain::vector_snapshot_in_tx(tx, generation_id)
+                    let Some(snapshot) = crate::storage::vector_domain::vector_snapshot_in_tx(tx, generation_id)? else { return Ok(None); };
+                    let embedder: String = tx.query_row_map("SELECT embedder_id FROM embedding_generations WHERE id = ?1",
+                        &crate::storage::api::params![generation_id], |row| row.get_typed(0))?;
+                    let (descriptor, provenance) = if embedder.starts_with("api:") {
+                        let representation: String = tx.query_row_map("SELECT value FROM meta WHERE key = ?1",
+                            &crate::storage::api::params![crate::storage::api_generation::representation_meta_key(generation_id)], |row| row.get_typed(0))?;
+                        let record = crate::search::model_api::RepresentationRecord::decode(representation.as_bytes())
+                            .map_err(|_| crate::storage::api::StorageError::Other { code: None, detail: "invalid API window representation".into() })?;
+                        if record.generation_id() != generation_id || record.embedder_id() != embedder
+                            || record.descriptor().effective_dimension() != snapshot.dim as u64 {
+                            return Err(crate::storage::api::StorageError::Other { code: None, detail: "API window representation mismatch".into() });
+                        }
+                        let provenance: String = tx.query_row_map("SELECT value FROM meta WHERE key = ?1",
+                            &crate::storage::api::params![crate::storage::api_generation::provenance_meta_key(generation_id)], |row| row.get_typed(0))?;
+                        (Some(record.descriptor_sha256().to_owned()), Some(hex::encode(Sha256::digest(provenance.as_bytes()))))
+                    } else { (None, None) };
+                    Ok(Some(VectorIdentity {
+                        generation_id: snapshot.generation_id, dim: snapshot.dim,
+                        fingerprint: snapshot.fingerprint, revision: snapshot.revision, instance_id: snapshot.instance_id,
+                        api_descriptor_sha256: descriptor, api_provenance_record_sha256: provenance,
+                    }))
                 }
                 None => Ok(None),
             }
@@ -882,10 +972,7 @@ pub(crate) fn capture_index_stamp_for_regression(
     Ok(IndexStamp {
         db_path: fs::canonicalize(context.database()).map_err(|_| WindowError::CacheUnavailable)?.to_string_lossy().into_owned(),
         schema_version, db_file: before, wal: None,
-        vector: vector.map(|snapshot| VectorIdentity {
-            generation_id: snapshot.generation_id, dim: snapshot.dim,
-            fingerprint: snapshot.fingerprint, revision: snapshot.revision, instance_id: snapshot.instance_id,
-        }),
+        vector,
     })
 }
 
@@ -1114,8 +1201,42 @@ fn validate_content(
         }
     }
 
+    if rerank.requested_provider != binding.provider { return Err(WindowError::InvalidInput); }
+    if let Some(evidence) = &rerank.model_api {
+        let route = binding.api_route.as_ref().ok_or(WindowError::InvalidInput)?;
+        let attempts = &evidence.attempts;
+        if evidence.primary_profile != route.rerank_profile || attempts.len() > 2
+            || rerank.identity.actual_provider.is_some()
+            || attempts.first().is_some_and(|a| a.profile != route.rerank_profile)
+            || attempts.get(1).is_some_and(|a| !route.allow_fallback || Some(&a.profile) != route.fallback_profile.as_ref()) {
+            return Err(WindowError::InvalidInput);
+        }
+        let sent = attempts.iter().filter(|a| a.network_attempted).count();
+        let duration = attempts.iter().try_fold(0u64, |total, a| total.checked_add(a.duration_ms))
+            .ok_or(WindowError::InvalidInput)?;
+        if rerank.http_requests != Some(sent) || rerank.model_requests != Some(sent) || rerank.duration_ms != duration {
+            return Err(WindowError::InvalidInput);
+        }
+        if rerank.applied {
+            let winner = attempts.last().ok_or(WindowError::InvalidInput)?;
+            if evidence.realized_profile.as_ref() != Some(&winner.profile) || winner.error_code.is_some()
+                || !winner.network_attempted || evidence.fallback_used != (attempts.len() == 2)
+                || rerank.identity.actual_model != winner.response_model || rerank.identity.serving_provider != winner.serving_provider {
+                return Err(WindowError::InvalidInput);
+            }
+        } else if evidence.realized_profile.is_some() || evidence.fallback_used {
+            return Err(WindowError::InvalidInput);
+        }
+        let first_error = attempts.first().and_then(|a| a.error_code.as_ref());
+        if attempts.len() == 2 {
+            if first_error.is_none() || evidence.fallback_reason.as_ref() != first_error { return Err(WindowError::InvalidInput); }
+        } else if evidence.fallback_reason.is_some() { return Err(WindowError::InvalidInput); }
+    } else if binding.api_route.is_some() && rerank.applied {
+        return Err(WindowError::InvalidInput);
+    }
+
     if let Some(actual) = rerank.identity.actual_provider {
-        if actual != rerank.requested_provider {
+        if actual.as_str() != rerank.requested_provider {
             return Err(WindowError::InvalidInput);
         }
     }
@@ -1564,7 +1685,8 @@ mod tests {
             embedding_model: Some("bge-m3".to_string()),
             rrf_limit: n,
             rerank_limit: k,
-            provider: ProviderChoice::Qwen3Local,
+            provider: ProviderChoice::Qwen3Local.as_str().to_owned(),
+            api_route: None,
             endpoint: "http://127.0.0.1:8000/v1/rerank?x=1".to_string(),
             aggregate: Some(vec!["agent".to_string(), "workspace".to_string()]),
             explain: true,
@@ -1666,7 +1788,8 @@ mod tests {
             explanation: Some(json!({"rrf": {"k": 60}})),
             retrieval_status: json!({"mode": "hybrid", "partial": false}),
             rerank: WindowRerankMeta {
-                requested_provider: ProviderChoice::Qwen3Local,
+                model_api: None,
+                requested_provider: ProviderChoice::Qwen3Local.as_str().to_owned(),
                 requested_model: ProviderChoice::Qwen3Local.request_model().to_string(),
                 identity: CallIdentity {
                     actual_provider: Some(ProviderChoice::Qwen3Local),
@@ -1926,7 +2049,7 @@ mod tests {
         limits.rerank_limit = 4;
         variants.push(limits);
         let mut provider = snap.request_binding.clone();
-        provider.provider = ProviderChoice::BgeLocal;
+        provider.provider = ProviderChoice::BgeLocal.as_str().to_owned();
         variants.push(provider);
         let mut endpoint = snap.request_binding.clone();
         endpoint.endpoint = "http://127.0.0.1:9999".to_string();
@@ -1990,14 +2113,12 @@ mod tests {
         let (id, _) = save_and_cursor(&st, &snap, 0);
         let base = read_saved(tmp.path(), &id);
 
-        let mut wrong_schema = base.clone();
-        wrong_schema["schema"] = json!("cass.rerank-window.v2");
-        let cursor = write_tampered(tmp.path(), &wrong_schema);
-        assert_eq!(
-            st.load(&cursor, &snap.request_binding, &db, NOW)
-                .unwrap_err(),
-            WindowError::Corrupt
-        );
+        for schema in ["cass.rerank-window.v1", "cass.rerank-window.v999"] {
+            let mut wrong_schema = base.clone();
+            wrong_schema["schema"] = json!(schema);
+            let cursor = write_tampered(tmp.path(), &wrong_schema);
+            assert_eq!(st.load(&cursor, &snap.request_binding, &db, NOW).unwrap_err(), WindowError::Corrupt);
+        }
 
         for key in WINDOW_KEYS {
             let mut value = base.clone();
@@ -2273,6 +2394,49 @@ mod tests {
     }
 
     #[test]
+    fn api_window_rejects_inconsistent_attempts_and_winner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = make_db(tmp.path());
+        let st = store(tmp.path());
+        let mut snap = snapshot(&db, NOW, true, 3, 3, 1);
+        snap.request_binding.provider = "ranker".into();
+        snap.request_binding.api_route = Some(ApiWindowRoute {
+            rerank_profile: "ranker".into(), rerank_route_sha256: "a".repeat(64),
+            fallback_profile: None, allow_fallback: true,
+            embedding_profile: Some("embed".into()), embedding_config_sha256: Some("b".repeat(64)), embedding_route_sha256: Some("c".repeat(64)),
+        });
+        snap.rerank.requested_provider = "ranker".into();
+        snap.rerank.identity.actual_provider = None;
+        snap.rerank.http_requests = Some(1);
+        snap.rerank.model_requests = Some(1);
+        snap.rerank.duration_ms = 7;
+        snap.rerank.model_api = Some(ApiWindowRerank {
+            primary_profile: "ranker".into(), realized_profile: Some("ranker".into()),
+            fallback_used: false, fallback_reason: None,
+            attempts: vec![ApiWindowAttempt {
+                profile: "ranker".into(), network_attempted: true, http_status: Some(200),
+                error_code: None, duration_ms: 7, response_model: snap.rerank.identity.actual_model.clone(),
+                response_revision: None, serving_provider: None, usage: None,
+            }],
+        });
+        st.save(&snap, NOW).expect("valid API window");
+        for mutation in 0..8 {
+            let mut bad = snap.clone();
+            match mutation {
+                0 => bad.rerank.http_requests = Some(0),
+                1 => bad.rerank.model_api.as_mut().unwrap().realized_profile = Some("other".into()),
+                2 => bad.rerank.model_api.as_mut().unwrap().attempts[0].error_code = Some("HttpStatus".into()),
+                3 => bad.rerank.model_api.as_mut().unwrap().fallback_used = true,
+                4 => bad.rerank.model_api = None,
+                5 => bad.request_binding.api_route.as_mut().unwrap().embedding_route_sha256 = None,
+                6 => bad.request_binding.api_route.as_mut().unwrap().embedding_route_sha256 = Some("invalid".into()),
+                _ => bad.rerank.requested_provider = "other".into(),
+            }
+            assert_eq!(st.save(&bad, NOW).unwrap_err(), WindowError::InvalidInput, "mutation {mutation}");
+        }
+    }
+
+    #[test]
     fn malformed_cursors_are_rejected() {
         use base64::Engine as _;
 
@@ -2284,26 +2448,28 @@ mod tests {
 
         let cases = vec![
             // offset at the window length is out of range
-            raw_cursor(json!({"version": 2, "window_id": id.clone(), "offset": 12})),
+            raw_cursor(json!({"version": 3, "window_id": id.clone(), "offset": 12})),
+            // Previous window cursor version also requires a new search.
+            raw_cursor(json!({"version": 2, "window_id": id.clone(), "offset": 0})),
             // old cursor version
             raw_cursor(json!({"version": 1, "window_id": id.clone(), "offset": 0})),
             // negative offset
-            raw_cursor(json!({"version": 2, "window_id": id.clone(), "offset": -1})),
+            raw_cursor(json!({"version": 3, "window_id": id.clone(), "offset": -1})),
             // fractional offset
-            raw_cursor(json!({"version": 2, "window_id": id.clone(), "offset": 1.5})),
+            raw_cursor(json!({"version": 3, "window_id": id.clone(), "offset": 1.5})),
             // extra field
-            raw_cursor(json!({"version": 2, "window_id": id.clone(), "offset": 0, "extra": 1})),
+            raw_cursor(json!({"version": 3, "window_id": id.clone(), "offset": 0, "extra": 1})),
             // path traversal in the id
-            raw_cursor(json!({"version": 2, "window_id": "../escape", "offset": 0})),
+            raw_cursor(json!({"version": 3, "window_id": "../escape", "offset": 0})),
             // uppercase hex is not the frozen spelling
-            raw_cursor(json!({"version": 2, "window_id": id.to_uppercase(), "offset": 0})),
+            raw_cursor(json!({"version": 3, "window_id": id.to_uppercase(), "offset": 0})),
             // not base64 at all
             "not-base64!!".to_string(),
             // base64 that decodes to a non-JSON body
             base64::prelude::BASE64_STANDARD.encode(b"not json"),
             // base64 of trailing garbage after a valid object
             base64::prelude::BASE64_STANDARD
-                .encode(format!(r#"{{"version":2,"window_id":"{id}","offset":0}}}}"#).as_bytes()),
+                .encode(format!(r#"{{"version":3,"window_id":"{id}","offset":0}}}}"#).as_bytes()),
         ];
 
         for cursor in cases {
@@ -2336,9 +2502,9 @@ mod tests {
             // old version-1 cursor
             raw_cursor(json!({"version": 1, "window_id": id.clone(), "offset": 0})),
             // wrong key set
-            raw_cursor(json!({"version": 2, "window_id": id.clone()})),
+            raw_cursor(json!({"version": 3, "window_id": id.clone()})),
             // not the frozen lowercase-hex id spelling
-            raw_cursor(json!({"version": 2, "window_id": id.to_uppercase(), "offset": 0})),
+            raw_cursor(json!({"version": 3, "window_id": id.to_uppercase(), "offset": 0})),
             // not base64
             "not-base64!!".to_string(),
             // base64 of a non-JSON body

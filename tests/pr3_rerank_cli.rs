@@ -2,9 +2,10 @@
 //!
 //! Every assertion here drives the real `cass` binary against a real
 //! file-backed schema-8 database, and the rerank backend is a loopback HTTP
-//! stub reached through `CASS_INFINITY_URL`. Nothing stubs the search path or
-//! the argument struct: the seam the ticket asks for is "real CLI subprocess,
-//! real file library, real HTTP requests, real window cache on disk".
+//! stub reached through a versioned model-API configuration named with
+//! `--api-config`. Nothing stubs the search path or the argument struct: the
+//! seam the ticket asks for is "real CLI subprocess, real file library, real
+//! HTTP requests, real window cache on disk".
 //!
 //! The fixture builds genuine chunks: each `message_chunks` row carries the
 //! `content_hash_hex` of the `canonicalize_for_embedding` + `chunk_normalized`
@@ -30,7 +31,9 @@ use coding_agent_search::search::canonicalize::{
     CANONICALIZE_PIPELINE_VERSION, canonicalize_for_embedding, content_hash_hex,
 };
 use coding_agent_search::search::chunking::{CHUNKING_POLICY_VERSION, chunk_normalized};
-use coding_agent_search::storage::api::{TxMode, Value};
+use coding_agent_search::search::model_api::ApiConfig;
+use coding_agent_search::storage::api::{StorageError, TxMode, Value};
+use coding_agent_search::storage::api_generation::create_api_generation;
 use coding_agent_search::storage::schema::{self, ChunkRow};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 use coding_agent_search::storage::vector_domain;
@@ -276,11 +279,16 @@ fn response_for(mode: StubMode, request: &RecordedRequest) -> Vec<u8> {
 // The schema-8 fixture
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FixtureOptions {
     rows: usize,
     /// Install a genuine float/vector domain for synthetic hybrid searches.
     semantic: bool,
+    /// When set alongside `semantic`, build the embedding generation through
+    /// the model-API path (`create_api_generation`) against a profile whose
+    /// endpoint is this origin, so the stored identity matches the profile the
+    /// run selects. Without it, `semantic` is unusable under the API path.
+    api_embed_origin: Option<String>,
     /// Write a scan watermark ahead of the indexed watermark, the durable
     /// half-finished-index signature `state_meta_json` reports as `partial`.
     partial: bool,
@@ -297,6 +305,7 @@ impl Default for FixtureOptions {
         FixtureOptions {
             rows: DEFAULT_N + 1,
             semantic: false,
+            api_embed_origin: None,
             partial: false,
             block_cache: false,
             corrupt_chunk_at: None,
@@ -335,16 +344,34 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
         .expect("insert agent");
 
         let generation = conn
-            .with_tx_no_replay(TxMode::Immediate, |tx| {
-                schema::create_embedding_generation(
-                    tx,
-                    "bge-m3",
-                    EMBED_DIM,
-                    CANONICALIZE_PIPELINE_VERSION,
-                    CHUNKING_POLICY_VERSION,
-                    b"p09-fixture",
-                    1,
-                )
+            .with_tx_no_replay(TxMode::Immediate, |tx| -> Result<i64, StorageError> {
+                // A hybrid fixture must store an identity the model-API path can
+                // reopen: `create_api_generation` writes the representation and
+                // provenance records `open_api_generation` re-checks, using the
+                // profile the run selects. Without an API origin the legacy
+                // `bge-m3` generation is kept for the lexical-only tests.
+                match options.api_embed_origin.as_deref() {
+                    Some(origin) => {
+                        let text = model_api_config(origin, DEAD_ORIGIN);
+                        let config =
+                            ApiConfig::parse_toml(&text).expect("fixture API config parses");
+                        let profile = config
+                            .profile(EMBED_PROFILE)
+                            .expect("fixture default embedding profile")
+                            .clone();
+                        create_api_generation(tx, &profile, EMBED_DIM as u64, b"p09-fixture", 1)
+                            .map_err(StorageError::from)
+                    }
+                    None => schema::create_embedding_generation(
+                        tx,
+                        "bge-m3",
+                        EMBED_DIM,
+                        CANONICALIZE_PIPELINE_VERSION,
+                        CHUNKING_POLICY_VERSION,
+                        b"p09-fixture",
+                        1,
+                    ),
+                }
             })
             .expect("create generation");
         if options.semantic {
@@ -478,20 +505,80 @@ fn build_fixture(options: FixtureOptions) -> Fixture {
 // CLI helpers
 // ---------------------------------------------------------------------------
 
-/// A local port nothing listens on (the discard port): the default origin for
-/// every Command that is not served by this ticket's stub, so no test can
-/// reach a real Qwen/Infinity service.
-const DEAD_ORIGIN: &str = "http://127.0.0.1:9/";
+/// A local port nothing listens on (the discard port): the origin the rerank
+/// endpoint is pointed at when a test needs a call that cannot succeed, and the
+/// origin both profiles use when no stub is serving this Command. No test can
+/// reach a real model service.
+const DEAD_ORIGIN: &str = "http://127.0.0.1:9";
+
+/// The selected rerank profile (the configured `default_rerank`).
+const RERANK_PROFILE: &str = "bge-local";
+/// A second rerank profile with the SAME endpoint and model, so a continuation
+/// can change ONLY the profile binding.
+const RERANK_PROFILE_ALT: &str = "qwen3-local";
+/// The selected embedding profile (the configured `default_embedding`).
+const EMBED_PROFILE: &str = "bge-m3";
+/// A second embedding profile with the SAME endpoint and model.
+const EMBED_PROFILE_ALT: &str = "minilm";
+
+/// The versioned model-API configuration this suite runs against.
+///
+/// `bge-local` and `qwen3-local` are byte-for-byte equivalent rerank profiles
+/// (same endpoint, same model), and `bge-m3` / `minilm` are their embedding
+/// counterparts. The first id of each kind is the configured default, so a run
+/// selects it unless `--rerank-profile` / `--embedding-profile` names the other.
+fn model_api_config(embed_origin: &str, rerank_origin: &str) -> String {
+    format!(
+        "version = 1\n\
+         default_embedding = \"{EMBED_PROFILE}\"\n\
+         default_rerank = \"{RERANK_PROFILE}\"\n\
+         \n\
+         [profiles.{EMBED_PROFILE}]\n\
+         kind = \"embedding\"\n\
+         protocol = \"openai-embeddings-v1\"\n\
+         endpoint = \"{embed_origin}/embeddings\"\n\
+         scope = \"loopback\"\n\
+         model = \"{EMBED_MODEL}\"\n\
+         model_revision = \"p09-embedding-1\"\n\
+         normalization = \"l2\"\n\
+         \n\
+         [profiles.{EMBED_PROFILE_ALT}]\n\
+         kind = \"embedding\"\n\
+         protocol = \"openai-embeddings-v1\"\n\
+         endpoint = \"{embed_origin}/embeddings\"\n\
+         scope = \"loopback\"\n\
+         model = \"{EMBED_MODEL}\"\n\
+         model_revision = \"p09-embedding-1\"\n\
+         normalization = \"l2\"\n\
+         \n\
+         [profiles.{RERANK_PROFILE}]\n\
+         kind = \"rerank\"\n\
+         protocol = \"rerank-json-v1\"\n\
+         endpoint = \"{rerank_origin}/rerank\"\n\
+         scope = \"loopback\"\n\
+         model = \"{RERANK_MODEL}\"\n\
+         model_revision = \"p09-rerank-1\"\n\
+         \n\
+         [profiles.{RERANK_PROFILE_ALT}]\n\
+         kind = \"rerank\"\n\
+         protocol = \"rerank-json-v1\"\n\
+         endpoint = \"{rerank_origin}/rerank\"\n\
+         scope = \"loopback\"\n\
+         model = \"{RERANK_MODEL}\"\n\
+         model_revision = \"p09-rerank-1\"\n"
+    )
+}
 
 struct RunEnv<'a> {
     fixture: &'a Fixture,
     stub: Option<&'a Stub>,
-    /// Point `CASS_QWEN_RERANK_URL` at the same stub as `CASS_INFINITY_URL`, so
-    /// a provider change keeps the endpoint identical and isolates the
-    /// provider binding.
-    qwen_at_stub: bool,
-    /// Override `CASS_INFINITY_URL` (e.g. an origin the binding must refuse).
-    infinity_override: Option<String>,
+    /// Point the rerank profile's endpoint at a loopback origin nothing listens
+    /// on, so a test can exercise a call that cannot succeed. The endpoint is
+    /// still a well-formed loopback URL, so the window itself still freezes.
+    rerank_dead: bool,
+    /// Give the rerank profile an endpoint with embedded credentials, which the
+    /// model-API contract forbids: the configuration must be refused outright.
+    rerank_userinfo: bool,
     extra_env: Vec<(&'static str, String)>,
 }
 
@@ -500,8 +587,8 @@ impl<'a> RunEnv<'a> {
         RunEnv {
             fixture,
             stub: None,
-            qwen_at_stub: false,
-            infinity_override: None,
+            rerank_dead: false,
+            rerank_userinfo: false,
             extra_env: Vec::new(),
         }
     }
@@ -510,25 +597,50 @@ impl<'a> RunEnv<'a> {
         RunEnv {
             fixture,
             stub: Some(stub),
-            qwen_at_stub: false,
-            infinity_override: None,
+            rerank_dead: false,
+            rerank_userinfo: false,
             extra_env: Vec::new(),
         }
     }
 
-    fn qwen_at_stub(mut self) -> Self {
-        self.qwen_at_stub = true;
+    fn rerank_dead_endpoint(mut self) -> Self {
+        self.rerank_dead = true;
         self
     }
 
-    fn infinity_url(mut self, url: &str) -> Self {
-        self.infinity_override = Some(url.to_string());
+    fn rerank_userinfo_endpoint(mut self) -> Self {
+        self.rerank_userinfo = true;
         self
     }
 
     fn env(mut self, key: &'static str, value: &str) -> Self {
         self.extra_env.push((key, value.to_string()));
         self
+    }
+
+    /// Write the model-API configuration for this run and return its path.
+    ///
+    /// With a stub, both endpoint kinds point at the stub's origin. Without one,
+    /// both point at [`DEAD_ORIGIN`], so no stray request can reach a service.
+    fn config_path(&self) -> PathBuf {
+        let stub_origin = self.stub.map(Stub::origin);
+        let embed_origin = stub_origin
+            .clone()
+            .unwrap_or_else(|| DEAD_ORIGIN.to_string());
+        let rerank_origin = if self.rerank_userinfo {
+            // A well-formed scheme and loopback host but embedded credentials:
+            // the model-API contract forbids URL userinfo, so the configuration
+            // must be refused at load time.
+            "http://user:pass@127.0.0.1:9".to_string()
+        } else if self.rerank_dead {
+            DEAD_ORIGIN.to_string()
+        } else {
+            stub_origin.clone().unwrap_or_else(|| DEAD_ORIGIN.to_string())
+        };
+        let path = self.fixture.home.join("model-api.toml");
+        std::fs::write(&path, model_api_config(&embed_origin, &rerank_origin))
+            .expect("write model API config");
+        path
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -541,25 +653,11 @@ impl<'a> RunEnv<'a> {
         command.env("XDG_CONFIG_HOME", self.fixture.home.join("xdg-config"));
         command.env("XDG_CACHE_HOME", self.fixture.home.join("xdg-cache"));
         command.env("CASS_OUTPUT_FORMAT", "json");
-        let stub_origin = self.stub.map(Stub::origin);
-        let infinity = self
-            .infinity_override
-            .clone()
-            .or_else(|| stub_origin.clone())
-            .unwrap_or_else(|| DEAD_ORIGIN.to_string());
-        command.env("CASS_INFINITY_URL", infinity);
-        let qwen = if self.qwen_at_stub {
-            stub_origin
-                .clone()
-                .unwrap_or_else(|| DEAD_ORIGIN.to_string())
-        } else {
-            DEAD_ORIGIN.to_string()
-        };
-        command.env("CASS_QWEN_RERANK_URL", qwen);
         for (key, value) in &self.extra_env {
             command.env(key, value);
         }
         command.current_dir(&self.fixture.home);
+        command.arg("--api-config").arg(self.config_path());
         command.arg("--data-dir").arg(&self.fixture.data_dir);
         command.args(args);
         command.output().expect("run cass binary")
@@ -674,8 +772,6 @@ fn rerank_args(n: usize, k: usize) -> Vec<String> {
         "--mode".to_string(),
         "lexical".to_string(),
         "--rerank".to_string(),
-        "--rerank-provider".to_string(),
-        "bge-local".to_string(),
         "--rrf-limit".to_string(),
         n.to_string(),
         "--rerank-limit".to_string(),
@@ -711,7 +807,9 @@ fn closed_first_n(env: &RunEnv<'_>, n: usize) -> Vec<String> {
 /// A well-formed rerank cursor naming `window_id` at `offset`.
 fn synthetic_cursor(window_id: &str, offset: usize) -> String {
     use base64::Engine as _;
-    let payload = serde_json::json!({ "version": 2, "window_id": window_id, "offset": offset });
+    // The cursor is `{version, window_id, offset}`; the current codec version
+    // is 3 (the model-API window format bumped it from 2).
+    let payload = serde_json::json!({ "version": 3, "window_id": window_id, "offset": offset });
     base64::prelude::BASE64_STANDARD.encode(payload.to_string())
 }
 
@@ -729,14 +827,12 @@ fn group1_first_lookup_posts_n_returns_k_in_the_reranked_order() {
     assert_success(&output, "first rerank lookup");
     let payload = stdout_json(&output);
 
-    // Exactly one BGE call: one GET /models then one POST /rerank, whose
-    // `top_n` is the actual window size.
+    // Exactly one BGE call: a single POST /rerank, whose `top_n` is the actual
+    // window size. The model-API path makes no readiness GET.
     let requests = stub.requests();
-    assert_eq!(requests.len(), 2, "one readiness GET and one scoring POST");
-    assert_eq!(requests[0].method, "GET");
-    assert_eq!(requests[0].path, "/models");
-    assert_eq!(requests[1].method, "POST");
-    assert_eq!(requests[1].path, "/rerank");
+    assert_eq!(requests.len(), 1, "one scoring POST");
+    assert_eq!(requests[0].method, "POST");
+    assert_eq!(requests[0].path, "/rerank");
     assert_eq!(
         posted_top_n(&stub),
         Some(DEFAULT_N as u64),
@@ -806,10 +902,28 @@ fn group1_first_lookup_posts_n_returns_k_in_the_reranked_order() {
     assert_eq!(meta["rrf_limit"], serde_json::json!(DEFAULT_N));
     assert_eq!(meta["returned_count"], serde_json::json!(DEFAULT_K));
     assert_eq!(meta["cache_reused"], serde_json::json!(false));
-    assert_eq!(meta["requested_provider"], serde_json::json!("bge-local"));
-    assert_eq!(meta["actual_provider"], serde_json::json!("bge-local"));
-    assert_eq!(meta["first_http_requests"], serde_json::json!(2));
-    assert_eq!(meta["http_requests"], serde_json::json!(2));
+    // Pin the NEW API identity, not just the disappearance of the retired
+    // provider vocabulary: the configured profile, its model, and the realized
+    // profile must all be reported exactly, and the fields the service did not
+    // supply stay null rather than being guessed.
+    assert_eq!(meta["requested_provider"], serde_json::json!(RERANK_PROFILE));
+    assert_eq!(meta["requested_model"], serde_json::json!(RERANK_MODEL));
+    assert_eq!(meta["actual_provider"], serde_json::Value::Null);
+    assert_eq!(meta["actual_model"], serde_json::json!(RERANK_MODEL));
+    assert_eq!(meta["serving_provider"], serde_json::Value::Null);
+    assert_eq!(
+        meta["model_api"]["primary_profile"],
+        serde_json::json!(RERANK_PROFILE),
+        "the API window evidence must name the configured primary profile"
+    );
+    assert_eq!(
+        meta["model_api"]["realized_profile"],
+        serde_json::json!(RERANK_PROFILE),
+        "the realized profile is the primary when no fallback is configured"
+    );
+    assert_eq!(meta["model_api"]["fallback_used"], serde_json::json!(false));
+    assert_eq!(meta["first_http_requests"], serde_json::json!(1));
+    assert_eq!(meta["http_requests"], serde_json::json!(1));
     assert_eq!(meta["first_model_requests"], serde_json::json!(1));
     assert_eq!(meta["model_requests"], serde_json::json!(1));
     assert_eq!(meta["failure_reason"], serde_json::Value::Null);
@@ -909,7 +1023,7 @@ fn group2_continuation_reuses_the_window_and_pages_exactly() {
     assert_eq!(meta["cache_reused"], serde_json::json!(true));
     assert_eq!(meta["http_requests"], serde_json::json!(0));
     assert_eq!(meta["model_requests"], serde_json::json!(0));
-    assert_eq!(meta["first_http_requests"], serde_json::json!(2));
+    assert_eq!(meta["first_http_requests"], serde_json::json!(1));
     assert_eq!(meta["first_model_requests"], serde_json::json!(1));
     assert_eq!(meta["offset"], serde_json::json!(DEFAULT_K));
     assert_eq!(meta["returned_count"], serde_json::json!(DEFAULT_K));
@@ -950,9 +1064,8 @@ fn online_success_window_continuation_makes_no_backend_request() {
     assert_eq!(ids(&first_payload), expected_order[..DEFAULT_K].to_vec());
     // All state is fixture-local. The stub stays online for the second process.
     let requests_before = stub.requests();
-    assert_eq!(requests_before.len(), 2, "first lookup reached the backend");
-    assert_eq!(requests_before[0].path, "/models");
-    assert_eq!(requests_before[1].path, "/rerank");
+    assert_eq!(requests_before.len(), 1, "first lookup reached the backend");
+    assert_eq!(requests_before[0].path, "/rerank");
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
     args.push("--cursor".to_string());
     args.push(cursor);
@@ -1041,11 +1154,10 @@ fn online_failed_window_continuation_makes_no_backend_request() {
     let requests_before = stub.requests();
     assert_eq!(
         requests_before.len(),
-        2,
+        1,
         "the first lookup attempted scoring"
     );
-    assert_eq!(requests_before[0].path, "/models");
-    assert_eq!(requests_before[1].path, "/rerank");
+    assert_eq!(requests_before[0].path, "/rerank");
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
     args.push("--cursor".to_string());
     args.push(cursor);
@@ -1171,8 +1283,6 @@ fn group2_window_boundaries() {
         "--mode",
         "lexical",
         "--rerank",
-        "--rerank-provider",
-        "bge-local",
         "--rrf-limit",
         "50",
         "--rerank-limit",
@@ -1354,9 +1464,11 @@ fn group4_a_cursor_is_refused_when_the_request_or_index_changes() {
             args
         }),
         ("changed provider", {
+            // Both rerank profiles name the SAME endpoint; only the profile id
+            // changes, so the rejection is attributable to the binding alone.
             let mut args = with_cursor(&[]);
-            let p = args.iter().position(|a| a == "--rerank-provider").unwrap();
-            args[p + 1] = "qwen3-local".to_string();
+            args.push("--rerank-profile".to_string());
+            args.push(RERANK_PROFILE_ALT.to_string());
             args
         }),
         ("changed filter", with_cursor(&["--agent", "other-agent"])),
@@ -1539,18 +1651,22 @@ fn group6_hybrid_aggregates_freeze_prefetch_statistics_without_an_exact_total() 
 
 fn assert_frozen_aggregate_statistics(semantic: bool) {
     // All state belongs to this fixture or its child processes. No global
-    // environment or shared counter is changed by either parallel test.
+    // environment or shared counter is changed by either parallel test. The
+    // stub starts first so a hybrid fixture can bind its generation to the
+    // exact embedding endpoint the run will use.
+    let stub = Stub::start(StubMode::Ordered);
     let fixture = build_fixture(FixtureOptions {
         semantic,
+        api_embed_origin: semantic.then(|| stub.origin()),
         ..FixtureOptions::default()
     });
-    let stub = Stub::start(StubMode::Ordered);
     let env = RunEnv::with_stub(&fixture, &stub);
 
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
     if semantic {
+        // Hybrid mode selects its query embedding through the configured
+        // `default_embedding` profile; the retired `--model` selector is gone.
         args[3] = "hybrid".to_string();
-        args.extend_from_slice(&["--model".to_string(), "bge-m3".to_string()]);
     }
     args.extend_from_slice(&[
         "--aggregate".to_string(),
@@ -1596,7 +1712,6 @@ fn assert_frozen_aggregate_statistics(semantic: bool) {
     let mut closed = closed_args(DEFAULT_N);
     if semantic {
         closed[3] = "hybrid".to_string();
-        closed.extend_from_slice(&["--model".to_string(), "bge-m3".to_string()]);
     }
     closed.extend_from_slice(&[
         "--aggregate".to_string(),
@@ -1773,18 +1888,30 @@ fn group6_partial_timeout_and_unwritable_cache_deliver_a_page_without_a_cursor()
 // dimension, bad stored metadata, and a failing call's real duration
 // ---------------------------------------------------------------------------
 
+// Migrated from `a_bad_local_endpoint_still_delivers_the_page`. That case drove
+// a legacy endpoint the binding could not normalize (embedded credentials) and
+// asserted a *refused binding*: page delivered, no cursor. Under the model-API
+// contract an illegal endpoint is refused while the configuration loads, which
+// is a different input class, so the original case is now covered by
+// `an_illegal_endpoint_is_refused_before_any_request_or_window` below, and this
+// case keeps the surviving half — a legal but unreachable endpoint — under a
+// name that says what it actually drives.
 #[test]
-fn a_bad_local_endpoint_still_delivers_the_page() {
-    // An origin the frozen binding cannot normalize (embedded credentials) must
-    // not drop the page: the current page is delivered in the original RRF
-    // order, no request is made and no cursor is issued.
+fn a_legal_but_unreachable_endpoint_still_delivers_the_page() {
+    // A rerank profile pointed at a loopback origin nothing listens on: the
+    // call cannot succeed, but it must not drop the page. The current page is
+    // delivered in the original RRF order with no scores, and the endpoint the
+    // stub would answer on sees no request. The endpoint is a well-formed
+    // loopback URL, so the window still freezes and a cursor is still emitted
+    // (a failed call is a frozen window, as in group3 and the delayed-failure
+    // case); there is simply nothing the binding can score against.
     let fixture = build_fixture(FixtureOptions::default());
     let stub = Stub::start(StubMode::Ordered);
-    let env = RunEnv::with_stub(&fixture, &stub).infinity_url("http://user:pass@127.0.0.1:9/");
+    let env = RunEnv::with_stub(&fixture, &stub).rerank_dead_endpoint();
 
     let output = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
-    assert_success(&output, "un-normalizable endpoint rerank");
-    assert_eq!(stub.request_count(), 0, "a refused binding sends nothing");
+    assert_success(&output, "unreachable endpoint rerank");
+    assert_eq!(stub.request_count(), 0, "a dead endpoint sends nothing to the stub");
     let payload = stdout_json(&output);
 
     let closed = env.run(&as_args(&closed_args(DEFAULT_N)));
@@ -1799,28 +1926,79 @@ fn a_bad_local_endpoint_still_delivers_the_page() {
     );
 
     for (_, _, rerank_score) in scored_hits(&payload) {
-        assert!(rerank_score.is_none(), "no scores without a frozen request");
+        assert!(
+            rerank_score.is_none(),
+            "a failed call scores nothing, so the page keeps its RRF order"
+        );
     }
     let meta = rerank_meta(&payload).expect("_meta.rerank");
     assert_eq!(meta["applied"], serde_json::json!(false));
+    assert_eq!(meta["pagination_unavailable_reason"], serde_json::Value::Null);
+    assert!(
+        next_cursor(&payload).is_some(),
+        "the window is frozen even though the call failed, so it stays continuable"
+    );
+}
+
+#[test]
+fn an_illegal_endpoint_is_refused_before_any_request_or_window() {
+    // The model-API contract forbids URL userinfo (spec §7). A profile whose
+    // endpoint embeds credentials must be rejected while the configuration
+    // loads, which happens before any request and before any window is frozen:
+    // exit 2 as a configuration refusal, zero backend requests, no window
+    // directory. (The parser guard for every normalized userinfo spelling is
+    // unit-tested in `search::model_api::config`; this is the CLI-level proof.)
+    let fixture = build_fixture(FixtureOptions::default());
+    let stub = Stub::start(StubMode::Ordered);
+    let env = RunEnv::with_stub(&fixture, &stub).rerank_userinfo_endpoint();
+
+    let output = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
     assert_eq!(
-        meta["pagination_unavailable_reason"],
-        serde_json::json!("invalid_input")
+        output.status.code(),
+        Some(2),
+        "a userinfo endpoint must be a configuration refusal; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Parse the stable envelope rather than matching product prose: the refusal
+    // must be the endpoint configuration error, with a bounded message that does
+    // not echo the supplied credentials.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let envelope: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("stderr must be the JSON error envelope: {e}; stderr: {stderr}"));
+    let error = &envelope["error"];
+    assert_eq!(error["code"], serde_json::json!(2));
+    assert_eq!(error["kind"], serde_json::json!("ModelApiConfiguration"));
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("InvalidEndpoint"),
+        "the refusal should name the invalid endpoint; message: {message}"
     );
     assert!(
-        next_cursor(&payload).is_none(),
-        "a refused binding yields no cursor"
+        !stderr.contains("user:pass"),
+        "the refusal must not echo the credential-bearing URL; stderr: {stderr}"
+    );
+    assert_eq!(
+        stub.request_count(),
+        0,
+        "a refused configuration sends nothing to the backend"
+    );
+
+    let windows = fixture.data_dir.join("cache").join("rerank-windows");
+    assert!(
+        !windows.exists(),
+        "a refused configuration publishes no window; found {}",
+        windows.display()
     );
 }
 
 #[test]
 fn a_provider_change_alone_is_refused() {
-    // Both local backends' origins point at the SAME stub, so the endpoint is
-    // identical across the two pages and only the provider differs -- the
-    // rejection is attributable to the provider binding alone.
+    // Both rerank profiles name the SAME stub endpoint and model, so the
+    // endpoint is identical across the two pages and only the profile binding
+    // differs -- the rejection is attributable to the binding alone.
     let fixture = build_fixture(FixtureOptions::default());
     let stub = Stub::start(StubMode::Ordered);
-    let env = RunEnv::with_stub(&fixture, &stub).qwen_at_stub();
+    let env = RunEnv::with_stub(&fixture, &stub);
 
     let first = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
     assert_success(&first, "first rerank lookup");
@@ -1828,8 +2006,8 @@ fn a_provider_change_alone_is_refused() {
     let requests_before = stub.request_count();
 
     let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
-    let position = args.iter().position(|a| a == "--rerank-provider").unwrap();
-    args[position + 1] = "qwen3-local".to_string();
+    args.push("--rerank-profile".to_string());
+    args.push(RERANK_PROFILE_ALT.to_string());
     args.push("--cursor".to_string());
     args.push(cursor);
     let changed = env.run(&as_args(&args));
@@ -1844,23 +2022,33 @@ fn a_provider_change_alone_is_refused() {
 
 #[test]
 fn an_effective_embedding_env_change_is_refused() {
-    let fixture = build_fixture(FixtureOptions::default());
+    // Hybrid mode freezes the effective embedding profile in the window
+    // binding, so re-running the continuation under a different (though
+    // equivalent -- same endpoint and model) embedding profile must be refused.
+    // The stub starts first so the generation binds to the run's endpoint.
     let stub = Stub::start(StubMode::Ordered);
+    let fixture = build_fixture(FixtureOptions {
+        semantic: true,
+        api_embed_origin: Some(stub.origin()),
+        ..FixtureOptions::default()
+    });
     let env = RunEnv::with_stub(&fixture, &stub);
 
-    let first = env.run(&as_args(&rerank_args(DEFAULT_N, DEFAULT_K)));
-    assert_success(&first, "first rerank lookup");
+    let mut first_args = rerank_args(DEFAULT_N, DEFAULT_K);
+    first_args[3] = "hybrid".to_string();
+    let first = env.run(&as_args(&first_args));
+    assert_success(&first, "first hybrid rerank lookup");
     let cursor = require_cursor(&stdout_json(&first));
     let requests_before = stub.request_count();
 
-    let mut args = rerank_args(DEFAULT_N, DEFAULT_K);
+    let mut args = first_args;
+    args.push("--embedding-profile".to_string());
+    args.push(EMBED_PROFILE_ALT.to_string());
     args.push("--cursor".to_string());
     args.push(cursor);
-    // The effective embedding selection is part of the frozen request, so an
-    // env change between the two pages must be refused.
-    let changed = RunEnv::with_stub(&fixture, &stub)
-        .env("CASS_SEMANTIC_EMBEDDER", "minilm")
-        .run(&as_args(&args));
+    // The effective embedding selection is part of the frozen request, so a
+    // profile change between the two pages must be refused.
+    let changed = env.run(&as_args(&args));
     assert_eq!(
         changed.status.code(),
         Some(2),
@@ -2206,7 +2394,7 @@ fn p10_sessions_remains_current_page_paths_only() {
         .map(str::to_string)
         .collect();
     assert_eq!(lines, expected);
-    assert_eq!(stub.request_count(), 2);
+    assert_eq!(stub.request_count(), 1, "one scoring POST; the continuation reuses the window");
 }
 
 #[test]

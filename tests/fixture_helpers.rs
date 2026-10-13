@@ -17,10 +17,24 @@
 //! let (dir, data_dir) = setup_connector_test("claude");
 //! ```
 
-use coding_agent_search::search::model_download::compute_sha256;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// SHA-256 of a file's bytes, lowercase hex.
+///
+/// Local to this helper module: the retired `search::model_download` module used
+/// to export one, and the test-only integrity check below for the retained ONNX
+/// fixture bundles (`tests/fixtures/models/`) still needs it. Nothing on the
+/// production API-only path hashes local weight files any more.
+fn compute_sha256(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
 
 /// Directory naming prefix for connector test fixtures.
 /// Using "fixture-" instead of "mock-" to clearly indicate real test data.

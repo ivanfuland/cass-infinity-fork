@@ -12,8 +12,13 @@
 //!
 //! # Implementations
 //!
-//! - **FastEmbed Reranker**: Uses ms-marco-MiniLM-L-6-v2 cross-encoder via FastEmbed.
-//!   Requires model download with user consent.
+//! - **HTTP model API**: the only production reranker. Scoring comes from a
+//!   configured rerank profile (`--rerank-profile` with `--api-config`); the
+//!   model and revision are the ones the profile declares and the service
+//!   reports. See [`crate::search::model_api`].
+//!
+//! The former on-device FastEmbed cross-encoder and the local/OpenRouter
+//! provider selection were retired with the model-API migration.
 
 use std::fmt;
 
@@ -87,13 +92,6 @@ impl fmt::Display for RerankerInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::fastembed_reranker::FastEmbedReranker;
-    use std::path::PathBuf;
-
-    fn fastembed_fixture_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/models/xenova-ms-marco-minilm-l6-v2-int8")
-    }
 
     // Fixed oracle for the existing SyncRerank seam. It performs no conversion
     // or sorting and does not stand in for a working semantic model.
@@ -174,23 +172,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scores, [0.125, 0.5, 0.875]);
-    }
-
-    #[test]
-    fn test_reranker_stub_unavailable_with_or_without_fixture() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        for path in [fastembed_fixture_dir(), tmp.path().to_path_buf()] {
-            let error = match FastEmbedReranker::load_from_dir(&path) {
-                Ok(_) => panic!("the permanent stub must not load"),
-                Err(error) => error,
-            };
-            match error {
-                RerankerError::RerankerUnavailable { model } => {
-                    assert_eq!(model, "ms-marco-minilm-l6-v2");
-                }
-                other => panic!("expected unavailable reranker, got {other:?}"),
-            }
-        }
     }
 
     fn assert_oracle_error(result: RerankerResult<Vec<f32>>, expected: &str) {

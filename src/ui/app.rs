@@ -5134,6 +5134,8 @@ pub struct CassApp {
     pub results_list_state: RefCell<VirtualizedListState>,
     /// Whether wildcard fallback was triggered for the current query.
     pub wildcard_fallback: bool,
+    /// The displayed result includes an allowed semantic-to-lexical fallback.
+    pub semantic_degraded: bool,
     /// Did-you-mean / filter suggestions for the current query.
     pub suggestions: Vec<QuerySuggestion>,
     /// Elapsed time of the last search (for latency badge).
@@ -5292,8 +5294,6 @@ pub struct CassApp {
     pub saved_view_rename_mode: bool,
     /// Rename buffer used while editing saved view labels.
     pub saved_view_rename_buffer: String,
-    /// Whether the consent dialog (model download) is visible.
-    pub show_consent_dialog: bool,
     /// Semantic search availability state.
     pub semantic_availability: SemanticAvailability,
     /// Whether the source filter popup menu is open.
@@ -5505,6 +5505,7 @@ impl Default for CassApp {
             per_pane_limit: 0,
             results_list_state: RefCell::new(VirtualizedListState::new()),
             wildcard_fallback: false,
+            semantic_degraded: false,
             suggestions: Vec::new(),
             last_search_ms: None,
             search_error_message: None,
@@ -5575,8 +5576,7 @@ impl Default for CassApp {
             saved_view_drag: None,
             saved_view_rename_mode: false,
             saved_view_rename_buffer: String::new(),
-            show_consent_dialog: false,
-            semantic_availability: SemanticAvailability::NotInstalled,
+            semantic_availability: SemanticAvailability::Disabled { reason: "Configure HTTP model services with --api-config".into() },
             source_filter_menu_open: false,
             source_filter_menu_selection: 0,
             available_source_ids: Vec::new(),
@@ -5683,6 +5683,11 @@ impl Default for CassApp {
 }
 
 impl CassApp {
+    fn disclose_semantic_fallback(&mut self) {
+        const SUFFIX: &str = " · lexical fallback (semantic search unavailable)";
+        if self.semantic_degraded && !self.status.ends_with(SUFFIX) { self.status.push_str(SUFFIX); }
+    }
+
     /// Reload persisted theme configuration from `self.data_dir/theme.json`.
     ///
     /// Baseline always starts from env-derived style options to keep startup
@@ -6470,7 +6475,6 @@ impl CassApp {
             && !self.show_bulk_modal
             && !self.show_saved_views_modal
             && !self.show_export_modal
-            && !self.show_consent_dialog
             && !self.source_filter_menu_open
             && !self.command_palette.is_visible()
     }
@@ -6479,7 +6483,6 @@ impl CassApp {
         if self.show_export_modal
             || self.show_bulk_modal
             || self.show_saved_views_modal
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible()
             || self.show_help
@@ -7177,6 +7180,7 @@ impl CassApp {
                     elapsed_ms: result.elapsed_ms,
                     suggestions: result.suggestions,
                     wildcard_fallback: result.wildcard_fallback,
+                    semantic_degraded: result.semantic_degraded,
                     append: matches!(pass, SearchPass::Pagination),
                 },
                 Err(e) => CassMsg::SearchFailed {
@@ -12863,72 +12867,6 @@ impl CassApp {
         }
     }
 
-    /// Render the semantic model consent dialog overlay.
-    fn render_consent_overlay(
-        &self,
-        frame: &mut super::ftui_adapter::Frame,
-        area: Rect,
-        styles: &StyleContext,
-    ) {
-        let dialog_w = 68u16.min(area.width.saturating_sub(2));
-        let dialog_h = 9u16.min(area.height.saturating_sub(2));
-        if dialog_w < 28 || dialog_h < 6 {
-            return;
-        }
-
-        let dialog_x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
-        let dialog_y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-        let dialog_area = Rect::new(dialog_x, dialog_y, dialog_w, dialog_h);
-
-        let bg_style = styles.style(style_system::STYLE_PANE_BASE);
-        let border_style = styles.style(style_system::STYLE_PANE_FOCUSED);
-        let text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
-        let muted_style = styles.style(style_system::STYLE_TEXT_MUTED);
-        let key_style = styles.style(style_system::STYLE_KBD_KEY);
-
-        // Clear background — use draw_rect_filled to overwrite both characters
-        // and styles (Block::style only sets bg without clearing foreground text).
-        let bg_color = bg_style.bg.unwrap_or(ftui::PackedRgba::rgb(0, 0, 0));
-        frame.draw_rect_filled(dialog_area, ftui::Cell::from_char(' ').with_bg(bg_color));
-        let outer = Block::new()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title("Enable semantic search?")
-            .title_alignment(Alignment::Left)
-            .style(border_style);
-        let inner = outer.inner(dialog_area);
-        outer.render(dialog_area, frame);
-        if inner.is_empty() {
-            return;
-        }
-
-        let lines = vec![
-            ftui::text::Line::from_spans(vec![ftui::text::Span::styled(
-                "Semantic/Hybrid mode needs a local embedding model download.".to_string(),
-                text_style,
-            )]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[D]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Download model (recommended)".to_string(), text_style),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[H]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(
-                    " Use hash fallback (no download)".to_string(),
-                    text_style,
-                ),
-            ]),
-            ftui::text::Line::from_spans(vec![
-                ftui::text::Span::styled("[Esc]".to_string(), key_style.bold()),
-                ftui::text::Span::styled(" Cancel for now".to_string(), muted_style),
-            ]),
-        ];
-        Paragraph::new(ftui::text::Text::from_lines(lines))
-            .style(text_style)
-            .wrap(ftui::text::WrapMode::Word)
-            .render(inner, frame);
-    }
-
     /// Render the saved views manager popup centered on screen.
     fn render_saved_views_overlay(
         &self,
@@ -14075,6 +14013,7 @@ pub enum CassMsg {
         elapsed_ms: u128,
         suggestions: Vec<QuerySuggestion>,
         wildcard_fallback: bool,
+        semantic_degraded: bool,
         /// When true, append hits to the existing result set instead of replacing it.
         append: bool,
     },
@@ -14320,23 +14259,9 @@ pub enum CassMsg {
     /// Export failed.
     ExportFailed(String),
 
-    // -- Consent dialog (semantic model download) -------------------------
-    /// Open the consent dialog.
-    ConsentDialogOpened,
-    /// Close the consent dialog.
-    ConsentDialogClosed,
-    /// User accepted model download.
-    ModelDownloadAccepted,
-    /// Model download progress update.
-    ModelDownloadProgress { bytes_downloaded: u64, total: u64 },
-    /// Model download completed.
-    ModelDownloadCompleted,
-    /// Model download failed.
-    ModelDownloadFailed(String),
-    /// User cancelled the active download.
-    ModelDownloadCancelled,
-    /// User accepted hash mode fallback (no ML model).
-    HashModeAccepted,
+    // The semantic-model consent/download messages were retired with the
+    // model-API migration: the TUI offers lexical and explicit API state only,
+    // and never prompts to download or install a local weight file.
 
     // -- Source filter menu ------------------------------------------------
     /// Toggle the source filter popup menu.
@@ -15295,6 +15220,8 @@ pub struct SearchResult {
     pub elapsed_ms: u128,
     pub suggestions: Vec<QuerySuggestion>,
     pub wildcard_fallback: bool,
+    /// The displayed result includes an allowed semantic-to-lexical fallback.
+    pub semantic_degraded: bool,
 }
 
 /// Background indexing with progress reporting.
@@ -15354,6 +15281,7 @@ pub trait PersistenceService: Send + Sync {
 struct TantivySearchService {
     client: Arc<crate::search::query::SearchClient>,
     live_runtime: Option<asupersync::runtime::Runtime>,
+    semantic_setup_error: Option<String>,
 }
 
 impl TantivySearchService {
@@ -15371,7 +15299,26 @@ impl TantivySearchService {
         Self {
             client,
             live_runtime,
+            semantic_setup_error: None,
         }
+    }
+
+    fn with_api_configuration(mut self, path: Option<&std::path::Path>) -> (Self, SemanticAvailability) {
+        use crate::search::embedder::Embedder;
+        self.semantic_setup_error = None;
+        let result = crate::search::model_api::index_embedding::IndexEmbeddingSetup::load(path, None, true)
+            .map_err(|error| error.to_string())
+            .and_then(|setup| setup.bind_search(&self.client).map_err(|error| error.to_string()));
+        let state = match result {
+            Ok(driver) => SemanticAvailability::Ready { embedder_id: driver.id().to_owned() },
+            Err(error) => {
+                let reason = format!("Semantic API unavailable: {error}. Configure --api-config and build an audited API generation.");
+                let _ = self.client.clear_semantic_context();
+                self.semantic_setup_error = Some(reason.clone());
+                SemanticAvailability::LoadFailed { context: reason }
+            }
+        };
+        (self, state)
     }
 
     fn progressive_enabled() -> bool {
@@ -15425,6 +15372,7 @@ impl TantivySearchService {
                 elapsed_ms: result.elapsed_ms,
                 suggestions: result.suggestions,
                 wildcard_fallback: result.wildcard_fallback,
+                semantic_degraded: result.semantic_degraded,
                 append: matches!(params.pass, SearchPass::Pagination),
             },
             Err(error) => CassMsg::SearchFailed { generation, error },
@@ -15438,6 +15386,9 @@ impl SearchService for TantivySearchService {
     fn execute(&self, params: &SearchParams) -> Result<SearchResult, String> {
         use crate::search::query::{FieldMask, SearchResult as BackendSearchResult};
 
+        if params.mode != SearchMode::Lexical && !params.query.trim().is_empty() {
+            if let Some(error) = &self.semantic_setup_error { return Err(error.clone()); }
+        }
         let started = Instant::now();
         let limit = params.limit;
         let offset = params.offset;
@@ -15468,6 +15419,7 @@ impl SearchService for TantivySearchService {
                 elapsed_ms: started.elapsed().as_millis(),
                 suggestions: Vec::new(),
                 wildcard_fallback: false,
+                semantic_degraded: false,
             });
         }
 
@@ -15517,23 +15469,16 @@ impl SearchService for TantivySearchService {
             }
         };
 
-        // Semantic/hybrid modes can be unavailable if embedders are not installed.
-        // Fall back to lexical so typing always returns results instead of no-op.
-        let backend = match execute_mode(requested_mode) {
-            Ok(result) => result,
-            Err(err) if matches!(requested_mode, SearchMode::Semantic | SearchMode::Hybrid) => {
-                execute_mode(SearchMode::Lexical).map_err(|fallback_err| {
-                    format!("search failed ({err}); lexical fallback failed: {fallback_err}")
-                })?
-            }
-            Err(err) => return Err(err),
-        };
+        // Preserve typed API failure policy; incompatible semantic requests
+        // must not be silently replaced by a lexical search here.
+        let backend = execute_mode(requested_mode)?;
 
         Ok(SearchResult {
             hits: backend.hits,
             elapsed_ms: started.elapsed().as_millis(),
             suggestions: backend.suggestions,
             wildcard_fallback: backend.wildcard_fallback,
+            semantic_degraded: backend.semantic_degraded,
         })
     }
 }
@@ -15930,20 +15875,6 @@ impl super::ftui_adapter::Model for CassApp {
                 if ke.modifiers.contains(super::ftui_adapter::Modifiers::ALT)
         );
         if raw_alt_update_shortcut && !self.can_handle_update_shortcuts() {
-            return ftui::Cmd::none();
-        }
-
-        // Consent dialog intercepts D/H keys and blocks other query input
-        if self.show_consent_dialog
-            && let CassMsg::QueryChanged(ref text) = msg
-        {
-            if text.eq_ignore_ascii_case("d") {
-                return self.update(CassMsg::ModelDownloadAccepted);
-            }
-            if text.eq_ignore_ascii_case("h") {
-                return self.update(CassMsg::HashModeAccepted);
-            }
-            // Ignore other query input while consent dialog is open
             return ftui::Cmd::none();
         }
 
@@ -16985,12 +16916,14 @@ impl super::ftui_adapter::Model for CassApp {
                 elapsed_ms,
                 suggestions,
                 wildcard_fallback,
+                semantic_degraded,
                 append,
             } => {
                 if generation != self.search_generation {
                     // Stale async completion from an older query — ignore.
                     return ftui::Cmd::none();
                 }
+                self.semantic_degraded = if append { self.semantic_degraded || semantic_degraded } else { semantic_degraded };
                 let progressive_initial = matches!(pass, SearchPass::Interactive)
                     && self.live_request_is_progressive_for(generation);
                 self.search_in_flight = false;
@@ -17035,6 +16968,7 @@ impl super::ftui_adapter::Model for CassApp {
                             ""
                         }
                     );
+                    self.disclose_semantic_fallback();
                     // If the user typed while the request was in-flight, schedule
                     // the next debounced search now that we're idle again.
                     if let Some(dirty_ts) = self.search_dirty_since {
@@ -17090,6 +17024,7 @@ impl super::ftui_adapter::Model for CassApp {
                         }
                     ),
                 };
+                self.disclose_semantic_fallback();
                 // Warn on slow searches so users notice latency issues.
                 if elapsed_ms >= 1000 {
                     self.toast_manager.push(
@@ -17203,6 +17138,7 @@ impl super::ftui_adapter::Model for CassApp {
                         }
                     );
                 }
+                self.disclose_semantic_fallback();
                 ftui::Cmd::none()
             }
             CassMsg::CursorMoved { delta } => {
@@ -18863,145 +18799,6 @@ impl super::ftui_adapter::Model for CassApp {
                 })
             }
 
-            // -- Consent dialog -----------------------------------------------
-            CassMsg::ConsentDialogOpened => {
-                self.show_consent_dialog = true;
-                self.focus_manager.push_trap(focus_ids::GROUP_CONSENT);
-                self.focus_manager.focus(focus_ids::CONSENT_DIALOG);
-                ftui::Cmd::none()
-            }
-            CassMsg::ConsentDialogClosed => {
-                self.show_consent_dialog = false;
-                self.focus_manager.pop_trap();
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadAccepted => {
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::Downloading {
-                    progress_pct: 0,
-                    bytes_downloaded: 0,
-                    total_bytes: 0,
-                };
-                self.status = "Starting semantic model download...".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::info(
-                        "Starting semantic model download...",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadProgress {
-                bytes_downloaded,
-                total,
-            } => {
-                // Respect explicit non-download semantic modes and ignore stale
-                // download lifecycle events that may arrive out of order.
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                let progress_pct = bytes_downloaded
-                    .saturating_mul(100)
-                    .checked_div(total)
-                    .map_or(0, |pct| pct.min(100));
-                let progress_pct = u8::try_from(progress_pct).unwrap_or(100);
-                self.semantic_availability = SemanticAvailability::Downloading {
-                    progress_pct,
-                    bytes_downloaded,
-                    total_bytes: total,
-                };
-                if total > 0 {
-                    let done_mb = bytes_downloaded as f64 / 1_048_576.0;
-                    let total_mb = total as f64 / 1_048_576.0;
-                    self.status = format!(
-                        "Downloading semantic model: {progress_pct}% ({done_mb:.1}/{total_mb:.1} MB)"
-                    );
-                } else {
-                    self.status = format!("Downloading semantic model: {bytes_downloaded} bytes");
-                }
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadCompleted => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::Ready {
-                    embedder_id:
-                        crate::search::fastembed_embedder::FastEmbedder::embedder_id_static()
-                            .to_string(),
-                };
-                self.status = "Semantic model ready. Run `cass index --semantic` to build or refresh vector search data.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::success(
-                        "Semantic model download complete",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadFailed(err) => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::NotInstalled;
-                self.status = format!("Model download failed: {err}");
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::error(format!(
-                        "Model download failed: {err}"
-                    )));
-                ftui::Cmd::none()
-            }
-            CassMsg::ModelDownloadCancelled => {
-                if matches!(
-                    self.semantic_availability,
-                    SemanticAvailability::HashFallback | SemanticAvailability::Disabled { .. }
-                ) {
-                    return ftui::Cmd::none();
-                }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::NotInstalled;
-                self.status =
-                    "Model download cancelled. Semantic search remains disabled.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::warning(
-                        "Model download cancelled",
-                    ));
-                ftui::Cmd::none()
-            }
-            CassMsg::HashModeAccepted => {
-                // User chose hash embedder fallback instead of downloading ML model.
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                }
-                self.semantic_availability = SemanticAvailability::HashFallback;
-                self.status = "Using hash embedder fallback for semantic mode.".to_string();
-                self.toast_manager
-                    .push(crate::ui::components::toast::Toast::info(
-                        "Hash embedder fallback enabled",
-                    ));
-                ftui::Cmd::none()
-            }
-
             // -- Source filter menu -------------------------------------------
             CassMsg::SourceFilterMenuToggled => {
                 if self.source_filter_menu_open {
@@ -19425,6 +19222,7 @@ impl super::ftui_adapter::Model for CassApp {
                 {
                     ftui::Cmd::task(move || {
                         let opts = crate::indexer::IndexOptions {
+                            model_api: None,
                             no_ingest: false,
                             full: false,
                             force_rebuild: false,
@@ -20925,11 +20723,6 @@ impl super::ftui_adapter::Model for CassApp {
                 ) {
                     return ftui::Cmd::msg(CassMsg::ViewStackPopped);
                 }
-                if self.show_consent_dialog {
-                    self.show_consent_dialog = false;
-                    self.focus_manager.pop_trap();
-                    return ftui::Cmd::none();
-                }
                 if self.show_inspector {
                     self.show_inspector = false;
                     if self.inspector_state.is_active() {
@@ -22327,7 +22120,6 @@ impl super::ftui_adapter::Model for CassApp {
             || self.show_detail_modal
             || self.show_help
             || self.show_inspector
-            || self.show_consent_dialog
             || self.source_filter_menu_open
             || self.command_palette.is_visible();
         if modal_visible && apply_style {
@@ -22443,10 +22235,6 @@ impl super::ftui_adapter::Model for CassApp {
 
         if self.source_filter_menu_open {
             self.render_source_filter_menu_overlay(frame, area, &styles);
-        }
-
-        if self.show_consent_dialog {
-            self.render_consent_overlay(frame, area, &styles);
         }
 
         // ── Help overlay ─────────────────────────────────────────────
@@ -23112,6 +22900,7 @@ pub fn run_tui_ftui(
     inline_config: Option<InlineTuiConfig>,
     macro_config: MacroConfig,
     data_dir_override: Option<PathBuf>,
+    api_config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     use ftui::ProgramConfig;
     use ftui::core::capability_override::{CapabilityOverride, push_override};
@@ -23200,33 +22989,11 @@ pub fn run_tui_ftui(
             },
         ) {
             Ok(Some(client)) => {
-                use crate::search::embedder_registry::{EmbedderRegistry, HASH_EMBEDDER};
-                use crate::search::model_manager::{
-                    load_hash_semantic_context, load_semantic_context,
-                };
-
                 let client = Arc::new(client);
-                let prefer_hash =
-                    EmbedderRegistry::new(&data_dir).best_available().name == HASH_EMBEDDER;
-                let setup = if prefer_hash {
-                    load_hash_semantic_context(&data_dir, &model.db_path)
-                } else {
-                    load_semantic_context(&data_dir, &model.db_path)
-                };
-                model.semantic_availability = setup.availability.clone();
-
-                if let Some(context) = setup.context {
-                    if let Err(err) =
-                        client.set_semantic_context(context.embedder, context.roles)
-                    {
-                        tracing::debug!(error = %err, "tui semantic context unavailable");
-                        let _ = client.clear_semantic_context();
-                    }
-                } else {
-                    let _ = client.clear_semantic_context();
-                }
-
-                let service = Arc::new(TantivySearchService::new(Arc::clone(&client)));
+                let (service, availability) = TantivySearchService::new(client)
+                    .with_api_configuration(api_config_path.as_deref());
+                model.semantic_availability = availability;
+                let service = Arc::new(service);
                 model.progressive_search_service = Some(Arc::clone(&service));
                 Some(service as Arc<dyn SearchService>)
             }
@@ -24156,7 +23923,6 @@ mod tests {
         assert!(!app.show_detail_modal);
         assert!(!app.show_export_modal);
         assert!(!app.show_bulk_modal);
-        assert!(!app.show_consent_dialog);
         assert!(!app.source_filter_menu_open);
         assert_eq!(app.source_filter_menu_selection, 0);
         assert!(app.available_source_ids.is_empty());
@@ -24165,125 +23931,31 @@ mod tests {
         assert!(app.query_history.is_empty());
     }
 
+    // Semantic mapping of the two retired tests above: `retired_model_actions_
+    // cannot_enable_local_or_hash_semantics` and `stale_download_events_cannot_
+    // change_verified_api_readiness` both drove the consent/download messages,
+    // which are removed here along with the messages themselves. The behavior
+    // they guarded -- that no local-model or hash action can turn on semantics,
+    // and that a verified API readiness is never downgraded -- is now structural
+    // (there is no such action left), and the surviving assertions are kept.
     #[test]
-    fn model_download_accepted_closes_consent_and_sets_downloading_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ConsentDialogOpened);
-        assert!(app.show_consent_dialog);
-
-        let _ = app.update(CassMsg::ModelDownloadAccepted);
-
-        assert!(!app.show_consent_dialog);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Downloading {
-                progress_pct: 0,
-                bytes_downloaded: 0,
-                total_bytes: 0
+    fn tui_offers_no_local_model_download_or_consent_surface() {
+        let app = CassApp::default();
+        assert!(!app.semantic_availability.can_search());
+        match &app.semantic_availability {
+            SemanticAvailability::Disabled { reason } => {
+                assert!(reason.contains("--api-config"), "{reason}");
             }
-        ));
-        assert!(app.status.contains("Starting semantic model download"));
-        assert_eq!(app.toast_manager.len(), 1);
+            other => panic!("expected Disabled default, got {other:?}"),
+        }
     }
 
     #[test]
-    fn model_download_progress_updates_downloading_state() {
+    fn verified_api_readiness_reports_searchable() {
         let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadProgress {
-            bytes_downloaded: 50,
-            total: 100,
-        });
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Downloading {
-                progress_pct: 50,
-                bytes_downloaded: 50,
-                total_bytes: 100
-            }
-        ));
-        assert!(app.status.contains("50%"));
-    }
-
-    #[test]
-    fn model_download_completed_sets_ready_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadCompleted);
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::Ready { .. }
-        ));
-        assert!(app.status.contains("Semantic model ready"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_failed_sets_not_installed_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ModelDownloadFailed("network timeout".to_string()));
-
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::NotInstalled
-        ));
-        assert!(app.status.contains("network timeout"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn hash_mode_accept_sets_hash_fallback_state() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::ConsentDialogOpened);
-        assert!(app.show_consent_dialog);
-
-        let _ = app.update(CassMsg::HashModeAccepted);
-
-        assert!(!app.show_consent_dialog);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert!(app.status.contains("hash embedder fallback"));
-        assert_eq!(app.toast_manager.len(), 1);
-    }
-
-    #[test]
-    fn model_download_events_do_not_override_hash_fallback() {
-        let mut app = CassApp::default();
-        let _ = app.update(CassMsg::HashModeAccepted);
-        let status_after_hash = app.status.clone();
-
-        let _ = app.update(CassMsg::ModelDownloadProgress {
-            bytes_downloaded: 10,
-            total: 100,
-        });
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadCompleted);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadFailed("late failure".to_string()));
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
-
-        let _ = app.update(CassMsg::ModelDownloadCancelled);
-        assert!(matches!(
-            app.semantic_availability,
-            SemanticAvailability::HashFallback
-        ));
-        assert_eq!(app.status, status_after_hash);
+        app.semantic_availability = SemanticAvailability::Ready { embedder_id:"api:verified".into() };
+        assert!(app.semantic_availability.can_search());
+        assert!(matches!(&app.semantic_availability, SemanticAvailability::Ready { embedder_id } if embedder_id == "api:verified"));
     }
 
     #[test]
@@ -25352,12 +25024,38 @@ mod tests {
     }
 
     #[test]
+    fn semantic_fallback_notice_survives_pagination_and_stream_completion() {
+        let mut app = CassApp::default();
+        let completion = |generation, degraded, append| CassMsg::SearchCompleted {
+            generation, pass: if append { SearchPass::Pagination } else { SearchPass::Interactive },
+            requested_limit: 16, hits: vec![], elapsed_ms: 1, suggestions: vec![],
+            wildcard_fallback: false, semantic_degraded: degraded, append,
+        };
+        let current = app.search_generation;
+        let _ = app.update(completion(current, true, false));
+        assert!(app.semantic_degraded);
+        assert!(app.status.contains("lexical fallback"));
+        let _ = app.update(completion(current, false, true));
+        assert!(app.status.contains("lexical fallback"));
+        app.search_refining = true;
+        app.status.push_str(" · refining");
+        let _ = app.update(CassMsg::SearchStreamFinished { generation: current });
+        assert_eq!(app.status.matches("lexical fallback").count(), 1);
+        let _ = app.update(completion(current.wrapping_add(1), false, false));
+        assert!(app.semantic_degraded, "an unrelated completion must not clear the displayed result state");
+        let _ = app.update(completion(current, false, false));
+        assert!(!app.semantic_degraded);
+        assert!(!app.status.contains("lexical fallback"));
+    }
+
+    #[test]
     fn search_result_constructible() {
         let _result = SearchResult {
             hits: Vec::new(),
             elapsed_ms: 42,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_degraded: false,
         };
     }
 
@@ -26929,6 +26627,7 @@ mod tests {
             elapsed_ms: 42,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert_eq!(app.panes.len(), 2, "should have 2 agent panes");
@@ -27845,6 +27544,63 @@ mod tests {
             !result.hits.is_empty(),
             "execute() should recall the persisted fixture message for its unique token"
         );
+
+        let (service, state) = service.with_api_configuration(Some(&data_dir.join("missing-models.toml")));
+        assert!(!state.is_ready());
+        for mode in [SearchMode::Semantic, SearchMode::Hybrid] {
+            let mut requested = params.clone(); requested.mode = mode;
+            assert!(service.execute(&requested).is_err(), "invalid API setup must not silently return lexical hits");
+        }
+        assert!(!service.execute(&params).unwrap().hits.is_empty(), "explicit lexical search stays available");
+
+        use crate::search::model_api::test_support::{HttpFixture, Reply};
+        use crate::search::model_api::index_embedding::IndexEmbeddingSetup;
+        use crate::indexer::db_vector_catchup::{probe_api_backfill, run_api_primary_catchup_backfill};
+        let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let endpoint = HttpFixture::start(vec![Reply::Conditional(unavailable.clone(),
+            Box::new(Reply::Embeddings(8)), Box::new(Reply::status(503)))]);
+        let config = data_dir.join("models.toml");
+        std::fs::write(&config, format!(r#"version=1
+default_embedding="ui"
+[profiles.ui]
+kind="embedding"
+protocol="openai-embeddings-v1"
+scope="loopback"
+endpoint="{}"
+model="example/ui-embedding"
+model_revision="fixture-r1"
+normalization="l2"
+query_prefix="Q:"
+"#, endpoint.base())).unwrap();
+        let setup = IndexEmbeddingSetup::load(Some(&config), None, true).unwrap();
+        let call = setup.call().unwrap();
+        let probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| panic!("{error}"));
+        let built = run_api_primary_catchup_backfill(&storage, 64, &call, call.profile(), &probe, 42)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(built.catchup.activated);
+        let before = endpoint.hits();
+        let (service, state) = service.with_api_configuration(Some(&config));
+        assert!(state.is_ready());
+        assert_eq!(endpoint.hits(), before, "UI setup verifies the stored generation without probing");
+        let mut requested = params.clone(); requested.mode = SearchMode::Semantic;
+        assert!(!service.execute(&requested).unwrap().hits.is_empty());
+        assert_eq!(endpoint.hits(), before + 1);
+        assert_eq!(endpoint.requests().last().unwrap().body()["input"], json!([format!("Q:{unique_token}")]));
+        unavailable.store(true, std::sync::atomic::Ordering::SeqCst);
+        requested.mode = SearchMode::Hybrid;
+        requested.query = "Investigate".into();
+        let degraded = service.execute(&requested).unwrap();
+        assert!(!degraded.hits.is_empty());
+        assert!(degraded.semantic_degraded, "allowed HTTP failure must retain the realized lexical mode");
+        assert_eq!(endpoint.hits(), before + 2);
+        unavailable.store(false, std::sync::atomic::Ordering::SeqCst);
+        let key = crate::storage::api_generation::provenance_meta_key(built.catchup.generation_id);
+        storage.raw().execute("DELETE FROM meta WHERE key=?1", &crate::storage::api::params![key]).unwrap();
+        requested.mode = SearchMode::Hybrid;
+        assert!(service.execute(&requested).is_err(), "late provenance failure must not become lexical success");
+        assert_eq!(endpoint.hits(), before + 2, "broken provenance is checked before another model request");
+        assert!(!service.execute(&params).unwrap().hits.is_empty());
+
     }
 
     #[test]
@@ -27862,6 +27618,7 @@ mod tests {
                     elapsed_ms: 5,
                     suggestions: vec![],
                     wildcard_fallback: false,
+                    semantic_degraded: false,
                 })
             }
         }
@@ -27905,6 +27662,7 @@ mod tests {
                     elapsed_ms: 5,
                     suggestions: vec![],
                     wildcard_fallback: false,
+                    semantic_degraded: false,
                 })
             }
         }
@@ -27967,6 +27725,7 @@ mod tests {
             elapsed_ms: 1,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert!(app.loading_context.is_none());
@@ -28011,6 +27770,7 @@ mod tests {
             elapsed_ms: 3,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
 
@@ -28070,6 +27830,7 @@ mod tests {
             elapsed_ms: 3,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
 
@@ -28282,6 +28043,7 @@ mod tests {
             elapsed_ms: 10,
             suggestions: vec![],
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         let state = app.results_list_state.borrow();
@@ -41901,6 +41663,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 7,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert!(
@@ -41934,6 +41697,7 @@ See also: [RFC-2847](https://internal/rfc/2847) for the full design doc.
             elapsed_ms: 6,
             suggestions: Vec::new(),
             wildcard_fallback: false,
+            semantic_degraded: false,
             append: false,
         });
         assert!(

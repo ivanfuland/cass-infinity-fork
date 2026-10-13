@@ -296,6 +296,7 @@ fn readonly_root_untouched() {
         let db_path = data_dir.join("agent_search.db");
         run_index(
             IndexOptions {
+                model_api: None,
                 no_ingest: false,
                 full: true,
                 force_rebuild: true,

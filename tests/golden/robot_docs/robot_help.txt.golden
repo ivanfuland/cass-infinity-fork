@@ -33,7 +33,7 @@ WORKFLOW:
 
 OUTPUT:
   --robot | --json   Machine-readable JSON output (auto-quiet enabled)
-  --rerank enables qwen3-local by default (N=200/K=5); select --rerank-provider explicitly to change backend.
+  --rerank requires a configured rerank API profile (--api-config / --rerank-profile); N=200/K=5 by default. The retired --rerank-provider selection is refused.
   Search uses --rrf-limit N and --rerank-limit K; legacy search --limit is refused. Pack --limit is unchanged.
   _meta.rerank is present in JSON/compact/JSONL/TOON when enabled, without --robot-meta; score and rerank_score are separate.
   Cursor pages repeat query/N/K/provider/filters and reuse the window without another model call.

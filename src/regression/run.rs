@@ -23,7 +23,10 @@ pub(crate) struct RegressionSearchRun {
     pub(crate) vector_mode: Option<VectorSearchMode>,
     pub(crate) n: usize,
     pub(crate) request: Value,
-    pub(crate) rerank: Option<(usize, crate::search::rerank::types::ProviderChoice)>,
+    pub(crate) rerank: Option<usize>,
+    pub(crate) semantic: crate::SemanticSearchOptions,
+    query_driver: Option<Arc<crate::search::model_api::query_embedding::ApiQueryEmbedder>>,
+    query_attempt_start: std::cell::Cell<usize>,
     pub(crate) endpoint: Option<String>,
 }
 
@@ -51,12 +54,12 @@ pub(crate) fn milliseconds(start: Instant) -> f64 {
 impl RegressionSearchRun {
     pub(crate) fn activate(validated: ValidatedRun, command: &RegressionCommand) -> Result<Self> {
         let RegressionCommand::FullSearch {
+            api,
             search_mode,
             vector_search_mode,
             rrf_limit,
             rerank,
             page_size,
-            rerank_provider,
             ..
         } = command
         else {
@@ -88,59 +91,46 @@ impl RegressionSearchRun {
         let client = verified
             .client
             .with_vector_search_mode(vector_search_mode.unwrap_or_default());
+        let rerank_limit = match rerank {
+            RerankSwitch::Off => None,
+            RerankSwitch::On => Some(page_size.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))? as usize),
+        };
+        let mut semantic = crate::SemanticSearchOptions {
+            api: crate::ApiSearchOptions {
+                config_path: api.config_path.clone(), embedding_profile: api.embedding_profile.clone(),
+                rerank_profile: api.rerank_profile.clone(), no_model_fallback: api.no_model_fallback,
+                ..Default::default()
+            },
+            model: None,
+            rerank: rerank_limit.is_some(), rerank_limit,
+            ..Default::default()
+        };
+        if api.selected() && (*search_mode != SearchMode::Lexical || semantic.rerank) {
+            crate::search::model_api::runtime::ensure_no_retired_model_env(|key| std::env::var_os(key))?;
+            semantic.api.frozen = Some(crate::search::model_api::runtime::load_config(api.config_path.as_deref(), |key| std::env::var_os(key))?);
+        }
+        let api_reranker = if semantic.rerank { crate::selected_api_rerank_profile(&semantic).map_err(|e| anyhow::anyhow!(e.message))? } else { None };
         let mut embedding_binding = None;
+        let mut query_driver = None;
         if *search_mode != SearchMode::Lexical {
-            #[cfg(not(feature = "infinity"))]
-            bail!("REGRESSION_SEMANTIC_NOT_INTEGRATED");
-            #[cfg(feature = "infinity")]
-            {
-                let config = crate::search::infinity::InfinityConfig::from_env();
-                if config.embed_model != "BAAI/bge-m3" {
-                    bail!("REGRESSION_EMBEDDING_CONFIGURATION_MISMATCH");
-                }
-                let setup =
-                    crate::search::model_manager::load_infinity_semantic_context_for_regression(
-                        &context, &config,
-                    )?;
-                let semantic = setup
-                    .context
-                    .ok_or_else(|| anyhow::anyhow!("REGRESSION_SEMANTIC_NOT_INTEGRATED"))?;
-                client.set_semantic_context(semantic.embedder, semantic.roles)?;
-                embedding_binding = Some(json!({
-                    "requested_model": config.embed_model,
-                    "origin_sha256": regression_trace::TextDigest::of(&config.base_url).sha256,
-                    "dimension": config.expected_dim,
-                    "timeout_ms": config.timeout.as_millis() as u64,
-                    "max_batch": config.max_batch,
-                }));
+            if let Some(config) = &semantic.api.frozen {
+                let profile = crate::select_api_embedding_profile(config, api.embedding_profile.as_deref()).map_err(|e| anyhow::anyhow!(e.message))?;
+                let route = crate::search::model_api::embedding_route::EmbeddingRoute::load(config, &profile, !api.no_model_fallback);
+                embedding_binding = Some({ let conn = context.connection()?; crate::api_regression_embedding_binding(&conn, &route)? });
+                semantic.api.embedding_route = Some(route.clone());
+                query_driver = Some(client.set_api_frozen_semantic_context(Arc::new(crate::search::model_api::ApiClient::new(config.clone(), Box::new(crate::search::model_api::EnvCredentialResolver))), route)?);
+            } else {
+                // Semantic regression requires a frozen model-API profile.
+                // There is no local inference tier left to fall back to.
+                bail!("REGRESSION_SEMANTIC_NOT_INTEGRATED");
             }
         }
-        let rerank = match rerank {
-            RerankSwitch::Off => None,
-            RerankSwitch::On => Some((
-                page_size.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))? as usize,
-                rerank_provider.ok_or_else(|| anyhow::anyhow!("REQUEST_PROFILE_INVALID"))?,
-            )),
-        };
-        let endpoint = rerank.map(|(_, provider)| crate::rerank_endpoint_origin(provider));
+        let rerank = rerank_limit;
+        let endpoint = api_reranker.as_ref().map(|p| p.endpoint.as_str().to_owned());
         let request = crate::regression_request_evidence(
-            &SearchFilters::default(),
-            *search_mode,
-            vector_search_mode.unwrap_or_default(),
-            *rrf_limit as usize,
-            None,
-            &crate::SemanticSearchOptions {
-                model: (*search_mode != SearchMode::Lexical).then(|| "bge-m3".into()),
-                rerank: rerank.is_some(),
-                reranker: None,
-                use_daemon: false,
-                rerank_limit: rerank.map(|(k, _)| k),
-                rerank_provider: rerank.map(|(_, p)| p),
-            },
-            &crate::RerankRequestContext::default(),
-            embedding_binding.as_ref(),
-        )
-        .map_err(|_| anyhow::anyhow!("REGRESSION_SEARCH_EVIDENCE_FAILED"))?;
+            &SearchFilters::default(), *search_mode, vector_search_mode.unwrap_or_default(),
+            *rrf_limit as usize, None, &semantic, &crate::RerankRequestContext::default(), embedding_binding.as_ref(),
+        ).map_err(|_| anyhow::anyhow!("REGRESSION_SEARCH_EVIDENCE_FAILED"))?;
         Ok(Self {
             validated,
             context,
@@ -151,11 +141,39 @@ impl RegressionSearchRun {
             n: *rrf_limit as usize,
             request,
             rerank,
+            semantic,
+            query_driver,
+            query_attempt_start: std::cell::Cell::new(0),
             endpoint,
         })
     }
 
+    pub(crate) fn embedding_cost(&self, whole_run: bool) -> Option<Value> {
+        let driver = self.query_driver.as_ref()?;
+        let attempts = driver.attempts();
+        let start = if whole_run { 0 } else { self.query_attempt_start.get() };
+        let calls = &attempts[start..];
+        let attempted = calls.iter().filter(|c| c.network_attempted).count();
+        let responses = calls.iter().filter(|c| c.http_status.is_some()).count();
+        Some(json!({"scope":"embedding-http", "http_attempts":attempted,
+            "http_response_observed":responses, "delivery_unknown":attempted.saturating_sub(responses),
+            "model_executions": if attempted == 0 { Some(0) } else { None::<usize> },
+            "basis": if attempted == 0 { "not-called" } else { "observed-client" }}))
+    }
+
+    pub(crate) fn persist_embedding_calls(&self) -> Result<()> {
+        if let Some(driver) = &self.query_driver {
+            let calls: Vec<_> = driver.attempts().iter().map(crate::search::rerank::window::ApiWindowAttempt::from).collect();
+            super::off::write_private(&self.validated.paths.run_root, "api-embedding-calls.json", &json!({
+                "schema":"cass.regression-api-embedding-calls.v1", "calls":calls,
+                "model_executions":null,
+            }))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn search_window(&self, query: &str) -> Result<RawSearchWindow> {
+        self.query_attempt_start.set(self.query_driver.as_ref().map(|d| d.attempts().len()).unwrap_or(0));
         let identity_start = Instant::now();
         let before =
             crate::search::rerank::window::capture_index_stamp_for_regression(&self.context)?;
@@ -261,6 +279,17 @@ pub(crate) fn validate_retrieval(
         bail!("REGRESSION_INVALID_OFF_SCORE");
     }
     Ok(())
+}
+
+pub(crate) fn run_with_api_config(command: &RegressionCommand, path: Option<&std::path::Path>) -> Result<Value> {
+    let mut command = command.clone();
+    match &mut command {
+        RegressionCommand::FullSearch { api, .. } | RegressionCommand::FixedCandidate { api, .. } => {
+            if let Some(path) = path { api.config_path = Some(path.to_path_buf()); }
+        }
+        _ => {}
+    }
+    run(&command)
 }
 
 pub(crate) fn run(command: &RegressionCommand) -> Result<Value> {
@@ -379,6 +408,7 @@ pub(crate) fn error_code(error: &anyhow::Error) -> &'static str {
         return code;
     }
     const CODES: &[&str] = &[
+        "REGRESSION_MODEL_API_MIGRATION", "ModelApiConfiguration", "ModelApiMigration",
         "AGGREGATE_INPUT_MISSING",
         "AGGREGATE_GENERATION_CHANGED",
         "AGGREGATE_POLICY_CHANGED",

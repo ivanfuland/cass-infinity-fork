@@ -22,7 +22,26 @@
 //! Neither the bearer token nor any response body, query or document text can
 //! reach an error value or a log line: [`RerankError`] carries only a short code
 //! and an optional status, and this module emits no tracing.
+//!
+//! # Two entry points, one transport
+//!
+//! [`HttpTransport::get_json`] and [`HttpTransport::post_json`] take a rooted
+//! request path and join it onto the base origin. The API-only model client
+//! instead holds a *complete* endpoint URL whose path the operator wrote, so it
+//! uses [`HttpTransport::get_json_target`] and
+//! [`HttpTransport::post_json_target`]: those take an absolute [`Url`], require
+//! it to be the same origin as the base, and send it exactly as parsed. Joining
+//! a configured path instead would reinterpret a leading `//` as a new
+//! authority and could send the body to a different host.
+//!
+//! The target entry points return [`TransportError`]: the in-memory
+//! [`TransportFailure`] the model client needs to decide whether one cloud
+//! attempt is allowed, together with the HTTP status the attempt actually
+//! observed. The path-based entry points keep returning [`RerankError`] and map
+//! every failure back onto the existing short codes, so the retired adapters
+//! are unaffected.
 
+use std::error::Error as StdError;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -59,6 +78,130 @@ pub struct HttpJson {
     pub body: Value,
 }
 
+/// The detail of one failed transport attempt, kept in memory only.
+///
+/// This is the classification the automatic cloud fallback reads. It is
+/// deliberately finer than [`RerankFailureReason`]: the routing contract only
+/// allows a second attempt for a connection refusal, an unreachable network, an
+/// interrupted connection, a connect or read timeout, and six HTTP statuses.
+/// Everything that cannot be attributed to one of those is
+/// [`Self::UnclassifiedTransport`], which the routing contract treats as "no
+/// fallback" rather than guessing.
+///
+/// The classification is drawn from typed error data only — a
+/// [`std::io::ErrorKind`] found by walking the `source` chain, or
+/// `reqwest::Error::is_timeout` — never from an error message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailure {
+    /// A connect or read wait exceeded its budget.
+    Timeout,
+    /// No connection could be established because the peer refused it.
+    ConnectionRefused,
+    /// An established connection broke or closed unexpectedly.
+    ConnectionInterrupted,
+    /// The network or the target host is not reachable.
+    NetworkUnavailable,
+    /// The service answered with a non-success HTTP status.
+    HttpStatus(u16),
+    /// The request was refused by our own validation before it was sent.
+    InvalidInput,
+    /// The response was unreadable, malformed, oversized or non-UTF-8.
+    InvalidResponse,
+    /// A transport problem this build cannot classify reliably.
+    UnclassifiedTransport,
+}
+
+impl TransportFailure {
+    /// The stable short code recorded on an attempt.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ConnectionRefused => "connection_refused",
+            Self::ConnectionInterrupted => "connection_interrupted",
+            Self::NetworkUnavailable => "network_unavailable",
+            Self::HttpStatus(_) => "http_status",
+            Self::InvalidInput => "invalid_input",
+            Self::InvalidResponse => "invalid_response",
+            Self::UnclassifiedTransport => "unclassified_transport",
+        }
+    }
+
+    /// The HTTP status this failure observed, when it observed one.
+    pub const fn http_status(self) -> Option<u16> {
+        match self {
+            Self::HttpStatus(status) => Some(status),
+            _ => None,
+        }
+    }
+
+    /// Whether the request reached the service far enough to get a status.
+    pub const fn network_attempted(self) -> bool {
+        !matches!(self, Self::InvalidInput)
+    }
+
+    /// Map onto the short failure codes the retired adapters already use.
+    pub fn to_rerank_error(self) -> RerankError {
+        match self {
+            Self::Timeout => RerankError::new(RerankFailureReason::Timeout),
+            Self::HttpStatus(status) => {
+                RerankError::with_status(RerankFailureReason::HttpError, status)
+            }
+            Self::InvalidInput => RerankError::new(RerankFailureReason::InvalidInput),
+            Self::InvalidResponse => RerankError::new(RerankFailureReason::InvalidResponse),
+            Self::ConnectionRefused
+            | Self::ConnectionInterrupted
+            | Self::NetworkUnavailable
+            | Self::UnclassifiedTransport => RerankError::new(RerankFailureReason::TransportError),
+        }
+    }
+}
+
+/// A failed transport attempt: its routing classification plus the HTTP status
+/// the attempt actually observed, when it observed one.
+///
+/// The two travel together on purpose. A read that times out after a `200`
+/// answer is a timeout for routing purposes but the service did answer, and a
+/// malformed body after a `200` is an invalid response — never a fallback
+/// trigger — while the status stays on the record so the failure is not
+/// misreported as "the service was never reached".
+///
+/// The classification alone decides fallback eligibility; the observed status
+/// is evidence, not routing input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportError {
+    failure: TransportFailure,
+    http_status: Option<u16>,
+}
+
+impl TransportError {
+    /// A failure with the status the attempt observed, if any.
+    pub const fn new(failure: TransportFailure, http_status: Option<u16>) -> Self {
+        Self {
+            failure,
+            http_status,
+        }
+    }
+
+    /// The routing classification.
+    pub const fn failure(self) -> TransportFailure {
+        self.failure
+    }
+
+    /// The observed HTTP status, when a response was actually read.
+    pub const fn http_status(self) -> Option<u16> {
+        self.http_status
+    }
+
+    /// Map onto the short failure codes the retired adapters already use.
+    ///
+    /// The mapping is exactly [`TransportFailure::to_rerank_error`], so the
+    /// path-based entry points keep the byte-for-byte behaviour they had before
+    /// the status field existed.
+    pub fn to_rerank_error(self) -> RerankError {
+        self.failure.to_rerank_error()
+    }
+}
+
 /// The shared blocking HTTP transport.
 ///
 /// The struct holds the bearer token, so it deliberately implements neither
@@ -80,6 +223,21 @@ impl HttpTransport {
     /// not resolve to loopback is [`RerankFailureReason::NonLoopbackEndpoint`];
     /// it is refused here, before any request exists.
     pub fn new(config: HttpConfig, bearer: Option<String>) -> Result<Self, RerankError> {
+        Self::build(config, bearer, None)
+    }
+
+    /// Build the transport, optionally trusting one extra PEM-encoded root.
+    ///
+    /// `extra_root` is `None` on every production path: the only caller that
+    /// passes one is the test-only constructor below, which exists so a
+    /// loopback TLS fixture can be connected to for real. There is no runtime
+    /// switch anywhere that disables verification or adds an operator-supplied
+    /// CA.
+    fn build(
+        config: HttpConfig,
+        bearer: Option<String>,
+        extra_root: Option<&[u8]>,
+    ) -> Result<Self, RerankError> {
         if config.timeout.is_zero()
             || config.connect_timeout.is_zero()
             || config.max_response_bytes == 0
@@ -100,6 +258,11 @@ impl HttpTransport {
             .retry(reqwest::retry::never())
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout);
+
+        if let Some(pem) = extra_root {
+            let certificate = reqwest::Certificate::from_pem(pem).map_err(|_| invalid_input())?;
+            builder = builder.add_root_certificate(certificate);
+        }
 
         if config.local_only && host_is_localhost_domain(&base) {
             // Pin the only permitted DNS name to loopback and the base port so
@@ -124,43 +287,129 @@ impl HttpTransport {
         })
     }
 
-    pub(crate) fn with_trace(mut self, trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>) -> Self {
+    pub(crate) fn with_trace(
+        mut self,
+        trace: std::sync::Arc<std::sync::Mutex<crate::search::regression_trace::RequestTrace>>,
+    ) -> Self {
         self.trace = Some(trace);
         self
     }
 
-    fn record_attempt(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Option<usize>, RerankError> {
-        self.trace.as_ref().map(|trace| {
-            trace.lock().map_err(|_| invalid_input())?.begin(method, path, body)
-        }).transpose()
+    /// Test-only: trust one additional PEM-encoded CA for this transport.
+    ///
+    /// This is the only way a test can connect to the loopback TLS fixture with
+    /// a certificate the public trust store does not know. It is compiled only
+    /// under `cfg(test)`, so no production build has a switch that widens trust.
+    #[cfg(test)]
+    pub fn new_with_test_root(
+        config: HttpConfig,
+        bearer: Option<String>,
+        ca_pem: &[u8],
+    ) -> Result<Self, RerankError> {
+        Self::build(config, bearer, Some(ca_pem))
+    }
+
+    fn record_attempt(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Option<usize>, RerankError> {
+        self.trace
+            .as_ref()
+            .map(|trace| {
+                trace
+                    .lock()
+                    .map_err(|_| invalid_input())?
+                    .begin(method, path, body)
+            })
+            .transpose()
     }
 
     /// Send one `GET` to `path` (a rooted, same-origin request path).
     pub fn get_json(&self, path: &str) -> Result<HttpJson, RerankError> {
         let target = self.resolve_target(path)?;
-        let mut req = self.client.get(target);
-        if let Some(auth) = &self.auth {
-            req = req.header(AUTHORIZATION, auth.clone());
-        }
-        let trace_index = self.record_attempt("GET", path, None)?;
-        let resp = req.send().map_err(classify_send_error)?;
-        self.finish(resp, trace_index)
+        self.send("GET", target, path, None)
+            .map_err(TransportError::to_rerank_error)
     }
 
     /// Send one `POST` to `path` with `body` as a JSON payload.
     pub fn post_json(&self, path: &str, body: &Value) -> Result<HttpJson, RerankError> {
         let target = self.resolve_target(path)?;
-        let mut req = self.client.post(target).json(body);
+        self.send("POST", target, path, Some(body))
+            .map_err(TransportError::to_rerank_error)
+    }
+
+    /// Send one `GET` to the absolute `target` URL.
+    ///
+    /// `target` must be the same origin as this transport's base and carry no
+    /// query or fragment. The parsed URL is sent exactly as it stands, so a
+    /// configured path that keeps a leading `//`, a literal `@` or a
+    /// percent-encoded byte reaches the service unchanged.
+    pub fn get_json_target(&self, target: &Url) -> Result<HttpJson, TransportError> {
+        self.same_origin_target(target)?;
+        let trace_path = target.path().to_string();
+        self.send("GET", target.clone(), &trace_path, None)
+    }
+
+    /// Send one `POST` to the absolute `target` URL with `body` as its payload.
+    ///
+    /// This is [`Self::get_json_target`]'s POST twin, and the entry point the
+    /// API-only model client uses: it never re-joins or reinterprets the path.
+    pub fn post_json_target(&self, target: &Url, body: &Value) -> Result<HttpJson, TransportError> {
+        self.same_origin_target(target)?;
+        let trace_path = target.path().to_string();
+        self.send("POST", target.clone(), &trace_path, Some(body))
+    }
+
+    /// Refuse a target that is not this base's origin, or that carries a query
+    /// or fragment no service endpoint may have.
+    fn same_origin_target(&self, target: &Url) -> Result<(), TransportError> {
+        if target.scheme() != self.base.scheme()
+            || target.host_str() != self.base.host_str()
+            || target.port_or_known_default() != self.base.port_or_known_default()
+            || target.username() != self.base.username()
+            || target.password() != self.base.password()
+            || target.query().is_some()
+            || target.fragment().is_some()
+        {
+            return Err(TransportError::new(TransportFailure::InvalidInput, None));
+        }
+        Ok(())
+    }
+
+    /// The single send path both entry points share: one request, one bounded
+    /// read, and a [`TransportError`] for every way it can fail.
+    fn send(
+        &self,
+        method: &str,
+        target: Url,
+        trace_path: &str,
+        body: Option<&Value>,
+    ) -> Result<HttpJson, TransportError> {
+        let mut req = if method == "POST" {
+            self.client.post(target).json(body.unwrap_or(&Value::Null))
+        } else {
+            self.client.get(target)
+        };
         if let Some(auth) = &self.auth {
             req = req.header(AUTHORIZATION, auth.clone());
         }
-        let trace_index = self.record_attempt("POST", path, Some(body))?;
-        let resp = req.send().map_err(classify_send_error)?;
+        let trace_index = self
+            .record_attempt(method, trace_path, body)
+            .map_err(|_| TransportError::new(TransportFailure::InvalidInput, None))?;
+        let resp = req
+            .send()
+            .map_err(|err| TransportError::new(classify_send_failure(&err), None))?;
         self.finish(resp, trace_index)
     }
 
     /// Validate `path` and join it onto the base origin, proving the result is
     /// still that same origin.
+    ///
+    /// Only the path-based entry points use this. A configured endpoint is sent
+    /// through [`Self::post_json_target`] precisely because joining its path
+    /// could reinterpret a leading `//` as a new authority.
     fn resolve_target(&self, path: &str) -> Result<Url, RerankError> {
         validate_request_path(path)?;
         let target = self.base.join(path).map_err(|_| invalid_input())?;
@@ -177,31 +426,47 @@ impl HttpTransport {
     }
 
     /// Classify a sent response: status gate, then a bounded streaming read.
-    fn finish(&self, resp: reqwest::blocking::Response, trace_index: Option<usize>) -> Result<HttpJson, RerankError> {
+    fn finish(
+        &self,
+        resp: reqwest::blocking::Response,
+        trace_index: Option<usize>,
+    ) -> Result<HttpJson, TransportError> {
         let status = resp.status();
+        let observed = status.as_u16();
         if let (Some(trace), Some(index)) = (&self.trace, trace_index) {
-            trace.lock().map_err(|_| invalid_input())?.response(index, status.as_u16())?;
+            trace
+                .lock()
+                .map_err(|_| TransportError::new(TransportFailure::InvalidInput, Some(observed)))?
+                .response(index, observed)
+                .map_err(|_| TransportError::new(TransportFailure::InvalidInput, Some(observed)))?;
         }
         if !status.is_success() {
             // The body is intentionally not read: only the status is exposed.
-            return Err(RerankError::with_status(
-                RerankFailureReason::HttpError,
-                status.as_u16(),
+            return Err(TransportError::new(
+                TransportFailure::HttpStatus(observed),
+                Some(observed),
             ));
         }
 
+        // Every failure below happened *after* a real answer arrived, so the
+        // status stays on the record. The classification alone decides whether
+        // the failure may trigger a fallback.
         let limit = self.max_response_bytes;
         let mut body = Vec::new();
         resp.take(limit as u64 + 1)
             .read_to_end(&mut body)
-            .map_err(classify_read_error)?;
+            .map_err(|err| TransportError::new(classify_read_failure(err), Some(observed)))?;
         if body.len() > limit {
-            return Err(invalid_response());
+            return Err(TransportError::new(
+                TransportFailure::InvalidResponse,
+                Some(observed),
+            ));
         }
 
-        let value = serde_json::from_slice(&body).map_err(|_| invalid_response())?;
+        let value = serde_json::from_slice(&body)
+            .map_err(|_| TransportError::new(TransportFailure::InvalidResponse, Some(observed)))?;
         Ok(HttpJson {
-            status: status.as_u16(),
+            status: observed,
             body: value,
         })
     }
@@ -209,10 +474,6 @@ impl HttpTransport {
 
 fn invalid_input() -> RerankError {
     RerankError::new(RerankFailureReason::InvalidInput)
-}
-
-fn invalid_response() -> RerankError {
-    RerankError::new(RerankFailureReason::InvalidResponse)
 }
 
 /// Parse and validate the base URL into a bare origin.
@@ -294,30 +555,86 @@ fn build_auth_header(token: &str) -> Result<HeaderValue, RerankError> {
     Ok(value)
 }
 
-/// Classify a send failure. The status is unavailable here, so the envelope
+/// Classify a send failure. The status is unavailable here, so the failure
 /// never carries a body or a URL.
-fn classify_send_error(err: reqwest::Error) -> RerankError {
+///
+/// The classification is typed: `is_timeout` for the wait budget, then the first
+/// [`std::io::Error`] found by walking the `source` chain for the network case.
+/// `reqwest::Error::is_connect` is deliberately not consulted — it is true for a
+/// TLS handshake failure too, and the routing contract must not read that as a
+/// retryable network fault. No error message text is ever matched.
+fn classify_send_failure(err: &reqwest::Error) -> TransportFailure {
     if err.is_timeout() {
-        RerankError::new(RerankFailureReason::Timeout)
-    } else if err.is_builder() {
-        invalid_input()
-    } else {
-        RerankError::new(RerankFailureReason::TransportError)
+        return TransportFailure::Timeout;
+    }
+    if err.is_builder() {
+        return TransportFailure::InvalidInput;
+    }
+    match first_io_kind(err) {
+        Some(kind) => classify_io_kind(kind),
+        None => TransportFailure::UnclassifiedTransport,
     }
 }
 
 /// Classify a body-read failure. The blocking response wraps a `reqwest::Error`
-/// inside the `io::Error`, which is where the timeout classification lives.
-fn classify_read_error(err: std::io::Error) -> RerankError {
-    if err.kind() == std::io::ErrorKind::TimedOut {
-        return RerankError::new(RerankFailureReason::Timeout);
-    }
-    if let Some(inner) = err.get_ref().and_then(|e| e.downcast_ref::<reqwest::Error>())
-        && inner.is_timeout()
+/// inside the `io::Error`, which is where a timeout classification lives.
+fn classify_read_failure(err: std::io::Error) -> TransportFailure {
+    if let Some(inner) = err
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<reqwest::Error>())
     {
-        return RerankError::new(RerankFailureReason::Timeout);
+        if inner.is_timeout() {
+            return TransportFailure::Timeout;
+        }
+        if let Some(kind) = first_io_kind(inner) {
+            return classify_io_kind(kind);
+        }
     }
-    RerankError::new(RerankFailureReason::TransportError)
+    classify_io_kind(err.kind())
+}
+
+/// Walk the `source` chain of `err` and return the kind of the first
+/// [`std::io::Error`] on it.
+fn first_io_kind(err: &dyn StdError) -> Option<std::io::ErrorKind> {
+    let mut source: Option<&(dyn StdError + 'static)> = err.source();
+    while let Some(current) = source {
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        source = current.source();
+    }
+    None
+}
+
+/// Reduce an [`std::io::ErrorKind`] to the routing-relevant failure.
+///
+/// Anything outside the enumerated kinds is deliberately
+/// [`TransportFailure::UnclassifiedTransport`]: a TLS problem, a proxy
+/// rejection and anything else we cannot attribute are all "do not fall back"
+/// rather than "retry somewhere else".
+///
+/// `UnexpectedEof` is excluded on purpose. A peer that closes a connection
+/// mid-body produces it, but so does a service that answers with a truncated
+/// body — a response-structure failure that must never trigger a second
+/// attempt. The unambiguous interruption signals below cover the case the
+/// routing contract actually allows.
+fn classify_io_kind(kind: std::io::ErrorKind) -> TransportFailure {
+    use std::io::ErrorKind as Kind;
+    if kind == Kind::TimedOut {
+        TransportFailure::Timeout
+    } else if kind == Kind::ConnectionRefused {
+        TransportFailure::ConnectionRefused
+    } else if kind == Kind::NetworkUnreachable || kind == Kind::HostUnreachable {
+        TransportFailure::NetworkUnavailable
+    } else if kind == Kind::ConnectionReset
+        || kind == Kind::ConnectionAborted
+        || kind == Kind::BrokenPipe
+        || kind == Kind::NotConnected
+    {
+        TransportFailure::ConnectionInterrupted
+    } else {
+        TransportFailure::UnclassifiedTransport
+    }
 }
 
 #[cfg(test)]
@@ -368,9 +685,7 @@ mod tests {
         fn spawn(ip: IpAddr, behavior: Behavior) -> Server {
             let listener = TcpListener::bind(SocketAddr::new(ip, 0)).expect("bind fixture port");
             let addr = listener.local_addr().expect("fixture local_addr");
-            listener
-                .set_nonblocking(true)
-                .expect("fixture nonblocking");
+            listener.set_nonblocking(true).expect("fixture nonblocking");
             let hits = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
@@ -620,19 +935,35 @@ mod tests {
         transport.post_json("/rerank", &body).unwrap();
         let requests = server.requests();
         let request = &requests[0];
-        let split = request.windows(4).position(|bytes| bytes == b"\r\n\r\n").unwrap() + 4;
+        let split = request
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
         let wire: Value = serde_json::from_slice(&request[split..]).unwrap();
         let trace = trace.lock().unwrap();
         let evidence = &trace.requests[0];
-        assert_eq!(evidence.json_body_sha256.as_ref().unwrap(), &hex::encode(Sha256::digest(&request[split..])));
+        assert_eq!(
+            evidence.json_body_sha256.as_ref().unwrap(),
+            &hex::encode(Sha256::digest(&request[split..]))
+        );
         let query = wire["query"].as_str().unwrap();
-        assert_eq!(evidence.query.as_ref().unwrap().utf8_bytes, query.len() as u64);
-        assert_eq!(evidence.query.as_ref().unwrap().sha256, hex::encode(Sha256::digest(query.as_bytes())));
-        for (slot,value) in wire["documents"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(
+            evidence.query.as_ref().unwrap().utf8_bytes,
+            query.len() as u64
+        );
+        assert_eq!(
+            evidence.query.as_ref().unwrap().sha256,
+            hex::encode(Sha256::digest(query.as_bytes()))
+        );
+        for (slot, value) in wire["documents"].as_array().unwrap().iter().enumerate() {
             let text = value.as_str().unwrap();
             let actual = &evidence.documents.as_ref().unwrap()[slot];
             assert_eq!(actual.input_slot, slot);
-            assert_eq!(actual.text.sha256, hex::encode(Sha256::digest(text.as_bytes())));
+            assert_eq!(
+                actual.text.sha256,
+                hex::encode(Sha256::digest(text.as_bytes()))
+            );
             assert_eq!(actual.text.utf8_bytes, text.len() as u64);
         }
         assert_eq!(evidence.http_status, Some(200));
@@ -646,22 +977,27 @@ mod tests {
     #[test]
     fn regression_request_trace_distinguishes_http_failure_from_delivery_unknown() {
         use crate::search::regression_trace::RequestTrace;
-        let server = Server::ipv4(Behavior::Fixed(b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()));
+        let server = Server::ipv4(Behavior::Fixed(
+            b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        ));
         let trace = Arc::new(Mutex::new(RequestTrace::default()));
-        let transport = transport(&server.base(),true).with_trace(trace.clone());
+        let transport = transport(&server.base(), true).with_trace(trace.clone());
         let body = json!({"query":"synthetic", "documents":["one"]});
-        assert!(transport.post_json("/rerank",&body).is_err());
-        assert_eq!(trace.lock().unwrap().requests[0].http_status,Some(500));
-        assert_eq!(trace.lock().unwrap().model_requests,None);
+        assert!(transport.post_json("/rerank", &body).is_err());
+        assert_eq!(trace.lock().unwrap().requests[0].http_status, Some(500));
+        assert_eq!(trace.lock().unwrap().model_requests, None);
         let trace = Arc::new(Mutex::new(RequestTrace::default()));
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST,0)).unwrap();
-        let unused = listener.local_addr().unwrap(); drop(listener);
-        let transport = super::HttpTransport::new(config(&format!("http://{unused}"),true),None).unwrap().with_trace(trace.clone());
-        assert!(transport.post_json("/rerank",&body).is_err());
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let unused = listener.local_addr().unwrap();
+        drop(listener);
+        let transport = super::HttpTransport::new(config(&format!("http://{unused}"), true), None)
+            .unwrap()
+            .with_trace(trace.clone());
+        assert!(transport.post_json("/rerank", &body).is_err());
         let trace = trace.lock().unwrap();
-        assert_eq!(trace.requests.len(),1);
-        assert_eq!(trace.requests[0].state,"attempted-delivery-unknown");
-        assert_eq!(trace.requests[0].http_status,None);
+        assert_eq!(trace.requests.len(), 1);
+        assert_eq!(trace.requests[0].state, "attempted-delivery-unknown");
+        assert_eq!(trace.requests[0].http_status, None);
     }
 
     #[test]
@@ -669,10 +1005,17 @@ mod tests {
         use crate::search::regression_trace::RequestTrace;
         let server = Server::ipv4(Behavior::Fixed(ok_json("{}")));
         let trace = Arc::new(Mutex::new(RequestTrace::default()));
-        let transport = transport(&server.base(),true).with_trace(trace.clone());
-        assert!(transport.post_json("http://invalid.example/rerank",&json!({"query":"q","documents":["d"]})).is_err());
+        let transport = transport(&server.base(), true).with_trace(trace.clone());
+        assert!(
+            transport
+                .post_json(
+                    "http://invalid.example/rerank",
+                    &json!({"query":"q","documents":["d"]})
+                )
+                .is_err()
+        );
         assert!(trace.lock().unwrap().requests.is_empty());
-        assert_eq!(server.hits(),0);
+        assert_eq!(server.hits(), 0);
     }
 
     #[test]
@@ -690,7 +1033,10 @@ mod tests {
         let t = transport(&server.base(), true);
         t.get_json("/probe").unwrap();
         let text = String::from_utf8_lossy(&server.requests()[0]).to_ascii_lowercase();
-        assert!(!text.contains("authorization:"), "unexpected header: {text}");
+        assert!(
+            !text.contains("authorization:"),
+            "unexpected header: {text}"
+        );
     }
 
     #[test]
@@ -806,31 +1152,19 @@ mod tests {
 
         let mut c = config(base, true);
         c.timeout = Duration::ZERO;
-        assert_eq!(
-            refused(c, None).reason,
-            RerankFailureReason::InvalidInput
-        );
+        assert_eq!(refused(c, None).reason, RerankFailureReason::InvalidInput);
 
         let mut c = config(base, true);
         c.connect_timeout = Duration::ZERO;
-        assert_eq!(
-            refused(c, None).reason,
-            RerankFailureReason::InvalidInput
-        );
+        assert_eq!(refused(c, None).reason, RerankFailureReason::InvalidInput);
 
         let mut c = config(base, true);
         c.max_response_bytes = 0;
-        assert_eq!(
-            refused(c, None).reason,
-            RerankFailureReason::InvalidInput
-        );
+        assert_eq!(refused(c, None).reason, RerankFailureReason::InvalidInput);
 
         let mut c = config(base, true);
         c.max_response_bytes = usize::MAX;
-        assert_eq!(
-            refused(c, None).reason,
-            RerankFailureReason::InvalidInput
-        );
+        assert_eq!(refused(c, None).reason, RerankFailureReason::InvalidInput);
     }
 
     #[test]
@@ -847,7 +1181,11 @@ mod tests {
             "/frag#ment",
         ] {
             let err = t.get_json(path).unwrap_err();
-            assert_eq!(err.reason, RerankFailureReason::InvalidInput, "path {path:?}");
+            assert_eq!(
+                err.reason,
+                RerankFailureReason::InvalidInput,
+                "path {path:?}"
+            );
         }
         assert_eq!(server.hits(), 0, "no request may be sent for a bad path");
     }
@@ -873,13 +1211,21 @@ mod tests {
         assert_eq!(err.reason, RerankFailureReason::HttpError);
         assert_eq!(err.http_status, Some(302));
         assert_eq!(first.hits(), 1);
-        assert_eq!(second.hits(), 0, "the redirect target must not be contacted");
+        assert_eq!(
+            second.hits(),
+            0,
+            "the redirect target must not be contacted"
+        );
     }
 
     #[test]
     fn oversized_body_with_content_length_is_refused() {
         let big = oversized_json(200);
-        let server = Server::ipv4(Behavior::Fixed(response_with("200 OK", &big, Some(big.len()))));
+        let server = Server::ipv4(Behavior::Fixed(response_with(
+            "200 OK",
+            &big,
+            Some(big.len()),
+        )));
         let t = HttpTransport::new(
             config_limits(&server.base(), true, Duration::from_secs(5), 64),
             None,
@@ -938,13 +1284,17 @@ mod tests {
         assert_eq!(err.reason, RerankFailureReason::HttpError);
         assert_eq!(err.http_status, Some(500));
         assert!(!format!("{err}").contains(FAKE_SECRET));
-        assert_eq!(server.hits(), 1, "a failed receive is attempted at most once");
+        assert_eq!(
+            server.hits(),
+            1,
+            "a failed receive is attempted at most once"
+        );
     }
 
     #[test]
     fn stalled_read_fails_with_timeout_short_code() {
-        let head =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: keep-alive\r\n\r\n".to_vec();
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: keep-alive\r\n\r\n"
+            .to_vec();
         let server = Server::ipv4(Behavior::Stall { head });
         let t = HttpTransport::new(
             config_limits(
@@ -1006,5 +1356,127 @@ mod tests {
             "the real target must have served the request"
         );
         assert_eq!(proxy.hits(), 0, "no request may reach the configured proxy");
+    }
+
+    // ------------------------------------------------------------------
+    // C3 — the absolute-target entry points and the detailed classification.
+    // ------------------------------------------------------------------
+
+    use crate::search::model_api::test_support::{HttpFixture, Reply};
+
+    #[test]
+    fn the_target_entry_point_sends_the_configured_path_verbatim() {
+        // A configured endpoint keeps whatever path the operator wrote. Joining
+        // that path onto a base origin would read a leading `//` as a new
+        // authority, so the target is sent exactly as parsed.
+        let fixture = HttpFixture::ok();
+        let t = transport(&fixture.base(), true);
+        let target = fixture.url("//a@b%41c");
+        let got = t.post_json_target(&target, &json!({"k": 1})).expect("post");
+        assert_eq!(got.status, 200);
+        assert_eq!(fixture.hits(), 1);
+        assert_eq!(fixture.requests()[0].target(), "//a@b%41c");
+    }
+
+    #[test]
+    fn the_target_entry_point_refuses_a_foreign_origin() {
+        let served = HttpFixture::ok();
+        let other = HttpFixture::ok();
+        let t = transport(&served.base(), true);
+        let target = Url::parse(&format!("http://127.0.0.1:{}/x", other.addr().port()))
+            .expect("foreign url");
+        let failure = t.post_json_target(&target, &json!({})).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::InvalidInput);
+        assert_eq!(failure.http_status(), None);
+        assert_eq!(served.hits(), 0);
+        assert_eq!(other.hits(), 0);
+    }
+
+    #[test]
+    fn the_target_entry_point_refuses_a_query_or_fragment() {
+        let fixture = HttpFixture::ok();
+        let t = transport(&fixture.base(), true);
+        assert_eq!(
+            t.get_json_target(&fixture.url("/x?y=1"))
+                .unwrap_err()
+                .failure(),
+            TransportFailure::InvalidInput
+        );
+        assert_eq!(
+            t.get_json_target(&fixture.url("/x#f"))
+                .unwrap_err()
+                .failure(),
+            TransportFailure::InvalidInput
+        );
+        assert_eq!(fixture.hits(), 0);
+    }
+
+    #[test]
+    fn a_refused_connection_is_classified_as_connection_refused() {
+        let refused = HttpFixture::refused_address();
+        let t = transport(&format!("http://{refused}"), true);
+        let target = Url::parse(&format!("http://{refused}/x")).expect("url");
+        let failure = t.post_json_target(&target, &json!({})).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::ConnectionRefused);
+        assert_eq!(failure.http_status(), None);
+    }
+
+    #[test]
+    fn a_non_success_status_is_classified_with_its_status() {
+        let fixture = HttpFixture::start(vec![Reply::status(503)]);
+        let t = transport(&fixture.base(), true);
+        let failure = t.get_json_target(&fixture.url("/x")).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::HttpStatus(503));
+        assert_eq!(failure.http_status(), Some(503));
+        assert!(TransportFailure::HttpStatus(503).http_status() == Some(503));
+        assert!(TransportFailure::HttpStatus(503).network_attempted());
+        assert!(!TransportFailure::InvalidInput.network_attempted());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_untrusted_certificate_is_unclassified_and_not_retryable() {
+        use crate::search::model_api::test_support::TlsFixture;
+        let tls = TlsFixture::start(vec![Reply::ok(json!({"ok": true}))]);
+        let t = HttpTransport::new(
+            HttpConfig {
+                base_url: tls.base(),
+                local_only: true,
+                timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(10),
+                max_response_bytes: 64 * 1024 * 1024,
+            },
+            None,
+        )
+        .expect("transport");
+        let failure = t.get_json_target(&tls.url("/probe")).unwrap_err();
+        assert_eq!(failure.failure(), TransportFailure::UnclassifiedTransport);
+        assert_eq!(failure.http_status(), None);
+        assert!(
+            tls.fixture().hits() >= 1,
+            "a real handshake must have been attempted"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_test_root_connects_to_the_loopback_tls_fixture() {
+        use crate::search::model_api::test_support::TlsFixture;
+        let tls = TlsFixture::start(vec![Reply::ok(json!({"ok": true}))]);
+        let t = HttpTransport::new_with_test_root(
+            HttpConfig {
+                base_url: tls.base(),
+                local_only: true,
+                timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(10),
+                max_response_bytes: 64 * 1024 * 1024,
+            },
+            None,
+            tls.ca_pem(),
+        )
+        .expect("transport");
+        let got = t.get_json_target(&tls.url("/probe")).expect("tls get");
+        assert_eq!(got.status, 200);
+        assert_eq!(got.body, json!({"ok": true}));
     }
 }
