@@ -1085,6 +1085,9 @@
         }
       }
     },
+    "db_vector_domain": {
+      "type": "null"
+    },
     "derived_semantic_assets": {
       "type": "object",
       "properties": {

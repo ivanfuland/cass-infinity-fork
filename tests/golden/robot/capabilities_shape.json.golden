@@ -62,30 +62,7 @@
           "arguments": {
             "type": "array",
             "items": {
-              "type": "object",
-              "properties": {
-                "name": {
-                  "type": "string"
-                },
-                "description": {
-                  "type": "string"
-                },
-                "arg_type": {
-                  "type": "string"
-                },
-                "required": {
-                  "type": "boolean"
-                },
-                "default": {
-                  "type": "string"
-                },
-                "enum_values": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              }
+              "type": "unknown"
             }
           },
           "has_json_output": {

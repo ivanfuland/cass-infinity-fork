@@ -9,15 +9,16 @@
       "title": "Aider Chat: coding_agent_session_search",
       "snippet": "[RESULT_SNIPPET]",
       "content": "[RESULT_CONTENT]",
-      "score": 1.3554823398590088,
+      "score": 0.6599361300468445,
       "source_path": "[REPO]/.aider.chat.history.md",
       "agent": "aider",
       "workspace": "[REPO]",
-      "created_at": 1764619673394,
+      "created_at": null,
       "line_number": 2,
       "match_type": "exact",
       "source_id": "local",
-      "origin_kind": "local"
+      "origin_kind": "local",
+      "message_id": 2
     }
   ],
   "max_tokens": null,

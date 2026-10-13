@@ -195,6 +195,93 @@ above is untouched by this change:
 - `robot_docs/schemas.txt.golden` — the same schema, rendered as text; purely
   additive.
 
+### API03K demo-archive rebuild and quarantine fixture path
+
+Two independent fixture defects kept eight `robot/*` cases red, and one of them
+had already frozen a wrong contract into the preceding refresh.
+
+**The quarantine fixture wrote where no reader looks.**
+`seed_diag_quarantine_fixture` based its layout on `data_dir.join("index")` and
+then took that path's *parent*, so `.lexical-publish-backups/` and
+`generation-quarantined/` landed directly under `<data_dir>/`. Every quarantine
+surface instead resolves `expected_index_dir(data_dir)` (`<data_dir>/index/v8`)
+first and takes **its** parent (`<data_dir>/index`) —
+`collect_diag_quarantine_report_inner` and `diag_lexical_manifest_scan_root` in
+`src/lib.rs`. The fixture now calls
+`coding_agent_search::indexer::expected_index_dir`, and the four tests that
+compare a full quarantine report — `diag_quarantine_json_matches_golden`,
+`doctor_quarantine_json_matches_golden`, `status_quarantine_json_matches_golden`
+and `status_quarantine_full_json_matches_golden` — assert the seeded totals — 2
+failed seed bundle files, 2 retained publish backups, 1 lexical generation with
+`build_state=failed` / `publish_state=quarantined` — **in addition to** their
+golden, so an empty report can never again be frozen as the contract.
+(`quarantine_summary_shape_matches_golden` consumes the same fixture but
+asserts only that the three surfaces agree on the summary schema; it is not one
+of the four.) `robot/diag_quarantine.json.golden` and
+`robot/quarantine_summary_shape.json.golden` returned to passing with no edit to
+those files, which is the independent evidence that the path was the whole
+defect.
+
+**The demo archive was frozen at a schema the CLI refuses.**
+`cass search` and `cass stats` happy-path cases read
+`tests/fixtures/search_demo_data`, whose `agent_search.db` still carries
+`user_version = 1`; `ensure_readonly_schema_current` rejects anything below
+`CURRENT_SCHEMA_VERSION`, so those four cases died before reaching their
+subject, and "fixing" it by raising `user_version` would have forged a rebuild
+that never happened. They now build their own archive under the temp HOME
+through today's production write path — `FrankenStorage::open` +
+`ensure_agent` / `ensure_workspace` / `insert_conversation_tree` — carrying the
+same logical corpus the checked-in fixture records (2 conversations, 6 messages,
+one `aider` agent, repo-root and `tests/fixtures/aider` workspaces, the same
+titles and timestamps). The checked-in fixture is untouched and remains the
+read-only historical record the other targets assert against.
+
+The search cases additionally need derived lexical assets, which the storage
+write path does not create, so they run `cass index --full` (lexical only, no
+`--semantic`) before searching, and pass a frozen version-1 model API
+configuration whose only profile points at a loopback HTTP service owned by the
+test. The default (hybrid-preferred) intent is kept: the configuration is
+valid, but no vector generation exists, so the search realises its visible
+lexical strategy and sends the service nothing
+(`model_api_stub_requests=[]` on every run). The loopback service is there so a
+request could never reach a real endpoint if one were made, and it records every
+request it answers.
+
+The helper also clears `RETIRED_MODEL_ENV_VARS` on the child process. That is
+environment hygiene, not a contract change: a model-dependent command refuses
+when any of those variables is present, the empty string included, so a
+developer or CI shell that still exports one would turn every search golden red
+for a reason unrelated to this repository. The ambient environment is not
+modified.
+
+Refreshed (only these moved):
+
+| Golden | What changed |
+|---|---|
+| `robot/capabilities_shape.json.golden` | `commands[0].arguments.items` becomes `{"type":"unknown"}`. |
+| `robot/doctor_shape.json.golden` | Adds `db_vector_domain` (`null`). |
+| `robot/health_shape.json.golden` | Adds `state.last_index` (7 all-null fields) and `state.db_vector_domain`. |
+| `robot/diag_quarantine.json.golden` | Unchanged (it was never refreshed to the empty report). |
+| `robot/doctor_quarantine.json.golden` | Replaces the frozen empty report with the seeded one. |
+| `robot/status_quarantine.json.golden` | Same, on the `status` surface. |
+| `robot/status_quarantine_full.json.golden` | Same; its content is identical to the non-full one. |
+| `robot/search_robot.json.golden` | `score` re-derived over the rebuilt index; `created_at` becomes `null`; adds `message_id`. |
+| `robot/search_robot_shape.json.golden` | `created_at` becomes `{"type":"null"}` — this run observes only `null`, so the frozen type is exactly `null`, not "integer or null"; adds `message_id` (`integer`). |
+| `robot/stats_full_payload.json.golden` / `..._shape.json.golden` | Unchanged — the rebuilt archive reproduces the frozen envelope byte for byte. |
+
+Two of those hunks are behaviour, not drift, and are worth naming:
+
+- `created_at` is `null` because the default lexical path hydrates it as
+  `CAST(m.created_at AS INTEGER)` (`sqlite_fts5_message_hydrate_query`) with no
+  fallback, and every message in this corpus has a null `created_at`. The
+  previous non-null value came from the retired Tantivy generation. The
+  message-scan path *does* fall back to `conversations.started_at`
+  (`src/search/query.rs:4890`); the default path does not. Freezing `null` here
+  states what the binary does today; the asymmetry is reported, not repaired,
+  by this change.
+- `message_id` is the T9 chunk-domain provenance field the search goldens were
+  never refreshed for.
+
 ## Follow-ups
 
 Goldens still to add under bead u9osp scope (each needs its own

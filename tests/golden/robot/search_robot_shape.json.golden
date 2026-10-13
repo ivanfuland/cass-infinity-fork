@@ -43,7 +43,7 @@
             "type": "string"
           },
           "created_at": {
-            "type": "integer"
+            "type": "null"
           },
           "line_number": {
             "type": "integer"
@@ -56,6 +56,9 @@
           },
           "origin_kind": {
             "type": "string"
+          },
+          "message_id": {
+            "type": "integer"
           }
         }
       }
