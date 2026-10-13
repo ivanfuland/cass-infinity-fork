@@ -169,6 +169,32 @@ golden test against the real binary, so only the touched hunks moved:
 
 The pre-existing `robot/*` drift listed above is unchanged by this refresh.
 
+### API03I rerank machine schema
+
+`response_schema_rerank_meta()` declared 22 of the 23 fields a rerank window
+really emits: the `model_api` block an API-backed window carries was missing, so
+the published schema did not describe the binary's own output, and validating
+that output against it failed. The same function still enumerated the five
+retired `ProviderChoice` selections for
+`requested_provider`, although that field has held the operator's configured
+profile id since the API-only rerank replaced the local/OpenRouter backends.
+
+Only these two frozen outputs moved; the pre-existing `robot/*` drift listed
+above is untouched by this change:
+
+- `robot/introspect.json.golden` / `robot/introspect_shape.json.golden` — the
+  `search` schema's `_meta.rerank` (and its `search-rerank-meta` alias) gains
+  `model_api`, typed as `object` or `null` with `primary_profile`,
+  `realized_profile`, `fallback_used`, `fallback_reason` and `attempts[]`, whose
+  elements carry `profile`, `network_attempted`, `http_status`, `error_code`,
+  `duration_ms`, `response_model`, `response_revision`, `serving_provider` and an
+  optional `usage`. `requested_provider` loses its retired-provider `enum` and
+  becomes a pattern-constrained profile id. `actual_provider` keeps its nullable
+  legacy enum: the API-only path never proves a `ProviderChoice`, so it stays
+  `null` there.
+- `robot_docs/schemas.txt.golden` — the same schema, rendered as text; purely
+  additive.
+
 ## Follow-ups
 
 Goldens still to add under bead u9osp scope (each needs its own

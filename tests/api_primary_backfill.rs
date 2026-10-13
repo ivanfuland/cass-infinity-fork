@@ -3066,3 +3066,239 @@ fn semantic_watch_once_ingests_appended_events_and_reuses_api_generation() {
     assert_eq!(report["indexing_stats"]["model_api"]["primary_profile"], "local8");
     assert!(!service.requests().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The `_meta.rerank` machine schema against the real API window
+// ---------------------------------------------------------------------------
+
+/// The shipped machine schema for `_meta.rerank`.
+///
+/// It is read back from the binary's own discovery surface rather than from a
+/// copy of the source, so this guard covers what a caller actually receives
+/// from `cass introspect --json`.
+fn rerank_meta_schema() -> serde_json::Value {
+    let output = cass(&["introspect", "--json"], &[]);
+    let document = assert_success(&output);
+    let schemas = &document["response_schemas"];
+    let schema = schemas["search"]["properties"]["_meta"]["properties"]["rerank"].clone();
+    assert!(
+        schema.is_object(),
+        "introspect must publish the search rerank schema: {document}"
+    );
+    assert_eq!(
+        schemas["search-rerank-meta"], schema,
+        "both discovery paths must publish the same rerank schema"
+    );
+    schema
+}
+
+/// The JSON type name of a value, as a schema `type` spells it.
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Check one emitted object against a schema object: the same keys, all of them
+/// required, each value admitted by its declared type. The recursion reaches
+/// every nested object and every array element, so no declared-but-unchecked
+/// `{"type": "object"}` can hide a missing or mistyped field.
+fn assert_object_matches_schema(schema: &serde_json::Value, value: &serde_json::Value, path: &str) {
+    let emitted = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{path} must be an object, got {value}"));
+    let declared = schema["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{path}: schema has no properties: {schema}"));
+    let mut emitted_keys: Vec<&str> = emitted.keys().map(String::as_str).collect();
+    let mut declared_keys: Vec<&str> = declared.keys().map(String::as_str).collect();
+    emitted_keys.sort_unstable();
+    declared_keys.sort_unstable();
+    assert_eq!(
+        emitted_keys, declared_keys,
+        "{path}: the schema must name exactly the emitted fields"
+    );
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{path}: schema has no required list: {schema}"))
+        .iter()
+        .map(|key| key.as_str().expect("required entries are strings"))
+        .collect();
+    for key in &declared_keys {
+        assert!(
+            required.contains(key),
+            "{path}.{key} is always emitted, so it must be required"
+        );
+        let property = declared[*key]
+            .as_object()
+            .unwrap_or_else(|| panic!("{path}.{key}: property is not an object"));
+        let field = format!("{path}.{key}");
+        assert_value_matches_property(property, &emitted[*key], &field);
+    }
+}
+
+/// Check one emitted value against one declared property.
+fn assert_value_matches_property(
+    property: &serde_json::Map<String, serde_json::Value>,
+    value: &serde_json::Value,
+    path: &str,
+) {
+    let kinds: Vec<&str> = match &property["type"] {
+        serde_json::Value::String(name) => vec![name.as_str()],
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().expect("type entries are strings"))
+            .collect(),
+        other => panic!("{path}: property declares no type: {other}"),
+    };
+    let actual = json_type_name(value);
+    assert!(
+        kinds.contains(&actual),
+        "{path}: emitted {actual} is not one of {kinds:?}"
+    );
+    // A `pattern` constrains strings only. A `null` (or any other branch the
+    // type list admits) is already settled by the check above, so a nullable
+    // patterned field must not be rejected merely for holding `null`.
+    if let (Some(pattern), Some(text)) = (
+        property.get("pattern").and_then(|pattern| pattern.as_str()),
+        value.as_str(),
+    ) {
+        assert!(
+            regex::Regex::new(pattern).expect("schema pattern compiles").is_match(text),
+            "{path}: {text:?} does not satisfy the declared pattern {pattern:?}"
+        );
+    }
+    // An array's element schema lives under `items`, not `properties`; recursing
+    // through it is what makes the nested attempts (and their usage) checked
+    // rather than waved through by a bare `{"type": "array"}`. Like `pattern`,
+    // `items` applies only to the branch it describes: a `null` admitted by the
+    // type list has no elements to check.
+    if let Some(element) = property.get("items") {
+        if let Some(rows) = value.as_array() {
+            let element = element
+                .as_object()
+                .unwrap_or_else(|| panic!("{path}: items is not an object: {element}"));
+            for (index, row) in rows.iter().enumerate() {
+                assert_value_matches_property(element, row, &format!("{path}[{index}]"));
+            }
+        }
+    }
+    // The same applies to a nested object schema: it is checked only when an
+    // object was actually emitted.
+    if let Some(nested) = property.get("properties") {
+        if value.is_object() {
+            let wrapper = serde_json::json!({
+                "properties": nested,
+                "required": property.get("required").cloned().unwrap_or(serde_json::json!([])),
+            });
+            assert_object_matches_schema(&wrapper, value, path);
+        }
+    }
+}
+
+/// The machine schema must describe what a real API-backed window emits.
+///
+/// Both windows below come from a real `cass` process scoring real SQLite
+/// content through a real loopback service; the schema comes from the same
+/// binary's `introspect`. A schema that drops an emitted field, leaves one
+/// unrequired, or still whitelists the retired `ProviderChoice` selections
+/// fails here instead of at a caller.
+#[test]
+fn the_rerank_meta_schema_describes_the_real_api_window() {
+    let (_dir, data_dir) = scratch();
+    let _storage = build_db(&data_dir, &[
+        "synthetic document alpha with enough detail to score",
+        "synthetic document beta with other detail to score",
+        "synthetic document gamma with distinct detail to score",
+    ]);
+    let embed = Stub::start(healthy_responder(8, 0));
+    // The first scoring call reports a usage block and the second reports none,
+    // so the emitted `usage` field is really exercised on both its branches.
+    let stub = Stub::start(|request, call| {
+        let body = request.body_json();
+        let docs = body["documents"].as_array().expect("whole rerank document window");
+        let rows: Vec<_> = (0..docs.len()).map(|i| serde_json::json!({"index": i, "relevance_score": i as f64})).collect();
+        let mut reply = serde_json::json!({"model":"example/dynamic-reranker", "results":rows});
+        if call == 0 {
+            reply["usage"] = serde_json::json!({"prompt_tokens": 11, "total_tokens": 11, "cost": 0.0001});
+        }
+        (200, reply.to_string())
+    });
+    // Two operator-chosen profile ids. Neither is one of the retired
+    // `ProviderChoice` names, so a schema that still enumerates those five
+    // cannot accept both.
+    // The second id carries a dot, which is inside the configured profile-id
+    // vocabulary; the table header is quoted so TOML does not read the dot as a
+    // table separator.
+    let profiles = ["ranker", "ranker-north.2"];
+    let config = data_dir.join("models.toml");
+    let mut text = String::from("version=1\ndefault_embedding=\"local8\"\n");
+    for id in profiles {
+        text.push_str(&format!(
+            "[profiles.\"{id}\"]\nkind=\"rerank\"\nprotocol=\"rerank-json-v1\"\nscope=\"loopback\"\n\
+             endpoint=\"{}\"\nmodel=\"example/dynamic-reranker\"\nmodel_revision=\"r1\"\n",
+            stub.endpoint()
+        ));
+    }
+    text.push_str(&embedding_profile_block("local8", &embed.endpoint(), EMBED_MODEL, EMBED_REVISION, 64, ""));
+    fs::write(&config, &text).unwrap();
+    assert_success(&run_backfill(&data_dir, &config, None, &[]));
+
+    let schema = rerank_meta_schema();
+    assert_eq!(
+        schema["properties"]["requested_provider"].get("enum"), None,
+        "a profile id is operator-chosen, so the schema must not whitelist providers: {schema}"
+    );
+    assert_eq!(
+        schema["properties"]["model_api"]["type"],
+        serde_json::json!(["object", "null"]),
+        "the API evidence is optional on the wire: {schema}"
+    );
+
+    let search = |query: &str, id: &str| {
+        cass(&[
+            "search", query, "--mode", "lexical", "--json", "--robot-meta",
+            "--rerank", "--rrf-limit", "3", "--rerank-limit", "3", "--rerank-profile", id,
+            "--data-dir", data_dir.to_str().unwrap(), "--api-config", config.to_str().unwrap(),
+        ], &[])
+    };
+    let mut reported_usage = Vec::new();
+    for id in profiles {
+        let result = assert_success(&search("synthetic", id));
+        let meta = &result["_meta"]["rerank"];
+        assert_eq!(meta["applied"], true, "{result}");
+        assert_eq!(meta["requested_provider"], id, "{result}");
+        assert!(meta["model_api"].is_object(), "a scored window carries its API evidence: {result}");
+        let attempt = &meta["model_api"]["attempts"][0];
+        assert_eq!(attempt["profile"], id, "{result}");
+        reported_usage.push(attempt["usage"].clone());
+        assert_object_matches_schema(&schema, meta, "_meta.rerank");
+    }
+    assert_eq!(stub.requests().len(), 2, "one scoring call per profile");
+    // `usage` is optional on the wire: the service that reported it must show an
+    // object, and the one that reported nothing must show null — both admitted
+    // by the same declared field.
+    assert!(
+        reported_usage[0].is_object(),
+        "a reported usage block must survive to the window: {reported_usage:?}"
+    );
+    assert!(
+        reported_usage[1].is_null(),
+        "a service that reported no usage must not have one invented: {reported_usage:?}"
+    );
+
+    // The same command with nothing to score keeps a window whose API evidence
+    // is absent, so the schema's own `null` branch is exercised on real output
+    // rather than only on the type array.
+    let empty = assert_success(&search("no-synthetic-document-matches-this", &profiles[0]));
+    let meta = &empty["_meta"]["rerank"];
+    assert!(meta.is_object(), "an unscored window still renders its rerank meta: {empty}");
+    assert!(meta["model_api"].is_null(), "no call ran, so no evidence is claimed: {empty}");
+    assert_object_matches_schema(&schema, meta, "_meta.rerank");
+}

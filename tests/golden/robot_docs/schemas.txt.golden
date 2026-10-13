@@ -3122,6 +3122,7 @@ schemas: (auto-generated from contract)
         - first_model_requests: ?
         - http_requests: ?
         - http_status: ?
+        - model_api: ?
         - model_requests: ?
         - offset: integer
         - pagination_unavailable_reason: ?
@@ -3196,6 +3197,12 @@ schemas: (auto-generated from contract)
     - first_model_requests: ?
     - http_requests: ?
     - http_status: ?
+    - model_api: ?
+      - attempts: array
+      - fallback_reason: ?
+      - fallback_used: boolean
+      - primary_profile: string
+      - realized_profile: ?
     - model_requests: ?
     - offset: integer
     - pagination_unavailable_reason: ?

@@ -86446,6 +86446,132 @@ fn response_schema_root_cause_attribution() -> serde_json::Value {
     })
 }
 
+/// Schema for one configured model-API profile id.
+///
+/// A profile id is an operator-chosen name in the API-only configuration, not
+/// one of the legacy [`crate::search::rerank::types::ProviderChoice`]
+/// selections, so a fixed enum here would refuse every legal profile an
+/// operator writes. The constraint is the configuration's own rule
+/// (`search::model_api::config::is_valid_profile_id`: 1–64 bytes over
+/// `[A-Za-z0-9._-]`).
+fn response_schema_profile_id() -> serde_json::Value {
+    serde_json::json!({"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"})
+}
+
+/// The same schema, also admitting `null`: the wire field is optional even
+/// though every property inside it is required once it is present.
+fn response_schema_nullable(mut schema: serde_json::Value) -> serde_json::Value {
+    let mut kinds = match schema["type"].take() {
+        serde_json::Value::String(name) => vec![serde_json::Value::String(name)],
+        serde_json::Value::Array(items) => items,
+        other => unreachable!("schema type is a string or an array, got {other}"),
+    };
+    kinds.push(serde_json::Value::String("null".to_string()));
+    schema["type"] = serde_json::Value::Array(kinds);
+    schema
+}
+
+/// Require every property of a schema that describes a
+/// `#[serde(deny_unknown_fields)]` struct: such a struct always serializes all
+/// of its fields, so none of them is optional on the wire.
+fn require_all_properties(schema: &mut serde_json::Value) {
+    let keys: Vec<String> = schema["properties"]
+        .as_object()
+        .expect("schema properties")
+        .keys()
+        .cloned()
+        .collect();
+    schema["required"] = serde_json::json!(keys);
+}
+
+/// Usage one model-API stage reported, mirroring
+/// `search::model_api::runtime::CheckUsage`.
+fn response_schema_api_usage() -> serde_json::Value {
+    let tokens = serde_json::json!({"type": ["integer", "null"], "minimum": 0});
+    let mut schema = response_schema_object([
+        ("prompt_tokens", tokens.clone()),
+        ("input_tokens", tokens.clone()),
+        ("total_tokens", tokens.clone()),
+        ("completion_tokens", tokens.clone()),
+        ("output_tokens", tokens.clone()),
+        ("cost", serde_json::json!({"type": ["number", "null"]})),
+    ]);
+    require_all_properties(&mut schema);
+    schema
+}
+
+/// One model-API attempt recorded inside a window, mirroring
+/// `search::rerank::window::ApiWindowAttempt`.
+fn response_schema_api_window_attempt() -> serde_json::Value {
+    let mut schema = response_schema_object([
+        ("profile", response_schema_profile_id()),
+        (
+            "network_attempted",
+            serde_json::json!({"type": "boolean"}),
+        ),
+        (
+            "http_status",
+            serde_json::json!({"type": ["integer", "null"], "minimum": 100, "maximum": 599}),
+        ),
+        (
+            "error_code",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "duration_ms",
+            serde_json::json!({"type": "integer", "minimum": 0}),
+        ),
+        (
+            "response_model",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "response_revision",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "serving_provider",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "usage",
+            response_schema_nullable(response_schema_api_usage()),
+        ),
+    ]);
+    require_all_properties(&mut schema);
+    schema
+}
+
+/// The API-only rerank evidence a window carries, mirroring
+/// `search::rerank::window::ApiWindowRerank`. Absent (`null`) whenever the
+/// window was not produced by an API-backed rerank.
+fn response_schema_api_window_rerank() -> serde_json::Value {
+    let mut schema = response_schema_object([
+        ("primary_profile", response_schema_profile_id()),
+        (
+            "realized_profile",
+            serde_json::json!({
+                "type": ["string", "null"],
+                "pattern": "^[A-Za-z0-9._-]{1,64}$",
+            }),
+        ),
+        ("fallback_used", serde_json::json!({"type": "boolean"})),
+        (
+            "fallback_reason",
+            serde_json::json!({"type": ["string", "null"]}),
+        ),
+        (
+            "attempts",
+            serde_json::json!({
+                "type": "array",
+                "items": response_schema_api_window_attempt(),
+            }),
+        ),
+    ]);
+    require_all_properties(&mut schema);
+    schema
+}
+
 fn response_schema_rerank_meta() -> serde_json::Value {
     use crate::search::rerank::types::ProviderChoice;
     let providers = serde_json::json!([
@@ -86462,9 +86588,10 @@ fn response_schema_rerank_meta() -> serde_json::Value {
         .push(serde_json::Value::Null);
     let mut schema = response_schema_object([
         (
-            "requested_provider",
-            serde_json::json!({"type": "string", "enum": providers}),
+            "model_api",
+            response_schema_nullable(response_schema_api_window_rerank()),
         ),
+        ("requested_provider", response_schema_profile_id()),
         ("requested_model", serde_json::json!({"type": "string"})),
         (
             "actual_provider",
@@ -86532,7 +86659,7 @@ fn response_schema_rerank_meta() -> serde_json::Value {
             serde_json::json!({"type": ["integer", "null"], "minimum": 0}),
         );
     }
-    schema["required"] = serde_json::json!(properties.keys().cloned().collect::<Vec<_>>());
+    require_all_properties(&mut schema);
     schema
 }
 
