@@ -4451,7 +4451,7 @@ where
                 //    same transaction, resolving the parent rows here too (the
                 //    non-caching entry, so a rollback leaves no parent row and
                 //    no cached id behind).
-                let mut installs: Vec<(source_facts::SourceClaim, source_facts::SourceAwareInsertOutcome)> =
+                let mut installs: Vec<(source_facts::SourceClaim, Arc<source_facts::SourceAwareInsertOutcome>)> =
                     Vec::new();
                 // The safety pass's claims are the authoritative, fully
                 // resolved form of every declaration this input carries: they
@@ -4510,7 +4510,7 @@ where
                         crate::storage::sqlite::ensure_parent_rows_in_tx(tx, &conversation)
                             .map_err(SourceInstallError::Db)
                             .map_err(SourceIngestError::Install)?;
-                    let inserted = project(
+                    let inserted = Arc::new(project(
                         tx,
                         agent_id,
                         workspace_id,
@@ -4519,9 +4519,12 @@ where
                         item.ordinal,
                         &claims,
                     )
-                    .map_err(SourceIngestError::Install)?;
+                    .map_err(SourceIngestError::Install)?);
+                    // Every claim uses the same conversation result. A deep
+                    // clone here would retain the whole incoming vector once
+                    // per message, making the install use quadratic memory.
                     for claim in &claims {
-                        installs.push((claim.clone(), inserted.clone()));
+                        installs.push((claim.clone(), Arc::clone(&inserted)));
                     }
                     // The commit summary: per projection, the canonical
                     // messages this input *created*. A replay creates none, so

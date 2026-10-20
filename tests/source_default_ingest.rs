@@ -1043,6 +1043,86 @@ fn source_byte_pages_preserve_verified_reader_position() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn source_projection_keeps_conversation_outcomes_bounded() {
+    const MESSAGES: usize = 2048;
+    for connector in ["claude", "codex"] {
+        let fixture = Fixture::new();
+        let session = "40000000-0000-4000-8000-000000000002";
+        let mut lines = if connector == "codex" {
+            vec![codex_session(session, "unused", "unused")[0].clone()]
+        } else {
+            Vec::new()
+        };
+        for index in 0..MESSAGES {
+            let body = format!("Synthetic bounded conversation message {index}");
+            lines.push(if connector == "claude" {
+                serde_json::json!({
+                    "type": "user", "sessionId": session,
+                    "uuid": format!("bounded-message-{index}"),
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "message": {"role": "user", "content": body}
+                })
+            } else {
+                serde_json::json!({
+                    "type": "response_item", "timestamp": "2026-01-01T00:00:00Z",
+                    "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": body}]}
+                })
+            });
+        }
+        if connector == "claude" {
+            fixture.write_claude_session("-synthetic-bounded/session.jsonl", &lines);
+        } else {
+            fixture.write_codex_session("2026/01/rollout-bounded.jsonl", &lines);
+        }
+        let stdout = std::fs::File::create(fixture.path().join("index.stdout"))
+            .expect("create child stdout");
+        let stderr_path = fixture.path().join("index.stderr");
+        let stderr = std::fs::File::create(&stderr_path).expect("create child stderr");
+        let mut command = Command::new(cass_bin());
+        fixture.isolate(&mut command);
+        let mut child = command
+            .args(["index", "--full", "--json", "--data-dir"])
+            .arg(fixture.data_dir())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .expect("spawn bounded conversation ingest");
+        let status_path = format!("/proc/{}/status", child.id());
+        let mut peak_rss_kib = 0_u64;
+        let status = loop {
+            if let Ok(status) = std::fs::read_to_string(&status_path) {
+                if let Some(value) = status.lines().find_map(|line| {
+                    line.strip_prefix("VmHWM:")?
+                        .split_whitespace().next()?.parse::<u64>().ok()
+                }) {
+                    peak_rss_kib = peak_rss_kib.max(value);
+                }
+            }
+            if let Some(status) = child.try_wait().expect("poll child") {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "{connector}: {}",
+            std::fs::read_to_string(stderr_path).expect("read child stderr"));
+        let db = fixture.open_db();
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM messages"), MESSAGES as i64);
+        assert_eq!(complete_inputs(&db), 1);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM source_records WHERE frame_state = 'activated'"),
+            lines.len() as i64);
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM source_message_links WHERE authority = 'canonical'"),
+            MESSAGES as i64);
+        // This is an observation, not a child-process memory limit. A small
+        // conversation must not retain a full message-result vector per claim.
+        assert!(peak_rss_kib > 0, "{connector}: no child memory observation");
+        assert!(peak_rss_kib < 512 * 1024,
+            "{connector}: {MESSAGES} messages used {peak_rss_kib} KiB peak RSS");
+    }
+}
+
 #[test]
 fn default_watch_once() {
     let fixture = Fixture::new();

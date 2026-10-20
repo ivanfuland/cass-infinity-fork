@@ -513,7 +513,7 @@ mod activation {
         ClaimMappingState, EvidenceKind, ExtraStorageKind, FramingScan, IncomingStatus, IndexStep,
         InstallationClass,
         MergeFingerprint, OriginalBinding, OriginalBindingOutcome, OriginalInstallation,
-        ParseState, ProjectionDisposition, RecordMappingState, ReplayRejectReason, SafeDiagnostic,
+        ParseState, ProjectionDisposition, RecordMappingState, ReplayRejectField, ReplayRejectReason, SafeDiagnostic,
         SafePosition, SafetyState, Sha256Digest, WinnerRejectionEvidence,
         SourceActivationOutcome, SourceActivationRequest, SourceClaim, SourceFormat,
         SourceInputDeclaration, SourceInstallError, SourceReceiptMatch, SourceSafetyConfig,
@@ -2429,6 +2429,114 @@ mod activation {
             source_id: "local".to_string(),
             origin_host: None,
         }
+    }
+
+    #[test]
+    fn source_replay_keeps_distinct_extra_and_binds_exact_duplicates() {
+        let dir = scratch_dir("source-replay-full-extra");
+        let storage = open_fresh_db(&dir.join("agent_search.db"));
+        storage.raw().with_tx(TxMode::Immediate, |tx| {
+            tx.execute_batch("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude', 'Claude', 'agent', 0, 0);")?;
+            let input = verified_input();
+            let mut conv = projection_conversation(0, "same visible content", 1);
+            conv.messages[0].extra_json = serde_json::json!({"native": "first"});
+            let mut distinct = conv.messages[0].clone();
+            distinct.idx = 1;
+            distinct.extra_json = serde_json::json!({"native": "second"});
+            let mut duplicate = conv.messages[0].clone();
+            duplicate.idx = 2;
+            conv.messages.extend([distinct, duplicate]);
+            let result = storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            assert_eq!(result.incoming.iter().map(|v| v.status).collect::<Vec<_>>(),
+                vec![IncomingStatus::AcceptedNew, IncomingStatus::AcceptedNew, IncomingStatus::VerifiedReplay]);
+            let first = result.incoming[0].stored.as_ref().expect("first stored row");
+            let second = result.incoming[1].stored.as_ref().expect("distinct stored row");
+            let duplicate = result.incoming[2].stored.as_ref().expect("duplicate's actual row");
+            assert_ne!(first.original_message_id, second.original_message_id);
+            assert_eq!(duplicate.original_message_id, first.original_message_id);
+            assert_eq!(duplicate.stored_idx, 0);
+            let count: i64 = tx.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+            assert_eq!(count, 2);
+            Ok(())
+        }).expect("full source replay transaction");
+    }
+
+    #[test]
+    fn source_replay_shifted_idx_requires_one_actual_full_match() {
+        let dir = scratch_dir("source-replay-shifted");
+        let storage = open_fresh_db(&dir.join("agent_search.db"));
+        storage.raw().with_tx(TxMode::Immediate, |tx| {
+            tx.execute_batch("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude', 'Claude', 'agent', 0, 0);")?;
+            let input = verified_input();
+            let mut conv = projection_conversation(0, "repeated source event", 1);
+            conv.messages[0].extra_json = serde_json::json!({"native": "unchanged"});
+            let first = storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            conv.messages[0].idx = 7;
+            let replay = storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            assert_eq!(replay.incoming[0].status, IncomingStatus::VerifiedReplay);
+            assert_eq!(replay.incoming[0].stored.as_ref().unwrap().original_message_id,
+                first.incoming[0].stored.as_ref().unwrap().original_message_id);
+            assert_eq!(replay.incoming[0].stored.as_ref().unwrap().stored_idx, 0);
+            tx.execute_batch("INSERT INTO messages (conversation_id, idx, role, author, created_at, content, extra_json, extra_bin, excluded) SELECT conversation_id, 8, role, author, created_at, content, extra_json, extra_bin, excluded FROM messages WHERE idx = 0;")?;
+            conv.messages[0].idx = 17;
+            let ambiguous = storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            assert_eq!(ambiguous.incoming[0].status, IncomingStatus::Unresolved);
+            assert_eq!(ambiguous.incoming[0].reason, Some(ReplayRejectReason::AmbiguousStoredRows));
+            assert!(ambiguous.incoming[0].stored.is_none());
+            let count: i64 = tx.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+            assert_eq!(count, 2, "ambiguous candidates must not cause another insertion");
+            Ok(())
+        }).expect("shifted source replay transaction");
+    }
+
+    #[test]
+    fn source_replay_same_idx_different_extra_is_not_verified() {
+        let dir = scratch_dir("source-replay-extra-mismatch");
+        let storage = open_fresh_db(&dir.join("agent_search.db"));
+        storage.raw().with_tx(TxMode::Immediate, |tx| {
+            tx.execute_batch("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude', 'Claude', 'agent', 0, 0);")?;
+            let input = verified_input();
+            let mut conv = projection_conversation(0, "unchanged body", 1);
+            conv.messages[0].extra_json = serde_json::json!({"native": "first"});
+            storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            conv.messages[0].extra_json = serde_json::json!({"native": "changed"});
+            let result = storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            assert_eq!(result.incoming[0].status, IncomingStatus::Unresolved);
+            assert_eq!(result.incoming[0].reason,
+                Some(ReplayRejectReason::StoredFactMismatch(ReplayRejectField::ExtraSemanticDigest)));
+            assert!(result.incoming[0].stored.is_none());
+            Ok(())
+        }).expect("extra mismatch stays unresolved");
+    }
+
+    #[test]
+    fn source_replay_refuses_corrupt_or_trailing_stored_metadata() {
+        let dir = scratch_dir("source-replay-corrupt-extra");
+        let storage = open_fresh_db(&dir.join("agent_search.db"));
+        storage.raw().with_tx(TxMode::Immediate, |tx| {
+            tx.execute_batch("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude', 'Claude', 'agent', 0, 0);")?;
+            let input = verified_input();
+            let mut conv = projection_conversation(0, "stored source event", 1);
+            conv.messages[0].extra_json = serde_json::json!({"native": "same"});
+            storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[])
+                .map_err(storage_err)?;
+            let mut trailing = rmp_serde::to_vec_named(&conv.messages[0].extra_json).unwrap();
+            trailing.push(0xc0);
+            for bytes in [vec![0xc1], trailing] {
+                tx.execute("UPDATE messages SET extra_bin = ?1", &[Value::Blob(bytes)])?;
+                assert!(storage.install_conversation_projection_in_tx(tx, 1, None, &conv, input.input_key(), 0, &[]).is_err(),
+                    "a source replay must not use the legacy corrupt-data fallback");
+                let count: i64 = tx.query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))?;
+                assert_eq!(count, 1);
+            }
+            Ok(())
+        }).expect("corrupt metadata is rejected before replay");
     }
 
     #[test]

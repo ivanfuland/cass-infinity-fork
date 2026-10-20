@@ -4841,7 +4841,9 @@ fn collect_new_messages_for_existing_conversation<'a>(
         }
 
         let incoming_replay = replay_fingerprint_from_merge(&incoming_fingerprint);
-        if existing_replay_fingerprints.contains(&incoming_replay) {
+        // Source projections already selected full-metadata replays. A
+        // remaining event must not be dropped by the weaker legacy key.
+        if retained.is_none() && existing_replay_fingerprints.contains(&incoming_replay) {
             tracing::debug!(
                 conversation_id,
                 idx = msg.idx,
@@ -9066,6 +9068,7 @@ impl FrankenStorage {
                 defer_lexical_updates,
                 defer_analytics_updates,
                 None,
+                None,
             )
             .map_err(anyhow_error_into_storage_error)
         })?)
@@ -9092,11 +9095,14 @@ impl FrankenStorage {
         defer_lexical_updates: bool,
         defer_analytics_updates: bool,
         mut retained: Option<&mut Vec<RetainedIdxHit>>,
+        lookup_conv: Option<&Conversation>,
     ) -> Result<InsertOutcome> {
+                // Replay selection must not change which parent the complete
+                // source projection resolves to.
                 let existing = franken_find_existing_conversation_with_tail_by_key(
                     tx,
                     &conversation_key,
-                    Some(conv),
+                    Some(lookup_conv.unwrap_or(conv)),
                 )?;
                 if let Some(existing) = existing {
                     let outcome = self.franken_append_messages_with_tail_in_tx(
@@ -9231,7 +9237,7 @@ impl FrankenStorage {
                         continue;
                     }
                     let incoming_replay = message_replay_fingerprint(msg)?;
-                    if pending_replay_fingerprints.contains(&incoming_replay) {
+                    if retained.is_none() && pending_replay_fingerprints.contains(&incoming_replay) {
                         tracing::debug!(
                             conversation_id = conv_id,
                             idx = msg.idx,
@@ -9331,6 +9337,8 @@ impl FrankenStorage {
             .map_err(anyhow_error_into_source_install)?;
 
         let conversation_key = conversation_merge_key(agent_id, conv);
+        let (write_conv, replay_aliases) = source_projection_replay_inputs(tx, conv, &conversation_key)
+            .map_err(anyhow_error_into_source_install)?;
         // §9: the merge reports the same-`idx` retentions it actually took. The
         // projection turns each into a winner observation by reading that row
         // back here; the legacy entry points pass no sink and pay nothing.
@@ -9340,7 +9348,7 @@ impl FrankenStorage {
                 tx,
                 agent_id,
                 workspace_id,
-                conv,
+                write_conv.as_ref(),
                 conversation_key,
                 // §15#18: the source-aware path writes the derived state in
                 // full, inside the caller's transaction. It does not consult the
@@ -9348,6 +9356,7 @@ impl FrankenStorage {
                 false,
                 false,
                 Some(&mut retained_hits),
+                Some(conv),
             )
             .map_err(anyhow_error_into_source_install)?;
 
@@ -9457,8 +9466,22 @@ impl FrankenStorage {
                 author: candidate.author.clone(),
                 content_hash: hex::encode(candidate.content_hash),
             };
+            let stored_idx = match replay_aliases.get(&message.idx) {
+                Some(Some(idx)) => *idx,
+                Some(None) => {
+                    incoming.push(IncomingMessageBinding {
+                        incoming_final_message_idx: message.idx,
+                        status: IncomingStatus::Unresolved,
+                        candidate_match: Some(candidate_match),
+                        stored: None,
+                        reason: Some(ReplayRejectReason::AmbiguousStoredRows),
+                    });
+                    continue;
+                }
+                None => message.idx,
+            };
             let Some(stored) =
-                franken_source_stored_message(tx, outcome.conversation_id, message.idx)
+                franken_source_stored_message(tx, outcome.conversation_id, stored_idx)
                     .map_err(anyhow_error_into_source_install)?
             else {
                 incoming.push(IncomingMessageBinding {
@@ -9501,6 +9524,31 @@ impl FrankenStorage {
                         )),
                     });
                 }
+                continue;
+            }
+            // Candidate hashes only select a row. The actual stored body,
+            // metadata and exclusion marker must agree before it can bind.
+            let stored_extra = stored.strict_extra_value().map_err(anyhow_error_into_source_install)?;
+            let incoming_excluded = message.excluded.as_ref()
+                .map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
+            let stored_excluded = stored.excluded_marker().map_err(anyhow_error_into_source_install)?
+                .as_ref().map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
+            let mismatch = if stored.content != message.content {
+                Some(facts::ReplayRejectField::SafeContentSha256)
+            } else if message_extra_to_source_jsonl_line(&stored_extra)
+                != message_extra_to_source_jsonl_line(&message.extra_json) {
+                Some(facts::ReplayRejectField::ExtraSemanticDigest)
+            } else if stored_excluded != incoming_excluded {
+                Some(facts::ReplayRejectField::ExcludedSemanticDigest)
+            } else { None };
+            if let Some(field) = mismatch {
+                incoming.push(IncomingMessageBinding {
+                    incoming_final_message_idx: message.idx,
+                    status: IncomingStatus::Unresolved,
+                    candidate_match: Some(candidate_match),
+                    stored: None,
+                    reason: Some(ReplayRejectReason::StoredFactMismatch(field)),
+                });
                 continue;
             }
             let inserted = outcome.inserted_indices.contains(&message.idx);
@@ -12605,6 +12653,25 @@ struct SourceStoredMessage {
 }
 
 impl SourceStoredMessage {
+    /// Source binding must not use the legacy decoder's corrupt-data fallback.
+    fn strict_extra_value(&self) -> Result<serde_json::Value> {
+        if let Some(bytes) = self.extra_bin.as_deref().filter(|bytes| !bytes.is_empty()) {
+            let mut cursor = std::io::Cursor::new(bytes);
+            let value = {
+                let mut decoder = rmp_serde::Deserializer::new(&mut cursor);
+                <serde_json::Value as serde::Deserialize>::deserialize(&mut decoder)
+                    .context("invalid stored source message metadata")?
+            };
+            anyhow::ensure!(cursor.position() == bytes.len() as u64,
+                "trailing bytes in stored source message metadata");
+            Ok(value)
+        } else if let Some(text) = self.extra_json.as_deref() {
+            serde_json::from_str(text).context("invalid stored source message metadata")
+        } else {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
     /// The row's *own* merge fingerprint, recomputed from its own bytes.
     ///
     /// The legacy lookup substitutes the incoming fingerprint for same-`idx`
@@ -12683,6 +12750,104 @@ impl SourceStoredMessage {
     }
 }
 
+/// Replay identity for source projections. Legacy replay keys omit metadata.
+#[derive(PartialEq, Eq, Hash)]
+struct SourceReplayKey {
+    replay: MessageReplayFingerprint,
+    content_sha256: [u8; 32],
+    extra_sha256: Option<[u8; 32]>,
+    excluded_sha256: Option<[u8; 32]>,
+}
+
+impl SourceReplayKey {
+    fn new(
+        fingerprint: &MessageMergeFingerprint,
+        content: &str,
+        extra: &serde_json::Value,
+        excluded: Option<&crate::indexer::exclusion::ExcludedMarker>,
+    ) -> Self {
+        let hash = |text: &str| *crate::storage::source_facts::Sha256Digest::of(text.as_bytes()).as_bytes();
+        Self {
+            replay: replay_fingerprint_from_merge(fingerprint),
+            content_sha256: hash(content),
+            extra_sha256: message_extra_to_source_jsonl_line(extra).as_deref().map(hash),
+            excluded_sha256: excluded.map(|marker| hash(&marker.to_json_string())),
+        }
+    }
+}
+
+/// Select exact replays before the shared merge runs. A missing index may
+/// refer to one proven full match, several ambiguous matches, or a new event.
+fn source_projection_replay_inputs<'a>(
+    tx: &FrankenTransaction<'_>,
+    conv: &'a Conversation,
+    key: &PendingConversationKey,
+) -> Result<(Cow<'a, Conversation>, HashMap<i64, Option<i64>>)> {
+    let mut targets: HashMap<SourceReplayKey, Option<i64>> = HashMap::new();
+    let mut stored_indices = HashSet::new();
+    if let Some(existing) = franken_find_existing_conversation_with_tail_by_key(tx, key, Some(conv))? {
+        let mut after: Option<i64> = None;
+        loop {
+            let sql = if after.is_some() {
+                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded)
+                 FROM messages WHERE conversation_id = ?1 AND idx > ?2 ORDER BY idx LIMIT 256"
+            } else {
+                "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded)
+                 FROM messages WHERE conversation_id = ?1 AND idx >= ?2 ORDER BY idx LIMIT 256"
+            };
+            let page: Vec<SourceStoredMessage> = tx.query_all_map(
+                sql,
+                fparams![existing.id, after.unwrap_or(i64::MIN)],
+                source_stored_message_from_row,
+            )?;
+            if page.is_empty() { break; }
+            for stored in page {
+                after = Some(stored.idx);
+                stored_indices.insert(stored.idx);
+                let fingerprint = stored.merge_fingerprint()?;
+                let extra = stored.strict_extra_value()?;
+                let excluded = stored.excluded_marker()?;
+                let replay = SourceReplayKey::new(&fingerprint, &stored.content, &extra, excluded.as_ref());
+                targets.entry(replay).and_modify(|target| *target = None).or_insert(Some(stored.idx));
+            }
+        }
+    }
+    let mut aliases = HashMap::new();
+    for message in &conv.messages {
+        // Same-index retentions still go through the real legacy merge branch.
+        if stored_indices.contains(&message.idx) { continue; }
+        let fingerprint = message_merge_fingerprint(message)?;
+        let replay = SourceReplayKey::new(&fingerprint, &message.content, &message.extra_json, message.excluded.as_ref());
+        if let Some(target) = targets.get(&replay) {
+            aliases.insert(message.idx, *target);
+        } else {
+            targets.insert(replay, Some(message.idx));
+        }
+    }
+    let write = if aliases.is_empty() {
+        Cow::Borrowed(conv)
+    } else {
+        let mut write = conv.clone();
+        // Keep the full projection's derived time bounds when alias rows are
+        // omitted from the write set.
+        write.started_at = conversation_effective_started_at(conv);
+        write.ended_at = conversation_tail_ended_at_candidate(conv);
+        write.messages.retain(|message| !aliases.contains_key(&message.idx));
+        Cow::Owned(write)
+    };
+    Ok((write, aliases))
+}
+
+fn source_stored_message_from_row(row: &FrankenRow) -> std::result::Result<SourceStoredMessage, StorageError> {
+    Ok(SourceStoredMessage {
+        id: row.get_typed(0)?, idx: row.get_typed(1)?, role: row.get_typed(2)?,
+        author: row.get_typed(3)?, created_at: row.get_typed(4)?, content: row.get_typed(5)?,
+        extra_json: row.get_typed(6)?, extra_bin: row.get_typed(7)?,
+        extra_value: franken_read_message_extra_compat(row, 6, 7),
+        excluded_json: row.get_typed(8)?,
+    })
+}
+
 /// Read one stored message row by its `(conversation_id, idx)` key.
 fn franken_source_stored_message(
     tx: &FrankenTransaction<'_>,
@@ -12693,20 +12858,7 @@ fn franken_source_stored_message(
         "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded)
          FROM messages WHERE conversation_id = ?1 AND idx = ?2",
         fparams![conversation_id, idx],
-        |row| {
-            Ok(SourceStoredMessage {
-                id: row.get_typed(0)?,
-                idx: row.get_typed(1)?,
-                role: row.get_typed(2)?,
-                author: row.get_typed(3)?,
-                created_at: row.get_typed(4)?,
-                content: row.get_typed(5)?,
-                extra_json: row.get_typed(6)?,
-                extra_bin: row.get_typed(7)?,
-                extra_value: franken_read_message_extra_compat(row, 6, 7),
-                excluded_json: row.get_typed(8)?,
-            })
-        },
+        source_stored_message_from_row,
     )?)
 }
 
