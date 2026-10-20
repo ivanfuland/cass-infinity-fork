@@ -31,6 +31,22 @@ impl CodexConnector {
 }
 
 impl Connector for CodexConnector {
+    // `SourceReadFailure` carries the frozen inline recovery state (partial
+    // `Finish`, next cursor and diagnostic), so the error type is large by
+    // contract. The pinned trait signature fixes that layout; boxing it here
+    // would change the published interface.
+    #[allow(clippy::result_large_err)]
+    fn scan_source_aware(
+        &self,
+        sealed: &franken_agent_detection::SealedInputContext,
+        sink: &mut dyn franken_agent_detection::SourceMappingSink,
+    ) -> std::result::Result<
+        franken_agent_detection::SourceInputFinish,
+        franken_agent_detection::SourceReadFailure,
+    > {
+        self.inner.scan_source_aware(sealed, sink)
+    }
+
     fn detect(&self) -> DetectionResult {
         self.inner.detect()
     }

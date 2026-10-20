@@ -1,0 +1,422 @@
+{
+  "schema": "cass.scalar-r0-supplement/1",
+  "expected_origin": "Hand-authored by controller; numeric time strings follow normative v0.4, intentionally differ from frozen oracle. Alias malformed-call fallback is controller-defined internal API behavior. No product imports.",
+  "cases": [
+    {
+      "id": "single",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "ok",
+          "raw_ref": "/a"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": "ok",
+        "raw_ref": "/a"
+      }
+    },
+    {
+      "id": "valid-and-invalid",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "ok",
+          "raw_ref": "/a"
+        },
+        {
+          "field": "probe",
+          "status": "invalid",
+          "raw_ref": "/bad",
+          "reason": "bad_type"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "reason": "invalid_alias",
+        "refs": [
+          {
+            "status": "present",
+            "value": "ok",
+            "raw_ref": "/a"
+          },
+          {
+            "status": "invalid",
+            "raw_ref": "/bad",
+            "reason": "bad_type"
+          }
+        ]
+      }
+    },
+    {
+      "id": "conflict-before-invalid",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "ok",
+          "raw_ref": "/a"
+        },
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "other",
+          "raw_ref": "/b"
+        },
+        {
+          "field": "probe",
+          "status": "invalid",
+          "raw_ref": "/bad",
+          "reason": "bad_type"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "conflict",
+        "refs": [
+          {
+            "status": "present",
+            "value": "ok",
+            "raw_ref": "/a"
+          },
+          {
+            "status": "present",
+            "value": "other",
+            "raw_ref": "/b"
+          },
+          {
+            "status": "invalid",
+            "raw_ref": "/bad",
+            "reason": "bad_type"
+          }
+        ]
+      }
+    },
+    {
+      "id": "empty",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [],
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "reason": "invalid_alias"
+      }
+    },
+    {
+      "id": "wrong-field",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "ok",
+          "raw_ref": "/a"
+        },
+        {
+          "field": "other",
+          "status": "present",
+          "value": "ok",
+          "raw_ref": "/b"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "reason": "invalid_alias",
+        "refs": [
+          {
+            "status": "present",
+            "value": "ok",
+            "raw_ref": "/a"
+          },
+          {
+            "status": "present",
+            "value": "ok",
+            "raw_ref": "/b"
+          }
+        ]
+      }
+    },
+    {
+      "id": "already-conflict",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "conflict",
+          "refs": [
+            {
+              "status": "present",
+              "value": "ok",
+              "raw_ref": "/a"
+            },
+            {
+              "status": "present",
+              "value": "other",
+              "raw_ref": "/b"
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "reason": "invalid_alias",
+        "refs": [
+          {
+            "status": "conflict",
+            "refs": [
+              {
+                "status": "present",
+                "value": "ok",
+                "raw_ref": "/a"
+              },
+              {
+                "status": "present",
+                "value": "other",
+                "raw_ref": "/b"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "same-value-different-unit",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "1",
+          "raw_ref": "/a",
+          "unit": "count"
+        },
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "1",
+          "raw_ref": "/b"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "conflict",
+        "refs": [
+          {
+            "status": "present",
+            "value": "1",
+            "raw_ref": "/a",
+            "unit": "count"
+          },
+          {
+            "status": "present",
+            "value": "1",
+            "raw_ref": "/b"
+          }
+        ]
+      }
+    },
+    {
+      "id": "count-null-parent-no-unit",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "missing",
+          "raw_ref": "/a",
+          "reason": "null",
+          "unit": "count"
+        },
+        {
+          "field": "probe",
+          "status": "missing",
+          "raw_ref": "/b",
+          "reason": "null",
+          "unit": "count"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "missing",
+        "reason": "null",
+        "refs": [
+          {
+            "status": "missing",
+            "raw_ref": "/a",
+            "reason": "null",
+            "unit": "count"
+          },
+          {
+            "status": "missing",
+            "raw_ref": "/b",
+            "reason": "null",
+            "unit": "count"
+          }
+        ]
+      }
+    },
+    {
+      "id": "numeric-time-string-123",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"123\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unit_unproven"
+      }
+    },
+    {
+      "id": "numeric-time-string-1700000000",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1700000000\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unit_unproven"
+      }
+    },
+    {
+      "id": "numeric-time-string--1",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"-1\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unit_unproven"
+      }
+    },
+    {
+      "id": "numeric-time-string-1e3",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1e3\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unit_unproven"
+      }
+    },
+    {
+      "id": "negative-magnitude--18446744073709551616",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "-18446744073709551616",
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "negative_nonzero",
+        "unit": "count"
+      }
+    },
+    {
+      "id": "negative-magnitude--99999999999999999999",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "-99999999999999999999",
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "negative_nonzero",
+        "unit": "count"
+      }
+    },
+    {
+      "id": "negative-magnitude--100000000000000000000",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "-100000000000000000000",
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "out_of_domain",
+        "unit": "count"
+      }
+    },
+    {
+      "id": "unbounded-exponent-15",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "0e9999999999999999999999999999999999999999999999999999999999999999",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "raw_ref": "/probe",
+        "unit": "count",
+        "value": "0"
+      }
+    },
+    {
+      "id": "unbounded-exponent-16",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "1e9999999999999999999999999999999999999999999999999999999999999999",
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "unit": "count",
+        "reason": "out_of_domain"
+      }
+    },
+    {
+      "id": "unbounded-exponent-17",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "1e-9999999999999999999999999999999999999999999999999999999999999999",
+      "expected": {
+        "field": "probe",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "unit": "count",
+        "reason": "not_an_integer"
+      }
+    }
+  ]
+}

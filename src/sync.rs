@@ -525,6 +525,7 @@ fn execute(
         embedder: semantic_setup.profile_id().to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
+        source_safety_config: None,
     };
     report.index.started = true;
 

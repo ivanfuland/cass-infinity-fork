@@ -61,6 +61,7 @@ pub mod root_cause_taxonomy;
 pub mod search;
 pub mod search_defaults;
 pub mod source_doctor_health;
+pub mod source_export;
 pub mod source_onboarding;
 pub mod sources;
 pub mod storage;
@@ -439,6 +440,26 @@ pub enum Commands {
         /// Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection.
         #[arg(long, default_value_t = false)]
         robot_trace_ingest: bool,
+
+        /// A caller-supplied fixed copy of the exclusion configuration. When
+        /// given, Claude and Codex inputs take the source-aware path: the copy
+        /// is read and verified (ordinary non-symlink file, original UTF-8
+        /// path, four array keys present), its bytes are re-checked before
+        /// each input is activated, and the input's records, links and receipt
+        /// are written in one transaction. Other sources keep their original
+        /// path.
+        ///
+        /// Without this flag, Claude and Codex ingestion still uses the
+        /// source-aware path by default: the run discovers the live effective
+        /// rules once, freezes them into a content-addressed private copy
+        /// under the data directory, and reuses that one copy for the whole
+        /// run. This flag therefore only overrides that fixed copy with the
+        /// caller's explicit file. A `--no-ingest` run prepares no source
+        /// configuration at all. A supplied copy that is missing or broken is
+        /// a startup failure and never falls back to a live or implicit
+        /// configuration.
+        #[arg(long, value_name = "PATH")]
+        source_safety_config: Option<PathBuf>,
     },
     /// One incremental sync round: pull configured mirrors, ingest local
     /// sessions, drain the semantic domain, report once as JSON.
@@ -850,6 +871,21 @@ pub enum Commands {
         /// **`--recover` 与 `--qualify` 时都允许缺席**（同 `--scratch`，R4 第 8 条）。
         #[arg(long, required_unless_present_any = ["recover", "qualify"])]
         snapshot_root: Option<String>,
+
+        /// Task14：来源声明文件（`cass.restore-source-contexts/1`）。
+        ///
+        /// 首批来源（Claude Code / Codex）参与时必须为每个实际访问位置提供唯一声明；
+        /// 纯 legacy 计划不需要它。与 `--recover` / `--qualify` 在解析层互斥：
+        /// 恢复只消费 journal 固定材料，资格门只读四个对象。
+        #[arg(long, conflicts_with_all = ["recover", "qualify"])]
+        source_contexts: Option<PathBuf>,
+
+        /// Task14：显式固定安全副本。
+        ///
+        /// 缺省时按普通摄入规则在 `data_dir/source-configs/v1` 发布一次固定副本
+        /// （内容身份）；显式路径保持原路径身份。与 `--recover` / `--qualify` 互斥。
+        #[arg(long, conflicts_with_all = ["recover", "qualify"])]
+        source_safety_config: Option<PathBuf>,
 
         /// 六类计数与 HOLD 清单的落点（JSON）。不给则只打印摘要。
         ///
@@ -2439,6 +2475,46 @@ pub enum SourcesCommand {
         #[arg(long, short)]
         verbose: bool,
         /// Output progress as JSON (implies non-interactive, for scripting)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Read complete source facts from the schema-9 archive
+    Facts {
+        #[command(subcommand)]
+        action: FactsCommand,
+    },
+}
+
+/// Subcommands of `cass sources facts` (Task17).
+#[derive(Subcommand, Debug, Clone)]
+pub enum FactsCommand {
+    /// Export the complete private source-facts package
+    Export {
+        /// New or empty private export directory
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        output: PathBuf,
+        /// Strict source-profile-materials JSON file
+        #[arg(long = "profile-materials", value_hint = ValueHint::FilePath)]
+        profile_materials: PathBuf,
+        /// Fact domain to read
+        #[arg(long, value_enum, default_value = "analysis")]
+        scope: crate::source_export::FactsScopeArg,
+        /// Exact connector filter (repeatable, one value each)
+        #[arg(long = "connectors")]
+        connectors: Vec<String>,
+        /// Exact input-key filter (repeatable, 64 lowercase hex digits each)
+        #[arg(
+            long = "input-keys",
+            value_parser = crate::source_export::parse_input_key
+        )]
+        input_keys: Vec<crate::storage::source_facts::Sha256Digest>,
+        /// Maximum records per page (u64)
+        #[arg(long, default_value_t = 64)]
+        max_records: u64,
+        /// Soft byte target per page (u64)
+        #[arg(long, default_value_t = 8388608)]
+        target_bytes: u64,
+        /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
@@ -7225,6 +7301,7 @@ async fn execute_cli(
                     progress_interval_ms,
                     no_progress_events,
                     robot_trace_ingest,
+                    source_safety_config,
                 } => {
                     // PR8 C8: resolve the ingest intent before anything runs.
                     // `--ingest` and `--no-ingest` are opposite instructions,
@@ -7275,6 +7352,7 @@ async fn execute_cli(
                         progress_interval_ms,
                         no_progress_events,
                         robot_trace_ingest,
+                        source_safety_config,
                     )?;
                 }
                 // PR10 task 05: the local half of `cass sync`. The handler
@@ -7594,6 +7672,8 @@ async fn execute_cli(
                     candidate_db,
                     scratch,
                     snapshot_root,
+                    source_contexts,
+                    source_safety_config,
                     out,
                     apply,
                     recover,
@@ -7622,7 +7702,13 @@ async fn execute_cli(
                         })?;
                         let outcome = crate::phase3_restore::restore_recover(&journal_path)
                             .map_err(|err| {
-                                fail("mirror_restore_recover_failed", err.to_string())
+                                // Task14：五个来源短码从 typed 错误 downcast；
+                                // 其余恢复错误仍沿用原 kind（含 E-JOURNAL-SCHEMA-MISMATCH）。
+                                let kind = err
+                                    .downcast_ref::<crate::phase3_restore::SourceRestoreError>()
+                                    .map(|typed| typed.code())
+                                    .unwrap_or("mirror_restore_recover_failed");
+                                fail(kind, err.to_string())
                             })?;
                         let state = crate::phase3_restore::restore_journal_read(&journal_path)
                             .map_err(|err| fail("mirror_restore_recover_failed", err.to_string()))?
@@ -7721,13 +7807,30 @@ async fn execute_cli(
                                 Ok(())
                             }
                             // **每层以自己的名义拒绝**：错误码原样带出，不折叠成一句「不合格」。
-                            Err(err) => Err(CliError {
-                                code: 1,
-                                kind: "mirror_restore_not_qualified",
-                                message: format!("{}: {err}", err.code()),
-                                hint: None,
-                                retryable: false,
-                            }),
+                            //
+                            // Task15: a layer-6 source rejection carries its own
+                            // `SourceRestoreError`. The JSON and text faces then
+                            // show only that fixed short code, with no `E-*`
+                            // prefix, no Debug formatting, no SQL and no path.
+                            Err(err) => {
+                                if let crate::phase3_restore::W1MarkerError::Source(inner) = &err {
+                                    Err(CliError {
+                                        code: 1,
+                                        kind: inner.code(),
+                                        message: inner.code().to_string(),
+                                        hint: None,
+                                        retryable: false,
+                                    })
+                                } else {
+                                    Err(CliError {
+                                        code: 1,
+                                        kind: "mirror_restore_not_qualified",
+                                        message: format!("{}: {err}", err.code()),
+                                        hint: None,
+                                        retryable: false,
+                                    })
+                                }
+                            }
                         };
                     }
 
@@ -7755,10 +7858,18 @@ async fn execute_cli(
                         db_path: candidate_db,
                         scratch_dir: scratch,
                         snapshot_root: snapshot_root.clone(),
+                        source_contexts: source_contexts.clone(),
+                        source_safety_config: source_safety_config.clone(),
                     };
 
-                    let report = crate::phase3_restore::plan_mirror_restore(&options)
-                        .map_err(|err| fail("mirror_restore_plan_failed", err.to_string()))?;
+                    let report =
+                        crate::phase3_restore::plan_mirror_restore(&options).map_err(|err| {
+                            let kind = err
+                                .downcast_ref::<crate::phase3_restore::SourceRestoreError>()
+                                .map(|typed| typed.code())
+                                .unwrap_or("mirror_restore_plan_failed");
+                            fail(kind, err.to_string())
+                        })?;
 
                     // 按 slug 分组报，不只报一个总数：操作者要知道**是哪些** slug 没映上，
                     // 一个 3443 只能告诉他「有问题」，告诉不了他去改什么。
@@ -7826,7 +7937,7 @@ async fn execute_cli(
                                     ("versions", format!("{} versions", versions.len()))
                                 }
                             };
-                            serde_json::json!({
+                            let mut record = serde_json::json!({
                                 "identity": h.identity.to_string(),
                                 // R-E-103：这里报的是**保真的原始 provider 串**（含 openclaw 实例），
                                 // 不是闭世界折叠值 —— 折叠值会让 HOLD 台账认不出是哪个实例。
@@ -7839,7 +7950,28 @@ async fn execute_cli(
                                 "evidence_kind": evidence_kind,
                                 "evidence_detail": evidence_detail,
                                 "consumed_manifest_fields": h.consumed_manifest_fields,
-                            })
+                            });
+                            // Task14：来源 HOLD 额外输出真实 manifest ID，按证据里的
+                            // 原始顺序；legacy HOLD 不加空键。
+                            let source_manifest_ids: Vec<String> = match &h.evidence {
+                                crate::phase3_restore::HoldEvidence::ByteLayer { versions }
+                                | crate::phase3_restore::HoldEvidence::MessageLayer {
+                                    versions,
+                                    ..
+                                }
+                                | crate::phase3_restore::HoldEvidence::Versions { versions } => {
+                                    versions
+                                        .iter()
+                                        .filter_map(|version| version.source_manifest_id.clone())
+                                        .collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            if !source_manifest_ids.is_empty() {
+                                record["source_manifest_ids"] =
+                                    serde_json::json!(source_manifest_ids);
+                            }
+                            record
                         })
                         .collect();
 
@@ -7888,6 +8020,22 @@ async fn execute_cli(
                              completes, watch-once incremental decisions are not trustworthy",
                     });
                     let mut summary = summary;
+                    // Task14：来源诊断只在非空时出现；每 manifest 一项，按实际参与位置
+                    // 首次访问次序，长度与 SHA 是完整封存字节的真实值。
+                    if !report.source_versions.is_empty() {
+                        summary["source_versions"] = serde_json::json!(
+                            report
+                                .source_versions
+                                .iter()
+                                .map(|version| serde_json::json!({
+                                    "manifest_id": version.manifest_id,
+                                    "byte_domain": version.byte_domain,
+                                    "full_byte_len": version.full_byte_len,
+                                    "full_byte_sha256": version.full_byte_sha256,
+                                }))
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     if let Some(path) = out.as_ref() {
                         let out_marker_path =
                             default_w1_marker_path(marker.as_ref(), &options.db_path);
@@ -7932,11 +8080,18 @@ async fn execute_cli(
                             // 事后另数一遍就是第二定义，而两份「数得一样」还要再验一次。
                             holds_count: report.holds.len() as i64,
                             origin_unmapped_count: report.origin_unmapped.len() as i64,
+                            source_contexts: report.source_contexts.clone(),
+                            source_contexts_digest: report.source_contexts_digest.clone(),
+                            source_profile: report.source_profile.clone(),
                         };
                         let outcome =
                             crate::phase3_restore::restore_apply_journaled(plan, &journal_path)
                                 .map_err(|err| {
-                                    fail("mirror_restore_apply_failed", err.to_string())
+                                    let kind = err
+                                        .downcast_ref::<crate::phase3_restore::SourceRestoreError>()
+                                        .map(|typed| typed.code())
+                                        .unwrap_or("mirror_restore_apply_failed");
+                                    fail(kind, err.to_string())
                                 })?;
                         let (as_json, as_text) = mirror_restore_apply_report(&outcome);
                         if json {
@@ -9828,6 +9983,12 @@ fn run_forget_command(
         "Matched conversations: {} ({} messages)",
         report.conversations_matched, report.messages_matched
     );
+    // The source copies are matched by their own rule (the original locator),
+    // so this count is independent of the conversation count above.
+    println!(
+        "Matched source copies: {} input(s) ({} records, {} links)",
+        report.source_inputs_matched, report.source_records_matched, report.source_links_matched
+    );
     if !report.sample_source_paths.is_empty() {
         println!("Sample matches:");
         for path in &report.sample_source_paths {
@@ -9840,18 +10001,145 @@ fn run_forget_command(
             );
         }
     }
+    if !report.sample_source_locators.is_empty() {
+        println!("Sample source locators (original root + locator):");
+        for locator in &report.sample_source_locators {
+            println!("  {locator}");
+        }
+        if report.source_inputs_matched > report.sample_source_locators.len() {
+            println!(
+                "  ... and {} more",
+                report.source_inputs_matched - report.sample_source_locators.len()
+            );
+        }
+    }
     println!();
     if apply {
+        // The derived-asset rebuild above is keyed on the canonical deletion,
+        // so this line may only claim it for the case that really ran it.
+        if report.conversations_deleted > 0 {
+            println!(
+                "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
+                report.conversations_deleted
+            );
+        } else {
+            println!(
+                "Deleted no conversations from the canonical DB, so derived assets were left as they were."
+            );
+        }
+        if report.source_inputs_deleted > 0 || report.source_links_historicalized > 0 {
+            println!(
+                "Removed {} source input(s) ({} records, {} links) from the canonical DB; {} unmatched source link(s) kept their facts and were historyized.",
+                report.source_inputs_deleted,
+                report.source_records_deleted,
+                report.source_links_deleted,
+                report.source_links_historicalized
+            );
+        }
         println!(
-            "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
-            report.conversations_deleted
+            "This only changed the canonical DB: session files and mirror blobs were left in place."
         );
-    } else if report.conversations_matched > 0 {
-        println!("Re-run with --apply to delete these conversations.");
+    } else if report.conversations_matched > 0 || report.source_inputs_matched > 0 {
+        println!("Re-run with --apply to delete these matches.");
     } else {
-        println!("No conversations match. Nothing to forget.");
+        println!("No conversations or source copies match. Nothing to forget.");
     }
     Ok(())
+}
+
+/// The raw-mirror blob locators a `cass mirror prune` must never delete.
+///
+/// Two independent sources, unioned (SRC05C-P / 承载合同 §17.1):
+///
+/// 1. `messages.excluded.raw.blob` — the legacy marker the capture pipeline
+///    stamped into the canonical archive (R9, 任务书 #113).
+/// 2. `source_inputs.sealed_ref_bin` for the rows whose state still needs a
+///    retry (`staged`, `partial`, `failed`) — those blobs are the sealed
+///    bytes a crashed ingest replays from, so deleting one breaks the replay
+///    path. `complete` inputs are deliberately absent: an activated input is
+///    already in the canonical archive and follows the ordinary mirror
+///    retention rules.
+///
+/// Returns a message rather than a typed error because every caller turns
+/// the failure into the same `raw-mirror` CLI error; the message says which
+/// read failed and why.
+fn read_raw_mirror_prune_references(db_path: &Path) -> Result<HashSet<String>, String> {
+    let conn = crate::storage::api::Conn::open_read(db_path).map_err(|err| {
+        format!(
+            "reading raw-mirror references from {} before prune: {err}",
+            db_path.display()
+        )
+    })?;
+    let mut referenced: HashSet<String> = conn
+        .query_all_map(
+            "SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL",
+            &[],
+            |row| row.get_typed::<Option<String>>(0),
+        )
+        .map_err(|err| {
+            format!(
+                "reading excluded.raw.blob references from {} before prune: {err}",
+                db_path.display()
+            )
+        })?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let sealed = crate::storage::source_facts::pending_sealed_blob_refs(&conn).map_err(|err| {
+        format!(
+            "reading sealed source-input references from {} before prune: {err}",
+            db_path.display()
+        )
+    })?;
+    if let crate::storage::source_facts::PendingSealedBlobRefs::Refs(refs) = sealed {
+        for reference in refs {
+            referenced.insert(sealed_ref_mirror_locator(&reference)?);
+        }
+    }
+    Ok(referenced)
+}
+
+/// The mirror-relative locator one decoded sealed reference protects
+/// (§17.1).
+///
+/// Four checks, and every failure is a refusal rather than a skip: silently
+/// dropping a reference would let the prune delete the blob it protects. The
+/// transport and the address algorithm must be the raw mirror's, the locator
+/// must stay under the mirror root, and it must be the content-addressed
+/// path of the digest the capture recorded — an address that disagrees with
+/// its digest cannot be trusted to name the same bytes.
+fn sealed_ref_mirror_locator(
+    reference: &crate::storage::source_facts::PendingSealedBlobRef,
+) -> Result<String, String> {
+    if reference.transport != "raw_blob" {
+        return Err(format!(
+            "sealed source-input reference uses unsupported transport `{}`",
+            reference.transport
+        ));
+    }
+    if reference.blob_algorithm != DOCTOR_RAW_MIRROR_HASH_ALGORITHM {
+        return Err(format!(
+            "sealed source-input reference uses unsupported blob algorithm `{}`",
+            reference.blob_algorithm
+        ));
+    }
+    let Some(canonical) = doctor_raw_mirror_blob_relative_path(&reference.blob_digest) else {
+        return Err(format!(
+            "sealed source-input reference digest `{}` is not a blake3 digest",
+            reference.blob_digest
+        ));
+    };
+    if reference.blob_relative_path != canonical {
+        return Err(format!(
+            "sealed source-input reference blob path `{}` does not match its content-addressed \
+             path `{canonical}`",
+            reference.blob_relative_path
+        ));
+    }
+    doctor_raw_mirror_validate_relative_path(&reference.blob_relative_path)
+        .map_err(|reason| format!("sealed source-input reference blob path is unsafe: {reason}"))?;
+    Ok(canonical)
 }
 
 fn run_mirror_prune(
@@ -9923,25 +10211,13 @@ fn run_mirror_prune(
     // degrades to an empty set with a warning instead of failing the whole
     // preview.
     let referenced_blobs: HashSet<String> = if db_path.exists() {
-        let read_result: Result<HashSet<String>, crate::storage::api::StorageError> = (|| {
-            let conn = crate::storage::api::Conn::open_read(&db_path)?;
-            let blobs = conn.query_all_map(
-                "SELECT json_extract(excluded,'$.raw.blob') FROM messages WHERE excluded IS NOT NULL",
-                &[],
-                |row| row.get_typed::<Option<String>>(0),
-            )?;
-            Ok(blobs.into_iter().flatten().collect())
-        })();
-        match read_result {
+        match read_raw_mirror_prune_references(&db_path) {
             Ok(blobs) => blobs,
             Err(err) if apply => {
                 return Err(CliError {
                     code: 9,
                     kind: "raw-mirror",
-                    message: format!(
-                        "reading excluded.raw.blob references from {} before prune --apply: {err}",
-                        db_path.display()
-                    ),
+                    message: err,
                     hint: None,
                     retryable: false,
                 });
@@ -9950,7 +10226,7 @@ fn run_mirror_prune(
                 tracing::warn!(
                     db_path = %db_path.display(),
                     error = %err,
-                    "dry-run: failed to read excluded.raw.blob references; this preview may \
+                    "dry-run: failed to read the raw-mirror reference set; this preview may \
                      understate which blobs are actually protected"
                 );
                 HashSet::new()
@@ -21158,7 +21434,7 @@ fn mirror_restore_write_out_reports(
 fn mirror_restore_apply_report(
     outcome: &crate::phase3_restore::RestoreRunOutcome,
 ) -> (serde_json::Value, String) {
-    let as_json = serde_json::json!({
+    let mut as_json = serde_json::json!({
         "applied": true,
         "restored": outcome.restored,
         // 去重收敛的条数：动作做过了，库里没多行。
@@ -21178,7 +21454,7 @@ fn mirror_restore_apply_report(
         "messages_deleted": outcome.messages_deleted,
         "receipt_keys": outcome.receipt_keys,
     });
-    let as_text = format!(
+    let mut as_text = format!(
         "applied: restored={} deduplicated={} already_committed={} \
          replaced={} published={} published_without_backlink={} \
          messages(+{}/-{}) receipts={}",
@@ -21192,6 +21468,19 @@ fn mirror_restore_apply_report(
         outcome.messages_deleted,
         outcome.receipt_keys.len()
     );
+    // Task15: the two source-only counters appear only when they are non-zero.
+    // A pure legacy run keeps its original output shape byte for byte.
+    if outcome.source_only_completed != 0 {
+        as_json["source_only_completed"] = serde_json::json!(outcome.source_only_completed);
+        as_text.push_str(&format!(
+            " source_only_completed={}",
+            outcome.source_only_completed
+        ));
+    }
+    if outcome.source_replayed != 0 {
+        as_json["source_replayed"] = serde_json::json!(outcome.source_replayed);
+        as_text.push_str(&format!(" source_replayed={}", outcome.source_replayed));
+    }
     (as_json, as_text)
 }
 
@@ -21201,7 +21490,7 @@ fn mirror_restore_recover_report(
     journal_state: &str,
     outcome: &crate::phase3_restore::RestoreRunOutcome,
 ) -> (serde_json::Value, String) {
-    let as_json = serde_json::json!({
+    let mut as_json = serde_json::json!({
         "recovered": true,
         "journal_state": journal_state,
         "restored": outcome.restored,
@@ -21212,7 +21501,7 @@ fn mirror_restore_recover_report(
         "published_without_backlink": outcome.published_without_backlink,
         "receipt_keys": outcome.receipt_keys,
     });
-    let as_text = format!(
+    let mut as_text = format!(
         "recovered: journal_state={journal_state} restored={} deduplicated={} \
          already_committed={} replaced={} published={} \
          published_without_backlink={}",
@@ -21223,6 +21512,17 @@ fn mirror_restore_recover_report(
         outcome.published,
         outcome.published_without_backlink
     );
+    if outcome.source_only_completed != 0 {
+        as_json["source_only_completed"] = serde_json::json!(outcome.source_only_completed);
+        as_text.push_str(&format!(
+            " source_only_completed={}",
+            outcome.source_only_completed
+        ));
+    }
+    if outcome.source_replayed != 0 {
+        as_json["source_replayed"] = serde_json::json!(outcome.source_replayed);
+        as_text.push_str(&format!(" source_replayed={}", outcome.source_replayed));
+    }
     (as_json, as_text)
 }
 
@@ -22640,6 +22940,18 @@ fn extract_request_id(cli: &Cli) -> Option<String> {
     }
 }
 
+/// Task17: the new Facts Export branch hides its trace arguments and both
+/// correlation identifiers. Every other command keeps the existing trace
+/// semantics unchanged.
+fn is_source_export_command(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Some(Commands::Sources(SourcesCommand::Facts {
+            action: FactsCommand::Export { .. }
+        }))
+    )
+}
+
 fn write_trace_line(
     path: &PathBuf,
     label: &str,
@@ -22649,9 +22961,15 @@ fn write_trace_line(
     exit_code: i32,
     error: Option<&CliError>,
 ) -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let request_id = extract_request_id(cli);
-    let trace_id = dotenvy::var("CASS_TRACE_ID").ok();
+    let (args, request_id, trace_id) = if is_source_export_command(cli) {
+        (Vec::new(), None, None)
+    } else {
+        (
+            std::env::args().collect::<Vec<String>>(),
+            extract_request_id(cli),
+            dotenvy::var("CASS_TRACE_ID").ok(),
+        )
+    };
     let payload = serde_json::json!({
         "start_ts": start_ts.to_rfc3339(),
         "end_ts": (*start_ts
@@ -79761,6 +80079,7 @@ pub(crate) fn run_doctor_impl(
                     embedder: "lexical".to_string(),
                     progress: Some(progress.clone()),
                     watch_interval_secs: 30,
+                    source_safety_config: None,
                 };
 
                 let rebuild_handle = std::thread::spawn(move || {
@@ -89787,6 +90106,7 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         embedder: "lexical".to_string(),
         progress: Some(Arc::clone(&progress)),
         watch_interval_secs: 30,
+        source_safety_config: None,
     };
     eprintln!("Refreshing index...");
 
@@ -89945,6 +90265,7 @@ fn run_index_with_data(
     progress_interval_ms: u64,
     no_progress_events: bool,
     robot_trace_ingest: bool,
+    source_safety_config: Option<PathBuf>,
 ) -> CliResult<()> {
     use std::time::Instant;
 
@@ -90195,6 +90516,7 @@ fn run_index_with_data(
         embedder: embedder.clone(),
         progress: Some(index_progress.clone()),
         watch_interval_secs: watch_interval,
+        source_safety_config,
     };
 
     // Set up progress display
@@ -98418,6 +98740,63 @@ fn run_sources_command(cmd: SourcesCommand, cli: &Cli) -> CliResult<()> {
                 json: is_robot,
             })
         }
+        SourcesCommand::Facts { action } => run_sources_facts(action, cli),
+    }
+}
+
+/// Task17: `cass sources facts export`.
+fn run_sources_facts(action: FactsCommand, cli: &Cli) -> CliResult<()> {
+    match action {
+        FactsCommand::Export {
+            output,
+            profile_materials,
+            scope,
+            connectors,
+            input_keys,
+            max_records,
+            target_bytes,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            let data_dir = default_data_dir();
+            let db_path = cli
+                .db
+                .clone()
+                .unwrap_or_else(|| data_dir.join("agent_search.db"));
+            let filter = crate::storage::source_facts::SourceFactsFilter {
+                scope: scope.into(),
+                connectors,
+                input_keys,
+            };
+            let options = crate::source_export::ExportOptions {
+                output,
+                profile_materials,
+                db_path,
+                filter,
+                max_records,
+                target_bytes,
+            };
+            let summary =
+                crate::source_export::run_export(&options).map_err(|error| error.to_cli_error())?;
+            let payload = serde_json::json!({
+                "status": "complete",
+                "page_count": summary.page_count.to_string(),
+                "unique_input_count": summary.unique_input_count.to_string(),
+                "record_count": summary.record_count.to_string(),
+                "oversized_records": summary.oversized_records.to_string(),
+                "index_sha256": &summary.index_sha256,
+            });
+            if let Some(format) = structured_format {
+                return output_structured_value(payload, format);
+            }
+            println!("status: complete");
+            println!("page_count: {}", summary.page_count);
+            println!("unique_input_count: {}", summary.unique_input_count);
+            println!("record_count: {}", summary.record_count);
+            println!("oversized_records: {}", summary.oversized_records);
+            println!("index_sha256: {}", summary.index_sha256);
+            Ok(())
+        }
     }
 }
 
@@ -100112,6 +100491,7 @@ fn run_sources_sync(
     let mut all_reports = Vec::new();
     let mut total_files = 0u64;
     let mut total_bytes = 0u64;
+    let mut failed_sources = 0u64;
 
     for source in &sources_to_sync {
         let sync_decision = status.decision_for_source_at(source, now_ms, true);
@@ -100125,7 +100505,17 @@ fn run_sources_sync(
         }
 
         if dry_run {
-            // In dry run, just show what would be synced
+            // In dry run, just show what would be synced. The failure count is
+            // independent of the JSON/human rendering: an invalid path entry
+            // fails this source in both modes.
+            let has_invalid_paths = source
+                .paths
+                .iter()
+                .enumerate()
+                .any(|(idx, path)| source_path_entry_error(idx, path).is_some());
+            if has_invalid_paths {
+                failed_sources += 1;
+            }
             if !is_robot {
                 for (idx, path) in source.paths.iter().enumerate() {
                     if let Some(message) = source_path_entry_error(idx, path) {
@@ -100162,9 +100552,6 @@ fn run_sources_sync(
                         }
                     })
                     .collect::<Vec<_>>();
-                let has_invalid_paths = paths
-                    .iter()
-                    .any(|path| path["success"].as_bool() == Some(false));
                 all_reports.push(serde_json::json!({
                     "source": source.name,
                     "status": if has_invalid_paths { "invalid_config" } else { "dry_run" },
@@ -100234,12 +100621,16 @@ fn run_sources_sync(
                         .unwrap_or("sync failed");
                     println!("  {} {}", "Error:".red().bold(), err_msg.red());
                 }
+                failed_sources += 1;
                 continue;
             }
         };
 
         // Update status
         status.update(&source.name, &report);
+        if !report.all_succeeded {
+            failed_sources += 1;
+        }
 
         // Print results
         let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -100326,31 +100717,10 @@ fn run_sources_sync(
         }
     }
 
-    // Output summary
-    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
-        if matches!(fmt, RobotFormat::Sessions) {
-            RobotFormat::Compact
-        } else {
-            fmt
-        }
-    });
-
-    if let Some(_fmt) = structured_format {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "complete",
-                "dry_run": dry_run,
-                "sources": all_reports,
-                "total_files": total_files,
-                "total_bytes": total_bytes,
-                "will_reindex": !no_index && !dry_run,
-            }))
-            .unwrap_or_default()
-        );
-    }
-
-    // Trigger re-index if requested
+    // Trigger re-index if requested. The result is kept, not propagated yet:
+    // this round's final summary is published after the index operation, and an
+    // index error keeps its original already-reported payload.
+    let mut index_result: Option<CliResult<()>> = None;
     if !no_index && !dry_run && total_files > 0 {
         if !is_robot {
             println!(
@@ -100369,7 +100739,7 @@ fn run_sources_sync(
             ProgressResolved::Plain
         };
 
-        run_index_with_data(
+        index_result = Some(run_index_with_data(
             None,           // db_override (uses data_dir default)
             false,          // full
             false,          // force_rebuild
@@ -100386,8 +100756,59 @@ fn run_sources_sync(
             None,  // idempotency_key
             2000,  // progress_interval_ms (default)
             false, // no_progress_events
-            false, // robot_trace_ingest
-        )?;
+            false, // robot_trace_ingest,
+
+            None, // source_safety_config
+        ));
+    }
+
+    // Output summary: complete only when the work this round attempted actually
+    // succeeded. An index that was not attempted is not a failure; an index
+    // that failed, or any per-source plan/transfer failure, is.
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let index_failed = index_result
+        .as_ref()
+        .is_some_and(|result| result.is_err());
+    let summary_status = if failed_sources == 0 && !index_failed {
+        "complete"
+    } else {
+        "error"
+    };
+
+    if let Some(_fmt) = structured_format {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": summary_status,
+                "dry_run": dry_run,
+                "sources": all_reports,
+                "total_files": total_files,
+                "total_bytes": total_bytes,
+                "will_reindex": !no_index && !dry_run,
+            }))
+            .unwrap_or_default()
+        );
+    }
+
+    // The index error keeps its original channel and already-reported marker.
+    if let Some(Err(err)) = index_result {
+        return Err(err);
+    }
+    if failed_sources > 0 {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::Source.kind_str(),
+            message: format!("sources sync: {failed_sources} source(s) failed"),
+            hint: None,
+            retryable: false,
+        });
     }
 
     Ok(())
@@ -100469,32 +100890,55 @@ fn run_sources_reingest(
         };
 
     let data_dir = default_data_dir();
-    let db_path = data_dir.join("agent_search.db");
 
-    // Surface the mirror roots that will actually be scanned so the operator
-    // can confirm the mirror is present before the (potentially long) ingest.
+    // Preflight every selected source's declared paths against the existing
+    // mirror layout. This is read-only: no database is opened or created.
     let mut mirror_roots: Vec<String> = Vec::new();
-    let mut missing_mirrors: Vec<String> = Vec::new();
-    // w1b Task B8 (d16, open-consumer audit): pure read (surfacing mirror
-    // roots for display), switched to the read-only open.
-    if let Ok(storage) = crate::storage::sqlite::FrankenStorage::open_readonly(&db_path) {
-        let roots = crate::indexer::build_scan_roots(&storage, &data_dir);
-        let selected_names: std::collections::HashSet<&str> =
-            selected.iter().map(|s| s.name.as_str()).collect();
-        for root in &roots {
-            if selected_names.contains(root.origin.source_id.as_str()) {
-                mirror_roots.push(root.path.display().to_string());
+    let mut failed_sources = 0u64;
+    for source in &selected {
+        let mut failed = source.paths.is_empty() || source.validate().is_err();
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if !failed {
+            for path in &source.paths {
+                match crate::indexer::choose_configured_mirror_root(source, &data_dir, path) {
+                    crate::indexer::MirrorRootChoice::One(root) => {
+                        if !roots.contains(&root) {
+                            roots.push(root);
+                        }
+                    }
+                    crate::indexer::MirrorRootChoice::Absent
+                    | crate::indexer::MirrorRootChoice::Ambiguous(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if failed {
+            failed_sources += 1;
+        } else {
+            for root in roots {
+                let text = root.display().to_string();
+                if !mirror_roots.contains(&text) {
+                    mirror_roots.push(text);
+                }
             }
         }
     }
-    for source in &selected {
-        if !mirror_roots
-            .iter()
-            .any(|p| p.contains(&format!("/remotes/{}/", source.name)))
-        {
-            missing_mirrors.push(source.name.clone());
-        }
+    if failed_sources > 0 {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::Source.kind_str(),
+            message: format!(
+                "sources reingest: {failed_sources} source(s) failed mirror preflight"
+            ),
+            hint: None,
+            retryable: false,
+        });
     }
+    // Every selected path resolved to one real canonical root; the old
+    // DB-derived "missing" list has no role in the preflight.
+    let missing_mirrors: Vec<String> = Vec::new();
 
     let is_robot = output_format.is_some() || robot_format_from_env().is_some();
     if !is_robot {
@@ -100541,6 +100985,7 @@ fn run_sources_reingest(
         2000,  // progress_interval_ms (default)
         false, // no_progress_events
         false, // robot_trace_ingest
+        None,  // source_safety_config
     )?;
 
     if is_robot {
@@ -102635,6 +103080,8 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
             agent.trim().to_ascii_lowercase()
         );
     }
+    let source_copies_left =
+        purge.source_inputs_deleted > 0 || purge.source_links_historicalized > 0;
     if keep_indexed_data {
         println!("Existing indexed archive data was left untouched.");
     } else if purge.conversations_deleted > 0 {
@@ -102642,12 +103089,38 @@ fn run_agents_exclude(agent: &str, keep_indexed_data: bool, cli: &Cli) -> CliRes
             "Purged {} conversations and {} messages already archived for that agent.",
             purge.conversations_deleted, purge.messages_deleted
         );
+        if source_copies_left {
+            println!(
+                "Removed {} source input(s) ({} records, {} links) and historyized {} unmatched source link(s) in the same transaction.",
+                purge.source_inputs_deleted,
+                purge.source_records_deleted,
+                purge.source_links_deleted,
+                purge.source_links_historicalized
+            );
+        }
         println!("Lexical search data was rebuilt from the remaining archive.");
         println!(
             "If you use semantic search assets, rerun `cass index --semantic` once to refresh them."
         );
+    } else if source_copies_left {
+        // No archived conversation matched, but the source copies this agent
+        // owns did: they are gone, and no derived asset was rebuilt because
+        // nothing canonical changed.
+        println!(
+            "Purged {} source input(s) ({} records, {} links) and historyized {} unmatched source link(s) already archived for that agent.",
+            purge.source_inputs_deleted,
+            purge.source_records_deleted,
+            purge.source_links_deleted,
+            purge.source_links_historicalized
+        );
+        println!("No archived conversation matched, so no derived search data needed rebuilding.");
     } else {
         println!("No already archived data for that agent was present in the local archive.");
+    }
+    if !keep_indexed_data && (purge.conversations_deleted > 0 || source_copies_left) {
+        println!(
+            "This only changed the canonical DB: session files and mirror blobs were left in place."
+        );
     }
     println!();
     println!("View exclusions with:");
@@ -103560,6 +104033,91 @@ mod subcommand_robot_output_tests {
             assert!(!refresh, "refresh should stay opt-in");
         });
     }
+
+    /// Task15 · the lib report/error seam for the source-only counters and the
+    /// fixed short codes. Five named rows, each one real value.
+    #[test]
+    fn u15_04_source_restore_output() {
+        let mut rows = Vec::new();
+
+        // activation-incomplete-fixed-code
+        assert_eq!(
+            crate::phase3_restore::SourceRestoreError::ActivationIncomplete.code(),
+            "source_restore_activation_incomplete"
+        );
+        rows.push(serde_json::json!({
+            "id":"activation-incomplete-fixed-code",
+            "expected":"source_restore_activation_incomplete",
+            "actual":crate::phase3_restore::SourceRestoreError::ActivationIncomplete.code(),
+        }));
+
+        // w1-source-code-delegation
+        let delegated = crate::phase3_restore::W1MarkerError::Source(
+            crate::phase3_restore::SourceRestoreError::ReceiptConflict,
+        );
+        assert_eq!(delegated.code(), "source_restore_receipt_conflict");
+        rows.push(serde_json::json!({
+            "id":"w1-source-code-delegation",
+            "expected":"source_restore_receipt_conflict",
+            "actual":delegated.code(),
+        }));
+
+        // source-zero-counts-omit-fields
+        let zero = crate::phase3_restore::RestoreRunOutcome::default();
+        let (zero_json, zero_text) = mirror_restore_apply_report(&zero);
+        assert!(zero_json.get("source_only_completed").is_none());
+        assert!(zero_json.get("source_replayed").is_none());
+        assert!(!zero_text.contains("source_only_completed"));
+        assert!(!zero_text.contains("source_replayed"));
+        rows.push(serde_json::json!({
+            "id":"source-zero-counts-omit-fields",
+            "expected":"original output shape",
+            "actual":"fields absent",
+        }));
+
+        // apply-new-counts
+        let outcome = crate::phase3_restore::RestoreRunOutcome {
+            source_only_completed: 3,
+            source_replayed: 2,
+            ..crate::phase3_restore::RestoreRunOutcome::default()
+        };
+        let (apply_json, apply_text) = mirror_restore_apply_report(&outcome);
+        assert_eq!(apply_json["source_only_completed"], serde_json::json!(3));
+        assert_eq!(apply_json["source_replayed"], serde_json::json!(2));
+        assert!(apply_text.contains("source_only_completed=3"));
+        assert!(apply_text.contains("source_replayed=2"));
+        rows.push(serde_json::json!({
+            "id":"apply-new-counts",
+            "expected":"correct actual usize JSON/text counts",
+            "actual":apply_text,
+        }));
+
+        // recover-new-counts
+        let (recover_json, recover_text) =
+            mirror_restore_recover_report("ClosureVerified", &outcome);
+        assert_eq!(recover_json["source_only_completed"], serde_json::json!(3));
+        assert_eq!(recover_json["source_replayed"], serde_json::json!(2));
+        assert!(recover_text.contains("source_only_completed=3"));
+        assert!(recover_text.contains("source_replayed=2"));
+        rows.push(serde_json::json!({
+            "id":"recover-new-counts",
+            "expected":"correct actual usize JSON/text counts",
+            "actual":recover_text,
+        }));
+
+        assert_eq!(rows.len(), 5);
+        let root = dotenvy::var("CASS_T15_RESULT_ROOT")
+            .expect("CASS_T15_RESULT_ROOT must be set for every Task15 private run");
+        let dir = std::path::PathBuf::from(root).join("u15_04_source_restore_output");
+        assert!(!dir.exists(), "fresh evidence dir required: {}", dir.display());
+        std::fs::create_dir_all(&dir).expect("create the evidence dir");
+        let mut body = String::new();
+        for row in &rows {
+            body.push_str(&serde_json::to_string(row).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(dir.join("cases.jsonl"), body).expect("write the case evidence");
+    }
 }
 
 #[cfg(test)]
@@ -104180,6 +104738,8 @@ mod mirror_restore_deep_verify_flag_tests {
             receipt_keys: vec!["k1".to_string()],
             messages_inserted: 4,
             messages_deleted: 0,
+            source_only_completed: 0,
+            source_replayed: 0,
         };
 
         let (as_json, as_text) = mirror_restore_apply_report(&outcome);
@@ -104214,6 +104774,8 @@ mod mirror_restore_deep_verify_flag_tests {
             receipt_keys: vec!["k1".to_string(), "k2".to_string()],
             messages_inserted: 0,
             messages_deleted: 0,
+            source_only_completed: 0,
+            source_replayed: 0,
         };
 
         let (as_json, as_text) = mirror_restore_recover_report("ClosureVerified", &outcome);
@@ -104229,6 +104791,7 @@ mod mirror_restore_deep_verify_flag_tests {
             "--recover 的文本摘要面同样必须报它，实得：{as_text}"
         );
     }
+
 
     // ── R3 第 13 条 / 裁定 R-E-103 J3：参数层要跟上 R-E-19 ─────────────
     //

@@ -214,6 +214,7 @@ fn run_index_does_not_drop_storage_without_explicit_close() {
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
+        source_safety_config: None,
     };
 
     let result = run_index(opts, None);

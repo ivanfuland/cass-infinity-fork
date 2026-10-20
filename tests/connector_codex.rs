@@ -1220,3 +1220,524 @@ fn codex_connector_metadata_indicates_format() {
         Some("rollout_json")
     );
 }
+
+/// SRC05B-01: the CASS `codex::CodexConnector` wrapper must forward the pinned
+/// franken_agent_detection sealed-source read instead of inheriting the trait's
+/// `Unsupported` default.
+///
+/// Every fixture here is synthetic bytes turned into a sealed context through
+/// the pinned public API only. No test in this module changes `CODEX_HOME`,
+/// reads a real user directory or fabricates a private field; the sealed read
+/// opens only the temp file the fixture wrote.
+mod codex_source_aware_bridge {
+    use std::fs;
+
+    use coding_agent_search::connectors::Connector;
+    use coding_agent_search::connectors::codex::CodexConnector as CassCodexConnector;
+    use franken_agent_detection::{
+        CodexConnector as FrankenCodexConnector, ContentDigest, Origin, SealedInputContext,
+        SealedSourceRef, Sha256Digest, SourceExpectedManifest, SourceFormat, SourceInputDescriptor,
+        SourceInputFinish, SourceInputRole, SourceMappedConversation, SourceMappingClaim,
+        SourceMappingDiagnostic, SourceMappingSink, SourceOrigin, SourceParserContext,
+        SourceParserRoot, SourceReadFailure, SourceReadFailureKind, SourceRecordLocator,
+        SourceRecordOutcome, SourceRecordSink, SourceSinkControl, SourceSinkFailure,
+        SourceSinkFailureCode,
+    };
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+
+    /// One `session_meta` plus one user and one assistant `response_item`, so a
+    /// faithful projection produces two real messages.
+    const SYNTHETIC_ROLLOUT: &str = concat!(
+        r#"{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"session-bridge","cwd":"/fixture/workspace"}}"#,
+        "\n",
+        r#"{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello bridge"}]}}"#,
+        "\n",
+        r#"{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"bridge answer"}]}}"#,
+        "\n",
+    );
+
+    /// Framing measurements and digest, computed from the bytes alone.
+    fn measure_framing(bytes: &[u8], format: SourceFormat) -> (u64, u64, u64, Sha256Digest) {
+        let mut framing = Sha256::new();
+        framing.update(b"cass.source-framing/1");
+        let mut offset = 0usize;
+        let mut records = 0u64;
+        let mut blank_lines = 0u64;
+        let mut blank_bytes = 0u64;
+        let frames: Vec<&[u8]> = match format {
+            SourceFormat::Jsonl => bytes.split_inclusive(|byte| *byte == b'\n').collect(),
+            SourceFormat::JsonDocument => vec![bytes],
+        };
+        for (line, frame) in frames.into_iter().enumerate() {
+            let raw = if format == SourceFormat::Jsonl {
+                frame
+                    .strip_suffix(b"\r\n")
+                    .or_else(|| frame.strip_suffix(b"\n"))
+                    .unwrap_or(frame)
+            } else {
+                frame
+            };
+            if format == SourceFormat::Jsonl && raw.iter().all(|b| b" \t\r\n".contains(b)) {
+                blank_lines += 1;
+                blank_bytes += raw.len() as u64;
+            } else {
+                records += 1;
+                let digest = format!("{:x}", Sha256::digest(raw));
+                let leaf = serde_json::to_vec(&[
+                    (line + 1).to_string(),
+                    String::new(),
+                    offset.to_string(),
+                    (offset + raw.len()).to_string(),
+                    digest,
+                ])
+                .unwrap();
+                framing.update((leaf.len() as u64).to_be_bytes());
+                framing.update(leaf);
+            }
+            offset += frame.len();
+        }
+        (
+            records,
+            blank_lines,
+            blank_bytes,
+            Sha256Digest::from_hex(&format!("{:x}", framing.finalize())).unwrap(),
+        )
+    }
+
+    /// Build a sealed context for `bytes`. `connector` names the discovery and
+    /// parser-context connector, exactly as the pinned harness does.
+    fn sealed_input(
+        bytes: &[u8],
+        format: SourceFormat,
+        connector: &str,
+    ) -> (TempDir, SealedInputContext) {
+        let dir = TempDir::new().unwrap();
+        let sealed_locator = dir.path().join("blob");
+        fs::write(&sealed_locator, bytes).unwrap();
+
+        let (records, blank_lines, blank_bytes, framing_sha256) = measure_framing(bytes, format);
+        let origin = SourceOrigin {
+            origin: Origin::local(),
+            source_version: None,
+        };
+        let discovery = SourceInputDescriptor {
+            connector: connector.into(),
+            scan_root: "/fixture/projects".into(),
+            source_path: "/fixture/projects/session.jsonl".into(),
+            relative_locator: "session.jsonl".into(),
+            role: SourceInputRole::PrimarySessionLog,
+            origin: origin.clone(),
+            platform: None,
+            size_bytes: None,
+            modified_at_ms: None,
+        };
+        let parser_context = SourceParserContext {
+            schema: "cass.source-parser-context/1".into(),
+            connector: discovery.connector.clone(),
+            roots: vec![SourceParserRoot {
+                path: discovery.scan_root.clone(),
+                origin,
+                platform: None,
+                workspace_rewrites: Vec::new(),
+            }],
+            relative_locator: discovery.relative_locator.clone(),
+            role: discovery.role,
+            effective_config_digest: None,
+        };
+        let mut sealed = SealedInputContext {
+            input_key: Sha256Digest::of(b""),
+            identity_namespace: "src05b-frozen".into(),
+            parser_context_digest: parser_context.digest().unwrap(),
+            content_digest: ContentDigest::of(bytes),
+            byte_len: bytes.len() as u64,
+            format,
+            normalizer_id: "cass.codex/1".into(),
+            safety_contract_id: "cass.source-safety/1".into(),
+            sealed_locator,
+            sealed_ref: SealedSourceRef {
+                transport: "frozen_file_unmirrored".into(),
+                blob_algorithm: None,
+                blob_digest: None,
+                blob_relative_path: None,
+            },
+            expected_manifest: SourceExpectedManifest {
+                verifier_version: "cass.source-verifier/1".into(),
+                format,
+                records,
+                blank_lines,
+                blank_bytes,
+                framing_sha256,
+                complete: true,
+            },
+            discovery,
+            parser_context,
+        };
+        rebind_identity(&mut sealed);
+        (dir, sealed)
+    }
+
+    /// Recompute the two derived digests after a semantic edit, so a mutated
+    /// context stays internally consistent and only the edited fact differs.
+    fn rebind_identity(sealed: &mut SealedInputContext) {
+        sealed.input_key = sealed.identity_for(sealed.content_digest).unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        records: Vec<SourceRecordOutcome>,
+        conversations: Vec<SourceMappedConversation>,
+        claims: Vec<(SourceRecordLocator, Vec<SourceMappingClaim>)>,
+        diagnostics: Vec<SourceMappingDiagnostic>,
+        stop_at: Option<&'static str>,
+        error: bool,
+    }
+
+    impl RecordingSink {
+        fn control(&self, stage: &str) -> Result<SourceSinkControl, SourceSinkFailure> {
+            if self.stop_at == Some(stage) {
+                if self.error {
+                    Err(SourceSinkFailure {
+                        code: SourceSinkFailureCode::Rejected,
+                        detail_digest: None,
+                    })
+                } else {
+                    Ok(SourceSinkControl::Stop)
+                }
+            } else {
+                Ok(SourceSinkControl::Continue)
+            }
+        }
+
+        fn canonical(&self) -> Vec<&SourceMappingClaim> {
+            self.claims
+                .iter()
+                .flat_map(|(_, claims)| claims)
+                .filter(|claim| claim.mapping_state == "canonical")
+                .collect()
+        }
+
+        fn claims_wire(&self) -> serde_json::Value {
+            serde_json::Value::Array(
+                self.claims
+                    .iter()
+                    .map(|(locator, claims)| {
+                        serde_json::json!({
+                            "ordinal": locator.ordinal,
+                            "record_pointer": locator.record_pointer.as_str(),
+                            "byte_start": locator.byte_start,
+                            "byte_end": locator.byte_end,
+                            "claims": serde_json::to_value(claims).unwrap(),
+                        })
+                    })
+                    .collect(),
+            )
+        }
+
+        fn records_wire(&self) -> serde_json::Value {
+            serde_json::Value::Array(self.records.iter().map(record_wire).collect())
+        }
+
+        fn conversations_wire(&self) -> serde_json::Value {
+            serde_json::Value::Array(
+                self.conversations
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "conversation_ordinal": item.conversation_ordinal,
+                            "conversation": serde_json::to_value(&item.conversation).unwrap(),
+                            "claims": serde_json::to_value(&item.claims).unwrap(),
+                        })
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    impl SourceRecordSink for RecordingSink {
+        fn on_record(
+            &mut self,
+            record: SourceRecordOutcome,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            self.records.push(record);
+            self.control("record")
+        }
+    }
+
+    impl SourceMappingSink for RecordingSink {
+        fn on_record_claims(
+            &mut self,
+            locator: SourceRecordLocator,
+            claims: Vec<SourceMappingClaim>,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            self.claims.push((locator, claims));
+            self.control("claims")
+        }
+
+        fn on_conversation(
+            &mut self,
+            item: SourceMappedConversation,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            self.conversations.push(item);
+            self.control("conversation")
+        }
+
+        fn on_diagnostic(
+            &mut self,
+            item: SourceMappingDiagnostic,
+        ) -> Result<SourceSinkControl, SourceSinkFailure> {
+            self.diagnostics.push(item);
+            self.control("diagnostic")
+        }
+    }
+
+    /// Every measurable field of one original record, including the canonical
+    /// text of its parsed value.
+    fn record_wire(record: &SourceRecordOutcome) -> serde_json::Value {
+        let value = record.value.as_ref().map(|value| {
+            let mut text = Vec::new();
+            value.write_canonical(&mut text).unwrap();
+            String::from_utf8(text).unwrap()
+        });
+        serde_json::json!({
+            "ordinal": record.locator.ordinal,
+            "record_pointer": record.locator.record_pointer.as_str(),
+            "byte_start": record.locator.byte_start,
+            "byte_end": record.locator.byte_end,
+            "record_byte_len": record.record_byte_len,
+            "terminator_len": record.terminator_len,
+            "source_record_sha256": record.source_record_sha256.to_string(),
+            "value": value,
+            "parse_state": serde_json::to_value(record.parse_state).unwrap(),
+            "diagnostics": serde_json::to_value(&record.diagnostics).unwrap(),
+        })
+    }
+
+    fn finish_wire(finish: &SourceInputFinish) -> serde_json::Value {
+        serde_json::to_value(finish).unwrap()
+    }
+
+    fn failure_wire(failure: &SourceReadFailure) -> serde_json::Value {
+        serde_json::json!({
+            "kind": format!("{:?}", failure.kind),
+            "partial_finish": serde_json::to_value(&failure.partial_finish).unwrap(),
+            "next_cursor": serde_json::to_value(&failure.next_cursor).unwrap(),
+            "diagnostic": serde_json::to_value(&failure.diagnostic).unwrap(),
+        })
+    }
+
+    /// The wrapper, called as a trait object, reads the same fixture as the
+    /// pinned native connector and reports exactly the same facts.
+    #[test]
+    fn codex_wrapper_forwards_sealed_read_and_matches_native_connector() {
+        let (_dir, sealed) =
+            sealed_input(SYNTHETIC_ROLLOUT.as_bytes(), SourceFormat::Jsonl, "codex");
+        let wrapper = CassCodexConnector::new();
+        let wrapper_trait: &dyn Connector = &wrapper;
+        let native = FrankenCodexConnector::new();
+
+        let mut wrapper_sink = RecordingSink::default();
+        let wrapper_finish = wrapper_trait
+            .scan_source_aware(&sealed, &mut wrapper_sink)
+            .expect(
+                "CASS CodexConnector must forward scan_source_aware to the pinned FAD connector",
+            );
+
+        let mut native_sink = RecordingSink::default();
+        let native_finish = native
+            .scan_source_aware(&sealed, &mut native_sink)
+            .expect("the pinned FAD CodexConnector implements scan_source_aware");
+
+        // Independent structural assertions first: the fixture really projects
+        // two messages, so an "both sides empty" comparison cannot pass here.
+        assert_eq!(wrapper_sink.records.len(), 3, "three source records");
+        assert_eq!(wrapper_sink.conversations.len(), 1, "one conversation");
+        assert_eq!(wrapper_finish.records_seen, 3);
+        assert!(wrapper_finish.reached_eof);
+        assert_eq!(wrapper_finish.bytes_read, SYNTHETIC_ROLLOUT.len() as u64);
+        let conversation = &wrapper_sink.conversations[0].conversation;
+        assert_eq!(conversation.agent_slug, "codex");
+        assert_eq!(conversation.external_id.as_deref(), Some("session"));
+        assert_eq!(conversation.workspace, Some("/fixture/workspace".into()));
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| (m.idx, m.role.as_str(), m.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "user", "hello bridge"),
+                (1, "assistant", "bridge answer"),
+            ]
+        );
+        let canonical = wrapper_sink.canonical();
+        assert_eq!(canonical.len(), 2, "one canonical claim per message");
+        assert_eq!(canonical[0].final_message_idx, Some(0));
+        assert_eq!(canonical[1].final_message_idx, Some(1));
+
+        // Field-by-field equality with the pinned native implementation.
+        assert_eq!(finish_wire(&wrapper_finish), finish_wire(&native_finish));
+        assert_eq!(wrapper_sink.records_wire(), native_sink.records_wire());
+        assert_eq!(
+            wrapper_sink.conversations_wire(),
+            native_sink.conversations_wire()
+        );
+        assert_eq!(wrapper_sink.claims_wire(), native_sink.claims_wire());
+        assert_eq!(wrapper_sink.diagnostics, native_sink.diagnostics);
+    }
+
+    /// A sealed context naming another connector, and one whose parser context
+    /// contradicts its discovery, must both keep the pinned `InvalidContext`
+    /// failure. Neither may reach the legacy scan.
+    #[test]
+    fn codex_wrapper_keeps_invalid_context_failure_without_legacy_fallback() {
+        let bytes = SYNTHETIC_ROLLOUT.as_bytes();
+
+        // Positive control on the same bytes: the fixture itself is readable,
+        // so the rejections below come from the context and not the input.
+        let (_dir, good) = sealed_input(bytes, SourceFormat::Jsonl, "codex");
+        assert!(good.validate().is_ok());
+        let mut good_sink = RecordingSink::default();
+        CassCodexConnector::new()
+            .scan_source_aware(&good, &mut good_sink)
+            .expect("positive control: connector codex reads this fixture");
+        assert_eq!(good_sink.conversations.len(), 1);
+
+        let native = FrankenCodexConnector::new();
+
+        // Case 1: a self-consistent context that declares another connector.
+        let (_dir, wrong_connector) = sealed_input(bytes, SourceFormat::Jsonl, "claude_code");
+        assert!(wrong_connector.validate().is_ok());
+        let mut sink = RecordingSink::default();
+        let failure = CassCodexConnector::new()
+            .scan_source_aware(&wrong_connector, &mut sink)
+            .expect_err("a claude_code sealed context is not a codex read");
+        assert_eq!(failure.kind, SourceReadFailureKind::InvalidContext);
+        assert!(sink.records.is_empty(), "no record may reach the sink");
+        assert!(sink.conversations.is_empty());
+        let mut native_sink = RecordingSink::default();
+        let native_failure = native
+            .scan_source_aware(&wrong_connector, &mut native_sink)
+            .expect_err("the pinned connector rejects the same context");
+        assert_eq!(failure_wire(&failure), failure_wire(&native_failure));
+        assert_eq!(native_sink.records.len(), sink.records.len());
+
+        // Case 2: the parser context root contradicts the discovery scan root.
+        let (_dir, bad_parser) = sealed_input(bytes, SourceFormat::Jsonl, "codex");
+        let mut bad_parser = bad_parser;
+        bad_parser.parser_context.roots[0].path = "/fixture/elsewhere".into();
+        bad_parser.parser_context_digest = bad_parser.parser_context.digest().unwrap();
+        rebind_identity(&mut bad_parser);
+        assert_eq!(
+            bad_parser.validate(),
+            Err(SourceReadFailureKind::InvalidContext)
+        );
+        let mut sink = RecordingSink::default();
+        let failure = CassCodexConnector::new()
+            .scan_source_aware(&bad_parser, &mut sink)
+            .expect_err("a context that fails validation is not read");
+        assert_eq!(failure.kind, SourceReadFailureKind::InvalidContext);
+        assert!(sink.records.is_empty(), "no record may reach the sink");
+        let mut native_sink = RecordingSink::default();
+        let native_failure = native
+            .scan_source_aware(&bad_parser, &mut native_sink)
+            .expect_err("the pinned connector rejects the same context");
+        assert_eq!(failure_wire(&failure), failure_wire(&native_failure));
+    }
+
+    /// A sink that stops or fails mid-delivery must keep the pinned failure
+    /// kind, the partial Finish and every event delivered before the stop,
+    /// exactly as the native connector reports them.
+    #[test]
+    fn codex_wrapper_keeps_sink_stop_and_rejection_failures() {
+        let bytes = SYNTHETIC_ROLLOUT.as_bytes();
+        let (_dir, sealed) = sealed_input(bytes, SourceFormat::Jsonl, "codex");
+        let native = FrankenCodexConnector::new();
+
+        for stage in ["record", "conversation", "claims"] {
+            for error in [false, true] {
+                let mut sink = RecordingSink {
+                    stop_at: Some(stage),
+                    error,
+                    ..RecordingSink::default()
+                };
+                let failure = CassCodexConnector::new()
+                    .scan_source_aware(&sealed, &mut sink)
+                    .expect_err("a halted or failing sink ends the read");
+
+                let mut native_sink = RecordingSink {
+                    stop_at: Some(stage),
+                    error,
+                    ..RecordingSink::default()
+                };
+                let native_failure = native
+                    .scan_source_aware(&sealed, &mut native_sink)
+                    .expect_err("the pinned connector stops the same way");
+
+                let expected_kind = if error {
+                    SourceReadFailureKind::Sink
+                } else {
+                    SourceReadFailureKind::Stopped
+                };
+                assert_eq!(failure.kind, expected_kind, "stage {stage}, error={error}");
+                assert_eq!(failure_wire(&failure), failure_wire(&native_failure));
+                assert!(!sink.records.is_empty(), "the stop happens after delivery");
+                assert_eq!(sink.records.len(), native_sink.records.len());
+                assert_eq!(sink.conversations.len(), native_sink.conversations.len());
+                assert_eq!(sink.claims.len(), native_sink.claims.len());
+                assert_eq!(sink.records_wire(), native_sink.records_wire());
+                assert_eq!(sink.claims_wire(), native_sink.claims_wire());
+                assert_eq!(sink.diagnostics, native_sink.diagnostics);
+            }
+        }
+    }
+
+    /// The whole-input projection rejection is the fourth outcome of the same
+    /// delegated method: a reserved record shape rejects the projection while
+    /// keeping every original record and publishing no claims.
+    #[test]
+    fn codex_wrapper_keeps_whole_input_projection_rejection() {
+        let bytes = concat!(
+            r#"{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"session-bridge","cwd":"/fixture/workspace"}}"#,
+            "\n",
+            r#"{"type":"response_item","raw_role":"reserved","payload":{"type":"message","role":"assistant","content":"rejected"}}"#,
+            "\n",
+        );
+        let (_dir, sealed) = sealed_input(bytes.as_bytes(), SourceFormat::Jsonl, "codex");
+
+        let mut sink = RecordingSink::default();
+        let failure = CassCodexConnector::new()
+            .scan_source_aware(&sealed, &mut sink)
+            .expect_err("a reserved raw_role rejects the whole input");
+        assert_eq!(failure.kind, SourceReadFailureKind::ProjectionRejected);
+        assert!(failure.partial_finish.reached_eof);
+        assert_eq!(failure.partial_finish.records_seen, 2);
+        assert_eq!(failure.partial_finish.mapping_diagnostics, 1);
+        assert_eq!(sink.records.len(), 2, "the original records still arrive");
+        assert!(
+            sink.claims.is_empty(),
+            "a rejected input publishes no claims"
+        );
+        assert!(sink.conversations.is_empty());
+        assert_eq!(sink.records[1].diagnostics.len(), 1);
+        assert_eq!(
+            sink.records[1].diagnostics[0].detail.as_deref(),
+            Some("projection_reserved_raw_role")
+        );
+        assert!(
+            sink.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "source_projection_rejected"),
+            "the registered rejection reason reaches the mapping sink"
+        );
+
+        let mut native_sink = RecordingSink::default();
+        let native_failure = FrankenCodexConnector::new()
+            .scan_source_aware(&sealed, &mut native_sink)
+            .expect_err("the pinned connector rejects the same input");
+        assert_eq!(failure_wire(&failure), failure_wire(&native_failure));
+        assert_eq!(sink.records_wire(), native_sink.records_wire());
+        assert_eq!(sink.claims_wire(), native_sink.claims_wire());
+        assert_eq!(sink.diagnostics, native_sink.diagnostics);
+    }
+}

@@ -113,6 +113,7 @@ fn run_cell(label: &str, governor: &str, combine: &str, shadow: &str, corpus_siz
         embedder: "fastembed".to_string(),
         progress: None,
         watch_interval_secs: 30,
+        source_safety_config: None,
     };
 
     // Critical: without CASS_IGNORE_SOURCES_CONFIG=1 + a private HOME,

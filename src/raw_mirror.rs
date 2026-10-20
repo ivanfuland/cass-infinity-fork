@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -1776,6 +1776,492 @@ pub(crate) struct RawMirrorCaptureForMaterialize {
     pub blob: Vec<u8>,
 }
 
+/// A manifest self-digest the read-only opener could actually confirm.
+///
+/// `Missing` is not a failure and must not be read as one: manifests written
+/// before the self-digest field existed carry no evidence either way, and the
+/// opener never back-writes a certificate for them (SRC05B-05 step 6). The two
+/// states are kept apart so a caller cannot turn "there was nothing to check"
+/// into "the bytes were verified".
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifiedManifestSelfDigest {
+    /// The manifest recorded a self-digest and it recomputes equal.
+    Verified,
+    /// The manifest predates the self-digest field; no evidence was recorded.
+    Missing,
+}
+
+/// The fixed failure set of [`open_verified_capture`].
+///
+/// Deliberately payload-free: none of these may carry the caller's input path,
+/// a manifest's original keys or content, or upstream `anyhow` text, and both
+/// `Display` and `Debug` stay context-free (SRC05B-05 C5). The one non-unit
+/// variant carries only a [`std::io::ErrorKind`], so a caller can still tell
+/// missing from denied without the raw error's context.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerifiedCaptureError {
+    /// A relative path in the record is not the canonical shape this module
+    /// derives from its own digest/path rules.
+    InvalidRelativePath,
+    /// A component between the mirror root and the leaf is a symlink, or an
+    /// entry is not the expected file/directory kind.
+    UnsafePath,
+    /// The manifest file is absent or could not be read.
+    ManifestUnreadable,
+    /// The manifest bytes are not a parseable manifest.
+    MalformedManifest,
+    /// The blob file is absent or could not be read.
+    BlobUnreadable,
+    /// The record and the manifest disagree on manifest id, blob path, blob
+    /// hash or blob size.
+    RecordManifestMismatch,
+    /// The manifest's own identity fields do not recompute to its manifest id.
+    ManifestIdentityMismatch,
+    /// The manifest records a self-digest that does not match its bytes.
+    ManifestSelfDigestMismatch,
+    /// The current blob bytes do not hash to the recorded digest.
+    BlobDigestMismatch,
+    /// The current blob length disagrees with a recorded length.
+    BlobSizeMismatch,
+    /// Schema version, manifest kind, hash algorithm, or the compression or
+    /// encryption envelope is outside the supported raw v1 shape.
+    UnsupportedFormat,
+    /// A filesystem error, keyed by kind only.
+    Io(std::io::ErrorKind),
+}
+
+impl VerifiedCaptureError {
+    /// The fixed, context-free code for this failure.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::InvalidRelativePath => "E-VERIFIED-CAPTURE-RELATIVE-PATH",
+            Self::UnsafePath => "E-VERIFIED-CAPTURE-UNSAFE-PATH",
+            Self::ManifestUnreadable => "E-VERIFIED-CAPTURE-MANIFEST-UNREADABLE",
+            Self::MalformedManifest => "E-VERIFIED-CAPTURE-MANIFEST-MALFORMED",
+            Self::BlobUnreadable => "E-VERIFIED-CAPTURE-BLOB-UNREADABLE",
+            Self::RecordManifestMismatch => "E-VERIFIED-CAPTURE-RECORD-MISMATCH",
+            Self::ManifestIdentityMismatch => "E-VERIFIED-CAPTURE-IDENTITY-MISMATCH",
+            Self::ManifestSelfDigestMismatch => "E-VERIFIED-CAPTURE-SELF-DIGEST-MISMATCH",
+            Self::BlobDigestMismatch => "E-VERIFIED-CAPTURE-BLOB-DIGEST-MISMATCH",
+            Self::BlobSizeMismatch => "E-VERIFIED-CAPTURE-BLOB-SIZE-MISMATCH",
+            Self::UnsupportedFormat => "E-VERIFIED-CAPTURE-UNSUPPORTED-FORMAT",
+            Self::Io(_) => "E-VERIFIED-CAPTURE-IO",
+        }
+    }
+}
+
+impl std::fmt::Display for VerifiedCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(kind) => write!(f, "{}: {kind:?}", self.code()),
+            other => f.write_str(other.code()),
+        }
+    }
+}
+
+impl std::error::Error for VerifiedCaptureError {}
+
+/// The manifest-recorded metadata retained by one verified capture handle.
+///
+/// These values are moved from the same parsed manifest the opener verified,
+/// never from the caller's [`RawMirrorCaptureRecord`], the current clock, the
+/// live source's stat, the path or the environment. They are kept exactly as
+/// recorded: whitespace is preserved, an empty host stays `Some("")`, and
+/// `None` / `Some(0)` / negative values round-trip unchanged.
+///
+/// This is the record of that one manifest read. It makes no claim about
+/// external history or about the files staying unchanged afterwards; a later
+/// full-content verifier still owns the final identity check.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RecordedRawMirrorMetadata {
+    pub(crate) provider: String,
+    pub(crate) source_id: String,
+    pub(crate) origin_kind: String,
+    pub(crate) origin_host: Option<String>,
+    pub(crate) captured_at_ms: i64,
+    pub(crate) source_mtime_ms: Option<i64>,
+}
+
+/// A read-only, re-verified view of one sealed raw-mirror capture.
+///
+/// The owned [`File`] is the single handle [`open_verified_capture`] opened,
+/// hashed and then rewound to offset 0; its bytes matched the recorded digest
+/// at the moment of the check. Fields are private and reachable only through
+/// accessors so the opener's invariants cannot be re-opened by hand.
+///
+/// This is the "second read" of the established two-read gate: it guarantees
+/// the bytes it hands over now, not that the file can never change afterwards.
+/// A later full-content verifier still owns the final identity check.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct VerifiedRawMirrorCapture {
+    file: File,
+    manifest_id: String,
+    manifest_relative_path: String,
+    blob_relative_path: String,
+    blob_blake3: String,
+    blob_size_bytes: u64,
+    original_path: String,
+    identity_host: String,
+    agent: String,
+    external_id: Option<String>,
+    shape_root: Option<String>,
+    relative_path: Option<String>,
+    self_digest: VerifiedManifestSelfDigest,
+    recorded_metadata: RecordedRawMirrorMetadata,
+}
+
+/// Hand-written so a stray `{:?}` cannot print the owned [`File`]'s path --
+/// only digests and sizes, which carry no filesystem or source context.
+impl std::fmt::Debug for VerifiedRawMirrorCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedRawMirrorCapture")
+            .field("manifest_id", &self.manifest_id)
+            .field("blob_blake3", &self.blob_blake3)
+            .field("blob_size_bytes", &self.blob_size_bytes)
+            .field("self_digest", &self.self_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl VerifiedRawMirrorCapture {
+    /// The sealed blob, already rewound to offset 0. `&File` is enough to read
+    /// and seek: `std` implements `Read`/`Seek` for `&File` too.
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
+    /// Take ownership of the verified handle when a pipeline must move it.
+    pub(crate) fn into_file(self) -> File {
+        self.file
+    }
+
+    pub(crate) fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+
+    pub(crate) fn manifest_relative_path(&self) -> &str {
+        &self.manifest_relative_path
+    }
+
+    pub(crate) fn blob_relative_path(&self) -> &str {
+        &self.blob_relative_path
+    }
+
+    pub(crate) fn blob_blake3(&self) -> &str {
+        &self.blob_blake3
+    }
+
+    pub(crate) fn blob_size_bytes(&self) -> u64 {
+        self.blob_size_bytes
+    }
+
+    /// The manifest's recorded original path -- returned as recorded, never
+    /// re-derived from the transport hash, the current machine or live config.
+    pub(crate) fn original_path(&self) -> &str {
+        &self.original_path
+    }
+
+    pub(crate) fn identity_host(&self) -> &str {
+        &self.identity_host
+    }
+
+    pub(crate) fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    pub(crate) fn external_id(&self) -> Option<&str> {
+        self.external_id.as_deref()
+    }
+
+    pub(crate) fn shape_root(&self) -> Option<&str> {
+        self.shape_root.as_deref()
+    }
+
+    pub(crate) fn relative_path(&self) -> Option<&str> {
+        self.relative_path.as_deref()
+    }
+
+    /// Whether the manifest carried a self-digest and it recomputed equal.
+    pub(crate) fn manifest_self_digest(&self) -> VerifiedManifestSelfDigest {
+        self.self_digest
+    }
+
+    /// The manifest-recorded identity and time fields of the same read this
+    /// handle was verified against. A borrowed view: reading it never opens,
+    /// seeks or rewrites anything and cannot change the retained values.
+    pub(crate) fn recorded_metadata(&self) -> &RecordedRawMirrorMetadata {
+        &self.recorded_metadata
+    }
+}
+
+/// Open one sealed capture read-only and re-verify it against the current blob
+/// bytes (SRC05B-05).
+///
+/// `record` names a capture produced by [`capture_source_file`]. The manifest
+/// and blob are resolved with the exact path and digest rules the capture side
+/// already uses -- [`raw_mirror_manifest_path_from_relative`],
+/// [`raw_mirror_blob_relative_path`], [`raw_mirror_manifest_id`] and
+/// [`raw_mirror_manifest_blake3`] -- rather than trusting the record's relative
+/// paths, and the blob is then hashed once through the very handle that is
+/// handed back. The call never writes: no manifest refresh, no `db_links` or
+/// cache touch, no permission or mtime change, no new manifest or blob, and no
+/// fallback to the live source (SRC05B-05 step 6).
+///
+/// Only the existing uncompressed, unencrypted raw carrier is supported. Any
+/// other compression or encryption envelope is
+/// [`VerifiedCaptureError::UnsupportedFormat`] instead of being decoded.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn open_verified_capture(
+    data_dir: &Path,
+    record: &RawMirrorCaptureRecord,
+) -> std::result::Result<VerifiedRawMirrorCapture, VerifiedCaptureError> {
+    let root = raw_mirror_root(data_dir);
+
+    // Step 1. Resolve the manifest with the shared validator, and require the
+    // record's id/path pair to be canonical: the name on disk is
+    // `manifests/<manifest_id>.json`, so a record whose id and path disagree,
+    // or whose path is not that shape, is refused before any file is touched.
+    let manifest_path =
+        raw_mirror_manifest_path_from_relative(&root, &record.manifest_relative_path)
+            .map_err(|_| VerifiedCaptureError::InvalidRelativePath)?;
+    if record.manifest_relative_path != raw_mirror_manifest_relative_path(&record.manifest_id) {
+        return Err(VerifiedCaptureError::InvalidRelativePath);
+    }
+    // The blob path is never taken from the record verbatim: it is recomputed
+    // from the record's digest and must equal what the record claims.
+    let canonical_blob_relative_path = raw_mirror_blob_relative_path(&record.blob_blake3)
+        .ok_or(VerifiedCaptureError::InvalidRelativePath)?;
+    if record.blob_relative_path != canonical_blob_relative_path {
+        return Err(VerifiedCaptureError::InvalidRelativePath);
+    }
+
+    // Step 4 (manifest half). No symlink or wrong-kind entry on the way down.
+    verify_readonly_file_under_data_dir(data_dir, &manifest_path).map_err(|err| match err {
+        VerifiedCaptureError::Io(std::io::ErrorKind::NotFound) => {
+            VerifiedCaptureError::ManifestUnreadable
+        }
+        other => other,
+    })?;
+
+    // Steps 1-3. Parse the small manifest metadata and check the sealed shape.
+    let manifest = read_raw_mirror_manifest(&manifest_path).map_err(map_manifest_read_error)?;
+    if manifest.schema_version != RAW_MIRROR_SCHEMA_VERSION
+        || manifest.manifest_kind != RAW_MIRROR_MANIFEST_KIND
+        || manifest.blob_hash_algorithm != RAW_MIRROR_HASH_ALGORITHM
+    {
+        return Err(VerifiedCaptureError::UnsupportedFormat);
+    }
+    if manifest.compression.state != "none"
+        || manifest.compression.algorithm.is_some()
+        || manifest.encryption.state != "none"
+        || manifest.encryption.algorithm.is_some()
+        || manifest.encryption.key_id.is_some()
+        || manifest.encryption.envelope_version.is_some()
+    {
+        return Err(VerifiedCaptureError::UnsupportedFormat);
+    }
+
+    // Step 2. The record and the manifest must agree on identity and blob facts.
+    if manifest.manifest_id != record.manifest_id
+        || manifest.blob_relative_path != record.blob_relative_path
+        || manifest.blob_blake3 != record.blob_blake3
+        || manifest.blob_size_bytes != record.blob_size_bytes
+    {
+        return Err(VerifiedCaptureError::RecordManifestMismatch);
+    }
+    // The manifest's own identity must recompute: the original-path digest,
+    // then the manifest id derived from the immutable identity tuple. `db_links`
+    // are mutable and outside that tuple, so a legal backlink update keeps the
+    // same manifest id and must not be mistaken for a broken one.
+    if raw_mirror_original_path_blake3(&manifest.original_path) != manifest.original_path_blake3 {
+        return Err(VerifiedCaptureError::ManifestIdentityMismatch);
+    }
+    let recomputed_manifest_id = raw_mirror_manifest_id(
+        &manifest.provider,
+        &manifest.source_id,
+        &manifest.origin_kind,
+        manifest.origin_host.as_deref(),
+        &manifest.original_path_blake3,
+        &manifest.blob_blake3,
+    );
+    if recomputed_manifest_id != manifest.manifest_id {
+        return Err(VerifiedCaptureError::ManifestIdentityMismatch);
+    }
+    // The manifest's blob path must itself be the canonical digest-derived path.
+    if raw_mirror_blob_relative_path(&manifest.blob_blake3).as_deref()
+        != Some(manifest.blob_relative_path.as_str())
+    {
+        return Err(VerifiedCaptureError::UnsupportedFormat);
+    }
+
+    // Step 2. Self-digest: verified when recorded and equal; explicitly Missing
+    // (never "assumed good", never back-written) when the manifest predates the
+    // field.
+    let self_digest = match manifest.manifest_blake3.as_deref() {
+        Some(recorded) => {
+            if raw_mirror_manifest_blake3(&manifest) != recorded {
+                return Err(VerifiedCaptureError::ManifestSelfDigestMismatch);
+            }
+            VerifiedManifestSelfDigest::Verified
+        }
+        None => VerifiedManifestSelfDigest::Missing,
+    };
+
+    // Step 4 (blob half) + step 5. Check the blob's own components, then open it
+    // exactly once and hash the current bytes through that same handle in a
+    // fixed bounded buffer -- never `fs::read` of the blob, never the whole blob
+    // in memory.
+    let blob_path = root.join(&manifest.blob_relative_path);
+    let blob_metadata =
+        verify_readonly_file_under_data_dir(data_dir, &blob_path).map_err(|err| match err {
+            VerifiedCaptureError::Io(std::io::ErrorKind::NotFound) => {
+                VerifiedCaptureError::BlobUnreadable
+            }
+            other => other,
+        })?;
+
+    let mut file = File::open(&blob_path).map_err(|err| VerifiedCaptureError::Io(err.kind()))?;
+    let (actual_hex, actual_bytes) =
+        blake3_stream_hex(&mut file).map_err(|err| VerifiedCaptureError::Io(err.kind()))?;
+    if actual_hex != manifest.blob_blake3 {
+        return Err(VerifiedCaptureError::BlobDigestMismatch);
+    }
+    if actual_bytes != manifest.blob_size_bytes {
+        return Err(VerifiedCaptureError::BlobSizeMismatch);
+    }
+    // The length seen while walking the path must equal the bytes actually read:
+    // a file that changed under us is a size mismatch, not a silent pass.
+    if blob_metadata.len() != actual_bytes {
+        return Err(VerifiedCaptureError::BlobSizeMismatch);
+    }
+    // A recorded uncompressed length is a cross-check on the measured bytes, not
+    // a substitute for measuring them (a stale verification status counts for
+    // nothing here).
+    if let Some(declared) = manifest.compression.uncompressed_size_bytes
+        && declared != actual_bytes
+    {
+        return Err(VerifiedCaptureError::BlobSizeMismatch);
+    }
+    // Hand the caller a handle that is already rewound to the start.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| VerifiedCaptureError::Io(err.kind()))?;
+
+    Ok(finish_verified_capture(
+        file,
+        manifest,
+        record.manifest_relative_path.clone(),
+        self_digest,
+    ))
+}
+
+/// Finish a verified capture from the manifest the opener already parsed.
+///
+/// Consumes that parsed manifest by value and only moves fields into the
+/// handle: it never opens, reads, seeks, re-parses or clones a reader, and it
+/// never consults `data_dir`, the manifest path or the caller record again.
+/// The opener calls it only after every original verification and the rewind
+/// succeeded.
+#[cfg_attr(not(test), allow(dead_code))]
+fn finish_verified_capture(
+    file: File,
+    manifest: RawMirrorManifestFile,
+    manifest_relative_path: String,
+    self_digest: VerifiedManifestSelfDigest,
+) -> VerifiedRawMirrorCapture {
+    VerifiedRawMirrorCapture {
+        file,
+        manifest_id: manifest.manifest_id,
+        manifest_relative_path,
+        blob_relative_path: manifest.blob_relative_path,
+        blob_blake3: manifest.blob_blake3,
+        blob_size_bytes: manifest.blob_size_bytes,
+        original_path: manifest.original_path,
+        identity_host: manifest.identity_host,
+        agent: manifest.agent,
+        external_id: manifest.external_id,
+        shape_root: manifest.shape_root,
+        relative_path: manifest.relative_path,
+        self_digest,
+        recorded_metadata: RecordedRawMirrorMetadata {
+            provider: manifest.provider,
+            source_id: manifest.source_id,
+            origin_kind: manifest.origin_kind,
+            origin_host: manifest.origin_host,
+            captured_at_ms: manifest.captured_at_ms,
+            source_mtime_ms: manifest.source_mtime_ms,
+        },
+    }
+}
+
+/// Map a manifest parse failure to the fixed error set, keeping `anyhow`
+/// context out of the error text: only the `io::ErrorKind` at the root cause,
+/// or a bare "malformed" code when the bytes themselves did not parse.
+#[cfg_attr(not(test), allow(dead_code))]
+fn map_manifest_read_error(err: anyhow::Error) -> VerifiedCaptureError {
+    match err.root_cause().downcast_ref::<std::io::Error>() {
+        Some(io) => VerifiedCaptureError::Io(io.kind()),
+        None => VerifiedCaptureError::MalformedManifest,
+    }
+}
+
+/// Read-only counterpart to the write-side `ensure_private_dir` checks: confirm
+/// every component between `data_dir` and `path` -- `raw-mirror` and `v1`
+/// included, not just the leaves under them -- is a real, non-symlink entry,
+/// and that `path` itself is a regular file. It never creates a directory or
+/// changes a permission, so a hostile symlink anywhere in the tree is rejected
+/// in place instead of being "repaired" (SRC05B-05 step 4).
+///
+/// The walk starts at `data_dir`'s own children deliberately: `symlink_metadata`
+/// on `data_dir/raw-mirror/v1` follows a symlinked `raw-mirror` parent and would
+/// only ever see a real `v1`, so the mirror root's *parent* has to be checked
+/// component by component. `data_dir` itself is not checked -- the caller's path
+/// convention for it is not this function's to change.
+///
+/// Returns the leaf's metadata so the caller can cross-check its length against
+/// the bytes it actually reads.
+#[cfg_attr(not(test), allow(dead_code))]
+fn verify_readonly_file_under_data_dir(
+    data_dir: &Path,
+    path: &Path,
+) -> std::result::Result<fs::Metadata, VerifiedCaptureError> {
+    let relative = path
+        .strip_prefix(data_dir)
+        .map_err(|_| VerifiedCaptureError::InvalidRelativePath)?;
+    let components: Vec<Component> = relative.components().collect();
+    if components.is_empty() {
+        return Err(VerifiedCaptureError::UnsafePath);
+    }
+
+    let mut current = data_dir.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            return Err(VerifiedCaptureError::InvalidRelativePath);
+        };
+        current.push(part);
+        let metadata =
+            fs::symlink_metadata(&current).map_err(|err| VerifiedCaptureError::Io(err.kind()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(VerifiedCaptureError::UnsafePath);
+        }
+        let is_leaf = index + 1 == components.len();
+        if is_leaf {
+            if !metadata.is_file() {
+                return Err(VerifiedCaptureError::UnsafePath);
+            }
+            return Ok(metadata);
+        }
+        if !metadata.is_dir() {
+            return Err(VerifiedCaptureError::UnsafePath);
+        }
+    }
+    Err(VerifiedCaptureError::UnsafePath)
+}
+
 /// PR6 T2b (任务书 #114, R2-B3): force-fsync a session's captured blob and
 /// manifest (plus their parent directories) *unconditionally* -- unlike
 /// [`sync_file`]/[`sync_parent`], this does **not** consult
@@ -2177,20 +2663,37 @@ fn unique_db_links(links: &[RawMirrorDbLink]) -> Vec<RawMirrorDbLink> {
     dedup
 }
 
-fn file_blake3(path: &Path) -> Result<String> {
-    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+/// Fixed bound on the hashing buffer shared by [`file_blake3`] and
+/// [`open_verified_capture`]: both stream a file through one small stack buffer
+/// instead of ever holding it whole.
+const BLAKE3_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Hash `reader` to completion with a fixed bounded buffer and report both the
+/// hex digest and the number of bytes consumed.
+///
+/// Extracted verbatim from the original [`file_blake3`] loop so the read-only
+/// opener can reuse one chunking rule on the handle it already verified, rather
+/// than a second hashing path (SRC05B-05). `file_blake3`'s result is unchanged.
+fn blake3_stream_hex<R: Read>(reader: &mut R) -> std::io::Result<(String, u64)> {
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = [0u8; BLAKE3_CHUNK_BYTES];
+    let mut bytes = 0u64;
     loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("read {}", path.display()))?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         hasher.update(&buffer[..read]);
+        bytes += read as u64;
     }
-    Ok(hasher.finalize().to_hex().to_string())
+    Ok((hasher.finalize().to_hex().to_string(), bytes))
+}
+
+fn file_blake3(path: &Path) -> Result<String> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let (digest, _bytes) =
+        blake3_stream_hex(&mut file).with_context(|| format!("read {}", path.display()))?;
+    Ok(digest)
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -5136,4 +5639,1185 @@ mod tests {
         let _ = link_a;
     }
     // =============== R1 Finding 6 判据结束（存储侧）===============
+
+    // ===================== SRC05B-05 只读验证打开判据开始 =====================
+
+    const VERIFIED_CAPTURE_MULTI_CHUNK_BYTES: usize = 200 * 1024;
+    const VERIFIED_CAPTURE_LARGE_BYTES: usize = 32 * 1024 * 1024;
+
+    fn verified_capture_fixture(
+        temp: &tempfile::TempDir,
+        provider: &str,
+        source_bytes: &[u8],
+    ) -> (PathBuf, RawMirrorCaptureRecord, PathBuf) {
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source-fixture.jsonl");
+        fs::write(&source_path, source_bytes).expect("write source fixture");
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider,
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture fixture");
+        (data_dir, record, source_path)
+    }
+
+    fn verified_capture_paths(
+        data_dir: &Path,
+        record: &RawMirrorCaptureRecord,
+    ) -> (PathBuf, PathBuf) {
+        let root = raw_mirror_root(data_dir);
+        (
+            root.join(&record.manifest_relative_path),
+            root.join(&record.blob_relative_path),
+        )
+    }
+
+    fn verified_capture_rewrite_manifest(path: &Path, mutate: impl FnOnce(&mut Value)) {
+        let mut value: Value = serde_json::from_slice(&fs::read(path).expect("manifest bytes"))
+            .expect("manifest json");
+        mutate(&mut value);
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(&value).expect("serialize manifest"),
+        )
+        .expect("rewrite manifest");
+    }
+
+    #[cfg(unix)]
+    fn verified_capture_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("metadata").permissions().mode()
+    }
+
+    /// C1: the sealed bytes survive the live source disappearing, the returned
+    /// handle starts at offset 0, and the metadata is the manifest's own.
+    #[test]
+    fn verified_capture_open_returns_sealed_bytes_after_live_source_is_gone_positive() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"sealed\"}\n";
+        let (data_dir, record, source_path) =
+            verified_capture_fixture(&temp, "codex", source_bytes);
+        let (manifest_path, blob_path) = verified_capture_paths(&data_dir, &record);
+        let manifest_before = read_raw_mirror_manifest(&manifest_path).expect("manifest");
+        let manifest_bytes_before = fs::read(&manifest_path).expect("manifest bytes");
+        let blob_bytes_before = fs::read(&blob_path).expect("blob bytes");
+
+        fs::remove_file(&source_path).expect("remove live source");
+
+        let opened = open_verified_capture(&data_dir, &record).expect("verified open");
+        assert_eq!(opened.manifest_id(), record.manifest_id.as_str());
+        assert_eq!(
+            opened.manifest_relative_path(),
+            record.manifest_relative_path.as_str()
+        );
+        assert_eq!(
+            opened.blob_relative_path(),
+            record.blob_relative_path.as_str()
+        );
+        assert_eq!(opened.blob_blake3(), record.blob_blake3.as_str());
+        assert_eq!(opened.blob_size_bytes(), record.blob_size_bytes);
+        assert_eq!(
+            opened.original_path(),
+            manifest_before.original_path.as_str()
+        );
+        assert_eq!(
+            opened.identity_host(),
+            manifest_before.identity_host.as_str()
+        );
+        assert_eq!(opened.agent(), manifest_before.agent.as_str());
+        assert_eq!(opened.external_id(), manifest_before.external_id.as_deref());
+        assert_eq!(opened.shape_root(), manifest_before.shape_root.as_deref());
+        assert_eq!(
+            opened.relative_path(),
+            manifest_before.relative_path.as_deref()
+        );
+        assert_eq!(
+            opened.manifest_self_digest(),
+            VerifiedManifestSelfDigest::Verified
+        );
+
+        let mut handle = opened.file();
+        assert_eq!(handle.stream_position().expect("offset"), 0);
+        let mut read_back = Vec::new();
+        handle
+            .read_to_end(&mut read_back)
+            .expect("read sealed bytes");
+        assert_eq!(read_back, source_bytes);
+        assert_eq!(read_back, blob_bytes_before);
+
+        // The open was read-only: neither file changed on disk.
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest bytes"),
+            manifest_bytes_before
+        );
+        assert_eq!(fs::read(&blob_path).expect("blob bytes"), blob_bytes_before);
+    }
+
+    /// C1: an empty blob and a blob larger than the hashing buffer both verify.
+    #[test]
+    fn verified_capture_reads_empty_and_multi_chunk_blobs_positive() {
+        let empty_temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&empty_temp, "codex", b"");
+        assert_eq!(record.blob_size_bytes, 0);
+        let opened = open_verified_capture(&data_dir, &record).expect("empty blob open");
+        assert_eq!(opened.blob_size_bytes(), 0);
+        let mut handle = opened.file();
+        let mut bytes = Vec::new();
+        handle.read_to_end(&mut bytes).expect("read empty blob");
+        assert!(bytes.is_empty());
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let large: Vec<u8> = (0..VERIFIED_CAPTURE_MULTI_CHUNK_BYTES)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", &large);
+        assert!(record.blob_size_bytes as usize > 128 * 1024);
+        let opened = open_verified_capture(&data_dir, &record).expect("multi-chunk open");
+        let mut handle = opened.file();
+        let mut bytes = Vec::new();
+        handle
+            .read_to_end(&mut bytes)
+            .expect("read multi-chunk blob");
+        assert_eq!(bytes, large);
+    }
+
+    /// C2: every record/manifest disagreement is refused and nothing changes on
+    /// disk. The unmutated record opens in the same run as the control.
+    #[test]
+    fn verified_capture_rejects_record_and_manifest_mismatches_r2() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (manifest_path, blob_path) = verified_capture_paths(&data_dir, &record);
+        let manifest_bytes = fs::read(&manifest_path).expect("manifest bytes");
+        let blob_bytes = fs::read(&blob_path).expect("blob bytes");
+        #[cfg(unix)]
+        let (manifest_mode, blob_mode) = (
+            verified_capture_mode(&manifest_path),
+            verified_capture_mode(&blob_path),
+        );
+
+        // Control.
+        open_verified_capture(&data_dir, &record).expect("control open");
+
+        let manifest_cases: [(&str, fn(&mut Value)); 4] = [
+            ("manifest_id", |value| {
+                value["manifest_id"] = json!("bogus-manifest-id")
+            }),
+            ("blob_relative_path", |value| {
+                value["blob_relative_path"] = json!("blobs/blake3/zz/not-canonical.raw")
+            }),
+            ("blob_blake3", |value| {
+                value["blob_blake3"] = json!("0".repeat(64))
+            }),
+            ("blob_size_bytes", |value| {
+                value["blob_size_bytes"] = json!(1_234_567u64)
+            }),
+        ];
+        for (label, mutate) in manifest_cases {
+            fs::write(&manifest_path, &manifest_bytes).expect("restore manifest");
+            verified_capture_rewrite_manifest(&manifest_path, mutate);
+            assert_eq!(
+                open_verified_capture(&data_dir, &record).unwrap_err(),
+                VerifiedCaptureError::RecordManifestMismatch,
+                "manifest `{label}` mismatch must be rejected"
+            );
+        }
+        fs::write(&manifest_path, &manifest_bytes).expect("restore manifest");
+
+        let mut bogus_id = record.clone();
+        bogus_id.manifest_id = "bogus-manifest-id".to_string();
+        assert_eq!(
+            open_verified_capture(&data_dir, &bogus_id).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut wrong_path = record.clone();
+        wrong_path.manifest_relative_path = "manifests/other.json".to_string();
+        assert_eq!(
+            open_verified_capture(&data_dir, &wrong_path).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut wrong_blob_path = record.clone();
+        wrong_blob_path.blob_relative_path = "blobs/blake3/aa/not-canonical.raw".to_string();
+        assert_eq!(
+            open_verified_capture(&data_dir, &wrong_blob_path).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut wrong_blob_hash = record.clone();
+        wrong_blob_hash.blob_blake3 = "1".repeat(64);
+        assert_eq!(
+            open_verified_capture(&data_dir, &wrong_blob_hash).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut wrong_size = record.clone();
+        wrong_size.blob_size_bytes = record.blob_size_bytes + 1;
+        assert_eq!(
+            open_verified_capture(&data_dir, &wrong_size).unwrap_err(),
+            VerifiedCaptureError::RecordManifestMismatch
+        );
+
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest bytes"),
+            manifest_bytes
+        );
+        assert_eq!(fs::read(&blob_path).expect("blob bytes"), blob_bytes);
+        #[cfg(unix)]
+        {
+            assert_eq!(verified_capture_mode(&manifest_path), manifest_mode);
+            assert_eq!(verified_capture_mode(&blob_path), blob_mode);
+        }
+    }
+
+    /// C2 + C7 discrimination: a same-length replacement is caught by the digest
+    /// comparison alone (the size check cannot see it).
+    #[test]
+    fn verified_capture_rejects_same_length_tampered_blob_r2() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"original\"}\n";
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", source_bytes);
+        let (manifest_path, blob_path) = verified_capture_paths(&data_dir, &record);
+        let manifest_bytes = fs::read(&manifest_path).expect("manifest bytes");
+        #[cfg(unix)]
+        let (manifest_mode, blob_mode) = (
+            verified_capture_mode(&manifest_path),
+            verified_capture_mode(&blob_path),
+        );
+
+        let mut tampered = source_bytes.to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'X' { b'Y' } else { b'X' };
+        assert_eq!(tampered.len(), source_bytes.len());
+        fs::write(&blob_path, &tampered).expect("tamper blob");
+
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::BlobDigestMismatch
+        );
+
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest bytes"),
+            manifest_bytes
+        );
+        assert_eq!(fs::read(&blob_path).expect("blob bytes"), tampered);
+        #[cfg(unix)]
+        {
+            assert_eq!(verified_capture_mode(&manifest_path), manifest_mode);
+            assert_eq!(verified_capture_mode(&blob_path), blob_mode);
+        }
+    }
+
+    /// C2: a missing manifest or blob is a fixed rejection and creates nothing.
+    #[test]
+    fn verified_capture_rejects_missing_manifest_and_blob_r2() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (manifest_path, _) = verified_capture_paths(&data_dir, &record);
+        fs::remove_file(&manifest_path).expect("remove manifest");
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::ManifestUnreadable
+        );
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (manifest_path, blob_path) = verified_capture_paths(&data_dir, &record);
+        let manifest_bytes = fs::read(&manifest_path).expect("manifest bytes");
+        let manifests_dir = manifest_path.parent().expect("manifests dir").to_path_buf();
+        let before: Vec<_> = fs::read_dir(&manifests_dir)
+            .expect("manifests dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        fs::remove_file(&blob_path).expect("remove blob");
+
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::BlobUnreadable
+        );
+        assert!(!blob_path.exists());
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest bytes"),
+            manifest_bytes
+        );
+        let after: Vec<_> = fs::read_dir(&manifests_dir)
+            .expect("manifests dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(after.len(), before.len());
+    }
+
+    /// C2: non-canonical or traversing relative paths never touch the filesystem.
+    #[test]
+    fn verified_capture_rejects_non_canonical_relative_paths_r2() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+
+        let mut absolute = record.clone();
+        absolute.manifest_relative_path = "/etc/passwd".to_string();
+        assert_eq!(
+            open_verified_capture(&data_dir, &absolute).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut traversal = record.clone();
+        traversal.manifest_relative_path = "../manifests/escape.json".to_string();
+        assert_eq!(
+            open_verified_capture(&data_dir, &traversal).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut wrong_prefix = record.clone();
+        wrong_prefix.manifest_relative_path = format!("blobs/{}.json", record.manifest_id);
+        assert_eq!(
+            open_verified_capture(&data_dir, &wrong_prefix).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+
+        let mut hostile_blob = record.clone();
+        hostile_blob.blob_relative_path = "../../escape.raw".to_string();
+        assert_eq!(
+            open_verified_capture(&data_dir, &hostile_blob).unwrap_err(),
+            VerifiedCaptureError::InvalidRelativePath
+        );
+    }
+
+    /// C2: a symlinked leaf or a symlinked intermediate directory is refused.
+    #[cfg(unix)]
+    #[test]
+    fn verified_capture_rejects_symlinked_leaf_and_component_r2() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (_, blob_path) = verified_capture_paths(&data_dir, &record);
+        let parked_blob = temp.path().join("parked-blob.raw");
+        fs::rename(&blob_path, &parked_blob).expect("park blob");
+        symlink(&parked_blob, &blob_path).expect("symlink blob leaf");
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::UnsafePath
+        );
+        assert!(
+            fs::symlink_metadata(&blob_path)
+                .expect("leaf")
+                .file_type()
+                .is_symlink()
+        );
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (_, blob_path) = verified_capture_paths(&data_dir, &record);
+        let prefix_dir = blob_path.parent().expect("prefix dir").to_path_buf();
+        let parked_prefix = temp.path().join("parked-prefix");
+        fs::rename(&prefix_dir, &parked_prefix).expect("park prefix dir");
+        symlink(&parked_prefix, &prefix_dir).expect("symlink prefix dir");
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::UnsafePath
+        );
+    }
+
+    /// C2: neither the mirror root's parent `raw-mirror` nor `v1` itself may be
+    /// a symlink, even though everything under them still resolves through it.
+    #[cfg(unix)]
+    #[test]
+    fn verified_capture_rejects_symlinked_mirror_root_components_r2() {
+        use std::os::unix::fs::symlink;
+
+        // `raw-mirror` (the mirror root's parent). `symlink_metadata` on
+        // `data_dir/raw-mirror/v1` follows this symlink and still sees a real
+        // `v1`, so only a component-by-component walk can catch it.
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        open_verified_capture(&data_dir, &record).expect("control open");
+        let mirror_dir = data_dir.join(RAW_MIRROR_ROOT_DIR);
+        let parked_mirror = temp.path().join("parked-raw-mirror");
+        fs::rename(&mirror_dir, &parked_mirror).expect("park raw-mirror dir");
+        symlink(&parked_mirror, &mirror_dir).expect("symlink raw-mirror dir");
+        assert!(
+            fs::symlink_metadata(&mirror_dir)
+                .expect("raw-mirror")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(mirror_dir.join(RAW_MIRROR_VERSION_DIR).is_dir());
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::UnsafePath
+        );
+
+        // `v1` (the mirror root itself).
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let root = raw_mirror_root(&data_dir);
+        let parked_root = temp.path().join("parked-v1");
+        fs::rename(&root, &parked_root).expect("park v1 dir");
+        symlink(&parked_root, &root).expect("symlink v1 dir");
+        assert!(
+            fs::symlink_metadata(&root)
+                .expect("v1")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::UnsafePath
+        );
+    }
+
+    /// C2: a blob path that is not a regular file is refused.
+    #[test]
+    fn verified_capture_rejects_non_file_blob_r2() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (_, blob_path) = verified_capture_paths(&data_dir, &record);
+        fs::remove_file(&blob_path).expect("remove blob");
+        fs::create_dir(&blob_path).expect("replace blob with a directory");
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::UnsafePath
+        );
+        assert!(fs::metadata(&blob_path).expect("blob dir").is_dir());
+    }
+
+    /// C3: self-digest mismatch is refused and not back-written; a legacy
+    /// manifest without one opens but reports `Missing`.
+    #[test]
+    fn verified_capture_self_digest_states_are_explicit_and_never_written_r3() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (manifest_path, _) = verified_capture_paths(&data_dir, &record);
+        let original = fs::read(&manifest_path).expect("manifest bytes");
+
+        assert_eq!(
+            open_verified_capture(&data_dir, &record)
+                .expect("verified open")
+                .manifest_self_digest(),
+            VerifiedManifestSelfDigest::Verified
+        );
+
+        verified_capture_rewrite_manifest(&manifest_path, |value| {
+            value["manifest_blake3"] = json!("doctor-raw-mirror-manifest-v1-0000000000000000");
+        });
+        let tampered_bytes = fs::read(&manifest_path).expect("manifest bytes");
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::ManifestSelfDigestMismatch
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest bytes"),
+            tampered_bytes,
+            "a failed open must not rewrite the manifest"
+        );
+        fs::write(&manifest_path, &original).expect("restore manifest");
+
+        verified_capture_rewrite_manifest(&manifest_path, |value| {
+            value
+                .as_object_mut()
+                .expect("manifest object")
+                .remove("manifest_blake3");
+        });
+        let legacy_bytes = fs::read(&manifest_path).expect("manifest bytes");
+        let opened = open_verified_capture(&data_dir, &record).expect("legacy manifest open");
+        assert_eq!(
+            opened.manifest_self_digest(),
+            VerifiedManifestSelfDigest::Missing
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest bytes"),
+            legacy_bytes,
+            "a legacy manifest must not gain a certificate"
+        );
+        fs::write(&manifest_path, &original).expect("restore manifest");
+    }
+
+    /// C3: a legal `db_links` update reissues the self-digest but keeps the
+    /// manifest id, because the mutable links are outside the identity tuple.
+    #[test]
+    fn verified_capture_accepts_db_links_update_with_same_manifest_id_r3() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (manifest_path, _) = verified_capture_paths(&data_dir, &record);
+        let manifest_id_before = read_raw_mirror_manifest(&manifest_path)
+            .expect("manifest")
+            .manifest_id;
+
+        merge_manifest_db_links(
+            &data_dir,
+            &record.manifest_relative_path,
+            &[RawMirrorDbLink {
+                conversation_id: Some(7),
+                message_count: Some(3),
+                source_path: Some("synthetic".to_string()),
+                started_at_ms: Some(1_733_000_000_000),
+            }],
+        )
+        .expect("merge db links");
+
+        let opened = open_verified_capture(&data_dir, &record).expect("open after a link update");
+        assert_eq!(
+            opened.manifest_self_digest(),
+            VerifiedManifestSelfDigest::Verified
+        );
+        assert_eq!(opened.manifest_id(), record.manifest_id.as_str());
+        let after = read_raw_mirror_manifest(&manifest_path).expect("manifest");
+        assert_eq!(after.manifest_id, manifest_id_before);
+        assert_eq!(after.db_links.len(), 1);
+    }
+
+    /// C3: schema, kind, hash algorithm, compression and encryption outside the
+    /// supported raw v1 shape are refused, never decoded into an accepted open.
+    #[test]
+    fn verified_capture_rejects_unsupported_carriers_r3() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let (data_dir, record, _) = verified_capture_fixture(&temp, "codex", b"body\n");
+        let (manifest_path, _) = verified_capture_paths(&data_dir, &record);
+        let original = fs::read(&manifest_path).expect("manifest bytes");
+
+        let cases: [(&str, fn(&mut Value)); 5] = [
+            ("schema_version", |value| value["schema_version"] = json!(2)),
+            ("manifest_kind", |value| {
+                value["manifest_kind"] = json!("cass_raw_session_mirror_v2")
+            }),
+            ("blob_hash_algorithm", |value| {
+                value["blob_hash_algorithm"] = json!("sha256")
+            }),
+            ("compression", |value| {
+                value["compression"]["state"] = json!("gzip")
+            }),
+            ("encryption", |value| {
+                value["encryption"]["state"] = json!("aes-256-gcm")
+            }),
+        ];
+        for (label, mutate) in cases {
+            fs::write(&manifest_path, &original).expect("restore manifest");
+            verified_capture_rewrite_manifest(&manifest_path, mutate);
+            assert_eq!(
+                open_verified_capture(&data_dir, &record).unwrap_err(),
+                VerifiedCaptureError::UnsupportedFormat,
+                "unsupported carrier `{label}` must not pass as raw"
+            );
+        }
+        fs::write(&manifest_path, &original).expect("restore manifest");
+    }
+
+    /// C4: a 32 MiB blob is written to disk in chunks, hashed through the
+    /// bounded buffer, and the returned handle re-hashes to the same digest.
+    #[test]
+    fn verified_capture_streams_large_blob_through_bounded_buffer_r4() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("large-fixture.bin");
+        {
+            let mut file = File::create(&source_path).expect("create fixture");
+            let pattern: Vec<u8> = (0..BLAKE3_CHUNK_BYTES)
+                .map(|index| (index % 251) as u8)
+                .collect();
+            let mut written = 0usize;
+            while written < VERIFIED_CAPTURE_LARGE_BYTES {
+                let chunk = (VERIFIED_CAPTURE_LARGE_BYTES - written).min(pattern.len());
+                file.write_all(&pattern[..chunk]).expect("write chunk");
+                written += chunk;
+            }
+            file.sync_all().expect("sync fixture");
+        }
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture large fixture");
+        assert_eq!(
+            record.blob_size_bytes as usize,
+            VERIFIED_CAPTURE_LARGE_BYTES
+        );
+
+        let opened = open_verified_capture(&data_dir, &record).expect("large verified open");
+        // Take ownership of the verified handle to prove `into_file` hands over
+        // the very handle the opener hashed, still positioned at offset 0.
+        let mut handle = opened.into_file();
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 128 * 1024];
+        let mut total = 0usize;
+        loop {
+            let read = handle.read(&mut buffer).expect("read chunk");
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            total += read;
+        }
+        assert_eq!(total, VERIFIED_CAPTURE_LARGE_BYTES);
+        assert_eq!(hasher.finalize().to_hex().to_string(), record.blob_blake3);
+    }
+
+    /// C5: error text is a fixed code only -- no planted path or content.
+    #[test]
+    fn verified_capture_error_text_carries_no_input_context_r5() {
+        const SENTINEL: &str = "SRC05B-LEAK-SENTINEL-9f3a";
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source_bytes = format!("{{\"text\":\"{SENTINEL}\"}}\n");
+        let (data_dir, record, _) =
+            verified_capture_fixture(&temp, "codex", source_bytes.as_bytes());
+        let (manifest_path, blob_path) = verified_capture_paths(&data_dir, &record);
+        let original = fs::read(&manifest_path).expect("manifest bytes");
+
+        verified_capture_rewrite_manifest(&manifest_path, |value| {
+            value["original_path"] = json!(format!("/synthetic/{SENTINEL}"));
+        });
+        let err = open_verified_capture(&data_dir, &record).expect_err("identity mismatch");
+        assert_eq!(err, VerifiedCaptureError::ManifestIdentityMismatch);
+        assert!(!format!("{err}").contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
+        fs::write(&manifest_path, &original).expect("restore manifest");
+
+        let mut tampered = source_bytes.clone().into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] = b'!';
+        fs::write(&blob_path, &tampered).expect("tamper blob");
+        let err = open_verified_capture(&data_dir, &record).expect_err("digest mismatch");
+        assert_eq!(err, VerifiedCaptureError::BlobDigestMismatch);
+        let display = format!("{err}");
+        assert!(!display.contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
+        assert!(!display.contains(&data_dir.display().to_string()));
+    }
+
+    /// C5: a broken sealed blob fails even when the live source is intact and
+    /// valid -- there is no fallback to the source.
+    #[test]
+    fn verified_capture_never_falls_back_to_live_source_r5() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source_bytes = b"{\"type\":\"message\",\"text\":\"live\"}\n";
+        let (data_dir, record, source_path) =
+            verified_capture_fixture(&temp, "codex", source_bytes);
+        let (_, blob_path) = verified_capture_paths(&data_dir, &record);
+        assert_eq!(fs::read(&source_path).expect("live source"), source_bytes);
+
+        let mut tampered = source_bytes.to_vec();
+        tampered[0] = b'X';
+        fs::write(&blob_path, &tampered).expect("tamper sealed blob");
+        assert_eq!(
+            open_verified_capture(&data_dir, &record).unwrap_err(),
+            VerifiedCaptureError::BlobDigestMismatch
+        );
+    }
+
+    // ===================== SRC05B-05 只读验证打开判据结束 =====================
 }
+
+// ===================== Task43 记录元信息读取面判据开始 =====================
+#[cfg(test)]
+mod recorded_metadata_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const RECORDED_PAYLOAD: &[u8] = b"S43_SEALED_BYTES\n";
+    const CALLER_CAPTURED_AT_MS: i64 = 999_999;
+    const CALLER_SOURCE_MTIME_MS: i64 = 888_888;
+
+    fn recorded_capture(
+        temp: &tempfile::TempDir,
+        provider: &str,
+        source_id: &str,
+        origin_kind: &str,
+        origin_host: Option<&str>,
+        payload: &[u8],
+    ) -> (PathBuf, RawMirrorCaptureRecord, PathBuf) {
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("source-fixture.jsonl");
+        fs::write(&source_path, payload).expect("write recorded fixture source");
+        let record = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider,
+            source_id,
+            origin_kind,
+            origin_host,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect("capture recorded fixture");
+        (data_dir, record, source_path)
+    }
+
+    fn recorded_manifest_path(data_dir: &Path, record: &RawMirrorCaptureRecord) -> PathBuf {
+        raw_mirror_root(data_dir).join(&record.manifest_relative_path)
+    }
+
+    fn recorded_blob_path(data_dir: &Path, record: &RawMirrorCaptureRecord) -> PathBuf {
+        raw_mirror_root(data_dir).join(&record.blob_relative_path)
+    }
+
+    /// Rewrite only the two times, keeping the manifest valid: a self-digest
+    /// manifest is re-sealed through the existing helper, a legacy one is left
+    /// without the field so it stays `Missing` rather than gaining evidence.
+    fn set_manifest_times(
+        manifest_path: &Path,
+        captured_at_ms: i64,
+        source_mtime_ms: Option<i64>,
+        keep_self_digest: bool,
+    ) {
+        let mut manifest =
+            read_raw_mirror_manifest(manifest_path).expect("read recorded manifest");
+        manifest.captured_at_ms = captured_at_ms;
+        manifest.source_mtime_ms = source_mtime_ms;
+        if keep_self_digest {
+            manifest.manifest_blake3 = Some(raw_mirror_manifest_blake3(&manifest));
+            let bytes = serde_json::to_vec_pretty(&manifest).expect("serialize manifest");
+            fs::write(manifest_path, bytes).expect("write recorded manifest");
+        } else {
+            manifest.manifest_blake3 = None;
+            let mut value = serde_json::to_value(&manifest).expect("manifest value");
+            value
+                .as_object_mut()
+                .expect("manifest object")
+                .remove("manifest_blake3");
+            let bytes = serde_json::to_vec_pretty(&value).expect("serialize manifest");
+            fs::write(manifest_path, bytes).expect("write recorded manifest");
+        }
+    }
+
+    fn caller_record(record: &RawMirrorCaptureRecord) -> RawMirrorCaptureRecord {
+        let mut caller = record.clone();
+        caller.captured_at_ms = CALLER_CAPTURED_AT_MS;
+        caller.source_mtime_ms = Some(CALLER_SOURCE_MTIME_MS);
+        caller
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_recorded_metadata(
+        opened: &VerifiedRawMirrorCapture,
+        provider: &str,
+        source_id: &str,
+        origin_kind: &str,
+        origin_host: Option<&str>,
+        captured_at_ms: i64,
+        source_mtime_ms: Option<i64>,
+    ) {
+        let meta = opened.recorded_metadata();
+        assert_eq!(meta.provider, provider, "provider must come from the manifest");
+        assert_eq!(meta.source_id, source_id, "source_id must come from the manifest");
+        assert_eq!(
+            meta.origin_kind, origin_kind,
+            "origin_kind must come from the manifest"
+        );
+        assert_eq!(
+            meta.origin_host.as_deref(),
+            origin_host,
+            "origin_host must keep its recorded value"
+        );
+        assert_eq!(
+            meta.captured_at_ms, captured_at_ms,
+            "captured_at_ms must come from the manifest, never the caller record"
+        );
+        assert_eq!(
+            meta.source_mtime_ms, source_mtime_ms,
+            "source_mtime_ms must come from the manifest, never the caller record"
+        );
+    }
+
+    #[cfg(unix)]
+    fn recorded_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).expect("metadata").permissions().mode()
+    }
+
+    #[test]
+    fn r1_values_are_from_manifest() {
+        let cases: [(
+            &str,
+            &str,
+            &str,
+            &str,
+            Option<&str>,
+            i64,
+            Option<i64>,
+            VerifiedManifestSelfDigest,
+        ); 4] = [
+            (
+                "local_missing_mtime",
+                "claude",
+                "S43_PRIVATE_LOCAL",
+                "local",
+                None,
+                -43,
+                None,
+                VerifiedManifestSelfDigest::Verified,
+            ),
+            (
+                "ssh_some_mtime",
+                " codex ",
+                " S43_PRIVATE_REMOTE ",
+                " ssh ",
+                Some(" S43_PRIVATE_HOST "),
+                43,
+                Some(-7),
+                VerifiedManifestSelfDigest::Verified,
+            ),
+            (
+                "host_empty",
+                "codex",
+                "S43_PRIVATE_EMPTY",
+                "ssh",
+                Some(""),
+                0,
+                Some(0),
+                VerifiedManifestSelfDigest::Verified,
+            ),
+            (
+                "legacy_missing_digest",
+                "claude_code",
+                "S43_PRIVATE_LEGACY",
+                "local",
+                None,
+                99,
+                None,
+                VerifiedManifestSelfDigest::Missing,
+            ),
+        ];
+        let mut failures: Vec<&str> = Vec::new();
+        for (case, provider, source_id, origin_kind, origin_host, captured_at_ms, source_mtime_ms, expected_digest) in cases
+        {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let temp = tempfile::TempDir::new().expect("tempdir");
+                let (data_dir, record, _) = recorded_capture(
+                    &temp,
+                    provider,
+                    source_id,
+                    origin_kind,
+                    origin_host,
+                    RECORDED_PAYLOAD,
+                );
+                let manifest_path = recorded_manifest_path(&data_dir, &record);
+                let blob_path = recorded_blob_path(&data_dir, &record);
+                set_manifest_times(
+                    &manifest_path,
+                    captured_at_ms,
+                    source_mtime_ms,
+                    expected_digest == VerifiedManifestSelfDigest::Verified,
+                );
+                let manifest = read_raw_mirror_manifest(&manifest_path).expect("manifest");
+                let manifest_bytes_before = fs::read(&manifest_path).expect("manifest bytes");
+                let blob_bytes_before = fs::read(&blob_path).expect("blob bytes");
+                #[cfg(unix)]
+                let (manifest_mode_before, blob_mode_before) =
+                    (recorded_mode(&manifest_path), recorded_mode(&blob_path));
+
+                let caller = caller_record(&record);
+                assert_ne!(
+                    caller.captured_at_ms, captured_at_ms,
+                    "the caller record must differ from the manifest time"
+                );
+                assert_ne!(
+                    caller.source_mtime_ms, source_mtime_ms,
+                    "the caller record must differ from the manifest mtime"
+                );
+
+                let opened =
+                    open_verified_capture(&data_dir, &caller).expect("open recorded capture");
+                assert_recorded_metadata(
+                    &opened,
+                    provider,
+                    source_id,
+                    origin_kind,
+                    origin_host,
+                    captured_at_ms,
+                    source_mtime_ms,
+                );
+                assert_eq!(opened.manifest_self_digest(), expected_digest);
+                assert_eq!(opened.manifest_id(), record.manifest_id.as_str());
+                assert_eq!(
+                    opened.manifest_relative_path(),
+                    record.manifest_relative_path.as_str()
+                );
+                assert_eq!(
+                    opened.blob_relative_path(),
+                    record.blob_relative_path.as_str()
+                );
+                assert_eq!(opened.blob_blake3(), record.blob_blake3.as_str());
+                assert_eq!(opened.blob_size_bytes(), record.blob_size_bytes);
+                assert_eq!(opened.original_path(), manifest.original_path.as_str());
+                assert_eq!(opened.identity_host(), manifest.identity_host.as_str());
+
+                assert_eq!(
+                    fs::read(&manifest_path).expect("manifest bytes"),
+                    manifest_bytes_before,
+                    "the open must not rewrite the manifest"
+                );
+                assert_eq!(
+                    fs::read(&blob_path).expect("blob bytes"),
+                    blob_bytes_before,
+                    "the open must not rewrite the blob"
+                );
+                #[cfg(unix)]
+                {
+                    assert_eq!(recorded_mode(&manifest_path), manifest_mode_before);
+                    assert_eq!(recorded_mode(&blob_path), blob_mode_before);
+                }
+            }));
+            match outcome {
+                Ok(()) => println!(
+                    "RECORDED_CAPTURE_METADATA_SCENARIO test=r1_values_are_from_manifest case={case} result=pass"
+                ),
+                Err(_) => {
+                    println!(
+                        "RECORDED_CAPTURE_METADATA_SCENARIO test=r1_values_are_from_manifest case={case} result=fail"
+                    );
+                    failures.push(case);
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "recorded metadata cases failed: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn r2_snapshot_survives_path_changes() {
+        let cases = [
+            "replace_manifest",
+            "delete_manifest",
+            "delete_live",
+            "delete_blob_path",
+        ];
+        let mut failures: Vec<&str> = Vec::new();
+        for case in cases {
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let temp = tempfile::TempDir::new().expect("tempdir");
+                let (data_dir, record, source_path) = recorded_capture(
+                    &temp,
+                    " codex ",
+                    " S43_PRIVATE_REMOTE ",
+                    " ssh ",
+                    Some(" S43_PRIVATE_HOST "),
+                    RECORDED_PAYLOAD,
+                );
+                let manifest_path = recorded_manifest_path(&data_dir, &record);
+                let blob_path = recorded_blob_path(&data_dir, &record);
+                set_manifest_times(&manifest_path, 43, Some(-7), true);
+                let manifest_bytes_before = fs::read(&manifest_path).expect("manifest bytes");
+                let blob_bytes_before = fs::read(&blob_path).expect("blob bytes");
+
+                // A second, independently valid capture whose six fields all
+                // differ from A's; it is opened once before being used.
+                let other_temp = tempfile::TempDir::new().expect("tempdir");
+                let (other_data_dir, other_record, _) = recorded_capture(
+                    &other_temp,
+                    "claude_code",
+                    "S43_OTHER_SOURCE",
+                    "local",
+                    None,
+                    b"S43_OTHER_BYTES\n",
+                );
+                let other_manifest_path = recorded_manifest_path(&other_data_dir, &other_record);
+                set_manifest_times(&other_manifest_path, 123, Some(44), true);
+                open_verified_capture(&other_data_dir, &other_record)
+                    .expect("the replacement B must verify before use");
+                let other_manifest_bytes =
+                    fs::read(&other_manifest_path).expect("B manifest bytes");
+                assert_ne!(other_manifest_bytes, manifest_bytes_before);
+
+                let caller = caller_record(&record);
+                let opened = open_verified_capture(&data_dir, &caller).expect("open A");
+                let mut handle = opened.file();
+                let mut prefix = [0u8; 2];
+                handle.read_exact(&mut prefix).expect("read prefix");
+                assert_eq!(&prefix, &RECORDED_PAYLOAD[..2]);
+
+                match case {
+                    "replace_manifest" => {
+                        fs::copy(&other_manifest_path, &manifest_path)
+                            .expect("replace A manifest with B");
+                    }
+                    "delete_manifest" => {
+                        fs::remove_file(&manifest_path).expect("delete A manifest");
+                    }
+                    "delete_live" => {
+                        fs::remove_file(&source_path).expect("delete the live source");
+                    }
+                    "delete_blob_path" => {
+                        fs::remove_file(&blob_path).expect("unlink the open blob path");
+                    }
+                    other => panic!("unknown r2 case: {other}"),
+                }
+
+                // The getter still reports A's snapshot, not the new state.
+                assert_recorded_metadata(
+                    &opened,
+                    " codex ",
+                    " S43_PRIVATE_REMOTE ",
+                    " ssh ",
+                    Some(" S43_PRIVATE_HOST "),
+                    43,
+                    Some(-7),
+                );
+                assert_eq!(
+                    opened.manifest_self_digest(),
+                    VerifiedManifestSelfDigest::Verified
+                );
+                assert_eq!(opened.manifest_id(), record.manifest_id.as_str());
+                assert_eq!(opened.blob_size_bytes(), record.blob_size_bytes);
+                assert_eq!(
+                    opened.file().stream_position().expect("cursor"),
+                    2,
+                    "the getter must not move the retained handle"
+                );
+
+                match case {
+                    "replace_manifest" => {
+                        assert_eq!(
+                            fs::read(&manifest_path).expect("manifest bytes"),
+                            other_manifest_bytes,
+                            "the getter must not restore A's manifest"
+                        );
+                    }
+                    "delete_manifest" => {
+                        assert!(!manifest_path.exists(), "the getter must not recreate it");
+                    }
+                    "delete_live" => {
+                        assert!(!source_path.exists());
+                        assert_eq!(
+                            fs::read(&manifest_path).expect("manifest bytes"),
+                            manifest_bytes_before
+                        );
+                    }
+                    "delete_blob_path" => {
+                        assert!(!blob_path.exists(), "the getter must not recreate the blob");
+                        assert_eq!(
+                            fs::read(&manifest_path).expect("manifest bytes"),
+                            manifest_bytes_before
+                        );
+                    }
+                    _ => {}
+                }
+                if case != "delete_blob_path" {
+                    assert_eq!(fs::read(&blob_path).expect("blob bytes"), blob_bytes_before);
+                }
+
+                let mut rest = Vec::new();
+                handle
+                    .read_to_end(&mut rest)
+                    .expect("read the remaining sealed bytes");
+                assert_eq!(rest, RECORDED_PAYLOAD[2..]);
+            }));
+            match outcome {
+                Ok(()) => println!(
+                    "RECORDED_CAPTURE_METADATA_SCENARIO test=r2_snapshot_survives_path_changes case={case} result=pass"
+                ),
+                Err(_) => {
+                    println!(
+                        "RECORDED_CAPTURE_METADATA_SCENARIO test=r2_snapshot_survives_path_changes case={case} result=fail"
+                    );
+                    failures.push(case);
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "recorded snapshot cases failed: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn r3_debug_and_readonly() {
+        let case = "private_metadata_not_debug";
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let (data_dir, record, _) = recorded_capture(
+                &temp,
+                "codex",
+                "S43_PRIVATE_DEBUG_ID",
+                "ssh",
+                Some("S43_PRIVATE_DEBUG_HOST"),
+                RECORDED_PAYLOAD,
+            );
+            let manifest_path = recorded_manifest_path(&data_dir, &record);
+            let blob_path = recorded_blob_path(&data_dir, &record);
+            set_manifest_times(&manifest_path, 43, Some(-7), true);
+            let manifest = read_raw_mirror_manifest(&manifest_path).expect("manifest");
+            let manifest_bytes = fs::read(&manifest_path).expect("manifest bytes");
+            let blob_bytes = fs::read(&blob_path).expect("blob bytes");
+            #[cfg(unix)]
+            let (manifest_mode, blob_mode) = (recorded_mode(&manifest_path), recorded_mode(&blob_path));
+            let manifests_dir = manifest_path
+                .parent()
+                .expect("manifests dir")
+                .to_path_buf();
+            let listing_before: Vec<_> = fs::read_dir(&manifests_dir)
+                .expect("manifests dir")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect();
+
+            let caller = caller_record(&record);
+            let opened = open_verified_capture(&data_dir, &caller).expect("open recorded capture");
+            assert_recorded_metadata(
+                &opened,
+                "codex",
+                "S43_PRIVATE_DEBUG_ID",
+                "ssh",
+                Some("S43_PRIVATE_DEBUG_HOST"),
+                43,
+                Some(-7),
+            );
+
+            let debug = format!("{opened:?}");
+            assert!(debug.contains(record.blob_blake3.as_str()));
+            assert!(debug.contains(&record.blob_size_bytes.to_string()));
+            assert!(debug.contains("Verified"));
+            assert!(
+                !debug.contains("S43_PRIVATE"),
+                "Debug must not print the recorded identity values: {debug}"
+            );
+            assert!(
+                !debug.contains("recorded_metadata"),
+                "Debug must not print the new field: {debug}"
+            );
+            assert!(
+                !debug.contains(manifest.original_path.as_str()),
+                "Debug must not print the original path"
+            );
+
+            for _ in 0..3 {
+                let meta = opened.recorded_metadata();
+                assert_eq!(meta.captured_at_ms, 43);
+            }
+
+            assert_eq!(fs::read(&manifest_path).expect("manifest bytes"), manifest_bytes);
+            assert_eq!(fs::read(&blob_path).expect("blob bytes"), blob_bytes);
+            #[cfg(unix)]
+            {
+                assert_eq!(recorded_mode(&manifest_path), manifest_mode);
+                assert_eq!(recorded_mode(&blob_path), blob_mode);
+            }
+            let listing_after: Vec<_> = fs::read_dir(&manifests_dir)
+                .expect("manifests dir")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect();
+            assert_eq!(listing_after, listing_before);
+        }));
+        match outcome {
+            Ok(()) => println!(
+                "RECORDED_CAPTURE_METADATA_SCENARIO test=r3_debug_and_readonly case={case} result=pass"
+            ),
+            Err(_) => println!(
+                "RECORDED_CAPTURE_METADATA_SCENARIO test=r3_debug_and_readonly case={case} result=fail"
+            ),
+        }
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+// ===================== Task43 记录元信息读取面判据结束 =====================

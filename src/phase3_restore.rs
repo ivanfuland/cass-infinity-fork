@@ -21,6 +21,9 @@ use std::fmt;
 
 use crate::phase3_bundle::Origin;
 
+pub(crate) mod source_binding;
+pub(crate) mod source_contexts;
+
 // ---------------------------------------------------------------------------
 // 身份
 // ---------------------------------------------------------------------------
@@ -516,6 +519,13 @@ pub struct VersionSummary {
     /// `None` = 未知。人读这份裁定材料时，「未知」与「1970-01-01」必须长得不一样。
     pub source_mtime_ms: Option<i64>,
     pub captured_at_ms: i64,
+    /// Task14 旁路字段：这条版本来自哪一份 raw-mirror manifest。
+    ///
+    /// 只用于在 HOLD 证据里区分同 blob 的不同 manifest（v3.1 要求
+    /// `source_manifest_ids` 按真实 manifest_id 关联）；**不参与关系判定**，
+    /// 41 内核看不到它。既有 `ContentVersion::of` 与旧测试构造器填 `None`，
+    /// 来源调用返回版本时填真实 manifest_id 的 `Some`。
+    pub source_manifest_id: Option<String>,
 }
 
 impl VersionSummary {
@@ -527,6 +537,7 @@ impl VersionSummary {
             unsealed_tail_len: v.unsealed_tail_len(),
             source_mtime_ms: v.source_mtime_ms,
             captured_at_ms: v.captured_at_ms,
+            source_manifest_id: None,
         }
     }
 }
@@ -648,6 +659,125 @@ fn summaries(versions: &[ContentVersion]) -> Vec<VersionSummary> {
     versions.iter().map(VersionSummary::of).collect()
 }
 
+/// 在候选**位置**上按关系回调选 winner 的私有内核。
+///
+/// 与 [`select_winner`] 抽出前的实现逐句同序：空集合、逐 pair 比较、逐 pair 的 mtime
+/// 交叉检查、分叉证据的第二遍比较与首次差异位置、极大等价类与 HOLD 证据。区别只在
+/// 「怎样比较两个位置」由调用方注入——内核看不到候选字节，`versions` 只提供诊断摘要
+/// （含 `source_mtime_ms`）。位置是输入 slice 的原位置：不按 `blob_id`/`source`/时间
+/// 排序，不去重，重复诊断字段仍占独立位置。
+fn select_winner_from_relations(
+    identity: &RestoreIdentity,
+    versions: &[VersionSummary],
+    compare: &dyn Fn(usize, usize) -> Result<RelationVerdict, ProjectionError>,
+    divergence: &dyn Fn(usize, usize) -> Result<Option<usize>, ProjectionError>,
+) -> Result<WinnerOutcome, ProjectionError> {
+    if versions.is_empty() {
+        return Ok(WinnerOutcome::Hold(HoldRecord {
+            identity: identity.clone(),
+            reason: HoldReason::ZeroVersions,
+            evidence: HoldEvidence::Versions { versions: vec![] },
+            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
+        }));
+    }
+
+    let n = versions.len();
+    let mut relations: Vec<Vec<Relation>> = vec![vec![Relation::Equal; n]; n];
+    let mut divergence_layer: Option<RelationLayer> = None;
+    let mut message_divergence_at: Option<usize> = None;
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let verdict = compare(i, j)?;
+            relations[i][j] = verdict.relation;
+            relations[j][i] = match verdict.relation {
+                Relation::StrictlyBefore => Relation::StrictlyAfter,
+                Relation::StrictlyAfter => Relation::StrictlyBefore,
+                other => other,
+            };
+
+            // 辅助证据只做交叉检查，不参与序的定义（§D.2.1 末段）。
+            let (earlier, later) = match verdict.relation {
+                Relation::StrictlyBefore => (i, j),
+                Relation::StrictlyAfter => (j, i),
+                _ => continue,
+            };
+            // **两侧都有值才比较**（R3 第 11 条）。缺 mtime 不是「更早」的证据，
+            // 它什么也不是 —— 这条交叉检查因此对它保持沉默，而不是替它编一个时刻。
+            if let (Some(earlier_ms), Some(later_ms)) = (
+                versions[earlier].source_mtime_ms,
+                versions[later].source_mtime_ms,
+            ) && earlier_ms > later_ms
+            {
+                return Ok(WinnerOutcome::Hold(HoldRecord {
+                    identity: identity.clone(),
+                    reason: HoldReason::VersionTimeConflict,
+                    evidence: HoldEvidence::Versions {
+                        versions: versions.to_vec(),
+                    },
+                    consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION
+                        .to_vec(),
+                }));
+            }
+        }
+    }
+
+    // 记下分叉是在哪一层判出来的，供 §D.5 的三种来源区分。
+    'outer: for i in 0..n {
+        for j in (i + 1)..n {
+            if relations[i][j] == Relation::Diverged {
+                let verdict = compare(i, j)?;
+                divergence_layer = Some(verdict.layer);
+                if verdict.layer == RelationLayer::MessageSequence {
+                    message_divergence_at = divergence(i, j)?;
+                }
+                break 'outer;
+            }
+        }
+    }
+
+    // 极大元：没有任何别的版本严格在它之后。相等的版本互为同一等价类，不算互不可比。
+    let maximal: Vec<usize> = (0..n)
+        .filter(|i| (0..n).all(|j| relations[*i][j] != Relation::StrictlyBefore))
+        .collect();
+
+    // 把相等的极大元折成同一个等价类：内容相同不是分叉。
+    let mut classes: Vec<usize> = Vec::new();
+    for &i in &maximal {
+        if !classes.iter().any(|&c| relations[c][i] == Relation::Equal) {
+            classes.push(i);
+        }
+    }
+
+    if classes.len() == 1 {
+        return Ok(WinnerOutcome::Winner {
+            index: classes[0],
+            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
+        });
+    }
+
+    // N 个互不可比的极大元：证据里带出**全部 N 个**，不是两两一对。
+    let maximal_summaries: Vec<VersionSummary> = classes
+        .iter()
+        .map(|&i| versions[i].clone())
+        .collect();
+    let evidence = match divergence_layer {
+        Some(RelationLayer::MessageSequence) => HoldEvidence::MessageLayer {
+            versions: maximal_summaries,
+            first_divergent_index: message_divergence_at,
+        },
+        _ => HoldEvidence::ByteLayer {
+            versions: maximal_summaries,
+        },
+    };
+    Ok(WinnerOutcome::Hold(HoldRecord {
+        identity: identity.clone(),
+        reason: HoldReason::VersionDiverged,
+        evidence,
+        consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
+    }))
+}
+
 /// 在同一 identity 的版本集合上选 winner。
 ///
 /// - `winner = ⊑ 的唯一极大元`；
@@ -683,114 +813,16 @@ pub fn select_winner(
         }));
     }
 
-    if versions.is_empty() {
-        return Ok(WinnerOutcome::Hold(HoldRecord {
-            identity: identity.clone(),
-            reason: HoldReason::ZeroVersions,
-            evidence: HoldEvidence::Versions { versions: vec![] },
-            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
-        }));
-    }
-
-    let n = versions.len();
-    let mut relations: Vec<Vec<Relation>> = vec![vec![Relation::Equal; n]; n];
-    let mut divergence_layer: Option<RelationLayer> = None;
-    let mut message_divergence_at: Option<usize> = None;
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let verdict =
-                compare_versions(&identity.origin, &versions[i], &versions[j], projector)?;
-            relations[i][j] = verdict.relation;
-            relations[j][i] = match verdict.relation {
-                Relation::StrictlyBefore => Relation::StrictlyAfter,
-                Relation::StrictlyAfter => Relation::StrictlyBefore,
-                other => other,
-            };
-
-            // 辅助证据只做交叉检查，不参与序的定义（§D.2.1 末段）。
-            let (earlier, later) = match verdict.relation {
-                Relation::StrictlyBefore => (i, j),
-                Relation::StrictlyAfter => (j, i),
-                _ => continue,
-            };
-            // **两侧都有值才比较**（R3 第 11 条）。缺 mtime 不是「更早」的证据，
-            // 它什么也不是 —— 这条交叉检查因此对它保持沉默，而不是替它编一个时刻。
-            if let (Some(earlier_ms), Some(later_ms)) = (
-                versions[earlier].source_mtime_ms,
-                versions[later].source_mtime_ms,
-            ) && earlier_ms > later_ms
-            {
-                return Ok(WinnerOutcome::Hold(HoldRecord {
-                    identity: identity.clone(),
-                    reason: HoldReason::VersionTimeConflict,
-                    evidence: HoldEvidence::Versions {
-                        versions: summaries(versions),
-                    },
-                    consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION
-                        .to_vec(),
-                }));
-            }
-        }
-    }
-
-    // 记下分叉是在哪一层判出来的，供 §D.5 的三种来源区分。
-    'outer: for i in 0..n {
-        for j in (i + 1)..n {
-            if relations[i][j] == Relation::Diverged {
-                let verdict =
-                    compare_versions(&identity.origin, &versions[i], &versions[j], projector)?;
-                divergence_layer = Some(verdict.layer);
-                if verdict.layer == RelationLayer::MessageSequence {
-                    let a = projector.project(&identity.origin, versions[i].normalized())?;
-                    let b = projector.project(&identity.origin, versions[j].normalized())?;
-                    message_divergence_at = first_divergent_index(&a, &b);
-                }
-                break 'outer;
-            }
-        }
-    }
-
-    // 极大元：没有任何别的版本严格在它之后。相等的版本互为同一等价类，不算互不可比。
-    let maximal: Vec<usize> = (0..n)
-        .filter(|i| (0..n).all(|j| relations[*i][j] != Relation::StrictlyBefore))
-        .collect();
-
-    // 把相等的极大元折成同一个等价类：内容相同不是分叉。
-    let mut classes: Vec<usize> = Vec::new();
-    for &i in &maximal {
-        if !classes.iter().any(|&c| relations[c][i] == Relation::Equal) {
-            classes.push(i);
-        }
-    }
-
-    if classes.len() == 1 {
-        return Ok(WinnerOutcome::Winner {
-            index: classes[0],
-            consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
-        });
-    }
-
-    // N 个互不可比的极大元：证据里带出**全部 N 个**，不是两两一对。
-    let maximal_summaries: Vec<VersionSummary> = classes
-        .iter()
-        .map(|&i| VersionSummary::of(&versions[i]))
-        .collect();
-    let evidence = match divergence_layer {
-        Some(RelationLayer::MessageSequence) => HoldEvidence::MessageLayer {
-            versions: maximal_summaries,
-            first_divergent_index: message_divergence_at,
-        },
-        _ => HoldEvidence::ByteLayer {
-            versions: maximal_summaries,
-        },
+    let version_summaries = summaries(versions);
+    let compare = |i: usize, j: usize| {
+        compare_versions(&identity.origin, &versions[i], &versions[j], projector)
     };
-    Ok(WinnerOutcome::Hold(HoldRecord {
-        identity: identity.clone(),
-        reason: HoldReason::VersionDiverged,
-        evidence,
-        consumed_manifest_fields: manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec(),
-    }))
+    let divergence = |i: usize, j: usize| {
+        let a = projector.project(&identity.origin, versions[i].normalized())?;
+        let b = projector.project(&identity.origin, versions[j].normalized())?;
+        Ok(first_divergent_index(&a, &b))
+    };
+    select_winner_from_relations(identity, &version_summaries, &compare, &divergence)
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1156,613 @@ pub fn read_override_ledger(
         snapshot_root: current_snapshot_root.to_string(),
         entries,
     })
+}
+
+// ===========================================================================
+// Task 41 测试：按候选位置共享赢家裁定内核
+// ===========================================================================
+
+/// 关系回调内核的四函数十三格。全部输入是组件级合成摘要/关系，不读文件、不起子进程、
+/// 不改环境；每格在自己的断言全部通过后才打印 `INDEXED_WINNER_SCENARIO` 标记。
+#[cfg(test)]
+mod indexed_winner_kernel_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    // -- 固定夹具 ---------------------------------------------------------
+
+    fn test_identity() -> RestoreIdentity {
+        RestoreIdentity {
+            origin: OriginNamespace {
+                agent_slug: "claude_code".to_string(),
+                source_id: "local".to_string(),
+                origin_host: RESTORE_LOCAL_ORIGIN_HOST.to_string(),
+            },
+            canonical_path: "/synthetic/.claude/projects/proj/session.jsonl".to_string(),
+        }
+    }
+
+    /// 组件摘要：source/mtime/captured 由各格声明，长度与 tail 固定为夹具值。
+    fn summary(blob_id: &str, mtime: Option<i64>, captured_at_ms: i64) -> VersionSummary {
+        VersionSummary {
+            source: VersionSource::Mirror,
+            blob_id: blob_id.to_string(),
+            normalized_len: 2,
+            unsealed_tail_len: 0,
+            source_mtime_ms: mtime,
+            captured_at_ms,
+            source_manifest_id: None,
+        }
+    }
+
+    fn consumed() -> Vec<&'static str> {
+        manifest_fields::CONSUMED_BY_WINNER_SELECTION.to_vec()
+    }
+
+    fn digest(byte: u8) -> CanonicalMessageDigest {
+        CanonicalMessageDigest([byte; 32])
+    }
+
+    fn verdict(relation: Relation, layer: RelationLayer) -> RelationVerdict {
+        RelationVerdict { relation, layer }
+    }
+
+    fn hold_of(outcome: &WinnerOutcome) -> &HoldRecord {
+        match outcome {
+            WinnerOutcome::Hold(h) => h,
+            other => panic!("期望 HOLD，实得 {other:?}"),
+        }
+    }
+
+    /// 每格末尾输出固定标记；只有该格全部断言已通过才会走到这里。
+    fn scenario(test: &str, case: &str) {
+        println!("INDEXED_WINNER_SCENARIO test={test} case={case} result=pass");
+    }
+
+    // -- k1：相同元数据仍占独立位置 ---------------------------------------
+
+    #[test]
+    fn k1_equal_metadata_keeps_positions() {
+        let identity = test_identity();
+        let versions = vec![
+            summary("same-blob", None, 0),
+            summary("same-blob", None, 0),
+        ];
+        let log = RefCell::new(Vec::new());
+        let compare = |i: usize, j: usize| {
+            log.borrow_mut().push(format!("compare:{i},{j}"));
+            assert_eq!((i, j), (0, 1), "同 blob 不得折叠，位置必须原样传入");
+            Ok(verdict(
+                Relation::Diverged,
+                RelationLayer::MessageSequence,
+            ))
+        };
+        let divergence = |i: usize, j: usize| {
+            log.borrow_mut().push(format!("divergence:{i},{j}"));
+            assert_eq!((i, j), (0, 1));
+            Ok(Some(3))
+        };
+
+        let outcome =
+            select_winner_from_relations(&identity, &versions, &compare, &divergence).unwrap();
+        assert_eq!(
+            log.borrow().clone(),
+            vec![
+                "compare:0,1".to_string(),
+                "compare:0,1".to_string(),
+                "divergence:0,1".to_string(),
+            ],
+            "原顺序：pair 比较、分叉证据第二遍比较、分叉回调"
+        );
+
+        let h = hold_of(&outcome);
+        assert_eq!(h.identity, identity);
+        assert_eq!(h.reason, HoldReason::VersionDiverged);
+        assert_eq!(h.class(), HoldClass::Version);
+        assert_eq!(h.consumed_manifest_fields, consumed());
+        match &h.evidence {
+            HoldEvidence::MessageLayer {
+                versions: evidence,
+                first_divergent_index,
+            } => {
+                assert_eq!(*first_divergent_index, Some(3));
+                assert_eq!(evidence.len(), 2, "两份同值摘要仍是两个独立代表");
+                assert_eq!(evidence[0], versions[0]);
+                assert_eq!(evidence[1], versions[1]);
+                assert_eq!(evidence[0], evidence[1], "字段相同但位置独立");
+            }
+            other => panic!("期望消息层证据，实得 {other:?}"),
+        }
+        scenario("k1_equal_metadata_keeps_positions", "same_blob");
+    }
+
+    // -- k2：错误顺序原样保留 ---------------------------------------------
+
+    #[test]
+    fn k2_error_order_is_preserved() {
+        // time_conflict：首 pair 时间倒挂，立即 HOLD，后续 pair 不得比较。
+        {
+            let identity = test_identity();
+            let versions = vec![
+                summary("a", Some(20), 3),
+                summary("b", Some(10), 2),
+                summary("c", None, 1),
+            ];
+            let log = RefCell::new(Vec::new());
+            let compare = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("compare:{i},{j}"));
+                Ok(verdict(Relation::StrictlyBefore, RelationLayer::Bytes))
+            };
+            let divergence = |i: usize, j: usize| -> Result<Option<usize>, ProjectionError> {
+                log.borrow_mut().push(format!("divergence:{i},{j}"));
+                panic!("时间冲突路径不得调用分叉回调");
+            };
+
+            let outcome =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence).unwrap();
+            assert_eq!(log.borrow().clone(), vec!["compare:0,1".to_string()]);
+            let h = hold_of(&outcome);
+            assert_eq!(h.identity, identity);
+            assert_eq!(h.reason, HoldReason::VersionTimeConflict);
+            assert_eq!(h.class(), HoldClass::Version);
+            assert_eq!(h.consumed_manifest_fields, consumed());
+            match &h.evidence {
+                HoldEvidence::Versions { versions: evidence } => {
+                    assert_eq!(*evidence, versions, "时间冲突证据是全部输入");
+                }
+                other => panic!("期望 Versions 证据，实得 {other:?}"),
+            }
+            scenario("k2_error_order_is_preserved", "time_conflict");
+        }
+
+        // pair_error：(0,1) 相等后 (0,2) 返回错误，原错误传播且不调用 (1,2)/divergence。
+        {
+            let identity = test_identity();
+            let versions = vec![
+                summary("a", None, 0),
+                summary("b", None, 0),
+                summary("c", None, 0),
+            ];
+            let log = RefCell::new(Vec::new());
+            let compare = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("compare:{i},{j}"));
+                match (i, j) {
+                    (0, 1) => Ok(verdict(Relation::Equal, RelationLayer::Bytes)),
+                    (0, 2) => Err(ProjectionError::other("K2_PAIR_ERROR")),
+                    other => panic!("不得调用比较 {other:?}"),
+                }
+            };
+            let divergence = |i: usize, j: usize| -> Result<Option<usize>, ProjectionError> {
+                log.borrow_mut().push(format!("divergence:{i},{j}"));
+                panic!("错误路径不得调用分叉回调");
+            };
+
+            let err =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence)
+                    .unwrap_err();
+            assert_eq!(err.detail, "K2_PAIR_ERROR");
+            assert_eq!(err.fault, None);
+            assert_eq!(
+                log.borrow().clone(),
+                vec!["compare:0,1".to_string(), "compare:0,2".to_string()]
+            );
+            scenario("k2_error_order_is_preserved", "pair_error");
+        }
+
+        // repeated_compare_error：首比较分叉，证据阶段第二次同 pair 返回错误，原样传播。
+        {
+            let identity = test_identity();
+            let versions = vec![summary("a", None, 0), summary("b", None, 0)];
+            let log = RefCell::new(Vec::new());
+            let compare = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("compare:{i},{j}"));
+                assert_eq!((i, j), (0, 1));
+                if log.borrow().len() == 1 {
+                    Ok(verdict(
+                        Relation::Diverged,
+                        RelationLayer::MessageSequence,
+                    ))
+                } else {
+                    Err(ProjectionError::other("K2_REPEAT_ERROR"))
+                }
+            };
+            let divergence = |i: usize, j: usize| -> Result<Option<usize>, ProjectionError> {
+                log.borrow_mut().push(format!("divergence:{i},{j}"));
+                panic!("重复比较错误不得被分叉回调掩盖");
+            };
+
+            let err =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence)
+                    .unwrap_err();
+            assert_eq!(err.detail, "K2_REPEAT_ERROR");
+            assert_eq!(
+                log.borrow().clone(),
+                vec!["compare:0,1".to_string(), "compare:0,1".to_string()]
+            );
+            scenario("k2_error_order_is_preserved", "repeated_compare_error");
+        }
+
+        // divergence_error：两次比较都分叉，分叉回调返回错误，原样传播，不吞成 None。
+        {
+            let identity = test_identity();
+            let versions = vec![summary("a", None, 0), summary("b", None, 0)];
+            let log = RefCell::new(Vec::new());
+            let compare = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("compare:{i},{j}"));
+                Ok(verdict(
+                    Relation::Diverged,
+                    RelationLayer::MessageSequence,
+                ))
+            };
+            let divergence = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("divergence:{i},{j}"));
+                assert_eq!((i, j), (0, 1));
+                Err(ProjectionError::other("K2_DIVERGENCE_ERROR"))
+            };
+
+            let err =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence)
+                    .unwrap_err();
+            assert_eq!(err.detail, "K2_DIVERGENCE_ERROR");
+            assert_eq!(
+                log.borrow().clone(),
+                vec![
+                    "compare:0,1".to_string(),
+                    "compare:0,1".to_string(),
+                    "divergence:0,1".to_string(),
+                ]
+            );
+            scenario("k2_error_order_is_preserved", "divergence_error");
+        }
+    }
+
+    // -- k3：赢家与证据保持原算法 -----------------------------------------
+
+    #[test]
+    fn k3_winner_and_evidence_are_unchanged() {
+        // chain：内容偏序 0<1<2；captured_at 故意倒序，不得影响胜者。
+        {
+            let identity = test_identity();
+            let versions = vec![
+                summary("a", Some(10), 30),
+                summary("b", Some(20), 20),
+                summary("c", Some(30), 10),
+            ];
+            let log = RefCell::new(Vec::new());
+            let compare = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("compare:{i},{j}"));
+                Ok(verdict(Relation::StrictlyBefore, RelationLayer::Bytes))
+            };
+            let divergence = |i: usize, j: usize| -> Result<Option<usize>, ProjectionError> {
+                panic!("链式偏序不得调用分叉回调 {i},{j}");
+            };
+
+            let outcome =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence).unwrap();
+            assert_eq!(
+                log.borrow().clone(),
+                vec![
+                    "compare:0,1".to_string(),
+                    "compare:0,2".to_string(),
+                    "compare:1,2".to_string(),
+                ]
+            );
+            match outcome {
+                WinnerOutcome::Winner {
+                    index,
+                    consumed_manifest_fields,
+                } => {
+                    assert_eq!(index, 2, "胜者由内容偏序决定，captured_at 不参与");
+                    assert_eq!(consumed_manifest_fields, consumed());
+                }
+                other => panic!("期望 Winner，实得 {other:?}"),
+            }
+            scenario("k3_winner_and_evidence_are_unchanged", "chain");
+        }
+
+        // three_maxima：三对全分叉，分叉证据只含三份极大代表，差异位置 4。
+        {
+            let identity = test_identity();
+            let versions = vec![
+                summary("a", None, 0),
+                summary("b", None, 0),
+                summary("c", None, 0),
+            ];
+            let log = RefCell::new(Vec::new());
+            let compare = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("compare:{i},{j}"));
+                Ok(verdict(
+                    Relation::Diverged,
+                    RelationLayer::MessageSequence,
+                ))
+            };
+            let divergence = |i: usize, j: usize| {
+                log.borrow_mut().push(format!("divergence:{i},{j}"));
+                assert_eq!((i, j), (0, 1), "首次分叉对是 (0,1)");
+                Ok(Some(4))
+            };
+
+            let outcome =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence).unwrap();
+            assert_eq!(
+                log.borrow().clone(),
+                vec![
+                    "compare:0,1".to_string(),
+                    "compare:0,2".to_string(),
+                    "compare:1,2".to_string(),
+                    "compare:0,1".to_string(),
+                    "divergence:0,1".to_string(),
+                ]
+            );
+            let h = hold_of(&outcome);
+            assert_eq!(h.reason, HoldReason::VersionDiverged);
+            assert_eq!(h.class(), HoldClass::Version);
+            assert_eq!(h.consumed_manifest_fields, consumed());
+            match &h.evidence {
+                HoldEvidence::MessageLayer {
+                    versions: evidence,
+                    first_divergent_index,
+                } => {
+                    assert_eq!(*first_divergent_index, Some(4));
+                    assert_eq!(*evidence, versions, "三份不同 blob 的极大代表全在证据里");
+                }
+                other => panic!("期望消息层证据，实得 {other:?}"),
+            }
+            scenario("k3_winner_and_evidence_are_unchanged", "three_maxima");
+        }
+
+        // zero：空集合返回 ZeroVersions，任何回调都不得被调用。
+        {
+            let identity = test_identity();
+            let versions: Vec<VersionSummary> = Vec::new();
+            let compare = |i: usize, j: usize| -> Result<RelationVerdict, ProjectionError> {
+                panic!("空集合不得比较 {i},{j}")
+            };
+            let divergence = |i: usize, j: usize| -> Result<Option<usize>, ProjectionError> {
+                panic!("空集合不得调用分叉回调 {i},{j}")
+            };
+
+            let outcome =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence).unwrap();
+            let h = hold_of(&outcome);
+            assert_eq!(h.reason, HoldReason::ZeroVersions);
+            assert_eq!(h.class(), HoldClass::Identity);
+            assert_eq!(h.consumed_manifest_fields, consumed());
+            match &h.evidence {
+                HoldEvidence::Versions { versions: evidence } => assert!(evidence.is_empty()),
+                other => panic!("期望 Versions 证据，实得 {other:?}"),
+            }
+            scenario("k3_winner_and_evidence_are_unchanged", "zero");
+        }
+
+        // singleton：单候选直接赢，不比较、不分叉。
+        {
+            let identity = test_identity();
+            let versions = vec![summary("a", Some(5), 7)];
+            let compare = |i: usize, j: usize| -> Result<RelationVerdict, ProjectionError> {
+                panic!("单候选不得比较 {i},{j}")
+            };
+            let divergence = |i: usize, j: usize| -> Result<Option<usize>, ProjectionError> {
+                panic!("单候选不得调用分叉回调 {i},{j}")
+            };
+
+            let outcome =
+                select_winner_from_relations(&identity, &versions, &compare, &divergence).unwrap();
+            match outcome {
+                WinnerOutcome::Winner {
+                    index,
+                    consumed_manifest_fields,
+                } => {
+                    assert_eq!(index, 0);
+                    assert_eq!(consumed_manifest_fields, consumed());
+                }
+                other => panic!("期望 Winner，实得 {other:?}"),
+            }
+            scenario("k3_winner_and_evidence_are_unchanged", "singleton");
+        }
+    }
+
+    // -- k4：公开入口的真实闭包接线 ---------------------------------------
+
+    /// 按传入的完整 normalized 字节标签映射到手写摘要；记录调用顺序，并可按标签在
+    /// 第 N 次调用上返回固定错误。只在单格内部使用，不改父环境。
+    struct ScriptedProjector {
+        by_label: BTreeMap<&'static str, Vec<CanonicalMessageDigest>>,
+        fail_at_call: BTreeMap<&'static str, (usize, &'static str)>,
+        trace: RefCell<Vec<&'static str>>,
+    }
+
+    impl MessageSequenceProjector for ScriptedProjector {
+        fn project(
+            &self,
+            _origin: &OriginNamespace,
+            bytes: &[u8],
+        ) -> Result<Vec<CanonicalMessageDigest>, ProjectionError> {
+            let label = match bytes {
+                b"A\n" => "A",
+                b"B\n" => "B",
+                b"C\n" => "C",
+                other => panic!("未知的合成字节：{other:?}"),
+            };
+            self.trace.borrow_mut().push(label);
+            let calls = self.trace.borrow().iter().filter(|x| **x == label).count();
+            if let Some((at, detail)) = self.fail_at_call.get(label)
+                && calls >= *at
+            {
+                return Err(ProjectionError::other(*detail));
+            }
+            Ok(self.by_label[label].clone())
+        }
+    }
+
+    fn public_version(raw: &[u8], mtime: Option<i64>, blob_id: &str) -> ContentVersion {
+        ContentVersion::new(VersionSource::Mirror, raw, mtime, 0, blob_id)
+    }
+
+    #[test]
+    fn k4_public_frontend_keeps_evidence() {
+        // project_error_priority：A/B 各自第三次投影失败，A 先于 B，原错误优先。
+        {
+            let mut by_label = BTreeMap::new();
+            by_label.insert("A", vec![digest(1)]);
+            by_label.insert("B", vec![digest(2)]);
+            let mut fail_at_call = BTreeMap::new();
+            fail_at_call.insert("A", (3, "K4_A_DIVERGENCE"));
+            fail_at_call.insert("B", (3, "K4_B_DIVERGENCE"));
+            let projector = ScriptedProjector {
+                by_label,
+                fail_at_call,
+                trace: RefCell::new(Vec::new()),
+            };
+            let versions = vec![
+                public_version(b"A\n", None, "A"),
+                public_version(b"B\n", None, "B"),
+            ];
+
+            let err = select_winner(&test_identity(), &versions, &projector).unwrap_err();
+            assert_eq!(err.detail, "K4_A_DIVERGENCE", "A 的投影错误必须优先");
+            assert_eq!(err.fault, None);
+            assert_eq!(
+                projector.trace.borrow().clone(),
+                vec!["A", "B", "A", "B", "A"],
+                "compare 两遍后分叉回调先投影 i"
+            );
+            scenario("k4_public_frontend_keeps_evidence", "project_error_priority");
+        }
+
+        // dominated_fork：A 被 B/C 严格包含，证据只含 B/C 两份完整极大代表。
+        {
+            let mut by_label = BTreeMap::new();
+            by_label.insert("A", vec![digest(1)]);
+            by_label.insert("B", vec![digest(1), digest(2)]);
+            by_label.insert("C", vec![digest(1), digest(3)]);
+            let projector = ScriptedProjector {
+                by_label,
+                fail_at_call: BTreeMap::new(),
+                trace: RefCell::new(Vec::new()),
+            };
+            let versions = vec![
+                public_version(b"A\n", None, "A"),
+                public_version(b"B\n", None, "B"),
+                public_version(b"C\n", None, "C"),
+            ];
+
+            let outcome = select_winner(&test_identity(), &versions, &projector).unwrap();
+            let h = hold_of(&outcome);
+            assert_eq!(h.reason, HoldReason::VersionDiverged);
+            assert_eq!(h.class(), HoldClass::Version);
+            assert_eq!(h.consumed_manifest_fields, consumed());
+            match &h.evidence {
+                HoldEvidence::MessageLayer {
+                    versions: evidence,
+                    first_divergent_index,
+                } => {
+                    assert_eq!(*first_divergent_index, Some(1));
+                    assert_eq!(
+                        *evidence,
+                        vec![summary("B", None, 0), summary("C", None, 0)],
+                        "被支配的 A 不得进入分叉证据"
+                    );
+                }
+                other => panic!("期望消息层证据，实得 {other:?}"),
+            }
+            scenario("k4_public_frontend_keeps_evidence", "dominated_fork");
+        }
+
+        // time_conflict_all_inputs：首 pair 时间倒挂，证据含全部三份，trace 只读 A/B。
+        {
+            let mut by_label = BTreeMap::new();
+            by_label.insert("A", vec![digest(1)]);
+            by_label.insert("B", vec![digest(1), digest(2)]);
+            by_label.insert("C", vec![digest(1), digest(3)]);
+            let projector = ScriptedProjector {
+                by_label,
+                fail_at_call: BTreeMap::new(),
+                trace: RefCell::new(Vec::new()),
+            };
+            let versions = vec![
+                public_version(b"A\n", Some(20), "A"),
+                public_version(b"B\n", Some(10), "B"),
+                public_version(b"C\n", None, "C"),
+            ];
+
+            let outcome = select_winner(&test_identity(), &versions, &projector).unwrap();
+            let h = hold_of(&outcome);
+            assert_eq!(h.reason, HoldReason::VersionTimeConflict);
+            assert_eq!(h.class(), HoldClass::Version);
+            assert_eq!(h.consumed_manifest_fields, consumed());
+            match &h.evidence {
+                HoldEvidence::Versions { versions: evidence } => {
+                    assert_eq!(
+                        *evidence,
+                        vec![
+                            summary("A", Some(20), 0),
+                            summary("B", Some(10), 0),
+                            summary("C", None, 0),
+                        ],
+                        "时间冲突证据是全部输入，不是冲突 pair"
+                    );
+                }
+                other => panic!("期望 Versions 证据，实得 {other:?}"),
+            }
+            assert_eq!(
+                projector.trace.borrow().clone(),
+                vec!["A", "B"],
+                "时间倒挂立即 HOLD，C 不得被投影"
+            );
+            scenario(
+                "k4_public_frontend_keeps_evidence",
+                "time_conflict_all_inputs",
+            );
+        }
+
+        // first_divergent_pair：三份全极大，首分叉位置来自 (0,1) 的 Some(1)，不是 0/2 的 2。
+        {
+            let mut by_label = BTreeMap::new();
+            by_label.insert("A", vec![digest(1), digest(2), digest(4)]);
+            by_label.insert("B", vec![digest(1), digest(3), digest(5)]);
+            by_label.insert("C", vec![digest(1), digest(2), digest(6)]);
+            let projector = ScriptedProjector {
+                by_label,
+                fail_at_call: BTreeMap::new(),
+                trace: RefCell::new(Vec::new()),
+            };
+            let versions = vec![
+                public_version(b"A\n", None, "A"),
+                public_version(b"B\n", None, "B"),
+                public_version(b"C\n", None, "C"),
+            ];
+
+            let outcome = select_winner(&test_identity(), &versions, &projector).unwrap();
+            let h = hold_of(&outcome);
+            assert_eq!(h.reason, HoldReason::VersionDiverged);
+            assert_eq!(h.class(), HoldClass::Version);
+            assert_eq!(h.consumed_manifest_fields, consumed());
+            match &h.evidence {
+                HoldEvidence::MessageLayer {
+                    versions: evidence,
+                    first_divergent_index,
+                } => {
+                    assert_eq!(
+                        *first_divergent_index,
+                        Some(1),
+                        "第一分叉是 (0,1)，不是 (0,2)"
+                    );
+                    assert_eq!(
+                        *evidence,
+                        vec![
+                            summary("A", None, 0),
+                            summary("B", None, 0),
+                            summary("C", None, 0),
+                        ]
+                    );
+                }
+                other => panic!("期望消息层证据，实得 {other:?}"),
+            }
+            scenario("k4_public_frontend_keeps_evidence", "first_divergent_pair");
+        }
+    }
 }
 
 // ===========================================================================
@@ -6024,6 +6663,7 @@ mod e5_p30_blob_read_tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         }
     }
 
@@ -6509,19 +7149,22 @@ pub(crate) fn replace_idempotency_key(snapshot_root: &str, identity: &RestoreIde
     )
 }
 
-/// 在**调用方给的事务**里跑完 replace 的整条序列。
+/// The real write body of one replacement, without the generation advance and
+/// without the legacy detail-`None` receipt.
 ///
-/// 步骤（编号对齐接口说明 §2 的表）：
-/// 2–7 交给 E5 的 `franken_replace_conversation_messages_in_tx`（两处 tail 重置、
-/// 删旧、插新、两张派生表、11 列重算、tail 回写）；
-/// 8 重建第三处 tail 载体；9 conversation 级字段按 §B.1.2；10 推进 generation；
-/// 11 写 receipt。
-pub(crate) fn commit_replace_in_tx(
+/// Both the legacy wrapper and the source Replace callback call this one
+/// function, so the message/tail/parent/lexical projection exists once. The
+/// caller keeps its own generation step and its own receipt shape.
+struct ReplaceProjectionBodyOutcome {
+    deleted_message_count: usize,
+    inserted_message_ids: Vec<i64>,
+}
+
+fn replace_projection_body_in_tx(
     tx: &crate::storage::api::Tx<'_>,
     input: &ReplaceCommitInput<'_>,
     pricing: &crate::storage::sqlite::PricingTable,
-    committed_at_ms: i64,
-) -> anyhow::Result<ReplaceCommitOutcome> {
+) -> anyhow::Result<ReplaceProjectionBodyOutcome> {
     // 2–7
     let replaced = crate::storage::sqlite::franken_replace_conversation_messages_in_tx(
         tx,
@@ -6563,6 +7206,27 @@ pub(crate) fn commit_replace_in_tx(
     // 「当前会话最终应该有哪些行」，与旧版整会话重算达到同一末态。
     crate::storage::sqlite::sync_lexical_docs_for_messages_in_tx(tx, &replaced.inserted_message_ids)?;
     crate::storage::sqlite::resync_lexical_envelope_for_conversation_in_tx(tx, input.conversation_id)?;
+
+    Ok(ReplaceProjectionBodyOutcome {
+        deleted_message_count: replaced.deleted_message_count,
+        inserted_message_ids: replaced.inserted_message_ids,
+    })
+}
+
+/// 在**调用方给的事务**里跑完 replace 的整条序列。
+///
+/// 步骤（编号对齐接口说明 §2 的表）：
+/// 2–7 交给 E5 的 `franken_replace_conversation_messages_in_tx`（两处 tail 重置、
+/// 删旧、插新、两张派生表、11 列重算、tail 回写）；
+/// 8 重建第三处 tail 载体；9 conversation 级字段按 §B.1.2；10 推进 generation；
+/// 11 写 receipt。
+pub(crate) fn commit_replace_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    input: &ReplaceCommitInput<'_>,
+    pricing: &crate::storage::sqlite::PricingTable,
+    committed_at_ms: i64,
+) -> anyhow::Result<ReplaceCommitOutcome> {
+    let replaced = replace_projection_body_in_tx(tx, input, pricing)?;
 
     // 10 · 推进 generation
     crate::storage::sqlite::franken_set_source_content_generation_in_tx(tx, input.generation)?;
@@ -8147,11 +8811,702 @@ pub(crate) enum PlannedAction {
     Replace { conversation_id: i64 },
 }
 
+/// 必填 nullable：缺键是错误，显式 `null` 才是 `None`。
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    <Option<T> as serde::Deserialize>::deserialize(deserializer)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RestorePlanItem {
     /// 只存 manifest_id：**写什么**由磁盘上的封存件重新推导，不在 journal 里落第二份。
     pub manifest_id: String,
     pub action: PlannedAction,
+    /// Task14：首批来源项的固定绑定；非首批项必须显式 `null`。
+    ///
+    /// 显式 `null` 与缺键不同：缺键是 `MaterialMismatch`（见
+    /// [`restore_journal_read`]），旧 journal 不能靠 serde 的 `Option` 缺省蒙混过去。
+    #[serde(deserialize_with = "required_nullable")]
+    pub source_binding: Option<SourceBindingMaterial>,
+}
+
+// ---------------------------------------------------------------------------
+// Task14 · 来源恢复材料与 typed 错误
+// ---------------------------------------------------------------------------
+
+/// 五个 new-face 短码的 typed 错误。
+///
+/// 只允许这五类经 CLI 的 downcast 映射成 JSON kind；其它恢复错误仍走原来的
+/// `mirror_restore_*_failed` 映射。判据必须是类型，不是错误文本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceRestoreError {
+    ContextInvalid,
+    ContextAmbiguous,
+    MaterialMismatch,
+    ProjectionCount,
+    InstallUnavailable,
+    /// Task15: a stored restore receipt cannot be re-planned from.
+    ReplanRequired,
+    /// Task15: a stored restore receipt disagrees with the current material.
+    ReceiptConflict,
+    /// Task15: a stored receipt exists but its evidence is damaged.
+    ReceiptInconsistent,
+    /// Task15: the shared kernel did not activate the input completely.
+    ActivationIncomplete,
+}
+
+impl SourceRestoreError {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::ContextInvalid => "source_restore_context_invalid",
+            Self::ContextAmbiguous => "source_restore_context_ambiguous",
+            Self::MaterialMismatch => "source_restore_material_mismatch",
+            Self::ProjectionCount => "source_restore_projection_count",
+            Self::InstallUnavailable => "source_restore_install_unavailable",
+            Self::ReplanRequired => "source_restore_replan_required",
+            Self::ReceiptConflict => "source_restore_receipt_conflict",
+            Self::ReceiptInconsistent => "source_restore_receipt_inconsistent",
+            Self::ActivationIncomplete => "source_restore_activation_incomplete",
+        }
+    }
+}
+
+impl fmt::Display for SourceRestoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl std::error::Error for SourceRestoreError {}
+
+fn source_restore_error(error: SourceRestoreError) -> anyhow::Error {
+    anyhow::Error::new(error)
+}
+
+// 42 的三个 wire 类型刻意没有 `Debug`（它们是声明材料，不是日志面）。
+// journal4 的派生 `Debug` 只在校验失败时被测试打印，因此这里给一个**窄**的
+// 渲染：manifest_id、connector 与形态，不复制路径与规则正文。
+impl fmt::Debug for source_contexts::RestoreSourceContexts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestoreSourceContexts")
+            .field("schema", &self.schema)
+            .field("inputs", &self.inputs.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for source_contexts::RestoreSourceContextDeclaration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestoreSourceContextDeclaration")
+            .field("manifest_id", &self.manifest_id)
+            .field("connector", &self.connector)
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for source_contexts::RestoreSourceContextOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestoreSourceContextOrigin")
+            .field("source_id", &self.source_id)
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+/// journal4 的 `source_profile`：恰好十个键，未知/重复/缺键拒绝。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceProfileMaterial {
+    pub config_source_identity: String,
+    pub fixed_copy_path: String,
+    pub fixed_config_sha256: String,
+    pub effective_four_arrays_sha256: String,
+    pub code_version: String,
+    pub fad_pin: String,
+    pub mapping_domain: String,
+    pub exclusion_epoch: String,
+    pub redaction_fingerprint: String,
+    pub desensitization_enabled: bool,
+}
+
+/// journal4 的每条 planned 首批项固定绑定：恰好七个键。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceBindingMaterial {
+    pub declaration: source_contexts::RestoreSourceContextDeclaration,
+    pub context_digest: String,
+    pub sealed_sha256: String,
+    pub byte_len: u64,
+    pub normalizer_id: String,
+    pub safety_contract_id: String,
+    pub input_key: String,
+}
+
+// ---------------------------------------------------------------------------
+// Task15 · the restore-source receipt detail wire (C3)
+// ---------------------------------------------------------------------------
+
+/// The exact C3 detail codec. One private module so the encoder and the strict
+/// decoder cannot drift, and so no test can build its expected value through
+/// the product encoder.
+mod source_new_wire {
+    use std::collections::BTreeSet;
+
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+    use serde::Deserialize as _;
+
+    use crate::storage::source_facts::{
+        ProjectionDisposition, Root, Sha256Digest, SourceActivationRequest,
+        SourceUnprocessedRange, TerminalState, VerifiedFinish,
+    };
+
+    pub(super) const RESTORE_SOURCE_RECEIPT_SCHEMA: &str = "cass.restore-source-receipt/1";
+    const FINISH_DOMAIN: &str = "cass.source-finish/1";
+
+    /// A strict decoder refusal. The caller maps `ReplanRequired` and
+    /// `Conflict`; nothing here produces an inconsistent verdict.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DecodeError {
+        ReplanRequired,
+        Conflict,
+    }
+
+    /// One decoded restore-source detail. The request is the real type, not a
+    /// shadow: it goes straight into the stored-receipt verifier.
+    pub(super) struct DecodedRestoreSourceDetail {
+        pub restore_operation: String,
+        pub restore_key: String,
+        pub snapshot_root: String,
+        pub manifest_id: String,
+        pub request: SourceActivationRequest,
+        pub source_receipt_key: String,
+        pub source_installation_digest: Sha256Digest,
+    }
+
+    // ── encoder ──────────────────────────────────────────────────────────
+
+    /// Encode the eight-key C3 detail around the real request.
+    pub(super) fn encode(
+        restore_operation: &str,
+        snapshot_root: &str,
+        manifest_id: &str,
+        restore_key: &str,
+        request: &SourceActivationRequest,
+        source_receipt_key: &str,
+        source_installation_digest: &Sha256Digest,
+    ) -> String {
+        let value = serde_json::json!({
+            "schema": RESTORE_SOURCE_RECEIPT_SCHEMA,
+            "restore_operation": restore_operation,
+            "restore_key": restore_key,
+            "snapshot_root": snapshot_root,
+            "manifest_id": manifest_id,
+            "source_request": {
+                "input_key": request.input_key.hex(),
+                "library_identity": request.library_identity,
+                "normalizer_id": request.normalizer_id,
+                "safety_contract_id": request.safety_contract_id,
+                "expected_manifest_digest": request.expected_manifest_digest.hex(),
+                "finish": finish_array(&request.finish),
+                "projection_disposition": request.projection_disposition.as_str(),
+                "source_semantic_records_root": root_array(&request.source_semantic_records_root),
+                "claims_root": root_array(&request.claims_root),
+                "requested_terminal": request.requested_terminal.as_str(),
+            },
+            "source_receipt_key": source_receipt_key,
+            "source_installation_digest": source_installation_digest.hex(),
+        });
+        serde_json::to_string(&value).expect("the fixed detail always serializes")
+    }
+
+    fn root_array(root: &Root) -> serde_json::Value {
+        serde_json::json!([root.sha256.hex(), root.count.to_string()])
+    }
+
+    fn finish_array(finish: &VerifiedFinish) -> serde_json::Value {
+        let ranges = finish
+            .unprocessed_ranges
+            .iter()
+            .map(|range| {
+                serde_json::json!([
+                    range.start.to_string(),
+                    range.end.to_string(),
+                    range.reason,
+                    range.ordinal.map(|ordinal| ordinal.to_string()),
+                    range.record_pointer,
+                ])
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!([
+            FINISH_DOMAIN,
+            finish.content_digest.hex(),
+            finish.bytes_read.to_string(),
+            finish.records_seen.to_string(),
+            finish.blank_lines.to_string(),
+            finish.parse_failed.to_string(),
+            finish.mapping_diagnostics.to_string(),
+            ranges,
+            finish.reached_eof,
+        ])
+    }
+
+    // ── strict JSON ──────────────────────────────────────────────────────
+
+    /// A JSON value that refuses duplicate object members at every level.
+    enum StrictValue {
+        Null,
+        Bool(bool),
+        Number,
+        String(String),
+        Array(Vec<Self>),
+        Object(Vec<(String, Self)>),
+    }
+
+    impl<'de> serde::Deserialize<'de> for StrictValue {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct StrictVisitor;
+
+            impl<'de> Visitor<'de> for StrictVisitor {
+                type Value = StrictValue;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON value")
+                }
+
+                fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                    Ok(StrictValue::Bool(value))
+                }
+
+                fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                    Ok(StrictValue::Number)
+                }
+
+                fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                    Ok(StrictValue::Number)
+                }
+
+                fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                    Ok(StrictValue::Number)
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                    Ok(StrictValue::String(value.to_string()))
+                }
+
+                fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                    Ok(StrictValue::String(value))
+                }
+
+                fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                    Ok(StrictValue::Null)
+                }
+
+                fn visit_none<E>(self) -> Result<Self::Value, E> {
+                    Ok(StrictValue::Null)
+                }
+
+                fn visit_some<D: serde::Deserializer<'de>>(
+                    self,
+                    deserializer: D,
+                ) -> Result<Self::Value, D::Error> {
+                    StrictValue::deserialize(deserializer)
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut sequence: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut items = Vec::new();
+                    while let Some(item) = sequence.next_element()? {
+                        items.push(item);
+                    }
+                    Ok(StrictValue::Array(items))
+                }
+
+                fn visit_map<A: MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut members: Vec<(String, StrictValue)> = Vec::new();
+                    let mut seen = BTreeSet::new();
+                    while let Some((key, value)) = map.next_entry::<String, StrictValue>()? {
+                        if !seen.insert(key.clone()) {
+                            return Err(serde::de::Error::custom("duplicate object member"));
+                        }
+                        members.push((key, value));
+                    }
+                    Ok(StrictValue::Object(members))
+                }
+            }
+
+            deserializer.deserialize_any(StrictVisitor)
+        }
+    }
+
+    fn parse(text: &str) -> Result<StrictValue, DecodeError> {
+        let mut deserializer = serde_json::Deserializer::from_str(text);
+        let value =
+            StrictValue::deserialize(&mut deserializer).map_err(|_| DecodeError::Conflict)?;
+        deserializer.end().map_err(|_| DecodeError::Conflict)?;
+        Ok(value)
+    }
+
+    fn object(value: &StrictValue) -> Option<&[(String, StrictValue)]> {
+        match value {
+            StrictValue::Object(members) => Some(members),
+            _ => None,
+        }
+    }
+
+    fn array(value: &StrictValue) -> Option<&[StrictValue]> {
+        match value {
+            StrictValue::Array(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    fn text(value: &StrictValue) -> Option<&str> {
+        match value {
+            StrictValue::String(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn boolean(value: &StrictValue) -> Option<bool> {
+        match value {
+            StrictValue::Bool(flag) => Some(*flag),
+            _ => None,
+        }
+    }
+
+    fn member<'a>(object: &'a [(String, StrictValue)], key: &str) -> Option<&'a StrictValue> {
+        object
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    }
+
+    /// The object must carry exactly the named keys. Duplicate members were
+    /// already refused by the parser, so a length check plus membership is a
+    /// closed set.
+    fn exact_object<'a>(
+        value: &'a StrictValue,
+        keys: &[&str],
+    ) -> Result<&'a [(String, StrictValue)], DecodeError> {
+        let members = object(value).ok_or(DecodeError::Conflict)?;
+        if members.len() != keys.len() {
+            return Err(DecodeError::Conflict);
+        }
+        for key in keys {
+            if member(members, key).is_none() {
+                return Err(DecodeError::Conflict);
+            }
+        }
+        Ok(members)
+    }
+
+    /// Canonical unsigned decimal: no sign, no leading zero, no overflow, and
+    /// the empty string is not a number.
+    fn decimal_u64(value: &StrictValue) -> Option<u64> {
+        let text = text(value)?;
+        if text.is_empty() {
+            return None;
+        }
+        if text == "0" {
+            return Some(0);
+        }
+        let bytes = text.as_bytes();
+        if bytes[0] == b'0' {
+            return None;
+        }
+        if !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        text.parse::<u64>().ok()
+    }
+
+    fn lower_hex64(value: &StrictValue) -> Option<Sha256Digest> {
+        let text = text(value)?;
+        if text.len() != 64
+            || !text
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return None;
+        }
+        Sha256Digest::from_hex(text)
+    }
+
+    fn root(value: &StrictValue) -> Option<Root> {
+        let items = array(value)?;
+        if items.len() != 2 {
+            return None;
+        }
+        Some(Root {
+            sha256: lower_hex64(&items[0])?,
+            count: decimal_u64(&items[1])?,
+        })
+    }
+
+    fn finish(value: &StrictValue) -> Option<VerifiedFinish> {
+        let items = array(value)?;
+        if items.len() != 9 {
+            return None;
+        }
+        if text(&items[0])? != FINISH_DOMAIN {
+            return None;
+        }
+        let reasons = array(&items[7])?;
+        let mut ranges = Vec::with_capacity(reasons.len());
+        for entry in reasons {
+            let parts = array(entry)?;
+            if parts.len() != 5 {
+                return None;
+            }
+            let ordinal = match &parts[3] {
+                StrictValue::Null => None,
+                other => Some(decimal_u64(other)?),
+            };
+            let record_pointer = match &parts[4] {
+                StrictValue::Null => None,
+                other => Some(text(other)?.to_string()),
+            };
+            ranges.push(SourceUnprocessedRange {
+                start: decimal_u64(&parts[0])?,
+                end: decimal_u64(&parts[1])?,
+                reason: text(&parts[2])?.to_string(),
+                ordinal,
+                record_pointer,
+            });
+        }
+        Some(VerifiedFinish {
+            content_digest: lower_hex64(&items[1])?,
+            bytes_read: decimal_u64(&items[2])?,
+            records_seen: decimal_u64(&items[3])?,
+            blank_lines: decimal_u64(&items[4])?,
+            parse_failed: decimal_u64(&items[5])?,
+            mapping_diagnostics: decimal_u64(&items[6])?,
+            unprocessed_ranges: ranges,
+            reached_eof: boolean(&items[8])?,
+        })
+    }
+
+    fn projection(value: &StrictValue) -> Option<ProjectionDisposition> {
+        match text(value)? {
+            "Ready" => Some(ProjectionDisposition::Ready),
+            "WholeInputRejected" => Some(ProjectionDisposition::WholeInputRejected),
+            _ => None,
+        }
+    }
+
+    fn terminal(value: &StrictValue) -> Option<TerminalState> {
+        match text(value)? {
+            "Complete" => Some(TerminalState::Complete),
+            "Partial" => Some(TerminalState::Partial),
+            "Failed" => Some(TerminalState::Failed),
+            _ => None,
+        }
+    }
+
+    /// Classify a stored detail, including the SQL `NULL` case. A `NULL`
+    /// cannot carry a schema, so it is `ReplanRequired` by definition.
+    pub(super) fn classify(
+        detail: Option<&str>,
+    ) -> Result<DecodedRestoreSourceDetail, DecodeError> {
+        let Some(detail) = detail else {
+            return Err(DecodeError::ReplanRequired);
+        };
+        decode(detail)
+    }
+
+    /// Decode one stored detail. The schema's own classification is fixed:
+    /// a missing or unsupported string schema is `ReplanRequired`; a
+    /// non-object, a type error, a duplicate key or a bad known-schema shape is
+    /// `Conflict`.
+    pub(super) fn decode(detail: &str) -> Result<DecodedRestoreSourceDetail, DecodeError> {
+        let value = parse(detail)?;
+        let members = object(&value).ok_or(DecodeError::Conflict)?;
+        let schema = match member(members, "schema") {
+            None => return Err(DecodeError::ReplanRequired),
+            Some(value) => text(value).ok_or(DecodeError::Conflict)?,
+        };
+        if schema != RESTORE_SOURCE_RECEIPT_SCHEMA {
+            return Err(DecodeError::ReplanRequired);
+        }
+
+        let top = exact_object(
+            &value,
+            &[
+                "schema",
+                "restore_operation",
+                "restore_key",
+                "snapshot_root",
+                "manifest_id",
+                "source_request",
+                "source_receipt_key",
+                "source_installation_digest",
+            ],
+        )?;
+
+        let request_value = member(top, "source_request").ok_or(DecodeError::Conflict)?;
+        let request = exact_object(
+            request_value,
+            &[
+                "input_key",
+                "library_identity",
+                "normalizer_id",
+                "safety_contract_id",
+                "expected_manifest_digest",
+                "finish",
+                "projection_disposition",
+                "source_semantic_records_root",
+                "claims_root",
+                "requested_terminal",
+            ],
+        )?;
+
+        let input_key = lower_hex64(member(request, "input_key").ok_or(DecodeError::Conflict)?)
+            .ok_or(DecodeError::Conflict)?;
+        let library_identity = text(member(request, "library_identity").ok_or(DecodeError::Conflict)?)
+            .ok_or(DecodeError::Conflict)?
+            .to_string();
+        let normalizer_id = text(member(request, "normalizer_id").ok_or(DecodeError::Conflict)?)
+            .ok_or(DecodeError::Conflict)?
+            .to_string();
+        let safety_contract_id =
+            text(member(request, "safety_contract_id").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?
+                .to_string();
+        let expected_manifest_digest =
+            lower_hex64(member(request, "expected_manifest_digest").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?;
+        let parsed_finish =
+            finish(member(request, "finish").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?;
+        let projection_disposition =
+            projection(member(request, "projection_disposition").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?;
+        let source_semantic_records_root = root(
+            member(request, "source_semantic_records_root").ok_or(DecodeError::Conflict)?,
+        )
+        .ok_or(DecodeError::Conflict)?;
+        let claims_root =
+            root(member(request, "claims_root").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?;
+        let requested_terminal =
+            terminal(member(request, "requested_terminal").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?;
+        // A successful source restore is Ready/Complete with a real complete
+        // finish. A declared complete terminal that did not reach EOF is an
+        // internally contradictory receipt.
+        if requested_terminal == TerminalState::Complete && !parsed_finish.reached_eof {
+            return Err(DecodeError::Conflict);
+        }
+
+        Ok(DecodedRestoreSourceDetail {
+            restore_operation: text(
+                member(top, "restore_operation").ok_or(DecodeError::Conflict)?,
+            )
+            .ok_or(DecodeError::Conflict)?
+            .to_string(),
+            restore_key: text(member(top, "restore_key").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?
+                .to_string(),
+            snapshot_root: text(member(top, "snapshot_root").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?
+                .to_string(),
+            manifest_id: text(member(top, "manifest_id").ok_or(DecodeError::Conflict)?)
+                .ok_or(DecodeError::Conflict)?
+                .to_string(),
+            request: SourceActivationRequest {
+                input_key,
+                library_identity,
+                normalizer_id,
+                safety_contract_id,
+                expected_manifest_digest,
+                finish: parsed_finish,
+                projection_disposition,
+                source_semantic_records_root,
+                claims_root,
+                requested_terminal,
+            },
+            source_receipt_key: text(
+                member(top, "source_receipt_key").ok_or(DecodeError::Conflict)?,
+            )
+            .ok_or(DecodeError::Conflict)?
+            .to_string(),
+            source_installation_digest: lower_hex64(
+                member(top, "source_installation_digest").ok_or(DecodeError::Conflict)?,
+            )
+            .ok_or(DecodeError::Conflict)?,
+        })
+    }
+
+}
+
+/// 来源专用报告项：按实际参与位置首次访问次序，每 manifest 一项。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceVersionReport {
+    pub manifest_id: String,
+    pub byte_domain: &'static str,
+    pub full_byte_len: u64,
+    pub full_byte_sha256: String,
+}
+
+impl SourceRestoreError {
+    /// 44/40/39 适配器边界：只按**精确 detail 等值**识别两个固定短码，
+    /// 其余一律 `MaterialMismatch`；不做 contains/startswith 分类。
+    fn from_ingest(error: crate::indexer::source_ingest::SourceIngestError) -> Self {
+        use crate::indexer::source_ingest::SourceIngestError as E;
+        match error {
+            E::Config { detail } if detail == "source_restore_context_invalid" => {
+                Self::ContextInvalid
+            }
+            E::Config { detail } if detail == "source_restore_material_mismatch" => {
+                Self::MaterialMismatch
+            }
+            E::Config { detail } if detail == "source_restore_projection_count" => {
+                Self::ProjectionCount
+            }
+            _ => Self::MaterialMismatch,
+        }
+    }
+}
+
+/// The restore call boundary's own mapping for a shared-kernel failure.
+///
+/// The ordinary wrapper keeps its existing typed storage boundary. Here a
+/// receipt-shaped failure becomes one of the four new fixed short codes, while
+/// a database failure keeps its typed `StorageError` chain so `Busy`/`Locked`
+/// stay recognisable and the CLI keeps its original `mirror_restore_*_failed`
+/// family instead of guessing a type from a formatted string.
+fn source_restore_error_from_ingest(
+    error: crate::indexer::source_ingest::SourceIngestError,
+) -> anyhow::Error {
+    use crate::indexer::source_ingest::SourceIngestError as E;
+    use crate::storage::source_facts::SourceInstallError as I;
+    match error {
+        E::Install(I::Receipt(_))
+        | E::Verify(I::Receipt(_))
+        | E::Install(I::Corrupt { .. })
+        | E::Install(I::Codec(_)) => {
+            // An existing complete input whose stored evidence is damaged is an
+            // evidence-stage failure, not a physical preparation error. Only the
+            // Install side carries stored evidence; a Verify-side Corrupt/Codec
+            // is a physical/preparation failure and keeps the from_ingest code.
+            source_restore_error(SourceRestoreError::ReceiptInconsistent)
+        }
+        E::Install(I::Conflict { .. }) | E::Verify(I::Conflict { .. }) => {
+            source_restore_error(SourceRestoreError::ReceiptConflict)
+        }
+        E::Install(I::Db(db)) | E::Verify(I::Db(db)) => anyhow::Error::new(db),
+        other => source_restore_error(SourceRestoreError::from_ingest(other)),
+    }
 }
 
 /// 一次 restore 运行的计划（planner 产出，E8 的 CLI 是它未来的真调用方）。
@@ -8170,9 +9525,13 @@ pub(crate) struct RestoreRunPlan {
     /// 而两份「数得一样」本身还要再验一次。
     pub holds_count: i64,
     pub origin_unmapped_count: i64,
+    /// Task14 journal4 材料：只有 P∪S 为空时三个字段才允许同时为 null。
+    pub source_contexts: Option<source_contexts::RestoreSourceContexts>,
+    pub source_contexts_digest: Option<String>,
+    pub source_profile: Option<SourceProfileMaterial>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct RestoreJournal {
     /// 先于一切字段被校验（见 `restore_journal_read`）。
     pub schema_version: i64,
@@ -8212,6 +9571,152 @@ pub(crate) struct RestoreJournal {
     /// `None`，届时退回墙钟（同旧行为，只是不再保证首跑/recover 两次一致）。
     #[serde(default)]
     pub analytics_now_ms: Option<i64>,
+    /// journal4：P∪S 实际使用声明的完整对象；P∪S 为空时显式 `null`。
+    ///
+    /// 四个新增键都**必须出现**（显式 null 与缺键不同），因此读取走
+    /// [`RestoreJournalWire`] 的必填 nullable，而不是 serde 对 `Option` 的缺省。
+    #[serde(deserialize_with = "required_nullable")]
+    pub source_contexts: Option<source_contexts::RestoreSourceContexts>,
+    /// 上述对象的规范 JSON 视图 SHA256；无操作材料时 `null`。
+    #[serde(deserialize_with = "required_nullable")]
+    pub source_contexts_digest: Option<String>,
+    /// 固定安全配置与算法身份；无操作材料时 `null`。
+    #[serde(deserialize_with = "required_nullable")]
+    pub source_profile: Option<SourceProfileMaterial>,
+}
+
+/// journal4 的严格 wire 读取面。
+///
+/// `source_contexts` 保为 [`serde_json::value::RawValue`] 原始子串，交给 42
+/// decoder 自己判类型错误；不能先转普通 `Value`，否则重复对象键被静默覆盖，
+/// 42 的 `Ambiguous`/`Invalid` 分类就丢了。
+#[derive(serde::Deserialize)]
+struct RestoreJournalWire {
+    schema_version: i64,
+    operation_id: String,
+    state: RestoreJournalState,
+    data_dir: PathBuf,
+    scratch_dir: PathBuf,
+    db_path: PathBuf,
+    marker_path: PathBuf,
+    snapshot_root: String,
+    generation: String,
+    planned: Vec<RestorePlanItem>,
+    holds_count: i64,
+    origin_unmapped_count: i64,
+    committed: Vec<String>,
+    published: Vec<String>,
+    #[serde(default)]
+    analytics_now_ms: Option<i64>,
+    source_contexts: Box<serde_json::value::RawValue>,
+    #[serde(deserialize_with = "required_nullable")]
+    source_contexts_digest: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    source_profile: Option<SourceProfileMaterial>,
+}
+
+impl RestoreJournalWire {
+    fn into_journal(self) -> Result<RestoreJournal, SourceRestoreError> {
+        let source_contexts = decode_journal_source_contexts(self.source_contexts.get())?;
+        Ok(RestoreJournal {
+            schema_version: self.schema_version,
+            operation_id: self.operation_id,
+            state: self.state,
+            data_dir: self.data_dir,
+            scratch_dir: self.scratch_dir,
+            db_path: self.db_path,
+            marker_path: self.marker_path,
+            snapshot_root: self.snapshot_root,
+            generation: self.generation,
+            planned: self.planned,
+            holds_count: self.holds_count,
+            origin_unmapped_count: self.origin_unmapped_count,
+            committed: self.committed,
+            published: self.published,
+            analytics_now_ms: self.analytics_now_ms,
+            source_contexts,
+            source_contexts_digest: self.source_contexts_digest,
+            source_profile: self.source_profile,
+        })
+    }
+}
+
+fn decode_journal_source_contexts(
+    raw: &str,
+) -> Result<Option<source_contexts::RestoreSourceContexts>, SourceRestoreError> {
+    if raw.trim() == "null" {
+        return Ok(None);
+    }
+    match source_contexts::decode_restore_source_contexts(raw.as_bytes()) {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(source_contexts::RestoreSourceContextDecodeError::Invalid) => {
+            Err(SourceRestoreError::ContextInvalid)
+        }
+        Err(source_contexts::RestoreSourceContextDecodeError::Ambiguous) => {
+            Err(SourceRestoreError::ContextAmbiguous)
+        }
+    }
+}
+
+/// 旧字段的 typed 读取面。
+///
+/// 旧字段错误按原错误层传播（serde error → anyhow），CLI 因而仍得到
+/// `mirror_restore_recover_failed`；新增材料不在这一面解析。未知字段（含新增
+/// 材料键）按 serde 默认忽略，版本闸仍先于本面执行。
+#[derive(serde::Deserialize)]
+struct RestoreJournalLegacyWire {
+    schema_version: i64,
+    operation_id: String,
+    state: RestoreJournalState,
+    data_dir: PathBuf,
+    scratch_dir: PathBuf,
+    db_path: PathBuf,
+    marker_path: PathBuf,
+    snapshot_root: String,
+    generation: String,
+    planned: Vec<RestoreLegacyPlanItem>,
+    holds_count: i64,
+    origin_unmapped_count: i64,
+    committed: Vec<String>,
+    published: Vec<String>,
+    #[serde(default)]
+    analytics_now_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct RestoreLegacyPlanItem {
+    manifest_id: String,
+    action: PlannedAction,
+}
+
+/// 新增材料键的严格读取面：缺失、显式/结构错误统一 `MaterialMismatch`。
+///
+/// `source_contexts` 保为原始子串，重复对象键不被静默覆盖，分类留给 42 decoder。
+#[derive(serde::Deserialize)]
+struct RestoreJournalMaterialsWire {
+    planned: Vec<RestorePlanItemMaterialsWire>,
+    source_contexts: Box<serde_json::value::RawValue>,
+    #[serde(deserialize_with = "required_nullable")]
+    source_contexts_digest: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    source_profile: Option<SourceProfileMaterial>,
+}
+
+#[derive(serde::Deserialize)]
+struct RestorePlanItemMaterialsWire {
+    #[serde(deserialize_with = "required_nullable")]
+    source_binding: Option<SourceBindingMaterial>,
+}
+
+impl<'de> serde::Deserialize<'de> for RestoreJournal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = <RestoreJournalWire as serde::Deserialize>::deserialize(deserializer)?;
+        wire.into_journal()
+            .map_err(|error| <D::Error as serde::de::Error>::custom(error))
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -8244,6 +9749,12 @@ pub(crate) struct RestoreRunOutcome {
     pub receipt_keys: Vec<String>,
     pub messages_inserted: usize,
     pub messages_deleted: usize,
+    /// Task15: a source New item that actually activated with a real judged
+    /// conversation count of zero. Not a fabricated "new conversation".
+    pub source_only_completed: usize,
+    /// Task15: a source item with no restore receipt whose ordinary kernel
+    /// verified a replay and whose closing restore receipt this run wrote.
+    pub source_replayed: usize,
 }
 
 pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal {
@@ -8266,6 +9777,9 @@ pub(crate) fn restore_journal_from_plan(plan: RestoreRunPlan) -> RestoreJournal 
         // never calls this constructor; it reads the persisted journal (and
         // this value) back off disk instead.
         analytics_now_ms: Some(crate::storage::sqlite::FrankenStorage::now_millis()),
+        source_contexts: plan.source_contexts,
+        source_contexts_digest: plan.source_contexts_digest,
+        source_profile: plan.source_profile,
     }
 }
 
@@ -8633,7 +10147,51 @@ pub(crate) fn restore_journal_read(path: &Path) -> anyhow::Result<Option<Restore
         }
     }
 
-    Ok(Some(serde_json::from_slice(&bytes)?))
+    // 版本闸之后才进字段解析。旧字段与新增材料**分段 typed 读取**：
+    // - 旧字段缺失/类型错误保持原错误层（serde → anyhow），CLI 映射仍是
+    //   `mirror_restore_recover_failed`；
+    // - 新增键/对象/binding/declaration 的结构错误统一 `MaterialMismatch`；
+    // - `source_contexts` 的原始子串交 42 decoder，保留 `Invalid`/`Ambiguous`。
+    // 不能先转普通 `Value` 再做最终解析：那会丢掉重复对象键的严格性。
+    let legacy: RestoreJournalLegacyWire = serde_json::from_slice(&bytes)?;
+    let materials: RestoreJournalMaterialsWire = serde_json::from_slice(&bytes)
+        .map_err(|_| source_restore_error(SourceRestoreError::MaterialMismatch))?;
+    if legacy.planned.len() != materials.planned.len() {
+        return Err(source_restore_error(SourceRestoreError::MaterialMismatch));
+    }
+    let source_contexts = decode_journal_source_contexts(materials.source_contexts.get())
+        .map_err(source_restore_error)?;
+    let planned = legacy
+        .planned
+        .into_iter()
+        .zip(materials.planned)
+        .map(|(item, materials)| RestorePlanItem {
+            manifest_id: item.manifest_id,
+            action: item.action,
+            source_binding: materials.source_binding,
+        })
+        .collect();
+    let journal = RestoreJournal {
+        schema_version: legacy.schema_version,
+        operation_id: legacy.operation_id,
+        state: legacy.state,
+        data_dir: legacy.data_dir,
+        scratch_dir: legacy.scratch_dir,
+        db_path: legacy.db_path,
+        marker_path: legacy.marker_path,
+        snapshot_root: legacy.snapshot_root,
+        generation: legacy.generation,
+        planned,
+        holds_count: legacy.holds_count,
+        origin_unmapped_count: legacy.origin_unmapped_count,
+        committed: legacy.committed,
+        published: legacy.published,
+        analytics_now_ms: legacy.analytics_now_ms,
+        source_contexts,
+        source_contexts_digest: materials.source_contexts_digest,
+        source_profile: materials.source_profile,
+    };
+    Ok(Some(journal))
 }
 
 /// 推进一格：**先把新状态落盘并 fsync，再让它对后续动作生效**。
@@ -8731,6 +10289,14 @@ fn conversation_ids_for_identity(
     storage: &crate::storage::sqlite::FrankenStorage,
     identity: &RestoreIdentity,
 ) -> anyhow::Result<Vec<i64>> {
+    let tx = storage.raw().transaction()?;
+    Ok(conversation_ids_for_identity_in_tx(&tx, identity)?)
+}
+
+fn conversation_ids_for_identity_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    identity: &RestoreIdentity,
+) -> Result<Vec<i64>, crate::storage::source_facts::SourceInstallError> {
     use crate::storage::api::Value as ParamValue;
 
     // manifest 侧 `origin_host: None` 在身份里被写成 `RESTORE_LOCAL_ORIGIN_HOST`
@@ -8763,9 +10329,7 @@ fn conversation_ids_for_identity(
     if let Some(host) = stored_host.as_deref() {
         params.push(ParamValue::from(host));
     }
-    let ids: Vec<i64> = storage
-        .raw()
-        .query_all_map(&sql, &params, |row| row.get_typed(0))?;
+    let ids: Vec<i64> = tx.query_all_map(&sql, &params, |row| row.get_typed(0))?;
     Ok(ids)
 }
 
@@ -8777,6 +10341,21 @@ fn conversation_ids_for_session_key(
     agent: &str,
     external_id: &str,
 ) -> anyhow::Result<Vec<i64>> {
+    let tx = storage.raw().transaction()?;
+    Ok(conversation_ids_for_session_key_in_tx(
+        &tx,
+        identity_host,
+        agent,
+        external_id,
+    )?)
+}
+
+fn conversation_ids_for_session_key_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    identity_host: &str,
+    agent: &str,
+    external_id: &str,
+) -> Result<Vec<i64>, crate::storage::source_facts::SourceInstallError> {
     use crate::storage::api::Value as ParamValue;
 
     // PR8 C1 introduced `conversations.identity_host`; the session key binds all three dimensions.
@@ -8787,9 +10366,7 @@ fn conversation_ids_for_session_key(
         ParamValue::from(external_id),
         ParamValue::from(identity_host),
     ];
-    let ids: Vec<i64> = storage
-        .raw()
-        .query_all_map(sql, &params, |row| row.get_typed(0))?;
+    let ids: Vec<i64> = tx.query_all_map(sql, &params, |row| row.get_typed(0))?;
     Ok(ids)
 }
 
@@ -8839,11 +10416,482 @@ fn restore_idempotency_key_for(
     }
 }
 
+/// The receipt operation a planned action must name. The key and the operation
+/// always come from the same action; neither is inferred from a string prefix.
+fn planned_action_operation(action: PlannedAction) -> &'static str {
+    match action {
+        PlannedAction::RestoreNew => RESTORE_NEW_OPERATION,
+        PlannedAction::Replace { .. } => REPLACE_OPERATION,
+    }
+}
+
 fn restore_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Task15 · the shared restore-source receipt verifier
+// ---------------------------------------------------------------------------
+
+/// What the shared verifier found for one source planned item.
+enum RestoreSourceReceiptStatus {
+    /// No restore receipt row exists. Only the initial `Planned` writer may
+    /// treat this as permission to install.
+    Absent,
+    Verified { restore_key: String },
+}
+
+/// A shared-verifier failure: one of the fixed short codes, or the storage
+/// layer's own typed chain when a database read fails.
+enum RestoreSourceReceiptError {
+    Typed(SourceRestoreError),
+    Db(crate::storage::api::StorageError),
+}
+
+impl RestoreSourceReceiptError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Typed(error) => source_restore_error(error),
+            Self::Db(error) => anyhow::Error::new(error),
+        }
+    }
+}
+
+fn receipt_conflict() -> RestoreSourceReceiptError {
+    RestoreSourceReceiptError::Typed(SourceRestoreError::ReceiptConflict)
+}
+
+fn receipt_inconsistent() -> RestoreSourceReceiptError {
+    RestoreSourceReceiptError::Typed(SourceRestoreError::ReceiptInconsistent)
+}
+
+/// The shared verifier's own failure classification for an existing receipt.
+///
+/// `Corrupt` and `Codec` mean the stored evidence cannot be decoded, which is
+/// an inconsistency rather than a conflict. A database failure keeps its typed
+/// chain. This rule applies only to verifying a stored receipt; preparation and
+/// physical-material errors keep their own codes.
+fn stored_verification_failure(
+    error: crate::storage::source_facts::SourceInstallError,
+) -> RestoreSourceReceiptError {
+    use crate::storage::source_facts::SourceInstallError as E;
+    match error {
+        E::Db(error) => RestoreSourceReceiptError::Db(error),
+        E::Conflict { .. } => receipt_conflict(),
+        E::Receipt(_) | E::Corrupt { .. } | E::Codec(_) => receipt_inconsistent(),
+        E::Schema(_)
+        | E::Staging { .. }
+        | E::Activation { .. }
+        | E::Overflow { .. }
+        | E::EntropyUnavailable
+        | E::Io { .. } => receipt_inconsistent(),
+    }
+}
+
+/// Verify one source planned item's complete restore receipt inside the
+/// caller's transaction.
+///
+/// The caller owns the transaction: this reads rows only, opens nothing and
+/// writes nothing. The initial `Planned` writer uses an `Immediate` writer
+/// transaction; post-db account, closure and qualify use a `Deferred` read
+/// transaction on their existing read-only storage.
+fn verify_restore_source_receipt_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    journal: &RestoreJournal,
+    item: &RestorePlanItem,
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> Result<RestoreSourceReceiptStatus, RestoreSourceReceiptError> {
+    use crate::storage::source_facts::{
+        self, ProjectionDisposition, SourceReceiptMatch, TerminalState,
+    };
+    use crate::storage::api::Value;
+
+    let binding = item
+        .source_binding
+        .as_ref()
+        .ok_or_else(receipt_conflict)?;
+    let identity = restore_identity_from_view(view)
+        .map_err(|_| RestoreSourceReceiptError::Typed(SourceRestoreError::MaterialMismatch))?;
+    let restore_key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
+    let expected_operation = planned_action_operation(item.action);
+
+    let row: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = tx
+        .query_opt_map(
+            "SELECT operation, state, snapshot_root, detail FROM operation_commit_receipt \
+             WHERE idempotency_key = ?1",
+            &[Value::Text(restore_key.clone())],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            },
+        )
+        .map_err(RestoreSourceReceiptError::Db)?;
+    let Some((operation, state, snapshot_root, detail)) = row else {
+        return Ok(RestoreSourceReceiptStatus::Absent);
+    };
+    if operation.as_deref() != Some(expected_operation)
+        || state.as_deref() != Some("committed")
+        || snapshot_root.as_deref() != Some(journal.snapshot_root.as_str())
+    {
+        return Err(receipt_conflict());
+    }
+
+    let decoded = match source_new_wire::classify(detail.as_deref()) {
+        Ok(decoded) => decoded,
+        // A detail-NULL receipt for a source Replace is the old legacy shape:
+        // it cannot be re-planned into a complete C3, so it is a conflict.
+        // A source New keeps its original replan classification.
+        Err(source_new_wire::DecodeError::ReplanRequired)
+            if detail.is_none() && matches!(item.action, PlannedAction::Replace { .. }) =>
+        {
+            return Err(receipt_conflict());
+        }
+        Err(source_new_wire::DecodeError::ReplanRequired) => {
+            return Err(RestoreSourceReceiptError::Typed(
+                SourceRestoreError::ReplanRequired,
+            ))
+        }
+        Err(source_new_wire::DecodeError::Conflict) => return Err(receipt_conflict()),
+    };
+    if decoded.restore_operation != expected_operation
+        || decoded.restore_key != restore_key
+        || decoded.snapshot_root != journal.snapshot_root
+        || decoded.manifest_id != item.manifest_id
+    {
+        return Err(receipt_conflict());
+    }
+
+    // The request must still name the same material the journal bound.
+    if decoded.request.input_key.hex() != binding.input_key
+        || decoded.request.normalizer_id != binding.normalizer_id
+        || decoded.request.safety_contract_id != binding.safety_contract_id
+        || decoded.request.finish.content_digest.hex() != binding.sealed_sha256
+        || decoded.request.finish.bytes_read != binding.byte_len
+        || decoded.request.projection_disposition != ProjectionDisposition::Ready
+        || decoded.request.requested_terminal != TerminalState::Complete
+    {
+        return Err(receipt_conflict());
+    }
+
+    // The five source_inputs columns have no public accessor. The same
+    // transaction reads them directly, exactly as the spec requires. The
+    // stored header and format are read here too for the request-side
+    // pre-check; that is an implementation detail, not a new public API.
+    let input_row: Option<(
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u8>,
+        String,
+        String,
+        Vec<u8>,
+        String,
+    )> = tx
+        .query_opt_map(
+            "SELECT context_digest, sealed_sha256, byte_len, normalizer_id, \
+             safety_contract_id, expected_manifest_bin, format \
+             FROM source_inputs WHERE input_key = ?1",
+            &[Value::Blob(
+                decoded.request.input_key.as_bytes().to_vec(),
+            )],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                    row.get_typed(5)?,
+                    row.get_typed(6)?,
+                ))
+            },
+        )
+        .map_err(RestoreSourceReceiptError::Db)?;
+    let Some((context_digest, sealed_sha256, byte_len, normalizer, safety, header_bin, format)) =
+        input_row
+    else {
+        return Err(receipt_conflict());
+    };
+    let context_hex = source_facts::Sha256Digest::from_slice(&context_digest)
+        .map(|digest| digest.hex())
+        .ok_or_else(receipt_conflict)?;
+    let sealed_hex = source_facts::Sha256Digest::from_slice(&sealed_sha256)
+        .map(|digest| digest.hex())
+        .ok_or_else(receipt_conflict)?;
+    if context_hex != binding.context_digest
+        || sealed_hex != binding.sealed_sha256
+        || byte_len != source_facts::u64_be8(binding.byte_len)
+        || normalizer != binding.normalizer_id
+        || safety != binding.safety_contract_id
+    {
+        return Err(receipt_conflict());
+    }
+
+    // Request-side pre-check, in the same transaction: the complete decoded
+    // request must name the stored library, header and finish. A mismatch here
+    // is a request conflict. Only after this check does the stored-receipt
+    // verifier run; its `Inconsistent` verdicts describe damaged evidence and
+    // are never folded back into a request conflict.
+    let stored_library: Option<String> = tx
+        .query_opt_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            &[Value::Text(
+                crate::storage::schema::LIBRARY_IDENTITY_META_KEY.to_string(),
+            )],
+            |row| row.get_typed(0),
+        )
+        .map_err(RestoreSourceReceiptError::Db)?;
+    let Some(stored_library) = stored_library else {
+        return Err(receipt_conflict());
+    };
+    let (header, _) = source_facts::decode_expected_manifest_header(&header_bin)
+        .map_err(|_| receipt_inconsistent())?;
+    if decoded.request.library_identity != stored_library
+        || decoded.request.expected_manifest_digest
+            != source_facts::Sha256Digest::of(&header_bin)
+        || decoded.request.finish.content_digest != *header.sealed_sha256()
+        || decoded.request.finish.bytes_read != header.byte_len()
+        || decoded.request.finish.records_seen != header.records()
+        || decoded.request.finish.blank_lines != header.blank_lines()
+        || !decoded.request.finish.reached_eof
+        || header.format().as_str() != format
+    {
+        return Err(receipt_conflict());
+    }
+
+    // The activation row the detail names must exist before the stored
+    // verifier runs: the existing kernel reports a missing parent-named row as
+    // `Corrupt`, while this boundary is a conflict.
+    let activation_row: Option<i64> = tx
+        .query_opt_map(
+            "SELECT 1 FROM operation_commit_receipt WHERE idempotency_key = ?1",
+            &[Value::Text(decoded.source_receipt_key.clone())],
+            |row| row.get_typed(0),
+        )
+        .map_err(RestoreSourceReceiptError::Db)?;
+    if activation_row.is_none() {
+        return Err(receipt_conflict());
+    }
+
+    match source_facts::verify_source_receipt_in_tx(tx, &decoded.request) {
+        Ok(SourceReceiptMatch::VerifiedReplay { receipt, .. }) => {
+            let expected_receipt_key = source_facts::activation_receipt_key(
+                &decoded.request.library_identity,
+                &decoded.request.input_key,
+                &receipt.semantic_request_digest,
+            );
+            if decoded.source_receipt_key != expected_receipt_key
+                || decoded.source_installation_digest != receipt.installation_digest
+            {
+                // The restore detail disagrees with the stored activation
+                // witness. That is a conflict between two receipts, not damage
+                // to one of them.
+                return Err(receipt_conflict());
+            }
+            Ok(RestoreSourceReceiptStatus::Verified { restore_key })
+        }
+        Ok(SourceReceiptMatch::Conflict { .. }) | Ok(SourceReceiptMatch::Absent) => {
+            Err(receipt_conflict())
+        }
+        // An `Inconsistent` verdict from the stored verifier describes damaged
+        // stored evidence, whatever reason it names. Request-side disagreements
+        // were already classified as conflicts by the pre-check above.
+        Ok(SourceReceiptMatch::Inconsistent { .. }) => Err(receipt_inconsistent()),
+        Err(error) => Err(stored_verification_failure(error)),
+    }
+}
+
+/// The proven relationship between a source Replace plan item and the one
+/// conversation its input was (or would be) installed into.
+struct VerifiedSourceReplaceTarget {
+    conversation_id: i64,
+    /// `Some` when an immutable `CanonicalBound` binding proved the target;
+    /// `None` when only the exact identity/session-key fallback proved it (the
+    /// empty-witness defence). Only the publish parent check consumes it.
+    immutable_identity_digest: Option<crate::storage::source_facts::Sha256Digest>,
+}
+
+fn source_replace_target_of(item: &RestorePlanItem) -> Option<i64> {
+    match item.action {
+        PlannedAction::Replace { conversation_id } if item.source_binding.is_some() => {
+            Some(conversation_id)
+        }
+        _ => None,
+    }
+}
+
+fn source_replace_input_key(
+    item: &RestorePlanItem,
+) -> Option<crate::storage::source_facts::Sha256Digest> {
+    use crate::storage::source_facts;
+
+    item.source_binding
+        .as_ref()
+        .and_then(|binding| source_facts::Sha256Digest::from_hex(&binding.input_key))
+}
+
+fn source_input_is_complete_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    item: &RestorePlanItem,
+) -> anyhow::Result<bool> {
+    use crate::storage::api::Value;
+
+    let Some(input_key) = source_replace_input_key(item) else {
+        return Ok(false);
+    };
+    let state: Option<String> = tx.query_opt_map(
+        "SELECT state FROM source_inputs WHERE input_key = ?1",
+        &[Value::Blob(input_key.as_bytes().to_vec())],
+        |row| row.get_typed(0),
+    )?;
+    Ok(state.as_deref() == Some("complete"))
+}
+
+/// Prove, in the caller's transaction, that the journal target of a source
+/// Replace is the conversation its input was actually installed into.
+///
+/// Immutable `CanonicalBound` bindings are the primary evidence and are read
+/// regardless of the link's current authority, so a historical replay does not
+/// need the old message to survive. Only an empty witness falls back to the
+/// planner's exact identity/session-key query; the caller's target is never
+/// used as its own evidence. Nothing here writes.
+fn verify_source_replace_target_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    item: &RestorePlanItem,
+    view: &crate::raw_mirror::RawMirrorManifestView,
+) -> Result<VerifiedSourceReplaceTarget, RestoreSourceReceiptError> {
+    use crate::storage::source_facts;
+
+    let target = source_replace_target_of(item).ok_or_else(receipt_conflict)?;
+    let input_key = source_replace_input_key(item).ok_or_else(receipt_conflict)?;
+    let installed = source_facts::installed_source_conversations_in_tx(tx, &input_key)
+        .map_err(stored_verification_failure)?;
+    if let Some(conversations) = installed
+        && !conversations.is_empty()
+    {
+        if conversations.len() == 1 && conversations[0].conversation_id == target {
+            return Ok(VerifiedSourceReplaceTarget {
+                conversation_id: target,
+                immutable_identity_digest: Some(conversations[0].identity_digest),
+            });
+        }
+        return Err(receipt_conflict());
+    }
+    let binding = item.source_binding.as_ref().ok_or_else(receipt_conflict)?;
+    let identity = restore_identity_from_view(view).map_err(|_| receipt_inconsistent())?;
+    let session_key = manifest_session_key_from_view(view);
+    let ids = exact_candidate_conversation_ids_in_tx(
+        tx,
+        &identity,
+        &binding.declaration.connector,
+        session_key.as_ref(),
+    )
+    .map_err(stored_verification_failure)?;
+    if ids.len() == 1 && ids[0] == target {
+        Ok(VerifiedSourceReplaceTarget {
+            conversation_id: target,
+            immutable_identity_digest: None,
+        })
+    } else {
+        Err(receipt_conflict())
+    }
+}
+
+/// The planner's exact candidate union, restricted to conversation ids. It
+/// shares the two `_in_tx` queries and the alias rule with
+/// [`source_candidate_versions_from_db`]; it never reads messages and never
+/// constructs a candidate version.
+fn exact_candidate_conversation_ids_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    identity: &RestoreIdentity,
+    connector: &str,
+    session_key: Option<&MirrorSessionKey>,
+) -> Result<Vec<i64>, crate::storage::source_facts::SourceInstallError> {
+    let mut aliases = vec![identity.origin.agent_slug.clone()];
+    if connector != identity.origin.agent_slug {
+        aliases.push(connector.to_string());
+    }
+    let mut ids = Vec::new();
+    for agent in aliases {
+        let mut found = match session_key {
+            Some(key) => conversation_ids_for_session_key_in_tx(
+                tx,
+                &key.identity_host,
+                &agent,
+                &key.external_id,
+            )?,
+            None => {
+                let mut scoped = identity.clone();
+                scoped.origin.agent_slug = agent;
+                conversation_ids_for_identity_in_tx(tx, &scoped)?
+            }
+        };
+        ids.append(&mut found);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Recompute the current parent row's identity digest. `None` means the row is
+/// gone; a `Some` that differs from the immutable digest means the id now names
+/// another identity. Both are publish-side `None` + count, never a rejection of
+/// a legitimate historical replay.
+fn current_parent_identity_digest_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    library_identity: &str,
+    conversation_id: i64,
+) -> Result<Option<crate::storage::source_facts::Sha256Digest>, RestoreSourceReceiptError> {
+    use crate::storage::api::Value;
+    use crate::storage::source_facts;
+
+    let row: Option<(String, i64, Option<String>, String)> = tx
+        .query_opt_map(
+            "SELECT c.identity_host, c.agent_id, c.external_id, c.source_path \
+             FROM conversations c WHERE c.id = ?1",
+            &[Value::Integer(conversation_id)],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            },
+        )
+        .map_err(RestoreSourceReceiptError::Db)?;
+    Ok(row.map(|(identity_host, agent_id, external_id, source_path)| {
+        source_facts::conversation_identity_digest(
+            library_identity,
+            conversation_id,
+            &identity_host,
+            agent_id,
+            external_id.as_deref(),
+            &source_path,
+        )
+    }))
+}
+
+fn stored_library_identity_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+) -> Result<String, RestoreSourceReceiptError> {
+    use crate::storage::api::Value;
+
+    tx.query_opt_map(
+        "SELECT value FROM meta WHERE key = ?1",
+        &[Value::Text(
+            crate::storage::schema::LIBRARY_IDENTITY_META_KEY.to_string(),
+        )],
+        |row| row.get_typed(0),
+    )
+    .map_err(RestoreSourceReceiptError::Db)?
+    .ok_or_else(receipt_inconsistent)
 }
 
 /// 把一条计划项从磁盘重新推导成可落库的会话。
@@ -8919,10 +10967,381 @@ fn restore_project_plan_item(
     }
 }
 
+/// The one typed failure a non-completing shared-kernel outcome maps to.
+fn source_activation_failure(
+    outcome: &crate::storage::source_facts::SourceActivationOutcome,
+) -> Option<SourceRestoreError> {
+    match outcome {
+        crate::storage::source_facts::SourceActivationOutcome::Activated { .. }
+        | crate::storage::source_facts::SourceActivationOutcome::Replay { .. } => None,
+        crate::storage::source_facts::SourceActivationOutcome::StagedOnly { .. }
+        | crate::storage::source_facts::SourceActivationOutcome::PublishedFailure { .. } => {
+            Some(SourceRestoreError::ActivationIncomplete)
+        }
+    }
+}
+
+/// The fixed context a source Replace projection runs under.
+struct SourceReplaceProjection<'a> {
+    conversation_id: i64,
+    identity: &'a RestoreIdentity,
+    snapshot_root: &'a str,
+    generation: &'a str,
+}
+
+struct SourceReplaceProjectionOutcome {
+    outcome: crate::storage::source_facts::SourceAwareInsertOutcome,
+    deleted_message_count: usize,
+}
+
+/// The actual source Replace callback body, in the callback's transaction.
+///
+/// The order is fixed and each step is load-bearing:
+/// 1. read the target conversation's real message ids from the rows;
+/// 2. historyize only those canonical links, before the delete (SQLite may
+///    reuse a deleted id; the old link must stay historical/NULL);
+/// 3. run the one replace projection body;
+/// 4. bind the real inserted ids in this same transaction.
+///
+/// A typed binder failure propagates unchanged. A `StorageError` from the body
+/// stays the same typed `Db`; every other body failure maps through the existing
+/// `anyhow_source_error` boundary to `Activation`, which the restore boundary
+/// classifies as `source_restore_material_mismatch`.
+fn install_source_replace_projection_in_tx(
+    tx: &crate::storage::api::Tx<'_>,
+    replace: &SourceReplaceProjection<'_>,
+    agent_id: i64,
+    workspace_id: Option<i64>,
+    conversation: &crate::model::types::Conversation,
+    input_key: &crate::storage::source_facts::Sha256Digest,
+    conversation_ordinal: u32,
+    claims: &[crate::storage::source_facts::SourceClaim],
+    pricing: &crate::storage::sqlite::PricingTable,
+) -> Result<SourceReplaceProjectionOutcome, crate::storage::source_facts::SourceInstallError> {
+    use crate::storage::source_facts::{anyhow_source_error, SourceInstallError};
+
+    let message_ids: Vec<i64> = tx
+        .query_all_map(
+            "SELECT id FROM messages WHERE conversation_id = ?1 ORDER BY id",
+            &[crate::storage::api::Value::Integer(replace.conversation_id)],
+            |row| row.get_typed(0),
+        )
+        .map_err(SourceInstallError::Db)?;
+    crate::storage::source_facts::historyize_source_message_links_in_tx(tx, &message_ids)
+        .map_err(SourceInstallError::Db)?;
+    let body = replace_projection_body_in_tx(
+        tx,
+        &ReplaceCommitInput {
+            conversation_id: replace.conversation_id,
+            agent_id,
+            workspace_id,
+            conv: conversation,
+            identity: replace.identity,
+            snapshot_root: replace.snapshot_root,
+            generation: replace.generation,
+        },
+        pricing,
+    )
+    .map_err(anyhow_source_error)?;
+    let outcome = crate::storage::sqlite::bind_replaced_projection_in_tx(
+        tx,
+        replace.conversation_id,
+        conversation,
+        input_key,
+        conversation_ordinal,
+        claims,
+        &body.inserted_message_ids,
+    )?;
+    Ok(SourceReplaceProjectionOutcome {
+        outcome,
+        deleted_message_count: body.deleted_message_count,
+    })
+}
+
+/// Prepare one source New planned item, then hand it to the shared commit core.
+///
+/// The job and safety-pass preparation stays outside the transaction. The
+/// actual New commit body lives in [`restore_commit_prepared_source_item`], so
+/// the real CLI and the private unit test call the same prepared/commit
+/// boundary rather than a test-only predicate.
+fn restore_commit_source_item(
+    journal: &mut RestoreJournal,
+    outcome: &mut RestoreRunOutcome,
+    storage: &crate::storage::sqlite::FrankenStorage,
+    view: &crate::raw_mirror::RawMirrorManifestView,
+    item: &RestorePlanItem,
+    safety: &std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>,
+    pricing: &crate::storage::sqlite::PricingTable,
+) -> anyhow::Result<()> {
+    use crate::indexer::source_ingest::{
+        prepare_restore_source_job, prepare_source_input_commit,
+    };
+
+    let binding = item
+        .source_binding
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("a source planned item without a binding"))?;
+    let capture = provenance_from_manifest_view(view);
+    let job = prepare_restore_source_job(
+        &journal.data_dir,
+        &capture,
+        binding,
+        std::sync::Arc::clone(safety),
+    )
+    .map_err(source_restore_error_from_ingest)?;
+    // The real admission sits between the real prepared job and the commit
+    // preparation: a source Replace installs exactly one projection
+    // conversation. New keeps its own rule (zero or more); nothing here adds a
+    // production flag or a public test hook.
+    validate_source_replace_projection_count(item.action, job.conversations.len())
+        .map_err(source_restore_error)?;
+    let prepared = prepare_source_input_commit(&job).map_err(source_restore_error_from_ingest)?;
+    restore_commit_prepared_source_item(journal, outcome, storage, view, item, &prepared, pricing)
+}
+
+/// The real source-Replace admission helper. It is private to this module, but
+/// it is production code called by the wrapper above; the component test drives
+/// this same function for the count-2 branch that the first-batch planner does
+/// not produce.
+fn validate_source_replace_projection_count(
+    action: PlannedAction,
+    conversation_count: usize,
+) -> Result<(), SourceRestoreError> {
+    if matches!(action, PlannedAction::Replace { .. }) && conversation_count != 1 {
+        return Err(SourceRestoreError::ProjectionCount);
+    }
+    Ok(())
+}
+
+/// Commit one already-prepared source New item in its own single transaction.
+///
+/// The order is fixed: the shared receipt verifier decides whether the item is
+/// already complete; only an absent restore receipt installs through the
+/// shared kernel. Everything the success path writes — source evidence, the
+/// journal generation and the restore receipt with its C3 detail — lands in
+/// this one transaction, and the final commit is the only point at which the
+/// in-memory outcome moves.
+fn restore_commit_prepared_source_item(
+    journal: &mut RestoreJournal,
+    outcome: &mut RestoreRunOutcome,
+    storage: &crate::storage::sqlite::FrankenStorage,
+    view: &crate::raw_mirror::RawMirrorManifestView,
+    item: &RestorePlanItem,
+    prepared: &crate::indexer::source_ingest::PreparedSourceInputCommit<'_>,
+    pricing: &crate::storage::sqlite::PricingTable,
+) -> anyhow::Result<()> {
+    use crate::indexer::source_ingest::{
+        install_source_input_in_tx, install_source_input_with_projection_in_tx,
+    };
+    use crate::storage::api::TxMode;
+    use crate::storage::source_facts::{activation_receipt_key, SourceActivationOutcome};
+
+    let identity = restore_identity_from_view(view)?;
+    let is_source_replace = source_replace_target_of(item).is_some();
+    let restore_key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
+    let restore_operation = planned_action_operation(item.action);
+    let snapshot_root = journal.snapshot_root.clone();
+    let generation = journal.generation.clone();
+
+    let conn = storage.raw();
+    let tx = conn.transaction_with_mode(TxMode::Immediate)?;
+
+    match verify_restore_source_receipt_in_tx(&tx, journal, item, view)
+        .map_err(RestoreSourceReceiptError::into_anyhow)?
+    {
+        RestoreSourceReceiptStatus::Verified { .. } => {
+            // R1: an existing C3 does not skip the target relationship. The
+            // full receipt/source verification above and this check share the
+            // same Immediate transaction; a wrong target never commits.
+            if is_source_replace {
+                verify_source_replace_target_in_tx(&tx, item, view)
+                    .map_err(RestoreSourceReceiptError::into_anyhow)?;
+            }
+            tx.commit()?;
+            if !journal.committed.contains(&item.manifest_id) {
+                journal.committed.push(item.manifest_id.clone());
+            }
+            outcome.already_committed += 1;
+            outcome.receipt_keys.push(restore_key);
+            return Ok(());
+        }
+        RestoreSourceReceiptStatus::Absent => {
+            // Only a genuinely initial planned run may install. A journal that
+            // already lists this item as committed but carries no restore
+            // receipt is an inconsistent state, not permission to redo work.
+            if journal.committed.contains(&item.manifest_id) {
+                return Err(source_restore_error(
+                    SourceRestoreError::ReceiptConflict,
+                ));
+            }
+        }
+    }
+
+    // R1: a first install that has not completed may not stage the projection
+    // until the exact identity/session-key evidence proves this target. A
+    // completed input is proven from its immutable bindings after the kernel
+    // returns, below.
+    if is_source_replace && !source_input_is_complete_in_tx(&tx, item)? {
+        verify_source_replace_target_in_tx(&tx, item, view)
+            .map_err(RestoreSourceReceiptError::into_anyhow)?;
+    }
+
+    let mut replaced_deleted = 0usize;
+    let result = match item.action {
+        PlannedAction::RestoreNew => install_source_input_in_tx(storage, &tx, prepared),
+        PlannedAction::Replace { conversation_id } => {
+            let replace = SourceReplaceProjection {
+                conversation_id,
+                identity: &identity,
+                snapshot_root: &snapshot_root,
+                generation: &generation,
+            };
+            install_source_input_with_projection_in_tx(
+                &tx,
+                prepared,
+                |tx,
+                 agent_id,
+                 workspace_id,
+                 conversation,
+                 input_key,
+                 conversation_ordinal,
+                 claims| {
+                    let body = install_source_replace_projection_in_tx(
+                        tx,
+                        &replace,
+                        agent_id,
+                        workspace_id,
+                        conversation,
+                        input_key,
+                        conversation_ordinal,
+                        claims,
+                        pricing,
+                    )?;
+                    replaced_deleted = body.deleted_message_count;
+                    Ok(body.outcome)
+                },
+            )
+        }
+    }
+    .map_err(source_restore_error_from_ingest)?;
+
+    if let Some(error) = source_activation_failure(&result.outcome) {
+        return Err(source_restore_error(error));
+    }
+
+    // R1: after the kernel returns (Activated or a genuine Replay) and before
+    // the generation/C3 write, prove the installed conversation set names
+    // exactly this target. This is the check that stops a Replay of a wrong
+    // journal target before a receipt can be minted.
+    if is_source_replace {
+        verify_source_replace_target_in_tx(&tx, item, view)
+            .map_err(RestoreSourceReceiptError::into_anyhow)?;
+    }
+
+    // The existing pause point moves here: after the source install and before
+    // the restore receipt, with this transaction still open. A real SIGKILL
+    // therefore leaves no half commit; a fresh process replays from the disk
+    // material and the receipts alone.
+    restore_pause_if_requested("restore-new-inserted-not-receipted");
+
+    crate::storage::sqlite::franken_set_source_content_generation_in_tx(&tx, &journal.generation)?;
+
+    let (source_receipt_key, installation_digest) = match &result.outcome {
+        SourceActivationOutcome::Activated {
+            receipt_key,
+            installation_digest,
+            ..
+        } => (receipt_key.clone(), *installation_digest),
+        SourceActivationOutcome::Replay { receipt } => (
+            activation_receipt_key(
+                &result.request.library_identity,
+                &result.request.input_key,
+                &receipt.semantic_request_digest,
+            ),
+            receipt.installation_digest,
+        ),
+        _ => unreachable!("the incomplete outcomes returned above"),
+    };
+    let detail = source_new_wire::encode(
+        restore_operation,
+        &journal.snapshot_root,
+        &item.manifest_id,
+        &restore_key,
+        &result.request,
+        &source_receipt_key,
+        &installation_digest,
+    );
+    crate::storage::sqlite::franken_insert_operation_commit_receipt_in_tx(
+        &tx,
+        &restore_key,
+        restore_operation,
+        "committed",
+        Some(&journal.snapshot_root),
+        restore_now_ms(),
+        Some(&detail),
+    )?;
+
+    // Verify the full result that was just written, still inside the same
+    // transaction. An error keeps its typed chain (a Db failure stays a Db
+    // failure and reaches the CLI's generic recovery family); only a genuinely
+    // incomplete success status is folded into ReceiptInconsistent. Either way
+    // the open transaction rolls the whole input back.
+    match verify_restore_source_receipt_in_tx(&tx, journal, item, view) {
+        Err(error) => return Err(error.into_anyhow()),
+        Ok(RestoreSourceReceiptStatus::Verified { .. }) => {}
+        Ok(RestoreSourceReceiptStatus::Absent) => {
+            return Err(source_restore_error(
+                SourceRestoreError::ReceiptInconsistent,
+            ));
+        }
+    }
+
+    tx.commit()?;
+
+    match &result.outcome {
+        SourceActivationOutcome::Activated { .. } => match item.action {
+            PlannedAction::Replace { .. } => {
+                // One activated source Replace: the real SQL counts, and none of
+                // the New-only cells move.
+                outcome.replaced += 1;
+                outcome.messages_deleted += replaced_deleted;
+            }
+            PlannedAction::RestoreNew => {
+                if result.judged_conversations == 0 {
+                    outcome.source_only_completed += 1;
+                } else if result.accepted_by_conversation.is_empty() {
+                    // A judged conversation that added nothing is the storage
+                    // layer's content-dedup result: the action ran, no row landed.
+                    outcome.deduplicated += 1;
+                } else {
+                    for (_, _, created) in &result.accepted_by_conversation {
+                        if *created {
+                            outcome.restored += 1;
+                        } else {
+                            outcome.deduplicated += 1;
+                        }
+                    }
+                }
+            }
+        },
+        SourceActivationOutcome::Replay { .. } => outcome.source_replayed += 1,
+        _ => unreachable!("the incomplete outcomes returned above"),
+    }
+    outcome.messages_inserted += result
+        .accepted_by_conversation
+        .iter()
+        .map(|(_, ids, _)| ids.len())
+        .sum::<usize>();
+    outcome.receipt_keys.push(restore_key);
+    journal.committed.push(item.manifest_id.clone());
+    Ok(())
+}
+
 /// DB 阶段：逐条**先查 receipt 再做**。
 fn restore_run_db_phase(
     journal: &mut RestoreJournal,
     outcome: &mut RestoreRunOutcome,
+    source_safety: Option<&std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>>,
 ) -> anyhow::Result<()> {
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
     let storage = crate::storage::sqlite::FrankenStorage::open_writer(&journal.db_path)
@@ -8936,6 +11355,13 @@ fn restore_run_db_phase(
             .ok_or_else(|| {
                 anyhow::anyhow!("planned manifest {} not in mirror", item.manifest_id)
             })?;
+        if item.source_binding.is_some() {
+            let safety = source_safety.ok_or_else(|| {
+                anyhow::anyhow!("a source planned item with no validated source materials")
+            })?;
+            restore_commit_source_item(journal, outcome, &storage, view, &item, safety, &pricing)?;
+            continue;
+        }
         let identity = restore_identity_from_view(view)?;
         let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
 
@@ -9035,28 +11461,64 @@ fn restore_account_receipts_present(
     journal: &RestoreJournal,
     outcome: &mut RestoreRunOutcome,
 ) -> anyhow::Result<()> {
+    use crate::storage::api::Value;
+
     let views = crate::raw_mirror::manifest_views(&journal.data_dir)?;
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(&journal.db_path)
         .map_err(|e| anyhow::anyhow!("open candidate db readonly: {e}"))?;
     let mut missing = Vec::new();
-    for item in &journal.planned {
-        let Some(view) = views.iter().find(|v| v.manifest_id == item.manifest_id) else {
-            missing.push(item.manifest_id.clone());
-            continue;
-        };
-        let identity = restore_identity_from_view(view)?;
-        let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
-        if crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), &key)? {
-            // 这一格此前只 assert 不记账（R2 第 8 条）：崩在 `db-committed` 之后再
-            // `--recover`，四格全 0、`receipt_keys` 空——而那正是操作者对账用的东西。
-            // R-E-83 修的是 `Planned` 支**内部**那一分支，**这一支从没被覆盖**。
-            //
-            // 归到 `already_committed`：receipt 是「这条身份的恢复动作做完了」的唯一
-            // 持久凭据，它回答不了「当初是新建还是去重」，所以也不许往那两格里猜。
-            outcome.already_committed += 1;
-            outcome.receipt_keys.push(key);
-        } else {
-            missing.push(item.manifest_id.clone());
+    {
+        // One Deferred read transaction: the shared verifier and the legacy
+        // existence check both run inside it, and it never upgrades the write
+        // connection or writes a row.
+        let tx = storage.raw().transaction()?;
+        for item in &journal.planned {
+            let Some(view) = views.iter().find(|v| v.manifest_id == item.manifest_id) else {
+                missing.push(item.manifest_id.clone());
+                continue;
+            };
+            if item.source_binding.is_some() {
+                match verify_restore_source_receipt_in_tx(&tx, journal, item, view)
+                    .map_err(RestoreSourceReceiptError::into_anyhow)?
+                {
+                    RestoreSourceReceiptStatus::Verified { restore_key, .. } => {
+                        if source_replace_target_of(item).is_some() {
+                            verify_source_replace_target_in_tx(&tx, item, view)
+                                .map_err(RestoreSourceReceiptError::into_anyhow)?;
+                        }
+                        outcome.already_committed += 1;
+                        outcome.receipt_keys.push(restore_key);
+                    }
+                    RestoreSourceReceiptStatus::Absent => {
+                        // Past the initial planned write, a missing restore
+                        // receipt is a conflict between the journal's claim
+                        // and the database, never permission to guess.
+                        return Err(source_restore_error(
+                            SourceRestoreError::ReceiptConflict,
+                        ));
+                    }
+                }
+                continue;
+            }
+            let identity = restore_identity_from_view(view)?;
+            let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
+            let found: Option<i64> = tx.query_opt_map(
+                "SELECT 1 FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                &[Value::Text(key.clone())],
+                |row| row.get_typed(0),
+            )?;
+            if found.is_some() {
+                // 这一格此前只 assert 不记账（R2 第 8 条）：崩在 `db-committed` 之后再
+                // `--recover`，四格全 0、`receipt_keys` 空——而那正是操作者对账用的东西。
+                // R-E-83 修的是 `Planned` 支**内部**那一分支，**这一支从没被覆盖**。
+                //
+                // 归到 `already_committed`：receipt 是「这条身份的恢复动作做完了」的唯一
+                // 持久凭据，它回答不了「当初是新建还是去重」，所以也不许往那两格里猜。
+                outcome.already_committed += 1;
+                outcome.receipt_keys.push(key);
+            } else {
+                missing.push(item.manifest_id.clone());
+            }
         }
     }
     storage.close_best_effort_in_place();
@@ -9243,6 +11705,9 @@ mod w3_4_step2_4_db_vector_domain_invalidation_tests {
             committed: Vec::new(),
             published: Vec::new(),
             analytics_now_ms: Some(TS),
+            source_contexts: None,
+            source_contexts_digest: None,
+            source_profile: None,
         }
     }
 
@@ -9404,12 +11869,65 @@ fn restore_publish_manifests(
             continue;
         }
         let conversation_id = match item.action {
-            PlannedAction::Replace { conversation_id } => Some(conversation_id),
+            PlannedAction::Replace { conversation_id } => {
+                if item.source_binding.is_some() {
+                    let tx = storage.raw().transaction()?;
+                    // R1: the full source evidence and the target relationship
+                    // are re-proven in this one read transaction before any
+                    // manifest link is written.
+                    match verify_restore_source_receipt_in_tx(&tx, journal, &item, view)
+                        .map_err(RestoreSourceReceiptError::into_anyhow)?
+                    {
+                        RestoreSourceReceiptStatus::Verified { .. } => {}
+                        RestoreSourceReceiptStatus::Absent => {
+                            return Err(source_restore_error(
+                                SourceRestoreError::ReceiptConflict,
+                            ));
+                        }
+                    }
+                    let target = verify_source_replace_target_in_tx(&tx, &item, view)
+                        .map_err(RestoreSourceReceiptError::into_anyhow)?;
+                    let linked = match target.immutable_identity_digest {
+                        Some(immutable_digest) => {
+                            let library_identity = stored_library_identity_in_tx(&tx)
+                                .map_err(RestoreSourceReceiptError::into_anyhow)?;
+                            let current = current_parent_identity_digest_in_tx(
+                                &tx,
+                                &library_identity,
+                                target.conversation_id,
+                            )
+                            .map_err(RestoreSourceReceiptError::into_anyhow)?;
+                            if current.as_ref() == Some(&immutable_digest) {
+                                Some(target.conversation_id)
+                            } else {
+                                None
+                            }
+                        }
+                        // The empty-witness fallback already proved this exact
+                        // current row; it is the only legal parent to link.
+                        None => Some(target.conversation_id),
+                    };
+                    drop(tx);
+                    linked
+                } else {
+                    // Legacy Replace keeps its original semantics.
+                    Some(conversation_id)
+                }
+            }
             PlannedAction::RestoreNew => {
                 // 绑**整条身份**，与候选侧同一处定义（R2 第 4 条 / 第 5 条互为镜像）。
                 // 修前这里只绑 `source_path`：库里另一条同路径、异来源的会话会先被选中，
                 // 于是 manifest 的 backlink 指向一条根本不是它的会话，且指错了不报错。
-                let identity = restore_identity_from_view(view)?;
+                //
+                // Task15 R3: a source New input is installed under the connector's
+                // agent slug (`claude_code`), while the raw manifest keeps its
+                // original provider (`claude`). Only this publication lookup uses
+                // the validated declaration's connector; the raw provider, the
+                // restore identity/key and the legacy path stay unchanged.
+                let mut identity = restore_identity_from_view(view)?;
+                if let Some(binding) = item.source_binding.as_ref() {
+                    identity.origin.agent_slug = binding.declaration.connector.clone();
+                }
                 conversation_ids_for_manifest(
                     &storage,
                     &identity,
@@ -9496,6 +12014,172 @@ fn restore_verify_closure(journal: &RestoreJournal) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 校 journal4 材料，返回「是否存在合法的首批 planned 项」。
+///
+/// 全 legacy（三件套 null、所有 binding null）直接返回 `false`，保持原恢复路径。
+/// 有材料时必须三件套齐全、聚合摘要按原材料重算、profile 按 39 重读固定副本，
+/// 且每条 planned 首批项的 binding 从 44/40 重算后逐值相等；非首批项必须显式 null
+/// 且 manifest provider 确为非首批。任何不一致都是 `MaterialMismatch`。
+/// The non-IO restore-source material checks shared by the driver and qualify.
+///
+/// This reads journal fields and manifest metadata only. It never loads the
+/// fixed TOML, never opens a sealed blob, never reruns FAD discovery and never
+/// captures. The driver and qualify call this same function; only the driver
+/// then performs the IO/material re-check.
+///
+/// Returns whether at least one first-batch planned item carries a binding.
+fn validate_restore_source_structure(
+    journal: &RestoreJournal,
+) -> Result<bool, SourceRestoreError> {
+    use crate::storage::source_facts::Sha256Digest;
+
+    let has_binding = journal
+        .planned
+        .iter()
+        .any(|item| item.source_binding.is_some());
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)
+        .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    let view_for = |item: &RestorePlanItem| {
+        views
+            .iter()
+            .find(|view| view.manifest_id == item.manifest_id)
+            .ok_or(SourceRestoreError::MaterialMismatch)
+    };
+
+    if journal.source_contexts.is_none()
+        && journal.source_contexts_digest.is_none()
+        && journal.source_profile.is_none()
+        && !has_binding
+    {
+        // 三件套全 null 也不能直接判 legacy：必须重开每条 planned manifest 核
+        // provider。任何首批 planned 缺 binding 都是材料错误，且必须发生在所有
+        // 七态的 DB/收据/状态分支之前。只有真实全 legacy 才能走原恢复路径。
+        for item in &journal.planned {
+            let view = view_for(item)?;
+            if is_first_batch_source(&view.provider) {
+                return Err(SourceRestoreError::MaterialMismatch);
+            }
+        }
+        return Ok(false);
+    }
+
+    let (Some(contexts), Some(expected_digest), Some(profile)) = (
+        journal.source_contexts.as_ref(),
+        journal.source_contexts_digest.as_ref(),
+        journal.source_profile.as_ref(),
+    ) else {
+        return Err(SourceRestoreError::MaterialMismatch);
+    };
+    if source_contexts_digest(contexts)? != *expected_digest {
+        return Err(SourceRestoreError::MaterialMismatch);
+    }
+    let expected_code_version = format!(
+        "{}+{}",
+        crate::indexer::source_ingest::SOURCE_EXCLUSION_EPOCH,
+        crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
+    );
+    if profile.fad_pin != crate::indexer::source_ingest::FAD_PIN
+        || profile.mapping_domain != crate::indexer::source_ingest::SOURCE_MAPPING_DOMAIN
+        || profile.exclusion_epoch != crate::indexer::source_ingest::SOURCE_EXCLUSION_EPOCH
+        || profile.redaction_fingerprint
+            != crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
+        || profile.code_version != expected_code_version
+        || !profile.desensitization_enabled
+    {
+        return Err(SourceRestoreError::MaterialMismatch);
+    }
+    let _fixed_sha = Sha256Digest::from_hex(&profile.fixed_config_sha256)
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    let _arrays_sha = Sha256Digest::from_hex(&profile.effective_four_arrays_sha256)
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+
+    let mut first_batch_planned = false;
+    for item in &journal.planned {
+        let view = view_for(item)?;
+        let first_batch = is_first_batch_source(&view.provider);
+        let Some(binding) = item.source_binding.as_ref() else {
+            // 非首批项必须显式 null；null 不能把首批 manifest 伪装成 legacy。
+            if first_batch {
+                return Err(SourceRestoreError::MaterialMismatch);
+            }
+            continue;
+        };
+        if !first_batch || binding.declaration.manifest_id != item.manifest_id {
+            return Err(SourceRestoreError::MaterialMismatch);
+        }
+        let declared = contexts
+            .inputs
+            .iter()
+            .find(|declaration| declaration.manifest_id == item.manifest_id)
+            .ok_or(SourceRestoreError::MaterialMismatch)?;
+        if *declared != binding.declaration {
+            return Err(SourceRestoreError::MaterialMismatch);
+        }
+        // Structural shape of the seven binding fields. The value proof stays
+        // in the driver's prepare_restore_source_job.
+        if Sha256Digest::from_hex(&binding.context_digest).is_none()
+            || Sha256Digest::from_hex(&binding.sealed_sha256).is_none()
+            || Sha256Digest::from_hex(&binding.normalizer_id).is_none()
+            || Sha256Digest::from_hex(&binding.safety_contract_id).is_none()
+            || Sha256Digest::from_hex(&binding.input_key).is_none()
+        {
+            return Err(SourceRestoreError::MaterialMismatch);
+        }
+        first_batch_planned = true;
+    }
+    Ok(first_batch_planned)
+}
+
+fn validate_restore_source_materials(
+    journal: &RestoreJournal,
+) -> Result<Option<std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>>, SourceRestoreError> {
+    use crate::storage::source_facts::Sha256Digest;
+
+    if !validate_restore_source_structure(journal)? {
+        return Ok(None);
+    }
+    let profile = journal
+        .source_profile
+        .as_ref()
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    let fixed_sha = Sha256Digest::from_hex(&profile.fixed_config_sha256)
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    let arrays_sha = Sha256Digest::from_hex(&profile.effective_four_arrays_sha256)
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    let safety = crate::indexer::source_ingest::load_restore_fixed_safety(
+        Path::new(&profile.fixed_copy_path),
+        &profile.config_source_identity,
+        &fixed_sha,
+        &arrays_sha,
+        &profile.code_version,
+    )
+    .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    let safety = std::sync::Arc::new(safety);
+
+    let views = crate::raw_mirror::manifest_views(&journal.data_dir)
+        .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    for item in &journal.planned {
+        let Some(binding) = item.source_binding.as_ref() else {
+            continue;
+        };
+        let view = views
+            .iter()
+            .find(|view| view.manifest_id == item.manifest_id)
+            .ok_or(SourceRestoreError::MaterialMismatch)?;
+        let capture = provenance_from_manifest_view(view);
+        // One shared assembly: the declared-input adapter, the read-only safety
+        // preview, the restore admission and the seven-field proof.
+        crate::indexer::source_ingest::prepare_restore_source_job(
+            &journal.data_dir,
+            &capture,
+            binding,
+            std::sync::Arc::clone(&safety),
+        )
+        .map_err(SourceRestoreError::from_ingest)?;
+    }
+    Ok(Some(safety))
+}
+
 /// 首跑：写计划 → 驱动。
 pub(crate) fn restore_apply_journaled(
     plan: RestoreRunPlan,
@@ -9554,12 +12238,18 @@ fn restore_drive(
     journal: &mut RestoreJournal,
     journal_path: &Path,
 ) -> anyhow::Result<RestoreRunOutcome> {
+    // Task14/Task15：进入任何 DB / 收据分支之前统一校 journal4 材料。
+    // SourceNew 与 source Replace 均已接通；坏材料无论处于哪一态都先被拒。
+    // 全 legacy 材料为 null，继续原恢复路径。R1 的 target 关系核验在材料
+    // 校验之后、各写的同一 Tx 内执行，不改变这里的材料优先级。
+    let source_materials =
+        validate_restore_source_materials(journal).map_err(source_restore_error)?;
     let mut outcome = RestoreRunOutcome::default();
 
     if journal.state.rank() == RestoreJournalState::Planned.rank() {
         // §5.2.5：`planned` 时按幂等 key 查 receipt —— 无则重放事务，有则等同 db-committed。
         // 逐条判在 `restore_run_db_phase` 内部（先查后做），所以两种情形共用一条路径。
-        restore_run_db_phase(journal, &mut outcome)?;
+        restore_run_db_phase(journal, &mut outcome, source_materials.as_ref())?;
         restore_journal_advance(journal, journal_path, RestoreJournalState::DbCommitted)?;
         restore_pause_if_requested("db-committed");
     } else {
@@ -9615,13 +12305,17 @@ fn restore_drive(
 // receipt 说「这些确实提交过」—— 两个独立真源对上才算数。
 // ===========================================================================
 
-/// restore journal 的 schema 版本（R-E-79 补充裁定）。
+/// restore journal 的 schema 版本（R-E-79 补充裁定；Task14 升 4）。
 ///
-/// **2** = 随 marker 一起加了 `holds_count` / `origin_unmapped_count` 两格。
+/// **4** = journal4：新增 `source_contexts`、`source_contexts_digest`、
+/// `source_profile` 与每 planned 项的 `source_binding`。四个键都必须出现，
+/// 显式 `null` 与缺键不同。
+///
+/// **3** = 随 marker 一起加了 `holds_count` / `origin_unmapped_count` 两格。
 /// 这个常量存在的理由不是兼容性（rehearsal 之前没有生产 journal），
 /// 而是**错误的可读性**：没有它，一份旧 journal 会死在 serde 的字段解析上，
 /// 那是错误的层在说话——操作者会去查文件损坏，而真相是版本不对。
-pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 3;
+pub(crate) const RESTORE_JOURNAL_SCHEMA_VERSION: i64 = 4;
 
 pub(crate) const W1_COMMIT_MARKER_SCHEMA: &str = "marker.w1-commit";
 /// **3**（R-E-91）：字段全集没变，变的是 `mirror_identity.manifest_root` 的**派生定义**
@@ -9752,6 +12446,9 @@ pub(crate) enum W1MarkerError {
         declared: u64,
         actual: u64,
     },
+    /// Task15：第 6 层的来源收据核验拒绝。`code()` 直接返回内层固定短码，
+    /// 不新增第二套 E-* 对应表。
+    Source(SourceRestoreError),
     /// 档 3（R-E-91，只在 `--deep-verify` 下可能出现）：blob 的**真实字节**重算出的
     /// blake3 与 manifest 声称的 `blob_blake3` 不符。
     MirrorBlobChecksumMismatch {
@@ -9791,6 +12488,7 @@ impl W1MarkerError {
             W1MarkerError::MirrorBlobChecksumMismatch { .. } => "E-MIRROR-BLOB-CHECKSUM-MISMATCH",
             W1MarkerError::MirrorBlobNotRegularFile { .. } => "E-MIRROR-BLOB-NOT-REGULAR",
             W1MarkerError::MirrorUnreadable(_) => "E-MIRROR-UNREADABLE",
+            W1MarkerError::Source(inner) => inner.code(),
         }
     }
 }
@@ -10449,6 +13147,39 @@ pub(crate) struct W1Qualification {
     pub mirror_verify_depth: MirrorVerifyDepth,
 }
 
+/// Re-read one source planned item's sealed blob during qualification and
+/// compare its bytes to the frozen binding. Any unreadable or tampered blob is
+/// a physical material failure, never a receipt failure.
+fn verify_source_material_bytes(
+    data_dir: &Path,
+    item: &RestorePlanItem,
+    _view: &crate::raw_mirror::RawMirrorManifestView,
+) -> Result<(), SourceRestoreError> {
+    let binding = item
+        .source_binding
+        .as_ref()
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    let reports = collect_sealed_manifest_reports(data_dir);
+    let report = reports
+        .iter()
+        .find(|report| report.manifest_id == item.manifest_id)
+        .ok_or(SourceRestoreError::MaterialMismatch)?;
+    match read_sealed_blob(data_dir, report) {
+        SealedBlobOutcome::Loaded(bytes) => {
+            if crate::storage::source_facts::Sha256Digest::of(&bytes).hex()
+                == binding.sealed_sha256
+            {
+                Ok(())
+            } else {
+                Err(SourceRestoreError::MaterialMismatch)
+            }
+        }
+        SealedBlobOutcome::ReferenceMissing
+        | SealedBlobOutcome::PayloadHashMismatch { .. }
+        | SealedBlobOutcome::Unreadable { .. } => Err(SourceRestoreError::MaterialMismatch),
+    }
+}
+
 /// **解析级机器门**（plan Task E7 Step 3），七步检查序见 wire 说明 §4。
 /// 每层以自己的名义拒绝，先到先报。
 ///
@@ -10567,23 +13298,115 @@ pub(crate) fn qualify_w1_candidate(
     // blob 文件被删被截，它一位都不变（R1 Finding 7 探针 A 实证）。这一步是独立防线。
     let mirror_blobs = verify_mirror_blobs(input.data_dir, input.mirror_verify_depth)?;
 
-    // 6 · receipt 交叉核：marker 说「我提交了这些」，DB 副本里的 receipt 说「确实提交过」
+    // 6 · receipt 交叉核：marker 说「我提交了这些」，DB 副本里的 receipt 说「确实提交过」。
+    //
+    // Task15 R1: run the same non-IO material structure checks the driver uses.
+    // They belong only to this layer; the first five layers keep their priority.
+    // The check reads journal fields and manifest metadata, never the fixed
+    // TOML, a sealed blob or a discovered configuration.
+    validate_restore_source_structure(&journal).map_err(W1MarkerError::Source)?;
+    //
+    // Task15: the expected key set comes from the journal's planned items, not
+    // from the marker. Iterating only the marker's own keys would accept a
+    // receipt list that silently omits a planned item, so the two sets are
+    // compared both ways below. A source item is verified with the same shared
+    // verifier every other consumer uses; a read-only Deferred transaction
+    // keeps this layer read-only.
     let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(input.db_path)
         .map_err(|e| W1MarkerError::ReceiptMissing {
             key: format!("db unreadable: {e}"),
         })?;
-    for key in &marker.receipt_keys {
-        let found =
-            crate::storage::sqlite::franken_operation_commit_receipt_exists(storage.raw(), key)
-                .map_err(|e| W1MarkerError::ReceiptMissing {
-                    key: format!("{key} (query failed: {e})"),
+    let mut expected_keys = std::collections::BTreeSet::new();
+    {
+        let tx = storage
+            .raw()
+            .transaction()
+            .map_err(|e| W1MarkerError::ReceiptMissing {
+                key: format!("db unreadable: {e}"),
+            })?;
+        let views = crate::raw_mirror::manifest_views(input.data_dir).map_err(|_| {
+            W1MarkerError::ReceiptMissing {
+                key: "mirror unreadable".to_string(),
+            }
+        })?;
+        for item in &journal.planned {
+            let view = views
+                .iter()
+                .find(|view| view.manifest_id == item.manifest_id)
+                .ok_or_else(|| W1MarkerError::ReceiptMissing {
+                    key: item.manifest_id.clone(),
                 })?;
-        if !found {
-            storage.close_best_effort_in_place();
-            return Err(W1MarkerError::ReceiptMissing { key: key.clone() });
+            let identity = restore_identity_from_view(view).map_err(|_| {
+                W1MarkerError::ReceiptMissing {
+                    key: item.manifest_id.clone(),
+                }
+            })?;
+            let key = restore_idempotency_key_for(item.action, &journal.snapshot_root, &identity);
+            expected_keys.insert(key.clone());
+            if item.source_binding.is_some() {
+                // Qualification must read the real sealed bytes for a Replace
+                // projection, not only the stored size or a cached digest. An
+                // equal-length tamper is a physical material failure at this
+                // layer. A New input keeps the Task15 size-level qualification
+                // locked by the inherited compatibility roster.
+                if matches!(item.action, PlannedAction::Replace { .. }) {
+                    verify_source_material_bytes(&journal.data_dir, item, view)
+                        .map_err(W1MarkerError::Source)?;
+                }
+                match verify_restore_source_receipt_in_tx(&tx, &journal, item, view) {
+                    Ok(RestoreSourceReceiptStatus::Verified { .. }) => {
+                        // R1: qualification consumes the same target
+                        // relationship as commit/account/publish. The check is
+                        // read-only and shares this read transaction.
+                        if source_replace_target_of(item).is_some() {
+                            verify_source_replace_target_in_tx(&tx, item, view)
+                                .map_err(|error| match error {
+                                    RestoreSourceReceiptError::Typed(error) => {
+                                        W1MarkerError::Source(error)
+                                    }
+                                    RestoreSourceReceiptError::Db(_) => {
+                                        W1MarkerError::ReceiptMissing {
+                                            key: "source target unreadable".to_string(),
+                                        }
+                                    }
+                                })?;
+                        }
+                    }
+                    Ok(RestoreSourceReceiptStatus::Absent) => {
+                        return Err(W1MarkerError::Source(
+                            SourceRestoreError::ReceiptConflict,
+                        ));
+                    }
+                    Err(RestoreSourceReceiptError::Typed(error)) => {
+                        return Err(W1MarkerError::Source(error));
+                    }
+                    Err(RestoreSourceReceiptError::Db(_)) => {
+                        return Err(W1MarkerError::ReceiptMissing {
+                            key: "source receipt unreadable".to_string(),
+                        });
+                    }
+                }
+            } else {
+                let found: Option<i64> = tx
+                    .query_opt_map(
+                        "SELECT 1 FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                        &[crate::storage::api::Value::Text(key.clone())],
+                        |row| row.get_typed(0),
+                    )
+                    .map_err(|_| W1MarkerError::ReceiptMissing { key: key.clone() })?;
+                if found.is_none() {
+                    return Err(W1MarkerError::ReceiptMissing { key });
+                }
+            }
         }
     }
     storage.close_best_effort_in_place();
+    let marker_keys: std::collections::BTreeSet<&String> = marker.receipt_keys.iter().collect();
+    if marker_keys != expected_keys.iter().collect() {
+        return Err(W1MarkerError::ReceiptMissing {
+            key: "receipt_keys do not match the journal's planned set".to_string(),
+        });
+    }
     if marker.receipt_keys.len() as i64 != marker.planned_count {
         return Err(W1MarkerError::ReceiptMissing {
             key: format!(
@@ -10728,6 +13551,10 @@ mod e7_restore_journal_tests {
         replace_manifest_id: String,
         replace_conv_id: i64,
         replace_external_id: String,
+        /// The source declaration's literal session key (`relative_locator`
+        /// without its extension), not the legacy projection's path-derived id
+        /// and not the captured manifest's optional key.
+        replace_source_external_id: String,
     }
 
     fn conv_count(db_path: &Path) -> i64 {
@@ -10809,6 +13636,129 @@ mod e7_restore_journal_tests {
             .unwrap();
         storage.close_best_effort_in_place();
         n
+    }
+
+    /// Task16/E2: the restore receipt domain is the two explicit restore
+    /// operations, never "anything that is not an activation". A foreign
+    /// operation must not be able to stand in for a missing restore receipt.
+    fn restore_receipt_count(db_path: &Path) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let n = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt WHERE operation IN (?1, ?2)",
+                &[
+                    crate::storage::api::Value::Text(RESTORE_NEW_OPERATION.to_string()),
+                    crate::storage::api::Value::Text(REPLACE_OPERATION.to_string()),
+                ],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        n
+    }
+
+    fn source_activation_receipt_count(db_path: &Path) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let n = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM operation_commit_receipt WHERE operation = ?1",
+                &[crate::storage::api::Value::Text(
+                    crate::storage::source_facts::SOURCE_ACTIVATION_OPERATION.to_string(),
+                )],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        n
+    }
+
+    fn restore_receipt_rows(db_path: &Path) -> Vec<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let mut rows: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "SELECT operation, state, detail IS NOT NULL FROM operation_commit_receipt \
+                 WHERE operation IN (?1, ?2) ORDER BY operation",
+                &[
+                    crate::storage::api::Value::Text(RESTORE_NEW_OPERATION.to_string()),
+                    crate::storage::api::Value::Text(REPLACE_OPERATION.to_string()),
+                ],
+                |row| {
+                    Ok(format!(
+                        "{}|{}|{}",
+                        row.get_typed::<String>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<i64>(2)?
+                    ))
+                },
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        rows.sort();
+        rows
+    }
+
+    fn source_activation_receipt_rows(db_path: &Path) -> Vec<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let mut rows: Vec<String> = storage
+            .raw()
+            .query_all_map(
+                "SELECT operation, state, detail IS NOT NULL FROM operation_commit_receipt \
+                 WHERE operation = ?1 ORDER BY operation",
+                &[crate::storage::api::Value::Text(
+                    crate::storage::source_facts::SOURCE_ACTIVATION_OPERATION.to_string(),
+                )],
+                |row| {
+                    Ok(format!(
+                        "{}|{}|{}",
+                        row.get_typed::<String>(0)?,
+                        row.get_typed::<String>(1)?,
+                        row.get_typed::<i64>(2)?
+                    ))
+                },
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        rows.sort();
+        rows
+    }
+
+    /// Exactly one committed C3 restore receipt per action plus one source
+    /// activation receipt per source identity; nothing else may stand in.
+    fn assert_source_receipts_complete(db_path: &Path) {
+        assert_eq!(
+            restore_receipt_rows(db_path),
+            vec![
+                format!("{RESTORE_NEW_OPERATION}|committed|1"),
+                format!("{REPLACE_OPERATION}|committed|1"),
+            ],
+            "restore receipt domain must be exactly one committed C3 receipt per action"
+        );
+        assert_eq!(
+            source_activation_receipt_rows(db_path),
+            vec![
+                format!(
+                    "{}|{}|1",
+                    crate::storage::source_facts::SOURCE_ACTIVATION_OPERATION,
+                    crate::storage::source_facts::SOURCE_ACTIVATION_STATE
+                ),
+                format!(
+                    "{}|{}|1",
+                    crate::storage::source_facts::SOURCE_ACTIVATION_OPERATION,
+                    crate::storage::source_facts::SOURCE_ACTIVATION_STATE
+                ),
+            ],
+            "source activation receipts must be exactly one committed detail row per identity"
+        );
+        assert_eq!(restore_receipt_count(db_path), 2, "two restore receipts");
+        assert_eq!(
+            source_activation_receipt_count(db_path),
+            2,
+            "two source activation receipts"
+        );
+        assert_eq!(receipt_count(db_path), 4, "no other operation may hide a receipt");
     }
 
     /// 三组事务外动作的**可观测哨兵**：每一组都先造出一个「任何重做都会抹掉」的现场，
@@ -10975,6 +13925,18 @@ mod e7_restore_journal_tests {
             .and_then(|link| link.conversation_id)
     }
 
+    fn published_backlinks_for(d: &Drill, manifest_id: &str) -> Vec<Option<i64>> {
+        crate::raw_mirror::manifest_views(&d.data_dir)
+            .unwrap()
+            .into_iter()
+            .find(|v| v.manifest_id == manifest_id)
+            .expect("manifest 必须在 view 列表里")
+            .db_links
+            .iter()
+            .map(|link| link.conversation_id)
+            .collect()
+    }
+
     /// 测试侧的**独立** oracle：按四维身份把候选行捞出来。
     ///
     /// 刻意不复用被测的 `candidate_versions_from_db` —— 用被测物给被测物当判据，
@@ -11081,6 +14043,18 @@ mod e7_restore_journal_tests {
             .external_id
             .clone()
             .expect("前置断言：投影产物必须带 external_id —— 没有它就无从判定同一条身份");
+        // Freeze the source declaration's literal session key now: FAD's codex
+        // external id is the relative locator with its extension removed (after
+        // stripping a leading `sessions` segment). The drill declares
+        // `relative_locator = path.file_name()`, so this is the literal value
+        // the re-projection must produce — never read back from the result.
+        let replace_source_external_id = Path::new(
+            b.file_name()
+                .expect("the replace fixture file has a name"),
+        )
+        .with_extension("")
+        .to_string_lossy()
+        .into_owned();
         let replace_conv_id: i64 = storage
             .raw()
             .query_row_map(
@@ -11105,6 +14079,7 @@ mod e7_restore_journal_tests {
             replace_manifest_id: cb.manifest_id,
             replace_conv_id,
             replace_external_id: external_id,
+            replace_source_external_id,
         }
     }
 
@@ -11152,7 +14127,116 @@ mod e7_restore_journal_tests {
         }
     }
 
+    /// Task14：为既有 E7 夹具构造**实际有效**的来源声明、固定配置与绑定。
+    ///
+    /// 43 个完整恢复用例在本阶段必须因「安装未接线」而失败，而不是因材料无效。
+    /// 因此这里走真实的 39/44/40 路径，不使用 `None` 占位。
+    fn source_materials_for_drill(
+        d: &Drill,
+    ) -> (
+        Option<source_contexts::RestoreSourceContexts>,
+        Option<String>,
+        Option<SourceProfileMaterial>,
+        std::collections::BTreeMap<String, SourceBindingMaterial>,
+    ) {
+        use crate::indexer::source_ingest::{
+            load_fixed_safety_config, preview_source_input_safety,
+        };
+        use franken_agent_detection::SourceInputRole;
+
+        let fixed_path = d._tmp.path().join("e7-fixed-safety.toml");
+        std::fs::write(
+            &fixed_path,
+            b"memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n",
+        )
+        .unwrap();
+        let safety = std::sync::Arc::new(load_fixed_safety_config(&fixed_path).unwrap());
+        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
+        let mut declarations = Vec::new();
+        let mut bindings = std::collections::BTreeMap::new();
+        for manifest_id in [&d.new_manifest_id, &d.replace_manifest_id] {
+            let view = views
+                .iter()
+                .find(|view| view.manifest_id == *manifest_id)
+                .expect("drill manifest must be in the view list");
+            let path = Path::new(&view.original_path);
+            let declaration = source_contexts::RestoreSourceContextDeclaration {
+                manifest_id: view.manifest_id.clone(),
+                identity_namespace: "e7-drill".to_string(),
+                connector: "codex".to_string(),
+                scan_root: path
+                    .parent()
+                    .expect("drill source path has a parent")
+                    .to_string_lossy()
+                    .into_owned(),
+                relative_locator: path
+                    .file_name()
+                    .expect("drill source path has a file name")
+                    .to_string_lossy()
+                    .into_owned(),
+                role: SourceInputRole::PrimarySessionLog,
+                origin: source_contexts::RestoreSourceContextOrigin {
+                    source_id: view.source_id.clone(),
+                    kind: match view.origin_kind.as_str() {
+                        "ssh" => franken_agent_detection::types::SourceKind::Ssh,
+                        _ => franken_agent_detection::types::SourceKind::Local,
+                    },
+                    host: view.origin_host.clone(),
+                    source_version: None,
+                },
+                platform: None,
+                workspace_rewrites: Vec::new(),
+            };
+            let capture = provenance_from_manifest_view(view);
+            let job = source_binding::prepare_declared_restore_source_input(
+                &d.data_dir,
+                &capture,
+                &declaration,
+                std::sync::Arc::clone(&safety),
+            )
+            .expect("the E7 drill declaration must prepare");
+            let preview =
+                preview_source_input_safety(&job).expect("the E7 drill preview must be produced");
+            validate_restore_source_preview(&job, &preview)
+                .expect("the E7 drill preview must be admitted");
+            let context_digest = job
+                .input
+                .identity_tuple()
+                .get(11)
+                .cloned()
+                .flatten()
+                .expect("the identity tuple carries the context digest");
+            bindings.insert(
+                view.manifest_id.clone(),
+                SourceBindingMaterial {
+                    declaration: declaration.clone(),
+                    context_digest,
+                    sealed_sha256: job.input.manifest().sealed_sha256().hex(),
+                    byte_len: job.input.manifest().byte_len(),
+                    normalizer_id: job.normalizer_id.clone(),
+                    safety_contract_id: job.safety_contract_id.clone(),
+                    input_key: job.input.input_key().hex(),
+                },
+            );
+            declarations.push(declaration);
+        }
+        declarations.sort_by(|left, right| {
+            left.manifest_id
+                .as_bytes()
+                .cmp(right.manifest_id.as_bytes())
+        });
+        let contexts = source_contexts::RestoreSourceContexts {
+            schema: "cass.restore-source-contexts/1".to_string(),
+            inputs: declarations,
+        };
+        let digest = source_contexts_digest(&contexts).unwrap();
+        let profile = source_profile_material(&safety).unwrap();
+        (Some(contexts), Some(digest), Some(profile), bindings)
+    }
+
     fn plan_for(d: &Drill) -> RestoreRunPlan {
+        let (source_contexts, source_contexts_digest, source_profile, mut bindings) =
+            source_materials_for_drill(d);
         RestoreRunPlan {
             operation_id: "e7-op-0001".into(),
             data_dir: d.data_dir.clone(),
@@ -11169,14 +14253,19 @@ mod e7_restore_journal_tests {
                 RestorePlanItem {
                     manifest_id: d.new_manifest_id.clone(),
                     action: PlannedAction::RestoreNew,
+                    source_binding: bindings.remove(&d.new_manifest_id),
                 },
                 RestorePlanItem {
                     manifest_id: d.replace_manifest_id.clone(),
                     action: PlannedAction::Replace {
                         conversation_id: d.replace_conv_id,
                     },
+                    source_binding: bindings.remove(&d.replace_manifest_id),
                 },
             ],
+            source_contexts,
+            source_contexts_digest,
+            source_profile,
         }
     }
 
@@ -11197,7 +14286,7 @@ mod e7_restore_journal_tests {
         assert_eq!(outcome.restored, 1, "新建支恰一条");
         assert_eq!(outcome.replaced, 1, "replace 支恰一条");
         assert_eq!(conv_count(&d.db_path), 2, "库里应当恰有两条会话");
-        assert_eq!(receipt_count(&d.db_path), 2, "两条身份各恰一条 receipt");
+        assert_source_receipts_complete(&d.db_path);
 
         let journal = restore_journal_read(&d.journal_path).unwrap().unwrap();
         assert_eq!(
@@ -11400,6 +14489,33 @@ mod e7_restore_journal_tests {
             "前置断言：四维全等的行此刻必须一条都没有 —— 否则本例证不到「查不到」那一支"
         );
 
+        // R1: publication now runs after the DB phase and re-verifies the
+        // source Replace. Install the plan for real first, then make the New
+        // item's conversation unreachable by its exact identity (a moved
+        // identity, not a deletion) so the legitimate "no current row" branch
+        // is exercised with real receipts present.
+        let installed = restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
+        assert_eq!(installed.restored, 1);
+        let new_ids = conversation_ids_by_full_identity(&d, &new_path);
+        assert_eq!(new_ids.len(), 1, "the New item installed one conversation");
+        let new_id = new_ids[0];
+        {
+            let mut storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path)
+                .expect("open for the identity move");
+            storage
+                .raw()
+                .execute(
+                    "UPDATE conversations SET external_id = ?1, source_path = ?2 WHERE id = ?3",
+                    &[
+                        crate::storage::api::Value::Text("e7-moved-external-id".to_string()),
+                        crate::storage::api::Value::Text("/private/moved.jsonl".to_string()),
+                        crate::storage::api::Value::Integer(new_id),
+                    ],
+                )
+                .expect("move the New conversation identity");
+            storage.close_best_effort_in_place();
+        }
+
         let mut journal = restore_journal_from_plan(plan_for(&d));
         let mut outcome = RestoreRunOutcome::default();
         restore_publish_manifests(&mut journal, &d.journal_path, &mut outcome).unwrap();
@@ -11409,17 +14525,32 @@ mod e7_restore_journal_tests {
             outcome.published_without_backlink, 1,
             "恰有一条（新建支）查不到候选行 —— 必须记账，不许静默"
         );
-        let linked = published_backlink_for(&d, &d.new_manifest_id);
-        assert_ne!(
+        // db_links is merged and re-sorted (None before Some), not append
+        // ordered: compare the exact link set, not first/last. The first
+        // publish's real link must survive, the second publish must add None,
+        // and the decoy must never appear.
+        let linked: std::collections::BTreeSet<Option<i64>> =
+            published_backlinks_for(&d, &d.new_manifest_id)
+                .into_iter()
+                .collect();
+        assert_eq!(
             linked,
-            Some(decoy_id),
+            std::collections::BTreeSet::from([None, Some(new_id)]),
+            "查不到就是 None，真 link 保留，诱饵不得出现；moved={new_id}；layout={}",
+            conversation_layout(&d.db_path)
+        );
+        assert!(
+            !linked.contains(&Some(decoy_id)),
             "静默指错：只绑路径时，恰好一行命中的诱饵会被当成本条身份的回链发出去"
         );
-        assert_eq!(linked, None, "查不到就是 None，不许凭路径猜一个填进去");
+        let replace_links: std::collections::BTreeSet<Option<i64>> =
+            published_backlinks_for(&d, &d.replace_manifest_id)
+                .into_iter()
+                .collect();
         assert_eq!(
-            published_backlink_for(&d, &d.replace_manifest_id),
-            Some(d.replace_conv_id),
-            "阳性对照：replace 支的 backlink 由计划显式带着，必须照常建立且不进那一格"
+            replace_links,
+            std::collections::BTreeSet::from([Some(d.replace_conv_id)]),
+            "阳性对照：replace 支的合法目标保留且不进那一格"
         );
     }
 
@@ -11811,7 +14942,11 @@ mod e7_restore_journal_tests {
             planned: vec![RestorePlanItem {
                 manifest_id: rec.manifest_id.clone(),
                 action: PlannedAction::RestoreNew,
+                source_binding: None,
             }],
+            source_contexts: None,
+            source_contexts_digest: None,
+            source_profile: None,
         };
         let mut journal = restore_journal_from_plan(plan);
         let mut outcome = RestoreRunOutcome::default();
@@ -11863,7 +14998,7 @@ mod e7_restore_journal_tests {
             "无 receipt = 事务没提交过 → 必须重放，把新建支那条写进去"
         );
         assert_eq!(conv_count(&d.db_path), 2, "重放后库里应当有两条");
-        assert_eq!(receipt_count(&d.db_path), 2);
+        assert_source_receipts_complete(&d.db_path);
         assert_eq!(
             restore_journal_read(&d.journal_path)
                 .unwrap()
@@ -11882,6 +15017,8 @@ mod e7_restore_journal_tests {
         restore_apply_journaled(plan_for(&d), &d.journal_path).unwrap();
         let conv_after_first = conv_count(&d.db_path);
         let receipts_after_first = receipt_count(&d.db_path);
+        let revision_after_first = revision_value_text(&d.db_path);
+        let source_rows_after_first = source_table_rows(&d.db_path);
         let daily_stats_after_first = daily_stats_snapshot(&d.db_path);
         // R2-F3: 首跑落地的 marker 逐字节快照——见下方 `expect_err` 之后的
         // 防覆写断言。
@@ -11934,30 +15071,23 @@ mod e7_restore_journal_tests {
         // 断言必须让测试红——那意味着 I1 的 marker-identity 语义被动过了，
         // 波2 修复落地的信号就是这里，届时把 `expect_err` 换回
         // `.unwrap()` 按新语义重写整段，不是继续放宽容忍。
-        let err = restore_recover(&d.journal_path).expect_err(
-            "recover must currently fail with the known W1 commit marker digest \
-             disagreement (STAGE-B-INDEX debt #7); an unexpected Ok means I1's \
-             marker-identity semantics changed underneath this test",
-        );
-        let detail = format!("{err:#}");
-        assert!(
-            detail.contains("existing W1 commit marker disagrees"),
-            "unexpected recover failure shape (not the known digest-disagreement \
-             debt this test pins down): {detail}"
-        );
-        // R2-F3（非阻断，波2 债 #7 的取证收窄）：这条子串断言只能证明
-        // `write_w1_commit_marker` 判定了「整个 marker 结构体不等」，证不到
-        // 到底是哪个字段不等——那层字段级取证仍然是波2 债 #7 的范围，这里
-        // 不越权补。能在波1 内验的是这条更根本的不变量 I1（"先查后做，绝不
-        // 覆盖"）：拒绝发布之后，磁盘上那份既有 marker 必须与首跑落地时逐
-        // 字节相等——`write_w1_commit_marker` 的 `hard_link` 发布路径失败于
-        // `EEXIST` 时从不触碰 `marker_path` 本身，只有 tmp 文件被清理；这里
-        // 拿真磁盘字节验证这一点，不是假定它。
+        // Task16: with the source-wired restore the digest disagreement of
+        // STAGE-B-INDEX debt #7 no longer fires for this scripted rewind — the
+        // recovery advances, finds both committed receipts and converges. The
+        // debt's own death condition said to rewrite this block for the new
+        // semantics when the failure disappeared; it has.
+        let outcome = restore_recover(&d.journal_path)
+            .expect("with Task16 source wiring the marker identity agrees again");
+        assert_eq!(outcome.restored, 0, "查到 receipt = 已提交 → 不得重放");
+        assert_eq!(outcome.replaced, 0, "查到 receipt = 已提交 → 不得重放");
+        assert_eq!(outcome.source_replayed, 0, "不得重放来源输入");
+        assert_eq!(outcome.already_committed, 2, "两条身份都已提交");
+        // R2-F3：不变量 I1（先查后做，绝不覆盖）在成功路径上的真实验证。
+        // 既有 marker 必须与首跑逐字节相等；recover 不得用自己的新字节覆盖它。
         assert_eq!(
-            std::fs::read(&marker_path).expect("recover 拒绝之后 marker 文件必须仍然存在"),
+            std::fs::read(&marker_path).expect("recover 之后 marker 文件必须仍然存在"),
             marker_bytes_after_first,
-            "recover 因 marker 不一致而拒绝时，绝不能覆写磁盘上既有的 marker —— \
-             这是不变量 I1（先查后做，绝不覆盖）在失败路径上的真实验证"
+            "recover 完成后既有 marker 必须逐字节不变"
         );
 
         assert_eq!(
@@ -11969,6 +15099,16 @@ mod e7_restore_journal_tests {
             receipt_count(&d.db_path),
             receipts_after_first,
             "receipt 也不许多出来"
+        );
+        assert_eq!(
+            revision_value_text(&d.db_path),
+            revision_after_first,
+            "source_facts_revision 不得变化"
+        );
+        assert_eq!(
+            source_table_rows(&d.db_path),
+            source_rows_after_first,
+            "来源事实表不得变化"
         );
         assert_eq!(
             daily_stats_snapshot(&d.db_path),
@@ -12068,45 +15208,50 @@ mod e7_restore_journal_tests {
     /// 所以种进去的字节与 restore 稍后自己投影出来的**逐字段同一**——
     /// 去重是按内容判的，内容不同一就测不到去重。
     fn seed_restore_new_content(d: &Drill) -> usize {
-        let views = crate::raw_mirror::manifest_views(&d.data_dir).unwrap();
-        let view = views
-            .iter()
-            .find(|v| v.manifest_id == d.new_manifest_id)
-            .expect("新建支的 manifest 应当在 view 列表里");
-        let conv = project_view_for_test(&d.data_dir, &d.scratch, view);
-        let message_total = conv.messages.len();
+        // Task15: a current-run success fixture is produced by an actual
+        // installation. Install the new item through the shared kernel, then
+        // remove the source rows and both receipts, so the genuine
+        // conversation remains as a legacy row with no source evidence.
+        let mut plan = plan_for(d);
+        plan.planned
+            .retain(|item| matches!(item.action, PlannedAction::RestoreNew));
+        assert_eq!(plan.planned.len(), 1, "seed plan: one RestoreNew item");
+        let seed_journal = d
+            .db_path
+            .parent()
+            .unwrap()
+            .join("e7-seed-journal.json");
+        let _ = std::fs::remove_file(&seed_journal);
+        let _ = std::fs::remove_file(
+            d.db_path
+                .parent()
+                .unwrap()
+                .join(W1_COMMIT_MARKER_FILENAME),
+        );
+        let seeded = restore_apply_journaled(plan, &seed_journal).unwrap();
+        let message_total = seeded.messages_inserted;
         assert!(
             message_total > 0,
             "前置断言：fixture 必须真的带消息，否则「messages_inserted == 0」是无分辨力的假绿"
         );
 
         let storage = crate::storage::sqlite::FrankenStorage::open(&d.db_path).unwrap();
-        let agent_id = storage
-            .ensure_agent(&crate::model::types::Agent {
-                id: None,
-                slug: conv.agent_slug.clone(),
-                name: conv.agent_slug.clone(),
-                version: None,
-                kind: crate::model::types::AgentKind::Cli,
-            })
-            .unwrap();
-        let workspace_id = conv
-            .workspace
-            .as_ref()
-            .map(|ws| storage.ensure_workspace(ws, None).unwrap());
-        let seeded = storage
-            .insert_conversations_batched(&[(agent_id, workspace_id, &conv)])
-            .unwrap();
-        assert!(
-            seeded[0].conversation_inserted,
-            "前置断言：种入这一步自己必须是真插入 —— 否则后面测的根本不是「去重」"
-        );
-        assert_eq!(
-            seeded[0].inserted_indices.len(),
-            message_total,
-            "前置断言：种入必须把消息全插进去"
-        );
+        for sql in [
+            "DELETE FROM source_message_links",
+            "DELETE FROM source_records",
+            "DELETE FROM source_inputs",
+            "DELETE FROM operation_commit_receipt \
+             WHERE operation IN ('source_input_activation_v1', 'mirror-restore-new')",
+        ] {
+            storage.raw().execute(sql, &[]).unwrap();
+        }
         drop(storage);
+        let _ = std::fs::remove_file(
+            d.db_path
+                .parent()
+                .unwrap()
+                .join(W1_COMMIT_MARKER_FILENAME),
+        );
         message_total
     }
 
@@ -12254,12 +15399,27 @@ mod e7_restore_journal_tests {
     //    （E3 的恢复是进程内调用；本任务把它抬到真·跨进程。）
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Task14：崩溃子进程需要的 journal4 材料（与 planned 分开传，保持原 child 机制）。
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct SourceMaterialsWire {
+        source_contexts: Option<source_contexts::RestoreSourceContexts>,
+        source_contexts_digest: Option<String>,
+        source_profile: Option<SourceProfileMaterial>,
+    }
+
     /// 崩溃子进程入口：由父进程用 `--ignored --exact` 拉起。
     #[test]
     #[ignore]
     fn e7_crash_child_entrypoint() {
         let planned: Vec<RestorePlanItem> =
             serde_json::from_str(&std::env::var("CASS_E7_PLAN_JSON").unwrap()).unwrap();
+        let materials: SourceMaterialsWire = serde_json::from_str(
+            &std::env::var("CASS_E7_SOURCE_MATERIALS").unwrap_or_else(|_| {
+                "{\"source_contexts\":null,\"source_contexts_digest\":null,\"source_profile\":null}"
+                    .to_string()
+            }),
+        )
+        .unwrap();
         let plan = RestoreRunPlan {
             operation_id: "e7-op-crash".into(),
             data_dir: PathBuf::from(std::env::var("CASS_E7_DATA_DIR").unwrap()),
@@ -12274,9 +15434,16 @@ mod e7_restore_journal_tests {
             holds_count: 3,
             origin_unmapped_count: 1,
             planned,
+            source_contexts: materials.source_contexts,
+            source_contexts_digest: materials.source_contexts_digest,
+            source_profile: materials.source_profile,
         };
         let journal = PathBuf::from(std::env::var("CASS_E7_JOURNAL").unwrap());
-        let _ = restore_apply_journaled(plan, &journal);
+        if let Err(error) = restore_apply_journaled(plan, &journal) {
+            // Task14: the parent attributes its stage failure to the child's
+            // typed short code, so the child must actually print it.
+            eprintln!("{error}");
+        }
     }
 
     /// 恢复子进程入口：**全新进程**，入参只有 journal 路径。
@@ -12295,7 +15462,7 @@ mod e7_restore_journal_tests {
     fn child_command(test_name: &str, d: &Drill) -> std::process::Command {
         let exe = std::env::current_exe().expect("test binary path");
         let mut cmd = std::process::Command::new(exe);
-        cmd.args(["--ignored", "--exact", test_name])
+        cmd.args(["--ignored", "--exact", test_name, "--nocapture"])
             .env("CASS_E7_DATA_DIR", &d.data_dir)
             .env("CASS_E7_SCRATCH", &d.scratch)
             .env("CASS_E7_DB", &d.db_path)
@@ -12305,7 +15472,11 @@ mod e7_restore_journal_tests {
             .env("CASS_DATA_DIR", &d.data_dir)
             .env("XDG_DATA_HOME", d.data_dir.parent().unwrap())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            // Task14: the child's stderr carries the typed short code that
+            // attributes a parent failure to the not-yet-wired successor
+            // stages. It must reach the parent's own stderr (and therefore the
+            // run log), not /dev/null.
+            .stderr(std::process::Stdio::inherit());
         cmd
     }
 
@@ -12320,12 +15491,20 @@ mod e7_restore_journal_tests {
             .parent()
             .unwrap()
             .join(format!("e7-sentinel-{boundary}"));
-        let plan_json = serde_json::to_string(&plan_for(d).planned).unwrap();
+        let plan = plan_for(d);
+        let plan_json = serde_json::to_string(&plan.planned).unwrap();
+        let materials_json = serde_json::to_string(&SourceMaterialsWire {
+            source_contexts: plan.source_contexts.clone(),
+            source_contexts_digest: plan.source_contexts_digest.clone(),
+            source_profile: plan.source_profile.clone(),
+        })
+        .unwrap();
         let mut child = child_command(
             "phase3_restore::e7_restore_journal_tests::e7_crash_child_entrypoint",
             d,
         )
         .env("CASS_E7_PLAN_JSON", plan_json)
+        .env("CASS_E7_SOURCE_MATERIALS", materials_json)
         .env("CASS_RESTORE_PAUSE_AT", boundary)
         .env("CASS_RESTORE_PAUSE_SENTINEL", &sentinel)
         .spawn()
@@ -12381,7 +15560,13 @@ mod e7_restore_journal_tests {
     fn assert_work_pending_at(boundary: &str, d: &Drill) {
         match boundary {
             "planned" => {
-                assert_eq!(receipt_count(&d.db_path), 0, "崩在 planned：不该有 receipt");
+                assert_eq!(restore_receipt_count(&d.db_path), 0, "崩在 planned：不该有恢复 receipt");
+                assert_eq!(
+                    source_activation_receipt_count(&d.db_path),
+                    0,
+                    "崩在 planned：不该有来源激活 receipt"
+                );
+                assert_eq!(receipt_count(&d.db_path), 0, "崩在 planned：不该有任何 receipt");
                 assert_eq!(conv_count(&d.db_path), 1, "崩在 planned：新建支还没进库");
             }
             // ── 欠账②的机器判据：receipt 必须写在插入**之后** ──────────────
@@ -12389,19 +15574,53 @@ mod e7_restore_journal_tests {
             // 「记了没插」为什么更糟：重做时查到 receipt → 直接短路跳过 → **静默丢一条
             // 会话**，而且没有任何约束会报错（UNIQUE 只拦重复 receipt，拦不住会话没进来）。
             "restore-new-inserted-not-receipted" => {
+                // E2: the shared source commit core performs the install, the
+                // new source facts and both receipts inside one uncommitted
+                // Immediate transaction. The label keeps its historical name,
+                // but a real SIGKILL here must leave **no** durable trace: the
+                // old replace parent and its messages, and the pre-existing
+                // source-fact tables, stay exactly as they were.
+                let journal = restore_journal_read(&d.journal_path)
+                    .unwrap()
+                    .expect("the crash child must have written the journal");
+                let new_item = journal
+                    .planned
+                    .iter()
+                    .find(|item| matches!(item.action, PlannedAction::RestoreNew))
+                    .expect("the drill plans a source New item");
+                assert!(
+                    new_item.source_binding.is_some(),
+                    "this boundary is only meaningful when the New item is source-wired"
+                );
                 assert_eq!(
                     conv_count(&d.db_path),
-                    2,
-                    "崩在这个窗：插入已提交，会话必须在库里"
+                    1,
+                    "崩在来源提交事务窗：插入尚未提交，库里仍是替换目标一条"
                 );
                 assert_eq!(
-                    receipt_count(&d.db_path),
-                    0,
-                    "崩在这个窗：receipt 必须**还没**写 —— 若它先于插入落库，这条即红"
+                    msg_count(&d.db_path, &d.replace_external_id),
+                    2,
+                    "崩在来源提交事务窗：原替换父的旧消息不得变化"
                 );
+                assert_eq!(
+                    source_table_rows(&d.db_path),
+                    (0, 0, 0),
+                    "崩在来源提交事务窗：新 source 事实不得可见"
+                );
+                assert_eq!(
+                    restore_receipt_count(&d.db_path),
+                    0,
+                    "崩在这个窗：恢复 receipt 必须**还没**落库"
+                );
+                assert_eq!(
+                    source_activation_receipt_count(&d.db_path),
+                    0,
+                    "崩在这个窗：来源激活 receipt 必须**还没**落库"
+                );
+                assert_eq!(receipt_count(&d.db_path), 0, "崩在这个窗：不得有任何 receipt");
             }
             "db-committed" => {
-                assert_eq!(receipt_count(&d.db_path), 2, "DB 阶段已完成");
+                assert_source_receipts_complete(&d.db_path);
                 assert!(
                     lexical_checkpoint_present(&d.data_dir)
                         && semantic_shards_present(&d.data_dir)
@@ -12444,13 +15663,107 @@ mod e7_restore_journal_tests {
         }
     }
 
+    fn revision_value_text(db_path: &Path) -> Option<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let value: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        value
+    }
+
+    /// `(source_inputs, source_records, source_message_links)` row census.
+    fn source_table_rows(db_path: &Path) -> (i64, i64, i64) {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let rows = storage
+            .raw()
+            .query_row_map(
+                "SELECT (SELECT COUNT(*) FROM source_inputs), \
+                 (SELECT COUNT(*) FROM source_records), \
+                 (SELECT COUNT(*) FROM source_message_links)",
+                &[],
+                |row| {
+                    Ok((
+                        row.get_typed::<i64>(0)?,
+                        row.get_typed::<i64>(1)?,
+                        row.get_typed::<i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        rows
+    }
+
+    fn conversation_message_count(db_path: &Path, conversation_id: i64) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let n = storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                &[crate::storage::api::Value::Integer(conversation_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        n
+    }
+
+    fn conversation_external_id(db_path: &Path, conversation_id: i64) -> Option<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let value: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT external_id FROM conversations WHERE id = ?1",
+                &[crate::storage::api::Value::Integer(conversation_id)],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        value
+    }
+
+    /// Compact `id:external_id:message_count` census for failure messages.
+    fn conversation_layout(db_path: &Path) -> String {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db_path).unwrap();
+        let layout: Option<String> = storage
+            .raw()
+            .query_row_map(
+                "SELECT group_concat(id || ':' || COALESCE(external_id, '') || ':' || \
+                 COALESCE(source_path, '') || ':' || \
+                 (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id), ';') \
+                 FROM conversations c ORDER BY c.id",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        layout.unwrap_or_default()
+    }
+
     fn assert_converged(d: &Drill) {
         assert_eq!(conv_count(&d.db_path), 2, "收敛后库里恰两条会话，不重不漏");
-        assert_eq!(receipt_count(&d.db_path), 2, "两条身份各恰一条 receipt");
+        assert_source_receipts_complete(&d.db_path);
+        // Content check on the original parent id: the source Replace rewrites
+        // the same conversation row, so its three messages must survive there.
         assert_eq!(
-            msg_count(&d.db_path, &d.replace_external_id),
+            conversation_message_count(&d.db_path, d.replace_conv_id),
             3,
-            "replace 支收敛后必须是三条消息（真前缀被换成完整版）"
+            "replace 支收敛后原 parent 必须仍有三条消息（真前缀被换成完整版）；layout={}",
+            conversation_layout(&d.db_path)
+        );
+        // External identity check: the re-projected conversation takes its
+        // session key from the manifest view, not from the legacy projection.
+        assert_eq!(
+            conversation_external_id(&d.db_path, d.replace_conv_id),
+            Some(d.replace_source_external_id.clone()),
+            "replace 支重装后的 external 身份必须是 declaration 推出的字面 session key；layout={}",
+            conversation_layout(&d.db_path)
         );
         assert!(!lexical_checkpoint_present(&d.data_dir));
         assert!(!semantic_shards_present(&d.data_dir));
@@ -12565,6 +15878,9 @@ mod e7_restore_journal_tests {
             holds_count: 0,
             origin_unmapped_count: 0,
             planned: Vec::new(),
+            source_contexts: None,
+            source_contexts_digest: None,
+            source_profile: None,
         });
 
         let _ = journal_trace_take();
@@ -13908,6 +17224,11 @@ pub(crate) struct MirrorRestorePlanOptions {
     pub scratch_dir: PathBuf,
     /// 本轮消费的封存件根，进计划项的幂等 key。
     pub snapshot_root: String,
+    /// Task14：来源声明文件。缺省时首批来源参与即 `context_invalid`；
+    /// 纯 legacy 计划不需要它。
+    pub source_contexts: Option<PathBuf>,
+    /// Task14：显式固定安全副本。缺省时按默认内容身份准备一次。
+    pub source_safety_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13943,6 +17264,12 @@ pub(crate) struct MirrorRestorePlanReport {
     /// `manifests_seen == 进入分组的 manifest 数 + origin_unmapped.len()`，
     /// 否则「有多少条被无声丢掉了」这个问题没有机器答案。
     pub manifests_seen: usize,
+    /// Task14：实际参与位置首次访问次序的完整封存字节诊断。
+    pub source_versions: Vec<SourceVersionReport>,
+    /// Task14 journal4 材料；P∪S 为空时三者全 `None`。
+    pub source_contexts: Option<source_contexts::RestoreSourceContexts>,
+    pub source_contexts_digest: Option<String>,
+    pub source_profile: Option<SourceProfileMaterial>,
 }
 
 /// 一条 provider 归一不了的 manifest（R-E-67）。
@@ -14031,8 +17358,54 @@ fn candidate_versions_from_db(
     session_key: Option<&MirrorSessionKey>,
 ) -> anyhow::Result<Vec<CandidateSideVersion>> {
     let ids = conversation_ids_for_manifest(storage, identity, session_key)?;
+    candidate_versions_for_ids(storage, &ids)
+}
+
+/// The source planning bridge: query the raw manifest provider's agent slug and
+/// the validated declaration's connector as two exact aliases, take the union
+/// of conversation ids, and sort/dedup before the existing candidate rules run.
+///
+/// Only the agent dimension is overridden. A session key keeps its
+/// `external_id`, `identity_host` and shape root; without one, only
+/// `identity.agent_slug` moves. The publisher side deliberately keeps querying
+/// the canonical connector alone, so a raw legacy row is never used as a
+/// backlink target. This is a local exact query primitive, not a global alias
+/// or family fold.
+fn source_candidate_versions_from_db(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    identity: &RestoreIdentity,
+    connector: &str,
+    session_key: Option<&MirrorSessionKey>,
+) -> anyhow::Result<Vec<CandidateSideVersion>> {
+    let mut aliases = vec![identity.origin.agent_slug.clone()];
+    if connector != identity.origin.agent_slug {
+        aliases.push(connector.to_string());
+    }
+    let mut ids: Vec<i64> = Vec::new();
+    for agent in aliases {
+        let mut found = match session_key {
+            Some(key) => {
+                conversation_ids_for_session_key(storage, &key.identity_host, &agent, &key.external_id)?
+            }
+            None => {
+                let mut scoped = identity.clone();
+                scoped.origin.agent_slug = agent;
+                conversation_ids_for_identity(storage, &scoped)?
+            }
+        };
+        ids.append(&mut found);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    candidate_versions_for_ids(storage, &ids)
+}
+
+fn candidate_versions_for_ids(
+    storage: &crate::storage::sqlite::FrankenStorage,
+    ids: &[i64],
+) -> anyhow::Result<Vec<CandidateSideVersion>> {
     let mut out = Vec::with_capacity(ids.len());
-    for conversation_id in ids {
+    for conversation_id in ids.iter().copied() {
         let messages = storage.fetch_messages(conversation_id)?;
         let digests: Vec<CanonicalMessageDigest> = messages
             .iter()
@@ -14124,6 +17497,353 @@ pub(crate) fn decide_action_with_candidate_digests(
     }
 }
 
+/// 来源 SQL 比较的 HOLD 证据只给**本次实际 winner** 补 manifest ID。
+///
+/// `MultipleCandidates` 的证据里只有 SQL 候选，没有任何 winner 版本；那一档必须
+/// 全部保持 `None`，不能补一个不存在的 winner。单候选的 superset/diverged 证据是
+/// `[candidate, winner]`，winner 是唯一 `VersionSource::Mirror` 的那一项；按来源
+/// 匹配而不是固定下标，避免把 ID 挂到第二个 SQL 候选上。
+fn attach_source_winner_manifest_id(action: RestoreAction, manifest_id: &str) -> RestoreAction {
+    let RestoreAction::Hold(mut hold) = action else {
+        return action;
+    };
+    if !matches!(
+        hold.reason,
+        HoldReason::CandidateSuperset | HoldReason::CandidateDiverged
+    ) {
+        return RestoreAction::Hold(hold);
+    }
+    let versions = match &mut hold.evidence {
+        HoldEvidence::ByteLayer { versions }
+        | HoldEvidence::MessageLayer { versions, .. }
+        | HoldEvidence::Versions { versions } => versions,
+        _ => return RestoreAction::Hold(hold),
+    };
+    if let Some(winner) = versions
+        .iter_mut()
+        .find(|version| version.source == VersionSource::Mirror)
+    {
+        winner.source_manifest_id = Some(manifest_id.to_string());
+    }
+    RestoreAction::Hold(hold)
+}
+
+// ---------------------------------------------------------------------------
+// Task14 · source-aware planning and journal4 materials
+// ---------------------------------------------------------------------------
+
+fn is_first_batch_source(provider: &str) -> bool {
+    matches!(
+        normalize_provider_to_origin(provider),
+        Some(Origin::ClaudeCode | Origin::Codex)
+    )
+}
+
+/// 完整封存字节的 Equal / 真前缀关系。**不复用 `ContentVersion`**：那一个在
+/// 最后一个 LF 处截尾，来源比较必须看完整字节。
+fn full_byte_relation(left: &[u8], right: &[u8]) -> Relation {
+    if left == right {
+        Relation::Equal
+    } else if left.starts_with(right) {
+        Relation::StrictlyAfter
+    } else if right.starts_with(left) {
+        Relation::StrictlyBefore
+    } else {
+        Relation::Diverged
+    }
+}
+
+/// v3.1 的 B/M 关系表。B 由完整字节给出，M 由 prepared 消息序列摘要给出。
+pub(crate) fn compare_restore_source_sequences(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    left_messages: &[CanonicalMessageDigest],
+    right_messages: &[CanonicalMessageDigest],
+) -> RelationVerdict {
+    let bytes = full_byte_relation(left_bytes, right_bytes);
+    let messages = digest_prefix_relation(left_messages, right_messages);
+    let verdict = |relation, layer| RelationVerdict { relation, layer };
+
+    match bytes {
+        Relation::Equal => match messages {
+            Some(Relation::Equal) => verdict(Relation::Equal, RelationLayer::Bytes),
+            _ => verdict(Relation::Diverged, RelationLayer::MessageSequence),
+        },
+        Relation::StrictlyBefore => match messages {
+            Some(Relation::Equal | Relation::StrictlyBefore) => {
+                verdict(Relation::StrictlyBefore, RelationLayer::Bytes)
+            }
+            _ => verdict(Relation::Diverged, RelationLayer::MessageSequence),
+        },
+        Relation::StrictlyAfter => match messages {
+            Some(Relation::Equal | Relation::StrictlyAfter) => {
+                verdict(Relation::StrictlyAfter, RelationLayer::Bytes)
+            }
+            _ => verdict(Relation::Diverged, RelationLayer::MessageSequence),
+        },
+        Relation::Diverged => {
+            // 两份字节不同且非前缀、消息都为零：空序列的 Equal 不足为证。
+            if left_messages.is_empty() && right_messages.is_empty() {
+                return verdict(Relation::Diverged, RelationLayer::Bytes);
+            }
+            match messages {
+                Some(relation) => verdict(relation, RelationLayer::MessageSequence),
+                None => verdict(Relation::Diverged, RelationLayer::MessageSequence),
+            }
+        }
+    }
+}
+
+/// 40 预览的准入：坏 finish/record 状态拒绝；diagnostics 计数本身不判失败。
+pub(crate) fn validate_restore_source_preview(
+    job: &crate::indexer::source_ingest::SourceInputJob,
+    preview: &crate::indexer::source_ingest::SourceSafetyPreview,
+) -> Result<(), SourceRestoreError> {
+    use crate::storage::source_facts::{ParseState, SafetyState};
+
+    if job.finish.parse_failed != 0
+        || !job.finish.unprocessed_ranges.is_empty()
+        || preview.parse_failed != 0
+    {
+        return Err(SourceRestoreError::MaterialMismatch);
+    }
+    if preview.records.iter().any(|record| {
+        record.parse_state() != ParseState::Parsed
+            || record.safety_state() != SafetyState::Preserved
+    }) {
+        return Err(SourceRestoreError::MaterialMismatch);
+    }
+    if preview.conversations.len() > 1 {
+        return Err(SourceRestoreError::ProjectionCount);
+    }
+    Ok(())
+}
+
+fn preview_message_digests(
+    preview: &crate::indexer::source_ingest::SourceSafetyPreview,
+) -> Vec<CanonicalMessageDigest> {
+    let Some(conversation) = preview.conversations.first() else {
+        return Vec::new();
+    };
+    conversation
+        .prepared
+        .conv
+        .messages
+        .iter()
+        .zip(conversation.prepared.excluded.iter())
+        .map(|(message, excluded)| {
+            let excluded_sha256 = excluded.as_ref().map(|e| e.sha256.as_str()).unwrap_or("");
+            compact_invariant_message_digest_scoped(
+                message,
+                DigestScope::Projection,
+                excluded_sha256,
+            )
+        })
+        .collect()
+}
+
+/// 40 的 `sql_projection` 经既有 `normalized_from_db_message` 与
+/// `CandidateComparable` 求摘要；prepared invocations 不进入 SQL 比较。
+fn preview_sql_digests(
+    preview: &crate::indexer::source_ingest::SourceSafetyPreview,
+) -> Vec<CanonicalMessageDigest> {
+    let Some(conversation) = preview.conversations.first() else {
+        return Vec::new();
+    };
+    conversation
+        .sql_projection
+        .messages
+        .iter()
+        .map(|message| {
+            let excluded_sha256 = message
+                .excluded
+                .as_ref()
+                .map(|e| e.sha256.as_str())
+                .unwrap_or("");
+            compact_invariant_message_digest_scoped(
+                &normalized_from_db_message(message),
+                DigestScope::CandidateComparable,
+                excluded_sha256,
+            )
+        })
+        .collect()
+}
+
+struct SourcePosition {
+    full_bytes: Vec<u8>,
+    message_digests: Vec<CanonicalMessageDigest>,
+    sql_digests: Vec<CanonicalMessageDigest>,
+    content: ContentVersion,
+    binding: SourceBindingMaterial,
+}
+
+struct SourceOperation<'a> {
+    options: &'a MirrorRestorePlanOptions,
+    declarations: Option<&'a source_contexts::RestoreSourceContexts>,
+    views: &'a [crate::raw_mirror::RawMirrorManifestView],
+    safety: std::cell::OnceCell<std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>>,
+    used: std::collections::BTreeMap<String, source_contexts::RestoreSourceContextDeclaration>,
+    source_versions: Vec<SourceVersionReport>,
+}
+
+impl<'a> SourceOperation<'a> {
+    fn ensure_safety(
+        &mut self,
+    ) -> Result<std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>, SourceRestoreError>
+    {
+        if self.safety.get().is_none() {
+            let prepared = crate::indexer::source_ingest::prepare_source_safety(
+                &self.options.data_dir,
+                self.options.source_safety_config.as_deref(),
+            )
+            .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+            let _ = self.safety.set(prepared);
+        }
+        Ok(std::sync::Arc::clone(
+            self.safety.get().expect("the safety copy was just set"),
+        ))
+    }
+
+    fn prepare(&mut self, view_index: usize) -> Result<SourcePosition, SourceRestoreError> {
+        let view = &self.views[view_index];
+        let declaration = self
+            .declarations
+            .and_then(|contexts| {
+                contexts
+                    .inputs
+                    .iter()
+                    .find(|input| input.manifest_id == view.manifest_id)
+            })
+            .cloned()
+            .ok_or(SourceRestoreError::ContextInvalid)?;
+        let safety = self.ensure_safety()?;
+        let capture = provenance_from_manifest_view(view);
+        let job = source_binding::prepare_declared_restore_source_input(
+            &self.options.data_dir,
+            &capture,
+            &declaration,
+            std::sync::Arc::clone(&safety),
+        )
+        .map_err(SourceRestoreError::from_ingest)?;
+        let preview = crate::indexer::source_ingest::preview_source_input_safety(&job)
+            .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+        validate_restore_source_preview(&job, &preview)?;
+
+        let full_bytes =
+            std::fs::read(&job.blob_path).map_err(|_| SourceRestoreError::MaterialMismatch)?;
+        let sealed_sha256 = job.input.manifest().sealed_sha256().hex();
+        if crate::storage::source_facts::Sha256Digest::of(&full_bytes).hex() != sealed_sha256 {
+            return Err(SourceRestoreError::MaterialMismatch);
+        }
+        let byte_len = job.input.manifest().byte_len();
+        let context_digest = job
+            .input
+            .identity_tuple()
+            .get(11)
+            .cloned()
+            .flatten()
+            .ok_or(SourceRestoreError::MaterialMismatch)?;
+        let binding = SourceBindingMaterial {
+            declaration: declaration.clone(),
+            context_digest,
+            sealed_sha256: sealed_sha256.clone(),
+            byte_len,
+            normalizer_id: job.normalizer_id.clone(),
+            safety_contract_id: job.safety_contract_id.clone(),
+            input_key: job.input.input_key().hex(),
+        };
+        let content = ContentVersion::new(
+            VersionSource::Mirror,
+            &full_bytes,
+            view.source_mtime_ms,
+            view.captured_at_ms,
+            view.blob_blake3.clone(),
+        );
+        self.used
+            .insert(view.manifest_id.clone(), declaration.clone());
+        self.source_versions.push(SourceVersionReport {
+            manifest_id: view.manifest_id.clone(),
+            byte_domain: "sealed_full",
+            full_byte_len: byte_len,
+            full_byte_sha256: crate::storage::source_facts::Sha256Digest::of(&full_bytes).hex(),
+        });
+        Ok(SourcePosition {
+            full_bytes,
+            message_digests: preview_message_digests(&preview),
+            sql_digests: preview_sql_digests(&preview),
+            content,
+            binding,
+        })
+    }
+}
+
+fn source_profile_material(
+    safety: &crate::indexer::source_ingest::FixedSafetyConfig,
+) -> Result<SourceProfileMaterial, SourceRestoreError> {
+    let verified = safety
+        .config()
+        .verify()
+        .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    Ok(SourceProfileMaterial {
+        config_source_identity: safety.config_source_identity().to_string(),
+        fixed_copy_path: safety.original_path().to_string(),
+        fixed_config_sha256: verified.fixed_config_sha256().hex(),
+        effective_four_arrays_sha256: verified.effective_four_arrays_sha256().hex(),
+        code_version: safety.config().code_version.clone(),
+        fad_pin: crate::indexer::source_ingest::FAD_PIN.to_string(),
+        mapping_domain: crate::indexer::source_ingest::SOURCE_MAPPING_DOMAIN.to_string(),
+        exclusion_epoch: crate::indexer::source_ingest::SOURCE_EXCLUSION_EPOCH.to_string(),
+        redaction_fingerprint: crate::indexer::redact_secrets::redaction_algorithm_fingerprint(),
+        desensitization_enabled: true,
+    })
+}
+
+/// 聚合上下文摘要：复用既有 `context_digest` 的规范 JSON 语义。
+fn source_contexts_digest(
+    contexts: &source_contexts::RestoreSourceContexts,
+) -> Result<String, SourceRestoreError> {
+    let value = serde_json::to_vec(contexts).map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    let lossless = franken_agent_detection::LosslessSourceValue::parse(&value)
+        .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    crate::storage::source_facts::context_digest(&lossless)
+        .map(|digest| digest.hex())
+        .map_err(|_| SourceRestoreError::MaterialMismatch)
+}
+
+/// journal4 材料的三件套；P∪S 为空时三者全 null。
+fn source_journal_materials(
+    used: std::collections::BTreeMap<String, source_contexts::RestoreSourceContextDeclaration>,
+    safety: Option<&std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>>,
+) -> Result<
+    (
+        Option<source_contexts::RestoreSourceContexts>,
+        Option<String>,
+        Option<SourceProfileMaterial>,
+    ),
+    SourceRestoreError,
+> {
+    if used.is_empty() {
+        return Ok((None, None, None));
+    }
+    let safety = safety.ok_or(SourceRestoreError::MaterialMismatch)?;
+    let mut inputs: Vec<_> = used.into_values().collect();
+    inputs.sort_by(|left, right| {
+        left.manifest_id
+            .as_bytes()
+            .cmp(right.manifest_id.as_bytes())
+    });
+    let contexts = source_contexts::RestoreSourceContexts {
+        schema: "cass.restore-source-contexts/1".to_string(),
+        inputs,
+    };
+    let digest = source_contexts_digest(&contexts)?;
+    Ok((
+        Some(contexts),
+        Some(digest),
+        Some(source_profile_material(safety)?),
+    ))
+}
+
 /// dry-run planner：**只读**，产六类计数 + 歧义表 + HOLD 清单 + 可执行计划。
 pub(crate) fn plan_mirror_restore(
     options: &MirrorRestorePlanOptions,
@@ -14162,6 +17882,52 @@ pub(crate) fn plan_mirror_restore(
         let identity = restore_identity_from_view(view)?;
         groups.entry(identity.clone()).or_default().push(index);
     }
+
+    // ── Task14：来源声明与固定安全材料 ────────────────────────────────
+    //
+    // 声明先整体解码（42 严格 decoder），再与本次发现名册对照：未知 ID 或
+    // 非首批 manifest 的声明一律 `context_invalid`。已知首批但最终未用的
+    // 声明允许，不做提前语义绑定。
+    let declarations = match options.source_contexts.as_deref() {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|_| source_restore_error(SourceRestoreError::ContextInvalid))?;
+            let decoded =
+                source_contexts::decode_restore_source_contexts(&bytes).map_err(|error| {
+                    source_restore_error(match error {
+                        source_contexts::RestoreSourceContextDecodeError::Invalid => {
+                            SourceRestoreError::ContextInvalid
+                        }
+                        source_contexts::RestoreSourceContextDecodeError::Ambiguous => {
+                            SourceRestoreError::ContextAmbiguous
+                        }
+                    })
+                })?;
+            Some(decoded)
+        }
+        None => None,
+    };
+    if let Some(contexts) = declarations.as_ref() {
+        for declaration in &contexts.inputs {
+            let Some(view) = views
+                .iter()
+                .find(|view| view.manifest_id == declaration.manifest_id)
+            else {
+                return Err(source_restore_error(SourceRestoreError::ContextInvalid));
+            };
+            if !is_first_batch_source(&view.provider) {
+                return Err(source_restore_error(SourceRestoreError::ContextInvalid));
+            }
+        }
+    }
+    let operation = std::cell::RefCell::new(SourceOperation {
+        options,
+        declarations: declarations.as_ref(),
+        views: &views,
+        safety: std::cell::OnceCell::new(),
+        used: std::collections::BTreeMap::new(),
+        source_versions: Vec::new(),
+    });
 
     // FIND-5 mitigation (R-E-71'): reopen the read-only candidate handle every
     // REOPEN_EVERY_IDENTITIES identities.
@@ -14202,6 +17968,209 @@ pub(crate) fn plan_mirror_restore(
         }
         let head = &views[indices[0]];
         let identity = restore_identity_from_view(head)?;
+
+        // ── 首批来源：按位置访问、B/M 关系、严格材料 ──────────────────
+        if is_first_batch_source(&head.provider) {
+            let positions: &[usize] = indices;
+            let cache: std::cell::RefCell<Vec<Option<std::rc::Rc<SourcePosition>>>> =
+                std::cell::RefCell::new((0..positions.len()).map(|_| None).collect());
+            let typed_error: std::cell::RefCell<Option<SourceRestoreError>> =
+                std::cell::RefCell::new(None);
+            // 位置第一次访问才准备：声明查找 → 共享固定配置 → 44 → 40 → 准入。
+            // 早 HOLD 之后的位置不会被访问，因此不会要求声明或材料。
+            let ensure = |position: usize| -> Result<std::rc::Rc<SourcePosition>, ()> {
+                if let Some(cached) = cache.borrow()[position].as_ref() {
+                    return Ok(std::rc::Rc::clone(cached));
+                }
+                let view_index = positions[position];
+                match operation.borrow_mut().prepare(view_index) {
+                    Ok(prepared) => {
+                        let prepared = std::rc::Rc::new(prepared);
+                        cache.borrow_mut()[position] = Some(std::rc::Rc::clone(&prepared));
+                        Ok(prepared)
+                    }
+                    Err(failure) => {
+                        let mut slot = typed_error.borrow_mut();
+                        if slot.is_none() {
+                            *slot = Some(failure);
+                        }
+                        Err(())
+                    }
+                }
+            };
+            // ── 位置回调之前的既有 metadata/blob 准入 ─────────────────
+            // 复用 doctor 报告与 read_sealed_blob；坏组按 legacy 既有分类发 HOLD，
+            // 不进入 44/40，也不要求未访问声明。Loaded 字节只用于 ContentVersion
+            // 的真实旧诊断域，逐项构摘要后立即释放。
+            let mut summaries: Vec<VersionSummary> = Vec::with_capacity(positions.len());
+            let mut input_fault: Option<HoldRecord> = None;
+            for &view_index in positions {
+                let view = &views[view_index];
+                let Some(doctor) = doctor_reports
+                    .iter()
+                    .find(|report| report.manifest_id == view.manifest_id)
+                else {
+                    input_fault = Some(hold_for_manifest_reference_missing(
+                        identity.clone(),
+                        Vec::new(),
+                    ));
+                    break;
+                };
+                match read_sealed_blob(&options.data_dir, doctor) {
+                    SealedBlobOutcome::Loaded(bytes) => {
+                        let mut summary = VersionSummary::of(&ContentVersion::new(
+                            VersionSource::Mirror,
+                            &bytes,
+                            view.source_mtime_ms,
+                            view.captured_at_ms,
+                            view.blob_blake3.clone(),
+                        ));
+                        summary.source_manifest_id = Some(view.manifest_id.clone());
+                        summaries.push(summary);
+                    }
+                    SealedBlobOutcome::ReferenceMissing => {
+                        input_fault = Some(hold_for_manifest_reference_missing(
+                            identity.clone(),
+                            Vec::new(),
+                        ));
+                        break;
+                    }
+                    SealedBlobOutcome::PayloadHashMismatch { detail } => {
+                        input_fault = Some(hold_for_unreadable_sealed_blob(
+                            identity.clone(),
+                            HoldReason::PayloadHashMismatch,
+                            detail,
+                        ));
+                        break;
+                    }
+                    SealedBlobOutcome::Unreadable { detail } => {
+                        input_fault = Some(hold_for_unreadable_sealed_blob(
+                            identity.clone(),
+                            HoldReason::ManifestReferenceMissing,
+                            detail,
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(hold) = input_fault {
+                report.non_relation_holds += 1;
+                report.holds.push(hold);
+                continue;
+            }
+            let outcome = {
+                // 41 的 typed 错误桥：回调里把原 typed 错误存进 `typed_error`，
+                // 只用一个无 payload sentinel 穿过 41，取回时再还原原错误。
+                let compare =
+                    |left: usize, right: usize| -> Result<RelationVerdict, ProjectionError> {
+                        // Left before right, and the first typed error wins: a
+                        // failed left position must not be replaced by a later
+                        // right-side material error.
+                        let left = match ensure(left) {
+                            Ok(position) => position,
+                            Err(()) => return Err(ProjectionError::other("source-restore-typed")),
+                        };
+                        let right = match ensure(right) {
+                            Ok(position) => position,
+                            Err(()) => return Err(ProjectionError::other("source-restore-typed")),
+                        };
+                        Ok(compare_restore_source_sequences(
+                            &left.full_bytes,
+                            &right.full_bytes,
+                            &left.message_digests,
+                            &right.message_digests,
+                        ))
+                    };
+                let divergence =
+                    |left: usize, right: usize| -> Result<Option<usize>, ProjectionError> {
+                        let left = match ensure(left) {
+                            Ok(position) => position,
+                            Err(()) => return Err(ProjectionError::other("source-restore-typed")),
+                        };
+                        let right = match ensure(right) {
+                            Ok(position) => position,
+                            Err(()) => return Err(ProjectionError::other("source-restore-typed")),
+                        };
+                        Ok(first_divergent_index(
+                            &left.message_digests,
+                            &right.message_digests,
+                        ))
+                    };
+                select_winner_from_relations(&identity, &summaries, &compare, &divergence)
+            };
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    let failure = typed_error
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or(SourceRestoreError::MaterialMismatch);
+                    return Err(source_restore_error(failure));
+                }
+            };
+            if let WinnerOutcome::Hold(hold) = outcome {
+                report.non_relation_holds += 1;
+                report.holds.push(hold);
+                continue;
+            }
+            let WinnerOutcome::Winner { index, .. } = outcome else {
+                unreachable!("the hold arm returned above")
+            };
+            // singleton 虽无 pair 回调，仍须验证 S。
+            let winner = match ensure(index) {
+                Ok(winner) => winner,
+                Err(()) => {
+                    let failure = typed_error
+                        .borrow_mut()
+                        .take()
+                        .unwrap_or(SourceRestoreError::MaterialMismatch);
+                    return Err(source_restore_error(failure));
+                }
+            };
+            let candidates = source_candidate_versions_from_db(
+                &storage,
+                &identity,
+                &winner.binding.declaration.connector,
+                manifest_session_key_from_view(head).as_ref(),
+            )?;
+            report.candidate_versions_seen += candidates.len();
+            // SQL 候选只用 40 的 sql_projection 摘要序列；不伪造 B。
+            let action = decide_action_with_candidate_digests(
+                &identity,
+                &candidates,
+                &winner.content,
+                &winner.sql_digests,
+            );
+            let action =
+                attach_source_winner_manifest_id(action, &winner.binding.declaration.manifest_id);
+            if !report.census.record(&action) {
+                report.non_relation_holds += 1;
+            }
+            match &action {
+                RestoreAction::Skip => {}
+                RestoreAction::Restore => report.plan.push(RestorePlanItem {
+                    manifest_id: winner.binding.declaration.manifest_id.clone(),
+                    action: PlannedAction::RestoreNew,
+                    source_binding: Some(winner.binding.clone()),
+                }),
+                RestoreAction::Replace => {
+                    let conversation_id = candidates
+                        .first()
+                        .map(|c| c.conversation_id)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("replace without a candidate conversation")
+                        })?;
+                    report.plan.push(RestorePlanItem {
+                        manifest_id: winner.binding.declaration.manifest_id.clone(),
+                        action: PlannedAction::Replace { conversation_id },
+                        source_binding: Some(winner.binding.clone()),
+                    });
+                }
+                RestoreAction::Hold(hold) => report.holds.push(hold.clone()),
+            }
+            continue;
+        }
+
         // 投影器要的是**分类**（选哪家 pin parser），不是身份 —— 用 family。
         let Some(family) = identity.origin.family() else {
             // provider 归一不出三族：planner 侧本就按 R-E-67 具名 HOLD，这里兜同一档，
@@ -14347,6 +18316,7 @@ pub(crate) fn plan_mirror_restore(
             RestoreAction::Restore => report.plan.push(RestorePlanItem {
                 manifest_id: views[indices[winner_index]].manifest_id.clone(),
                 action: PlannedAction::RestoreNew,
+                source_binding: None,
             }),
             RestoreAction::Replace => {
                 let conversation_id = candidates
@@ -14356,6 +18326,7 @@ pub(crate) fn plan_mirror_restore(
                 report.plan.push(RestorePlanItem {
                     manifest_id: views[indices[winner_index]].manifest_id.clone(),
                     action: PlannedAction::Replace { conversation_id },
+                    source_binding: None,
                 });
             }
             RestoreAction::Hold(hold) => report.holds.push(hold.clone()),
@@ -14363,6 +18334,16 @@ pub(crate) fn plan_mirror_restore(
     }
 
     storage.close_best_effort_in_place();
+
+    // Task14：材料只来自真实访问过的 P∪S；P∪S 为空时三件套全 null。
+    let mut operation = operation.into_inner();
+    report.source_versions = std::mem::take(&mut operation.source_versions);
+    let (source_contexts, source_contexts_digest, source_profile) =
+        source_journal_materials(std::mem::take(&mut operation.used), operation.safety.get())
+            .map_err(source_restore_error)?;
+    report.source_contexts = source_contexts;
+    report.source_contexts_digest = source_contexts_digest;
+    report.source_profile = source_profile;
 
     // 对账：每一份读到的 manifest 要么进了某个 identity 组，要么被 `origin_unmapped`
     // 具名接住，**没有第三条去处**。R-E-67 加了一条 `continue`，而 `continue` 正是
@@ -14443,6 +18424,8 @@ mod e8_dry_run_planner_tests {
             db_path: b.db_path.clone(),
             scratch_dir: b.scratch.clone(),
             snapshot_root: "e8-bench-root".into(),
+            source_contexts: None,
+            source_safety_config: None,
         })
         .expect("dry-run planner must run")
     }
@@ -15268,5 +19251,3193 @@ mod e8_dry_run_planner_tests {
             10,
             "reason 全集变了就要同时更新解析与分类，这条是覆盖面自检"
         );
+    }
+}
+
+// ===========================================================================
+// Task14 · private unit matrices (r14_09, r14_10)
+// ===========================================================================
+
+#[cfg(test)]
+mod source_restore_context_tests {
+    use super::*;
+    use crate::indexer::source_ingest::{
+        SourceSafetyPreview, load_fixed_safety_config, preview_source_input_safety,
+    };
+    use crate::phase3_restore::source_contexts::{
+        RestoreSourceContextDeclaration, RestoreSourceContextOrigin,
+    };
+    use crate::storage::source_facts::{
+        FramedSourceRecord, FramingScan, ParseState, SafetyState, SourceFormat,
+    };
+    use franken_agent_detection::SourceInputRole;
+
+    fn digest_from_tokens(tokens: &[u8]) -> Vec<CanonicalMessageDigest> {
+        tokens
+            .iter()
+            .map(|token| CanonicalMessageDigest([*token; 32]))
+            .collect()
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        text.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("hex pair");
+                u8::from_str_radix(pair, 16).expect("hex byte")
+            })
+            .collect()
+    }
+
+    struct RelationRow {
+        id: &'static str,
+        left_hex: &'static str,
+        right_hex: &'static str,
+        left_tokens: &'static [u8],
+        right_tokens: &'static [u8],
+        relation: Relation,
+        layer: RelationLayer,
+    }
+
+    const RELATION_ROWS: [RelationRow; 22] = [
+        RelationRow {
+            id: "B-Equal-M-Equal",
+            left_hex: "61",
+            right_hex: "61",
+            left_tokens: &[1],
+            right_tokens: &[1],
+            relation: Relation::Equal,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-Equal-M-StrictlyBefore",
+            left_hex: "61",
+            right_hex: "61",
+            left_tokens: &[1],
+            right_tokens: &[1, 2],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Equal-M-StrictlyAfter",
+            left_hex: "61",
+            right_hex: "61",
+            left_tokens: &[1, 2],
+            right_tokens: &[1],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Equal-M-Diverged",
+            left_hex: "61",
+            right_hex: "61",
+            left_tokens: &[1],
+            right_tokens: &[2],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-StrictlyBefore-M-Equal",
+            left_hex: "61",
+            right_hex: "6162",
+            left_tokens: &[1],
+            right_tokens: &[1],
+            relation: Relation::StrictlyBefore,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-StrictlyBefore-M-StrictlyBefore",
+            left_hex: "61",
+            right_hex: "6162",
+            left_tokens: &[1],
+            right_tokens: &[1, 2],
+            relation: Relation::StrictlyBefore,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-StrictlyBefore-M-StrictlyAfter",
+            left_hex: "61",
+            right_hex: "6162",
+            left_tokens: &[1, 2],
+            right_tokens: &[1],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-StrictlyBefore-M-Diverged",
+            left_hex: "61",
+            right_hex: "6162",
+            left_tokens: &[1],
+            right_tokens: &[2],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-StrictlyAfter-M-Equal",
+            left_hex: "6162",
+            right_hex: "61",
+            left_tokens: &[1],
+            right_tokens: &[1],
+            relation: Relation::StrictlyAfter,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-StrictlyAfter-M-StrictlyBefore",
+            left_hex: "6162",
+            right_hex: "61",
+            left_tokens: &[1],
+            right_tokens: &[1, 2],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-StrictlyAfter-M-StrictlyAfter",
+            left_hex: "6162",
+            right_hex: "61",
+            left_tokens: &[1, 2],
+            right_tokens: &[1],
+            relation: Relation::StrictlyAfter,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-StrictlyAfter-M-Diverged",
+            left_hex: "6162",
+            right_hex: "61",
+            left_tokens: &[1],
+            right_tokens: &[2],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Diverged-M-Equal",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[1],
+            right_tokens: &[1],
+            relation: Relation::Equal,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Diverged-M-StrictlyBefore",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[1],
+            right_tokens: &[1, 2],
+            relation: Relation::StrictlyBefore,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Diverged-M-StrictlyAfter",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[1, 2],
+            right_tokens: &[1],
+            relation: Relation::StrictlyAfter,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Diverged-M-Diverged",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[1],
+            right_tokens: &[2],
+            relation: Relation::Diverged,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Equal-both-zero",
+            left_hex: "61",
+            right_hex: "61",
+            left_tokens: &[],
+            right_tokens: &[],
+            relation: Relation::Equal,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-StrictlyBefore-both-zero",
+            left_hex: "61",
+            right_hex: "6162",
+            left_tokens: &[],
+            right_tokens: &[],
+            relation: Relation::StrictlyBefore,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-StrictlyAfter-both-zero",
+            left_hex: "6162",
+            right_hex: "61",
+            left_tokens: &[],
+            right_tokens: &[],
+            relation: Relation::StrictlyAfter,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-Diverged-both-zero",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[],
+            right_tokens: &[],
+            relation: Relation::Diverged,
+            layer: RelationLayer::Bytes,
+        },
+        RelationRow {
+            id: "B-Diverged-one-zero-StrictlyBefore",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[],
+            right_tokens: &[1],
+            relation: Relation::StrictlyBefore,
+            layer: RelationLayer::MessageSequence,
+        },
+        RelationRow {
+            id: "B-Diverged-one-zero-StrictlyAfter",
+            left_hex: "61",
+            right_hex: "62",
+            left_tokens: &[1],
+            right_tokens: &[],
+            relation: Relation::StrictlyAfter,
+            layer: RelationLayer::MessageSequence,
+        },
+    ];
+
+    #[test]
+    fn r14_09_full_byte_prepared_relation_matrix() {
+        assert_eq!(
+            RELATION_ROWS.len(),
+            22,
+            "the frozen relation matrix has 22 rows"
+        );
+        for row in &RELATION_ROWS {
+            let verdict = compare_restore_source_sequences(
+                &hex_bytes(row.left_hex),
+                &hex_bytes(row.right_hex),
+                &digest_from_tokens(row.left_tokens),
+                &digest_from_tokens(row.right_tokens),
+            );
+            assert_eq!(verdict.relation, row.relation, "row {}", row.id);
+            assert_eq!(verdict.layer, row.layer, "row {}", row.id);
+            println!("R14_UNIT row={} result=pass", row.id);
+        }
+    }
+
+    const FIXED_SAFETY_UTF8: &str = "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n";
+    const CLAUDE_ONE: &[u8] = br#"{"type":"user","uuid":"C44-U","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"C44 question"}}
+"#;
+
+    struct Bench {
+        _tmp: tempfile::TempDir,
+        data_dir: std::path::PathBuf,
+        safety: std::sync::Arc<crate::indexer::source_ingest::FixedSafetyConfig>,
+        capture: crate::raw_mirror::RawMirrorCaptureRecord,
+        declaration: RestoreSourceContextDeclaration,
+    }
+
+    fn bench() -> Bench {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let fixed_path = tmp.path().join("fixed-safety.toml");
+        std::fs::write(&fixed_path, FIXED_SAFETY_UTF8).expect("write the fixed copy");
+        let safety = std::sync::Arc::new(
+            load_fixed_safety_config(&fixed_path).expect("load the fixed copy"),
+        );
+        let live = tmp
+            .path()
+            .join("home/.claude/projects/C14-ws/session.jsonl");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, CLAUDE_ONE).unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let capture = crate::raw_mirror::capture_source_file_with_identity(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude_code",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &live,
+                db_links: &[],
+            },
+            crate::raw_mirror::RawMirrorSessionIdentity {
+                identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the fixture");
+        let declaration = RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "C14_NAMESPACE".to_string(),
+            connector: "claude_code".to_string(),
+            scan_root: live.parent().unwrap().to_string_lossy().into_owned(),
+            relative_locator: "session.jsonl".to_string(),
+            role: SourceInputRole::PrimarySessionLog,
+            origin: RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        Bench {
+            _tmp: tmp,
+            data_dir,
+            safety,
+            capture,
+            declaration,
+        }
+    }
+
+    fn prepare(
+        bench: &Bench,
+    ) -> (
+        crate::indexer::source_ingest::SourceInputJob,
+        SourceSafetyPreview,
+    ) {
+        let job = source_binding::prepare_declared_restore_source_input(
+            &bench.data_dir,
+            &bench.capture,
+            &bench.declaration,
+            std::sync::Arc::clone(&bench.safety),
+        )
+        .expect("the declared input must prepare");
+        let preview = preview_source_input_safety(&job).expect("the preview must be produced");
+        (job, preview)
+    }
+
+    fn frame(body: &[u8], index: usize) -> FramedSourceRecord {
+        let mut scan = FramingScan::new(body, SourceFormat::Jsonl);
+        let mut frames = Vec::new();
+        while !scan.is_done() {
+            let page = scan.next_page(64).expect("framing page");
+            if page.is_empty() {
+                break;
+            }
+            frames.extend(page);
+        }
+        frames
+            .into_iter()
+            .nth(index)
+            .expect("the requested frame exists")
+    }
+
+    fn expect_error(
+        bench: &Bench,
+        id: &str,
+        mutate: impl FnOnce(
+            &mut crate::indexer::source_ingest::SourceInputJob,
+            &mut SourceSafetyPreview,
+        ),
+        expected: SourceRestoreError,
+    ) {
+        let (mut job, mut preview) = prepare(bench);
+        mutate(&mut job, &mut preview);
+        let outcome = validate_restore_source_preview(&job, &preview);
+        assert_eq!(outcome, Err(expected), "row {id}");
+        println!("R14_UNIT row={id} result=pass");
+    }
+
+    fn expect_ok(
+        bench: &Bench,
+        id: &str,
+        mutate: impl FnOnce(
+            &mut crate::indexer::source_ingest::SourceInputJob,
+            &mut SourceSafetyPreview,
+        ),
+    ) {
+        let (mut job, mut preview) = prepare(bench);
+        mutate(&mut job, &mut preview);
+        let outcome = validate_restore_source_preview(&job, &preview);
+        assert_eq!(outcome, Ok(()), "row {id}");
+        println!("R14_UNIT row={id} result=pass");
+    }
+
+    #[test]
+    fn r14_10_source_preview_admission_matrix() {
+        let bench = bench();
+        expect_ok(&bench, "one-valid-conversation", |_, _| {});
+        let empty = bench_for_payload(b"");
+        expect_ok(&empty, "zero-records-zero-conversations", |_, _| {});
+        let array_zero = bench_for_payload(b"[]\n");
+        expect_ok(&array_zero, "parsed-record-zero-conversations", |_, _| {});
+        expect_ok(&bench, "positive-diagnostics", |job, preview| {
+            preview.diagnostics = 1;
+            job.finish.mapping_diagnostics = 1;
+        });
+        expect_error(
+            &bench,
+            "two-valid-conversations",
+            |_, preview| {
+                let first = &preview.conversations[0];
+                preview.conversations.push(
+                    crate::indexer::source_ingest::SourceSafetyPreviewConversation {
+                        ordinal: 1,
+                        prepared: first.prepared.clone(),
+                        sql_projection: first.sql_projection.clone(),
+                    },
+                );
+            },
+            SourceRestoreError::ProjectionCount,
+        );
+        expect_error(
+            &bench,
+            "finish-parse-failed",
+            |job, _| {
+                job.finish.parse_failed = 1;
+            },
+            SourceRestoreError::MaterialMismatch,
+        );
+        expect_error(
+            &bench,
+            "finish-unprocessed",
+            |job, _| {
+                job.finish.unprocessed_ranges =
+                    vec![franken_agent_detection::SourceUnprocessedRanges {
+                        byte_start: 0,
+                        byte_end: 1,
+                        reason: "c14-unprocessed".to_owned(),
+                        ordinal: Some(1),
+                        record_pointer: None,
+                    }];
+            },
+            SourceRestoreError::MaterialMismatch,
+        );
+        expect_error(
+            &bench,
+            "preview-parse-failed",
+            |_, preview| {
+                preview.parse_failed = 1;
+            },
+            SourceRestoreError::MaterialMismatch,
+        );
+        for (id, parse_state, safety_state) in [
+            (
+                "record-parse-pending",
+                ParseState::Pending,
+                SafetyState::Preserved,
+            ),
+            (
+                "record-parse-failed",
+                ParseState::ParseFailed,
+                SafetyState::Preserved,
+            ),
+            (
+                "record-safety-pending",
+                ParseState::Parsed,
+                SafetyState::Pending,
+            ),
+            (
+                "record-safety-blocked",
+                ParseState::Parsed,
+                SafetyState::Blocked,
+            ),
+        ] {
+            expect_error(
+                &bench,
+                id,
+                |_, preview| {
+                    let existing = &preview.records[0];
+                    let replacement =
+                        crate::storage::source_facts::VerifiedStagedRecord::from_frame(
+                            &frame(CLAUDE_ONE, 0),
+                            Some(*frame(CLAUDE_ONE, 0).raw_sha256()),
+                            parse_state,
+                            existing.record_mapping_state(),
+                            safety_state,
+                            None,
+                            None,
+                            None,
+                        );
+                    preview.records[0] = replacement;
+                },
+                SourceRestoreError::MaterialMismatch,
+            );
+        }
+    }
+
+    fn bench_for_payload(payload: &'static [u8]) -> Bench {
+        let mut base = bench();
+        let live = base
+            ._tmp
+            .path()
+            .join("home/.claude/projects/C14-ws/session.jsonl");
+        std::fs::write(&live, payload).unwrap();
+        // A fresh mirror keeps the empty / zero payload manifests distinct.
+        let data_dir = base._tmp.path().join("data-zero");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let capture = crate::raw_mirror::capture_source_file_with_identity(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude_code",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &live,
+                db_links: &[],
+            },
+            crate::raw_mirror::RawMirrorSessionIdentity {
+                identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the zero fixture");
+        base.data_dir = data_dir;
+        base.declaration.manifest_id = capture.manifest_id.clone();
+        base.capture = capture;
+        base
+    }
+
+    // ------------------------------------------------------------------
+    // r14_13 · source HOLD diagnostics keep the ContentVersion domain
+    // ------------------------------------------------------------------
+
+    const R14_13_SINGLE_A: &[u8] = br#"{"type":"user","uuid":"C14_R13_U1","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"C14 r13 alpha"}}"#;
+    const R14_13_SINGLE_B: &[u8] = br#"{"type":"user","uuid":"C14_R13_U1","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"C14 r13 beta"}}"#;
+    const R14_13_TAIL_A: &[u8] = br#"{"type":"assistant","uuid":"C14_R13_A2","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"C14 r13 tail alpha"}],"model":"C14-model"}}"#;
+    const R14_13_TAIL_B: &[u8] = br#"{"type":"assistant","uuid":"C14_R13_A2","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"C14 r13 tail beta"}],"model":"C14-model"}}"#;
+    const R14_13_DOC_A: &[u8] = br#"{"cwd":"/synthetic/c14-r13","sessionId":"C14_R13_DOC","version":"2.0.37","messages":[{"role":"user","content":"C14 r13 document alpha","timestamp":"2026-01-01T00:00:00.000Z"}]}"#;
+    const R14_13_DOC_B: &[u8] = br#"{"cwd":"/synthetic/c14-r13","sessionId":"C14_R13_DOC","version":"2.0.37","messages":[{"role":"user","content":"C14 r13 document beta","timestamp":"2026-01-01T00:00:00.000Z"}]}"#;
+
+    struct HoldWorld {
+        _tmp: tempfile::TempDir,
+        data_dir: std::path::PathBuf,
+        db_path: std::path::PathBuf,
+        scratch: std::path::PathBuf,
+        fixed: std::path::PathBuf,
+        contexts: std::path::PathBuf,
+        manifest_ids: [String; 2],
+    }
+
+    fn rewrite_source_times(
+        data_dir: &std::path::Path,
+        capture: &crate::raw_mirror::RawMirrorCaptureRecord,
+        mtime: i64,
+        captured: i64,
+    ) {
+        let path = data_dir
+            .join("raw-mirror")
+            .join("v1")
+            .join(&capture.manifest_relative_path);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read the manifest"))
+                .expect("decode the manifest");
+        manifest["source_mtime_ms"] = serde_json::json!(mtime);
+        manifest["captured_at_ms"] = serde_json::json!(captured);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap())
+            .expect("write the manifest times");
+        let digest =
+            crate::raw_mirror::recompute_manifest_blake3(data_dir, &capture.manifest_relative_path)
+                .expect("recompute the manifest self digest");
+        manifest["manifest_blake3"] = serde_json::json!(digest);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap())
+            .expect("write the manifest digest");
+    }
+
+    fn set_unique_mtime(path: &std::path::Path) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(1);
+        let sequence = SEQ.fetch_add(1, Ordering::Relaxed);
+        let stamp =
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + sequence);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open the fixture for mtime");
+        file.set_modified(stamp)
+            .expect("set a unique fixture mtime");
+    }
+
+    fn hold_world(logical: &str, first: &[u8], second: &[u8]) -> HoldWorld {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join("data");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let db_path = tmp.path().join("candidate.sqlite");
+        {
+            let mut storage = crate::storage::sqlite::FrankenStorage::open(&db_path)
+                .expect("open the candidate db");
+            storage.close_best_effort_in_place();
+        }
+        let fixed = tmp.path().join("fixed-safety.toml");
+        std::fs::write(&fixed, FIXED_SAFETY_UTF8).unwrap();
+        let live = tmp.path().join("home").join(logical);
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+
+        let mut captures = Vec::new();
+        for bytes in [first, second] {
+            std::fs::write(&live, bytes).unwrap();
+            set_unique_mtime(&live);
+            let capture = crate::raw_mirror::capture_source_file_with_identity(
+                crate::raw_mirror::RawMirrorCaptureInput {
+                    data_dir: &data_dir,
+                    provider: "claude_code",
+                    source_id: "local",
+                    origin_kind: "local",
+                    origin_host: None,
+                    source_path: &live,
+                    db_links: &[],
+                },
+                crate::raw_mirror::RawMirrorSessionIdentity {
+                    identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                    external_id: None,
+                },
+            )
+            .expect("capture the hold fixture");
+            captures.push(capture);
+        }
+        for capture in &captures {
+            rewrite_source_times(&data_dir, capture, 1_700_000_500, 1_700_000_600);
+        }
+
+        let mut declarations: Vec<RestoreSourceContextDeclaration> = captures
+            .iter()
+            .map(|capture| RestoreSourceContextDeclaration {
+                manifest_id: capture.manifest_id.clone(),
+                identity_namespace: "C14_NAMESPACE".to_string(),
+                connector: "claude_code".to_string(),
+                scan_root: live.parent().unwrap().to_string_lossy().into_owned(),
+                relative_locator: live.file_name().unwrap().to_string_lossy().into_owned(),
+                role: SourceInputRole::PrimarySessionLog,
+                origin: RestoreSourceContextOrigin {
+                    source_id: "local".to_string(),
+                    kind: franken_agent_detection::types::SourceKind::Local,
+                    host: None,
+                    source_version: None,
+                },
+                platform: None,
+                workspace_rewrites: Vec::new(),
+            })
+            .collect();
+        declarations.sort_by(|left, right| {
+            left.manifest_id
+                .as_bytes()
+                .cmp(right.manifest_id.as_bytes())
+        });
+        let value = serde_json::json!({
+            "schema": "cass.restore-source-contexts/1",
+            "inputs": declarations,
+        });
+        let contexts = tmp.path().join("contexts.json");
+        std::fs::write(&contexts, serde_json::to_vec_pretty(&value).unwrap())
+            .expect("write the contexts file");
+
+        HoldWorld {
+            _tmp: tmp,
+            data_dir,
+            db_path,
+            scratch,
+            fixed,
+            contexts,
+            manifest_ids: [
+                captures[0].manifest_id.clone(),
+                captures[1].manifest_id.clone(),
+            ],
+        }
+    }
+
+    fn literal_old_domain(bytes: &[u8]) -> (u64, u64) {
+        let boundary = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        (boundary as u64, (bytes.len() - boundary) as u64)
+    }
+
+    #[test]
+    fn r14_13_source_hold_diagnostic_lengths() {
+        let jsonl = ".claude/projects/C14-ws/r13.jsonl";
+        let mut tail_a = R14_13_SINGLE_A.to_vec();
+        tail_a.push(b'\n');
+        tail_a.extend_from_slice(R14_13_TAIL_A);
+        let mut tail_b = R14_13_SINGLE_A.to_vec();
+        tail_b.push(b'\n');
+        tail_b.extend_from_slice(R14_13_TAIL_B);
+        let mut lf_a = R14_13_SINGLE_A.to_vec();
+        lf_a.push(b'\n');
+        let mut lf_b = R14_13_SINGLE_B.to_vec();
+        lf_b.push(b'\n');
+
+        let cases: Vec<(&str, &str, Vec<u8>, Vec<u8>)> = vec![
+            (
+                "no-lf-jsonl",
+                jsonl,
+                R14_13_SINGLE_A.to_vec(),
+                R14_13_SINGLE_B.to_vec(),
+            ),
+            ("lf-jsonl", jsonl, lf_a, lf_b),
+            ("jsonl-tail", jsonl, tail_a, tail_b),
+            (
+                "document-no-lf",
+                ".claude/projects/C14-ws/r13.json",
+                R14_13_DOC_A.to_vec(),
+                R14_13_DOC_B.to_vec(),
+            ),
+        ];
+
+        for (id, logical, first, second) in cases {
+            let world = hold_world(logical, &first, &second);
+            let options = MirrorRestorePlanOptions {
+                data_dir: world.data_dir.clone(),
+                db_path: world.db_path.clone(),
+                scratch_dir: world.scratch.clone(),
+                snapshot_root: "c14-r2-r14-13".to_string(),
+                source_contexts: Some(world.contexts.clone()),
+                source_safety_config: Some(world.fixed.clone()),
+            };
+            let report = plan_mirror_restore(&options).expect("the plan must succeed");
+            assert_eq!(report.holds.len(), 1, "row {id}: one HOLD expected");
+            let versions = match &report.holds[0].evidence {
+                HoldEvidence::MessageLayer { versions, .. }
+                | HoldEvidence::ByteLayer { versions }
+                | HoldEvidence::Versions { versions } => versions.clone(),
+                other => panic!("row {id}: unexpected evidence {other:?}"),
+            };
+            assert_eq!(versions.len(), 2, "row {id}: both versions must be present");
+
+            let views = crate::raw_mirror::manifest_views(&world.data_dir).expect("manifest views");
+            for (bytes, manifest_id) in [
+                (&first, &world.manifest_ids[0]),
+                (&second, &world.manifest_ids[1]),
+            ] {
+                let summary = versions
+                    .iter()
+                    .find(|version| {
+                        version.source_manifest_id.as_deref() == Some(manifest_id.as_str())
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("row {id}: manifest {manifest_id} missing from evidence")
+                    });
+                let expected = literal_old_domain(bytes);
+                assert_eq!(
+                    (summary.normalized_len, summary.unsealed_tail_len),
+                    expected,
+                    "row {id}: the old diagnostic domain must come from the real sealed bytes"
+                );
+                let view = views
+                    .iter()
+                    .find(|view| view.manifest_id == *manifest_id)
+                    .expect("the manifest view");
+                assert_eq!(
+                    summary.blob_id, view.blob_blake3,
+                    "row {id}: blob_id stays the real blob hash"
+                );
+                let reported = report
+                    .source_versions
+                    .iter()
+                    .find(|version| version.manifest_id == *manifest_id)
+                    .unwrap_or_else(|| panic!("row {id}: no source_versions entry"));
+                assert_eq!(reported.byte_domain, "sealed_full");
+                assert_eq!(reported.full_byte_len, bytes.len() as u64);
+                assert_eq!(
+                    reported.full_byte_sha256,
+                    crate::storage::source_facts::Sha256Digest::of(bytes).hex(),
+                    "row {id}: the full length and SHA live only in source_versions"
+                );
+            }
+            println!("R14_UNIT row={id} result=pass");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // r14_15 · every HOLD summary uses the real old domain, including the
+    // unvisited third position
+    // ------------------------------------------------------------------
+
+    const CLAUDE_TWO_NO_LF: &[u8] = br#"{"type":"user","uuid":"C44-U","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"C44 question"}}
+{"type":"assistant","uuid":"C44-A","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"C44 answer"}],"model":"C44-model"}}"#;
+    const CLAUDE_THREE_NO_LF: &[u8] = br#"{"type":"user","uuid":"C44-U","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"C44 question"}}
+{"type":"assistant","uuid":"C44-A","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"C44 answer"}],"model":"C44-model"}}
+{"type":"user","uuid":"C14-U3","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"user","content":"C14 third message"}}"#;
+
+    struct ThreeHoldWorld {
+        _tmp: tempfile::TempDir,
+        data_dir: std::path::PathBuf,
+        db_path: std::path::PathBuf,
+        scratch: std::path::PathBuf,
+        fixed: std::path::PathBuf,
+        contexts: std::path::PathBuf,
+        manifest_ids: Vec<String>,
+        payloads: Vec<Vec<u8>>,
+    }
+
+    fn three_hold_world() -> ThreeHoldWorld {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join("data");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let db_path = tmp.path().join("candidate.sqlite");
+        {
+            let mut storage = crate::storage::sqlite::FrankenStorage::open(&db_path)
+                .expect("open the candidate db");
+            storage.close_best_effort_in_place();
+        }
+        let fixed = tmp.path().join("fixed-safety.toml");
+        std::fs::write(&fixed, FIXED_SAFETY_UTF8).unwrap();
+        let live = tmp.path().join("home/.claude/projects/C14-ws/three.jsonl");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+
+        let mut one = CLAUDE_ONE.to_vec();
+        if one.last() == Some(&b'\n') {
+            one.pop();
+        }
+        let payloads = vec![one, CLAUDE_TWO_NO_LF.to_vec(), CLAUDE_THREE_NO_LF.to_vec()];
+        let mtimes = [1_700_000_003_000i64, 1_700_000_002_000, 1_700_000_001_000];
+        let mut captures = Vec::new();
+        for (bytes, mtime_ms) in payloads.iter().zip(mtimes) {
+            std::fs::write(&live, bytes).unwrap();
+            let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms as u64);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&live)
+                .expect("open the fixture for mtime");
+            file.set_modified(stamp).expect("set the reverse mtime");
+            let capture = crate::raw_mirror::capture_source_file_with_identity(
+                crate::raw_mirror::RawMirrorCaptureInput {
+                    data_dir: &data_dir,
+                    provider: "claude_code",
+                    source_id: "local",
+                    origin_kind: "local",
+                    origin_host: None,
+                    source_path: &live,
+                    db_links: &[],
+                },
+                crate::raw_mirror::RawMirrorSessionIdentity {
+                    identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                    external_id: None,
+                },
+            )
+            .expect("capture the three-version fixture");
+            captures.push(capture);
+        }
+        let mut ordered: Vec<(String, Vec<u8>, crate::raw_mirror::RawMirrorCaptureRecord)> =
+            payloads
+                .into_iter()
+                .zip(captures)
+                .map(|(bytes, capture)| (capture.manifest_id.clone(), bytes, capture))
+                .collect();
+        ordered.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+
+        let declarations: Vec<RestoreSourceContextDeclaration> = ordered
+            .iter()
+            .take(2)
+            .map(|(_, _, capture)| RestoreSourceContextDeclaration {
+                manifest_id: capture.manifest_id.clone(),
+                identity_namespace: "C14_NAMESPACE".to_string(),
+                connector: "claude_code".to_string(),
+                scan_root: live.parent().unwrap().to_string_lossy().into_owned(),
+                relative_locator: live.file_name().unwrap().to_string_lossy().into_owned(),
+                role: SourceInputRole::PrimarySessionLog,
+                origin: RestoreSourceContextOrigin {
+                    source_id: "local".to_string(),
+                    kind: franken_agent_detection::types::SourceKind::Local,
+                    host: None,
+                    source_version: None,
+                },
+                platform: None,
+                workspace_rewrites: Vec::new(),
+            })
+            .collect();
+        let value = serde_json::json!({
+            "schema": "cass.restore-source-contexts/1",
+            "inputs": declarations,
+        });
+        let contexts = tmp.path().join("contexts.json");
+        std::fs::write(&contexts, serde_json::to_vec_pretty(&value).unwrap())
+            .expect("write the contexts file");
+
+        let mut manifest_ids = Vec::new();
+        let mut aligned_payloads = Vec::new();
+        for (id, bytes, _) in ordered {
+            manifest_ids.push(id);
+            aligned_payloads.push(bytes);
+        }
+
+        ThreeHoldWorld {
+            _tmp: tmp,
+            data_dir,
+            db_path,
+            scratch,
+            fixed,
+            contexts,
+            manifest_ids,
+            payloads: aligned_payloads,
+        }
+    }
+
+    #[test]
+    fn r14_15_unvisited_summary_domain() {
+        let world = three_hold_world();
+        let options = MirrorRestorePlanOptions {
+            data_dir: world.data_dir.clone(),
+            db_path: world.db_path.clone(),
+            scratch_dir: world.scratch.clone(),
+            snapshot_root: "c14-r3-r14-15".to_string(),
+            source_contexts: Some(world.contexts.clone()),
+            source_safety_config: Some(world.fixed.clone()),
+        };
+        let report = plan_mirror_restore(&options).expect("the plan must succeed");
+        assert_eq!(report.holds.len(), 1, "one time-conflict HOLD expected");
+        assert_eq!(report.holds[0].reason, HoldReason::VersionTimeConflict);
+        let versions = match &report.holds[0].evidence {
+            HoldEvidence::Versions { versions } => versions,
+            other => panic!("unexpected evidence {other:?}"),
+        };
+        assert_eq!(versions.len(), 3, "all three versions must be present");
+        assert_eq!(
+            report.source_versions.len(),
+            2,
+            "only the actually prepared positions belong to P∪S"
+        );
+        for (index, expected_id) in world.manifest_ids.iter().take(2).enumerate() {
+            assert_eq!(report.source_versions[index].manifest_id, *expected_id);
+        }
+        let views = crate::raw_mirror::manifest_views(&world.data_dir).expect("manifest views");
+        for (index, manifest_id) in world.manifest_ids.iter().enumerate() {
+            let summary = versions
+                .iter()
+                .find(|version| version.source_manifest_id.as_deref() == Some(manifest_id.as_str()))
+                .unwrap_or_else(|| panic!("manifest {manifest_id} missing from the HOLD evidence"));
+            let expected = literal_old_domain(&world.payloads[index]);
+            assert_eq!(
+                (summary.normalized_len, summary.unsealed_tail_len),
+                expected,
+                "row healthy-unvisited-third-no-lf: manifest {manifest_id} must use the real old domain"
+            );
+            let view = views
+                .iter()
+                .find(|view| view.manifest_id == *manifest_id)
+                .expect("the manifest view");
+            assert_eq!(summary.blob_id, view.blob_blake3);
+        }
+        println!("R14_UNIT row=healthy-unvisited-third-no-lf result=pass");
+    }
+}
+
+// ===========================================================================
+// Task29 · private error-boundary matrix (p29_05)
+// ===========================================================================
+
+#[cfg(test)]
+mod restore_source_job_error_tests {
+    use super::*;
+    use crate::indexer::source_ingest::{
+        SourceIngestError, SourceInputJob, SourceSafetyPreview, load_fixed_safety_config,
+        preview_source_input_safety,
+    };
+    use crate::phase3_restore::source_contexts::{
+        RestoreSourceContextDeclaration, RestoreSourceContextOrigin,
+    };
+    use franken_agent_detection::SourceInputRole;
+    use std::sync::Arc;
+
+    const FIXED_SAFETY_UTF8: &str = "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n";
+    const CLAUDE_ONE: &[u8] = br#"{"type":"user","uuid":"C44-U","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"C44 question"}}
+"#;
+
+    fn bench() -> (tempfile::TempDir, SourceInputJob, SourceSafetyPreview) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let fixed_path = tmp.path().join("fixed-safety.toml");
+        std::fs::write(&fixed_path, FIXED_SAFETY_UTF8).expect("write the fixed copy");
+        let safety = Arc::new(load_fixed_safety_config(&fixed_path).expect("load the fixed copy"));
+        let live = tmp
+            .path()
+            .join("home/.claude/projects/C29-ws/session.jsonl");
+        std::fs::create_dir_all(live.parent().expect("live parent"))
+            .expect("mkdir the live parent");
+        std::fs::write(&live, CLAUDE_ONE).expect("write the payload");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let capture = crate::raw_mirror::capture_source_file_with_identity(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &live,
+                db_links: &[],
+            },
+            crate::raw_mirror::RawMirrorSessionIdentity {
+                identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the fixture");
+        let declaration = RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "C29_NAMESPACE".to_string(),
+            connector: "claude_code".to_string(),
+            scan_root: live
+                .parent()
+                .expect("live parent")
+                .to_string_lossy()
+                .into_owned(),
+            relative_locator: "session.jsonl".to_string(),
+            role: SourceInputRole::PrimarySessionLog,
+            origin: RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        let job = source_binding::prepare_declared_restore_source_input(
+            &data_dir,
+            &capture,
+            &declaration,
+            safety,
+        )
+        .expect("the declared input must prepare");
+        let preview = preview_source_input_safety(&job).expect("the preview must be produced");
+        (tmp, job, preview)
+    }
+
+    #[test]
+    fn p29_05_projection_error_boundary() {
+        // two-projection-component: the actual admission helper on a controlled
+        // two-conversation preview. This is a component counterexample, not a
+        // claim about native FAD multi-conversation output.
+        {
+            let (_tmp, job, mut preview) = bench();
+            let first = &preview.conversations[0];
+            preview.conversations.push(
+                crate::indexer::source_ingest::SourceSafetyPreviewConversation {
+                    ordinal: 1,
+                    prepared: first.prepared.clone(),
+                    sql_projection: first.sql_projection.clone(),
+                },
+            );
+            assert_eq!(
+                validate_restore_source_preview(&job, &preview),
+                Err(SourceRestoreError::ProjectionCount)
+            );
+            println!(
+                "R29_UNIT group=p29_05_projection_error_boundary row=two-projection-component result=pass"
+            );
+        }
+
+        // exact-projection-code: the exact short code keeps its own type.
+        {
+            let mapped = SourceRestoreError::from_ingest(SourceIngestError::Config {
+                detail: "source_restore_projection_count".to_string(),
+            });
+            assert_eq!(mapped, SourceRestoreError::ProjectionCount);
+            println!(
+                "R29_UNIT group=p29_05_projection_error_boundary row=exact-projection-code result=pass"
+            );
+        }
+
+        // suffixed-projection-code: an adjacent suffixed detail stays a
+        // material mismatch. The comparison is exact equality, not a prefix.
+        {
+            let mapped = SourceRestoreError::from_ingest(SourceIngestError::Config {
+                detail: "source_restore_projection_count:extra".to_string(),
+            });
+            assert_eq!(mapped, SourceRestoreError::MaterialMismatch);
+            println!(
+                "R29_UNIT group=p29_05_projection_error_boundary row=suffixed-projection-code result=pass"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Task15 · private receipt-wire tests (u15_02_c3_wire)
+// ===========================================================================
+
+#[cfg(test)]
+mod source_new_receipt_wire_tests {
+    use serde_json::{json, Value};
+
+    use super::source_new_wire::{self, DecodeError};
+
+    fn result_root() -> std::path::PathBuf {
+        let root = dotenvy::var("CASS_T15_RESULT_ROOT")
+            .expect("CASS_T15_RESULT_ROOT must be set for every Task15 private run");
+        let path = std::path::PathBuf::from(root).join("u15_02_c3_wire");
+        assert!(
+            !path.exists(),
+            "the private evidence directory must be fresh: {}",
+            path.display()
+        );
+        std::fs::create_dir_all(&path).expect("create the private evidence directory");
+        path
+    }
+
+    fn input_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(
+            dotenvy::var("CASS_T15_INPUT_ROOT")
+                .expect("CASS_T15_INPUT_ROOT must point at the frozen assets"),
+        )
+    }
+
+    fn literal() -> String {
+        std::fs::read_to_string(input_root().join("c3-detail-literal.json"))
+            .expect("read the frozen C3 literal")
+    }
+
+    fn encode(value: &Value) -> String {
+        serde_json::to_string(value).expect("serialize a mutated literal")
+    }
+
+    fn record(
+        rows: &mut Vec<Value>,
+        id: &str,
+        expected: &str,
+        actual: &str,
+        ok: bool,
+    ) {
+        rows.push(json!({
+            "id": id,
+            "expected": expected,
+            "actual": actual,
+            "ok": ok,
+        }));
+    }
+
+    fn describe(result: &Result<source_new_wire::DecodedRestoreSourceDetail, DecodeError>) -> &'static str {
+        match result {
+            Ok(_) => "ok",
+            Err(DecodeError::ReplanRequired) => "replan_required",
+            Err(DecodeError::Conflict) => "conflict",
+        }
+    }
+
+    #[test]
+    fn u15_02_c3_wire() {
+        let evidence = result_root();
+        let literal = literal();
+        let mut rows = Vec::new();
+
+        // 1 · canonical-independent-literal: the full decoded request and the
+        // encoder's independent expected value.
+        {
+            let decoded = source_new_wire::classify(Some(&literal)).expect("the literal decodes");
+            assert_eq!(decoded.restore_operation, "mirror-restore-new");
+            assert_eq!(decoded.restore_key, "C15_RESTORE_KEY_LITERAL");
+            assert_eq!(decoded.snapshot_root, "C15_SNAPSHOT_LITERAL");
+            assert_eq!(decoded.manifest_id, "C15 opaque manifest/identity");
+            assert_eq!(
+                decoded.request.input_key.hex(),
+                "1111111111111111111111111111111111111111111111111111111111111111"
+            );
+            assert_eq!(decoded.request.library_identity, "C15 opaque library identity");
+            assert_eq!(
+                decoded.request.normalizer_id,
+                "2222222222222222222222222222222222222222222222222222222222222222"
+            );
+            assert_eq!(
+                decoded.request.safety_contract_id,
+                "3333333333333333333333333333333333333333333333333333333333333333"
+            );
+            assert_eq!(
+                decoded.request.expected_manifest_digest.hex(),
+                "4444444444444444444444444444444444444444444444444444444444444444"
+            );
+            assert_eq!(
+                decoded.request.finish.content_digest.hex(),
+                "5555555555555555555555555555555555555555555555555555555555555555"
+            );
+            assert_eq!(decoded.request.finish.bytes_read, 8);
+            assert_eq!(decoded.request.finish.records_seen, 1);
+            assert_eq!(decoded.request.finish.blank_lines, 0);
+            assert_eq!(decoded.request.finish.parse_failed, 0);
+            assert_eq!(decoded.request.finish.mapping_diagnostics, 0);
+            assert!(decoded.request.finish.unprocessed_ranges.is_empty());
+            assert!(decoded.request.finish.reached_eof);
+            assert_eq!(
+                decoded.request.source_semantic_records_root.sha256.hex(),
+                "6666666666666666666666666666666666666666666666666666666666666666"
+            );
+            assert_eq!(decoded.request.source_semantic_records_root.count, 1);
+            assert_eq!(
+                decoded.request.claims_root.sha256.hex(),
+                "7777777777777777777777777777777777777777777777777777777777777777"
+            );
+            assert_eq!(decoded.request.claims_root.count, 1);
+            assert_eq!(
+                decoded.source_receipt_key,
+                "source-input-v1:8888888888888888888888888888888888888888888888888888888888888888"
+            );
+            assert_eq!(
+                decoded.source_installation_digest.hex(),
+                "9999999999999999999999999999999999999999999999999999999999999999"
+            );
+
+            let encoded = source_new_wire::encode(
+                crate::phase3_restore::RESTORE_NEW_OPERATION,
+                &decoded.snapshot_root,
+                &decoded.manifest_id,
+                &decoded.restore_key,
+                &decoded.request,
+                &decoded.source_receipt_key,
+                &decoded.source_installation_digest,
+            );
+            let expected: Value = serde_json::from_str(&literal).expect("literal is JSON");
+            let actual: Value = serde_json::from_str(&encoded).expect("encoder is JSON");
+            assert_eq!(actual, expected, "the encoder must reproduce every literal field");
+            record(&mut rows, "canonical-independent-literal", "ok", "ok", true);
+        }
+
+        // 2 · whitespace-and-key-order-accepted: the same bytes with reversed
+        // object member order and pretty whitespace still decode.
+        {
+            fn reverse(value: &Value) -> Value {
+                match value {
+                    Value::Object(map) => {
+                        let mut reversed = serde_json::Map::new();
+                        for (key, item) in map.iter().rev() {
+                            reversed.insert(key.clone(), reverse(item));
+                        }
+                        Value::Object(reversed)
+                    }
+                    Value::Array(items) => Value::Array(items.iter().map(reverse).collect()),
+                    other => other.clone(),
+                }
+            }
+            let value: Value = serde_json::from_str(&literal).unwrap();
+            let reordered = serde_json::to_string_pretty(&reverse(&value)).unwrap();
+            let result = source_new_wire::classify(Some(&reordered));
+            let actual = describe(&result);
+            assert_eq!(actual, "ok");
+            record(&mut rows, "whitespace-and-key-order-accepted", "ok", actual, true);
+        }
+
+        // 3 · opaque-library-and-manifest-strings-preserved
+        {
+            let decoded = source_new_wire::classify(Some(&literal)).unwrap();
+            let ok = decoded.request.library_identity == "C15 opaque library identity"
+                && decoded.manifest_id == "C15 opaque manifest/identity";
+            assert!(ok);
+            record(
+                &mut rows,
+                "opaque-library-and-manifest-strings-preserved",
+                "ok",
+                "ok",
+                true,
+            );
+        }
+
+        // The remaining rows are one mutation each over the independent
+        // literal. Positive controls are the three rows above; every mutation
+        // below must be refused with its named class.
+        let mut expect = |id: &str, detail: Option<String>, expected: &str| {
+            let result = source_new_wire::classify(detail.as_deref());
+            let actual = describe(&result);
+            assert_eq!(actual, expected, "case {id}");
+            record(&mut rows, id, expected, actual, true);
+        };
+
+        expect("sql-null", None, "replan_required");
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value.as_object_mut().unwrap().remove("schema");
+            expect("missing-schema", Some(encode(&value)), "replan_required");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["schema"] = json!("cass.restore-source-receipt/2");
+            expect("unsupported-string-schema", Some(encode(&value)), "replan_required");
+        }
+        expect("invalid-json", Some("{".to_string()), "conflict");
+        expect("nonobject", Some("[]".to_string()), "conflict");
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["schema"] = json!(1);
+            expect("schema-type", Some(encode(&value)), "conflict");
+        }
+        {
+            let idx = literal.rfind('}').unwrap();
+            let duplicate = format!(
+                "{},\"restore_key\":\"C15_RESTORE_KEY_LITERAL\"{}",
+                &literal[..idx],
+                &literal[idx..]
+            );
+            expect("duplicate-top-key", Some(duplicate), "conflict");
+        }
+        {
+            let duplicate = literal.replacen(
+                "\"requested_terminal\":\"Complete\"}",
+                "\"requested_terminal\":\"Complete\",\"library_identity\":\"C15 opaque library identity\"}",
+                1,
+            );
+            expect("duplicate-request-key", Some(duplicate), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["extra"] = json!(1);
+            expect("unknown-top-key", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("source_installation_digest");
+            expect("missing-top-key", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["extra"] = json!(1);
+            expect("unknown-request-key", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]
+                .as_object_mut()
+                .unwrap()
+                .remove("requested_terminal");
+            expect("missing-request-key", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][0] = json!("other-domain/1");
+            expect("wrong-finish-domain", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"]
+                .as_array_mut()
+                .unwrap()
+                .pop();
+            expect("wrong-finish-arity", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["source_semantic_records_root"] =
+                json!(["6666666666666666666666666666666666666666666666666666666666666666"]);
+            expect("wrong-root-arity", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][2] = json!(1);
+            expect("numeric-u64", Some(encode(&value)), "conflict");
+        }
+        for (id, spelling) in [
+            ("u64-plus", "+1"),
+            ("u64-leading-zero", "01"),
+            ("u64-negative", "-1"),
+            ("u64-overflow", "18446744073709551616"),
+            ("u64-empty", ""),
+        ] {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][2] = json!(spelling);
+            expect(id, Some(encode(&value)), "conflict");
+        }
+        for (id, spelling) in [
+            ("digest-uppercase", "A".repeat(64)),
+            ("digest-short", "a".repeat(63)),
+            ("digest-nonhex", "g".repeat(64)),
+        ] {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][1] = json!(spelling);
+            expect(id, Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][8] = json!("true");
+            expect("finish-bool-string", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][8] = json!(false);
+            expect("finish-bool-false", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][7] = json!([["0", "1", "reason", null]]);
+            expect("bad-range-arity", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][7] = json!([["0", "1", "reason", 1, null]]);
+            expect("range-bad-ordinal", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["finish"][7] = json!([["0", "1", "reason", null, true]]);
+            expect("range-pointer-type", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["projection_disposition"] = json!("ready");
+            expect("unknown-projection", Some(encode(&value)), "conflict");
+        }
+        {
+            let mut value: Value = serde_json::from_str(&literal).unwrap();
+            value["source_request"]["requested_terminal"] = json!("complete");
+            expect("unknown-terminal", Some(encode(&value)), "conflict");
+        }
+
+        assert_eq!(
+            rows.len(),
+            34,
+            "the frozen u15_02 catalogue has exactly 34 named rows"
+        );
+        let mut body = String::new();
+        for row in &rows {
+            body.push_str(&serde_json::to_string(row).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(evidence.join("cases.jsonl"), body).expect("write case evidence");
+        std::fs::write(
+            evidence.join("summary.json"),
+            serde_json::to_vec_pretty(&json!({
+                "function": "u15_02_c3_wire",
+                "rows": rows.len(),
+                "all_ok": rows.iter().all(|row| row["ok"] == json!(true)),
+            }))
+            .unwrap(),
+        )
+        .expect("write summary");
+    }
+}
+
+// ===========================================================================
+// Task15 · private incomplete-activation tests (u15_01)
+// ===========================================================================
+
+#[cfg(test)]
+mod source_new_commit_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::indexer::source_ingest::{
+        load_fixed_safety_config, prepare_source_input_commit,
+    };
+    use crate::raw_mirror::{
+        capture_source_file_with_identity, RawMirrorCaptureInput, RawMirrorSessionIdentity,
+        RAW_MIRROR_LOCAL_IDENTITY_HOST,
+    };
+
+    const FIXED_SAFETY: &str = "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n";
+    const CLAUDE_LINE: &str = "{\"type\":\"user\",\"uuid\":\"C15-U\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"C15 question\"}}\n";
+
+    fn evidence_dir(name: &str) -> std::path::PathBuf {
+        let root = dotenvy::var("CASS_T15_RESULT_ROOT")
+            .expect("CASS_T15_RESULT_ROOT must be set for every Task15 private run");
+        let path = std::path::PathBuf::from(root).join(name);
+        assert!(
+            !path.exists(),
+            "the private evidence directory must be fresh: {}",
+            path.display()
+        );
+        std::fs::create_dir_all(&path).expect("create the private evidence directory");
+        path
+    }
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        db: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+        manifest_id: String,
+        item: RestorePlanItem,
+        job: crate::indexer::source_ingest::SourceInputJob,
+    }
+
+    impl Fixture {
+        /// The real manifest view the prepared commit core reads.
+        fn view(&self) -> crate::raw_mirror::RawMirrorManifestView {
+            crate::raw_mirror::manifest_views(&self.data_dir)
+                .expect("read the fixture manifest views")
+                .into_iter()
+                .find(|view| view.manifest_id == self.manifest_id)
+                .expect("the fixture manifest view")
+        }
+
+        /// A real planned journal over the fixture's data dir and candidate db.
+        fn journal(&self) -> RestoreJournal {
+            RestoreJournal {
+                schema_version: RESTORE_JOURNAL_SCHEMA_VERSION,
+                operation_id: "mirror-restore:C15SNAP".to_string(),
+                state: RestoreJournalState::Planned,
+                data_dir: self.data_dir.clone(),
+                scratch_dir: self.data_dir.clone(),
+                db_path: self.db.clone(),
+                marker_path: self._tmp.path().join("marker.json"),
+                snapshot_root: "C15SNAP".to_string(),
+                generation: "C15GEN".to_string(),
+                planned: vec![self.item.clone()],
+                holds_count: 0,
+                origin_unmapped_count: 0,
+                committed: Vec::new(),
+                published: Vec::new(),
+                analytics_now_ms: None,
+                source_contexts: None,
+                source_contexts_digest: None,
+                source_profile: None,
+            }
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        let projects = home.join(".claude/projects");
+        let session = projects.join("C15-ws/session.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, CLAUDE_LINE).unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let fixed = tmp.path().join("fixed-safety.toml");
+        std::fs::write(&fixed, FIXED_SAFETY).unwrap();
+        let safety = std::sync::Arc::new(load_fixed_safety_config(&fixed).unwrap());
+        let capture = capture_source_file_with_identity(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &session,
+                db_links: &[],
+            },
+            RawMirrorSessionIdentity {
+                identity_host: RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the source");
+        let declaration = source_contexts::RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "C15_NS".to_string(),
+            connector: "claude_code".to_string(),
+            scan_root: projects.to_string_lossy().into_owned(),
+            relative_locator: "C15-ws/session.jsonl".to_string(),
+            role: franken_agent_detection::SourceInputRole::PrimarySessionLog,
+            origin: source_contexts::RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        let job = source_binding::prepare_declared_restore_source_input(
+            &data_dir,
+            &capture,
+            &declaration,
+            safety,
+        )
+        .expect("prepare the declared source input");
+        let binding = SourceBindingMaterial {
+            declaration: declaration.clone(),
+            context_digest: job
+                .input
+                .identity_tuple()
+                .get(11)
+                .cloned()
+                .flatten()
+                .expect("the identity tuple carries the context digest"),
+            sealed_sha256: job.input.manifest().sealed_sha256().hex(),
+            byte_len: job.input.manifest().byte_len(),
+            normalizer_id: job.normalizer_id.clone(),
+            safety_contract_id: job.safety_contract_id.clone(),
+            input_key: job.input.input_key().hex(),
+        };
+        let manifest_id = capture.manifest_id.clone();
+        let item = RestorePlanItem {
+            manifest_id: manifest_id.clone(),
+            action: PlannedAction::RestoreNew,
+            source_binding: Some(binding),
+        };
+        let db = tmp.path().join("candidate.sqlite");
+        let mut storage = crate::storage::sqlite::FrankenStorage::open(&db).unwrap();
+        storage.close_best_effort_in_place();
+        Fixture {
+            _tmp: tmp,
+            db,
+            data_dir,
+            manifest_id,
+            item,
+            job,
+        }
+    }
+
+    fn count(db: &std::path::Path, table: &str) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db).unwrap();
+        let value = storage
+            .raw()
+            .query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        storage.close_best_effort_in_place();
+        value
+    }
+
+    fn count_sql(db: &std::path::Path, sql: &str) -> i64 {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db).unwrap();
+        let value = storage
+            .raw()
+            .query_row_map(sql, &[], |row| row.get_typed(0))
+            .unwrap();
+        storage.close_best_effort_in_place();
+        value
+    }
+
+    fn generation(db: &std::path::Path) -> Option<String> {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db).unwrap();
+        let value = storage
+            .raw()
+            .query_opt_map(
+                "SELECT value FROM meta WHERE key = 'source_content_generation'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        value
+    }
+
+    fn assert_rolled_back(db: &std::path::Path) {
+        for table in [
+            "source_inputs",
+            "source_records",
+            "source_message_links",
+            "conversations",
+            "messages",
+            "agents",
+            "workspaces",
+            "operation_commit_receipt",
+        ] {
+            assert_eq!(count(db, table), 0, "{table} must roll back");
+        }
+        assert_eq!(generation(db), None, "generation must not advance");
+    }
+
+    #[test]
+    fn u15_01_incomplete_activation() {
+        let evidence = evidence_dir("u15_01_incomplete_activation");
+        let mut rows = Vec::new();
+
+        for mutation in ["no-claims", "all-unmapped"] {
+            let f = fixture();
+            let mut job = f.job.clone();
+            match mutation {
+                "no-claims" => {
+                    for record in &mut job.records {
+                        record.claims.clear();
+                    }
+                    job.conversations.clear();
+                }
+                "all-unmapped" => {
+                    for record in &mut job.records {
+                        for claim in &mut record.claims {
+                            claim.mapping_state = "unmapped".to_string();
+                            claim.evidence_kind = "parse_failed".to_string();
+                            claim.conversation_ordinal = None;
+                            claim.final_message_idx = None;
+                            claim.projection_pointer = None;
+                        }
+                    }
+                    job.conversations.clear();
+                }
+                _ => unreachable!(),
+            }
+            let prepared = prepare_source_input_commit(&job).expect("prepare the mutated job");
+            let view = f.view();
+            let mut journal = f.journal();
+            let mut outcome = RestoreRunOutcome::default();
+            let mut storage = crate::storage::sqlite::FrankenStorage::open(&f.db).unwrap();
+            let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())
+                .expect("load pricing");
+            let error = restore_commit_prepared_source_item(
+                &mut journal,
+                &mut outcome,
+                &storage,
+                &view,
+                &f.item,
+                &prepared,
+                &pricing,
+            )
+            .expect_err("the real commit core must refuse an incomplete activation");
+            assert!(
+                matches!(
+                    error.downcast_ref::<SourceRestoreError>(),
+                    Some(SourceRestoreError::ActivationIncomplete)
+                ),
+                "{mutation}: the commit core must produce the typed ActivationIncomplete"
+            );
+            storage.close_best_effort_in_place();
+            assert_rolled_back(&f.db);
+            assert_eq!(journal.state, RestoreJournalState::Planned);
+            assert!(journal.committed.is_empty());
+            assert_eq!(outcome, RestoreRunOutcome::default());
+            rows.push(json!({
+                "id": mutation,
+                "expected": "source_restore_activation_incomplete",
+                "actual": "source_restore_activation_incomplete",
+                "core": "restore_commit_prepared_source_item",
+                "rollback": "all-zero",
+            }));
+        }
+
+        // The unmodified control calls the same prepared commit core and must
+        // complete with both receipts.
+        let f = fixture();
+        let prepared = prepare_source_input_commit(&f.job).expect("prepare the control job");
+        let view = f.view();
+        let mut journal = f.journal();
+        let mut outcome = RestoreRunOutcome::default();
+        let mut storage = crate::storage::sqlite::FrankenStorage::open(&f.db).unwrap();
+        let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())
+            .expect("load pricing");
+        restore_commit_prepared_source_item(
+            &mut journal,
+            &mut outcome,
+            &storage,
+            &view,
+            &f.item,
+            &prepared,
+            &pricing,
+        )
+        .expect("the unmodified job must commit");
+        storage.close_best_effort_in_place();
+        assert_eq!(outcome.restored, 1, "the control creates one conversation");
+        assert_eq!(
+            outcome.messages_inserted, 1,
+            "the control inserts one message"
+        );
+        assert_eq!(count(&f.db, "source_inputs"), 1);
+        assert_eq!(count(&f.db, "source_records"), 1);
+        assert_eq!(count(&f.db, "conversations"), 1);
+        assert_eq!(count(&f.db, "messages"), 1);
+        assert_eq!(
+            count_sql(
+                &f.db,
+                "SELECT COUNT(*) FROM operation_commit_receipt \
+                 WHERE operation = 'source_input_activation_v1' AND state = 'committed'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_sql(
+                &f.db,
+                "SELECT COUNT(*) FROM operation_commit_receipt \
+                 WHERE operation = 'mirror-restore-new' AND state = 'committed'"
+            ),
+            1
+        );
+        assert_eq!(generation(&f.db), Some("C15GEN".to_string()));
+        assert_eq!(journal.committed, vec![f.manifest_id.clone()]);
+        rows.push(json!({
+            "id": "unmodified-control",
+            "expected": "Activated/Complete/two receipts",
+            "actual": "Activated",
+            "rollback": "not-applicable",
+        }));
+
+        let mut body = String::new();
+        for row in &rows {
+            body.push_str(&serde_json::to_string(row).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(evidence.join("cases.jsonl"), body).expect("write case evidence");
+    }
+}
+
+// ===========================================================================
+// Task15 · private typed-boundary tests (u15_03, u15_05)
+// ===========================================================================
+
+#[cfg(test)]
+mod source_new_receipt_tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::indexer::source_ingest::SourceIngestError;
+    use crate::storage::api::{BusyScope, StorageError};
+    use crate::storage::source_codec::SourceCodecError;
+    use crate::storage::source_facts::{ReceiptInconsistency, SourceInstallError};
+
+    fn evidence_dir(name: &str) -> std::path::PathBuf {
+        let root = dotenvy::var("CASS_T15_RESULT_ROOT")
+            .expect("CASS_T15_RESULT_ROOT must be set for every Task15 private run");
+        let path = std::path::PathBuf::from(root).join(name);
+        assert!(
+            !path.exists(),
+            "the private evidence directory must be fresh: {}",
+            path.display()
+        );
+        std::fs::create_dir_all(&path).expect("create the private evidence directory");
+        path
+    }
+
+    fn write_rows(dir: &std::path::Path, rows: &[serde_json::Value]) {
+        let mut body = String::new();
+        for row in rows {
+            body.push_str(&serde_json::to_string(row).unwrap());
+            body.push('\n');
+        }
+        std::fs::write(dir.join("cases.jsonl"), body).expect("write case evidence");
+    }
+
+    fn sqlite_exec(
+        db: &std::path::Path,
+        sql: &str,
+        params: &[crate::storage::api::Value],
+    ) {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open(db).unwrap();
+        storage.raw().execute(sql, params).unwrap();
+        storage.close_best_effort_in_place();
+    }
+
+    fn mutate_detail(
+        db: &std::path::Path,
+        mutate: impl FnOnce(&mut serde_json::Value),
+    ) {
+        let mut storage = crate::storage::sqlite::FrankenStorage::open_readonly(db).unwrap();
+        let text: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT detail FROM operation_commit_receipt \
+                 WHERE operation = 'mirror-restore-new'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        storage.close_best_effort_in_place();
+        let mut detail: serde_json::Value = serde_json::from_str(&text).unwrap();
+        mutate(&mut detail);
+        sqlite_exec(
+            db,
+            "UPDATE operation_commit_receipt SET detail = ?1 \
+             WHERE operation = 'mirror-restore-new'",
+            &[crate::storage::api::Value::Text(
+                serde_json::to_string(&detail).unwrap(),
+            )],
+        );
+    }
+
+    fn typed_code(error: anyhow::Error) -> &'static str {
+        error
+            .downcast_ref::<SourceRestoreError>()
+            .map(|typed| typed.code())
+            .unwrap_or("not-typed")
+    }
+
+    #[test]
+    fn u15_03_typed_install_errors() {
+        let evidence = evidence_dir("u15_03_typed_install_errors");
+        let mut rows = Vec::new();
+
+        let receipt = source_restore_error_from_ingest(SourceIngestError::Install(
+            SourceInstallError::Receipt(ReceiptInconsistency::InvalidHeader),
+        ));
+        assert_eq!(typed_code(receipt), "source_restore_receipt_inconsistent");
+        rows.push(json!({"id":"typed-receipt","expected":"source_restore_receipt_inconsistent","actual":"source_restore_receipt_inconsistent","ok":true}));
+
+        let conflict = source_restore_error_from_ingest(SourceIngestError::Verify(
+            SourceInstallError::Conflict { detail: "mismatch".to_string() },
+        ));
+        assert_eq!(typed_code(conflict), "source_restore_receipt_conflict");
+        rows.push(json!({"id":"typed-conflict","expected":"source_restore_receipt_conflict","actual":"source_restore_receipt_conflict","ok":true}));
+
+        // The stored verifier's own classification is a production function:
+        // the test calls it with the real typed variants, not a copy.
+        let corrupt = stored_verification_failure(SourceInstallError::Corrupt {
+            detail: "stored detail cannot be decoded".to_string(),
+        });
+        match corrupt {
+            RestoreSourceReceiptError::Typed(SourceRestoreError::ReceiptInconsistent) => {}
+            _ => panic!("Corrupt from a stored verifier must be ReceiptInconsistent"),
+        }
+        rows.push(json!({"id":"typed-corrupt-in-stored-verifier","expected":"source_restore_receipt_inconsistent","actual":"source_restore_receipt_inconsistent","ok":true}));
+
+        let codec = stored_verification_failure(SourceInstallError::Codec(
+            SourceCodecError::UnknownField,
+        ));
+        match codec {
+            RestoreSourceReceiptError::Typed(SourceRestoreError::ReceiptInconsistent) => {}
+            _ => panic!("Codec from a stored verifier must be ReceiptInconsistent"),
+        }
+        rows.push(json!({"id":"typed-codec-in-stored-verifier","expected":"source_restore_receipt_inconsistent","actual":"source_restore_receipt_inconsistent","ok":true}));
+
+        // The database failure keeps its typed chain: the anyhow error
+        // downcasts to the same StorageError, not to a SourceRestoreError.
+        let busy = source_restore_error_from_ingest(SourceIngestError::Install(
+            SourceInstallError::Db(StorageError::Busy {
+                scope: BusyScope::Statement,
+            }),
+        ));
+        assert!(matches!(
+            busy.downcast_ref::<StorageError>(),
+            Some(StorageError::Busy { .. })
+        ));
+        assert!(busy.downcast_ref::<SourceRestoreError>().is_none());
+        rows.push(json!({"id":"typed-db-busy-preserved","expected":"same StorageError typed chain","actual":"StorageError::Busy","ok":true}));
+
+        let locked = source_restore_error_from_ingest(SourceIngestError::Install(
+            SourceInstallError::Db(StorageError::Locked),
+        ));
+        assert!(matches!(
+            locked.downcast_ref::<StorageError>(),
+            Some(StorageError::Locked)
+        ));
+        assert!(locked.downcast_ref::<SourceRestoreError>().is_none());
+        rows.push(json!({"id":"typed-db-locked-preserved","expected":"same StorageError typed chain","actual":"StorageError::Locked","ok":true}));
+
+        let oom = source_restore_error_from_ingest(SourceIngestError::Install(
+            SourceInstallError::Db(StorageError::Other {
+                code: None,
+                detail: "out of memory".to_string(),
+            }),
+        ));
+        assert!(matches!(
+            oom.downcast_ref::<StorageError>(),
+            Some(StorageError::Other { .. })
+        ));
+        assert!(oom.downcast_ref::<SourceRestoreError>().is_none());
+        rows.push(json!({"id":"typed-db-oom-preserved","expected":"same StorageError typed chain","actual":"StorageError::Other(out of memory)","ok":true}));
+
+        // R3-SIDE · only an Install(Corrupt/Codec) names damaged stored
+        // evidence. A Verify-side Corrupt/Codec is a physical/preparation
+        // failure and keeps the from_ingest material code. Side columns, not
+        // part of the frozen 7.
+        let mut side = Vec::new();
+        let install_corrupt = source_restore_error_from_ingest(SourceIngestError::Install(
+            SourceInstallError::Corrupt {
+                detail: "stored evidence".to_string(),
+            },
+        ));
+        assert_eq!(
+            typed_code(install_corrupt),
+            "source_restore_receipt_inconsistent"
+        );
+        side.push(json!({
+            "id": "r3-side/install-corrupt-stored",
+            "expected": "source_restore_receipt_inconsistent",
+            "actual": "source_restore_receipt_inconsistent",
+        }));
+        let install_codec = source_restore_error_from_ingest(SourceIngestError::Install(
+            SourceInstallError::Codec(SourceCodecError::UnknownField),
+        ));
+        assert_eq!(
+            typed_code(install_codec),
+            "source_restore_receipt_inconsistent"
+        );
+        side.push(json!({
+            "id": "r3-side/install-codec-stored",
+            "expected": "source_restore_receipt_inconsistent",
+            "actual": "source_restore_receipt_inconsistent",
+        }));
+        let verify_corrupt = source_restore_error_from_ingest(SourceIngestError::Verify(
+            SourceInstallError::Corrupt {
+                detail: "physical material".to_string(),
+            },
+        ));
+        assert_eq!(
+            typed_code(verify_corrupt),
+            "source_restore_material_mismatch"
+        );
+        side.push(json!({
+            "id": "r3-side/verify-corrupt-physical",
+            "expected": "source_restore_material_mismatch",
+            "actual": "source_restore_material_mismatch",
+        }));
+        let verify_codec = source_restore_error_from_ingest(SourceIngestError::Verify(
+            SourceInstallError::Codec(SourceCodecError::UnknownField),
+        ));
+        assert_eq!(
+            typed_code(verify_codec),
+            "source_restore_material_mismatch"
+        );
+        side.push(json!({
+            "id": "r3-side/verify-codec-physical",
+            "expected": "source_restore_material_mismatch",
+            "actual": "source_restore_material_mismatch",
+        }));
+
+        assert_eq!(rows.len(), 7);
+        write_rows(&evidence, &rows);
+        let mut side_body = String::new();
+        for row in &side {
+            side_body.push_str(&serde_json::to_string(row).unwrap());
+            side_body.push('\n');
+        }
+        std::fs::write(evidence.join("r3-side.jsonl"), side_body)
+            .expect("write the R3 side evidence");
+    }
+
+    // ── u15_05 · the closure consumer, called through its real private entry ──
+
+    struct ClosureFixture {
+        _tmp: tempfile::TempDir,
+        db: std::path::PathBuf,
+        data_dir: std::path::PathBuf,
+        journal_path: std::path::PathBuf,
+        journal: RestoreJournal,
+    }
+
+    fn closure_fixture() -> ClosureFixture {
+        use crate::indexer::source_ingest::{
+            load_fixed_safety_config, preview_source_input_safety,
+        };
+        use crate::raw_mirror::{
+            capture_source_file_with_identity, RawMirrorCaptureInput, RawMirrorSessionIdentity,
+            RAW_MIRROR_LOCAL_IDENTITY_HOST,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let projects = home.join(".claude/projects");
+        let session = projects.join("C15-ws/session.json");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        let document = concat!(
+            "{\"cwd\":\"/synthetic/c15\",\"sessionId\":\"C15-CLAUDE\",\"version\":\"2.0.37\",",
+            "\"messages\":[",
+            "{\"role\":\"user\",\"content\":\"C15 question\",\"timestamp\":\"2026-01-01T00:00:00.000Z\"},",
+            "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"C15 answer\"}],",
+            "\"timestamp\":\"2026-01-01T00:00:01.000Z\"}]}\n"
+        );
+        std::fs::write(&session, document).unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let fixed = tmp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &fixed,
+            "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n",
+        )
+        .unwrap();
+        let safety = std::sync::Arc::new(load_fixed_safety_config(&fixed).unwrap());
+        let capture = capture_source_file_with_identity(
+            RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &session,
+                db_links: &[],
+            },
+            RawMirrorSessionIdentity {
+                identity_host: RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .unwrap();
+        let declaration = source_contexts::RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "C15_NS".to_string(),
+            connector: "claude_code".to_string(),
+            scan_root: projects.to_string_lossy().into_owned(),
+            relative_locator: "C15-ws/session.json".to_string(),
+            role: franken_agent_detection::SourceInputRole::PrimarySessionLog,
+            origin: source_contexts::RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        let job = source_binding::prepare_declared_restore_source_input(
+            &data_dir,
+            &capture,
+            &declaration,
+            std::sync::Arc::clone(&safety),
+        )
+        .unwrap();
+        let preview = preview_source_input_safety(&job).unwrap();
+        validate_restore_source_preview(&job, &preview).unwrap();
+        let binding = SourceBindingMaterial {
+            declaration: declaration.clone(),
+            context_digest: job
+                .input
+                .identity_tuple()
+                .get(11)
+                .cloned()
+                .flatten()
+                .unwrap(),
+            sealed_sha256: job.input.manifest().sealed_sha256().hex(),
+            byte_len: job.input.manifest().byte_len(),
+            normalizer_id: job.normalizer_id.clone(),
+            safety_contract_id: job.safety_contract_id.clone(),
+            input_key: job.input.input_key().hex(),
+        };
+        let contexts = source_contexts::RestoreSourceContexts {
+            schema: "cass.restore-source-contexts/1".to_string(),
+            inputs: vec![declaration],
+        };
+        let digest = source_contexts_digest(&contexts).unwrap();
+        let profile = source_profile_material(&safety).unwrap();
+        let db = tmp.path().join("candidate.sqlite");
+        {
+            let mut storage = crate::storage::sqlite::FrankenStorage::open(&db).unwrap();
+            storage.close_best_effort_in_place();
+        }
+        let journal_path = tmp.path().join("journal.json");
+        let plan = RestoreRunPlan {
+            operation_id: "mirror-restore:c15".into(),
+            data_dir: data_dir.clone(),
+            scratch_dir: scratch,
+            db_path: db.clone(),
+            marker_path: tmp.path().join(W1_COMMIT_MARKER_FILENAME),
+            snapshot_root: "c15-snapshot".into(),
+            generation: "c15-generation".into(),
+            planned: vec![RestorePlanItem {
+                manifest_id: capture.manifest_id.clone(),
+                action: PlannedAction::RestoreNew,
+                source_binding: Some(binding),
+            }],
+            holds_count: 0,
+            origin_unmapped_count: 0,
+            source_contexts: Some(contexts),
+            source_contexts_digest: Some(digest),
+            source_profile: Some(profile),
+        };
+        restore_apply_journaled(plan, &journal_path).unwrap();
+        let journal = restore_journal_read(&journal_path).unwrap().unwrap();
+        ClosureFixture {
+            _tmp: tmp,
+            db,
+            data_dir,
+            journal_path,
+            journal,
+        }
+    }
+
+    fn closure_error_code(fixture: &ClosureFixture) -> String {
+        let journal = restore_journal_read(&fixture.journal_path).unwrap().unwrap();
+        match restore_verify_closure(&journal) {
+            Ok(()) => "complete".to_string(),
+            Err(error) => error
+                .downcast_ref::<SourceRestoreError>()
+                .map(|typed| typed.code().to_string())
+                .unwrap_or_else(|| "untyped".to_string()),
+        }
+    }
+
+    fn file_digest(path: &std::path::Path) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        blake3::hash(&bytes).to_hex().to_string()
+    }
+
+    /// Every file under one tree, with its digest, in a deterministic order.
+    fn mirror_tree_digest(root: &std::path::Path) -> String {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push(format!("{}={}", path.display(), file_digest(&path)));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, &mut out);
+        out.join("\n")
+    }
+
+    #[test]
+    fn u15_05_closure() {
+        let evidence = evidence_dir("u15_05_closure");
+        let mut rows = Vec::new();
+
+        for (id, expected) in [
+            ("closure/valid", "complete"),
+            ("closure/detail-null", "source_restore_replan_required"),
+            (
+                "closure/detail-unsupported-schema",
+                "source_restore_replan_required",
+            ),
+            (
+                "closure/detail-restore-key-valid-other",
+                "source_restore_receipt_conflict",
+            ),
+            (
+                "closure/restore-row-missing",
+                "source_restore_receipt_conflict",
+            ),
+            (
+                "closure/source-activation-hash-valid-other",
+                "source_restore_receipt_inconsistent",
+            ),
+        ] {
+            let fixture = closure_fixture();
+
+            match id {
+                "closure/valid" => {}
+                "closure/detail-null" => sqlite_exec(
+                    &fixture.db,
+                    "UPDATE operation_commit_receipt SET detail = NULL \
+                     WHERE operation = 'mirror-restore-new'",
+                    &[],
+                ),
+                "closure/detail-unsupported-schema" => mutate_detail(&fixture.db, |detail| {
+                    detail["schema"] = serde_json::json!("cass.restore-source-receipt/2");
+                }),
+                "closure/detail-restore-key-valid-other" => {
+                    mutate_detail(&fixture.db, |detail| {
+                        detail["restore_key"] = serde_json::json!("C15_OTHER_VALID_RESTORE_KEY");
+                    })
+                }
+                "closure/restore-row-missing" => {
+                    sqlite_exec(
+                        &fixture.db,
+                        "DELETE FROM operation_commit_receipt \
+                         WHERE operation = 'mirror-restore-new'",
+                        &[],
+                    );
+                }
+                "closure/source-activation-hash-valid-other" => {
+                    sqlite_exec(
+                        &fixture.db,
+                        "UPDATE source_inputs SET activation_request_hash = ?1",
+                        &[crate::storage::api::Value::Blob(vec![0xAA; 32])],
+                    );
+                }
+                _ => unreachable!(),
+            }
+
+            // Snapshot after the one deliberate mutation, before the closure
+            // call: the closure must not write either side.
+            let before_db = file_digest(&fixture.db);
+            let before_mirror = mirror_tree_digest(&fixture.data_dir);
+
+            let actual = closure_error_code(&fixture);
+            assert_eq!(actual, expected, "{id}");
+            assert_eq!(file_digest(&fixture.db), before_db, "{id}: no DB write");
+            let after_mirror = mirror_tree_digest(&fixture.data_dir);
+            assert_eq!(after_mirror, before_mirror, "{id}: no mirror write");
+            rows.push(json!({"id": id, "expected": expected, "actual": actual}));
+        }
+
+        assert_eq!(rows.len(), 6);
+        write_rows(&evidence, &rows);
+    }
+}
+
+/// Task16 private component rows (u16_01 .. u16_04).
+///
+/// These live beside the production helpers so the component boundary is the
+/// real one: the admission helper, the history-only helper, the real Replace
+/// projection callback and the real candidate query.
+#[cfg(test)]
+mod source_replace_private_tests {
+    use super::*;
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::storage::api::{params, TxMode, Value};
+    use crate::storage::sqlite::FrankenStorage;
+    use crate::storage::source_facts::{self as facts, SourceDeletionSelection};
+
+    const TS: i64 = 1_772_000_000_000;
+
+    fn evidence(function: &str, rows: &[String]) {
+        let root = std::env::var("CASS_T16_RESULT_ROOT").ok().map(std::path::PathBuf::from);
+        let dir = root.unwrap_or_else(std::env::temp_dir).join(function);
+        std::fs::create_dir_all(&dir).expect("create the private evidence directory");
+        let mut out = String::new();
+        for row in rows {
+            out.push_str(row);
+            out.push('\n');
+        }
+        std::fs::write(dir.join("cases.jsonl"), out).expect("write the private evidence");
+    }
+
+    fn world() -> (tempfile::TempDir, FrankenStorage, i64, i64, Vec<i64>) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = dir.path().join("agent_search.db");
+        let storage = FrankenStorage::open(&db).expect("open storage");
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "codex".into(),
+                name: "Codex".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .expect("ensure agent");
+        let conv = Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: Some("PRIVATE-E".into()),
+            title: Some("private".into()),
+            source_path: std::path::PathBuf::from("/private/chain.jsonl"),
+            started_at: Some(TS),
+            ended_at: Some(TS + 1000),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(TS),
+                    content: "one".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                },
+                Message {
+                    excluded: None,
+                    id: None,
+                    idx: 1,
+                    role: MessageRole::Assistant,
+                    author: None,
+                    created_at: Some(TS + 1),
+                    content: "two".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                },
+            ],
+            source_id: "local".into(),
+            origin_host: None,
+        };
+        let outcome = storage
+            .insert_conversation_tree(agent_id, None, &conv)
+            .expect("insert the private conversation");
+        let conversation_id = outcome.conversation_id;
+        let ids: Vec<i64> = storage
+            .raw()
+            .query_all_map(
+                "SELECT id FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+                &[Value::Integer(conversation_id)],
+                |row| row.get_typed(0),
+            )
+            .expect("read the private message ids");
+        (dir, storage, agent_id, conversation_id, ids)
+    }
+
+    fn seed_input(storage: &FrankenStorage, connector: &str) -> i64 {
+        let key = [connector.as_bytes().first().copied().unwrap_or(1); 32];
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO source_inputs (input_key, identity_tuple_bin, source_id, \
+                 identity_namespace, connector, root_id_bin, relative_locator_bin, \
+                 discovery_bin, parser_context_bin, context_digest, sealed_ref_bin, \
+                 sealed_sha256, byte_len, format, expected_manifest_bin, normalizer_id, \
+                 safety_contract_id, state, expected_records, expected_blank_lines, \
+                 observed_records, observed_blank_lines, activation_request_hash, \
+                 receipt_key, applied_content_generation) \
+                 VALUES (?1, x'00', 'local', 'NS', ?2, x'00', x'00', x'00', x'00', ?3, \
+                 x'00', ?3, ?4, 'jsonl', x'00', 'n', 's', 'complete', ?4, ?4, ?4, ?4, ?3, \
+                 'source-input-v1:private', 'g-private')",
+                &[
+                    Value::Blob(key.to_vec()),
+                    Value::Text(connector.to_string()),
+                    Value::Blob(vec![1u8; 32]),
+                    Value::Blob(vec![0u8; 8]),
+                ],
+            )
+            .expect("insert the private source input");
+        storage
+            .raw()
+            .query_opt_map(
+                "SELECT id FROM source_inputs WHERE connector = ?1 ORDER BY id DESC LIMIT 1",
+                &[Value::Text(connector.to_string())],
+                |row| row.get_typed::<i64>(0),
+            )
+            .expect("read the private input id")
+            .expect("the private input exists")
+    }
+
+    fn seed_record(storage: &FrankenStorage, input_id: i64, ordinal: u64) -> i64 {
+        let ordinal_bytes = ordinal.to_be_bytes().to_vec();
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO source_records (input_id, ordinal, record_pointer, position_bin, \
+                 expected_source_record_sha256, frame_state, parse_state, record_mapping_state, \
+                 safety_state, retention_state) \
+                 VALUES (?1, ?2, ?3, x'00', ?4, 'frame_pending', 'pending', 'claims_pending', \
+                 'pending', 'payload_absent')",
+                &[
+                    Value::Integer(input_id),
+                    Value::Blob(ordinal_bytes),
+                    Value::Text(format!("record-{ordinal}")),
+                    Value::Blob(vec![2u8; 32]),
+                ],
+            )
+            .expect("insert the private record");
+        storage
+            .raw()
+            .query_opt_map(
+                "SELECT id FROM source_records WHERE input_id = ?1 AND ordinal = ?2",
+                &[
+                    Value::Integer(input_id),
+                    Value::Blob(ordinal.to_be_bytes().to_vec()),
+                ],
+                |row| row.get_typed::<i64>(0),
+            )
+            .expect("read the private record id")
+            .expect("the private record exists")
+    }
+
+    fn seed_link(
+        storage: &FrankenStorage,
+        record_id: i64,
+        authority: &str,
+        message_id: Option<i64>,
+        ordinal: u8,
+    ) {
+        let synthetic = matches!(authority, "standalone" | "unmapped");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO source_message_links (record_id, projection_key, \
+                 conversation_ordinal, final_message_idx, source_positions_bin, \
+                 projection_pointer, message_id, authority, evidence_kind, binding_digest) \
+                 VALUES (?1, ?2, ?3, ?4, x'00', ?5, ?6, ?7, 'prose', ?8)",
+                &[
+                    Value::Integer(record_id),
+                    Value::Blob(vec![ordinal; 32]),
+                    if synthetic { Value::Null } else { Value::Integer(1) },
+                    if synthetic { Value::Null } else { Value::Integer(0) },
+                    if synthetic { Value::Null } else { Value::Text(format!("p{ordinal}")) },
+                    match message_id {
+                        Some(id) => Value::Integer(id),
+                        None => Value::Null,
+                    },
+                    Value::Text(authority.to_string()),
+                    Value::Blob(vec![ordinal; 32]),
+                ],
+            )
+            .expect("insert the private link");
+    }
+
+    fn canonical_count(storage: &FrankenStorage, message_id: i64) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM source_message_links \
+                 WHERE authority = 'canonical' AND message_id = ?1",
+                &[Value::Integer(message_id)],
+                |row| row.get_typed(0),
+            )
+            .expect("count the canonical links")
+    }
+
+    fn historical_null_count(storage: &FrankenStorage) -> i64 {
+        storage
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM source_message_links \
+                 WHERE authority = 'historical' AND message_id IS NULL",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("count the historical links")
+    }
+
+    fn revision_value(storage: &FrankenStorage) -> i64 {
+        let text: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("read the revision");
+        text.parse().expect("the revision is an integer")
+    }
+
+    #[test]
+    fn u16_01_projection_admission() {
+        let cases = [
+            ("New-0", PlannedAction::RestoreNew, 0usize, true),
+            ("New-2", PlannedAction::RestoreNew, 2, true),
+            ("Replace-0", PlannedAction::Replace { conversation_id: 1 }, 0, false),
+            ("Replace-1", PlannedAction::Replace { conversation_id: 1 }, 1, true),
+            ("Replace-2", PlannedAction::Replace { conversation_id: 1 }, 2, false),
+        ];
+        let mut rows = Vec::new();
+        for (id, action, count, ok) in cases {
+            let result = validate_source_replace_projection_count(action, count);
+            assert_eq!(result.is_ok(), ok, "{id}: admission verdict");
+            if !ok {
+                assert_eq!(
+                    result.unwrap_err().code(),
+                    "source_restore_projection_count",
+                    "{id}: fixed short code"
+                );
+            }
+            rows.push(format!(
+                "{{\"id\":\"{id}\",\"conversation_count\":{count},\"ok\":{ok}}}"
+            ));
+        }
+        evidence("u16_01_projection_admission", &rows);
+    }
+
+    #[test]
+    fn u16_02_history_only() {
+        let mut rows = Vec::new();
+        let mut row = |id: &str, check: &dyn Fn()| {
+            check();
+            rows.push(format!("{{\"id\":\"{id}\",\"ok\":true}}"));
+        };
+
+        row("empty-id-list", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "canonical", Some(ids[0]), 1);
+            let before = revision_value(&storage);
+            let updated = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::historyize_source_message_links_in_tx(tx, &[])
+                })
+                .unwrap();
+            assert_eq!(updated, 0);
+            let after = revision_value(&storage);
+            assert_eq!(before, after, "the helper never moves the revision");
+        });
+
+        row("one-canonical", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "canonical", Some(ids[0]), 1);
+            seed_link(&storage, record, "canonical", Some(ids[1]), 2);
+            let updated = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::historyize_source_message_links_in_tx(tx, &[ids[0]])
+                })
+                .unwrap();
+            assert_eq!(updated, 1);
+            assert_eq!(
+                storage
+                    .raw()
+                    .query_opt_map(
+                        "SELECT authority FROM source_message_links WHERE message_id = ?1",
+                        &[Value::Integer(ids[1])],
+                        |row| row.get_typed::<String>(0),
+                    )
+                    .unwrap(),
+                Some("canonical".into())
+            );
+        });
+
+        row("same-id-duplicates", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let first = seed_record(&storage, input, 1);
+            let second = seed_record(&storage, input, 2);
+            seed_link(&storage, first, "canonical", Some(ids[0]), 1);
+            seed_link(&storage, second, "canonical", Some(ids[0]), 2);
+            let updated = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::historyize_source_message_links_in_tx(tx, &[ids[0]])
+                })
+                .unwrap();
+            assert_eq!(updated, 2, "every canonical row with that id moves");
+        });
+
+        row("history-already-null", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "historical", None, 1);
+            let updated = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::historyize_source_message_links_in_tx(tx, &[ids[0]])
+                })
+                .unwrap();
+            assert_eq!(updated, 0);
+        });
+
+        row("standalone-unmapped-untouched", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "standalone", None, 1);
+            seed_link(&storage, record, "unmapped", None, 2);
+            let updated = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::historyize_source_message_links_in_tx(tx, &[ids[0]])
+                })
+                .unwrap();
+            assert_eq!(updated, 0);
+        });
+
+        row("other-message-untouched", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "canonical", Some(ids[1]), 1);
+            let updated = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::historyize_source_message_links_in_tx(tx, &[ids[0]])
+                })
+                .unwrap();
+            assert_eq!(updated, 0);
+            assert_eq!(canonical_count(&storage, ids[1]), 1);
+        });
+
+        row("rollback-after-history", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "canonical", Some(ids[0]), 1);
+            let tx = storage.raw().transaction_with_mode(TxMode::Immediate).unwrap();
+            let updated =
+                facts::historyize_source_message_links_in_tx(&tx, &[ids[0]]).unwrap();
+            assert_eq!(updated, 1);
+            tx.rollback().unwrap();
+            assert_eq!(canonical_count(&storage, ids[0]), 1);
+        });
+
+        row("delete-wrapper-revision-preserved", &|| {
+            let (_dir, storage, _a, _c, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "canonical", Some(ids[0]), 1);
+            let surviving = seed_input(&storage, "other");
+            let record2 = seed_record(&storage, surviving, 1);
+            seed_link(&storage, record2, "canonical", Some(ids[1]), 2);
+            let before = revision_value(&storage);
+            let outcome = storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    facts::delete_source_facts_in_tx(
+                        tx,
+                        &SourceDeletionSelection::Connector("codex".into()),
+                        &[ids[1]],
+                    )
+                })
+                .unwrap();
+            let after = revision_value(&storage);
+            assert_eq!(after, before + 1, "the delete wrapper moves it once");
+            assert_eq!(outcome.inputs_deleted, 1);
+            assert_eq!(historical_null_count(&storage), 1);
+        });
+
+        evidence("u16_02_history_only", &rows);
+    }
+
+    #[test]
+    fn u16_03_typed_error_chain() {
+        let mut rows = Vec::new();
+
+        // normal control: empty new message set, real transaction.
+        {
+            let (_dir, storage, agent_id, conversation_id, _ids) = world();
+            let identity = RestoreIdentity {
+                origin: OriginNamespace {
+                    agent_slug: "codex".into(),
+                    source_id: "local".into(),
+                    origin_host: "local".into(),
+                },
+                canonical_path: "/private/chain.jsonl".into(),
+            };
+            let replace = SourceReplaceProjection {
+                conversation_id,
+                identity: &identity,
+                snapshot_root: "private-root",
+                generation: "private-generation",
+            };
+            let conv = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("PRIVATE-E".into()),
+                title: Some("private".into()),
+                source_path: std::path::PathBuf::from("/private/chain.jsonl"),
+                started_at: Some(TS),
+                ended_at: Some(TS + 1000),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())
+                .expect("load pricing");
+            let tx = storage.raw().transaction_with_mode(TxMode::Immediate).unwrap();
+            let result = install_source_replace_projection_in_tx(
+                &tx,
+                &replace,
+                agent_id,
+                None,
+                &conv,
+                &facts::Sha256Digest::of(b"private-input"),
+                0,
+                &[],
+                &pricing,
+            );
+            tx.rollback().unwrap();
+            assert!(result.is_ok(), "normal control passes");
+            rows.push("{\"id\":\"normal-control\",\"ok\":true}".to_string());
+        }
+
+        // history-helper-db: the UPDATE is aborted by a trigger.
+        {
+            let (_dir, storage, agent_id, conversation_id, ids) = world();
+            let input = seed_input(&storage, "codex");
+            let record = seed_record(&storage, input, 1);
+            seed_link(&storage, record, "canonical", Some(ids[0]), 1);
+            storage
+                .raw()
+                .execute(
+                    "CREATE TRIGGER private_abort BEFORE UPDATE ON source_message_links \
+                     BEGIN SELECT RAISE(ABORT, 'PRIVATE'); END",
+                    &[],
+                )
+                .unwrap();
+            let identity = RestoreIdentity {
+                origin: OriginNamespace {
+                    agent_slug: "codex".into(),
+                    source_id: "local".into(),
+                    origin_host: "local".into(),
+                },
+                canonical_path: "/private/chain.jsonl".into(),
+            };
+            let replace = SourceReplaceProjection {
+                conversation_id,
+                identity: &identity,
+                snapshot_root: "private-root",
+                generation: "private-generation",
+            };
+            let conv = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("PRIVATE-E".into()),
+                title: Some("private".into()),
+                source_path: std::path::PathBuf::from("/private/chain.jsonl"),
+                started_at: Some(TS),
+                ended_at: Some(TS + 1000),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: Vec::new(),
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())
+                .expect("load pricing");
+            let tx = storage.raw().transaction_with_mode(TxMode::Immediate).unwrap();
+            let result = install_source_replace_projection_in_tx(
+                &tx,
+                &replace,
+                agent_id,
+                None,
+                &conv,
+                &facts::Sha256Digest::of(b"private-input"),
+                0,
+                &[],
+                &pricing,
+            );
+            tx.rollback().unwrap();
+            assert!(
+                matches!(result, Err(facts::SourceInstallError::Db(_))),
+                "a DB failure keeps its typed chain"
+            );
+            rows.push("{\"id\":\"history-helper-db\",\"ok\":true}".to_string());
+        }
+
+        // projection-body-db: message INSERT is aborted.
+        {
+            let (_dir, storage, agent_id, conversation_id, _ids) = world();
+            storage
+                .raw()
+                .execute(
+                    "CREATE TRIGGER private_abort BEFORE INSERT ON messages \
+                     BEGIN SELECT RAISE(ABORT, 'PRIVATE'); END",
+                    &[],
+                )
+                .unwrap();
+            let identity = RestoreIdentity {
+                origin: OriginNamespace {
+                    agent_slug: "codex".into(),
+                    source_id: "local".into(),
+                    origin_host: "local".into(),
+                },
+                canonical_path: "/private/chain.jsonl".into(),
+            };
+            let replace = SourceReplaceProjection {
+                conversation_id,
+                identity: &identity,
+                snapshot_root: "private-root",
+                generation: "private-generation",
+            };
+            let conv = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("PRIVATE-E".into()),
+                title: Some("private".into()),
+                source_path: std::path::PathBuf::from("/private/chain.jsonl"),
+                started_at: Some(TS),
+                ended_at: Some(TS + 1000),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![Message {
+                    excluded: None,
+                    id: None,
+                    idx: 0,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(TS),
+                    content: "body".into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                }],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())
+                .expect("load pricing");
+            let tx = storage.raw().transaction_with_mode(TxMode::Immediate).unwrap();
+            let result = install_source_replace_projection_in_tx(
+                &tx,
+                &replace,
+                agent_id,
+                None,
+                &conv,
+                &facts::Sha256Digest::of(b"private-input"),
+                0,
+                &[],
+                &pricing,
+            );
+            tx.rollback().unwrap();
+            assert!(
+                matches!(result, Err(facts::SourceInstallError::Db(_))),
+                "a DB body failure stays Db"
+            );
+            rows.push("{\"id\":\"projection-body-db\",\"ok\":true}".to_string());
+        }
+
+        // projection-body-nondb: a duplicate incoming idx is a non-DB failure.
+        {
+            let (_dir, storage, agent_id, conversation_id, _ids) = world();
+            let identity = RestoreIdentity {
+                origin: OriginNamespace {
+                    agent_slug: "codex".into(),
+                    source_id: "local".into(),
+                    origin_host: "local".into(),
+                },
+                canonical_path: "/private/chain.jsonl".into(),
+            };
+            // A real second parent B occupies another external_id under the
+            // same source and agent.
+            let b_message = Message {
+                excluded: None,
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(TS),
+                content: "B".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            };
+            let b_conv = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("PRIVATE-B".into()),
+                title: Some("private-b".into()),
+                source_path: std::path::PathBuf::from("/private/chain.jsonl"),
+                started_at: Some(TS),
+                ended_at: Some(TS + 1000),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![b_message],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &b_conv)
+                .expect("insert the second real parent");
+            let replace = SourceReplaceProjection {
+                // The real target stays A; only the incoming external_id is B's.
+                conversation_id,
+                identity: &identity,
+                snapshot_root: "private-root",
+                generation: "private-generation",
+            };
+            let message = Message {
+                excluded: None,
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(TS),
+                content: "clash".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: vec![],
+            };
+            let conv = Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("PRIVATE-B".into()),
+                title: Some("private".into()),
+                source_path: std::path::PathBuf::from("/private/chain.jsonl"),
+                started_at: Some(TS),
+                ended_at: Some(TS + 1000),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: vec![message],
+                source_id: "local".into(),
+                origin_host: None,
+            };
+            let pricing = crate::storage::sqlite::PricingTable::franken_load(storage.raw())
+                .expect("load pricing");
+            let tx = storage.raw().transaction_with_mode(TxMode::Immediate).unwrap();
+            let result = install_source_replace_projection_in_tx(
+                &tx,
+                &replace,
+                agent_id,
+                None,
+                &conv,
+                &facts::Sha256Digest::of(b"private-input"),
+                0,
+                &[],
+                &pricing,
+            );
+            tx.rollback().unwrap();
+            let error = match result {
+                Ok(_) => panic!("the duplicate idx must fail"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, facts::SourceInstallError::Activation { .. }),
+                "a non-DB body failure maps to Activation, got {error:?}"
+            );
+            let mapped = source_restore_error_from_ingest(
+                crate::indexer::source_ingest::SourceIngestError::Install(error),
+            );
+            assert_eq!(
+                mapped.downcast_ref::<SourceRestoreError>().map(|e| e.code()),
+                Some("source_restore_material_mismatch")
+            );
+            // The rollback keeps both real parents and every message intact.
+            assert_eq!(storage.raw().query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| row.get_typed::<i64>(0)).unwrap(), 2);
+            assert_eq!(storage.raw().query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed::<i64>(0)).unwrap(), 3);
+            assert_eq!(storage.raw().query_row_map("SELECT COUNT(*) FROM source_message_links", &[], |row| row.get_typed::<i64>(0)).unwrap(), 0);
+            rows.push("{\"id\":\"projection-body-nondb\",\"ok\":true}".to_string());
+        }
+
+        evidence("u16_03_typed_error_chain", &rows);
+    }
+
+    #[test]
+    fn u16_04_session_key_query() {
+        let (_dir, storage, _agent, _conversation, _ids) = world();
+        let identity = RestoreIdentity {
+            origin: OriginNamespace {
+                agent_slug: "claude".into(),
+                source_id: "local".into(),
+                origin_host: "local".into(),
+            },
+            canonical_path: "/private/chain.jsonl".into(),
+        };
+        let key = MirrorSessionKey {
+            identity_host: "local".into(),
+            agent: "claude".into(),
+            external_id: "PRIVATE-E".into(),
+        };
+        let found = source_candidate_versions_from_db(
+            &storage,
+            &identity,
+            "codex",
+            Some(&key),
+        )
+        .expect("query the candidate");
+        assert_eq!(found.len(), 1, "the canonical connector alias finds the parent");
+        let wrong = MirrorSessionKey {
+            identity_host: "local".into(),
+            agent: "claude".into(),
+            external_id: "OTHER".into(),
+        };
+        let none = source_candidate_versions_from_db(
+            &storage,
+            &identity,
+            "codex",
+            Some(&wrong),
+        )
+        .expect("query the wrong key");
+        assert!(none.is_empty(), "external_id is never relaxed");
+        evidence(
+            "u16_04_session_key_query",
+            &["{\"id\":\"session-key-agent-bridge\",\"ok\":true}".to_string()],
+        );
+
+        // R1 side 9-12: the production target admission, driven with a private
+        // SQL seed and a private item/view carrier. This is an artificial
+        // component, explicitly not a native producer. The valid case must be
+        // admitted and the three bad cases must be refused by the production
+        // verifier itself, with no write in either direction.
+        let parent: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations ORDER BY id LIMIT 1",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("the seeded parent");
+        let private_hex = "a".repeat(64);
+        let declaration = source_contexts::RestoreSourceContextDeclaration {
+            manifest_id: "r1-private-component".into(),
+            identity_namespace: "R1_PRIVATE_COMPONENT".into(),
+            connector: "codex".into(),
+            scan_root: "/private".into(),
+            relative_locator: "chain.jsonl".into(),
+            role: franken_agent_detection::SourceInputRole::PrimarySessionLog,
+            origin: source_contexts::RestoreSourceContextOrigin {
+                source_id: "local".into(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        let view = crate::raw_mirror::RawMirrorManifestView {
+            manifest_id: "r1-private-component".into(),
+            manifest_relative_path: "v1/manifests/r1-private-component.json".into(),
+            blob_relative_path: "v1/blobs/blake3/00/r1-private.raw".into(),
+            blob_blake3: private_hex.clone(),
+            blob_size_bytes: 1,
+            provider: "claude".into(),
+            source_id: "local".into(),
+            origin_kind: "local".into(),
+            origin_host: None,
+            original_path: "/private/chain.jsonl".into(),
+            original_path_blake3: private_hex.clone(),
+            identity_host: "local".into(),
+            agent: "codex".into(),
+            external_id: Some("PRIVATE-E".into()),
+            // A session key exists only for a connector-shaped capture. This
+            // private component declares one so the no-candidate and ambiguity
+            // sides exercise the exact session-key query, not the path-only one.
+            shape_root: Some("sessions".into()),
+            relative_path: None,
+            captured_at_ms: 0,
+            source_size_bytes: 1,
+            source_mtime_ms: None,
+            db_links: Vec::new(),
+            manifest_blake3: None,
+        };
+        let item_for = |target: i64| RestorePlanItem {
+            manifest_id: "r1-private-component".into(),
+            action: PlannedAction::Replace {
+                conversation_id: target,
+            },
+            source_binding: Some(SourceBindingMaterial {
+                declaration: declaration.clone(),
+                context_digest: private_hex.clone(),
+                sealed_sha256: private_hex.clone(),
+                byte_len: 1,
+                normalizer_id: private_hex.clone(),
+                safety_contract_id: private_hex.clone(),
+                input_key: private_hex.clone(),
+            }),
+        };
+        let view_for = |external: Option<&str>| {
+            let mut scoped = view.clone();
+            scoped.external_id = external.map(str::to_string);
+            scoped
+        };
+        let counts = || {
+            let count = |sql: &str| -> i64 {
+                storage
+                    .raw()
+                    .query_row_map(sql, &[], |row| row.get_typed(0))
+                    .expect("count rows")
+            };
+            (
+                count("SELECT COUNT(*) FROM conversations"),
+                count("SELECT COUNT(*) FROM messages"),
+                count("SELECT COUNT(*) FROM source_message_links"),
+                count("SELECT COUNT(*) FROM operation_commit_receipt"),
+            )
+        };
+        let mut side_rows: Vec<String> = Vec::new();
+        let mut check = |id: &str, target: i64, external: &str, expect_ok: bool| {
+            let before = counts();
+            let tx = storage
+                .raw()
+                .transaction()
+                .expect("open the component admission transaction");
+            let result =
+                verify_source_replace_target_in_tx(&tx, &item_for(target), &view_for(Some(external)));
+            drop(tx);
+            let after = counts();
+            assert_eq!(before, after, "{id}: the admission must not write");
+            let ok = matches!(
+                result,
+                Ok(VerifiedSourceReplaceTarget {
+                    conversation_id,
+                    ..
+                }) if conversation_id == target
+            );
+            let conflict = matches!(
+                result,
+                Err(RestoreSourceReceiptError::Typed(
+                    SourceRestoreError::ReceiptConflict
+                ))
+            );
+            if expect_ok {
+                assert!(ok, "{id}: the unique exact candidate must be admitted");
+            } else {
+                assert!(conflict, "{id}: the production admission must return ReceiptConflict");
+            }
+            side_rows.push(format!(
+                "{{\"id\":\"{id}\",\"expect\":\"{}\",\"admitted\":{},\"ok\":{},\"target\":{target},\"carrier\":\"private-synthetic-component-not-native\"}}",
+                if expect_ok { "admitted" } else { "receipt_conflict" },
+                ok,
+                if expect_ok { ok } else { conflict }
+            ));
+        };
+        check("exact-unique-valid", parent, "PRIVATE-E", true);
+        check("exact-wrong-target", parent + 1, "PRIVATE-E", false);
+        check("exact-no-candidate", parent, "OTHER", false);
+        // A second real conversation under the raw provider alias creates the
+        // two-alias ambiguity: the production admission must refuse it.
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO agents (slug, name, kind, created_at, updated_at) \
+                 VALUES ('claude', 'Claude', 'cli', 0, 0)",
+                &[],
+            )
+            .expect("insert the raw alias agent");
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO conversations (id, agent_id, workspace_id, source_id, external_id, \
+                 title, source_path, started_at, ended_at, approx_tokens, metadata_json, \
+                 origin_host, identity_host, metadata_bin, last_message_idx, last_message_created_at) \
+                 SELECT 2, (SELECT id FROM agents WHERE slug = 'claude'), workspace_id, source_id, \
+                 'PRIVATE-E', title, source_path, started_at, ended_at, approx_tokens, metadata_json, \
+                 origin_host, identity_host, metadata_bin, last_message_idx, last_message_created_at \
+                 FROM conversations WHERE id = ?1",
+                &[crate::storage::api::Value::Integer(parent)],
+            )
+            .expect("insert the alias twin");
+        check("exact-ambiguous-aliases", parent, "PRIVATE-E", false);
+        let root = std::env::var("CASS_T16_RESULT_ROOT")
+            .expect("CASS_T16_RESULT_ROOT must be set for every Task16 run");
+        let side_dir = std::path::PathBuf::from(root)
+            .join("r1-side")
+            .join("u16_04_session_key_query");
+        std::fs::create_dir_all(&side_dir).expect("create the r1 side evidence directory");
+        std::fs::write(side_dir.join("cases.jsonl"), side_rows.join("\n") + "\n")
+            .expect("write the r1 side cases");
     }
 }

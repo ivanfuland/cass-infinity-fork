@@ -291,111 +291,131 @@ fn read_jsonl_lines(blob_path: &Path) -> std::io::Result<Vec<(usize, String)>> {
 /// filter `event.blocks` by block `kind`/`tool_use_id`, never by the
 /// duplicate's position, so a full block list is sufficient and exactly
 /// matches what the pre-existing tool_result-mixed duplication already did.
+/// The raw events one Claude Code record produces, in the order the connector
+/// projects its messages from that record.
+///
+/// This is the per-record core behind `claude_code_events_from_blob`: the
+/// source-aware path hands in the record's own bytes, so attribution runs
+/// through that record's proven claims instead of a whole-file positional
+/// alignment. Both callers share this one implementation.
+pub(crate) fn claude_code_events_for_value(
+    value: &serde_json::Value,
+    line_no: usize,
+) -> Vec<RawEvent> {
+    let mut events = Vec::new();
+    push_claude_code_events(value, line_no, &mut events);
+    events
+}
+
+fn push_claude_code_events(value: &serde_json::Value, line_no: usize, events: &mut Vec<RawEvent>) {
+    let event_key = value.get("uuid").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{line_no}"));
+
+    // Role resolution (claude_code.rs's `message_role`): only a
+    // user/assistant envelope (explicit `message.role`, or an implicit
+    // top-level `type` of "user"/"assistant" with no nested role) ever
+    // emits a message; `system`'s `away_summary` subtype is the one
+    // exception (handled separately, no content-block splitting).
+    let entry_type = value.get("type").and_then(|v| v.as_str());
+    let inner_role = value.pointer("/message/role").and_then(|v| v.as_str());
+    let role: Option<&str> = match (entry_type, inner_role) {
+        (Some("user" | "assistant" | "message"), Some(r)) if r == "user" || r == "assistant" => Some(r),
+        (Some(r @ ("user" | "assistant")), None) => Some(r),
+        _ => None,
+    };
+    let is_system_away_summary =
+        entry_type == Some("system") && value.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
+
+    let content_val = value.pointer("/message/content").or_else(|| value.get("content"));
+
+    if is_system_away_summary {
+        let has_content = content_val.and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+        if has_content {
+            events.push(RawEvent { event_key, blocks: Vec::new() });
+        }
+        return;
+    }
+    let Some(role) = role else { return };
+
+    match content_val {
+        Some(serde_json::Value::Array(content)) => {
+            let mut blocks = Vec::with_capacity(content.len());
+            for (i, block) in content.iter().enumerate() {
+                let block_type = block.get("type").and_then(|v| v.as_str());
+                let kind = match block_type {
+                    Some("text" | "input_text" | "output_text") if block.get("text").and_then(|v| v.as_str()).is_some() => BlockKind::Text,
+                    Some("tool_use") if block.get("name").and_then(|v| v.as_str()).is_some() => BlockKind::ToolUse,
+                    Some("tool_result") => BlockKind::ToolResult,
+                    // `thinking` blocks (need `thinking` or `text` as a
+                    // string) never participate in any decision filter,
+                    // so BlockKind::Other is sufficient here.
+                    Some("thinking")
+                        if block.get("thinking").and_then(|v| v.as_str()).or_else(|| block.get("text").and_then(|v| v.as_str())).is_some() =>
+                    {
+                        BlockKind::Other
+                    }
+                    _ => continue, // split_content_blocks drops malformed/unknown blocks entirely
+                };
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
+                    .map(str::to_string);
+                let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
+                let args = block.get("input").cloned();
+                blocks.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
+            }
+            let event = RawEvent { event_key, blocks };
+
+            // N14 (任务书 #118a): index by each block's own `.index`
+            // field, not by zipping `event.blocks` positionally against
+            // `content` -- `blocks` already dropped unrecognized
+            // elements (the `_ => continue` above), so a leading skipped
+            // block (e.g. `[image, text]`) shifts every later block's
+            // Vec position out of sync with its `content` position; a
+            // straight positional zip would then pair the surviving
+            // `text` block descriptor with the WRONG `content` element
+            // and silently fail to find its `text` field.
+            let prose: String = event
+                .blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Text)
+                .filter_map(|b| content.get(b.index as usize))
+                .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !prose.trim().is_empty() {
+                events.push(event.clone());
+            }
+            for b in &event.blocks {
+                let matches_role = match b.kind {
+                    BlockKind::ToolUse | BlockKind::Other => role == "assistant",
+                    BlockKind::ToolResult => role == "user",
+                    BlockKind::Text => false, // already accounted for as prose above
+                };
+                if matches_role && b.kind != BlockKind::Text {
+                    events.push(event.clone());
+                }
+            }
+        }
+        Some(other) => {
+            let content_str = match other {
+                serde_json::Value::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            if !content_str.trim().is_empty() {
+                events.push(RawEvent { event_key, blocks: Vec::new() });
+            }
+        }
+        None => {}
+    }
+}
+
 fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
     let lines = read_jsonl_lines(blob_path)?;
     let mut events = Vec::with_capacity(lines.len());
     for (line_no, line) in &lines {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let event_key = value.get("uuid").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{line_no}"));
-
-        // Role resolution (claude_code.rs's `message_role`): only a
-        // user/assistant envelope (explicit `message.role`, or an implicit
-        // top-level `type` of "user"/"assistant" with no nested role) ever
-        // emits a message; `system`'s `away_summary` subtype is the one
-        // exception (handled separately, no content-block splitting).
-        let entry_type = value.get("type").and_then(|v| v.as_str());
-        let inner_role = value.pointer("/message/role").and_then(|v| v.as_str());
-        let role: Option<&str> = match (entry_type, inner_role) {
-            (Some("user" | "assistant" | "message"), Some(r)) if r == "user" || r == "assistant" => Some(r),
-            (Some(r @ ("user" | "assistant")), None) => Some(r),
-            _ => None,
-        };
-        let is_system_away_summary =
-            entry_type == Some("system") && value.get("subtype").and_then(|v| v.as_str()) == Some("away_summary");
-
-        let content_val = value.pointer("/message/content").or_else(|| value.get("content"));
-
-        if is_system_away_summary {
-            let has_content = content_val.and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
-            if has_content {
-                events.push(RawEvent { event_key, blocks: Vec::new() });
-            }
-            continue;
-        }
-        let Some(role) = role else { continue };
-
-        match content_val {
-            Some(serde_json::Value::Array(content)) => {
-                let mut blocks = Vec::with_capacity(content.len());
-                for (i, block) in content.iter().enumerate() {
-                    let block_type = block.get("type").and_then(|v| v.as_str());
-                    let kind = match block_type {
-                        Some("text" | "input_text" | "output_text") if block.get("text").and_then(|v| v.as_str()).is_some() => BlockKind::Text,
-                        Some("tool_use") if block.get("name").and_then(|v| v.as_str()).is_some() => BlockKind::ToolUse,
-                        Some("tool_result") => BlockKind::ToolResult,
-                        // `thinking` blocks (need `thinking` or `text` as a
-                        // string) never participate in any decision filter,
-                        // so BlockKind::Other is sufficient here.
-                        Some("thinking")
-                            if block.get("thinking").and_then(|v| v.as_str()).or_else(|| block.get("text").and_then(|v| v.as_str())).is_some() =>
-                        {
-                            BlockKind::Other
-                        }
-                        _ => continue, // split_content_blocks drops malformed/unknown blocks entirely
-                    };
-                    let tool_use_id = block
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| block.get("tool_use_id").and_then(|v| v.as_str()))
-                        .map(str::to_string);
-                    let tool_name = block.get("name").and_then(|v| v.as_str()).map(str::to_string);
-                    let args = block.get("input").cloned();
-                    blocks.push(RawBlock { index: i as u32, kind, tool_use_id, tool_name, args });
-                }
-                let event = RawEvent { event_key, blocks };
-
-                // N14 (任务书 #118a): index by each block's own `.index`
-                // field, not by zipping `event.blocks` positionally against
-                // `content` -- `blocks` already dropped unrecognized
-                // elements (the `_ => continue` above), so a leading skipped
-                // block (e.g. `[image, text]`) shifts every later block's
-                // Vec position out of sync with its `content` position; a
-                // straight positional zip would then pair the surviving
-                // `text` block descriptor with the WRONG `content` element
-                // and silently fail to find its `text` field.
-                let prose: String = event
-                    .blocks
-                    .iter()
-                    .filter(|b| b.kind == BlockKind::Text)
-                    .filter_map(|b| content.get(b.index as usize))
-                    .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if !prose.trim().is_empty() {
-                    events.push(event.clone());
-                }
-                for b in &event.blocks {
-                    let matches_role = match b.kind {
-                        BlockKind::ToolUse | BlockKind::Other => role == "assistant",
-                        BlockKind::ToolResult => role == "user",
-                        BlockKind::Text => false, // already accounted for as prose above
-                    };
-                    if matches_role && b.kind != BlockKind::Text {
-                        events.push(event.clone());
-                    }
-                }
-            }
-            Some(other) => {
-                let content_str = match other {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => String::new(),
-                };
-                if !content_str.trim().is_empty() {
-                    events.push(RawEvent { event_key, blocks: Vec::new() });
-                }
-            }
-            None => {}
-        }
+        push_claude_code_events(&value, *line_no, &mut events);
     }
     Ok(events)
 }
@@ -420,108 +440,126 @@ fn claude_code_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEven
 /// every codex session has at least one dropped `developer`-role line, so
 /// the prior always-push-one behavior meant `EVENT_ALIGN_FAILED` on
 /// essentially every codex session, not just an edge case.
+/// The raw events one Codex record produces, in the order the connector
+/// projects its messages from that record.
+///
+/// The per-record core behind `codex_events_from_blob`; see
+/// [`claude_code_events_for_value`] for why the source-aware path needs it.
+pub(crate) fn codex_events_for_value(
+    value: &serde_json::Value,
+    line_no: usize,
+) -> Vec<RawEvent> {
+    let mut events = Vec::new();
+    push_codex_events(value, line_no, &mut events);
+    events
+}
+
+fn push_codex_events(value: &serde_json::Value, line_no: usize, events: &mut Vec<RawEvent>) {
+    let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(payload) = value.get("payload") else { return };
+    let event_key = payload.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{line_no}"));
+    let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
+    let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
+
+    let text_nonempty = |key: &str| payload.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+    // R2-B3 (任务书 #119a): mirrors pin `utils.rs:416`'s
+    // `extract_content_part` FIRST branch (`item.as_str()`) -- a
+    // `payload.content`/`payload.output` array element may itself be a
+    // bare JSON string, not only `{"type":"text","text":...}`; the
+    // pre-fix version only ever read `.get("text")`, so an array like
+    // `["hello"]` counted as empty and a real, non-empty `message`/
+    // `agent_message` event got dropped instead of counted (miscounting
+    // in the OTHER direction from R1-B2/N1's array-of-empty-text case
+    // below -- both are "does this array actually carry visible text").
+    let block_text_nonempty = |block: &serde_json::Value| {
+        block.as_str().is_some_and(|s| !s.trim().is_empty())
+            || block.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty())
+    };
+    // R1-B2/N1 (任务书 #118a): mirrors the real connector's
+    // `flatten_content` (pin `codex.rs:773`), which accepts a bare
+    // non-empty STRING `payload.content`/`payload.output` (not just an
+    // array), and for an array form drops blocks with no non-empty
+    // `text` before deciding whether anything survived -- an array of
+    // only empty-text blocks produces zero real messages, not one.
+    let content_nonempty = || match payload.get("content").or_else(|| payload.get("output")) {
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(block_text_nonempty),
+        _ => false,
+    };
+
+    let blocks: Option<Vec<RawBlock>> = match entry_type {
+        "response_item" => {
+            let payload_type = payload.get("type").and_then(|v| v.as_str());
+            match payload_type {
+                Some("message") | None => {
+                    let role = payload.get("role").and_then(|v| v.as_str());
+                    if matches!(role, Some("user" | "assistant")) && content_nonempty() {
+                        Some(vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
+                    } else {
+                        None
+                    }
+                }
+                Some("agent_message") => content_nonempty()
+                    .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                Some("reasoning") => {
+                    // R2-B3 (任务书 #119a): mirrors pin `codex.rs:849-853`
+                    // (`reasoning_summary_text` + the keep/drop check
+                    // right after it) -- the real connector judges
+                    // emptiness on the EXTRACTED text (join every
+                    // non-empty `summary[].text` with `\n`), not on
+                    // whether the `summary` array itself is non-empty.
+                    // `summary:[{"type":"summary_text","text":""}]` is a
+                    // non-empty ARRAY whose extracted text is empty; the
+                    // pre-fix version kept it (miscounting an event pin
+                    // would drop), which is the exact "counts equal but
+                    // wrong events" shape R2-B3's alignment-gate report
+                    // describes.
+                    let summary_text_nonempty = payload
+                        .get("summary")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|items| items.iter().any(|item| item.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty())));
+                    (summary_text_nonempty || payload.get("encrypted_content").is_some())
+                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
+                }
+                Some("function_call" | "custom_tool_call") => {
+                    let args = payload.get("arguments").or_else(|| payload.get("input")).cloned();
+                    Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
+                }
+                Some("function_call_output" | "custom_tool_call_output") => {
+                    Some(vec![RawBlock { index: 0, kind: BlockKind::ToolResult, tool_use_id: call_id, tool_name: None, args: None }])
+                }
+                Some(_) => None,
+            }
+        }
+        "event_msg" => {
+            let event_type = payload.get("type").and_then(|v| v.as_str());
+            match event_type {
+                Some("agent_message") => None, // duplicates the response_item version
+                Some("user_message") => text_nonempty("message")
+                    .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                Some("agent_reasoning") => text_nonempty("text")
+                    .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
+                Some("tool_call") => {
+                    let args = payload.get("input").or_else(|| payload.get("arguments")).cloned();
+                    Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
+                }
+                // "token_count" attaches to an existing message, no message of its own.
+                _ => None,
+            }
+        }
+        // "session_meta" / "turn_context" / anything else: metadata only.
+        _ => None,
+    };
+    let Some(blocks) = blocks else { return };
+    events.push(RawEvent { event_key, blocks });
+}
+
 fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
     let lines = read_jsonl_lines(blob_path)?;
     let mut events = Vec::with_capacity(lines.len());
     for (line_no, line) in &lines {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        let entry_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(payload) = value.get("payload") else { continue };
-        let event_key = payload.get("id").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("line:{line_no}"));
-        let call_id = payload.get("call_id").and_then(|v| v.as_str()).map(str::to_string);
-        let name = payload.get("name").and_then(|v| v.as_str()).map(str::to_string);
-
-        let text_nonempty = |key: &str| payload.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
-        // R2-B3 (任务书 #119a): mirrors pin `utils.rs:416`'s
-        // `extract_content_part` FIRST branch (`item.as_str()`) -- a
-        // `payload.content`/`payload.output` array element may itself be a
-        // bare JSON string, not only `{"type":"text","text":...}`; the
-        // pre-fix version only ever read `.get("text")`, so an array like
-        // `["hello"]` counted as empty and a real, non-empty `message`/
-        // `agent_message` event got dropped instead of counted (miscounting
-        // in the OTHER direction from R1-B2/N1's array-of-empty-text case
-        // below -- both are "does this array actually carry visible text").
-        let block_text_nonempty = |block: &serde_json::Value| {
-            block.as_str().is_some_and(|s| !s.trim().is_empty())
-                || block.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty())
-        };
-        // R1-B2/N1 (任务书 #118a): mirrors the real connector's
-        // `flatten_content` (pin `codex.rs:773`), which accepts a bare
-        // non-empty STRING `payload.content`/`payload.output` (not just an
-        // array), and for an array form drops blocks with no non-empty
-        // `text` before deciding whether anything survived -- an array of
-        // only empty-text blocks produces zero real messages, not one.
-        let content_nonempty = || match payload.get("content").or_else(|| payload.get("output")) {
-            Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
-            Some(serde_json::Value::Array(arr)) => arr.iter().any(block_text_nonempty),
-            _ => false,
-        };
-
-        let blocks: Option<Vec<RawBlock>> = match entry_type {
-            "response_item" => {
-                let payload_type = payload.get("type").and_then(|v| v.as_str());
-                match payload_type {
-                    Some("message") | None => {
-                        let role = payload.get("role").and_then(|v| v.as_str());
-                        if matches!(role, Some("user" | "assistant")) && content_nonempty() {
-                            Some(vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
-                        } else {
-                            None
-                        }
-                    }
-                    Some("agent_message") => content_nonempty()
-                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
-                    Some("reasoning") => {
-                        // R2-B3 (任务书 #119a): mirrors pin `codex.rs:849-853`
-                        // (`reasoning_summary_text` + the keep/drop check
-                        // right after it) -- the real connector judges
-                        // emptiness on the EXTRACTED text (join every
-                        // non-empty `summary[].text` with `\n`), not on
-                        // whether the `summary` array itself is non-empty.
-                        // `summary:[{"type":"summary_text","text":""}]` is a
-                        // non-empty ARRAY whose extracted text is empty; the
-                        // pre-fix version kept it (miscounting an event pin
-                        // would drop), which is the exact "counts equal but
-                        // wrong events" shape R2-B3's alignment-gate report
-                        // describes.
-                        let summary_text_nonempty = payload
-                            .get("summary")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|items| items.iter().any(|item| item.get("text").and_then(|v| v.as_str()).is_some_and(|t| !t.trim().is_empty())));
-                        (summary_text_nonempty || payload.get("encrypted_content").is_some())
-                            .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }])
-                    }
-                    Some("function_call" | "custom_tool_call") => {
-                        let args = payload.get("arguments").or_else(|| payload.get("input")).cloned();
-                        Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
-                    }
-                    Some("function_call_output" | "custom_tool_call_output") => {
-                        Some(vec![RawBlock { index: 0, kind: BlockKind::ToolResult, tool_use_id: call_id, tool_name: None, args: None }])
-                    }
-                    Some(_) => None,
-                }
-            }
-            "event_msg" => {
-                let event_type = payload.get("type").and_then(|v| v.as_str());
-                match event_type {
-                    Some("agent_message") => None, // duplicates the response_item version
-                    Some("user_message") => text_nonempty("message")
-                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
-                    Some("agent_reasoning") => text_nonempty("text")
-                        .then(|| vec![RawBlock { index: 0, kind: BlockKind::Text, tool_use_id: None, tool_name: None, args: None }]),
-                    Some("tool_call") => {
-                        let args = payload.get("input").or_else(|| payload.get("arguments")).cloned();
-                        Some(vec![RawBlock { index: 0, kind: BlockKind::ToolUse, tool_use_id: call_id, tool_name: name, args }])
-                    }
-                    // "token_count" attaches to an existing message, no message of its own.
-                    _ => None,
-                }
-            }
-            // "session_meta" / "turn_context" / anything else: metadata only.
-            _ => None,
-        };
-        let Some(blocks) = blocks else { continue };
-        events.push(RawEvent { event_key, blocks });
+        push_codex_events(&value, *line_no, &mut events);
     }
     Ok(events)
 }
@@ -1359,6 +1397,18 @@ fn is_owned_body_copy(recorded: &str, body: &str) -> bool {
         && recorded.contains(body)
 }
 
+/// The same exact / bounded-wrapper test [`apply_extra`] uses, exposed so the
+/// source-aware path can clear a copy of an excluded body inside a *record*
+/// with one rule rather than a second, differently-tuned one.
+///
+/// The rule is deliberately strict and one-directional: `recorded` is a copy of
+/// `body` only when it is the body itself or a small wrapper around it. It is
+/// never "anything containing the body", so an unrelated record's prose that
+/// merely quotes a fragment is not swept up.
+pub(crate) fn text_is_owned_body_copy(recorded: &str, body: &str) -> bool {
+    is_owned_body_copy(recorded, body)
+}
+
 /// One element of a content array, rendered exactly as the connector renders
 /// it (pin `bc0f4d3c02356eac4d4dbc48e6f7d830d2caa9e8`,
 /// `connectors/utils.rs::extract_content_part`): a bare string is itself, a
@@ -1570,6 +1620,36 @@ pub(crate) fn apply(
     idx: u32,
     field_map: ExtraFieldMap,
 ) -> ExcludedMarker {
+    // The legacy wrapper keeps its own gate: it reads the process-wide
+    // switch. The source-aware path must not consult that switch at all
+    // (SRC05B-07 hard constraint 2: `CASS_REDACT_SECRETS=0` may turn the
+    // legacy path off; it can never turn the new one off), so it calls
+    // [`apply_with_redaction`] with the flag stated explicitly.
+    apply_with_redaction(
+        msg,
+        decision,
+        redactor,
+        blob,
+        idx,
+        field_map,
+        crate::indexer::redact_secrets::redaction_enabled(),
+    )
+}
+
+/// The explicitly-enabled core of [`apply`].
+///
+/// Same work, with `redaction_enabled` handed in rather than read from the
+/// environment, so a caller whose own contract fixes the answer is not at
+/// the mercy of a process-global switch.
+pub(crate) fn apply_with_redaction(
+    msg: &mut NormalizedMessage,
+    decision: &Decision,
+    redactor: &mut MemoizingRedactor,
+    blob: &str,
+    idx: u32,
+    field_map: ExtraFieldMap,
+    redaction_enabled: bool,
+) -> ExcludedMarker {
     let original = std::mem::take(&mut msg.content);
     // R1-N25 (任务书 #118b): must agree with the ordinary (non-excluded)
     // mapping layer's own `redaction_enabled()` gate (`indexer/mod.rs`'s
@@ -1580,7 +1660,7 @@ pub(crate) fn apply(
     // to the ORIGINAL string, breaking both the "sha256 = what should have
     // been written to content" audit contract and cross-row dedup identity
     // for that config.
-    let redacted = if crate::indexer::redact_secrets::redaction_enabled() {
+    let redacted = if redaction_enabled {
         redactor.redact_text(&original)
     } else {
         original.clone()

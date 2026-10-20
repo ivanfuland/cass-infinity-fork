@@ -11,7 +11,10 @@
 //! See also: `pages::secret_scan` (post-hoc scanning of existing data).
 
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::fmt;
 
+use franken_agent_detection::LosslessSourceValue;
 use once_cell::sync::Lazy;
 use regex::{Regex, RegexSet};
 
@@ -229,6 +232,230 @@ pub fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         }
         other => other.clone(),
     }
+}
+
+/// Structured, payload-free failure for [`redact_lossless_source`].
+///
+/// The variant set is closed on purpose: callers branch on the variant, never
+/// on a rendered string, and no variant carries an original key, a value, an
+/// input path or any upstream text. [`fmt::Display`] prints a fixed short code
+/// and the derived `Debug` prints the variant name only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceRedactionError {
+    /// An object carried a repeated member name. The lossless source IR
+    /// requires unique object keys, so redaction refuses the tree rather than
+    /// letting a later member overwrite an earlier one.
+    DuplicateObjectMember,
+    /// A redacted key could not be given a free name that is itself stable
+    /// under [`redact_text`]. The tree is refused rather than kept under the
+    /// original sensitive key.
+    KeyAllocationExhausted,
+}
+
+impl SourceRedactionError {
+    /// Stable short code for logs and robot output. Contains no source data.
+    #[must_use]
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::DuplicateObjectMember => "duplicate-object-member",
+            Self::KeyAllocationExhausted => "key-allocation-exhausted",
+        }
+    }
+}
+
+impl fmt::Display for SourceRedactionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+impl std::error::Error for SourceRedactionError {}
+
+/// Extra suffix attempts allowed beyond the number of members in one object.
+///
+/// An object of `n` members can occupy at most `n` names, so among the `n + 1`
+/// candidates `<base>#1..<base>#(n+1)` at least one name is free for a given
+/// base. This headroom absorbs names rejected by the stability re-check; the
+/// bound turns an impossible allocation into a fixed error instead of a loop.
+const MAX_KEY_SUFFIX_ATTEMPTS: usize = 1024;
+
+/// Redact secrets from a lossless source tree without changing its shape.
+///
+/// This is the lossless-node adapter of the ingestion secret-redaction stage:
+/// it runs [`redact_text`] over every string value and every object key,
+/// replaces the value under a credential-bearing key (judged by
+/// [`is_sensitive_json_field`] on the *original* key) with the `[REDACTED]`
+/// marker, and leaves every other node in place. A non-sensitive
+/// [`LosslessSourceValue::Number`] keeps its original token text verbatim: this
+/// function never converts to or from `serde_json::Value` and never routes a
+/// number through `f64`.
+///
+/// Object handling (frozen `prx-source-carrier-contract` v0.4 section 8):
+/// - a repeated original member name is refused with
+///   [`SourceRedactionError::DuplicateObjectMember`] — the lossless IR requires
+///   unique keys, and a silent overwrite would drop a value;
+/// - every key that redaction leaves unchanged is reserved first;
+/// - members are then renamed in their original order: an unconflicted redacted
+///   key is reused, and a collision takes the first free `<redacted>#1`,
+///   `<redacted>#2`, … name that skips reserved and already-assigned names;
+/// - a generated name must survive a second [`redact_text`] pass unchanged, so a
+///   new key can never itself reintroduce a secret;
+/// - member order and count are preserved, and nested objects allocate
+///   independently.
+///
+/// The redaction walk is iterative, so it adds no recursive call frame per
+/// tree level — the lossless reader can produce trees too deep for recursion.
+/// This is a statement about this function's own walk only; it does not claim
+/// that every other stage of the pipeline is free of a stack-depth limit. The
+/// function reads no environment variable and selects no policy: it always
+/// redacts, and the caller decides whether the tree is admitted.
+///
+/// # Errors
+///
+/// Returns [`SourceRedactionError`] on a duplicate member name or an
+/// unallocatable key. Neither error carries source content.
+pub fn redact_lossless_source(
+    value: &LosslessSourceValue,
+) -> Result<LosslessSourceValue, SourceRedactionError> {
+    /// One unit of the explicit post-order walk.
+    enum Frame<'a> {
+        /// Transform a subtree.
+        Node(&'a LosslessSourceValue),
+        /// A value already decided at the parent (a replaced sensitive value).
+        Ready(LosslessSourceValue),
+        /// Reassemble the last `count` produced values as an array.
+        Array(usize),
+        /// Reassemble the last `arity` produced values as an object with `keys`.
+        Object { keys: Vec<String>, arity: usize },
+    }
+
+    let mut frames = vec![Frame::Node(value)];
+    let mut produced: Vec<LosslessSourceValue> = Vec::new();
+
+    while let Some(frame) = frames.pop() {
+        match frame {
+            Frame::Ready(value) => produced.push(value),
+            Frame::Node(node) => match node {
+                LosslessSourceValue::String(text) => {
+                    produced.push(LosslessSourceValue::String(redact_text(text).into_owned()));
+                }
+                LosslessSourceValue::Number(number) => {
+                    produced.push(LosslessSourceValue::Number(number.clone()));
+                }
+                LosslessSourceValue::Bool(flag) => {
+                    produced.push(LosslessSourceValue::Bool(*flag));
+                }
+                LosslessSourceValue::Null => produced.push(LosslessSourceValue::Null),
+                LosslessSourceValue::Array(items) => {
+                    frames.push(Frame::Array(items.len()));
+                    for item in items.iter().rev() {
+                        frames.push(Frame::Node(item));
+                    }
+                }
+                LosslessSourceValue::Object(members) => {
+                    let keys = allocate_redacted_keys(members)?;
+                    frames.push(Frame::Object {
+                        keys,
+                        arity: members.len(),
+                    });
+                    // Push members in reverse so they are produced in order.
+                    for (key, member) in members.iter().rev() {
+                        if is_sensitive_json_field(key)
+                            && !matches!(member, LosslessSourceValue::Null)
+                        {
+                            frames.push(Frame::Ready(LosslessSourceValue::String(
+                                REDACTED.to_owned(),
+                            )));
+                        } else {
+                            frames.push(Frame::Node(member));
+                        }
+                    }
+                }
+            },
+            // Children are pushed in reverse and popped in forward order, so
+            // the produced tail already sits in original order: it must not be
+            // reversed again.
+            Frame::Array(count) => {
+                let items = produced.split_off(produced.len() - count);
+                produced.push(LosslessSourceValue::Array(items));
+            }
+            Frame::Object { keys, arity } => {
+                let values = produced.split_off(produced.len() - arity);
+                produced.push(LosslessSourceValue::Object(
+                    keys.into_iter().zip(values).collect(),
+                ));
+            }
+        }
+    }
+
+    debug_assert_eq!(produced.len(), 1, "one root produces exactly one value");
+    let root = produced
+        .pop()
+        .expect("the redaction walk produces exactly one root value");
+    Ok(root)
+}
+
+/// Build the redacted, collision-free key list for one object's members.
+///
+/// The returned list is in original member order with one name per member, so
+/// the caller zips it with redacted values and preserves order and count. See
+/// [`redact_lossless_source`] for the frozen contract this implements.
+fn allocate_redacted_keys(
+    members: &[(String, LosslessSourceValue)],
+) -> Result<Vec<String>, SourceRedactionError> {
+    // A repeated original key cannot be represented by the lossless IR and must
+    // never be silently merged. `LosslessSourceValue::parse` rejects it, but the
+    // public `Object(Vec)` constructor can build one, so it is checked here.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(members.len());
+    for (key, _) in members {
+        if !seen.insert(key.as_str()) {
+            return Err(SourceRedactionError::DuplicateObjectMember);
+        }
+    }
+
+    let redacted: Vec<String> = members
+        .iter()
+        .map(|(key, _)| redact_text(key).into_owned())
+        .collect();
+
+    // Reserve every key that redaction leaves unchanged before assigning any
+    // renamed key, so a generated name can never take a safe member's name.
+    let mut used: HashSet<String> = HashSet::with_capacity(members.len());
+    for ((key, _), redacted_key) in members.iter().zip(&redacted) {
+        if redacted_key.as_str() == key.as_str() {
+            used.insert(key.clone());
+        }
+    }
+
+    let max_suffix = members.len().saturating_add(MAX_KEY_SUFFIX_ATTEMPTS);
+    let mut assigned: Vec<String> = Vec::with_capacity(members.len());
+    for ((key, _), redacted_key) in members.iter().zip(&redacted) {
+        if redacted_key.as_str() == key.as_str() {
+            assigned.push(key.clone());
+            continue;
+        }
+        let mut suffix = 0usize;
+        loop {
+            let candidate = if suffix == 0 {
+                redacted_key.clone()
+            } else {
+                format!("{redacted_key}#{suffix}")
+            };
+            // The name must be free AND stable under a second redaction pass.
+            let free = !used.contains(candidate.as_str());
+            let stable = free && redact_text(&candidate).as_ref() == candidate.as_str();
+            if stable {
+                used.insert(candidate.clone());
+                assigned.push(candidate);
+                break;
+            }
+            suffix += 1;
+            if suffix > max_suffix {
+                return Err(SourceRedactionError::KeyAllocationExhausted);
+            }
+        }
+    }
+    Ok(assigned)
 }
 
 #[doc(hidden)]

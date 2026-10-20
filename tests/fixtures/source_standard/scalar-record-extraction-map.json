@@ -1,0 +1,1614 @@
+{
+  "schema": "cass.scalar-gold-extraction/1",
+  "gold_sha256": "02a5b27d6d3483d2a140fdd77b7c3913f5f6f884a4a8b6899a9889085edd244f",
+  "method": "Only input/expected JSON Pointers; expected values remain in immutable original gold. Every listed primitive composition independently replayed against frozen oracle and matched the full original fact.",
+  "records": 24,
+  "total_field_facts": 204,
+  "primitive_cases": [
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/model",
+      "primitive": "value_fact",
+      "field": "model",
+      "input_pointer": "/message/model"
+    },
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/native_ids/provider_message_id",
+      "primitive": "value_fact",
+      "field": "provider_message_id",
+      "input_pointer": "/message/id"
+    },
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/native_ids/request_id",
+      "primitive": "value_fact",
+      "field": "request_id",
+      "input_pointer": "/requestId"
+    },
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/model",
+      "primitive": "value_fact",
+      "field": "model",
+      "input_pointer": "/message/model"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/native_ids/request_id",
+      "primitive": "value_fact",
+      "field": "request_id",
+      "input_pointer": "/requestId"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-off-role",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/2/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-off-role",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/2/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-off-role",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/2/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-off-role",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/2/expected_standard/tools/0/name",
+      "primitive": "value_fact",
+      "field": "name",
+      "input_pointer": "/message/content/0/name"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/model",
+      "primitive": "value_fact",
+      "field": "model",
+      "input_pointer": "/message/model"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/native_ids/provider_message_id",
+      "primitive": "value_fact",
+      "field": "provider_message_id",
+      "input_pointer": "/message/id"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/native_ids/request_id",
+      "primitive": "value_fact",
+      "field": "request_id",
+      "input_pointer": "/requestId"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/tools/0/name",
+      "primitive": "value_fact",
+      "field": "name",
+      "input_pointer": "/message/content/0/name"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/tools/0/id",
+      "primitive": "value_fact",
+      "field": "id",
+      "input_pointer": "/message/content/0/id"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/tools/0/input",
+      "primitive": "value_fact",
+      "field": "input",
+      "input_pointer": "/message/content/0/input"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/tools/1/value",
+      "primitive": "value_fact",
+      "field": "stop_reason",
+      "input_pointer": "/message/stop_reason"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/tools/0/id",
+      "primitive": "value_fact",
+      "field": "id",
+      "input_pointer": "/message/content/0/tool_use_id"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/tools/0/content",
+      "primitive": "value_fact",
+      "field": "content",
+      "input_pointer": "/message/content/0/content"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/tools/0/is_error",
+      "primitive": "value_fact",
+      "field": "is_error",
+      "input_pointer": "/message/content/0/is_error"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/model",
+      "primitive": "value_fact",
+      "field": "model",
+      "input_pointer": "/message/model"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/native_ids/provider_message_id",
+      "primitive": "value_fact",
+      "field": "provider_message_id",
+      "input_pointer": "/message/id"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/native_ids/request_id",
+      "primitive": "value_fact",
+      "field": "request_id",
+      "input_pointer": "/requestId"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/message/usage/input_tokens"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/message/usage/output_tokens"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/message/usage/cache_read_input_tokens"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/message/usage/cache_creation_input_tokens"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/message/usage/thinking_tokens"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/output_tokens_details",
+      "primitive": "value_fact",
+      "field": "output_tokens_details",
+      "input_pointer": "/message/usage/output_tokens_details"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/1/fields/cache_write_5m",
+      "primitive": "count_fact",
+      "field": "cache_write_5m",
+      "input_pointer": "/message/usage/cache_creation/ephemeral_5m_input_tokens"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/1/fields/cache_write_1h",
+      "primitive": "count_fact",
+      "field": "cache_write_1h",
+      "input_pointer": "/message/usage/cache_creation/ephemeral_1h_input_tokens"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/toolUseResult/usage/input_tokens"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/toolUseResult/usage/output_tokens"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/toolUseResult/usage/cache_read_input_tokens"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/toolUseResult/usage/cache_creation_input_tokens"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/usage/1/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/toolUseResult/totalTokens"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/native_ids/record_uuid",
+      "primitive": "value_fact",
+      "field": "record_uuid",
+      "input_pointer": "/uuid"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/modelUsage/model-a/input_tokens"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/modelUsage/model-a/output_tokens"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/modelUsage/model-a/cache_read_input_tokens"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/modelUsage/model-a/cache_creation_input_tokens"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/usage/0/fields/source_details",
+      "primitive": "value_fact",
+      "field": "source_details",
+      "input_pointer": "/modelUsage/model-a"
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/native_ids/session_id",
+      "primitive": "value_fact",
+      "field": "session_id",
+      "input_pointer": "/sessionId"
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/messages/0/times/timestamp",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/messages/0/timestamp"
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/messages/0/times/time",
+      "primitive": "alias_fact",
+      "field": "time",
+      "candidates": [
+        {
+          "primitive": "time_fact",
+          "field": "time",
+          "input_pointer": "/messages/0/timestamp",
+          "expected_pointer": "/cases/8/expected_standard/messages/0/times/time/refs/0"
+        },
+        {
+          "primitive": "time_fact",
+          "field": "time",
+          "input_pointer": "/messages/0/time",
+          "expected_pointer": "/cases/8/expected_standard/messages/0/times/time/refs/1"
+        }
+      ]
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/messages/0/role/0",
+      "primitive": "alias_fact",
+      "field": "role",
+      "candidates": [
+        {
+          "primitive": "value_fact",
+          "field": "role",
+          "input_pointer": "/messages/0/role",
+          "expected_pointer": "/cases/8/expected_standard/messages/0/role/0/refs/0"
+        },
+        {
+          "primitive": "value_fact",
+          "field": "role",
+          "input_pointer": "/messages/0/type",
+          "expected_pointer": "/cases/8/expected_standard/messages/0/role/0/refs/1"
+        }
+      ]
+    },
+    {
+      "case_id": "claude-unknown",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/9/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-context",
+      "connector": "codex",
+      "expected_pointer": "/cases/10/expected_standard/model",
+      "primitive": "value_fact",
+      "field": "model",
+      "input_pointer": "/payload/model"
+    },
+    {
+      "case_id": "codex-context",
+      "connector": "codex",
+      "expected_pointer": "/cases/10/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-session",
+      "connector": "codex",
+      "expected_pointer": "/cases/11/expected_standard/provider",
+      "primitive": "value_fact",
+      "field": "provider",
+      "input_pointer": "/payload/model_provider"
+    },
+    {
+      "case_id": "codex-session",
+      "connector": "codex",
+      "expected_pointer": "/cases/11/expected_standard/native_ids/session_metadata_id",
+      "primitive": "value_fact",
+      "field": "session_metadata_id",
+      "input_pointer": "/payload/id"
+    },
+    {
+      "case_id": "codex-session",
+      "connector": "codex",
+      "expected_pointer": "/cases/11/expected_standard/native_ids/cwd",
+      "primitive": "value_fact",
+      "field": "cwd",
+      "input_pointer": "/payload/cwd"
+    },
+    {
+      "case_id": "codex-session",
+      "connector": "codex",
+      "expected_pointer": "/cases/11/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-session",
+      "connector": "codex",
+      "expected_pointer": "/cases/11/expected_standard/times/payload",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/payload/timestamp"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/native_ids/item_id",
+      "primitive": "value_fact",
+      "field": "item_id",
+      "input_pointer": "/payload/id"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/native_ids/call_id",
+      "primitive": "value_fact",
+      "field": "call_id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/tools/0/name",
+      "primitive": "value_fact",
+      "field": "name",
+      "input_pointer": "/payload/name"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/tools/0/id",
+      "primitive": "value_fact",
+      "field": "id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/tools/0/arguments",
+      "primitive": "value_fact",
+      "field": "arguments",
+      "input_pointer": "/payload/arguments"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/native_ids/item_id",
+      "primitive": "value_fact",
+      "field": "item_id",
+      "input_pointer": "/payload/id"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/native_ids/call_id",
+      "primitive": "value_fact",
+      "field": "call_id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/tools/0/name",
+      "primitive": "value_fact",
+      "field": "name",
+      "input_pointer": "/payload/name"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/tools/0/id",
+      "primitive": "value_fact",
+      "field": "id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/tools/0/arguments",
+      "primitive": "alias_fact",
+      "field": "arguments",
+      "candidates": [
+        {
+          "primitive": "value_fact",
+          "field": "arguments",
+          "input_pointer": "/payload/arguments",
+          "expected_pointer": "/cases/13/expected_standard/tools/0/arguments/refs/0"
+        },
+        {
+          "primitive": "value_fact",
+          "field": "arguments",
+          "input_pointer": "/payload/input",
+          "expected_pointer": "/cases/13/expected_standard/tools/0/arguments/refs/1"
+        }
+      ]
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/native_ids/item_id",
+      "primitive": "value_fact",
+      "field": "item_id",
+      "input_pointer": "/payload/id"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/native_ids/call_id",
+      "primitive": "value_fact",
+      "field": "call_id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/tools/0/id",
+      "primitive": "value_fact",
+      "field": "id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/tools/0/output",
+      "primitive": "value_fact",
+      "field": "output",
+      "input_pointer": "/payload/output"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/native_ids/call_id",
+      "primitive": "value_fact",
+      "field": "call_id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/native_ids/record_id",
+      "primitive": "value_fact",
+      "field": "record_id",
+      "input_pointer": "/payload/id"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/tools/0/event_type",
+      "primitive": "value_fact",
+      "field": "event_type",
+      "input_pointer": "/payload/type"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/tools/1/name",
+      "primitive": "value_fact",
+      "field": "name",
+      "input_pointer": "/payload/name"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/tools/1/id",
+      "primitive": "value_fact",
+      "field": "id",
+      "input_pointer": "/payload/call_id"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/tools/1/arguments",
+      "primitive": "alias_fact",
+      "field": "arguments",
+      "candidates": [
+        {
+          "primitive": "value_fact",
+          "field": "arguments",
+          "input_pointer": "/payload/arguments",
+          "expected_pointer": "/cases/15/expected_standard/tools/1/arguments/refs/0"
+        },
+        {
+          "primitive": "value_fact",
+          "field": "arguments",
+          "input_pointer": "/payload/input",
+          "expected_pointer": "/cases/15/expected_standard/tools/1/arguments/refs/1"
+        }
+      ]
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/info/last_token_usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/info/last_token_usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/info/last_token_usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/info/last_token_usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/0/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/info/last_token_usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/0/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/info/last_token_usage/total_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/1/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/info/total_token_usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/1/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/info/total_token_usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/1/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/info/total_token_usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/1/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/info/total_token_usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/1/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/info/total_token_usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/1/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/info/total_token_usage/total_tokens"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/2/fields/context_window",
+      "primitive": "count_fact",
+      "field": "context_window",
+      "input_pointer": "/payload/info/model_context_window"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/usage/3/fields/rate_limits",
+      "primitive": "value_fact",
+      "field": "rate_limits",
+      "input_pointer": "/payload/rate_limits"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/info/last_token_usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/info/last_token_usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/info/last_token_usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/info/last_token_usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/usage/0/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/info/last_token_usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/usage/0/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/info/last_token_usage/total_tokens"
+    },
+    {
+      "case_id": "codex-usage-null-info",
+      "connector": "codex",
+      "expected_pointer": "/cases/18/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-usage-null-info",
+      "connector": "codex",
+      "expected_pointer": "/cases/18/expected_standard/usage/0/fields/rate_limits",
+      "primitive": "value_fact",
+      "field": "rate_limits",
+      "input_pointer": "/payload/rate_limits"
+    },
+    {
+      "case_id": "codex-legacy-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/19/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-legacy-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/19/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/input_tokens"
+    },
+    {
+      "case_id": "codex-legacy-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/19/expected_standard/usage/0/fields/output",
+      "primitive": "alias_fact",
+      "field": "output",
+      "candidates": [
+        {
+          "primitive": "count_fact",
+          "field": "output",
+          "input_pointer": "/payload/output_tokens",
+          "expected_pointer": "/cases/19/expected_standard/usage/0/fields/output/refs/0"
+        },
+        {
+          "primitive": "count_fact",
+          "field": "output",
+          "input_pointer": "/payload/tokens",
+          "expected_pointer": "/cases/19/expected_standard/usage/0/fields/output/refs/1"
+        }
+      ]
+    },
+    {
+      "case_id": "codex-legacy-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/19/expected_standard/usage/0/fields/output_legacy",
+      "primitive": "count_fact",
+      "field": "output_legacy",
+      "input_pointer": "/payload/tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/native_ids/response_id",
+      "primitive": "value_fact",
+      "field": "response_id",
+      "input_pointer": "/payload/response_id"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/native_ids/thread_id",
+      "primitive": "value_fact",
+      "field": "thread_id",
+      "input_pointer": "/payload/thread_id"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/native_ids/turn_id",
+      "primitive": "value_fact",
+      "field": "turn_id",
+      "input_pointer": "/payload/turn_id"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/0/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/0/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/usage/total_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/1/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/turn_token_usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/1/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/turn_token_usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/1/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/turn_token_usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/1/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/turn_token_usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/1/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/turn_token_usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/1/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/turn_token_usage/total_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/2/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/thread_token_usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/2/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/thread_token_usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/2/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/thread_token_usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/2/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/thread_token_usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/2/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/thread_token_usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/usage/2/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/thread_token_usage/total_tokens"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/native_ids/response_id",
+      "primitive": "value_fact",
+      "field": "response_id",
+      "input_pointer": "/payload/response_id"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/usage/0/fields/input",
+      "primitive": "count_fact",
+      "field": "input",
+      "input_pointer": "/payload/usage/input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/usage/0/fields/output",
+      "primitive": "count_fact",
+      "field": "output",
+      "input_pointer": "/payload/usage/output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/usage/0/fields/cache_read",
+      "primitive": "count_fact",
+      "field": "cache_read",
+      "input_pointer": "/payload/usage/cached_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/usage/0/fields/cache_write",
+      "primitive": "count_fact",
+      "field": "cache_write",
+      "input_pointer": "/payload/usage/cache_write_input_tokens"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/usage/0/fields/thinking",
+      "primitive": "count_fact",
+      "field": "thinking",
+      "input_pointer": "/payload/usage/reasoning_output_tokens"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/usage/0/fields/total",
+      "primitive": "count_fact",
+      "field": "total",
+      "input_pointer": "/payload/usage/total_tokens"
+    },
+    {
+      "case_id": "codex-unknown",
+      "connector": "codex",
+      "expected_pointer": "/cases/22/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    },
+    {
+      "case_id": "codex-invalid-time",
+      "connector": "codex",
+      "expected_pointer": "/cases/23/expected_standard/times/event",
+      "primitive": "time_fact",
+      "field": "time",
+      "input_pointer": "/timestamp"
+    }
+  ],
+  "mapper_owned": [
+    {
+      "case_id": "claude-identity-time",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/0/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-null-missing",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/1/expected_standard/native_ids/provider_message_id",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-off-role",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/2/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-off-role",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/2/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-tools",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/3/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-tool-result",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/4/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/5/expected_standard/usage/0/fields/total",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-nested-usage",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/6/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-model-cost",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/7/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-document",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/8/expected_standard/messages/0/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-unknown",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/9/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "claude-unknown",
+      "connector": "claude_code",
+      "expected_pointer": "/cases/9/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-context",
+      "connector": "codex",
+      "expected_pointer": "/cases/10/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-session",
+      "connector": "codex",
+      "expected_pointer": "/cases/11/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-call-string",
+      "connector": "codex",
+      "expected_pointer": "/cases/12/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-call-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/13/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-result",
+      "connector": "codex",
+      "expected_pointer": "/cases/14/expected_standard/tools/0/status",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-tool-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/15/expected_standard/tools/0/status",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-last-total",
+      "connector": "codex",
+      "expected_pointer": "/cases/16/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-next",
+      "connector": "codex",
+      "expected_pointer": "/cases/17/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-null-info",
+      "connector": "codex",
+      "expected_pointer": "/cases/18/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-null-info",
+      "connector": "codex",
+      "expected_pointer": "/cases/18/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-legacy-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/19/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-legacy-conflict",
+      "connector": "codex",
+      "expected_pointer": "/cases/19/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-record",
+      "connector": "codex",
+      "expected_pointer": "/cases/20/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-usage-record-event",
+      "connector": "codex",
+      "expected_pointer": "/cases/21/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-unknown",
+      "connector": "codex",
+      "expected_pointer": "/cases/22/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-unknown",
+      "connector": "codex",
+      "expected_pointer": "/cases/22/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-invalid-time",
+      "connector": "codex",
+      "expected_pointer": "/cases/23/expected_standard/model",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    },
+    {
+      "case_id": "codex-invalid-time",
+      "connector": "codex",
+      "expected_pointer": "/cases/23/expected_standard/provider",
+      "reason": "source_applicability_or_mapping_not_a_scalar_primitive"
+    }
+  ]
+}
