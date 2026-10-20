@@ -9,8 +9,8 @@
 //! The nine cases are the fixed roster of `task-19-test-contract.md`. The
 //! legacy pre-state for the no-ingest cases comes from
 //! `util/source_legacy_seed.rs` through an explicit `#[path]` module, so this
-//! target holds exactly nine tests and does not pull in the shared `util`
-//! module's 57 tests.
+//! target keeps those nine tests plus the verified-reader pagination
+//! regressions, without pulling in the shared `util` module's 57 tests.
 //!
 //! The fixtures are synthetic and neutral. No real session, path or secret
 //! appears in this file.
@@ -952,6 +952,94 @@ fn default_index() {
         drop(db);
 
         assert_auto_identity(&fixture, label);
+    }
+}
+
+fn assert_verified_source_pages(connector: &str, records: usize, large_first_body: bool, streaming: bool) {
+    let fixture = Fixture::new();
+    let session = "40000000-0000-4000-8000-000000000001";
+    let mut lines = if connector == "codex" {
+        vec![codex_session(session, "unused", "unused")[0].clone()]
+    } else {
+        Vec::new()
+    };
+    for index in lines.len()..records {
+        let padding = if large_first_body && index == usize::from(connector == "codex") {
+            "x".repeat(9 * 1024 * 1024)
+        } else {
+            "alpha beta gamma ".repeat(65)
+        };
+        let body = format!("Synthetic paging record {index}: {padding}");
+        lines.push(if connector == "claude" {
+            serde_json::json!({
+                "type": "user", "sessionId": session,
+                "uuid": format!("paging-message-{index}"),
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"role": "user", "content": body}
+            })
+        } else {
+            serde_json::json!({
+                "type": "response_item", "timestamp": "2026-01-01T00:00:00Z",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": body}]}
+            })
+        });
+    }
+    let path = if connector == "claude" {
+        fixture.write_claude_session("-synthetic-paging/session.jsonl", &lines)
+    } else {
+        fixture.write_codex_session("2026/01/rollout-paging.jsonl", &lines)
+    };
+    let original = std::fs::read(&path).expect("read the independent source bytes");
+    let expected_hashes: Vec<Vec<u8>> = original
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| Sha256::digest(line).to_vec())
+        .collect();
+    let output = fixture.index(
+        &["--full"],
+        &[("CASS_STREAMING_INDEX", if streaming { "1" } else { "0" }),
+          ("RAYON_NUM_THREADS", "2")],
+    );
+    assert_eq!(output.status.code(), Some(0),
+        "{connector}/{records}/large={large_first_body}/streaming={streaming}: {}",
+        String::from_utf8_lossy(&output.stderr));
+    let db = fixture.open_db();
+    assert_eq!(complete_inputs(&db), 1);
+    assert_eq!(inputs_with_committed_receipt(&db), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM messages"),
+        (records - usize::from(connector == "codex")) as i64);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM source_records WHERE frame_state = 'activated'"), records as i64);
+    let mut statement = db.prepare(
+        "SELECT expected_source_record_sha256, observed_source_record_sha256 FROM source_records ORDER BY ordinal"
+    ).expect("prepare record hash query");
+    let hashes: Vec<(Vec<u8>, Vec<u8>)> = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query record hashes").collect::<rusqlite::Result<_>>().expect("read record hashes");
+    assert_eq!(hashes.len(), expected_hashes.len());
+    for ((expected, observed), physical) in hashes.iter().zip(expected_hashes.iter()) {
+        assert_eq!(expected, physical);
+        assert_eq!(observed, physical);
+    }
+    assert_eq!(std::fs::read(&path).expect("source remains readable"), original);
+}
+
+#[test]
+fn source_record_pages_preserve_verified_reader_position() {
+    for streaming in [true, false] {
+        for connector in ["claude", "codex"] {
+            for records in [32, 64, 65, 130] {
+                assert_verified_source_pages(connector, records, false, streaming);
+            }
+        }
+    }
+}
+
+#[test]
+fn source_byte_pages_preserve_verified_reader_position() {
+    for streaming in [true, false] {
+        for connector in ["claude", "codex"] {
+            assert_verified_source_pages(connector, 3, true, streaming);
+        }
     }
 }
 
