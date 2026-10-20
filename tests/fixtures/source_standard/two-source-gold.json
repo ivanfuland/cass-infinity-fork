@@ -1,0 +1,2055 @@
+{
+  "schema": "cass.mapper-gold/1",
+  "oracle_commit": "de50d7538d72c49ef284e33464c7c1bce480bc67",
+  "expected_origin": "independent oracle snapshot plus hand-authored scalar assertions; no product imports",
+  "cases": [
+    {
+      "id": "claude-identity-time",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"assistant\",\"sessionId\":\"s-a\",\"uuid\":\"r-a\",\"requestId\":\"q-a\",\"timestamp\":\"1969-12-31T23:59:59.875Z\",\"message\":{\"id\":\"m-a\",\"model\":\"model-a\",\"role\":\"assistant\"},\"unknown\":{\"n\":9007199254740993}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "present",
+          "value": "model-a",
+          "raw_ref": "/message/model"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "present",
+            "value": "s-a",
+            "raw_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "present",
+            "value": "r-a",
+            "raw_ref": "/uuid"
+          },
+          "provider_message_id": {
+            "field": "provider_message_id",
+            "status": "present",
+            "value": "m-a",
+            "raw_ref": "/message/id"
+          },
+          "request_id": {
+            "field": "request_id",
+            "status": "present",
+            "value": "q-a",
+            "raw_ref": "/requestId"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "present",
+            "value": "-0.125",
+            "raw_ref": "/timestamp",
+            "unit": "epoch"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-null-missing",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"assistant\",\"message\":{\"model\":null,\"id\":\"\"},\"timestamp\":null}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "raw_ref": "/message/model",
+          "reason": "null"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          },
+          "provider_message_id": {
+            "field": "provider_message_id",
+            "status": "invalid",
+            "raw_ref": "/message/id",
+            "reason": "empty_id"
+          },
+          "request_id": {
+            "field": "request_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/requestId"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "raw_ref": "/timestamp",
+            "reason": "null"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-off-role",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"assistant\",\"message\":{\"role\":\"user\",\"model\":\"ignored\",\"usage\":{\"input_tokens\":3},\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"id\":\"c1\",\"input\":{}}]}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "tool_use_off_role",
+            "raw_ref": "/message/content/0",
+            "name": {
+              "field": "name",
+              "status": "present",
+              "value": "Read",
+              "raw_ref": "/message/content/0/name"
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-tools",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Read\",\"id\":\"call-a\",\"input\":{\"ok\":false,\"value\":1e400}}],\"stop_reason\":\"tool_use\"}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "absent",
+          "presence_ref": "/message/model"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          },
+          "provider_message_id": {
+            "field": "provider_message_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/message/id"
+          },
+          "request_id": {
+            "field": "request_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/requestId"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "call",
+            "raw_ref": "/message/content/0",
+            "name": {
+              "field": "name",
+              "status": "present",
+              "value": "Read",
+              "raw_ref": "/message/content/0/name"
+            },
+            "id": {
+              "field": "id",
+              "status": "present",
+              "value": "call-a",
+              "raw_ref": "/message/content/0/id"
+            },
+            "input": {
+              "field": "input",
+              "status": "present",
+              "value": [
+                "obj",
+                [
+                  [
+                    "ok",
+                    [
+                      "bool",
+                      false
+                    ]
+                  ],
+                  [
+                    "value",
+                    [
+                      "num",
+                      "1e400"
+                    ]
+                  ]
+                ]
+              ],
+              "value_kind": "object",
+              "raw_ref": "/message/content/0/input"
+            }
+          },
+          {
+            "kind": "stop_reason",
+            "raw_ref": "/message/stop_reason",
+            "value": {
+              "field": "stop_reason",
+              "status": "present",
+              "value": "tool_use",
+              "raw_ref": "/message/stop_reason"
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-tool-result",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-a\",\"content\":[],\"is_error\":false}]}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "result",
+            "raw_ref": "/message/content/0",
+            "id": {
+              "field": "id",
+              "status": "present",
+              "value": "call-a",
+              "raw_ref": "/message/content/0/tool_use_id"
+            },
+            "content": {
+              "field": "content",
+              "status": "present",
+              "value": [
+                "arr",
+                []
+              ],
+              "value_kind": "array",
+              "raw_ref": "/message/content/0/content"
+            },
+            "is_error": {
+              "field": "is_error",
+              "status": "present",
+              "value": false,
+              "raw_ref": "/message/content/0/is_error"
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-usage",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1e3,\"output_tokens\":1.0,\"cache_read_input_tokens\":2,\"cache_creation_input_tokens\":3,\"thinking_tokens\":4,\"output_tokens_details\":{\"thinking_tokens\":5},\"cache_creation\":{\"ephemeral_5m_input_tokens\":6,\"ephemeral_1h_input_tokens\":7}}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "absent",
+          "presence_ref": "/message/model"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          },
+          "provider_message_id": {
+            "field": "provider_message_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/message/id"
+          },
+          "request_id": {
+            "field": "request_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/requestId"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "event",
+            "role": "message_usage",
+            "raw_ref": "/message/usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "1000",
+                "raw_ref": "/message/usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "present",
+                "value": "1",
+                "raw_ref": "/message/usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "present",
+                "value": "2",
+                "raw_ref": "/message/usage/cache_read_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "present",
+                "value": "3",
+                "raw_ref": "/message/usage/cache_creation_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "present",
+                "value": "4",
+                "raw_ref": "/message/usage/thinking_tokens",
+                "unit": "count"
+              },
+              "output_tokens_details": {
+                "field": "output_tokens_details",
+                "status": "present",
+                "value": [
+                  "obj",
+                  [
+                    [
+                      "thinking_tokens",
+                      [
+                        "num",
+                        "5"
+                      ]
+                    ]
+                  ]
+                ],
+                "value_kind": "object",
+                "raw_ref": "/message/usage/output_tokens_details"
+              },
+              "total": {
+                "field": "total",
+                "status": "missing",
+                "reason": "not_applicable"
+              }
+            }
+          },
+          {
+            "scope": "cache_creation_detail",
+            "role": "message_usage",
+            "raw_ref": "/message/usage/cache_creation",
+            "fields": {
+              "cache_write_5m": {
+                "field": "cache_write_5m",
+                "status": "present",
+                "value": "6",
+                "raw_ref": "/message/usage/cache_creation/ephemeral_5m_input_tokens",
+                "unit": "count"
+              },
+              "cache_write_1h": {
+                "field": "cache_write_1h",
+                "status": "present",
+                "value": "7",
+                "raw_ref": "/message/usage/cache_creation/ephemeral_1h_input_tokens",
+                "unit": "count"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-nested-usage",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"user\",\"toolUseResult\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":9,\"cache_read_input_tokens\":1,\"cache_creation_input_tokens\":2},\"totalTokens\":17}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "nested_result",
+            "role": "tool_use_result",
+            "raw_ref": "/toolUseResult/usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "8",
+                "raw_ref": "/toolUseResult/usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "present",
+                "value": "9",
+                "raw_ref": "/toolUseResult/usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "present",
+                "value": "1",
+                "raw_ref": "/toolUseResult/usage/cache_read_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "present",
+                "value": "2",
+                "raw_ref": "/toolUseResult/usage/cache_creation_input_tokens",
+                "unit": "count"
+              }
+            }
+          },
+          {
+            "scope": "nested_result_total",
+            "role": "tool_use_result",
+            "raw_ref": "/toolUseResult/totalTokens",
+            "fields": {
+              "total": {
+                "field": "total",
+                "status": "present",
+                "value": "17",
+                "raw_ref": "/toolUseResult/totalTokens",
+                "unit": "count"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-model-cost",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"system\",\"modelUsage\":{\"model-a\":{\"inputTokens\":8,\"outputTokens\":9,\"cacheReadInputTokens\":1,\"cacheCreationInputTokens\":2,\"costUSD\":0.12}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/sessionId"
+          },
+          "record_uuid": {
+            "field": "record_uuid",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/uuid"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "cost_state",
+            "role": "model_usage",
+            "raw_ref": "/modelUsage/model-a",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/modelUsage/model-a/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/modelUsage/model-a/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/modelUsage/model-a/cache_read_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/modelUsage/model-a/cache_creation_input_tokens",
+                "unit": "count"
+              },
+              "source_details": {
+                "field": "source_details",
+                "status": "present",
+                "value": [
+                  "obj",
+                  [
+                    [
+                      "inputTokens",
+                      [
+                        "num",
+                        "8"
+                      ]
+                    ],
+                    [
+                      "outputTokens",
+                      [
+                        "num",
+                        "9"
+                      ]
+                    ],
+                    [
+                      "cacheReadInputTokens",
+                      [
+                        "num",
+                        "1"
+                      ]
+                    ],
+                    [
+                      "cacheCreationInputTokens",
+                      [
+                        "num",
+                        "2"
+                      ]
+                    ],
+                    [
+                      "costUSD",
+                      [
+                        "num",
+                        "0.12"
+                      ]
+                    ]
+                  ]
+                ],
+                "value_kind": "object",
+                "raw_ref": "/modelUsage/model-a"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "claude-document",
+      "connector": "claude_code",
+      "format": "json_document",
+      "input_json": "{\"sessionId\":\"doc-a\",\"messages\":[{\"role\":\"assistant\",\"type\":\"user\",\"timestamp\":\"1970-01-01T00:00:00.25Z\",\"time\":\"1970-01-01T00:00:01Z\",\"content\":[{\"type\":\"text\",\"text\":\"fixture\"}]}]}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "session_id": {
+            "field": "session_id",
+            "status": "present",
+            "value": "doc-a",
+            "raw_ref": "/sessionId"
+          }
+        },
+        "times": {},
+        "tools": [],
+        "usage": [],
+        "messages": [
+          {
+            "ref": "/messages/0",
+            "model": {
+              "field": "model",
+              "status": "missing",
+              "reason": "not_applicable"
+            },
+            "ids": {},
+            "times": {
+              "timestamp": {
+                "field": "time",
+                "status": "present",
+                "value": "0.25",
+                "raw_ref": "/messages/0/timestamp",
+                "unit": "epoch"
+              },
+              "time": {
+                "field": "time",
+                "status": "conflict",
+                "refs": [
+                  {
+                    "status": "present",
+                    "value": "0.25",
+                    "raw_ref": "/messages/0/timestamp",
+                    "unit": "epoch"
+                  },
+                  {
+                    "status": "present",
+                    "value": "1",
+                    "raw_ref": "/messages/0/time",
+                    "unit": "epoch"
+                  }
+                ]
+              }
+            },
+            "role": [
+              {
+                "field": "role",
+                "status": "conflict",
+                "refs": [
+                  {
+                    "status": "present",
+                    "value": "assistant",
+                    "raw_ref": "/messages/0/role"
+                  },
+                  {
+                    "status": "present",
+                    "value": "user",
+                    "raw_ref": "/messages/0/type"
+                  }
+                ]
+              }
+            ],
+            "usage": [],
+            "tools": []
+          }
+        ]
+      }
+    },
+    {
+      "id": "claude-unknown",
+      "connector": "claude_code",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"future_event\",\"new_field\":[0,false,null]}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-context",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"turn_context\",\"timestamp\":\"1970-01-01T00:00:01.125Z\",\"payload\":{\"model\":\"model-b\"}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "present",
+          "value": "model-b",
+          "raw_ref": "/payload/model"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "present",
+            "value": "1.125",
+            "raw_ref": "/timestamp",
+            "unit": "epoch"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-session",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s-b\",\"model_provider\":\"provider-b\",\"timestamp\":123,\"cwd\":\"/fixture/project\"}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "present",
+          "value": "provider-b",
+          "raw_ref": "/payload/model_provider"
+        },
+        "native_ids": {
+          "session_metadata_id": {
+            "field": "session_metadata_id",
+            "status": "present",
+            "value": "s-b",
+            "raw_ref": "/payload/id"
+          },
+          "cwd": {
+            "field": "cwd",
+            "status": "present",
+            "value": "/fixture/project",
+            "raw_ref": "/payload/cwd"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          },
+          "payload": {
+            "field": "time",
+            "status": "invalid",
+            "raw_ref": "/payload/timestamp",
+            "reason": "unit_unproven"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-call-string",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"id\":\"item-b\",\"call_id\":\"call-b\",\"name\":\"Read\",\"arguments\":\"{}\"}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "item_id": {
+            "field": "item_id",
+            "status": "present",
+            "value": "item-b",
+            "raw_ref": "/payload/id"
+          },
+          "call_id": {
+            "field": "call_id",
+            "status": "present",
+            "value": "call-b",
+            "raw_ref": "/payload/call_id"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "call",
+            "raw_ref": "/payload",
+            "name": {
+              "field": "name",
+              "status": "present",
+              "value": "Read",
+              "raw_ref": "/payload/name"
+            },
+            "id": {
+              "field": "id",
+              "status": "present",
+              "value": "call-b",
+              "raw_ref": "/payload/call_id"
+            },
+            "arguments": {
+              "field": "arguments",
+              "status": "present",
+              "value": "{}",
+              "raw_ref": "/payload/arguments"
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-call-conflict",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"response_item\",\"payload\":{\"type\":\"custom_tool_call\",\"call_id\":\"call-b\",\"name\":\"Read\",\"arguments\":{\"x\":1},\"input\":{\"x\":2}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "item_id": {
+            "field": "item_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/payload/id"
+          },
+          "call_id": {
+            "field": "call_id",
+            "status": "present",
+            "value": "call-b",
+            "raw_ref": "/payload/call_id"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "call",
+            "raw_ref": "/payload",
+            "name": {
+              "field": "name",
+              "status": "present",
+              "value": "Read",
+              "raw_ref": "/payload/name"
+            },
+            "id": {
+              "field": "id",
+              "status": "present",
+              "value": "call-b",
+              "raw_ref": "/payload/call_id"
+            },
+            "arguments": {
+              "field": "arguments",
+              "status": "conflict",
+              "refs": [
+                {
+                  "status": "present",
+                  "value": [
+                    "obj",
+                    [
+                      [
+                        "x",
+                        [
+                          "num",
+                          "1"
+                        ]
+                      ]
+                    ]
+                  ],
+                  "value_kind": "object",
+                  "raw_ref": "/payload/arguments"
+                },
+                {
+                  "status": "present",
+                  "value": [
+                    "obj",
+                    [
+                      [
+                        "x",
+                        [
+                          "num",
+                          "2"
+                        ]
+                      ]
+                    ]
+                  ],
+                  "value_kind": "object",
+                  "raw_ref": "/payload/input"
+                }
+              ]
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-result",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"call-b\",\"output\":\"\",\"status\":\"completed\"}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "item_id": {
+            "field": "item_id",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/payload/id"
+          },
+          "call_id": {
+            "field": "call_id",
+            "status": "present",
+            "value": "call-b",
+            "raw_ref": "/payload/call_id"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "result",
+            "raw_ref": "/payload/output",
+            "id": {
+              "field": "id",
+              "status": "present",
+              "value": "call-b",
+              "raw_ref": "/payload/call_id"
+            },
+            "output": {
+              "field": "output",
+              "status": "present",
+              "value": "",
+              "raw_ref": "/payload/output"
+            },
+            "status": {
+              "field": "status",
+              "status": "invalid",
+              "value": "completed",
+              "raw_ref": "/payload/status",
+              "reason": "unmapped"
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-tool-event",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"event_msg\",\"payload\":{\"type\":\"tool_call\",\"call_id\":\"call-b\",\"id\":\"event-b\",\"name\":\"Read\",\"arguments\":\"a\",\"input\":\"b\",\"status\":\"queued\"}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "call_id": {
+            "field": "call_id",
+            "status": "present",
+            "value": "call-b",
+            "raw_ref": "/payload/call_id"
+          },
+          "record_id": {
+            "field": "record_id",
+            "status": "present",
+            "value": "event-b",
+            "raw_ref": "/payload/id"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [
+          {
+            "kind": "event",
+            "raw_ref": "/payload",
+            "event_type": {
+              "field": "event_type",
+              "status": "present",
+              "value": "tool_call",
+              "raw_ref": "/payload/type"
+            },
+            "status": {
+              "field": "status",
+              "status": "invalid",
+              "value": "queued",
+              "raw_ref": "/payload/status",
+              "reason": "unmapped"
+            }
+          },
+          {
+            "kind": "call",
+            "raw_ref": "/payload",
+            "name": {
+              "field": "name",
+              "status": "present",
+              "value": "Read",
+              "raw_ref": "/payload/name"
+            },
+            "id": {
+              "field": "id",
+              "status": "present",
+              "value": "call-b",
+              "raw_ref": "/payload/call_id"
+            },
+            "arguments": {
+              "field": "arguments",
+              "status": "conflict",
+              "refs": [
+                {
+                  "status": "present",
+                  "value": "a",
+                  "raw_ref": "/payload/arguments"
+                },
+                {
+                  "status": "present",
+                  "value": "b",
+                  "raw_ref": "/payload/input"
+                }
+              ]
+            }
+          }
+        ],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-usage-last-total",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":100,\"output_tokens\":2,\"cached_input_tokens\":3,\"cache_write_input_tokens\":4,\"reasoning_output_tokens\":5,\"total_tokens\":114},\"total_token_usage\":{\"input_tokens\":1000,\"output_tokens\":20,\"cached_input_tokens\":30,\"cache_write_input_tokens\":40,\"reasoning_output_tokens\":50,\"total_tokens\":1140},\"model_context_window\":128000},\"rate_limits\":{\"used\":0.25}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "codex_last",
+            "role": "snapshot",
+            "raw_ref": "/payload/info/last_token_usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "100",
+                "raw_ref": "/payload/info/last_token_usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "present",
+                "value": "2",
+                "raw_ref": "/payload/info/last_token_usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "present",
+                "value": "3",
+                "raw_ref": "/payload/info/last_token_usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "present",
+                "value": "4",
+                "raw_ref": "/payload/info/last_token_usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "present",
+                "value": "5",
+                "raw_ref": "/payload/info/last_token_usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "present",
+                "value": "114",
+                "raw_ref": "/payload/info/last_token_usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          },
+          {
+            "scope": "codex_total",
+            "role": "snapshot",
+            "raw_ref": "/payload/info/total_token_usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "1000",
+                "raw_ref": "/payload/info/total_token_usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "present",
+                "value": "20",
+                "raw_ref": "/payload/info/total_token_usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "present",
+                "value": "30",
+                "raw_ref": "/payload/info/total_token_usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "present",
+                "value": "40",
+                "raw_ref": "/payload/info/total_token_usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "present",
+                "value": "50",
+                "raw_ref": "/payload/info/total_token_usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "present",
+                "value": "1140",
+                "raw_ref": "/payload/info/total_token_usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          },
+          {
+            "scope": "capacity",
+            "role": "context_window",
+            "raw_ref": "/payload/info/model_context_window",
+            "fields": {
+              "context_window": {
+                "field": "context_window",
+                "status": "present",
+                "value": "128000",
+                "raw_ref": "/payload/info/model_context_window",
+                "unit": "count"
+              }
+            }
+          },
+          {
+            "scope": "rate_limits",
+            "role": "limits",
+            "raw_ref": "/payload/rate_limits",
+            "fields": {
+              "rate_limits": {
+                "field": "rate_limits",
+                "status": "present",
+                "value": [
+                  "obj",
+                  [
+                    [
+                      "used",
+                      [
+                        "num",
+                        "0.25"
+                      ]
+                    ]
+                  ]
+                ],
+                "value_kind": "object",
+                "raw_ref": "/payload/rate_limits"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-usage-next",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":120,\"output_tokens\":3}}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "codex_last",
+            "role": "snapshot",
+            "raw_ref": "/payload/info/last_token_usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "120",
+                "raw_ref": "/payload/info/last_token_usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "present",
+                "value": "3",
+                "raw_ref": "/payload/info/last_token_usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/info/last_token_usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/info/last_token_usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/info/last_token_usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/info/last_token_usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-usage-null-info",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":null,\"rate_limits\":{\"used\":0}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "rate_limits",
+            "role": "limits",
+            "raw_ref": "/payload/rate_limits",
+            "fields": {
+              "rate_limits": {
+                "field": "rate_limits",
+                "status": "present",
+                "value": [
+                  "obj",
+                  [
+                    [
+                      "used",
+                      [
+                        "num",
+                        "0"
+                      ]
+                    ]
+                  ]
+                ],
+                "value_kind": "object",
+                "raw_ref": "/payload/rate_limits"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-legacy-conflict",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"token_count\",\"payload\":{\"input_tokens\":5,\"output_tokens\":7,\"tokens\":8}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "codex_legacy",
+            "role": "token_count",
+            "raw_ref": "/payload",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "5",
+                "raw_ref": "/payload/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "conflict",
+                "refs": [
+                  {
+                    "status": "present",
+                    "value": "7",
+                    "raw_ref": "/payload/output_tokens",
+                    "unit": "count"
+                  },
+                  {
+                    "status": "present",
+                    "value": "8",
+                    "raw_ref": "/payload/tokens",
+                    "unit": "count"
+                  }
+                ]
+              },
+              "output_legacy": {
+                "field": "output_legacy",
+                "status": "present",
+                "value": "8",
+                "raw_ref": "/payload/tokens",
+                "unit": "count"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-usage-record",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"token_usage_record\",\"payload\":{\"response_id\":\"resp-b\",\"thread_id\":\"thread-b\",\"turn_id\":\"turn-b\",\"usage\":{\"input_tokens\":1},\"turn_token_usage\":{\"input_tokens\":2},\"thread_token_usage\":{\"input_tokens\":3}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "response_id": {
+            "field": "response_id",
+            "status": "present",
+            "value": "resp-b",
+            "raw_ref": "/payload/response_id"
+          },
+          "thread_id": {
+            "field": "thread_id",
+            "status": "present",
+            "value": "thread-b",
+            "raw_ref": "/payload/thread_id"
+          },
+          "turn_id": {
+            "field": "turn_id",
+            "status": "present",
+            "value": "turn-b",
+            "raw_ref": "/payload/turn_id"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "token_usage_record_usage",
+            "role": "snapshot",
+            "raw_ref": "/payload/usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "1",
+                "raw_ref": "/payload/usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          },
+          {
+            "scope": "token_usage_record_turn",
+            "role": "snapshot",
+            "raw_ref": "/payload/turn_token_usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "2",
+                "raw_ref": "/payload/turn_token_usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/turn_token_usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/turn_token_usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/turn_token_usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/turn_token_usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/turn_token_usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          },
+          {
+            "scope": "token_usage_record_thread",
+            "role": "snapshot",
+            "raw_ref": "/payload/thread_token_usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "present",
+                "value": "3",
+                "raw_ref": "/payload/thread_token_usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/thread_token_usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/thread_token_usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/thread_token_usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/thread_token_usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/thread_token_usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-usage-record-event",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_usage_record\",\"response_id\":\"resp-c\",\"usage\":{\"output_tokens\":4}}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {
+          "response_id": {
+            "field": "response_id",
+            "status": "present",
+            "value": "resp-c",
+            "raw_ref": "/payload/response_id"
+          }
+        },
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [
+          {
+            "scope": "token_usage_record_usage",
+            "role": "snapshot",
+            "raw_ref": "/payload/usage",
+            "fields": {
+              "input": {
+                "field": "input",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/input_tokens",
+                "unit": "count"
+              },
+              "output": {
+                "field": "output",
+                "status": "present",
+                "value": "4",
+                "raw_ref": "/payload/usage/output_tokens",
+                "unit": "count"
+              },
+              "cache_read": {
+                "field": "cache_read",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/cached_input_tokens",
+                "unit": "count"
+              },
+              "cache_write": {
+                "field": "cache_write",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/cache_write_input_tokens",
+                "unit": "count"
+              },
+              "thinking": {
+                "field": "thinking",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/reasoning_output_tokens",
+                "unit": "count"
+              },
+              "total": {
+                "field": "total",
+                "status": "missing",
+                "reason": "absent",
+                "presence_ref": "/payload/usage/total_tokens",
+                "unit": "count"
+              }
+            }
+          }
+        ],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-unknown",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"future_event\",\"payload\":{\"new_field\":1e-400}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "missing",
+            "reason": "absent",
+            "presence_ref": "/timestamp"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    },
+    {
+      "id": "codex-invalid-time",
+      "connector": "codex",
+      "format": "jsonl",
+      "input_json": "{\"type\":\"turn_context\",\"timestamp\":\"2026-01-01T00:00:00\",\"payload\":{\"model\":42}}",
+      "expected_standard": {
+        "model": {
+          "field": "model",
+          "status": "invalid",
+          "raw_ref": "/payload/model",
+          "reason": "bad_type"
+        },
+        "provider": {
+          "field": "provider",
+          "status": "missing",
+          "reason": "not_applicable"
+        },
+        "native_ids": {},
+        "times": {
+          "event": {
+            "field": "time",
+            "status": "invalid",
+            "raw_ref": "/timestamp",
+            "reason": "unproven_format"
+          }
+        },
+        "tools": [],
+        "usage": [],
+        "messages": []
+      }
+    }
+  ],
+  "count_gold": [
+    {
+      "input_json": "0",
+      "status": "present",
+      "value": "0",
+      "reason": null
+    },
+    {
+      "input_json": "-0",
+      "status": "present",
+      "value": "0",
+      "reason": null
+    },
+    {
+      "input_json": "1.0",
+      "status": "present",
+      "value": "1",
+      "reason": null
+    },
+    {
+      "input_json": "1e3",
+      "status": "present",
+      "value": "1000",
+      "reason": null
+    },
+    {
+      "input_json": "1000e-3",
+      "status": "present",
+      "value": "1",
+      "reason": null
+    },
+    {
+      "input_json": "9007199254740993",
+      "status": "present",
+      "value": "9007199254740993",
+      "reason": null
+    },
+    {
+      "input_json": "18446744073709551615",
+      "status": "present",
+      "value": "18446744073709551615",
+      "reason": null
+    },
+    {
+      "input_json": "18446744073709551616",
+      "status": "invalid",
+      "value": null,
+      "reason": "out_of_domain"
+    },
+    {
+      "input_json": "-1",
+      "status": "invalid",
+      "value": null,
+      "reason": "negative_nonzero"
+    },
+    {
+      "input_json": "0.1",
+      "status": "invalid",
+      "value": null,
+      "reason": "not_an_integer"
+    },
+    {
+      "input_json": "1e400",
+      "status": "invalid",
+      "value": null,
+      "reason": "out_of_domain"
+    },
+    {
+      "input_json": "1e-400",
+      "status": "invalid",
+      "value": null,
+      "reason": "not_an_integer"
+    },
+    {
+      "input_json": "1e999999999",
+      "status": "invalid",
+      "value": null,
+      "reason": "out_of_domain"
+    },
+    {
+      "input_json": "1e-999999999",
+      "status": "invalid",
+      "value": null,
+      "reason": "not_an_integer"
+    },
+    {
+      "input_json": "\"1\"",
+      "status": "invalid",
+      "value": null,
+      "reason": "not_a_number"
+    },
+    {
+      "input_json": "true",
+      "status": "invalid",
+      "value": null,
+      "reason": "not_a_number"
+    }
+  ]
+}

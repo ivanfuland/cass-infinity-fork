@@ -103,7 +103,15 @@ use super::api::{Conn, StorageError, Tx, TxMode, Value, params};
 /// Version 8 adds eight int8 mirrors beside each float index, a database
 /// instance identity and transactionally maintained vector revisions.
 /// Older archives must be rebuilt; this is not an in-place migration.
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+/// Version 9 (SRC05A) adds the three source-aware tables
+/// (`source_inputs`, `source_records`, `source_message_links`) together with
+/// their shape-checked integer/SHA BLOB predicates, the per-library
+/// `library_identity` UUIDv4 meta row and the `source_facts_revision`
+/// counter. It also makes a strict source-schema shape verification run on
+/// every open, after the version check and before any derived repair, so a
+/// missing or drifted source table is refused instead of silently
+/// rebuilt. Rebuild-only, same as v5 through v8.
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 /// The `lex_docs`/`fts_lex` domain DDL (w2 Task W2-2, OQ2: external-content
 /// mode) — **must stay byte-for-byte identical** to the matching two lines
@@ -255,6 +263,132 @@ INSERT INTO meta(key,value) VALUES('vector_domain_instance_id',lower(hex(randomb
 
 "#;
 
+/// meta key holding this library's UUIDv4 identity (SRC05A §12). Written once
+/// in the schema-9 initialization transaction; a read-only open never writes
+/// it. A byte copy of a library keeps the same UUID; a brand-new library (or a
+/// restore-new target) generates a fresh one.
+pub(crate) const LIBRARY_IDENTITY_META_KEY: &str = "library_identity";
+
+/// meta key holding the monotonic `source_facts_revision` counter (SRC05A §13),
+/// stored as a decimal string. Initialized to `"0"`.
+pub(crate) const SOURCE_FACTS_REVISION_META_KEY: &str = "source_facts_revision";
+
+/// The three source-aware tables and their two partial/stream indexes
+/// (SRC05A contract §6), split one statement per element so
+/// [`crate::storage::source_facts::verify_source_schema`] can compare each
+/// stored `sqlite_master.sql` byte-for-byte after whitespace normalization.
+///
+/// The statement text is the frozen contract DDL: the integer/SHA predicates
+/// (`typeof(...)='blob' AND length(...)=N`) and the ordered `CHECK` pairs are
+/// the whole point of these tables, so they are verified structurally rather
+/// than trusted by name. The statements are executed in the same
+/// schema-9 initialization transaction as [`FRESH_SCHEMA_DDL`]; they are never
+/// created by the derived-repair path.
+pub const SOURCE_FACTS_DDL_STATEMENTS: [&str; 5] = [
+    r#"CREATE TABLE source_inputs (
+  id INTEGER PRIMARY KEY,
+  input_key BLOB NOT NULL UNIQUE CHECK(typeof(input_key)='blob' AND length(input_key)=32),
+  identity_tuple_bin BLOB NOT NULL,
+  source_id TEXT NOT NULL,
+  identity_namespace TEXT NOT NULL,
+  connector TEXT NOT NULL,
+  origin_host TEXT,
+  origin_source_version TEXT,
+  role_bin BLOB CHECK(role_bin IS NULL OR typeof(role_bin)='blob'),
+  platform_bin BLOB CHECK(platform_bin IS NULL OR typeof(platform_bin)='blob'),
+  root_id_bin BLOB NOT NULL,
+  relative_locator_bin BLOB NOT NULL,
+  discovery_bin BLOB NOT NULL,
+  parser_context_bin BLOB NOT NULL,
+  context_digest BLOB NOT NULL CHECK(typeof(context_digest)='blob' AND length(context_digest)=32),
+  sealed_ref_bin BLOB NOT NULL,
+  sealed_sha256 BLOB NOT NULL CHECK(typeof(sealed_sha256)='blob' AND length(sealed_sha256)=32),
+  byte_len BLOB NOT NULL CHECK(typeof(byte_len)='blob' AND length(byte_len)=8),
+  format TEXT NOT NULL CHECK(format IN ('jsonl','json_document')),
+  expected_manifest_bin BLOB NOT NULL,
+  normalizer_id TEXT NOT NULL,
+  safety_contract_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('staged','partial','failed','complete')),
+  expected_records BLOB NOT NULL CHECK(typeof(expected_records)='blob' AND length(expected_records)=8),
+  expected_blank_lines BLOB NOT NULL CHECK(typeof(expected_blank_lines)='blob' AND length(expected_blank_lines)=8),
+  observed_records BLOB CHECK(observed_records IS NULL OR (typeof(observed_records)='blob' AND length(observed_records)=8)),
+  observed_blank_lines BLOB CHECK(observed_blank_lines IS NULL OR (typeof(observed_blank_lines)='blob' AND length(observed_blank_lines)=8)),
+  unprocessed_ranges_bin BLOB,
+  attempt_history_bin BLOB,
+  activation_request_hash BLOB CHECK(activation_request_hash IS NULL OR (typeof(activation_request_hash)='blob' AND length(activation_request_hash)=32)),
+  receipt_key TEXT,
+  applied_content_generation TEXT,
+  CHECK(state <> 'complete' OR (receipt_key IS NOT NULL AND applied_content_generation IS NOT NULL
+        AND activation_request_hash IS NOT NULL AND observed_records IS NOT NULL AND observed_blank_lines IS NOT NULL)),
+  CHECK(state =  'complete' OR (receipt_key IS NULL AND applied_content_generation IS NULL
+        AND activation_request_hash IS NULL))
+)"#,
+    r#"CREATE TABLE source_records (
+  id INTEGER PRIMARY KEY,
+  input_id INTEGER NOT NULL REFERENCES source_inputs(id) ON DELETE CASCADE,
+  ordinal BLOB NOT NULL CHECK(typeof(ordinal)='blob' AND length(ordinal)=8 AND ordinal > x'0000000000000000'),
+  record_pointer TEXT NOT NULL COLLATE BINARY,
+  position_bin BLOB NOT NULL,
+  expected_source_record_sha256 BLOB NOT NULL CHECK(typeof(expected_source_record_sha256)='blob' AND length(expected_source_record_sha256)=32),
+  observed_source_record_sha256 BLOB CHECK(observed_source_record_sha256 IS NULL OR (typeof(observed_source_record_sha256)='blob' AND length(observed_source_record_sha256)=32)),
+  frame_state TEXT NOT NULL CHECK(frame_state IN ('frame_pending','staged','activated')),
+  native_ids_bin BLOB,
+  parse_state TEXT NOT NULL CHECK(parse_state IN ('pending','parsed','parse_failed')),
+  record_mapping_state TEXT NOT NULL CHECK(record_mapping_state IN ('claims_pending','no_claims','all_canonical','all_standalone','all_unmapped','mixed')),
+  safety_state TEXT NOT NULL CHECK(safety_state IN ('pending','preserved','blocked')),
+  retention_state TEXT NOT NULL CHECK(retention_state IN ('payload_absent','payload_present')),
+  codec TEXT CHECK(codec IS NULL OR codec = 'safe-json-msgpack/1'),
+  payload_bin BLOB,
+  safe_value_hash BLOB CHECK(safe_value_hash IS NULL OR (typeof(safe_value_hash)='blob' AND length(safe_value_hash)=32)),
+  diagnostics_bin BLOB,
+  UNIQUE(input_id, ordinal, record_pointer),
+  CHECK(retention_state <> 'payload_present' OR (codec IS NOT NULL AND payload_bin IS NOT NULL AND safe_value_hash IS NOT NULL)),
+  CHECK(retention_state <> 'payload_absent'  OR (codec IS NULL AND payload_bin IS NULL AND safe_value_hash IS NULL))
+)"#,
+    r#"CREATE INDEX idx_source_records_stream
+  ON source_records(input_id, ordinal, record_pointer)"#,
+    r#"CREATE INDEX idx_source_records_activated
+  ON source_records(input_id, ordinal, record_pointer) WHERE frame_state = 'activated'"#,
+    r#"CREATE TABLE source_message_links (
+  id INTEGER PRIMARY KEY,
+  record_id INTEGER NOT NULL REFERENCES source_records(id) ON DELETE CASCADE,
+  projection_key BLOB NOT NULL CHECK(typeof(projection_key)='blob' AND length(projection_key)=32),
+  conversation_ordinal INTEGER CHECK(conversation_ordinal IS NULL OR (typeof(conversation_ordinal)='integer' AND conversation_ordinal >= 0 AND conversation_ordinal <= 4294967295)),
+  final_message_idx INTEGER CHECK(final_message_idx IS NULL OR (typeof(final_message_idx)='integer' AND final_message_idx >= 0)),
+  source_positions_bin BLOB NOT NULL,
+  projection_pointer TEXT COLLATE BINARY CHECK(projection_pointer IS NULL OR typeof(projection_pointer)='text'),
+  message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+  authority TEXT CHECK(authority IS NULL OR authority IN ('canonical','historical','standalone','unmapped','unresolved')),
+  evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('prose','tool_call','tool_result','reasoning','no_message','parse_failed')),
+  binding_digest BLOB NOT NULL CHECK(typeof(binding_digest)='blob' AND length(binding_digest)=32),
+  UNIQUE(record_id, projection_key),
+  CHECK((conversation_ordinal IS NULL AND final_message_idx IS NULL AND projection_pointer IS NULL) OR (conversation_ordinal IS NOT NULL AND final_message_idx IS NOT NULL AND projection_pointer IS NOT NULL)),
+  CHECK(authority IS NULL OR authority IN ('standalone','unmapped') OR (conversation_ordinal IS NOT NULL AND final_message_idx IS NOT NULL AND projection_pointer IS NOT NULL)),
+  CHECK(authority IS NULL OR authority NOT IN ('standalone','unmapped') OR (conversation_ordinal IS NULL AND final_message_idx IS NULL AND projection_pointer IS NULL)),
+  CHECK((authority IS NOT NULL AND authority='canonical' AND message_id IS NOT NULL) OR ((authority IS NULL OR authority<>'canonical') AND message_id IS NULL))
+)"#,
+];
+
+/// The exact ordered object list [`SOURCE_FACTS_DDL_STATEMENTS`] creates, in
+/// `(type, name, statement_index)` order, used by the verification gate.
+pub const SOURCE_FACTS_SCHEMA_OBJECTS: [(&str, &str, usize); 5] = [
+    ("table", "source_inputs", 0),
+    ("table", "source_records", 1),
+    ("index", "idx_source_records_stream", 2),
+    ("index", "idx_source_records_activated", 3),
+    ("table", "source_message_links", 4),
+];
+
+/// The two foreign-key actions the source-aware shape relies on
+/// (SRC05A contract §6): deleting a source input cascades to its records and
+/// links, while deleting a referenced message only nulls the link.
+pub(crate) const SOURCE_FACTS_FOREIGN_KEY_ACTIONS: [(&str, &str, &str, &str); 3] = [
+    // (child table, child column, parent table, on_delete)
+    ("source_records", "input_id", "source_inputs", "CASCADE"),
+    ("source_message_links", "record_id", "source_records", "CASCADE"),
+    ("source_message_links", "message_id", "messages", "SET NULL"),
+];
+
 // Whole CREATE TRIGGER statements live separately: each contains its own
 // semicolons, while the interrupted-DDL test deliberately splits the ordinary
 // fresh schema into statements and tests every transaction rollback boundary.
@@ -357,7 +491,32 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
             for ddl in VECTOR_DOMAIN_TRIGGER_DDL {
                 tx.execute_batch(ddl)?;
             }
+            // SRC05A §6/§12: the three source-aware tables and this library's
+            // UUIDv4 identity are created in the same initialization
+            // transaction as the rest of the fresh schema.
+            for ddl in SOURCE_FACTS_DDL_STATEMENTS {
+                tx.execute_batch(ddl)?;
+            }
+            let library_identity = generate_library_identity_uuid_v4()?;
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+                &[Value::Text(LIBRARY_IDENTITY_META_KEY.into()), Value::Text(library_identity)],
+            )?;
+            tx.execute(
+                "INSERT INTO meta(key, value) VALUES(?1, ?2)",
+                &[
+                    Value::Text(SOURCE_FACTS_REVISION_META_KEY.into()),
+                    Value::Text("0".into()),
+                ],
+            )?;
             tx.execute_batch(&set_user_version_sql(CURRENT_SCHEMA_VERSION))?;
+            // §6.4: validate the source-schema shape inside the same
+            // transaction that created it, so a built-but-drifted shape rolls
+            // the whole initialization back rather than leaving a half-usable
+            // archive.
+            crate::storage::source_facts::verify_source_schema(tx).map_err(|err| {
+                StorageError::Corrupt { detail: format!("source schema verification failed: {err}") }
+            })?;
             Ok(())
         });
     }
@@ -381,8 +540,53 @@ pub fn ensure(conn: &Conn) -> Result<(), StorageError> {
         return Err(StorageError::SchemaRebuildRequired { found: version, required: CURRENT_SCHEMA_VERSION });
     }
 
-    // version == CURRENT_SCHEMA_VERSION: already built, nothing to do.
+    // version == CURRENT_SCHEMA_VERSION: already built. SRC05A §6.4 requires
+    // the strict source-schema shape gate on every open, after the version
+    // check and before any derived-repair path runs. A missing table or a
+    // drifted column/CHECK/partial index is refused (structured `Corrupt`),
+    // never silently rebuilt.
+    crate::storage::source_facts::verify_source_schema(conn).map_err(|err| {
+        StorageError::Corrupt { detail: format!("source schema verification failed: {err}") }
+    })?;
     Ok(())
+}
+
+/// Error detail token for a failed system-entropy read during schema-9
+/// initialization (SRC05A §12). Initialization is refused rather than falling
+/// back to a time- or counter-derived identity.
+pub(crate) const ENTROPY_UNAVAILABLE_DETAIL: &str = "source-init-entropy-unavailable";
+
+/// Generate this library's UUIDv4 identity string from system entropy
+/// (SRC05A §12): 16 bytes from `rand::rngs::SysRng`, with the version field
+/// forced to 4 and the variant field to RFC 4122 (10xx). The crate carries no
+/// `uuid` dependency, so the 8-4-4-4-12 formatting is written here.
+///
+/// Entropy failure is a hard refusal, never a fallback to time or a
+/// pseudo-random counter.
+pub(crate) fn generate_library_identity_uuid_v4() -> Result<String, StorageError> {
+    use rand::TryRng;
+    use rand::rngs::SysRng;
+
+    let mut bytes = [0u8; 16];
+    let mut rng = SysRng;
+    rng.try_fill_bytes(&mut bytes).map_err(|_| StorageError::Other {
+        code: None,
+        detail: ENTROPY_UNAVAILABLE_DETAIL.to_string(),
+    })?;
+    // Version 4: high nibble of byte 6 is 0100.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    // Variant RFC 4122: top two bits of byte 8 are 10.
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 // =============================================================================

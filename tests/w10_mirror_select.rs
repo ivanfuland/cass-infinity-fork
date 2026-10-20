@@ -349,17 +349,10 @@ fn fallback_mirror_dir(data_dir: &Path, source_id: &str) -> PathBuf {
 /// Register one remote source in `data_dir`'s archive the way the registry
 /// holds it once the first ingest has run.
 ///
-/// Deliberately **no `config_json`**, and that is a finding rather than a
-/// shortcut. With `config_json.paths` present the first pass derives
-/// `<mirror>/<safe dirname>` and the second derives `<mirror>`: ingesting a
-/// session whose `source_id` is new upserts a placeholder `Source` with
-/// `config_json: None` (`src/storage/sqlite.rs`, the `known_sources` arm), and
-/// `upsert_source`'s `ON CONFLICT ... DO UPDATE SET config_json =
-/// excluded.config_json` lets that NULL overwrite the registered paths. The
-/// root changes between passes, claude's `external_id_root` changes with it,
-/// and the second pass dies on `E-MANIFEST-SESSION-KEY-CONFLICT` from
-/// `raw_mirror`'s session-key merge. Reported to the control plane; fixing it
-/// would change product scan rules, which this task does not own.
+/// This fixture has no `config_json.paths` so it continues to exercise the
+/// direct mirror-root fallback. Ordinary source ensures formerly overwrote
+/// registered paths with placeholder NULLs; the registered-path replay test
+/// below covers preservation separately.
 fn register_fallback_source(data_dir: &Path, source_id: &str) {
     let db_path = data_dir.join("agent_search.db");
     let storage = FrankenStorage::open(&db_path).expect("open the archive to register a source");
@@ -799,4 +792,126 @@ fn relative_and_symlinked_data_dirs_keep_the_incremental_state() {
             );
         }
     });
+}
+
+/// Registered paths must survive both ordinary write paths and replay. Each
+/// cell owns its HOME, XDG directories, database and source-safety policy.
+#[test]
+fn a4_registered_fallback_replay_preserves_source() {
+    for streaming in [false, true] {
+        for concurrent in [false, true] {
+            let env = Env::new(streaming);
+            let policy = env.root().join("source-safety.toml");
+            std::fs::copy(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("config/excluded_context_paths.toml"),
+                &policy,
+            )
+            .expect("copy private safety policy");
+            let storage = FrankenStorage::open(&env.db_path()).unwrap();
+            let mut source = Source::remote(FALLBACK_SOURCE_ID, "registered-host");
+            source.machine_id = Some("registered-machine".into());
+            source.platform = Some("linux".into());
+            source.config_json = Some(serde_json::json!({"paths": [REMOTE_PATH]}));
+            source.created_at = Some(1_700_000_000_000);
+            source.updated_at = Some(1_700_000_000_001);
+            storage.upsert_source(&source).unwrap();
+            let initial =
+                serde_json::to_value(storage.get_source(FALLBACK_SOURCE_ID).unwrap().unwrap())
+                    .unwrap();
+            storage.close().unwrap();
+            let mirror = fallback_mirror_dir(&env.data_dir, FALLBACK_SOURCE_ID)
+                .join(path_to_safe_dirname(REMOTE_PATH));
+            write_claude_session(&mirror, SESSION_RELATIVE);
+            let mut first_identities = None;
+            for pass in 1..=2 {
+                let mut cmd = env.cass();
+                cmd.env_clear()
+                    .env("HOME", &env.home)
+                    .env("XDG_CONFIG_HOME", &env.config_home)
+                    .env("XDG_DATA_HOME", env.home.join(".local/share"))
+                    .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+                    .env("NO_COLOR", "1")
+                    .env("CASS_IGNORE_SOURCES_CONFIG", "1")
+                    .env("CASS_STREAMING_INDEX", if streaming { "1" } else { "0" })
+                    .env(
+                        "CASS_INDEXER_BEGIN_CONCURRENT",
+                        if concurrent { "1" } else { "0" },
+                    )
+                    .args([
+                        "--verbose",
+                        "index",
+                        "--source-safety-config",
+                        policy.to_str().unwrap(),
+                        "--json",
+                        "--data-dir",
+                    ])
+                    .arg(&env.data_dir);
+                if concurrent {
+                    cmd.env("CASS_INDEXER_BEGIN_CONCURRENT_CHUNK_SIZE", "1");
+                }
+                let out = cmd.output().expect("run isolated cass");
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success(),
+                    "streaming={streaming} concurrent={concurrent} pass={pass}: {:?}\n{}\n{stderr}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout)
+                );
+                if concurrent {
+                    assert!(
+                        stderr.contains("using begin-concurrent write path for indexing"),
+                        "concurrent path not observed: {stderr}"
+                    );
+                }
+                let storage = FrankenStorage::open_readonly(&env.db_path()).unwrap();
+                let actual =
+                    serde_json::to_value(storage.get_source(FALLBACK_SOURCE_ID).unwrap().unwrap())
+                        .unwrap();
+                assert_eq!(
+                    actual, initial,
+                    "registration changed: streaming={streaming} concurrent={concurrent} pass={pass}"
+                );
+                storage.close().unwrap();
+                let conversations = table_rows(
+                    &env.db_path(),
+                    "SELECT CAST(id AS TEXT) || '|' || source_id || '|' || COALESCE(external_id, '') FROM conversations ORDER BY id",
+                );
+                let messages = table_rows(
+                    &env.db_path(),
+                    "SELECT CAST(id AS TEXT) || '|' || conversation_id || '|' || idx FROM messages ORDER BY id",
+                );
+                assert!(
+                    !messages.is_empty(),
+                    "the fixture must actually be ingested"
+                );
+                assert!(!conversations.is_empty());
+                assert!(
+                    conversations
+                        .iter()
+                        .all(|row| row.split('|').nth(1) == Some(FALLBACK_SOURCE_ID)),
+                    "wrong source: {conversations:?}"
+                );
+                println!(
+                    "registered replay streaming={streaming} concurrent={concurrent} pass={pass}: rc=0 source preserved, conversations={conversations:?}, messages={messages:?}"
+                );
+                if concurrent {
+                    println!(
+                        "{}",
+                        stderr
+                            .lines()
+                            .find(|line| line
+                                .contains("using begin-concurrent write path for indexing"))
+                            .unwrap()
+                    );
+                }
+                let identities = (conversations, messages);
+                if let Some(first) = &first_identities {
+                    assert_eq!(&identities, first, "replay changed identities");
+                } else {
+                    first_identities = Some(identities);
+                }
+            }
+        }
+    }
 }

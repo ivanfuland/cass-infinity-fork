@@ -105,6 +105,7 @@ fn index_opts(
         embedder: "infinity".to_string(),
         progress: Some(progress),
         watch_interval_secs: 30,
+        source_safety_config: None,
     }
 }
 
@@ -305,6 +306,7 @@ fn build_backup_corpus(other: &TempDir) -> PathBuf {
         embedder: "infinity".to_string(),
         progress: Some(Arc::new(IndexingProgress::default())),
         watch_interval_secs: 30,
+        source_safety_config: None,
     };
     let _codex = EnvGuard::set("CODEX_HOME", codex_home.to_str().unwrap());
     indexer::run_index(options, None).expect("backup corpus index run");

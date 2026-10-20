@@ -1,0 +1,580 @@
+{
+  "schema": "cass.scalar-boundary-gold/1",
+  "oracle_commit": "de50d7538d72c49ef284e33464c7c1bce480bc67",
+  "expected_origin": "Hand-authored complete facts checked by execution against independent frozen oracle; no product imports. No empty-alias input policy is inferred.",
+  "cases": [
+    {
+      "id": "count_fact-absent",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": false,
+      "input_json": null,
+      "expected": {
+        "field": "probe",
+        "status": "missing",
+        "reason": "absent",
+        "presence_ref": "/probe",
+        "unit": "count"
+      }
+    },
+    {
+      "id": "count_fact-null",
+      "primitive": "count_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "null",
+      "expected": {
+        "field": "probe",
+        "status": "missing",
+        "reason": "null",
+        "raw_ref": "/probe",
+        "unit": "count"
+      }
+    },
+    {
+      "id": "value_fact-absent",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": false,
+      "input_json": null,
+      "expected": {
+        "field": "probe",
+        "status": "missing",
+        "reason": "absent",
+        "presence_ref": "/probe"
+      }
+    },
+    {
+      "id": "value_fact-null",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "null",
+      "expected": {
+        "field": "probe",
+        "status": "missing",
+        "reason": "null",
+        "raw_ref": "/probe"
+      }
+    },
+    {
+      "id": "time_fact-absent",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": false,
+      "input_json": null,
+      "expected": {
+        "field": "time",
+        "status": "missing",
+        "reason": "absent",
+        "presence_ref": "/probe"
+      }
+    },
+    {
+      "id": "time_fact-null",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "null",
+      "expected": {
+        "field": "time",
+        "status": "missing",
+        "reason": "null",
+        "raw_ref": "/probe"
+      }
+    },
+    {
+      "id": "value-empty-string",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"\"",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": "",
+        "raw_ref": "/probe"
+      }
+    },
+    {
+      "id": "value-false",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "false",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": false,
+        "raw_ref": "/probe"
+      }
+    },
+    {
+      "id": "value-number-text",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "1e400",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": "1e400",
+        "raw_ref": "/probe",
+        "unit": "number_text"
+      }
+    },
+    {
+      "id": "value-empty-array",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "[]",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": [
+          "arr",
+          []
+        ],
+        "raw_ref": "/probe",
+        "value_kind": "array"
+      }
+    },
+    {
+      "id": "value-empty-object",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "{}",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": [
+          "obj",
+          []
+        ],
+        "raw_ref": "/probe",
+        "value_kind": "object"
+      }
+    },
+    {
+      "id": "value-ordered-object",
+      "primitive": "value_fact",
+      "field": "probe",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "{\"z\":1,\"a\":2}",
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": [
+          "obj",
+          [
+            [
+              "z",
+              [
+                "num",
+                "1"
+              ]
+            ],
+            [
+              "a",
+              [
+                "num",
+                "2"
+              ]
+            ]
+          ]
+        ],
+        "raw_ref": "/probe",
+        "value_kind": "object"
+      }
+    },
+    {
+      "id": "time-epoch",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T00:00:00Z\"",
+      "expected": {
+        "field": "time",
+        "status": "present",
+        "raw_ref": "/probe",
+        "value": "0",
+        "unit": "epoch"
+      }
+    },
+    {
+      "id": "time-negative-fraction",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1969-12-31T23:59:59.875Z\"",
+      "expected": {
+        "field": "time",
+        "status": "present",
+        "raw_ref": "/probe",
+        "value": "-0.125",
+        "unit": "epoch"
+      }
+    },
+    {
+      "id": "time-positive-fraction",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T00:00:00.2500Z\"",
+      "expected": {
+        "field": "time",
+        "status": "present",
+        "raw_ref": "/probe",
+        "value": "0.2500",
+        "unit": "epoch"
+      }
+    },
+    {
+      "id": "time-positive-offset",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T01:00:00+01:00\"",
+      "expected": {
+        "field": "time",
+        "status": "present",
+        "raw_ref": "/probe",
+        "value": "0",
+        "unit": "epoch"
+      }
+    },
+    {
+      "id": "time-negative-offset",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1969-12-31T23:00:00-01:00\"",
+      "expected": {
+        "field": "time",
+        "status": "present",
+        "raw_ref": "/probe",
+        "value": "0",
+        "unit": "epoch"
+      }
+    },
+    {
+      "id": "time-lowercase",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01t00:00:00z\"",
+      "expected": {
+        "field": "time",
+        "status": "present",
+        "raw_ref": "/probe",
+        "value": "0",
+        "unit": "epoch"
+      }
+    },
+    {
+      "id": "time-missing-zone",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"2026-01-01T00:00:00\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unproven_format"
+      }
+    },
+    {
+      "id": "time-unknown-offset",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T00:00:00-00:00\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unit_unproven"
+      }
+    },
+    {
+      "id": "time-bad-day",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"2026-02-29T00:00:00Z\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unproven_format"
+      }
+    },
+    {
+      "id": "time-bad-hour",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T24:00:00Z\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unproven_format"
+      }
+    },
+    {
+      "id": "time-bad-offset",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T00:00:00+24:00\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unproven_format"
+      }
+    },
+    {
+      "id": "time-leap-second",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "\"1970-01-01T00:00:60Z\"",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unproven_format"
+      }
+    },
+    {
+      "id": "time-numeric",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "123",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "unit_unproven"
+      }
+    },
+    {
+      "id": "time-bool",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "false",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "bad_type"
+      }
+    },
+    {
+      "id": "time-array",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "[]",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "bad_type"
+      }
+    },
+    {
+      "id": "time-object",
+      "primitive": "time_fact",
+      "field": "time",
+      "raw_ref": "/probe",
+      "node_present": true,
+      "input_json": "{}",
+      "expected": {
+        "field": "time",
+        "status": "invalid",
+        "raw_ref": "/probe",
+        "reason": "bad_type"
+      }
+    },
+    {
+      "id": "alias-different-values",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "left",
+          "raw_ref": "/a"
+        },
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "right",
+          "raw_ref": "/b"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "conflict",
+        "refs": [
+          {
+            "status": "present",
+            "value": "left",
+            "raw_ref": "/a"
+          },
+          {
+            "status": "present",
+            "value": "right",
+            "raw_ref": "/b"
+          }
+        ]
+      }
+    },
+    {
+      "id": "alias-same-values",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "same",
+          "raw_ref": "/a"
+        },
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "same",
+          "raw_ref": "/b"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": "same",
+        "raw_ref": "/a",
+        "refs": [
+          {
+            "status": "present",
+            "value": "same",
+            "raw_ref": "/a"
+          },
+          {
+            "status": "present",
+            "value": "same",
+            "raw_ref": "/b"
+          }
+        ]
+      }
+    },
+    {
+      "id": "alias-both-null",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "missing",
+          "raw_ref": "/a",
+          "reason": "null"
+        },
+        {
+          "field": "probe",
+          "status": "missing",
+          "raw_ref": "/b",
+          "reason": "null"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "missing",
+        "reason": "null",
+        "refs": [
+          {
+            "status": "missing",
+            "raw_ref": "/a",
+            "reason": "null"
+          },
+          {
+            "status": "missing",
+            "raw_ref": "/b",
+            "reason": "null"
+          }
+        ]
+      }
+    },
+    {
+      "id": "alias-one-null",
+      "primitive": "alias_fact",
+      "field": "probe",
+      "candidates": [
+        {
+          "field": "probe",
+          "status": "present",
+          "value": "ok",
+          "raw_ref": "/a"
+        },
+        {
+          "field": "probe",
+          "status": "missing",
+          "raw_ref": "/b",
+          "reason": "null"
+        }
+      ],
+      "expected": {
+        "field": "probe",
+        "status": "present",
+        "value": "ok",
+        "raw_ref": "/a",
+        "refs": [
+          {
+            "status": "present",
+            "value": "ok",
+            "raw_ref": "/a"
+          },
+          {
+            "status": "missing",
+            "raw_ref": "/b",
+            "reason": "null"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -578,6 +578,16 @@ pub(crate) fn open_current_schema_storage_with_timeout(
         return Ok(None);
     }
 
+    // SRC05A §6.4: same strict source-schema shape gate as `schema::ensure`,
+    // on the write-capable fast path, before any caller gets the handle. A
+    // drifted source schema is refused rather than handed out and then
+    // silently "repaired" by the derived-repair pass below (the three source
+    // tables are deliberately absent from that machinery).
+    crate::storage::source_facts::verify_source_schema(storage.raw()).map_err(|err| {
+        anyhow::Error::new(StorageError::Corrupt {
+            detail: format!("source schema verification failed: {err}"),
+        })
+    })?;
     storage.repair_missing_current_schema_objects()?;
     storage.apply_config()?;
     Ok(Some(storage))
@@ -706,6 +716,16 @@ pub(crate) fn ensure_readonly_schema_current(conn: &FrankenConnection) -> Result
         .context("reading PRAGMA user_version for the read-only schema guard")?;
 
     if found == CURRENT_SCHEMA_VERSION {
+        // SRC05A §6.4: the strict source-schema shape gate runs on the
+        // read-only path too, after the version check and before any caller
+        // can run SQL through this handle. A missing or drifted source table
+        // is a structured refusal here, not something this open repairs; the
+        // check only reads `sqlite_master` and PRAGMAs and writes nothing.
+        crate::storage::source_facts::verify_source_schema(conn).map_err(|err| {
+            anyhow::Error::new(StorageError::Corrupt {
+                detail: format!("source schema verification failed: {err}"),
+            })
+        })?;
         return Ok(());
     }
 
@@ -4728,12 +4748,76 @@ fn replay_fingerprints_from_merge_set(
         .collect()
 }
 
+/// §9: the raw material of a same-`idx` retention. The merge records this where
+/// it makes the decision to keep the row it already has; the source projection
+/// turns it into a full `RetainedIdxObservation` by reading the winner row back
+/// in the same transaction.
+///
+/// The legacy entry points pass no sink, so they pay nothing for it.
+#[derive(Debug, Clone)]
+struct RetainedIdxHit {
+    idx: i64,
+    incoming_fingerprint: MessageMergeFingerprint,
+}
+
+/// §9: a same-`idx` retention the merge really took, with the winner row and
+/// the parent identity digest read back in the installing transaction.
+///
+/// This never leaves this module. It is the only value that may assert "the
+/// merge kept a real row at this `idx`", so nothing outside the projection's
+/// own SQL branch can construct one or fill in an identity of its own.
+struct RetainedIdxRetention {
+    incoming_idx: i64,
+    incoming_merge_fingerprint: MessageMergeFingerprint,
+    winner_conversation_id: i64,
+    winner_message_id: i64,
+    winner_idx: i64,
+    winner_merge_fingerprint: MessageMergeFingerprint,
+    conversation_identity_digest: crate::storage::source_facts::Sha256Digest,
+}
+
+impl RetainedIdxRetention {
+    /// §9's first requirement: the winner holds the incoming `idx` and its
+    /// fingerprint differs from the incoming one.
+    fn is_a_divergent_same_idx_retention(&self) -> bool {
+        self.winner_idx == self.incoming_idx
+            && self.winner_merge_fingerprint.idx == self.incoming_idx
+            && (self.winner_merge_fingerprint.content_hash
+                != self.incoming_merge_fingerprint.content_hash
+                || self.winner_merge_fingerprint.created_at
+                    != self.incoming_merge_fingerprint.created_at
+                || self.winner_merge_fingerprint.role != self.incoming_merge_fingerprint.role
+                || self.winner_merge_fingerprint.author
+                    != self.incoming_merge_fingerprint.author)
+    }
+
+    /// Freeze the witness for one claim that names this retained position. The
+    /// claim supplies its own frozen digest; the retention supplies the winner
+    /// row and the identity digest this transaction read.
+    fn to_rejection_evidence(
+        &self,
+        claim: &crate::storage::source_facts::SourceClaim,
+    ) -> crate::storage::source_facts::WinnerRejectionEvidence {
+        crate::storage::source_facts::WinnerRejectionEvidence {
+            claim_digest: claim.pending_claim_digest(),
+            conversation_identity_digest: self.conversation_identity_digest,
+            incoming_idx: self.incoming_idx,
+            incoming_merge_fingerprint: merge_fingerprint_to_facts(&self.incoming_merge_fingerprint),
+            winner_conversation_id: self.winner_conversation_id,
+            winner_message_id: self.winner_message_id,
+            winner_idx: self.winner_idx,
+            winner_merge_fingerprint: merge_fingerprint_to_facts(&self.winner_merge_fingerprint),
+        }
+    }
+}
+
 fn collect_new_messages_for_existing_conversation<'a>(
     conversation_id: i64,
     conv: &'a Conversation,
     existing_messages: &mut HashMap<i64, MessageMergeFingerprint>,
     existing_replay_fingerprints: &mut HashSet<MessageReplayFingerprint>,
     replay_skip_log: &'static str,
+    mut retained: Option<&mut Vec<RetainedIdxHit>>,
 ) -> anyhow::Result<ExistingConversationNewMessages<'a>> {
     let mut idx_collision_count = 0usize;
     let mut first_collision_idx: Option<i64> = None;
@@ -4746,6 +4830,12 @@ fn collect_new_messages_for_existing_conversation<'a>(
                     if existing_fingerprint != &incoming_fingerprint {
                 idx_collision_count = idx_collision_count.saturating_add(1);
                 first_collision_idx.get_or_insert(msg.idx);
+            }
+            if let Some(sink) = retained.as_deref_mut() {
+                sink.push(RetainedIdxHit {
+                    idx: msg.idx,
+                    incoming_fingerprint: incoming_fingerprint.clone(),
+                });
             }
             continue;
         }
@@ -6046,6 +6136,68 @@ impl FrankenStorage {
             .collect())
     }
 
+    /// Every source input recorded for one `(namespace, connector, scan
+    /// root)`, in **every** state, as `(state, role, relative locator,
+    /// normalizer id, safety contract id)` (SRC05B-08).
+    ///
+    /// This is a read of existing facts, and the only thing a source-aware
+    /// skip may rest on. It deliberately does **not** filter to `complete`:
+    /// the caller needs the whole set for one `(role, locator)`, because a
+    /// completed input from an earlier read and an unfinished one from a later
+    /// read can coexist for the same locator, and the unfinished one has to
+    /// win -- retrying a file whose input is staged, Partial or Failed is the
+    /// contract, and letting the earlier success hide it is not.
+    ///
+    /// The caller compares the two identity columns against the profile the
+    /// current configuration assembles, so a changed mapping or a changed
+    /// fixed safety copy simply does not match and the file is read again.
+    /// Nothing here writes, and nothing here decides.
+    ///
+    /// The lookup key is the **original scan root** the input was sealed under
+    /// (the declaration's identity element 4), not the `cfg:`/`home:` routing
+    /// id: the root string is part of the key, so two roots that share a
+    /// `(connector, locator)` pair never answer for each other. A row whose
+    /// stored locator or role is not valid UTF-8 is skipped rather than
+    /// guessed at.
+    pub fn recorded_source_inputs(
+        &self,
+        identity_namespace: &str,
+        connector: &str,
+        scan_root: &str,
+    ) -> Result<Vec<(String, Option<String>, String, String, String)>> {
+        let rows: Vec<(String, Option<Vec<u8>>, Vec<u8>, String, String)> =
+            self.conn.query_all_map(
+                "SELECT state, role_bin, relative_locator_bin, normalizer_id, safety_contract_id
+                 FROM source_inputs
+                 WHERE identity_namespace = ?1 AND connector = ?2 AND root_id_bin = ?3",
+                fparams![
+                    identity_namespace,
+                    connector,
+                    scan_root.as_bytes().to_vec()
+                ],
+                |row| {
+                    Ok((
+                        row.get_typed(0)?,
+                        row.get_typed(1)?,
+                        row.get_typed(2)?,
+                        row.get_typed(3)?,
+                        row.get_typed(4)?,
+                    ))
+                },
+            )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(state, role, locator, normalizer_id, safety_contract_id)| {
+                let locator = String::from_utf8(locator).ok()?;
+                let role = match role {
+                    Some(bytes) => Some(String::from_utf8(bytes).ok()?),
+                    None => None,
+                };
+                Some((state, role, locator, normalizer_id, safety_contract_id))
+            })
+            .collect())
+    }
+
     /// Record that this `(root_id, connector)` scan saw `relative_path` with
     /// the given size/mtime. Written only for roots whose scan had no error.
     pub fn upsert_scan_file_state(
@@ -6374,96 +6526,164 @@ impl FrankenStorage {
     /// Remove all archived conversations/messages for one agent slug.
     ///
     /// This only affects cass's local archive database. Source session files on
-    /// disk are untouched.
+    /// disk are untouched, and so is the raw mirror: the §14.5 deletion is
+    /// DB-only on both sides.
+    ///
+    /// The agent's source copies leave in the same transaction. Their
+    /// selection is the connector, not the conversations table, so a purge
+    /// that matches no canonical conversation still removes the copies this
+    /// agent owns.
     pub fn purge_agent_archive_data(&self, agent_slug: &str) -> Result<AgentArchivePurgeResult> {
+        use crate::storage::source_facts::{SourceDeletionOutcome, SourceDeletionSelection};
+
         let normalized = agent_slug.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             return Err(anyhow!("agent slug cannot be empty"));
         }
 
-        let Some(agent_id) = self
+        let agent_id: Option<i64> = self
             .conn
             .query_row_map(
                 "SELECT id FROM agents WHERE slug = ?1",
                 fparams![normalized.as_str()],
                 |row| row.get_typed::<i64>(0),
             )
-            .optional()?
-        else {
-            return Ok(AgentArchivePurgeResult::default());
+            .optional()?;
+
+        let conversations_deleted: i64 = match agent_id {
+            Some(agent_id) => self.conn.query_row_map(
+                "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1",
+                fparams![agent_id],
+                |row| row.get_typed(0),
+            )?,
+            None => 0,
         };
 
-        let conversations_deleted: i64 = self.conn.query_row_map(
-            "SELECT COUNT(*) FROM conversations WHERE agent_id = ?1",
-            fparams![agent_id],
-            |row| row.get_typed(0),
-        )?;
-        if conversations_deleted == 0 {
+        // §14.5: the source side is its own selection. Neither early return
+        // below may stand in for it, so the prompt-to-stop decision is made on
+        // both sets together.
+        let source_selection = SourceDeletionSelection::Connector(normalized.clone());
+        let matched_source = self.select_source_inputs(&source_selection)?;
+        if conversations_deleted == 0 && matched_source.input_ids.is_empty() {
             return Ok(AgentArchivePurgeResult::default());
         }
 
-        let messages_deleted: i64 = self.conn.query_row_map(
-            "SELECT COUNT(*)
-             FROM messages
-             WHERE conversation_id IN (
-                 SELECT id FROM conversations WHERE agent_id = ?1
-             )",
-            fparams![agent_id],
-            |row| row.get_typed(0),
-        )?;
-
-        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
-        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
-            tx.execute(
-                "DELETE FROM conversation_external_lookup
+        let messages_deleted: i64 = match agent_id {
+            Some(agent_id) if conversations_deleted > 0 => self.conn.query_row_map(
+                "SELECT COUNT(*)
+                 FROM messages
                  WHERE conversation_id IN (
                      SELECT id FROM conversations WHERE agent_id = ?1
                  )",
-                fparams![agent_id],
-            )?;
-            tx.execute(
-                "DELETE FROM conversation_external_tail_lookup
-                 WHERE conversation_id IN (
-                     SELECT id FROM conversations WHERE agent_id = ?1
-                 )",
-                fparams![agent_id],
-            )?;
-            // T6 (plan v5.1): collect this agent's message ids first, then
-            // route the delete through delete_messages_ordered_in_tx --
-            // must run *before* the conversations delete below, while
-            // `messages` still exist to resolve which vec0/fts_lex rows
-            // belong to this agent (the old plain fts_lex delete here never
-            // touched vec0 at all -- no FK/cascade tie -- leaking any
-            // embedded chunk's vec0 row forever once the conversations
-            // delete cascade-removed its parent message).
-            let message_ids: Vec<i64> = tx.query_all_map(
-                "SELECT m.id FROM messages m
-                 JOIN conversations c ON c.id = m.conversation_id
-                 WHERE c.agent_id = ?1",
                 fparams![agent_id],
                 |row| row.get_typed(0),
-            )?;
-            delete_messages_ordered_in_tx(tx, &message_ids)
-                .map_err(anyhow_error_into_storage_error)?;
-            tx.execute(
-                "DELETE FROM conversations WHERE agent_id = ?1",
-                fparams![agent_id],
-            )?;
-            tx.execute(
-                "DELETE FROM agents
-                 WHERE id = ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM conversations WHERE agent_id = ?1
-                   )",
-                fparams![agent_id],
-            )?;
-            Ok(())
-        })?;
+            )?,
+            _ => 0,
+        };
+
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        let source_outcome: SourceDeletionOutcome = self.conn.with_tx(
+            TxMode::Immediate,
+            |tx| -> Result<SourceDeletionOutcome, StorageError> {
+                // T6 (plan v5.1): collect this agent's message ids first, then
+                // route the delete through delete_messages_ordered_in_tx --
+                // must run *before* the conversations delete below, while
+                // `messages` still exist to resolve which vec0/fts_lex rows
+                // belong to this agent (the old plain fts_lex delete here never
+                // touched vec0 at all -- no FK/cascade tie -- leaking any
+                // embedded chunk's vec0 row forever once the conversations
+                // delete cascade-removed its parent message).
+                let message_ids: Vec<i64> = match agent_id {
+                    Some(agent_id) if conversations_deleted > 0 => tx.query_all_map(
+                        "SELECT m.id FROM messages m
+                         JOIN conversations c ON c.id = m.conversation_id
+                         WHERE c.agent_id = ?1",
+                        fparams![agent_id],
+                        |row| row.get_typed(0),
+                    )?,
+                    _ => Vec::new(),
+                };
+
+                // The copies leave in this same transaction, and an unmatched
+                // source still pointing at a doomed message is historyized
+                // before that message goes (§14.5). A canonical link left
+                // alone would make the message delete's `ON DELETE SET NULL`
+                // collide with the canonical CHECK and abort the purge.
+                let outcome = crate::storage::source_facts::delete_source_facts_in_tx(
+                    tx,
+                    &source_selection,
+                    &message_ids,
+                )?;
+
+                if conversations_deleted > 0
+                    && let Some(agent_id) = agent_id
+                {
+                    tx.execute(
+                        "DELETE FROM conversation_external_lookup
+                         WHERE conversation_id IN (
+                             SELECT id FROM conversations WHERE agent_id = ?1
+                         )",
+                        fparams![agent_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM conversation_external_tail_lookup
+                         WHERE conversation_id IN (
+                             SELECT id FROM conversations WHERE agent_id = ?1
+                         )",
+                        fparams![agent_id],
+                    )?;
+                    delete_messages_ordered_in_tx(tx, &message_ids)
+                        .map_err(anyhow_error_into_storage_error)?;
+                    tx.execute(
+                        "DELETE FROM conversations WHERE agent_id = ?1",
+                        fparams![agent_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM agents
+                         WHERE id = ?1
+                           AND NOT EXISTS (
+                               SELECT 1 FROM conversations WHERE agent_id = ?1
+                           )",
+                        fparams![agent_id],
+                    )?;
+                }
+
+                #[cfg(test)]
+                if crate::storage::source_facts::delete_fault_hooks::late_delete_failure_armed() {
+                    return Err(StorageError::Corrupt {
+                        detail: "injected late failure inside the purge delete transaction"
+                            .to_string(),
+                    });
+                }
+                Ok(outcome)
+            },
+        )?;
 
         Ok(AgentArchivePurgeResult {
             conversations_deleted: conversations_deleted.max(0) as usize,
             messages_deleted: messages_deleted.max(0) as usize,
+            source_inputs_deleted: source_outcome.inputs_deleted,
+            source_records_deleted: source_outcome.records_deleted,
+            source_links_deleted: source_outcome.links_deleted,
+            source_links_historicalized: source_outcome.links_historicalized,
         })
+    }
+
+    /// §14.5: the source inputs one forget/purge selection addresses.
+    ///
+    /// Read-only, so the two entry points use it both for their "is there
+    /// anything to do" decision and for the dry-run/preview numbers, on the
+    /// same code path the deletion itself re-runs inside the write
+    /// transaction.
+    fn select_source_inputs(
+        &self,
+        selection: &crate::storage::source_facts::SourceDeletionSelection,
+    ) -> Result<crate::storage::source_facts::SourceSelection> {
+        self.conn
+            .with_tx(TxMode::Deferred, |tx| {
+                crate::storage::source_facts::select_source_inputs_in_tx(tx, selection)
+            })
+            .with_context(|| "selecting the source facts a forget/purge addresses")
     }
 
     /// `cass forget` (#292 ask #2): prune an already-indexed subset of
@@ -6481,11 +6701,19 @@ impl FrankenStorage {
     /// Matching is done in Rust with the `glob` crate (not a SQL `GLOB`
     /// operator) so the semantics are portable and deterministic across the
     /// the legacy embedded engine backend.
+    ///
+    /// The §14.5 source copies leave in the same transaction, selected
+    /// independently: the glob is applied to each input's **original**
+    /// locator, so this entry point can match a source whose canonical
+    /// `source_path` does not (and the other way round). A run that matches
+    /// only source inputs still reports and applies them.
     pub fn forget_conversations_by_source_glob(
         &self,
         pattern: &str,
         dry_run: bool,
     ) -> Result<ForgetConversationsResult> {
+        use crate::storage::source_facts::{SourceDeletionOutcome, SourceDeletionSelection};
+
         let trimmed = pattern.trim();
         if trimmed.is_empty() {
             return Err(anyhow!("forget source-glob pattern cannot be empty"));
@@ -6519,14 +6747,20 @@ impl FrankenStorage {
             }
         }
 
-        if matched_ids.is_empty() {
+        // §14.5: the source copies are selected by their own rule, on the
+        // ORIGINAL locator the ingest recorded -- never on today's filesystem,
+        // a canonicalized path or a workspace rewrite, and never derived from
+        // the canonical match above.
+        let source_selection = SourceDeletionSelection::OriginalGlob(glob.clone());
+        let matched_source = self.select_source_inputs(&source_selection)?;
+
+        // Both selections empty is the only no-op case: a glob that matches no
+        // conversation may still match source copies, and those must go.
+        if matched_ids.is_empty() && matched_source.input_ids.is_empty() {
             return Ok(ForgetConversationsResult {
                 pattern: trimmed.to_string(),
                 dry_run,
-                conversations_matched: 0,
-                messages_matched: 0,
-                conversations_deleted: 0,
-                sample_source_paths: Vec::new(),
+                ..ForgetConversationsResult::default()
             });
         }
 
@@ -6536,66 +6770,107 @@ impl FrankenStorage {
             .collect::<Vec<_>>()
             .join(",");
 
-        let messages_matched: i64 = self.conn.query_row_map(
-            &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
-
-        if dry_run {
-            return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
-                dry_run,
-                conversations_matched: matched_ids.len(),
-                messages_matched: messages_matched.max(0) as usize,
-                conversations_deleted: 0,
-                sample_source_paths: sample_paths,
-            });
-        }
-
-        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
-        self.conn.with_tx(TxMode::Immediate, |tx| -> Result<(), StorageError> {
-            // Non-cascading external-lookup tables first (mirrors agent purge).
-            tx.execute(
-                &format!(
-                    "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-                ),
-                fparams![],
-            )?;
-            tx.execute(
-                &format!(
-                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-                ),
-                fparams![],
-            )?;
-            // T6 (plan v5.1) -- see `purge_agent_archive_data`'s identical
-            // reasoning: collect message ids first, route the delete
-            // through delete_messages_ordered_in_tx (vec0 + fts_lex/lex_docs
-            // + messages + demote, in the order that keeps vec0 from being
-            // orphaned) *before* the cascading conversations delete below.
-            let message_ids: Vec<i64> = tx.query_all_map(
-                &format!("SELECT id FROM messages WHERE conversation_id IN ({id_list})"),
+        let messages_matched: i64 = if matched_ids.is_empty() {
+            0
+        } else {
+            self.conn.query_row_map(
+                &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
                 fparams![],
                 |row| row.get_typed(0),
-            )?;
-            delete_messages_ordered_in_tx(tx, &message_ids)
-                .map_err(anyhow_error_into_storage_error)?;
-            // The remaining child tables (snippets, tags, ...) cascade.
-            tx.execute(
-                &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-                fparams![],
-            )?;
-            Ok(())
-        })?;
+            )?
+        };
 
-        Ok(ForgetConversationsResult {
+        let mut result = ForgetConversationsResult {
             pattern: trimmed.to_string(),
             dry_run,
             conversations_matched: matched_ids.len(),
             messages_matched: messages_matched.max(0) as usize,
-            conversations_deleted: matched_ids.len(),
+            conversations_deleted: 0,
             sample_source_paths: sample_paths,
-        })
+            source_inputs_matched: matched_source.input_ids.len(),
+            source_records_matched: matched_source.records_matched,
+            source_links_matched: matched_source.links_matched,
+            source_inputs_deleted: 0,
+            source_records_deleted: 0,
+            source_links_deleted: 0,
+            source_links_historicalized: 0,
+            sample_source_locators: matched_source.sample_locators.clone(),
+        };
+
+        if dry_run {
+            return Ok(result);
+        }
+
+        // w1b Task B3 (D2): with_tx, TxMode::Immediate.
+        let source_outcome: SourceDeletionOutcome = self.conn.with_tx(
+            TxMode::Immediate,
+            |tx| -> Result<SourceDeletionOutcome, StorageError> {
+                // T6 (plan v5.1) -- see `purge_agent_archive_data`'s identical
+                // reasoning: collect message ids first, route the delete
+                // through delete_messages_ordered_in_tx (vec0 + fts_lex/lex_docs
+                // + messages + demote, in the order that keeps vec0 from being
+                // orphaned) *before* the cascading conversations delete below.
+                let message_ids: Vec<i64> = if matched_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    tx.query_all_map(
+                        &format!("SELECT id FROM messages WHERE conversation_id IN ({id_list})"),
+                        fparams![],
+                        |row| row.get_typed(0),
+                    )?
+                };
+
+                // The matched source copies leave here, and a source the glob
+                // did NOT match keeps its facts: when one of its canonical
+                // messages is about to go, it is historyized rather than
+                // deleted, which is also what keeps the message delete's
+                // `ON DELETE SET NULL` from colliding with the canonical CHECK.
+                let outcome = crate::storage::source_facts::delete_source_facts_in_tx(
+                    tx,
+                    &source_selection,
+                    &message_ids,
+                )?;
+
+                if !matched_ids.is_empty() {
+                    // Non-cascading external-lookup tables first (mirrors agent purge).
+                    tx.execute(
+                        &format!(
+                            "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
+                        ),
+                        fparams![],
+                    )?;
+                    tx.execute(
+                        &format!(
+                            "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
+                        ),
+                        fparams![],
+                    )?;
+                    delete_messages_ordered_in_tx(tx, &message_ids)
+                        .map_err(anyhow_error_into_storage_error)?;
+                    // The remaining child tables (snippets, tags, ...) cascade.
+                    tx.execute(
+                        &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
+                        fparams![],
+                    )?;
+                }
+
+                #[cfg(test)]
+                if crate::storage::source_facts::delete_fault_hooks::late_delete_failure_armed() {
+                    return Err(StorageError::Corrupt {
+                        detail: "injected late failure inside the forget delete transaction"
+                            .to_string(),
+                    });
+                }
+                Ok(outcome)
+            },
+        )?;
+
+        result.conversations_deleted = matched_ids.len();
+        result.source_inputs_deleted = source_outcome.inputs_deleted;
+        result.source_records_deleted = source_outcome.records_deleted;
+        result.source_links_deleted = source_outcome.links_deleted;
+        result.source_links_historicalized = source_outcome.links_historicalized;
+        Ok(result)
     }
 
     /// `coding_agent_session_search-uhhxy` (gh #302 ask #2): collapse
@@ -8782,7 +9057,42 @@ impl FrankenStorage {
         let defer_analytics_updates = defer_analytics_updates_enabled();
         let conversation_key = conversation_merge_key(agent_id, conv);
         Ok(self.conn.with_tx(TxMode::Immediate, |tx| -> Result<InsertOutcome, StorageError> {
-            (|| -> Result<InsertOutcome> {
+            self.insert_conversation_tree_body_in_tx(
+                tx,
+                agent_id,
+                workspace_id,
+                conv,
+                conversation_key.clone(),
+                defer_lexical_updates,
+                defer_analytics_updates,
+                None,
+            )
+            .map_err(anyhow_error_into_storage_error)
+        })?)
+    }
+
+    /// The shared transaction body behind [`Self::insert_conversation_tree`]
+    /// (SRC05A §11).
+    ///
+    /// This is the algorithm the source-aware projection reuses: it opens no
+    /// transaction of its own and commits nothing, so a caller that has already
+    /// opened one gets the parent row, the conversation merge, the messages,
+    /// the snippets, the lexical derivation and the token/metrics/rollups
+    /// inside **its** transaction. The one step it deliberately does not do is
+    /// `ensure_source_for_conversation`, which the legacy entry point keeps in
+    /// autocommit; a caller inside a transaction establishes the source row
+    /// itself through `ensure_sources_in_tx`.
+    fn insert_conversation_tree_body_in_tx(
+        &self,
+        tx: &FrankenTransaction<'_>,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        conversation_key: PendingConversationKey,
+        defer_lexical_updates: bool,
+        defer_analytics_updates: bool,
+        mut retained: Option<&mut Vec<RetainedIdxHit>>,
+    ) -> Result<InsertOutcome> {
                 let existing = franken_find_existing_conversation_with_tail_by_key(
                     tx,
                     &conversation_key,
@@ -8797,6 +9107,7 @@ impl FrankenStorage {
                         existing.tail_state,
                         defer_lexical_updates,
                         defer_analytics_updates,
+                        retained,
                     )?;
                     return Ok(outcome);
                 }
@@ -8825,6 +9136,7 @@ impl FrankenStorage {
                             &mut existing_messages,
                             &mut existing_replay_fingerprints,
                             "skipping replay-equivalent recovered message with shifted idx",
+                            retained.as_deref_mut(),
                         )?;
                         franken_record_merge_conflicts_in_tx(tx, existing_id, conv)?;
                         let (inserted_last_idx, inserted_last_created_at) =
@@ -8973,9 +9285,335 @@ impl FrankenStorage {
                     conversation_inserted: true,
                     inserted_indices,
                 })
-            })()
-            .map_err(anyhow_error_into_storage_error)
-        })?)
+    }
+
+    /// SRC05A §11: install one conversation projection inside a caller's
+    /// transaction and report a real outcome for every incoming message.
+    ///
+    /// The write path is [`Self::insert_conversation_tree_body_in_tx`], so the
+    /// conversation merge, the messages, the snippets, the lexical derivation
+    /// and the token/metrics/rollups all land in the transaction the caller
+    /// already owns. Unlike the legacy entry point the parent `sources` row is
+    /// established *inside* that transaction rather than in autocommit.
+    ///
+    /// Every outcome is formed by reading the stored row back in this same
+    /// transaction and fingerprinting its own bytes. The incoming fingerprint
+    /// is never reused as a presence marker: the legacy lookup does exactly
+    /// that for same-`idx` rows, and it cannot distinguish "the stored row is
+    /// the same message" from "a different message holds this `idx`".
+    pub fn install_conversation_projection_in_tx(
+        &self,
+        tx: &FrankenTransaction<'_>,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv: &Conversation,
+        input_key: &crate::storage::source_facts::Sha256Digest,
+        conversation_ordinal: u32,
+        claims: &[crate::storage::source_facts::SourceClaim],
+    ) -> std::result::Result<
+        crate::storage::source_facts::SourceAwareInsertOutcome,
+        crate::storage::source_facts::SourceInstallError,
+    > {
+        use crate::storage::source_facts as facts;
+        use crate::storage::source_facts::{
+            IncomingMessageBinding, IncomingStatus, ReplayCandidateMatch, ReplayRejectReason,
+        };
+
+        let normalized = normalized_conversation_for_storage(conv);
+        let conv = normalized.as_ref();
+
+        // §8 rule 6: a repeated incoming idx inside one projection is refused
+        // outright, never silently deduplicated.
+        let indices: Vec<i64> = conv.messages.iter().map(|message| message.idx).collect();
+        facts::check_incoming_indices(&indices)?;
+
+        ensure_sources_in_tx(tx, &[(agent_id, workspace_id, conv)])
+            .map_err(anyhow_error_into_source_install)?;
+
+        let conversation_key = conversation_merge_key(agent_id, conv);
+        // §9: the merge reports the same-`idx` retentions it actually took. The
+        // projection turns each into a winner observation by reading that row
+        // back here; the legacy entry points pass no sink and pay nothing.
+        let mut retained_hits: Vec<RetainedIdxHit> = Vec::new();
+        let outcome = self
+            .insert_conversation_tree_body_in_tx(
+                tx,
+                agent_id,
+                workspace_id,
+                conv,
+                conversation_key,
+                // §15#18: the source-aware path writes the derived state in
+                // full, inside the caller's transaction. It does not consult the
+                // global defer switches, which exist for the legacy entries.
+                false,
+                false,
+                Some(&mut retained_hits),
+            )
+            .map_err(anyhow_error_into_source_install)?;
+
+        // §9's parent identity digest, taken from the parent row this
+        // transaction just resolved plus this library's identity. `source_id`
+        // is deliberately not part of it: it is a first-ingest attribute and
+        // does not take part in conversation identity. The identity attributes
+        // are read from that row, never from the caller's `Conversation`: the
+        // row is the thing that was actually merged into, and a caller-supplied
+        // value can disagree with it.
+        let library_identity: String = tx.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![crate::storage::schema::LIBRARY_IDENTITY_META_KEY],
+            |row| row.get_typed(0),
+        )?;
+        let (parent_identity_host, parent_agent_id, parent_external_id, parent_source_path): (
+            String,
+            i64,
+            Option<String>,
+            String,
+        ) = tx.query_row_map(
+            "SELECT identity_host, agent_id, external_id, source_path
+             FROM conversations WHERE id = ?1",
+            fparams![outcome.conversation_id],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            },
+        )?;
+        let identity_digest = facts::conversation_identity_digest(
+            &library_identity,
+            outcome.conversation_id,
+            &parent_identity_host,
+            parent_agent_id,
+            parent_external_id.as_deref(),
+            &parent_source_path,
+        );
+
+        // The winner row behind each retention, read in this transaction, with
+        // the parent identity digest this transaction read bound in. A hit
+        // whose row is gone by now yields no retention, and the message then
+        // stays `Unresolved` rather than being called a rejection (§9).
+        //
+        // `RetainedIdxRetention` never leaves this module: it is the one value
+        // that may assert "the merge kept a real row here", and only this SQL
+        // branch constructs it.
+        let mut retentions: std::collections::HashMap<i64, RetainedIdxRetention> =
+            std::collections::HashMap::new();
+        for hit in &retained_hits {
+            let Some(winner) = franken_source_stored_message(tx, outcome.conversation_id, hit.idx)
+                .map_err(anyhow_error_into_source_install)?
+            else {
+                continue;
+            };
+            let winner_fingerprint =
+                winner.merge_fingerprint().map_err(anyhow_error_into_source_install)?;
+            let retention = RetainedIdxRetention {
+                incoming_idx: hit.idx,
+                incoming_merge_fingerprint: hit.incoming_fingerprint.clone(),
+                winner_conversation_id: outcome.conversation_id,
+                winner_message_id: winner.id,
+                winner_idx: winner.idx,
+                winner_merge_fingerprint: winner_fingerprint,
+                conversation_identity_digest: identity_digest,
+            };
+            if retention.is_a_divergent_same_idx_retention() {
+                retentions.insert(hit.idx, retention);
+            }
+        }
+
+        // §9: freeze one witness per claim that names a retained position. The
+        // claim supplies its own locator, pointer and frozen digest; the
+        // retention supplies the winner row and the parent identity. Neither is
+        // allowed to stand in for the other, and a claim that names no retained
+        // position gets no witness.
+        let mut winner_rejections: Vec<(facts::Sha256Digest, facts::WinnerRejectionEvidence)> =
+            Vec::new();
+        for claim in claims {
+            if claim.input_key != *input_key
+                || claim.conversation_ordinal != Some(conversation_ordinal)
+            {
+                continue;
+            }
+            let Some(idx) = claim.final_message_idx else {
+                continue;
+            };
+            let Some(retention) = retentions.get(&idx) else {
+                continue;
+            };
+            winner_rejections.push((
+                claim.pending_claim_digest(),
+                retention.to_rejection_evidence(claim),
+            ));
+        }
+
+        let mut incoming = Vec::with_capacity(conv.messages.len());
+        for message in &conv.messages {
+            let candidate =
+                message_merge_fingerprint(message).map_err(anyhow_error_into_source_install)?;
+            let candidate_match = ReplayCandidateMatch {
+                created_at: candidate.created_at,
+                role: candidate.role.to_string(),
+                author: candidate.author.clone(),
+                content_hash: hex::encode(candidate.content_hash),
+            };
+            let Some(stored) =
+                franken_source_stored_message(tx, outcome.conversation_id, message.idx)
+                    .map_err(anyhow_error_into_source_install)?
+            else {
+                incoming.push(IncomingMessageBinding {
+                    incoming_final_message_idx: message.idx,
+                    status: IncomingStatus::Unresolved,
+                    candidate_match: Some(candidate_match),
+                    stored: None,
+                    reason: Some(ReplayRejectReason::NoMatchingStoredRow),
+                });
+                continue;
+            };
+            let stored_fingerprint =
+                stored.merge_fingerprint().map_err(anyhow_error_into_source_install)?;
+            if stored_fingerprint.content_hash != candidate.content_hash
+                || stored_fingerprint.created_at != candidate.created_at
+                || stored_fingerprint.role != candidate.role
+                || stored_fingerprint.author != candidate.author
+            {
+                // §9: a same-`idx` row with a different fingerprint is a winner
+                // rejection *only* when the merge really took its "keep the row
+                // this `idx` already has" branch. Without that branch proof the
+                // message stays `Unresolved`, with the field that disagreed
+                // recorded — a mismatch alone is not proof of a rejection.
+                if retentions.contains_key(&message.idx) {
+                    incoming.push(IncomingMessageBinding {
+                        incoming_final_message_idx: message.idx,
+                        status: IncomingStatus::Rejected,
+                        candidate_match: Some(candidate_match),
+                        stored: None,
+                        reason: Some(ReplayRejectReason::WinnerRejected),
+                    });
+                } else {
+                    incoming.push(IncomingMessageBinding {
+                        incoming_final_message_idx: message.idx,
+                        status: IncomingStatus::Unresolved,
+                        candidate_match: Some(candidate_match),
+                        stored: None,
+                        reason: Some(ReplayRejectReason::StoredFactMismatch(
+                            source_reject_field(&candidate, &stored_fingerprint),
+                        )),
+                    });
+                }
+                continue;
+            }
+            let inserted = outcome.inserted_indices.contains(&message.idx);
+            let binding_outcome = if inserted {
+                crate::storage::source_facts::OriginalBindingOutcome::AcceptedNew
+            } else {
+                crate::storage::source_facts::OriginalBindingOutcome::VerifiedReplay
+            };
+            incoming.push(IncomingMessageBinding {
+                incoming_final_message_idx: message.idx,
+                status: if inserted {
+                    IncomingStatus::AcceptedNew
+                } else {
+                    IncomingStatus::VerifiedReplay
+                },
+                candidate_match: Some(candidate_match),
+                stored: Some(
+                    stored
+                        .into_evidence(outcome.conversation_id, identity_digest, binding_outcome)
+                        .map_err(anyhow_error_into_source_install)?,
+                ),
+                reason: None,
+            });
+        }
+
+        // §15#18: the same envelope-change rule the batched entry applies, so a
+        // re-ingest that only moves the title still moves every lexical row's
+        // envelope. The shared message body does not do this itself.
+        resync_envelope_if_changed_in_tx(tx, outcome.conversation_id, conv, workspace_id)
+            .map_err(anyhow_error_into_source_install)?;
+
+        // §15#18: the same collector and flush the batched entry uses, driven
+        // by the messages this transaction actually inserted. The rows are read
+        // back by `idx`, so a replayed or rejected message contributes nothing.
+        let conv_day_id = conversation_effective_started_at(conv)
+            .map(FrankenStorage::day_id_from_millis)
+            .unwrap_or(0);
+        let mut inserted_for_analytics: Vec<(i64, Message)> = Vec::new();
+        for message in &conv.messages {
+            if !outcome.inserted_indices.contains(&message.idx) {
+                continue;
+            }
+            let Some(stored) =
+                franken_source_stored_message(tx, outcome.conversation_id, message.idx)
+                    .map_err(anyhow_error_into_source_install)?
+            else {
+                // The merge reported this `idx` as inserted, so its row must be
+                // readable here. If it is not, the derived rows would silently
+                // go missing; refuse instead.
+                return Err(crate::storage::source_facts::SourceInstallError::Activation {
+                    detail: format!(
+                        "the merge inserted idx {} but its message row is not readable in this \
+                         transaction",
+                        message.idx
+                    ),
+                });
+            };
+            inserted_for_analytics.push((
+                stored.id,
+                Message {
+                    id: Some(stored.id),
+                    idx: stored.idx,
+                    role: role_from_str(&stored.role),
+                    author: stored.author.clone(),
+                    created_at: stored.created_at,
+                    content: stored.content.clone(),
+                    extra_json: stored.extra_value.clone(),
+                    snippets: Vec::new(),
+                    excluded: None,
+                },
+            ));
+        }
+        // A brand-new conversation owes its session row even when it carries no
+        // messages, exactly as the batched entry records it.
+        if !inserted_for_analytics.is_empty() || outcome.conversation_inserted {
+            let pricing_table = PricingTable::franken_load(&self.conn).unwrap_or_else(|e| {
+                tracing::warn!(target: "cass::analytics::pricing", error = %e, "failed to load pricing table");
+                PricingTable { entries: Vec::new() }
+            });
+            let mut pricing_diag = PricingDiagnostics::default();
+            let mut analytics = InlineAnalyticsBatch::new();
+            let inserted_refs: Vec<(i64, &Message)> = inserted_for_analytics
+                .iter()
+                .map(|(message_id, message)| (*message_id, message))
+                .collect();
+            analytics.collect_for_inserted(
+                conv,
+                outcome.conversation_id,
+                agent_id,
+                workspace_id,
+                conv_day_id,
+                i64::from(outcome.conversation_inserted),
+                &inserted_refs,
+                &pricing_table,
+                &mut pricing_diag,
+            );
+            if !analytics.is_empty() {
+                analytics
+                    .flush_in_tx(tx, FrankenStorage::now_millis())
+                    .map_err(anyhow_error_into_source_install)?;
+                pricing_diag.log_summary();
+            }
+        }
+
+        Ok(crate::storage::source_facts::SourceAwareInsertOutcome::new(
+            *input_key,
+            conversation_ordinal,
+            outcome.conversation_id,
+            outcome.conversation_inserted,
+            identity_digest,
+            incoming,
+            winner_rejections,
+        ))
     }
 
     #[cfg(test)]
@@ -9189,6 +9827,7 @@ impl FrankenStorage {
                 &mut existing_messages,
                 &mut existing_replay_fingerprints,
                 "skipping replay-equivalent profiled append message with shifted idx",
+                None,
             )?
         };
         profile.dedupe_filter_duration += dedupe_filter_start.elapsed();
@@ -9314,6 +9953,7 @@ impl FrankenStorage {
         append_tail_state: Option<ExistingConversationTailState>,
         defer_lexical_updates: bool,
         defer_analytics_updates: bool,
+        mut retained: Option<&mut Vec<RetainedIdxHit>>,
     ) -> Result<InsertOutcome> {
         let append_tail_ended_at = append_tail_state.and_then(|state| state.ended_at);
         let append_plan = append_tail_state.as_ref().and_then(|state| {
@@ -9342,6 +9982,7 @@ impl FrankenStorage {
                 &mut existing_messages,
                 &mut existing_replay_fingerprints,
                 "skipping replay-equivalent recovered message with shifted idx",
+                retained.as_deref_mut(),
             )?
         };
         franken_record_merge_conflicts_in_tx(tx, conversation_id, conv)?;
@@ -9979,11 +10620,7 @@ impl FrankenStorage {
 
                 let mut outcomes = Vec::with_capacity(conversations.len());
                 let mut stats = StatsAggregator::new();
-                let mut token_stats = TokenStatsAggregator::new();
-                let mut token_entries: Vec<TokenUsageEntry> = Vec::new();
-                let mut metrics_entries: Vec<MessageMetricsEntry> = Vec::new();
-                let mut rollup_agg = AnalyticsRollupAggregator::new();
-                let mut conv_ids_to_summarize: Vec<i64> = Vec::new();
+                let mut analytics = InlineAnalyticsBatch::new();
                 let mut pending_conversation_ids: HashMap<PendingConversationKey, i64> = HashMap::new();
                 let mut pending_message_fingerprints: HashMap<i64, HashMap<i64, MessageMergeFingerprint>> =
                     HashMap::new();
@@ -10221,27 +10858,7 @@ impl FrankenStorage {
                             inserted_messages.iter().map(|(id, _)| *id).collect();
                         sync_lexical_docs_for_messages_in_tx(tx, &inserted_message_ids)?;
 
-                        let (current_title, current_workspace_id): (Option<String>, Option<i64>) = tx
-                            .query_row_map(
-                                "SELECT title, workspace_id FROM conversations WHERE id = ?1",
-                                fparams![conv_id],
-                                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
-                            )
-                            .with_context(|| {
-                                format!("loading current title/workspace_id for envelope-change detection (conversation {conv_id})")
-                            })?;
-                        let envelope_changed =
-                            current_title != conv.title || current_workspace_id != workspace_id;
-                        if envelope_changed {
-                            tx.execute(
-                                "UPDATE conversations SET title = ?2, workspace_id = ?3 WHERE id = ?1",
-                                fparams![conv_id, conv.title.as_deref(), workspace_id],
-                            )
-                            .with_context(|| {
-                                format!("updating title/workspace_id for conversation {conv_id} (envelope change on re-ingest)")
-                            })?;
-                            resync_lexical_envelope_for_conversation_in_tx(tx, conv_id)?;
-                        }
+                        resync_envelope_if_changed_in_tx(tx, conv_id, conv, workspace_id)?;
                     }
 
                     if !defer_analytics_updates {
@@ -10265,163 +10882,17 @@ impl FrankenStorage {
                         );
 
                         let conv_day_id = day_id;
-                        let mut session_model_family = String::from("unknown");
-                        let mut has_any_tokens = false;
-
-                        for &(message_id, msg) in &inserted_messages {
-                            let role_s = role_str(&msg.role);
-                            let usage = if historical_raw_json(&msg.extra_json).is_some() {
-                                crate::connectors::extract_tokens_for_agent(
-                                    &conv.agent_slug,
-                                    &serde_json::Value::Null,
-                                    &msg.content,
-                                    &role_s,
-                                )
-                            } else {
-                                crate::connectors::extract_tokens_for_agent(
-                                    &conv.agent_slug,
-                                    &msg.extra_json,
-                                    &msg.content,
-                                    &role_s,
-                                )
-                            };
-
-                            let msg_ts = msg
-                                .created_at
-                                .or(conversation_effective_started_at(conv))
-                                .unwrap_or(0);
-                            let msg_day_id = if msg_ts > 0 {
-                                FrankenStorage::day_id_from_millis(msg_ts)
-                            } else {
-                                conv_day_id
-                            };
-
-                            let model_info = usage
-                                .model_name
-                                .as_deref()
-                                .map(crate::connectors::normalize_model);
-
-                            let model_family = model_info
-                                .as_ref()
-                                .map(|i| i.family.clone())
-                                .unwrap_or_else(|| "unknown".into());
-                            let model_tier = model_info
-                                .as_ref()
-                                .map(|i| i.tier.clone())
-                                .unwrap_or_else(|| "unknown".into());
-                            let provider = usage
-                                .provider
-                                .clone()
-                                .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
-                                .unwrap_or_else(|| "unknown".into());
-
-                            if model_family != "unknown" {
-                                session_model_family = model_family.clone();
-                            }
-
-                            let estimated_cost = pricing_table.compute_cost(
-                                usage.model_name.as_deref(),
-                                msg_day_id,
-                                usage.input_tokens,
-                                usage.output_tokens,
-                                usage.cache_read_tokens,
-                                usage.cache_creation_tokens,
-                            );
-                            if estimated_cost.is_some() {
-                                pricing_diag.record_priced();
-                            } else if usage.has_token_data() {
-                                pricing_diag.record_unpriced(usage.model_name.as_deref());
-                            }
-
-                            token_stats.record(
-                                &conv.agent_slug,
-                                &conv.source_id,
-                                msg_day_id,
-                                &model_family,
-                                &role_s,
-                                &usage,
-                                msg.content.len() as i64,
-                                estimated_cost.unwrap_or(0.0),
-                            );
-
-                            if usage.has_token_data() {
-                                has_any_tokens = true;
-                            }
-
-                            let content_chars = msg.content.len() as i64;
-                            let content_tokens_est = content_chars / 4;
-                            let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
-                            let has_plan = has_plan_for_role(&role_s, &msg.content);
-
-                            token_entries.push(TokenUsageEntry {
-                                message_id,
-                                conversation_id: conv_id,
-                                agent_id,
-                                workspace_id,
-                                source_id: conv.source_id.clone(),
-                                timestamp_ms: msg_ts,
-                                day_id: msg_day_id,
-                                model_name: usage.model_name.clone(),
-                                model_family: Some(model_family.clone()),
-                                model_tier: Some(model_tier.clone()),
-                                service_tier: usage.service_tier.clone(),
-                                provider: Some(provider.clone()),
-                                input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                                cache_read_tokens: usage.cache_read_tokens,
-                                cache_creation_tokens: usage.cache_creation_tokens,
-                                thinking_tokens: usage.thinking_tokens,
-                                total_tokens: usage.total_tokens(),
-                                estimated_cost_usd: estimated_cost,
-                                role: role_s.to_string(),
-                                content_chars,
-                                has_tool_calls: usage.has_tool_calls,
-                                tool_call_count: usage.tool_call_count,
-                                data_source: usage.data_source.as_str().to_string(),
-                            });
-
-                            let mm = MessageMetricsEntry {
-                                message_id,
-                                created_at_ms: msg_ts,
-                                hour_id: msg_hour_id,
-                                day_id: msg_day_id,
-                                agent_slug: conv.agent_slug.clone(),
-                                workspace_id: workspace_id.unwrap_or(0),
-                                source_id: conv.source_id.clone(),
-                                role: role_s.to_string(),
-                                content_chars,
-                                content_tokens_est,
-                                model_name: usage.model_name.clone(),
-                                model_family: model_family.clone(),
-                                model_tier: model_tier.clone(),
-                                provider,
-                                api_input_tokens: usage.input_tokens,
-                                api_output_tokens: usage.output_tokens,
-                                api_cache_read_tokens: usage.cache_read_tokens,
-                                api_cache_creation_tokens: usage.cache_creation_tokens,
-                                api_thinking_tokens: usage.thinking_tokens,
-                                api_service_tier: usage.service_tier.clone(),
-                                api_data_source: usage.data_source.as_str().to_string(),
-                                tool_call_count: usage.tool_call_count as i64,
-                                has_tool_calls: usage.has_tool_calls,
-                                has_plan,
-                            };
-                            rollup_agg.record(&mm);
-                            metrics_entries.push(mm);
-                        }
-
-                        if session_count_delta > 0 {
-                            token_stats.record_session(
-                                &conv.agent_slug,
-                                &conv.source_id,
-                                conv_day_id,
-                                &session_model_family,
-                            );
-                        }
-
-                        if has_any_tokens {
-                            conv_ids_to_summarize.push(conv_id);
-                        }
+                        analytics.collect_for_inserted(
+                            conv,
+                            conv_id,
+                            agent_id,
+                            workspace_id,
+                            conv_day_id,
+                            session_count_delta,
+                            &inserted_messages,
+                            &pricing_table,
+                            &mut pricing_diag,
+                        );
                     }
 
                     outcomes.push(InsertOutcome {
@@ -10444,71 +10915,9 @@ impl FrankenStorage {
                     );
                 }
 
-                // Batch insert token_usage rows
-                if !defer_analytics_updates && !token_entries.is_empty() {
-                    let token_count = token_entries.len();
-                    let inserted = franken_insert_token_usage_batched_in_tx(tx, &token_entries)?;
-                    tracing::debug!(
-                        target: "cass::perf::token_usage",
-                        total = token_count,
-                        inserted = inserted,
-                        "franken_batch_token_usage_insert_complete"
-                    );
-                }
-
-                // Batched token_daily_stats update
-                if !defer_analytics_updates && !token_stats.is_empty() {
-                    let entries = token_stats.expand();
-                    let affected = franken_update_token_daily_stats_batched_in_tx(
-                        tx,
-                        &entries,
-                        FrankenStorage::now_millis(),
-                    )?;
-                    tracing::debug!(
-                        target: "cass::perf::token_daily_stats",
-                        raw = token_stats.raw_entry_count(),
-                        expanded = entries.len(),
-                        affected = affected,
-                        "franken_batched_token_stats_update_complete"
-                    );
-                }
-
-                // Batch insert message_metrics rows
-                if !defer_analytics_updates && !metrics_entries.is_empty() {
-                    let mm_count = metrics_entries.len();
-                    let inserted = franken_insert_message_metrics_batched_in_tx(tx, &metrics_entries)?;
-                    tracing::debug!(
-                        target: "cass::perf::message_metrics",
-                        total = mm_count,
-                        inserted = inserted,
-                        "franken_batch_message_metrics_insert_complete"
-                    );
-                }
-
-                // Flush usage_hourly + usage_daily rollups
-                if !defer_analytics_updates && !rollup_agg.is_empty() {
-                    let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(
-                        tx,
-                        &rollup_agg,
-                        FrankenStorage::now_millis(),
-                    )?;
-                    tracing::debug!(
-                        target: "cass::perf::usage_rollups",
-                        hourly_buckets = rollup_agg.hourly_entry_count(),
-                        daily_buckets = rollup_agg.daily_entry_count(),
-                        models_daily_buckets = rollup_agg.models_daily_entry_count(),
-                        hourly_affected = hourly,
-                        daily_affected = daily,
-                        models_daily_affected = models_daily,
-                        "franken_batched_usage_rollups_complete"
-                    );
-                }
-
-                // Update conversation-level token summaries
-                if !defer_analytics_updates {
-                    for conv_id in &conv_ids_to_summarize {
-                        franken_update_conversation_token_summaries_in_tx(tx, *conv_id)?;
-                    }
+                // Flush every collected derived row in this same transaction.
+                if !defer_analytics_updates && !analytics.is_empty() {
+                    analytics.flush_in_tx(tx, FrankenStorage::now_millis())?;
                 }
                     Ok(outcomes)
                 })()
@@ -10519,6 +10928,285 @@ impl FrankenStorage {
         pricing_diag.log_summary();
 
         Ok(outcomes)
+    }
+}
+
+/// §15#18: the inline token, metrics and rollup analytics one transaction
+/// accumulates for the messages it inserted, flushed once at the end.
+///
+/// The batched entry accumulates across a whole batch and flushes once; the
+/// source-aware projection uses one of these per conversation and flushes it
+/// inside the caller's transaction. Both go through the same collection and the
+/// same flush, so the two paths cannot drift into two algorithms.
+struct InlineAnalyticsBatch {
+    token_entries: Vec<TokenUsageEntry>,
+    token_stats: TokenStatsAggregator,
+    metrics_entries: Vec<MessageMetricsEntry>,
+    rollup_agg: AnalyticsRollupAggregator,
+    conv_ids_to_summarize: Vec<i64>,
+}
+
+impl InlineAnalyticsBatch {
+    fn new() -> Self {
+        Self {
+            token_entries: Vec::new(),
+            token_stats: TokenStatsAggregator::new(),
+            metrics_entries: Vec::new(),
+            rollup_agg: AnalyticsRollupAggregator::new(),
+            conv_ids_to_summarize: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.token_entries.is_empty()
+            && self.token_stats.is_empty()
+            && self.metrics_entries.is_empty()
+            && self.rollup_agg.is_empty()
+            && self.conv_ids_to_summarize.is_empty()
+    }
+
+    /// Collect one conversation's **newly inserted** messages. `inserted_messages`
+    /// carries the real ids the insert returned, so a replayed or rejected
+    /// message is never counted here.
+    fn collect_for_inserted(
+        &mut self,
+        conv: &Conversation,
+        conversation_id: i64,
+        agent_id: i64,
+        workspace_id: Option<i64>,
+        conv_day_id: i64,
+        session_count_delta: i64,
+        inserted_messages: &[(i64, &Message)],
+        pricing_table: &PricingTable,
+        pricing_diag: &mut PricingDiagnostics,
+    ) {
+        let mut session_model_family = String::from("unknown");
+        let mut has_any_tokens = false;
+
+    for &(message_id, msg) in inserted_messages {
+        let role_s = role_str(&msg.role);
+        let usage = if historical_raw_json(&msg.extra_json).is_some() {
+            crate::connectors::extract_tokens_for_agent(
+                &conv.agent_slug,
+                &serde_json::Value::Null,
+                &msg.content,
+                &role_s,
+            )
+        } else {
+            crate::connectors::extract_tokens_for_agent(
+                &conv.agent_slug,
+                &msg.extra_json,
+                &msg.content,
+                &role_s,
+            )
+        };
+
+        let msg_ts = msg
+            .created_at
+            .or(conversation_effective_started_at(conv))
+            .unwrap_or(0);
+        let msg_day_id = if msg_ts > 0 {
+            FrankenStorage::day_id_from_millis(msg_ts)
+        } else {
+            conv_day_id
+        };
+
+        let model_info = usage
+            .model_name
+            .as_deref()
+            .map(crate::connectors::normalize_model);
+
+        let model_family = model_info
+            .as_ref()
+            .map(|i| i.family.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let model_tier = model_info
+            .as_ref()
+            .map(|i| i.tier.clone())
+            .unwrap_or_else(|| "unknown".into());
+        let provider = usage
+            .provider
+            .clone()
+            .or_else(|| model_info.as_ref().map(|i| i.provider.clone()))
+            .unwrap_or_else(|| "unknown".into());
+
+        if model_family != "unknown" {
+            session_model_family = model_family.clone();
+        }
+
+        let estimated_cost = pricing_table.compute_cost(
+            usage.model_name.as_deref(),
+            msg_day_id,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_creation_tokens,
+        );
+        if estimated_cost.is_some() {
+            pricing_diag.record_priced();
+        } else if usage.has_token_data() {
+            pricing_diag.record_unpriced(usage.model_name.as_deref());
+        }
+
+        self.token_stats.record(
+            &conv.agent_slug,
+            &conv.source_id,
+            msg_day_id,
+            &model_family,
+            &role_s,
+            &usage,
+            msg.content.len() as i64,
+            estimated_cost.unwrap_or(0.0),
+        );
+
+        if usage.has_token_data() {
+            has_any_tokens = true;
+        }
+
+        let content_chars = msg.content.len() as i64;
+        let content_tokens_est = content_chars / 4;
+        let msg_hour_id = FrankenStorage::hour_id_from_millis(msg_ts);
+        let has_plan = has_plan_for_role(&role_s, &msg.content);
+
+        self.token_entries.push(TokenUsageEntry {
+            message_id,
+            conversation_id: conversation_id,
+            agent_id,
+            workspace_id,
+            source_id: conv.source_id.clone(),
+            timestamp_ms: msg_ts,
+            day_id: msg_day_id,
+            model_name: usage.model_name.clone(),
+            model_family: Some(model_family.clone()),
+            model_tier: Some(model_tier.clone()),
+            service_tier: usage.service_tier.clone(),
+            provider: Some(provider.clone()),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            thinking_tokens: usage.thinking_tokens,
+            total_tokens: usage.total_tokens(),
+            estimated_cost_usd: estimated_cost,
+            role: role_s.to_string(),
+            content_chars,
+            has_tool_calls: usage.has_tool_calls,
+            tool_call_count: usage.tool_call_count,
+            data_source: usage.data_source.as_str().to_string(),
+        });
+
+        let mm = MessageMetricsEntry {
+            message_id,
+            created_at_ms: msg_ts,
+            hour_id: msg_hour_id,
+            day_id: msg_day_id,
+            agent_slug: conv.agent_slug.clone(),
+            workspace_id: workspace_id.unwrap_or(0),
+            source_id: conv.source_id.clone(),
+            role: role_s.to_string(),
+            content_chars,
+            content_tokens_est,
+            model_name: usage.model_name.clone(),
+            model_family: model_family.clone(),
+            model_tier: model_tier.clone(),
+            provider,
+            api_input_tokens: usage.input_tokens,
+            api_output_tokens: usage.output_tokens,
+            api_cache_read_tokens: usage.cache_read_tokens,
+            api_cache_creation_tokens: usage.cache_creation_tokens,
+            api_thinking_tokens: usage.thinking_tokens,
+            api_service_tier: usage.service_tier.clone(),
+            api_data_source: usage.data_source.as_str().to_string(),
+            tool_call_count: usage.tool_call_count as i64,
+            has_tool_calls: usage.has_tool_calls,
+            has_plan,
+        };
+        self.rollup_agg.record(&mm);
+        self.metrics_entries.push(mm);
+    }
+
+        if session_count_delta > 0 {
+            self.token_stats.record_session(
+                &conv.agent_slug,
+                &conv.source_id,
+                conv_day_id,
+                &session_model_family,
+            );
+        }
+
+        if has_any_tokens {
+            self.conv_ids_to_summarize.push(conversation_id);
+        }
+    }
+
+    /// Write everything collected so far, in the caller's transaction.
+    fn flush_in_tx(&self, tx: &FrankenTransaction<'_>, now_ms: i64) -> Result<()> {
+        // The caller decides *whether* to flush (the batch keeps its defer
+        // switch); this function only writes what was collected.
+        if !self.token_entries.is_empty() {
+        let token_count = self.token_entries.len();
+        let inserted = franken_insert_token_usage_batched_in_tx(tx, &self.token_entries)?;
+        tracing::debug!(
+            target: "cass::perf::token_usage",
+            total = token_count,
+            inserted = inserted,
+            "franken_batch_token_usage_insert_complete"
+        );
+    }
+
+    // Batched token_daily_stats update
+    if !self.token_stats.is_empty() {
+        let entries = self.token_stats.expand();
+        let affected = franken_update_token_daily_stats_batched_in_tx(
+            tx,
+            &entries,
+            now_ms,
+        )?;
+        tracing::debug!(
+            target: "cass::perf::token_daily_stats",
+            raw = self.token_stats.raw_entry_count(),
+            expanded = entries.len(),
+            affected = affected,
+            "franken_batched_token_stats_update_complete"
+        );
+    }
+
+    // Batch insert message_metrics rows
+    if !self.metrics_entries.is_empty() {
+        let mm_count = self.metrics_entries.len();
+        let inserted = franken_insert_message_metrics_batched_in_tx(tx, &self.metrics_entries)?;
+        tracing::debug!(
+            target: "cass::perf::message_metrics",
+            total = mm_count,
+            inserted = inserted,
+            "franken_batch_message_metrics_insert_complete"
+        );
+    }
+
+    // Flush usage_hourly + usage_daily rollups
+    if !self.rollup_agg.is_empty() {
+        let (hourly, daily, models_daily) = franken_flush_analytics_rollups_in_tx(
+            tx,
+            &self.rollup_agg,
+            now_ms,
+        )?;
+        tracing::debug!(
+            target: "cass::perf::usage_rollups",
+            hourly_buckets = self.rollup_agg.hourly_entry_count(),
+            daily_buckets = self.rollup_agg.daily_entry_count(),
+            models_daily_buckets = self.rollup_agg.models_daily_entry_count(),
+            hourly_affected = hourly,
+            daily_affected = daily,
+            models_daily_affected = models_daily,
+            "franken_batched_usage_rollups_complete"
+        );
+    }
+
+    // Update conversation-level token summaries
+    for conversation_id in &self.conv_ids_to_summarize {
+        franken_update_conversation_token_summaries_in_tx(tx, *conversation_id)?;
+    }
+        Ok(())
     }
 }
 
@@ -10588,6 +11276,24 @@ fn normalized_conversation_for_storage<'a>(conv: &'a Conversation) -> Cow<'a, Co
 }
 
 impl FrankenStorage {
+    /// Ordinary ingestion may create a placeholder, but never replace registration.
+    fn insert_missing_conversation_source(&self, source: &Source) -> Result<()> {
+        let now = Self::now_millis();
+        let kind = source.kind.to_string();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sources(id, kind, host_label, created_at, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            fparams![
+                source.id.as_str(),
+                kind.as_str(),
+                source.host_label.as_deref(),
+                now,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
     fn ensure_source_for_conversation(&self, conv: &Conversation) -> Result<()> {
         let source = normalized_source_for_conversation(conv);
         if is_bootstrap_local_source(&source) {
@@ -10599,7 +11305,7 @@ impl FrankenStorage {
         if self.conversation_source_already_ensured(&cache_key) {
             return Ok(());
         }
-        self.upsert_source(&source)?;
+        self.insert_missing_conversation_source(&source)?;
         self.mark_conversation_source_ensured(cache_key);
         Ok(())
     }
@@ -10615,7 +11321,7 @@ impl FrankenStorage {
                 if is_bootstrap_local_source(&source) {
                     continue;
                 }
-                self.upsert_source(&source)?;
+                self.insert_missing_conversation_source(&source)?;
                 self.mark_conversation_source_ensured(EnsuredConversationSourceKey::from_source(
                     &source,
                 ));
@@ -10647,6 +11353,61 @@ fn franken_last_rowid(tx: &FrankenTransaction<'_>) -> Result<i64> {
 /// `ensure_agent` outside the transaction, but those autocommit writes may
 /// not be visible inside a legacy embedded engine transaction snapshot.  This function
 /// checks each unique agent_id and creates a stub row if it's missing.
+/// Resolve one conversation's parent rows inside the caller's transaction.
+///
+/// SRC05B-07: the source-aware input resolves its parents *here*, in the same
+/// transaction as its projections. The caching [`FrankenStorage::ensure_agent`]
+/// and [`FrankenStorage::ensure_workspace`] write on the connection outside any
+/// transaction and publish their ids to the connection cache; a failed input
+/// that rolls back must leave neither a parent row nor a cached id behind, so
+/// this entry does neither. The SQL is the same upsert-then-select the caching
+/// pair runs, so the two agree on the row they land on.
+///
+/// Returns `(agent_id, workspace_id)`.
+pub(crate) fn ensure_parent_rows_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conv: &Conversation,
+) -> Result<(i64, Option<i64>), StorageError> {
+    let now = FrankenStorage::now_millis();
+    tx.execute(
+        "INSERT INTO agents(slug, name, version, kind, created_at, updated_at)
+         VALUES(?1, ?2, NULL, 'cli', ?3, ?4)
+         ON CONFLICT(slug) DO UPDATE SET
+             name = excluded.name,
+             kind = excluded.kind,
+             updated_at = excluded.updated_at
+         WHERE NOT (agents.name IS excluded.name AND agents.kind IS excluded.kind)",
+        fparams![conv.agent_slug.as_str(), conv.agent_slug.as_str(), now, now],
+    )?;
+    let agent_id: i64 = tx.query_row_map(
+        "SELECT id FROM agents WHERE slug = ?1 LIMIT 1",
+        fparams![conv.agent_slug.as_str()],
+        |row| row.get_typed(0),
+    )?;
+
+    let workspace_id = match &conv.workspace {
+        None => None,
+        Some(path) => {
+            let path_str = path.to_string_lossy().to_string();
+            tx.execute(
+                "INSERT OR IGNORE INTO workspaces(path, display_name) VALUES(?1, NULL)",
+                fparams![path_str.as_str()],
+            )?;
+            Some(tx.query_row_map(
+                "SELECT id FROM workspaces WHERE path = ?1 LIMIT 1",
+                fparams![path_str.as_str()],
+                |row| row.get_typed(0),
+            )?)
+        }
+    };
+
+    // The conversation's own source row, through the shared in-transaction
+    // guard (it caches nothing either).
+    ensure_sources_in_tx(tx, &[(agent_id, workspace_id, conv)])
+        .map_err(anyhow_error_into_storage_error)?;
+    Ok((agent_id, workspace_id))
+}
+
 fn ensure_agents_in_tx(
     tx: &FrankenTransaction<'_>,
     conversations: &[(i64, Option<i64>, &Conversation)],
@@ -11827,6 +12588,429 @@ struct ExistingMessageLookup {
     replay: HashSet<MessageReplayFingerprint>,
 }
 
+/// SRC05A §11: one message row read back inside the installing transaction,
+/// with the compat-decoded extra the rest of storage already uses.
+struct SourceStoredMessage {
+    id: i64,
+    idx: i64,
+    role: String,
+    author: Option<String>,
+    created_at: Option<i64>,
+    content: String,
+    extra_json: Option<String>,
+    extra_bin: Option<Vec<u8>>,
+    /// The compat-decoded extra value (`extra_bin` wins when non-empty).
+    extra_value: serde_json::Value,
+    excluded_json: Option<String>,
+}
+
+impl SourceStoredMessage {
+    /// The row's *own* merge fingerprint, recomputed from its own bytes.
+    ///
+    /// The legacy lookup substitutes the incoming fingerprint for same-`idx`
+    /// rows as a cheap presence marker; that cannot tell "the stored row is
+    /// this message" from "a different message holds this `idx`", so the
+    /// source-aware projection never reuses it.
+    fn merge_fingerprint(&self) -> Result<MessageMergeFingerprint> {
+        Ok(MessageMergeFingerprint {
+            idx: self.idx,
+            created_at: self.created_at,
+            role: role_from_str(&self.role),
+            author: self.author.clone(),
+            content_hash: self.content_hash()?,
+        })
+    }
+
+    fn excluded_marker(
+        &self,
+    ) -> Result<Option<crate::indexer::exclusion::ExcludedMarker>> {
+        Ok(self
+            .excluded_json
+            .as_deref()
+            .map(crate::indexer::exclusion::ExcludedMarker::from_json_str)
+            .transpose()?)
+    }
+
+    fn content_hash(&self) -> Result<[u8; 32]> {
+        let excluded = self.excluded_marker()?;
+        fingerprint_hash_for(&self.content, excluded.as_ref())
+    }
+
+    /// The complete binding evidence for this row (§10).
+    fn into_evidence(
+        self,
+        conversation_id: i64,
+        conversation_identity_digest: crate::storage::source_facts::Sha256Digest,
+        outcome: crate::storage::source_facts::OriginalBindingOutcome,
+    ) -> Result<crate::storage::source_facts::StoredBindingEvidence> {
+        use crate::storage::source_facts::{
+            ExtraStorageKind, Sha256Digest, StoredBindingEvidence,
+        };
+
+        let fingerprint = self.merge_fingerprint()?;
+        let excluded = self.excluded_marker()?;
+        let extra_storage_kind = match self.extra_bin.as_deref() {
+            Some(bytes) if !bytes.is_empty() => ExtraStorageKind::MsgPack,
+            _ if self.extra_json.is_some() => ExtraStorageKind::HistoricalJson,
+            _ => ExtraStorageKind::Null,
+        };
+        // The semantic extra digest is over the canonical source line the
+        // stored extra decodes to, not over the stored column's own bytes;
+        // `extra_json_sha256`/`extra_bin_sha256` carry the physical digests.
+        let extra_semantic_digest = message_extra_to_source_jsonl_line(&self.extra_value)
+            .map(|line| Sha256Digest::of(line.as_bytes()));
+        let excluded_semantic_digest = excluded
+            .as_ref()
+            .map(|marker| Sha256Digest::of(marker.to_json_string().as_bytes()));
+
+        Ok(StoredBindingEvidence {
+            outcome,
+            conversation_id,
+            conversation_identity_digest,
+            stored_idx: self.idx,
+            original_message_id: self.id,
+            stored_merge_fingerprint: merge_fingerprint_to_facts(&fingerprint),
+            safe_content_sha256: Sha256Digest::of(self.content.as_bytes()),
+            extra_storage_kind,
+            extra_json_sha256: self
+                .extra_json
+                .as_deref()
+                .map(|raw| Sha256Digest::of(raw.as_bytes())),
+            extra_bin_sha256: self.extra_bin.as_deref().map(Sha256Digest::of),
+            extra_semantic_digest,
+            excluded_semantic_digest,
+        })
+    }
+}
+
+/// Read one stored message row by its `(conversation_id, idx)` key.
+fn franken_source_stored_message(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    idx: i64,
+) -> Result<Option<SourceStoredMessage>> {
+    Ok(tx.query_opt_map(
+        "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded)
+         FROM messages WHERE conversation_id = ?1 AND idx = ?2",
+        fparams![conversation_id, idx],
+        |row| {
+            Ok(SourceStoredMessage {
+                id: row.get_typed(0)?,
+                idx: row.get_typed(1)?,
+                role: row.get_typed(2)?,
+                author: row.get_typed(3)?,
+                created_at: row.get_typed(4)?,
+                content: row.get_typed(5)?,
+                extra_json: row.get_typed(6)?,
+                extra_bin: row.get_typed(7)?,
+                extra_value: franken_read_message_extra_compat(row, 6, 7),
+                excluded_json: row.get_typed(8)?,
+            })
+        },
+    )?)
+}
+
+/// The facts-layer form of a storage-layer merge fingerprint (§9/§10). One
+/// conversion, so a binding and a rejection evidence can never disagree on how
+/// the five elements are spelled.
+fn merge_fingerprint_to_facts(
+    fingerprint: &MessageMergeFingerprint,
+) -> crate::storage::source_facts::MergeFingerprint {
+    crate::storage::source_facts::MergeFingerprint {
+        idx: fingerprint.idx,
+        created_at: fingerprint.created_at,
+        role: fingerprint.role.to_string(),
+        author: fingerprint.author.clone(),
+        content_blake3_hex: hex::encode(fingerprint.content_hash),
+    }
+}
+
+/// Which merge-fingerprint field a stored row disagrees on (§10's
+/// `StoredFactMismatch{field}`).
+fn source_reject_field(
+    incoming: &MessageMergeFingerprint,
+    stored: &MessageMergeFingerprint,
+) -> crate::storage::source_facts::ReplayRejectField {
+    use crate::storage::source_facts::ReplayRejectField;
+    if incoming.content_hash != stored.content_hash {
+        ReplayRejectField::ContentHash
+    } else if incoming.created_at != stored.created_at {
+        ReplayRejectField::CreatedAt
+    } else if incoming.role != stored.role {
+        ReplayRejectField::Role
+    } else {
+        ReplayRejectField::Author
+    }
+}
+
+/// Keep a storage failure typed when it crosses into the source-facts layer.
+fn anyhow_error_into_source_install(
+    err: anyhow::Error,
+) -> crate::storage::source_facts::SourceInstallError {
+    crate::storage::source_facts::anyhow_source_error(err)
+}
+
+/// Task 30 (执行契约 v2「恢复准备与替换绑定的封闭边界」): the source binding
+/// evidence for a conversation the caller's own transaction has just
+/// *replaced*.
+///
+/// `commit_replace_in_tx` deletes every old message row and inserts the incoming
+/// set unconditionally, so unlike the merge projection there is no "keep the row
+/// this `idx` already has" branch here: every incoming position must bind to a
+/// row this transaction really wrote, or the call refuses. A disagreeing row is
+/// never degraded into a `VerifiedReplay`/`Unresolved` non-failure.
+///
+/// The primitive only reads. It writes no receipt, no tail row and no lexical or
+/// analytics state, and it never calls
+/// [`FrankenStorage::install_conversation_projection_in_tx`] — that entry writes
+/// the message body, which the replace has already written.
+///
+/// `inserted_message_ids` is the write path's own insertion order, and that
+/// order is deliberately not evidence (§9): the declared list is checked for
+/// repeats, then every incoming message is bound by its own `idx`, so the same
+/// set handed in a different order binds identically. The parent identity is
+/// read from the final `conversations` row in this transaction, never from
+/// `conv`.
+///
+/// `claims` is part of the frozen call shape so a caller uses one signature for
+/// both projections. A replacement retains no same-`idx` winner, so this
+/// primitive proves no witness: `winner_rejections` is empty by construction and
+/// no claim is turned into a fabricated rejection.
+///
+/// # Errors
+/// [`crate::storage::source_facts::SourceInstallError::Staging`] when one
+/// projection repeats an incoming `idx`;
+/// [`crate::storage::source_facts::SourceInstallError::Conflict`] when the
+/// declared ids disagree with the rows in any direction, a row is missing, or
+/// the stored `content`/`role`/`author`/`created_at`/`extra`/`excluded`
+/// disagrees with the incoming message. Detail text names positions and fields
+/// only — never message content or extra bytes.
+pub(crate) fn bind_replaced_projection_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+    input_key: &crate::storage::source_facts::Sha256Digest,
+    conversation_ordinal: u32,
+    claims: &[crate::storage::source_facts::SourceClaim],
+    inserted_message_ids: &[i64],
+) -> std::result::Result<
+    crate::storage::source_facts::SourceAwareInsertOutcome,
+    crate::storage::source_facts::SourceInstallError,
+> {
+    use crate::storage::source_facts as facts;
+    use crate::storage::source_facts::{
+        IncomingMessageBinding, IncomingStatus, OriginalBindingOutcome, ReplayCandidateMatch,
+        ReplayRejectField, Sha256Digest, SourceAwareInsertOutcome, SourceInstallError,
+    };
+
+    let normalized = normalized_conversation_for_storage(conv);
+    let conv = normalized.as_ref();
+
+    // §8 rule 6, the same check the merge projection applies: one entry per
+    // incoming message, and a repeated `idx` inside one projection is refused
+    // rather than silently deduplicated.
+    let indices: Vec<i64> = conv.messages.iter().map(|message| message.idx).collect();
+    facts::check_incoming_indices(&indices)?;
+
+    let conflict = |detail: String| SourceInstallError::Conflict { detail };
+
+    // The declared insertions are a *set*: a repeat inside the caller's own list
+    // would make "every declared id was consumed" prove nothing.
+    let mut declared: std::collections::HashSet<i64> =
+        std::collections::HashSet::with_capacity(inserted_message_ids.len());
+    for id in inserted_message_ids {
+        if !declared.insert(*id) {
+            return Err(conflict(format!(
+                "the replacement declares message id {id} more than once"
+            )));
+        }
+    }
+
+    // Pass 1 — verify every row against the incoming message. Nothing is called
+    // accepted until this loop has walked the whole projection: a disagreement
+    // anywhere leaves no partially-accepted outcome behind.
+    //
+    // Binding by the incoming message's own `idx` (rather than by its position
+    // in `inserted_message_ids`) is what makes the declared list's order
+    // irrelevant, and requiring the row's *real* id to be one the caller
+    // declared is what makes a missing, extra, repeated or foreign id a refusal
+    // instead of a silent mis-binding.
+    let mut consumed: std::collections::HashSet<i64> =
+        std::collections::HashSet::with_capacity(inserted_message_ids.len());
+    let mut verified: Vec<(MessageMergeFingerprint, SourceStoredMessage)> =
+        Vec::with_capacity(conv.messages.len());
+    for message in &conv.messages {
+        let candidate =
+            message_merge_fingerprint(message).map_err(anyhow_error_into_source_install)?;
+        let stored = franken_source_stored_message(tx, conversation_id, message.idx)
+            .map_err(anyhow_error_into_source_install)?
+            .ok_or_else(|| {
+                conflict(format!(
+                    "the replacement names incoming idx {} but this transaction holds no stored \
+                     row for it",
+                    message.idx
+                ))
+            })?;
+        if !declared.contains(&stored.id) {
+            return Err(conflict(format!(
+                "the row at idx {} of conversation {conversation_id} holds message id {}, which \
+                 the replacement did not declare",
+                message.idx, stored.id
+            )));
+        }
+        if !consumed.insert(stored.id) {
+            return Err(conflict(format!(
+                "message id {} is bound by more than one incoming idx",
+                stored.id
+            )));
+        }
+        let stored_fingerprint = stored
+            .merge_fingerprint()
+            .map_err(anyhow_error_into_source_install)?;
+        if stored_fingerprint.content_hash != candidate.content_hash
+            || stored_fingerprint.created_at != candidate.created_at
+            || stored_fingerprint.role != candidate.role
+            || stored_fingerprint.author != candidate.author
+        {
+            return Err(conflict(format!(
+                "the stored row at idx {} disagrees with the incoming message on {}",
+                message.idx,
+                source_reject_field(&candidate, &stored_fingerprint).as_str()
+            )));
+        }
+        // The merge fingerprint is not sufficient on its own. For an excluded row
+        // it is the marker's own `fingerprint_blake3`, so two rows carrying the
+        // same marker but different safe bodies share one fingerprint and the
+        // comparison above would accept the wrong body. The evidence's own
+        // `safe_content_sha256` form is the field that has to agree, and
+        // `into_evidence` computes it from the stored bytes with the same helper
+        // used here for the incoming side.
+        if Sha256Digest::of(message.content.as_bytes())
+            != Sha256Digest::of(stored.content.as_bytes())
+        {
+            return Err(conflict(format!(
+                "the stored row at idx {} disagrees with the incoming message on {}",
+                message.idx,
+                ReplayRejectField::SafeContentSha256.as_str()
+            )));
+        }
+        // The fingerprint does not cover `extra` at all, and it folds `excluded`
+        // into the content hash without naming it. Both are therefore compared
+        // again in their semantic form: the stored column may be historical JSON
+        // text or a MsgPack blob, so its physical bytes can never be compared to
+        // the incoming value.
+        if message_extra_to_source_jsonl_line(&message.extra_json)
+            != message_extra_to_source_jsonl_line(&stored.extra_value)
+        {
+            return Err(conflict(format!(
+                "the stored row at idx {} disagrees with the incoming message on {}",
+                message.idx,
+                ReplayRejectField::ExtraSemanticDigest.as_str()
+            )));
+        }
+        let incoming_excluded = message
+            .excluded
+            .as_ref()
+            .map(crate::indexer::exclusion::ExcludedMarker::to_json_string);
+        let stored_excluded = stored
+            .excluded_marker()
+            .map_err(anyhow_error_into_source_install)?
+            .map(|marker| marker.to_json_string());
+        if incoming_excluded != stored_excluded {
+            return Err(conflict(format!(
+                "the stored row at idx {} disagrees with the incoming message on {}",
+                message.idx,
+                ReplayRejectField::ExcludedSemanticDigest.as_str()
+            )));
+        }
+        verified.push((candidate, stored));
+    }
+    if consumed.len() != declared.len() {
+        return Err(conflict(format!(
+            "the replacement declares {} message id(s) but only {} of them belong to this \
+             conversation's rows",
+            declared.len(),
+            consumed.len()
+        )));
+    }
+
+    // §9: the identity attributes come from the row this transaction's replace
+    // actually wrote, plus this library's identity. The caller's `Conversation`
+    // is never evidence for them — a caller-supplied value can disagree with the
+    // row that was really merged into.
+    let library_identity: String = tx.query_row_map(
+        "SELECT value FROM meta WHERE key = ?1",
+        fparams![crate::storage::schema::LIBRARY_IDENTITY_META_KEY],
+        |row| row.get_typed(0),
+    )?;
+    let (identity_host, parent_agent_id, external_id, source_path): (
+        String,
+        i64,
+        Option<String>,
+        String,
+    ) = tx.query_row_map(
+        "SELECT identity_host, agent_id, external_id, source_path FROM conversations WHERE id = ?1",
+        fparams![conversation_id],
+        |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+            ))
+        },
+    )?;
+    let identity_digest = facts::conversation_identity_digest(
+        &library_identity,
+        conversation_id,
+        &identity_host,
+        parent_agent_id,
+        external_id.as_deref(),
+        &source_path,
+    );
+
+    // Pass 2 — every row agreed, so every incoming position is the first binding
+    // of its own stored row. A replacement deletes the old set before inserting,
+    // so no position can be a replay and no winner was retained.
+    let mut incoming = Vec::with_capacity(verified.len());
+    for (candidate, stored) in verified {
+        let candidate_match = ReplayCandidateMatch {
+            created_at: candidate.created_at,
+            role: candidate.role.to_string(),
+            author: candidate.author.clone(),
+            content_hash: hex::encode(candidate.content_hash),
+        };
+        let evidence = stored
+            .into_evidence(
+                conversation_id,
+                identity_digest,
+                OriginalBindingOutcome::AcceptedNew,
+            )
+            .map_err(anyhow_error_into_source_install)?;
+        incoming.push(IncomingMessageBinding {
+            incoming_final_message_idx: candidate.idx,
+            status: IncomingStatus::AcceptedNew,
+            candidate_match: Some(candidate_match),
+            stored: Some(evidence),
+            reason: None,
+        });
+    }
+
+    // Accepted for the frozen call shape only; see the note above. Freezing no
+    // witness is a fact about a replacement, not an omission.
+    let _ = claims;
+
+    Ok(SourceAwareInsertOutcome::new(
+        *input_key,
+        conversation_ordinal,
+        conversation_id,
+        false,
+        identity_digest,
+        incoming,
+        Vec::new(),
+    ))
+}
+
 /// Task A4a: owned stand-in for `FrankenRow` — `api::Row` borrows for the
 /// duration of a single `query_all_map` callback, so it can't be collected into
 /// a `Vec` and processed later the way the native row type could. This function
@@ -12176,6 +13360,7 @@ fn franken_collect_batched_existing_new_messages<'a>(
         &mut existing_messages,
         &mut existing_replay_fingerprints,
         replay_skip_log,
+        None,
     )?;
     Ok((
         new_messages,
@@ -12341,6 +13526,45 @@ pub(crate) fn sync_lexical_docs_for_messages_in_tx(
 /// `UPDATE` alone would leave the old projection values still searchable
 /// via `fts_lex` while `lex_docs` already shows the new ones). Returns the
 /// number of `lex_docs` rows touched.
+/// T5's envelope-change rule: a re-ingest that changes only the conversation's
+/// title or workspace still has to move the envelope every `lex_docs` row of
+/// that conversation carries, without touching content. Shared, so the batched
+/// entry and the source-aware projection cannot disagree about it.
+fn resync_envelope_if_changed_in_tx(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+    workspace_id: Option<i64>,
+) -> Result<()> {
+    let (current_title, current_workspace_id): (Option<String>, Option<i64>) = tx
+        .query_row_map(
+            "SELECT title, workspace_id FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+        )
+        .with_context(|| {
+            format!(
+                "loading current title/workspace_id for envelope-change detection (conversation \
+                 {conversation_id})"
+            )
+        })?;
+    if current_title == conv.title && current_workspace_id == workspace_id {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE conversations SET title = ?2, workspace_id = ?3 WHERE id = ?1",
+        fparams![conversation_id, conv.title.as_deref(), workspace_id],
+    )
+    .with_context(|| {
+        format!(
+            "updating title/workspace_id for conversation {conversation_id} (envelope change on \
+             re-ingest)"
+        )
+    })?;
+    resync_lexical_envelope_for_conversation_in_tx(tx, conversation_id)?;
+    Ok(())
+}
+
 pub(crate) fn resync_lexical_envelope_for_conversation_in_tx(
     tx: &FrankenTransaction<'_>,
     conversation_id: i64,
@@ -15789,15 +17013,37 @@ pub struct DailyStatsRebuildResult {
 }
 
 /// Result of purging archived data for a single agent.
+///
+/// The `source_*` counters are the §14.5 addition: the source-aware tables are
+/// a copy of the same canonical data, so a purge removes the copies its
+/// connector owns in the same transaction. A canonical-only purge reports
+/// zeros here, and a source-only purge reports zeros for the two conversation
+/// counters above.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AgentArchivePurgeResult {
     pub conversations_deleted: usize,
     pub messages_deleted: usize,
+    /// `source_inputs` rows removed for this agent's connector.
+    pub source_inputs_deleted: usize,
+    /// `source_records` rows that went with them.
+    pub source_records_deleted: usize,
+    /// `source_message_links` rows that went with them.
+    pub source_links_deleted: usize,
+    /// Surviving links whose canonical message was deleted while their own
+    /// input was not matched: they were historyized, not removed.
+    pub source_links_historicalized: usize,
 }
 
 /// Result of a `cass forget` source-glob prune (#292 ask #2). On a dry run the
 /// `*_deleted` fields are zero and the `*_matched` fields report what WOULD be
 /// removed.
+///
+/// The `source_*` fields are the §14.5 addition. Their matching rule is the
+/// **original** locator (`root_id` + `relative_locator`), not the
+/// `conversations.source_path` glob the counters above use, so the two matched
+/// sets can legitimately differ. `source_links_historicalized` counts the
+/// unmatched copies that kept their facts because a canonical message they
+/// referenced was deleted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ForgetConversationsResult {
     pub pattern: String,
@@ -15807,6 +17053,15 @@ pub struct ForgetConversationsResult {
     pub conversations_deleted: usize,
     /// Bounded (<= 20) sample of matched source paths, for operator review.
     pub sample_source_paths: Vec<String>,
+    pub source_inputs_matched: usize,
+    pub source_records_matched: usize,
+    pub source_links_matched: usize,
+    pub source_inputs_deleted: usize,
+    pub source_records_deleted: usize,
+    pub source_links_deleted: usize,
+    pub source_links_historicalized: usize,
+    /// Bounded (<= 20) sample of matched ORIGINAL locator paths.
+    pub sample_source_locators: Vec<String>,
 }
 
 /// A single PRE-EXISTING duplicate conversation pair detected by
@@ -25568,6 +26823,140 @@ mod tests {
     // Source storage tests (bead yln.4)
     // =========================================================================
 
+    mod registration_preservation_tests {
+        use super::*;
+
+        fn registered_source(id: &str, kind: SourceKind) -> Source {
+            Source {
+                id: id.into(),
+                kind,
+                host_label: Some("registered-host".into()),
+                machine_id: Some("registered-machine".into()),
+                platform: Some("linux".into()),
+                config_json: Some(serde_json::json!({"paths": ["/registered/sessions"]})),
+                created_at: Some(1_700_000_000_000),
+                updated_at: Some(1_700_000_000_001),
+            }
+        }
+
+        fn conversation(id: &str, host: &str) -> Conversation {
+            Conversation {
+                id: None,
+                agent_slug: "codex".into(),
+                workspace: None,
+                external_id: Some("registration-preservation".into()),
+                title: None,
+                source_path: PathBuf::from("/log/registration-preservation.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: None,
+                approx_tokens: None,
+                metadata_json: serde_json::json!({}),
+                messages: vec![],
+                source_id: id.into(),
+                origin_host: Some(host.into()),
+            }
+        }
+
+        fn assert_source_eq(actual: &Source, expected: &Source) {
+            assert_eq!(actual.id, expected.id);
+            assert_eq!(actual.kind, expected.kind);
+            assert_eq!(actual.host_label, expected.host_label);
+            assert_eq!(actual.machine_id, expected.machine_id);
+            assert_eq!(actual.platform, expected.platform);
+            assert_eq!(actual.config_json, expected.config_json);
+            assert_eq!(actual.created_at, expected.created_at);
+            assert_eq!(actual.updated_at, expected.updated_at);
+        }
+
+        #[test]
+        fn a1_single_ensure_preserves_registered_source() {
+            let dir = TempDir::new().unwrap();
+            let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+            // Collect observations before asserting so both registration kinds
+            // exercise the cold cache and a second, distinct host cache key.
+            let mut observations = Vec::new();
+            for (id, kind) in [
+                ("registered-local", SourceKind::Local),
+                ("registered-ssh", SourceKind::Ssh),
+            ] {
+                storage.upsert_source(&registered_source(id, kind)).unwrap();
+                let initial = storage.get_source(id).unwrap().unwrap();
+                for host in ["inferred-first", "inferred-second"] {
+                    storage
+                        .ensure_source_for_conversation(&conversation(id, host))
+                        .unwrap();
+                    observations.push((storage.get_source(id).unwrap().unwrap(), initial.clone()));
+                }
+            }
+            let (actual, expected): (Vec<_>, Vec<_>) = observations
+                .into_iter()
+                .map(|(actual, expected)| {
+                    (serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap())
+                })
+                .unzip();
+            // One assertion reports both kinds and both cache misses on failure.
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn a2_batch_ensure_preserves_existing_and_creates_missing() {
+            let dir = TempDir::new().unwrap();
+            let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+            storage
+                .upsert_source(&registered_source("existing-source", SourceKind::Ssh))
+                .unwrap();
+            let initial = storage.get_source("existing-source").unwrap().unwrap();
+            let existing = conversation("existing-source", "inferred-existing");
+            let missing = conversation("missing-source", "  first-host  ");
+            let duplicate = conversation("missing-source", "second-host");
+            let existing_duplicate = conversation("existing-source", "another-host");
+            storage
+                .ensure_sources_for_batch(&[
+                    (1, None, &existing),
+                    (1, None, &missing),
+                    (1, None, &duplicate),
+                    (1, None, &existing_duplicate),
+                ])
+                .unwrap();
+            assert_source_eq(
+                &storage.get_source("existing-source").unwrap().unwrap(),
+                &initial,
+            );
+            let created = storage.get_source("missing-source").unwrap().unwrap();
+            let normalized = normalized_source_for_conversation(&missing);
+            assert_eq!(created.id, normalized.id);
+            assert_eq!(created.kind, normalized.kind);
+            assert_eq!(created.host_label, normalized.host_label);
+            assert_eq!(created.host_label.as_deref(), Some("first-host"));
+            assert!(created.machine_id.is_none());
+            assert!(created.platform.is_none());
+            assert!(created.config_json.is_none());
+            assert!(created.created_at.is_some_and(|time| time > 0));
+            assert!(created.updated_at.is_some_and(|time| time > 0));
+        }
+
+        #[test]
+        fn a3_explicit_upsert_still_clears_optional_fields() {
+            let dir = TempDir::new().unwrap();
+            let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+            let mut source = registered_source("explicit-source", SourceKind::Ssh);
+            storage.upsert_source(&source).unwrap();
+            let initial = storage.get_source(&source.id).unwrap().unwrap();
+            source.host_label = None;
+            source.machine_id = None;
+            source.platform = None;
+            source.config_json = None;
+            source.created_at = Some(1_800_000_000_000);
+            storage.upsert_source(&source).unwrap();
+            let cleared = storage.get_source(&source.id).unwrap().unwrap();
+            assert!(cleared.host_label.is_none());
+            assert!(cleared.machine_id.is_none());
+            assert!(cleared.platform.is_none());
+            assert!(cleared.config_json.is_none());
+            assert_eq!(cleared.created_at, initial.created_at);
+        }
+    }
+
     #[test]
     fn upsert_source_creates_new() {
         let dir = TempDir::new().unwrap();
@@ -28246,6 +29635,465 @@ mod tests {
         assert_eq!(storage.total_conversation_count().unwrap(), 1);
     }
 
+    /// SRC05C-D: a late failure inside the delete transaction rolls back
+    /// **every** change it made -- the canonical rows, the source copies and
+    /// the revision -- and the retry then applies them all.
+    ///
+    /// The failure is injected through the `#[cfg(test)]` hook in
+    /// `storage::source_facts`; a production fault switch would be a new way
+    /// for a real run to fail, and the ticket forbids adding one.
+    #[test]
+    fn a_late_failure_rolls_back_the_forget_deletion_and_its_source_facts() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::storage::source_facts::delete_fault_hooks;
+        use std::path::PathBuf;
+
+        /// Insert one minimal, fully CHECK-legal source input and its single
+        /// record, and hand back the pair's ids. A `complete` input also
+        /// carries the four columns the frozen CHECK requires of it, so the
+        /// receipt-key path can be exercised.
+        fn seed_source_input(
+            conn: &crate::storage::api::Conn,
+            input_key_seed: u8,
+            relative: &str,
+            state: &str,
+            receipt_key: Option<&str>,
+        ) -> (i64, i64) {
+            use crate::storage::api::Value as ApiValue;
+            let mut input_key = vec![0u8; 32];
+            input_key[0] = input_key_seed;
+            let complete = state == "complete";
+            let complete_only =
+                |value: ApiValue| -> ApiValue { if complete { value } else { ApiValue::Null } };
+            conn.execute(
+                "INSERT INTO source_inputs (
+                     input_key, identity_tuple_bin, source_id, identity_namespace, connector,
+                     origin_host, origin_source_version, role_bin, platform_bin,
+                     root_id_bin, relative_locator_bin, discovery_bin, parser_context_bin,
+                     context_digest, sealed_ref_bin, sealed_sha256, byte_len, format,
+                     expected_manifest_bin, normalizer_id, safety_contract_id, state,
+                     expected_records, expected_blank_lines, receipt_key,
+                     applied_content_generation, activation_request_hash,
+                     observed_records, observed_blank_lines)
+                 VALUES (?1, x'00', 'synthetic-source', 'synthetic-host', 'claude_code',
+                     NULL, NULL, NULL, NULL,
+                     ?2, ?3, x'00', x'00',
+                     zeroblob(32), x'00', zeroblob(32), zeroblob(8), 'jsonl',
+                     x'00', 'synthetic-normalizer', 'synthetic-safety', ?4,
+                     zeroblob(8), zeroblob(8), ?5,
+                     ?6, ?7, ?8, ?9)",
+                &[
+                    ApiValue::Blob(input_key),
+                    ApiValue::Blob(b"/tmp/synthetic".to_vec()),
+                    ApiValue::Blob(relative.as_bytes().to_vec()),
+                    ApiValue::Text(state.to_string()),
+                    receipt_key.map_or(ApiValue::Null, |key| ApiValue::Text(key.to_string())),
+                    complete_only(ApiValue::Text(
+                        "cass.source-generation/1:synthetic".to_string(),
+                    )),
+                    complete_only(ApiValue::Blob(vec![0u8; 32])),
+                    complete_only(ApiValue::Blob(vec![0u8; 8])),
+                    complete_only(ApiValue::Blob(vec![0u8; 8])),
+                ],
+            )
+            .expect("insert the source input");
+            let input_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO source_records (
+                     input_id, ordinal, record_pointer, position_bin,
+                     expected_source_record_sha256, observed_source_record_sha256, frame_state,
+                     native_ids_bin, parse_state, record_mapping_state, safety_state,
+                     retention_state, codec, payload_bin, safe_value_hash, diagnostics_bin)
+                 VALUES (?1, x'0000000000000001', '/records/0', x'00',
+                     zeroblob(32), NULL, 'activated',
+                     NULL, 'parsed', 'all_canonical', 'preserved',
+                     'payload_absent', NULL, NULL, NULL, NULL)",
+                &[crate::storage::api::Value::from(input_id)],
+            )
+            .expect("insert the source record");
+            (input_id, conn.last_insert_rowid())
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("forget-rollback.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let agent = Agent {
+            id: None,
+            slug: "claude".into(),
+            name: "claude".into(),
+            version: None,
+            kind: AgentKind::Cli,
+        };
+        let agent_id = storage.ensure_agent(&agent).unwrap();
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("rollback-marker".into()),
+            title: Some("rollback".into()),
+            source_path: PathBuf::from("/tmp/synthetic/subagents/agent-a.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![Message {
+                excluded: None,
+                id: None,
+                idx: 0,
+                role: MessageRole::User,
+                author: Some("user".into()),
+                created_at: Some(1_700_000_000_010),
+                content: "rollback content".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let message_id: i64 = storage
+            .raw()
+            .query_row_map("SELECT id FROM messages LIMIT 1", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+
+        // One input the glob matches (it goes), and one it does not: the
+        // latter's canonical link must be historyized, not deleted, because
+        // its message is about to disappear. The matched one is `complete` and
+        // names an activation receipt, so the rollback has to restore that
+        // receipt too.
+        let matched_receipt_key = "source-input-v1:synthetic-matched-receipt";
+        let unmatched_receipt_key = "source-input-v1:synthetic-unmatched-receipt";
+        let (_matched_input, _matched_record) = seed_source_input(
+            storage.raw(),
+            1,
+            "subagents/agent-a.jsonl",
+            "complete",
+            Some(matched_receipt_key),
+        );
+        seed_source_input(
+            storage.raw(),
+            3,
+            "projects/unmatched.jsonl",
+            "complete",
+            Some(unmatched_receipt_key),
+        );
+        let (_kept_input, kept_record) =
+            seed_source_input(storage.raw(), 2, "projects/other.jsonl", "staged", None);
+        for (key, operation) in [
+            (matched_receipt_key, "source_input_activation_v1"),
+            (unmatched_receipt_key, "source_input_activation_v1"),
+            ("synthetic-other-operation-key", "some_other_operation_v1"),
+        ] {
+            storage
+                .raw()
+                .execute(
+                    "INSERT INTO operation_commit_receipt
+                         (idempotency_key, operation, state, snapshot_root, committed_at_ms, detail)
+                     VALUES (?1, ?2, 'committed', NULL, 1, NULL)",
+                    &[
+                        crate::storage::api::Value::Text(key.to_string()),
+                        crate::storage::api::Value::Text(operation.to_string()),
+                    ],
+                )
+                .unwrap();
+        }
+        storage
+            .raw()
+            .execute(
+                "INSERT INTO source_message_links (
+                     record_id, projection_key, conversation_ordinal, final_message_idx,
+                     source_positions_bin, projection_pointer, message_id, authority,
+                     evidence_kind, binding_digest)
+                 VALUES (?1, zeroblob(32), 0, 0, x'00', '/messages/0', ?2, 'canonical', 'prose', zeroblob(32))",
+                &[
+                    crate::storage::api::Value::from(kept_record),
+                    crate::storage::api::Value::from(message_id),
+                ],
+            )
+            .unwrap();
+
+        let revision_before: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let source_rows = |table: &str| -> i64 {
+            storage
+                .raw()
+                .query_row_map(
+                    &format!("SELECT COUNT(*) FROM {table}"),
+                    fparams![],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .unwrap()
+        };
+        let glob = "**/subagents/*.jsonl";
+
+        delete_fault_hooks::arm_late_delete_failure();
+        let failed = storage.forget_conversations_by_source_glob(glob, false);
+        delete_fault_hooks::disarm_late_delete_failure();
+        assert!(
+            failed.is_err(),
+            "the injected late failure must abort the transaction"
+        );
+        assert_eq!(
+            storage.total_conversation_count().unwrap(),
+            1,
+            "the canonical row came back"
+        );
+        assert_eq!(storage.total_message_count().unwrap(), 1);
+        assert_eq!(
+            source_rows("source_inputs"),
+            3,
+            "every source copy came back"
+        );
+        assert_eq!(source_rows("source_records"), 3);
+        let (authority, link_message): (String, Option<i64>) = storage
+            .raw()
+            .query_row_map(
+                "SELECT authority, message_id FROM source_message_links",
+                fparams![],
+                |row| Ok((row.get_typed(0)?, row.get_typed(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (authority.as_str(), link_message),
+            ("canonical", Some(message_id)),
+            "the historyize was rolled back with everything else"
+        );
+        let revision_after: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(revision_after, revision_before, "the revision did not move");
+
+        let receipt_exists = |key: &str| -> bool {
+            storage
+                .raw()
+                .query_opt_map(
+                    "SELECT 1 FROM operation_commit_receipt WHERE idempotency_key = ?1",
+                    fparams![key],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .unwrap()
+                .is_some()
+        };
+        assert!(
+            receipt_exists(matched_receipt_key),
+            "the injected failure restored the matched input's receipt as well"
+        );
+
+        // The retry applies every part of the same change.
+        let applied = storage
+            .forget_conversations_by_source_glob(glob, false)
+            .unwrap();
+        assert_eq!(applied.conversations_deleted, 1);
+        assert_eq!(applied.source_inputs_deleted, 1);
+        assert_eq!(applied.source_links_historicalized, 1);
+        assert_eq!(
+            source_rows("source_inputs"),
+            2,
+            "only the two unmatched copies are left"
+        );
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT authority FROM source_message_links",
+                    fparams![],
+                    |row| row.get_typed::<String>(0),
+                )
+                .unwrap(),
+            "historical",
+            "the surviving link keeps its witness and only changes authority"
+        );
+        assert!(
+            !receipt_exists(matched_receipt_key),
+            "the deleted input's own receipt leaves with it"
+        );
+        assert!(
+            receipt_exists(unmatched_receipt_key),
+            "another input of the same operation keeps its receipt"
+        );
+        assert!(
+            receipt_exists("synthetic-other-operation-key"),
+            "another operation's receipt is never touched"
+        );
+
+        // And repeating the same apply changes nothing at all.
+        let revision_settled: String = storage
+            .raw()
+            .query_row_map(
+                "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                fparams![],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let repeated = storage
+            .forget_conversations_by_source_glob(glob, false)
+            .unwrap();
+        assert_eq!(repeated.conversations_deleted, 0);
+        assert_eq!(repeated.source_inputs_deleted, 0);
+        assert_eq!(repeated.source_links_historicalized, 0);
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                    fparams![],
+                    |row| row.get_typed::<String>(0),
+                )
+                .unwrap(),
+            revision_settled
+        );
+    }
+
+    /// SRC05C-D (§15.3): the deletion range and the facts revision answer
+    /// different questions. Every matched page is removed whatever state it is
+    /// in, while `source_facts_revision` moves only for the part the default
+    /// reader can see.
+    ///
+    /// The three fixture rows are the three cases the rule distinguishes: a
+    /// never-activated `staged` page, a `StagedOnly` attempt row (`state`
+    /// `failed` but no failure publication), and a final failure publication.
+    /// The first two are private staging state and leave the counter still;
+    /// the third is published and earns exactly one increment.
+    #[test]
+    fn deleting_unpublished_source_pages_leaves_the_facts_revision_still() {
+        use crate::storage::api::Value;
+
+        /// One input with an explicit terminal state. `published_failure`
+        /// writes the `unprocessed_ranges_bin` column the real failure
+        /// publication writes; leaving it NULL is what a `StagedOnly` attempt
+        /// leaves behind.
+        fn seed(
+            conn: &crate::storage::api::Conn,
+            key_seed: u8,
+            relative: &str,
+            state: &str,
+            published_failure: bool,
+        ) -> i64 {
+            let mut input_key = vec![0u8; 32];
+            input_key[0] = key_seed;
+            let unprocessed = if published_failure {
+                Value::Blob(vec![0])
+            } else {
+                Value::Null
+            };
+            conn.execute(
+                "INSERT INTO source_inputs (
+                     input_key, identity_tuple_bin, source_id, identity_namespace, connector,
+                     origin_host, origin_source_version, role_bin, platform_bin,
+                     root_id_bin, relative_locator_bin, discovery_bin, parser_context_bin,
+                     context_digest, sealed_ref_bin, sealed_sha256, byte_len, format,
+                     expected_manifest_bin, normalizer_id, safety_contract_id, state,
+                     expected_records, expected_blank_lines, unprocessed_ranges_bin)
+                 VALUES (?1, x'00', 'synthetic-source', 'synthetic-host', 'claude_code',
+                     NULL, NULL, NULL, NULL,
+                     ?2, ?3, x'00', x'00',
+                     zeroblob(32), x'00', zeroblob(32), zeroblob(8), 'jsonl',
+                     x'00', 'synthetic-normalizer', 'synthetic-safety', ?4,
+                     zeroblob(8), zeroblob(8), ?5)",
+                &[
+                    Value::Blob(input_key),
+                    Value::Blob(b"/tmp/synthetic-rev".to_vec()),
+                    Value::Blob(relative.as_bytes().to_vec()),
+                    Value::Text(state.to_string()),
+                    unprocessed,
+                ],
+            )
+            .expect("insert the source input");
+            conn.last_insert_rowid()
+        }
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("source-revision-boundary.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+
+        let plant = |key_seed: u8, relative: &str, state: &str, published: bool| {
+            seed(storage.raw(), key_seed, relative, state, published)
+        };
+        plant(1, "a/staged-page.jsonl", "staged", false);
+        plant(2, "a/stagedonly-failed.jsonl", "failed", false);
+        plant(3, "a/published-failure.jsonl", "failed", true);
+
+        let revision_of = || -> String {
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT value FROM meta WHERE key = 'source_facts_revision'",
+                    fparams![],
+                    |row| row.get_typed(0),
+                )
+                .unwrap()
+        };
+        let inputs_of = || -> i64 {
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM source_inputs", fparams![], |row| {
+                    row.get_typed(0)
+                })
+                .unwrap()
+        };
+
+        let before = revision_of();
+        assert_eq!(inputs_of(), 3);
+
+        // A never-activated page: removed, and the reader's revision is still.
+        let staged = storage
+            .forget_conversations_by_source_glob("**/staged-page.jsonl", false)
+            .unwrap();
+        assert_eq!(
+            staged.source_inputs_deleted, 1,
+            "the staged page really goes"
+        );
+        assert_eq!(staged.conversations_deleted, 0);
+        assert_eq!(inputs_of(), 2);
+        assert_eq!(
+            revision_of(),
+            before,
+            "private staging state is not a visible change"
+        );
+
+        // A StagedOnly attempt row: same answer, and it is `failed` all the
+        // same -- the state column alone is not the publication fact.
+        let staged_only = storage
+            .forget_conversations_by_source_glob("**/stagedonly-failed.jsonl", false)
+            .unwrap();
+        assert_eq!(staged_only.source_inputs_deleted, 1);
+        assert_eq!(inputs_of(), 1);
+        assert_eq!(
+            revision_of(),
+            before,
+            "a failure attempt that never published is not a visible change"
+        );
+
+        // A final failure publication: removed, and the revision moves once.
+        let published = storage
+            .forget_conversations_by_source_glob("**/published-failure.jsonl", false)
+            .unwrap();
+        assert_eq!(published.source_inputs_deleted, 1);
+        assert_eq!(published.source_links_historicalized, 0);
+        assert_eq!(inputs_of(), 0);
+        assert_eq!(
+            revision_of(),
+            (before.parse::<u64>().unwrap_or(0) + 1).to_string(),
+            "a published input leaving the reader's view is one visible change"
+        );
+    }
+
     /// Regression for cass#202: a `Connection` dropped mid-transaction can
     /// leave child rows persisted without a matching parent. The next indexer
     /// pass then trips `FOREIGN KEY constraint failed` on every write, the
@@ -30303,5 +32151,878 @@ mod e5_replace_tests {
             .raw()
             .execute("INSERT INTO fts_lex(fts_lex, rank) VALUES('integrity-check', 1)", fparams![])
             .expect("fts_lex integrity-check must pass (no dangling/corrupt shadow rows)");
+    }
+}
+
+// =========================================================================
+// Task 30 · 替换后的来源绑定证据
+//
+// 三个具名 AC（票 30 §验收与验证）：
+//   A1 replacement_binding_reads_sql      —— 真跑 replace 后按 idx 逐条绑定
+//   A2 replacement_binding_rejects_mismatch —— 每一项必要条件被破坏都拒绝
+//   A3 replacement_binding_no_writes      —— 原语只读 + 外层整体回滚
+// =========================================================================
+
+#[cfg(test)]
+mod source_replace_binding_tests {
+    use super::*;
+    use crate::indexer::exclusion::{ExcludedMarker, ExclusionAnchor, ExclusionReason, RawRef};
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::phase3_restore::{
+        OriginNamespace, ReplaceCommitInput, RestoreIdentity, commit_replace_in_tx,
+    };
+    use crate::storage::api::Tx;
+    use crate::storage::source_facts::{
+        ClaimMappingState, EvidenceKind, ExtraStorageKind, IncomingStatus, InstallationClass,
+        OriginalBindingOutcome, Sha256Digest, SourceAwareInsertOutcome, SourceClaim,
+        SourceInstallError,
+    };
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    const TS: i64 = 1_770_551_400_000;
+    const ORDINAL: u32 = 7;
+    const OLD_EXTERNAL_ID: &str = "task30-old-external-id";
+    const OLD_PATH: &str = "/fixtures/task30-old.jsonl";
+    const PROJECTED_PATH: &str = "/fixtures/task30-projected.jsonl";
+    /// A token that only the *old* messages carry, so the lexical assertions
+    /// have something to observe on both sides of the replace.
+    const OLD_TOKEN: &str = "oldmarkertoken";
+    const NEW_TOKEN: &str = "newmarkertoken";
+
+    fn message(idx: i64, role: MessageRole, content: &str) -> Message {
+        Message {
+            excluded: None,
+            id: None,
+            idx,
+            role,
+            author: None,
+            created_at: Some(TS + idx * 1_000),
+            content: content.into(),
+            extra_json: serde_json::Value::Null,
+            snippets: vec![],
+        }
+    }
+
+    /// A 64-hex marker; `fingerprint_blake3` is what the merge fingerprint uses
+    /// for an excluded row, so two markers that differ only outside it stay
+    /// fingerprint-identical and isolate the `excluded` comparison.
+    fn excluded_marker(tag: u8) -> ExcludedMarker {
+        ExcludedMarker {
+            reason: ExclusionReason::ContextFileRead,
+            rule_version: u32::from(tag),
+            bytes: u64::from(tag) * 7,
+            sha256: format!("{:02x}", tag).repeat(32),
+            fingerprint_blake3: format!("{:02x}", tag.wrapping_add(0x40)).repeat(32),
+            anchor: ExclusionAnchor::default(),
+            src: None,
+            parse_error: None,
+            raw: RawRef {
+                blob: "blobs/task30/fixture.raw".into(),
+                idx: 0,
+                event_key: "task30-event-0".into(),
+                blocks: Vec::new(),
+            },
+        }
+    }
+
+    fn conversation(
+        external_id: Option<&str>,
+        source_path: &str,
+        title: &str,
+        messages: Vec<Message>,
+    ) -> Conversation {
+        let started_at = messages.iter().filter_map(|m| m.created_at).min();
+        let ended_at = messages.iter().filter_map(|m| m.created_at).max();
+        Conversation {
+            id: None,
+            agent_slug: "codex".into(),
+            workspace: None,
+            external_id: external_id.map(str::to_owned),
+            title: Some(title.to_owned()),
+            source_path: std::path::PathBuf::from(source_path),
+            started_at,
+            ended_at,
+            approx_tokens: Some(999),
+            metadata_json: serde_json::json!({"source": "task30"}),
+            messages,
+            source_id: "local".into(),
+            origin_host: None,
+        }
+    }
+
+    fn old_conversation(messages: Vec<Message>) -> Conversation {
+        conversation(Some(OLD_EXTERNAL_ID), OLD_PATH, "旧标题", messages)
+    }
+
+    /// The projection the replace writes. Its `external_id` is `None` while the
+    /// stored row keeps the old one (the replace writes `external_id` back only
+    /// when the projection carries one) and its `source_path` differs from the
+    /// stored one — together those make the incoming parent fields
+    /// distinguishable from the row, which A1 needs to be a real check.
+    fn projected_conversation() -> Conversation {
+        let mut second = message(1, MessageRole::Assistant, "新 1");
+        second.extra_json = serde_json::Value::Null;
+        let mut third = message(2, MessageRole::User, "新 2");
+        third.excluded = Some(excluded_marker(1));
+        let mut first = message(0, MessageRole::User, NEW_TOKEN);
+        first.extra_json = serde_json::json!({"kind": "task30", "n": 0});
+        conversation(None, PROJECTED_PATH, "新标题", vec![first, second, third])
+    }
+
+    struct Harness {
+        dir: TempDir,
+        storage: FrankenStorage,
+        agent_id: i64,
+        conversation_id: i64,
+        pricing: PricingTable,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            let storage = FrankenStorage::open(&dir.path().join("task30.sqlite")).unwrap();
+            let agent_id = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "codex".into(),
+                    name: "codex".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .unwrap();
+            let conversation_id = seed_old_conversation(&storage, agent_id);
+            let pricing = PricingTable::franken_load(storage.raw()).unwrap();
+            Self {
+                dir,
+                storage,
+                agent_id,
+                conversation_id,
+                pricing,
+            }
+        }
+
+        fn tx(&self) -> Tx<'_> {
+            self.storage.raw().transaction().unwrap()
+        }
+    }
+
+    /// Two batched inserts, so the append branch writes the third tail carrier:
+    /// the rollback AC is then not vacuous.
+    fn seed_old_conversation(storage: &FrankenStorage, agent_id: i64) -> i64 {
+        let first = old_conversation(vec![
+            message(0, MessageRole::User, OLD_TOKEN),
+            message(1, MessageRole::Assistant, "旧 1"),
+        ]);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &first)])
+            .unwrap();
+        let grown = old_conversation(vec![
+            message(0, MessageRole::User, OLD_TOKEN),
+            message(1, MessageRole::Assistant, "旧 1"),
+            message(2, MessageRole::User, "旧 2"),
+        ]);
+        storage
+            .insert_conversations_batched(&[(agent_id, None, &grown)])
+            .unwrap();
+
+        let conversation_id: i64 = storage
+            .raw()
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams![OLD_EXTERNAL_ID],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        let tail: Option<i64> = storage
+            .raw()
+            .query_row_map(
+                "SELECT last_message_idx FROM conversation_external_tail_lookup
+                 WHERE conversation_id = ?1",
+                fparams![conversation_id],
+                |row| row.get_typed(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tail,
+            Some(2),
+            "前置断言：第三处 tail 载体必须已有行且停在 idx 2，否则回滚断言空转"
+        );
+        conversation_id
+    }
+
+    fn restore_identity() -> RestoreIdentity {
+        RestoreIdentity {
+            origin: OriginNamespace {
+                agent_slug: "codex".into(),
+                source_id: "local".into(),
+                origin_host: "task30-host".into(),
+            },
+            canonical_path: OLD_PATH.into(),
+        }
+    }
+
+    fn input_key() -> Sha256Digest {
+        Sha256Digest::of(b"task30-input-key")
+    }
+
+    fn claim_for(idx: i64) -> SourceClaim {
+        SourceClaim {
+            input_key: input_key(),
+            record_ordinal: u64::try_from(idx).expect("fixture idx is non-negative"),
+            record_pointer: format!("record:{idx}"),
+            conversation_ordinal: Some(ORDINAL),
+            final_message_idx: Some(idx),
+            positions: Vec::new(),
+            projection_pointer: Some(format!("message:{idx}")),
+            evidence_kind: EvidenceKind::Prose,
+            mapping_state: ClaimMappingState::Canonical,
+        }
+    }
+
+    /// Run the real replace inside the caller's transaction and hand back the
+    /// ids the write path really inserted.
+    fn replace_in_tx(h: &Harness, tx: &Tx<'_>, projected: &Conversation) -> Vec<i64> {
+        commit_replace_in_tx(
+            tx,
+            &ReplaceCommitInput {
+                conversation_id: h.conversation_id,
+                agent_id: h.agent_id,
+                workspace_id: None,
+                conv: projected,
+                identity: &restore_identity(),
+                snapshot_root: "task30-root",
+                generation: "task30-gen",
+            },
+            &h.pricing,
+            TS,
+        )
+        .unwrap()
+        .inserted_message_ids
+    }
+
+    fn bind(
+        h: &Harness,
+        tx: &Tx<'_>,
+        conv: &Conversation,
+        ids: &[i64],
+    ) -> Result<SourceAwareInsertOutcome, SourceInstallError> {
+        bind_replaced_projection_in_tx(tx, h.conversation_id, conv, &input_key(), ORDINAL, &[], ids)
+    }
+
+    struct StoredRow {
+        id: i64,
+        idx: i64,
+        role: String,
+        author: Option<String>,
+        created_at: Option<i64>,
+        content: String,
+        extra_json: Option<String>,
+        extra_bin: Option<Vec<u8>>,
+        excluded_json: Option<String>,
+    }
+
+    /// Every helper below reads through the caller's own transaction: the
+    /// binding primitive must be exercised inside the write transaction that
+    /// ran the replace, and a second transaction on the same connection would
+    /// both nest illegally and hide which state was read.
+    fn stored_rows(tx: &Tx<'_>, conversation_id: i64) -> Vec<StoredRow> {
+        tx.query_all_map(
+            "SELECT id, idx, role, author, created_at, content, extra_json, extra_bin, json(excluded)
+             FROM messages WHERE conversation_id = ?1 ORDER BY idx",
+            fparams![conversation_id],
+            |row| {
+                Ok(StoredRow {
+                    id: row.get_typed(0)?,
+                    idx: row.get_typed(1)?,
+                    role: row.get_typed(2)?,
+                    author: row.get_typed(3)?,
+                    created_at: row.get_typed(4)?,
+                    content: row.get_typed(5)?,
+                    extra_json: row.get_typed(6)?,
+                    extra_bin: row.get_typed(7)?,
+                    excluded_json: row.get_typed(8)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn parent_row(tx: &Tx<'_>, conversation_id: i64) -> (String, i64, Option<String>, String) {
+        tx.query_row_map(
+            "SELECT identity_host, agent_id, external_id, source_path
+             FROM conversations WHERE id = ?1",
+            fparams![conversation_id],
+            |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn library_identity(tx: &Tx<'_>) -> String {
+        tx.query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            fparams![crate::storage::schema::LIBRARY_IDENTITY_META_KEY],
+            |row| row.get_typed(0),
+        )
+        .unwrap()
+    }
+
+    /// A stable text rendering of every row a statement returns, sorted so a
+    /// scan-order change cannot pass for a data change.
+    fn dump(tx: &Tx<'_>, sql: &str, params: &[crate::storage::api::Value]) -> Vec<String> {
+        let mut rows: Vec<String> = tx
+            .query_all_map(sql, params, |row| {
+                let mut cells = Vec::new();
+                // `Row` exposes no column count; walk the row until the first
+                // out-of-range index instead.
+                for idx in 0..64 {
+                    match row.get_value(idx) {
+                        Ok(value) => cells.push(format!("{value:?}")),
+                        Err(_) => break,
+                    }
+                }
+                Ok(cells.join(" | "))
+            })
+            .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// Every table the replace and the binding primitive could touch, plus the
+    /// lexical domains and a probe for the old token.
+    fn sql_state(tx: &Tx<'_>) -> Vec<String> {
+        let mut state = Vec::new();
+        let sources: [(&str, &str); 12] = [
+            ("messages", "SELECT * FROM messages"),
+            ("conversations", "SELECT * FROM conversations"),
+            (
+                "conversation_tail_state",
+                "SELECT * FROM conversation_tail_state",
+            ),
+            (
+                "conversation_external_tail_lookup",
+                "SELECT * FROM conversation_external_tail_lookup",
+            ),
+            ("snippets", "SELECT * FROM snippets"),
+            ("lex_docs", "SELECT * FROM lex_docs"),
+            ("token_usage", "SELECT * FROM token_usage"),
+            ("message_metrics", "SELECT * FROM message_metrics"),
+            (
+                "operation_commit_receipt",
+                "SELECT * FROM operation_commit_receipt",
+            ),
+            ("meta", "SELECT * FROM meta"),
+            ("sources", "SELECT * FROM sources"),
+            ("agents", "SELECT * FROM agents"),
+        ];
+        for (label, sql) in sources {
+            for row in dump(tx, sql, fparams![]) {
+                state.push(format!("{label}: {row}"));
+            }
+        }
+        for row in dump(tx, "SELECT count(*) FROM fts_lex", fparams![]) {
+            state.push(format!("fts_lex_count: {row}"));
+        }
+        // The two lexical probes bind the marker as a query value: a value never
+        // becomes SQL text here, and the snapshot still covers the same rows it
+        // covered before.
+        let probes: [(&str, &str, &str); 2] = [
+            (
+                "fts_lex_old_token",
+                "SELECT count(*) FROM fts_lex WHERE fts_lex MATCH ?1",
+                OLD_TOKEN,
+            ),
+            (
+                "lex_docs_old_token",
+                "SELECT count(*) FROM lex_docs WHERE content LIKE '%' || ?1 || '%'",
+                OLD_TOKEN,
+            ),
+        ];
+        for (label, sql, token) in probes {
+            for row in dump(tx, sql, fparams![token]) {
+                state.push(format!("{label}: {row}"));
+            }
+        }
+        state
+    }
+
+    fn state_of(h: &Harness) -> Vec<String> {
+        let tx = h.tx();
+        let state = sql_state(&tx);
+        tx.rollback().unwrap();
+        state
+    }
+
+    fn assert_conflict(result: Result<SourceAwareInsertOutcome, SourceInstallError>, what: &str) {
+        match result {
+            Ok(outcome) => panic!(
+                "{what}: expected a refusal, got an outcome with {} binding(s)",
+                outcome.incoming.len()
+            ),
+            Err(SourceInstallError::Conflict { detail }) => {
+                assert!(!detail.is_empty(), "{what}: a refusal must carry a detail");
+            }
+            Err(other) => panic!(
+                "{what}: the refusal must be a business rejection, not {other} — a SQL or type \
+                 error here would be a false red"
+            ),
+        }
+    }
+
+    // ── A1 · replacement_binding_reads_sql ────────────────────────────────
+    #[test]
+    #[serial]
+    fn replacement_binding_reads_sql() {
+        let h = Harness::new();
+        let projected = projected_conversation();
+
+        let tx = h.tx();
+        let ids = replace_in_tx(&h, &tx, &projected);
+        assert_eq!(
+            ids.len(),
+            projected.messages.len(),
+            "前置断言：真 replace 必须为每条 incoming 插一行，否则后续逐条断言空转"
+        );
+
+        let outcome = bind(&h, &tx, &projected, &ids).unwrap();
+
+        assert_eq!(outcome.conversation_id, h.conversation_id);
+        assert_eq!(outcome.input_key, input_key());
+        assert_eq!(outcome.conversation_ordinal, ORDINAL);
+        assert!(
+            !outcome.conversation_inserted,
+            "替换是既有会话，conversation_inserted 必须为 false"
+        );
+
+        // 父身份必须来自本事务最终的 conversations 行，而不是 incoming。
+        let (identity_host, parent_agent_id, stored_external_id, stored_source_path) =
+            parent_row(&tx, h.conversation_id);
+        assert_eq!(
+            stored_external_id.as_deref(),
+            Some(OLD_EXTERNAL_ID),
+            "可区分条件的前置：投影 external_id 为 None，replace 不写回，行上仍留旧值"
+        );
+        let library_identity = library_identity(&tx);
+        let from_sql = crate::storage::source_facts::conversation_identity_digest(
+            &library_identity,
+            h.conversation_id,
+            &identity_host,
+            parent_agent_id,
+            stored_external_id.as_deref(),
+            &stored_source_path,
+        );
+        let from_incoming_locator = crate::storage::source_facts::conversation_identity_digest(
+            &library_identity,
+            h.conversation_id,
+            &identity_host,
+            parent_agent_id,
+            projected.external_id.as_deref(),
+            &projected.source_path.to_string_lossy(),
+        );
+        assert_ne!(
+            from_sql, from_incoming_locator,
+            "夹具必须让 incoming 父字段与最终 SQL 行可区分，否则本断言是空转"
+        );
+        assert_eq!(
+            outcome.conversation_identity_digest, from_sql,
+            "parent 摘要必须由最终 SQL 行算出"
+        );
+
+        let rows = stored_rows(&tx, h.conversation_id);
+        assert_eq!(rows.len(), projected.messages.len());
+        assert_eq!(outcome.incoming.len(), projected.messages.len());
+
+        for (message, row) in projected.messages.iter().zip(rows.iter()) {
+            assert_eq!(row.idx, message.idx, "夹具按 idx 对齐");
+            let binding = outcome
+                .incoming
+                .iter()
+                .find(|binding| binding.incoming_final_message_idx == message.idx)
+                .unwrap_or_else(|| panic!("idx {} 必须有一条绑定", message.idx));
+
+            assert_eq!(binding.status, IncomingStatus::AcceptedNew);
+            assert!(binding.reason.is_none());
+            assert!(binding.candidate_match.is_some());
+            let evidence = binding
+                .stored
+                .as_ref()
+                .expect("AcceptedNew 必须带完整 SQL 证据");
+
+            assert_eq!(evidence.outcome, OriginalBindingOutcome::AcceptedNew);
+            assert_eq!(evidence.conversation_id, h.conversation_id);
+            assert_eq!(
+                evidence.conversation_identity_digest,
+                outcome.conversation_identity_digest
+            );
+            assert_eq!(evidence.stored_idx, message.idx);
+
+            // 实际 SQL 行：id / 指纹 / 正文摘要，逐条核对。
+            assert_eq!(evidence.original_message_id, row.id);
+            assert_eq!(evidence.stored_merge_fingerprint.idx, row.idx);
+            assert_eq!(evidence.stored_merge_fingerprint.created_at, row.created_at);
+            // 指纹里的 role 是既有 `merge_fingerprint_to_facts` 的表示
+            // （`MessageRole` 的 `Display`，如 "User"），**不是** SQL 字面量；
+            // 期望值因此从实际 SQL 列经 `role_from_str` 回读后再取 Display。
+            assert_eq!(
+                evidence.stored_merge_fingerprint.role,
+                role_from_str(&row.role).to_string(),
+                "指纹的 role 必须由实际 SQL 列经既有编码得到"
+            );
+            assert_eq!(
+                row.role,
+                role_as_str(&message.role),
+                "SQL 行的 role 列必须是存库字面量"
+            );
+            assert_eq!(evidence.stored_merge_fingerprint.author, row.author);
+            assert_eq!(
+                evidence.safe_content_sha256,
+                Sha256Digest::of(row.content.as_bytes())
+            );
+            assert_eq!(
+                row.content, message.content,
+                "成功路径上存储的安全正文必须与 incoming 逐字节相同"
+            );
+            // 指纹是行自己的字节复算出来的：excluded 行用 marker 的 blake3，
+            // 其余行用正文的 blake3。
+            let expected_content_hash = match message.excluded.as_ref() {
+                Some(marker) => marker.fingerprint_blake3.clone(),
+                None => hex::encode(blake3::hash(row.content.as_bytes()).as_bytes()),
+            };
+            assert_eq!(
+                evidence.stored_merge_fingerprint.content_blake3_hex,
+                expected_content_hash
+            );
+
+            // 声明的 ID 集合必须真的是这些行。
+            assert!(
+                ids.contains(&row.id),
+                "idx {} 的 id 必须在声明集合中",
+                message.idx
+            );
+
+            // extra / excluded 的语义证据来自 SQL 原列。
+            if row
+                .extra_bin
+                .as_deref()
+                .is_some_and(|bytes| !bytes.is_empty())
+            {
+                assert_eq!(evidence.extra_storage_kind, ExtraStorageKind::MsgPack);
+            } else if row.extra_json.is_some() {
+                assert_eq!(
+                    evidence.extra_storage_kind,
+                    ExtraStorageKind::HistoricalJson
+                );
+            } else {
+                assert_eq!(evidence.extra_storage_kind, ExtraStorageKind::Null);
+            }
+            // 两项**物理**摘要必须等于 SQL 原列的字节摘要（缺席即 None），
+            // 而不是只核存储种类。
+            assert_eq!(
+                evidence.extra_json_sha256,
+                row.extra_json
+                    .as_deref()
+                    .map(|raw| Sha256Digest::of(raw.as_bytes())),
+                "extra_json_sha256 必须是 SQL 列文本的字节摘要（缺席为 None）"
+            );
+            assert_eq!(
+                evidence.extra_bin_sha256,
+                row.extra_bin.as_deref().map(Sha256Digest::of),
+                "extra_bin_sha256 必须是 SQL 列 blob 的字节摘要（缺席为 None）"
+            );
+            match message_extra_to_source_jsonl_line(&message.extra_json) {
+                Some(line) => assert_eq!(
+                    evidence.extra_semantic_digest,
+                    Some(Sha256Digest::of(line.as_bytes()))
+                ),
+                None => assert!(evidence.extra_semantic_digest.is_none()),
+            }
+            assert_eq!(
+                evidence.excluded_semantic_digest,
+                message
+                    .excluded
+                    .as_ref()
+                    .map(|marker| Sha256Digest::of(marker.to_json_string().as_bytes()))
+            );
+        }
+
+        // 无 winner rejection：每个 incoming 位置的 claim 都 join 到 CanonicalBound。
+        let semantic_request = Sha256Digest::of(b"task30-semantic-request");
+        for message in &projected.messages {
+            let claim = claim_for(message.idx);
+            assert!(
+                outcome.winner_rejection_for_claim(&claim).is_none(),
+                "替换不保留任何同 idx 赢家，idx {} 不得有 witness",
+                message.idx
+            );
+            let installation = outcome
+                .installation_for_claim(&claim, semantic_request)
+                .unwrap_or_else(|| panic!("idx {} 的 claim 必须能 join 到绑定", message.idx));
+            assert_eq!(installation.class, InstallationClass::CanonicalBound);
+            assert!(installation.rejection.is_none());
+            assert_eq!(
+                installation.binding.as_ref().map(|binding| binding.outcome),
+                Some(OriginalBindingOutcome::AcceptedNew)
+            );
+        }
+
+        // 列表顺序不是证据：同一集合倒序必须绑定到同一批 idx 行。
+        let mut reversed = ids.clone();
+        reversed.reverse();
+        assert_ne!(reversed, ids, "夹具必须真的把顺序倒过来");
+        let again = bind(&h, &tx, &projected, &reversed).unwrap();
+        assert_eq!(
+            again, outcome,
+            "ID 列表顺序不同、集合相同，必须得到同样的按 idx 绑定"
+        );
+
+        drop(tx);
+    }
+
+    // ── 具名 AC 之外共用的拒绝断言 ────────────────────────────────────────
+
+    fn assert_staging(result: Result<SourceAwareInsertOutcome, SourceInstallError>, what: &str) {
+        match result {
+            Ok(outcome) => panic!(
+                "{what}: expected a refusal, got an outcome with {} binding(s)",
+                outcome.incoming.len()
+            ),
+            Err(SourceInstallError::Staging { detail }) => {
+                assert!(!detail.is_empty(), "{what}: a refusal must carry a detail");
+            }
+            Err(other) => panic!("{what}: expected Staging, got {other}"),
+        }
+    }
+
+    // ── A2 · replacement_binding_rejects_mismatch ─────────────────────────
+    //
+    // 每个子用例都在自己那份**真跑过 replace** 的库上先证明正常侧可成功，再只
+    // 破坏一个必要条件：因此拒绝只能来自业务判定，不可能来自编译或 SQL 错误。
+    #[test]
+    #[serial]
+    fn replacement_binding_rejects_mismatch() {
+        // 1 · 外来 ID 集合：长度相同，但没有一个属于本会话的行
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let foreign: Vec<i64> = ids.iter().map(|id| id + 1_000_000).collect();
+            assert_conflict(bind(&h, &tx, &projected, &foreign), "外来 ID 集合");
+            drop(tx);
+        }
+        // 2 · 缺 ID：漏掉最后一行
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let short = ids[..ids.len() - 1].to_vec();
+            assert_conflict(bind(&h, &tx, &projected, &short), "缺一个 ID");
+            drop(tx);
+        }
+        // 3 · 多 ID：所有行的 ID 都在，但集合里多出一个
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut long = ids.clone();
+            long.push(ids[0] + 5_000_000);
+            assert_conflict(bind(&h, &tx, &projected, &long), "多一个 ID");
+            drop(tx);
+        }
+        // 4 · 重复 ID：声明列表内部重复
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut repeated = ids.clone();
+            let last = repeated.len() - 1;
+            repeated[last] = repeated[0];
+            assert_conflict(bind(&h, &tx, &projected, &repeated), "重复 ID");
+            drop(tx);
+        }
+        // 5 · 缺 row：incoming 多出一个库里没有行的 idx
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut conv = projected.clone();
+            conv.messages
+                .push(message(9, MessageRole::User, "库里没有这一行"));
+            assert_conflict(bind(&h, &tx, &conv, &ids), "缺 row");
+            drop(tx);
+        }
+        // 6 · 错 content（非排除行）：指纹就能分辨
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut conv = projected.clone();
+            conv.messages[0].content = "被改过的正文".into();
+            assert_conflict(bind(&h, &tx, &conv, &ids), "错 content");
+            drop(tx);
+        }
+        // 7 · 错 content（排除行，同一 marker）：指纹在此**分辨不了** ——
+        //     `fingerprint_hash_for(content, Some(marker))` 只用 marker 的
+        //     blake3，不读 content。只有安全正文自身的一致性检查能拒绝它。
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            assert!(
+                projected.messages[2].excluded.is_some(),
+                "本反例要的是一行带 excluded marker 的消息"
+            );
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut conv = projected.clone();
+            conv.messages[2].content = "同 marker 下的另一段正文".into();
+            assert_eq!(
+                conv.messages[2].excluded, projected.messages[2].excluded,
+                "本反例必须保持 marker 完全相同，否则它退化成 A2 的第 9 个子用例"
+            );
+            assert_conflict(
+                bind(&h, &tx, &conv, &ids),
+                "同一 excluded marker、仅安全正文不同",
+            );
+            drop(tx);
+        }
+        // 8 · 错 extra：指纹不覆盖 extra，只能由 extra 的语义比较拒绝
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut conv = projected.clone();
+            conv.messages[0].extra_json = serde_json::json!({"kind": "task30", "n": 1});
+            assert_conflict(bind(&h, &tx, &conv, &ids), "错 extra");
+            drop(tx);
+        }
+        // 9 · 错 excluded：指纹只吃 marker 的 blake3，所以这里让 marker 在
+        //     blake3 之外的字段上漂移 —— 只有 excluded 的语义比较能拒绝它。
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut drifted = excluded_marker(1);
+            drifted.rule_version += 1;
+            drifted.bytes += 1;
+            let mut conv = projected.clone();
+            assert_eq!(
+                conv.messages[2]
+                    .excluded
+                    .as_ref()
+                    .map(|m| m.fingerprint_blake3.clone()),
+                Some(drifted.fingerprint_blake3.clone()),
+                "本反例必须让 marker 的 blake3 保持不变，否则指纹就会先拒绝"
+            );
+            conv.messages[2].excluded = Some(drifted);
+            assert_conflict(bind(&h, &tx, &conv, &ids), "错 excluded");
+            drop(tx);
+        }
+        // 10 · 重复 idx：一条 incoming 列表内部重复
+        {
+            let h = Harness::new();
+            let projected = projected_conversation();
+            let tx = h.tx();
+            let ids = replace_in_tx(&h, &tx, &projected);
+            bind(&h, &tx, &projected, &ids).expect("正常侧必须先可成功");
+            let mut conv = projected.clone();
+            conv.messages[2].idx = conv.messages[0].idx;
+            assert_staging(bind(&h, &tx, &conv, &ids), "重复 idx");
+            drop(tx);
+        }
+    }
+
+    // ── A3 · replacement_binding_no_writes ────────────────────────────────
+    #[test]
+    #[serial]
+    fn replacement_binding_no_writes() {
+        let h = Harness::new();
+        let projected = projected_conversation();
+
+        let committed_before = state_of(&h);
+        assert!(
+            committed_before.iter().any(|row| row.contains(OLD_TOKEN)),
+            "前置断言：事务前的基线必须含旧正文，否则回滚比较是在两个空状态之间做"
+        );
+        assert!(
+            !committed_before.iter().any(|row| row.contains(NEW_TOKEN)),
+            "前置断言：事务前不得含新正文"
+        );
+
+        let tx = h.tx();
+        let ids = replace_in_tx(&h, &tx, &projected);
+        let after_replace = sql_state(&tx);
+        assert_ne!(
+            committed_before, after_replace,
+            "前置断言：真 replace 必须改变库状态，否则「原语没写」与「回滚有效」都空转"
+        );
+        assert!(
+            after_replace.iter().any(|row| row.contains(NEW_TOKEN)),
+            "replace 之后必须能观察到新正文"
+        );
+        // 收据/代际都真的在事务里写过，回滚断言才不是「本来就没写」。
+        assert!(
+            after_replace
+                .iter()
+                .any(|row| row.contains("mirror-restore-replace")),
+            "replace 必须已在本事务内写入自己的收据"
+        );
+        assert!(
+            after_replace.iter().any(|row| row.contains("task30-gen")),
+            "replace 必须已在本事务内推进内容代际"
+        );
+
+        let outcome = bind(&h, &tx, &projected, &ids).unwrap();
+        assert_eq!(outcome.incoming.len(), projected.messages.len());
+
+        let after_bind = sql_state(&tx);
+        assert_eq!(
+            after_replace, after_bind,
+            "原语只能读取：调用前后相关 SQL 状态必须逐行一致"
+        );
+
+        tx.rollback().unwrap();
+
+        let committed_after = state_of(&h);
+        assert_eq!(
+            committed_before, committed_after,
+            "包含真 replace 的外层事务整体回滚后，旧消息、三处 tail、收据与词法状态都必须恢复"
+        );
+        assert!(
+            committed_after.iter().any(|row| row.contains(OLD_TOKEN)),
+            "回滚后旧正文必须回来"
+        );
+        assert!(
+            !committed_after.iter().any(|row| row.contains(NEW_TOKEN)),
+            "回滚后新正文必须消失"
+        );
+        assert!(
+            !committed_after
+                .iter()
+                .any(|row| row.contains("mirror-restore-replace")),
+            "回滚后 replace 的收据必须消失"
+        );
     }
 }

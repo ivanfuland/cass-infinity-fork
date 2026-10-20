@@ -11,6 +11,8 @@ pub mod scan_root_meta;
 pub(crate) mod responsiveness;
 pub mod semantic;
 pub mod semantic_progress;
+pub(crate) mod source_ingest;
+pub(crate) mod source_ownership;
 pub(crate) mod staging_reclaim;
 
 use self::quarantine::{QuarantineKey, QuarantineState};
@@ -904,6 +906,10 @@ pub struct SemanticCleanupFailure {
 }
 
 /// Aggregate indexing statistics for JSON output (T7.4).
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct IndexingStats {
     /// Time spent in scanning phase (ms)
@@ -934,6 +940,15 @@ pub struct IndexingStats {
     pub semantic_watch_once: Option<SemanticWatchOnceStats>,
     /// Conversations skipped by ingest quarantine during this run.
     pub quarantined_conversations: usize,
+    /// SRC05B-07: sealed inputs this run committed. "The source commit is
+    /// complete" is this number, not a claim about the vector side.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub source_inputs_committed: usize,
+    /// SRC05B-07: committed inputs whose semantic derivation was not read back
+    /// in memory and is left to the existing catch-up. Non-zero means the
+    /// source commit is complete while vector recovery is still outstanding.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub source_inputs_pending_recovery: usize,
     /// True when SQLite ingest succeeded but inline lexical updates were
     /// deferred and the caller must rebuild lexical assets from the archive.
     pub lexical_update_deferred: bool,
@@ -1631,6 +1646,17 @@ pub struct IndexOptions {
     /// Minimum interval (in seconds) between watch scan cycles. Prevents tight-loop
     /// CPU burn when filesystem events arrive continuously. Default: 30.
     pub watch_interval_secs: u64,
+    /// SRC05B-07 / Task 19: the caller-supplied fixed safety-configuration
+    /// copy.
+    ///
+    /// `Some` is an explicit override: the run uses this copy as its fixed
+    /// configuration instead of the default one. `None` no longer means the
+    /// legacy path -- a run that actually ingests prepares the default fixed
+    /// configuration once from the live effective rules and reuses that copy
+    /// for the whole run. A `--no-ingest` run, an absent-path early return and
+    /// a canonical-only derived rebuild prepare nothing. A supplied copy that
+    /// is missing or broken is a startup failure; it never falls back.
+    pub source_safety_config: Option<PathBuf>,
 }
 
 pub fn set_robot_trace_ingest_enabled(enabled: bool) -> bool {
@@ -5616,8 +5642,25 @@ fn should_skip_unchanged_explicit_watch_once_paths(
     opts: &IndexOptions,
     storage: &FrankenStorage,
     roots: &[(ConnectorKind, ScanRoot)],
+    source_fidelity_enabled: bool,
 ) -> Result<bool> {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
+        return Ok(false);
+    }
+    // SRC05B-09A: this skip answers "the file has not been touched since the
+    // last index run" from the mtime and from a conversation already recorded
+    // for that path. Neither is a source fact: a run whose source receipt is
+    // missing, or whose fixed safety copy changed, has a current mtime and a
+    // conversation row while its input is still unfinished, and skipping on
+    // that evidence would report a completed run over an input that was never
+    // sealed. The source-aware path has its own answer for "already read"
+    // (prepare + the kernel's verified replay), so it never takes this one.
+    //
+    // Task 19: `source_fidelity_enabled` states that this run prepares a
+    // fixed configuration even though no explicit copy was named. It is a
+    // caller-owned fact about the run, not a product switch, and it must
+    // disable the shortcut for exactly the same reason the explicit copy does.
+    if source_fidelity_enabled || opts.source_safety_config.is_some() {
         return Ok(false);
     }
 
@@ -5646,6 +5689,7 @@ fn should_skip_unchanged_explicit_watch_once_paths(
 fn can_skip_unchanged_explicit_watch_once_index_run(
     opts: &IndexOptions,
     storage: &FrankenStorage,
+    source_fidelity_enabled: bool,
 ) -> Result<bool> {
     if opts.watch || opts.full || opts.force_rebuild || opts.semantic {
         return Ok(false);
@@ -5661,7 +5705,12 @@ fn can_skip_unchanged_explicit_watch_once_index_run(
     let additional_scan_roots =
         additional_scan_roots_for_scan_or_watch(storage, &opts.data_dir)?;
     let watch_roots = build_watch_roots(additional_scan_roots);
-    if !should_skip_unchanged_explicit_watch_once_paths(opts, storage, &watch_roots)? {
+    if !should_skip_unchanged_explicit_watch_once_paths(
+        opts,
+        storage,
+        &watch_roots,
+        source_fidelity_enabled,
+    )? {
         return Ok(false);
     }
 
@@ -6865,6 +6914,17 @@ pub(crate) enum IndexMessage {
         connector_name: &'static str,
         error: String,
     },
+    /// SRC05B-07: one prepared sealed input.
+    ///
+    /// This is deliberately not a `Batch`: an input is one unit of work with
+    /// its own root association, and it may never be split into several
+    /// independent conversation commits. The consumer commits it and, when the
+    /// commit fails, withholds that root's watermark.
+    SourceInput {
+        connector_name: &'static str,
+        job: Box<source_ingest::SourceInputJob>,
+        byte_reservation: usize,
+    },
     /// Producer has finished scanning
     Done {
         connector_name: &'static str,
@@ -7459,6 +7519,9 @@ struct StreamingProducerConfig {
     /// PR8 C3: the metadata every scan root (configured + home) is looked up
     /// in for its `identity_host` / `root_id`.
     scan_roots_meta: Arc<scan_root_meta::ScanRootMetaIndex>,
+    /// SRC05B-07: the loaded fixed safety configuration, when the caller asked
+    /// for the source-aware path.
+    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 }
 
 /// PR8 C3: one connector's watermarks-enabled roots, split by where they come
@@ -7467,15 +7530,28 @@ struct StreamingProducerConfig {
 #[derive(Debug, Clone, Default)]
 struct ConnectorRootPlans {
     home: Vec<LocalRootPlan>,
-    configured: HashMap<PathBuf, LocalRootPlan>,
+    configured: HashMap<ConfiguredRootKey, LocalRootPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ConfiguredRootKey {
+    LegacyPath(PathBuf),
+    Declaration { source_id: String, canonical_path: PathBuf },
 }
 
 impl ConnectorRootPlans {
-    /// The plan for one configured root, keyed by its canonical path.
+    /// Look up the declaration key first, then fall back to the legacy path key.
     fn configured_for(&self, root: &ScanRoot) -> Option<&LocalRootPlan> {
         self.configured
-            .get(&scan_root_meta::canonicalize_root_path(&root.path))
+            .get(&ConfiguredRootKey::Declaration {
+                source_id: root.origin.source_id.clone(),
+                canonical_path: scan_root_meta::canonicalize_root_path(&root.path),
+            })
+            .or_else(|| self.configured.get(&ConfiguredRootKey::LegacyPath(
+                scan_root_meta::canonicalize_root_path(&root.path),
+            )))
     }
+
 }
 
 /// The batch path's per-root scan: the same rules as the streaming producer's
@@ -7489,6 +7565,8 @@ fn batch_scan_one_root(
     active_source_filter: &ActiveSessionSourceFilter,
     convs: &mut Vec<crate::indexer::exclusion::PreparedConversation>,
     scan_errors: &mut Vec<String>,
+    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+    source_jobs: &mut Vec<source_ingest::SourceInputJob>,
 ) -> (RootScanOutcome, bool) {
     let mut prepare_failed = false;
     let capture_fallback_roots: Vec<ScanRoot> = conn
@@ -7498,6 +7576,10 @@ fn batch_scan_one_root(
         .cloned()
         .map(ScanRoot::local)
         .collect();
+    let mut collect_source_input = |job: source_ingest::SourceInputJob| {
+        source_jobs.push(job);
+        Ok(())
+    };
     let (outcome, fatal) = run_local_root_scan(
         conn,
         name,
@@ -7534,6 +7616,8 @@ fn batch_scan_one_root(
                 }
             }
         },
+        source_safety,
+        if source_safety.is_some() { Some(&mut collect_source_input) } else { None },
     );
 
     if let Some(error) = fatal {
@@ -7629,6 +7713,29 @@ fn scan_one_root_for_producer(
         .cloned()
         .map(ScanRoot::local)
         .collect();
+    let connector_name = name;
+    let mut deliver_source_input = |job: source_ingest::SourceInputJob| {
+        // Same backpressure as a batch: the reservation is acquired before
+        // the message can be queued and released by the consumer once it has
+        // committed the input.
+        let byte_reservation = config
+            .flow_limiter
+            .acquire(job.byte_reservation)
+            .map_err(|_| anyhow::Error::new(StreamingConsumerDisconnected { connector_name }))?;
+        tx.send(IndexMessage::SourceInput {
+            connector_name,
+            job: Box::new(job),
+            byte_reservation,
+        })
+        .map_err(|_| anyhow::Error::new(StreamingConsumerDisconnected { connector_name }))
+    };
+    // SRC05B-routing: one producer runs one connector, so the capability is
+    // decided here, once, and the whole root keeps the legacy projection path
+    // when this connector is not wired to the sealed read.
+    let source_safety = config
+        .source_safety
+        .as_ref()
+        .filter(|_| source_ingest::supports_source_fidelity(name));
     let (outcome, fatal) = run_local_root_scan(
         conn,
         name,
@@ -7682,6 +7789,8 @@ fn scan_one_root_for_producer(
                 }
             }
         },
+        source_safety,
+        if source_safety.is_some() { Some(&mut deliver_source_input) } else { None },
     );
 
     if let Err(error) = batch_sender.flush() {
@@ -7704,12 +7813,19 @@ fn scan_one_root_for_producer(
     if prepare_failed || flush_failed || !outcome.succeeded {
         scan_succeeded = false;
     }
+    if let Some(error) = &outcome.error {
+        let _ = tx.send(IndexMessage::ScanError {
+            connector_name: name,
+            error: error.clone(),
+        });
+    }
     let mut outcome = outcome;
     if !scan_succeeded {
         // A root whose scan (or one of its sessions' prepare) failed must not
         // advance its watermark or rewrite its file state (hard constraint 5).
         outcome.succeeded = false;
         outcome.files.clear();
+        outcome.discovered_paths.clear();
     }
 
     match fatal {
@@ -7773,7 +7889,9 @@ fn spawn_connector_producer(
             root_outcomes.extend(outcomes);
             scan_succeeded = roots_succeeded;
             consumer_disconnected = disconnected;
-        } else if detect.detected {
+        } else if detect.detected
+            && !(config.source_safety.is_some() && source_ingest::supports_source_fidelity(name))
+        {
             // Update discovered agents count immediately when detected
             if let Some(p) = &config.progress {
                 p.discovered_agents.fetch_add(1, Ordering::Relaxed);
@@ -7927,6 +8045,11 @@ fn spawn_connector_producer(
                 }
                 continue;
             }
+            // A root with no plan is one the contract keeps on the baseline
+            // full-root scan below: a `full_scan` source of a run that did not
+            // ask for the source-aware path (SRC05B-08 builds those roots a
+            // plan of their own), or a root outside the connectors that take
+            // per-root plans at all.
             let local_since_ts = config
                 .local_since_ts_by_connector
                 .get(name)
@@ -8216,6 +8339,13 @@ fn run_streaming_consumer(
     // Per-connector stats tracking (T7.4)
     let mut connector_stats: HashMap<String, ConnectorStats> = HashMap::new();
     let mut failed_scan_connectors = BTreeSet::new();
+    // SRC05B-07: roots whose source-aware input did not commit. Recorded here
+    // (not in the producer) because the commit happens in this loop, and the
+    // root must not advance its watermark on the strength of a scan that lost
+    // an input.
+    let mut failed_source_roots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut source_inputs_committed = 0usize;
+    let mut source_inputs_pending_recovery = 0usize;
 
     // Card 3 (flat combining, §14.2): when enabled and at least one
     // additional producer is live, we opportunistically drain pending
@@ -8246,6 +8376,85 @@ fn run_streaming_consumer(
             rx.recv()
         };
         match next_message {
+            Ok(IndexMessage::SourceInput {
+                connector_name,
+                job,
+                byte_reservation,
+            }) => {
+                let root_id = job.root_id.clone();
+                let outcome = source_ingest::commit_source_input_dispatched(
+                    storage,
+                    &job,
+                    defer_streaming_checkpoints,
+                );
+                flow_limiter.release(byte_reservation);
+                let stats = connector_stats
+                    .entry(connector_name.to_string())
+                    .or_insert_with(|| ConnectorStats {
+                        name: connector_name.to_string(),
+                        ..Default::default()
+                    });
+                match outcome {
+                    Ok(commit) if commit.outcome.is_success() => {
+                        source_inputs_committed += 1;
+                        if matches!(
+                            commit.outcome,
+                            source_ingest::SourceInputOutcome::PostCommitPendingRecovery { .. }
+                        ) {
+                            source_inputs_pending_recovery += 1;
+                        }
+                        // The commit's rows go into the same counters every
+                        // other ingest writes, so the run's totals and its
+                        // canonical-mutation accounting both see them. The
+                        // input's own delta is used for what it proves (which
+                        // messages were accepted) and then released; the vector
+                        // end is the existing hole/backfill path.
+                        total_conversations += commit.inserted_conversations;
+                        total_messages += commit.inserted_messages;
+                        ingest_outcome.canonical_mutations =
+                            ingest_outcome.canonical_mutations.accumulate(
+                                crate::indexer::CanonicalMutationCounts {
+                                    inserted_conversations: commit.inserted_conversations,
+                                    inserted_messages: commit.inserted_messages,
+                                },
+                            );
+                        drop(commit.delta);
+                        tracing::info!(
+                            target: "cass::scan_session",
+                            connector = connector_name,
+                            root_id = %root_id,
+                            input = %commit.outcome.input_key().hex(),
+                            outcome = %commit.outcome.describe(),
+                            "source_input"
+                        );
+                        if let Some(p) = progress {
+                            p.current.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    other => {
+                        // A lost input is this connector's and this root's
+                        // failure: it must reach both the connector-level and
+                        // the root-level watermark decision.
+                        failed_scan_connectors.insert(connector_name.to_string());
+                        failed_source_roots
+                            .entry(connector_name.to_string())
+                            .or_default()
+                            .insert(root_id.clone());
+                        ingest_outcome.scan_had_errors = true;
+                        let reason = match other {
+                            Ok(commit) => commit.outcome.describe(),
+                            Err(error) => error.to_string(),
+                        };
+                        stats.error = Some(reason.clone());
+                        tracing::warn!(
+                            connector = connector_name,
+                            root_id = %root_id,
+                            reason = %reason,
+                            "source_aware_input_not_committed"
+                        );
+                    }
+                }
+            }
             Ok(IndexMessage::Batch {
                 connector_name,
                 conversations,
@@ -8453,6 +8662,19 @@ fn run_streaming_consumer(
                 root_outcomes,
             }) => {
                 active_producers -= 1;
+                // A root whose input did not commit reports failed here, even
+                // though its own enumeration looked clean. Without this the
+                // watermark would advance past a file the run never ingested.
+                let failed_roots = failed_source_roots.get(connector_name);
+                let root_outcomes: Vec<RootScanOutcome> = root_outcomes
+                    .into_iter()
+                    .map(|outcome| {
+                        match failed_roots.filter(|roots| roots.contains(&outcome.root_id)) {
+                            Some(_) => failed_outcome(outcome),
+                            None => outcome,
+                        }
+                    })
+                    .collect();
                 ingest_outcome.root_outcomes.extend(root_outcomes);
                 let effective_scan_succeeded =
                     scan_succeeded && !failed_scan_connectors.contains(connector_name);
@@ -8544,6 +8766,8 @@ fn run_streaming_consumer(
         stats.agents_discovered = discovered_names.clone();
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
+        stats.source_inputs_committed = source_inputs_committed;
+        stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
         stats.quarantined_conversations = stats
             .quarantined_conversations
             .saturating_add(ingest_outcome.quarantined_conversations);
@@ -8578,6 +8802,7 @@ fn run_streaming_index(
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
+    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     memprobe_point("run_streaming_index", "ingest", "start");
     let result = run_streaming_index_with_connector_factories(
@@ -8591,6 +8816,7 @@ fn run_streaming_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
+        source_safety,
     );
     memprobe_point("run_streaming_index", "ingest", "end");
     result
@@ -8651,6 +8877,7 @@ fn run_streaming_index_with_connector_factories(
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
+    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     if connector_factories.is_empty() {
         tracing::warn!("no enabled connectors are configured for indexing; skipping scan");
@@ -8711,8 +8938,12 @@ fn run_streaming_index_with_connector_factories(
             &connector_factories,
             &additional_scan_roots,
             scan_roots_meta,
+            source_safety.as_ref(),
+            true,
+            &opts.data_dir,
         )?),
         scan_roots_meta: Arc::new(scan_roots_meta.clone()),
+        source_safety: source_safety.clone(),
         progress: opts.progress.clone(),
         active_source_filter: Arc::new(ActiveSessionSourceFilter::with_shared_skips(
             opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
@@ -8814,6 +9045,7 @@ fn run_batch_index(
     scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
+    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     memprobe_point("run_batch_index", "ingest", "start");
     let result = run_batch_index_with_connector_factories(
@@ -8827,6 +9059,7 @@ fn run_batch_index(
         scan_start_ts,
         progress_bump,
         active_session_source_skips,
+        source_safety,
     );
     memprobe_point("run_batch_index", "ingest", "end");
     result
@@ -8844,6 +9077,7 @@ fn run_batch_index_with_connector_factories(
     _scan_start_ts: i64,
     progress_bump: Option<&Arc<AtomicI64>>,
     active_session_source_skips: &SharedActiveSessionSourceSkips,
+    source_safety: Option<Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<NonWatchIngestOutcome> {
     let scan_start = std::time::Instant::now();
 
@@ -8873,6 +9107,9 @@ fn run_batch_index_with_connector_factories(
         scan_error: Option<String>,
         /// PR8 C3: this connector's per-root outcomes, persisted at finalize.
         root_outcomes: Vec<RootScanOutcome>,
+        /// SRC05B-07: sealed inputs this connector prepared, committed after
+        /// the parallel scan joins (the commit needs the single writer).
+        source_jobs: Vec<source_ingest::SourceInputJob>,
     }
 
     let progress_ref = opts.progress.as_ref();
@@ -8892,6 +9129,9 @@ fn run_batch_index_with_connector_factories(
         &connector_factories,
         &additional_scan_roots,
         scan_roots_meta,
+        source_safety.as_ref(),
+        true,
+        &opts.data_dir,
     )?;
 
     // Keep scan completion state with each connector so watermarks are only
@@ -8908,8 +9148,16 @@ fn run_batch_index_with_connector_factories(
                 let mut scan_succeeded = true;
                 let mut scan_errors = Vec::new();
                 let mut root_outcomes: Vec<RootScanOutcome> = Vec::new();
+                let mut source_jobs: Vec<source_ingest::SourceInputJob> = Vec::new();
                 let empty_plans = ConnectorRootPlans::default();
                 let plans = root_plans_by_connector.get(name).unwrap_or(&empty_plans);
+                // SRC05B-routing: the batch scan of this connector takes the
+                // safety configuration only when this connector can read
+                // through it. `None` here is the legacy projection path, byte
+                // for byte the one a run without the flag takes.
+                let connector_safety = source_safety
+                    .as_ref()
+                    .filter(|_| source_ingest::supports_source_fidelity(name));
 
                 if detect.detected && !plans.home.is_empty() {
                     // Update discovered agents count immediately when detected
@@ -8921,7 +9169,7 @@ fn run_batch_index_with_connector_factories(
                     is_discovered = true;
 
                     for plan in &plans.home {
-                        let (outcome, root_succeeded) = batch_scan_one_root(
+                        let (mut outcome, mut root_succeeded) = batch_scan_one_root(
                             conn.as_ref(),
                             name,
                             &data_dir,
@@ -8929,13 +9177,18 @@ fn run_batch_index_with_connector_factories(
                             active_source_filter.as_ref(),
                             &mut convs,
                             &mut scan_errors,
+                            connector_safety,
+                            &mut source_jobs,
                         );
+                        let _ = &source_jobs;
                         if !root_succeeded {
                             scan_succeeded = false;
                         }
                         root_outcomes.push(outcome);
                     }
-                } else if detect.detected {
+                } else if detect.detected
+                    && !(source_safety.is_some() && source_ingest::supports_source_fidelity(name))
+                {
                     // Update discovered agents count immediately when detected
                     // This gives fast UI feedback during the discovery phase
                     // Note: AtomicUsize has no contention, only the mutex was problematic
@@ -9009,7 +9262,7 @@ fn run_batch_index_with_connector_factories(
                         // (`full_scan` source) fall through to the baseline
                         // full-root scan.
                         if let Some(plan) = plans.configured_for(root) {
-                            let (outcome, root_succeeded) = batch_scan_one_root(
+                            let (mut outcome, mut root_succeeded) = batch_scan_one_root(
                                 conn.as_ref(),
                                 name,
                                 &data_dir,
@@ -9017,13 +9270,19 @@ fn run_batch_index_with_connector_factories(
                                 active_source_filter.as_ref(),
                                 &mut convs,
                                 &mut scan_errors,
+                                connector_safety,
+                                &mut source_jobs,
                             );
+                            let _ = &source_jobs;
                             if !root_succeeded {
                                 scan_succeeded = false;
                             }
                             root_outcomes.push(outcome);
                             continue;
                         }
+                        // A root with no plan is one the contract keeps on the
+                        // baseline full-root scan below: see the streaming
+                        // producer's matching branch.
                         let local_since_ts = local_since_ts_by_connector
                             .get(name)
                             .copied()
@@ -9125,9 +9384,73 @@ fn run_batch_index_with_connector_factories(
                     scan_succeeded,
                     scan_error,
                     root_outcomes,
+                    source_jobs,
                 })
             })
             .collect();
+
+    // SRC05B-07: commit every prepared sealed input now that the parallel scan
+    // has joined. A commit failure is that connector's and that root's
+    // failure, and it must land in the root outcome before the watermark
+    // decision reads it.
+    let mut source_inputs_committed = 0usize;
+    let mut source_inputs_pending_recovery = 0usize;
+    let mut pending_source_mutations = crate::indexer::CanonicalMutationCounts::default();
+    let mut pending_batches = pending_batches;
+    for pending in pending_batches.iter_mut() {
+        if pending.source_jobs.is_empty() {
+            continue;
+        }
+        let mut failures: Vec<String> = Vec::new();
+        let mut failed_root_ids: BTreeSet<String> = BTreeSet::new();
+        for job in &pending.source_jobs {
+            let root_id = job.root_id.clone();
+            let hint = job.origin_hint();
+            let outcome = source_ingest::commit_source_input_dispatched(storage, job, false);
+            match outcome {
+                Ok(commit) if commit.outcome.is_success() => {
+                    source_inputs_committed += 1;
+                    if matches!(
+                        commit.outcome,
+                        source_ingest::SourceInputOutcome::PostCommitPendingRecovery { .. }
+                    ) {
+                        source_inputs_pending_recovery += 1;
+                    }
+                    pending_source_mutations =
+                        pending_source_mutations.accumulate(crate::indexer::CanonicalMutationCounts {
+                            inserted_conversations: commit.inserted_conversations,
+                            inserted_messages: commit.inserted_messages,
+                        });
+                    if let Some(p) = &opts.progress {
+                        p.current.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                other => {
+                    let reason = match other {
+                        Ok(commit) => commit.outcome.describe(),
+                        Err(error) => error.to_string(),
+                    };
+                    failures.push(format!("{hint}: {reason}"));
+                    failed_root_ids.insert(root_id);
+                }
+            }
+        }
+        if !failed_root_ids.is_empty() {
+            pending.scan_succeeded = false;
+            for outcome in &mut pending.root_outcomes {
+                if failed_root_ids.contains(&outcome.root_id) {
+                    *outcome = failed_outcome(outcome.clone());
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let joined = failures.join("; ");
+            pending.scan_error = Some(match pending.scan_error.take() {
+                Some(existing) => format!("{existing}; {joined}"),
+                None => joined,
+            });
+        }
+    }
 
     // Post-parallel phase: collect discovered agent names with single mutex lock
     // This eliminates O(connectors) mutex acquisitions during parallel execution
@@ -9240,12 +9563,17 @@ fn run_batch_index_with_connector_factories(
         stats.agents_discovered = discovered_names.clone();
         stats.total_conversations = total_conversations;
         stats.total_messages = total_messages;
+        stats.source_inputs_committed = source_inputs_committed;
+        stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
         stats.quarantined_conversations = stats
             .quarantined_conversations
             .saturating_add(ingest_outcome.quarantined_conversations);
         stats.lexical_update_deferred |= ingest_outcome.lexical_update_deferred;
     }
 
+    ingest_outcome.canonical_mutations = ingest_outcome
+        .canonical_mutations
+        .accumulate(pending_source_mutations);
     ingest_outcome.scanned_connectors.extend(scanned_connectors);
     ingest_outcome.scan_had_errors |= scan_had_errors;
 
@@ -9371,11 +9699,99 @@ struct LocalRootPlan {
     /// `relative_path -> (size, mtime)` last recorded for this
     /// `(root_id, connector)`.
     file_states: HashMap<String, (i64, i64)>,
+    /// SRC05B-08: the `(role, relative locator)` pairs a **previous** run
+    /// already completed under the profile the current configuration
+    /// assembles.
+    ///
+    /// The source-aware scan may skip a file whose per-file state says
+    /// unchanged only when the file appears here. A first entry from the
+    /// legacy path, a changed path mapping or a changed fixed safety copy all
+    /// leave the pair out, and so does an unfinished input for the same
+    /// locator even when an earlier one completed -- an unknown, and a known
+    /// failure, are never treated as complete.
+    ///
+    /// Empty for a `full_scan` root: it keeps no watermark, so the metadata
+    /// comparison already hands over every candidate and nothing is skipped.
+    source_evidence: HashSet<(String, String)>,
+    /// Shared only inside this invocation and this original declaration.
+    ownership: Option<Arc<PreparedRootOwnership>>,
+}
+
+#[derive(Clone)]
+struct PreparedRootOwnership {
+    sources: HashMap<&'static str, Vec<crate::connectors::DiscoveredSourceFile>>,
+    partition: Result<source_ownership::SourceOwnershipPartition, String>,
+}
+
+impl std::fmt::Debug for PreparedRootOwnership {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRootOwnership")
+            .field("connector_count", &self.sources.len())
+            .field("complete", &self.partition.is_ok()).finish()
+    }
+}
+
+fn prepare_root_ownership(
+    data_dir: &Path,
+    root: &ScanRoot,
+    native_owner: Option<&str>,
+    factories: &[(&'static str, ConnectorFactory)],
+) -> PreparedRootOwnership {
+    let ctx = crate::connectors::ScanContext::with_roots(
+        data_dir.to_path_buf(), vec![root.clone()], None,
+    );
+    let mut sources = HashMap::new();
+    let mut claims = Vec::new();
+    let mut incomplete = false;
+    for (name, factory) in factories {
+        if native_owner.is_some_and(|owner| owner != *name) {
+            continue;
+        }
+        match factory().discover_source_files(&ctx) {
+            Ok(found) => {
+                claims.extend(found.iter().map(|source| source_ownership::SourceOwnershipClaim {
+                    cass_connector: (*name).to_string(),
+                    source_path: source.source_path.clone(),
+                }));
+                sources.insert(*name, found);
+            }
+            Err(_) => incomplete = true,
+        }
+    }
+    let partition = if incomplete {
+        Err("source_ownership_incomplete_discovery".to_string())
+    } else {
+        source_ownership::partition_source_ownership(&root.path, native_owner, &claims)
+            .map_err(|error| error.to_string())
+    };
+    PreparedRootOwnership { sources, partition }
+}
+
+fn physical_carriers_cover_source(
+    sources: &[crate::connectors::DiscoveredSourceFile],
+    path: &Path,
+) -> bool {
+    use std::path::Component;
+    if !path_has_no_relative_escape(path) {
+        return false;
+    }
+    sources.iter().any(|source| {
+        if path == source.source_path {
+            return true;
+        }
+        if source.role != crate::connectors::DiscoveredSourceRole::SqliteDatabase {
+            return false;
+        }
+        path.strip_prefix(&source.source_path).is_ok_and(|relative| {
+            let mut components = relative.components();
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+        })
+    })
 }
 
 /// What one root's scan reported back. Persisted only once the whole run's
 /// status is known (see [`persist_root_scan_outcomes`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RootScanOutcome {
     connector: String,
     root_id: String,
@@ -9410,6 +9826,33 @@ struct RootScanOutcome {
     /// (home roots, machine-local configured roots, the DB-registered
     /// fallback), which keep the baseline write-it-and-warn path.
     mirror_root: bool,
+    /// Whether `(root_id, connector)` watermarks and per-file state apply to
+    /// this root, read from its own [`scan_root_meta::ScanRootMeta`].
+    ///
+    /// `false` only for a configured `full_scan` root (SRC05B-08): it takes
+    /// neither row, so the persist stage writes neither -- that is what keeps
+    /// it a full scan on every run. `run_local_root_scan` stamps it from the
+    /// plan, because the persist stage runs long after the plan is out of
+    /// scope.
+    watermarks_enabled: bool,
+}
+
+impl Default for RootScanOutcome {
+    fn default() -> Self {
+        // `watermarks_enabled: true` is the safe default: every root kind that
+        // had a plan before SRC05B-08 keeps the watermark row and the per-file
+        // state it always wrote.
+        Self {
+            connector: String::new(),
+            root_id: String::new(),
+            succeeded: false,
+            error: None,
+            files: Vec::new(),
+            discovered_paths: Vec::new(),
+            mirror_root: false,
+            watermarks_enabled: true,
+        }
+    }
 }
 
 impl RootScanOutcome {
@@ -9422,6 +9865,7 @@ impl RootScanOutcome {
             files: Vec::new(),
             discovered_paths: Vec::new(),
             mirror_root,
+            watermarks_enabled: true,
         }
     }
 
@@ -9461,6 +9905,7 @@ fn failed_outcome(outcome: RootScanOutcome) -> RootScanOutcome {
 fn local_root_plans(
     connector: &str,
     storage: &FrankenStorage,
+    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<Vec<LocalRootPlan>> {
     let mut plans = Vec::new();
     for path in scan_root_meta::home_scan_roots(connector) {
@@ -9471,72 +9916,237 @@ fn local_root_plans(
         let root_id = scan_root_meta::home_root_id(connector, &canonical_path);
         let watermark = storage.get_scan_watermark(&root_id, connector)?;
         let file_states = storage.scan_file_states_for_root_connector(&root_id, connector)?;
+        let root = ScanRoot::local(canonical_path.clone());
+        let meta = scan_root_meta::ScanRootMeta {
+            root_id,
+            origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+            readonly: false,
+            canonical_path,
+            source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+            watermarks_enabled: true,
+            mirror_root: false,
+        };
+        let source_evidence =
+            source_completion_evidence(storage, connector, &root, &meta, source_safety)?;
         plans.push(LocalRootPlan {
-            root: ScanRoot::local(canonical_path.clone()),
-            meta: scan_root_meta::ScanRootMeta {
-                root_id,
-                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
-                readonly: false,
-                canonical_path,
-                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
-                watermarks_enabled: true,
-                mirror_root: false,
-            },
+            root,
+            meta,
             watermark,
             file_states,
+            source_evidence,
+            ownership: None,
         });
     }
     Ok(plans)
 }
 
-/// The plan for one configured root, when the contract gives it watermarks
-/// (`watermarks_enabled`: a configured root of a source that did not opt into
-/// full scans -- a local one, or an ssh mirror root per PR10 hard constraint
-/// 9). `full_scan` sources return `None` and keep
-/// `explicit_scan_root_since_ts`'s full-root scan.
+/// The plan for one configured root.
+///
+/// A root the contract gives watermarks (`watermarks_enabled`: a configured
+/// root of a source that did not opt into full scans -- a local one, or an ssh
+/// mirror root per PR10 hard constraint 9) keeps the watermark and the
+/// per-file state it always had.
+///
+/// A `full_scan` root (SRC05B-08) takes the same plan shape with no watermark
+/// and no per-file state: the contract gives it neither row, so the metadata
+/// comparison has nothing to compare against and hands over its whole
+/// enumeration on every run. Neither its rows nor its evidence are read here
+/// -- there is nothing to skip, so nothing can prove a skip.
 fn configured_local_root_plan(
     connector: &str,
     storage: &FrankenStorage,
     root: &ScanRoot,
     meta: &scan_root_meta::ScanRootMeta,
+    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<LocalRootPlan> {
+    if !meta.watermarks_enabled {
+        return Ok(LocalRootPlan {
+            root: root.clone(),
+            meta: meta.clone(),
+            watermark: None,
+            file_states: HashMap::new(),
+            source_evidence: HashSet::new(),
+            ownership: None,
+        });
+    }
     let watermark = storage.get_scan_watermark(&meta.root_id, connector)?;
     let file_states = storage.scan_file_states_for_root_connector(&meta.root_id, connector)?;
+    let source_evidence =
+        source_completion_evidence(storage, connector, root, meta, source_safety)?;
     Ok(LocalRootPlan {
         root: root.clone(),
         meta: meta.clone(),
         watermark,
         file_states,
+        source_evidence,
+        ownership: None,
     })
+}
+
+/// The `(role, relative locator)` pairs a previous run already completed under
+/// the profile the current configuration assembles (SRC05B-08).
+///
+/// This is the only evidence a source-aware skip may rest on, and it is read
+/// **here**, on the thread that holds the database handle, because the scan
+/// itself owns none. Every recorded input for the root takes part, in every
+/// state, and three facts have to agree before a pair counts:
+///
+/// - a **same-generation** input for this `(role, locator)` is `complete`: its
+///   stored `normalizer_id` is the one this root and role assemble now, so a
+///   changed path mapping or a changed effective configuration misses, and its
+///   stored `safety_contract_id` is the one the loaded fixed copy produces
+///   now, so a changed fixed safety copy misses too;
+/// - **no** same-generation input for that `(role, locator)` is unfinished.
+///   A completed read and a later `staged` / `Partial` / `Failed` read can
+///   coexist for one locator, and the earlier success must not hide the later
+///   failure: as long as the unfinished one is there, the file is read again.
+///   Rows from another generation are neither evidence nor a block -- they
+///   describe an older configuration and are diagnosed on their own.
+///
+/// The lookup key is the **original scan root** the input was sealed under
+/// (the declaration's identity element 4), never the `cfg:`/`home:` routing
+/// id: two roots that share a `(connector, locator)` pair must not answer for
+/// each other. A root whose path is not UTF-8, or a row whose stored role is
+/// not one the sealed path can carry, simply contributes nothing.
+fn source_completion_evidence(
+    storage: &FrankenStorage,
+    connector: &str,
+    root: &ScanRoot,
+    meta: &scan_root_meta::ScanRootMeta,
+    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+) -> Result<HashSet<(String, String)>> {
+    let Some(safety) = source_safety else {
+        return Ok(HashSet::new());
+    };
+    let Some(scan_root_text) = root.path.to_str() else {
+        return Ok(HashSet::new());
+    };
+    let rows = storage.recorded_source_inputs(
+        &meta.origin_host,
+        &source_ingest::fad_connector_name(connector),
+        scan_root_text,
+    )?;
+    let mut completed: HashSet<(String, String)> = HashSet::new();
+    let mut unfinished: HashSet<(String, String)> = HashSet::new();
+    let mut profiles: HashMap<String, source_ingest::SourceProfile> = HashMap::new();
+    for (state, role, relative_locator, normalizer_id, safety_contract_id) in rows {
+        let Some(role) = role else {
+            continue;
+        };
+        if !profiles.contains_key(&role) {
+            let Some(sealed_role) = source_ingest::sealed_role_from_key(&role) else {
+                continue;
+            };
+            let Ok(profile) = source_ingest::root_profile(safety, connector, root, sealed_role)
+            else {
+                continue;
+            };
+            profiles.insert(role.clone(), profile);
+        }
+        let Some(profile) = profiles.get(&role) else {
+            continue;
+        };
+        if normalizer_id != profile.normalizer_id
+            || safety_contract_id != profile.safety_contract_id
+        {
+            continue;
+        }
+        let key = (role, relative_locator);
+        if state == "complete" {
+            completed.insert(key);
+        } else {
+            unfinished.insert(key);
+        }
+    }
+    Ok(completed
+        .into_iter()
+        .filter(|key| !unfinished.contains(key))
+        .collect())
 }
 
 /// Build every connector's root plans once, before the scan loops start: the
 /// streaming producers own no database handle, and the batch scan runs inside
 /// rayon.
+///
+/// A configured root the contract leaves without watermarks (`full_scan`) gets
+/// a plan only when the run asked for the source-aware path (SRC05B-08): that
+/// path is what covers it, and without it the root keeps the baseline
+/// full-root scan `explicit_scan_root_since_ts` selects. So the roots and the
+/// selection of a run that did not pass `--source-safety-config` are exactly
+/// what they were.
+///
+/// Ownership preparation is a run-level choice. Source completion evidence
+/// remains a connector capability: legacy readers never require a receipt.
 fn build_connector_root_plans(
     storage: &FrankenStorage,
     connector_factories: &[(&'static str, ConnectorFactory)],
     additional_scan_roots: &[ScanRoot],
     scan_roots_meta: &scan_root_meta::ScanRootMetaIndex,
+    source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+    consume_ownership: bool,
+    data_dir: &Path,
 ) -> Result<HashMap<&'static str, ConnectorRootPlans>> {
     let mut plans_by_connector = HashMap::new();
+    let consume_ownership = consume_ownership && source_safety.is_some();
+    let mut prepared = HashMap::new();
+    if consume_ownership {
+        for root in additional_scan_roots {
+            let key = (root.origin.source_id.clone(), scan_root_meta::canonicalize_root_path(&root.path));
+            prepared.entry(key).or_insert_with(|| Arc::new(
+                prepare_root_ownership(data_dir, root, None, connector_factories),
+            ));
+        }
+    }
 
     for (name, _) in connector_factories {
+        let connector_safety = source_safety
+            .filter(|_| source_ingest::supports_source_fidelity(name));
         let mut plans = ConnectorRootPlans {
-            home: local_root_plans(name, storage)?,
+            home: local_root_plans(name, storage, connector_safety)?,
             configured: HashMap::new(),
         };
+        if consume_ownership {
+            for plan in &mut plans.home {
+                plan.ownership = Some(Arc::new(prepare_root_ownership(
+                    data_dir, &plan.root, Some(name), connector_factories,
+                )));
+            }
+        }
         for root in additional_scan_roots {
-            let Some(meta) = scan_roots_meta.get_by_path(&root.path) else {
-                continue;
+            let canonical_path = scan_root_meta::canonicalize_root_path(&root.path);
+            let temporary_meta;
+            let meta = if consume_ownership {
+                match scan_roots_meta.get(&root.origin.source_id, &canonical_path) {
+                    Some(meta) => meta,
+                    None => {
+                        let identity = IngestIdentity::local();
+                        temporary_meta = scan_root_meta::ScanRootMeta {
+                            root_id: identity.root_id.to_string(),
+                            origin_host: identity.identity_host.to_string(),
+                            source_name: root.origin.source_id.clone(),
+                            canonical_path: canonical_path.clone(),
+                            readonly: false,
+                            watermarks_enabled: false,
+                            mirror_root: false,
+                        };
+                        &temporary_meta
+                    }
+                }
+            } else {
+                let Some(meta) = scan_roots_meta.get_by_path(&root.path) else { continue; };
+                meta
             };
-            if !meta.watermarks_enabled {
+            if !meta.watermarks_enabled && source_safety.is_none() {
                 continue;
             }
-            let plan = configured_local_root_plan(name, storage, root, meta)?;
-            plans
-                .configured
-                .insert(scan_root_meta::canonicalize_root_path(&root.path), plan);
+            let mut plan = configured_local_root_plan(name, storage, root, meta, connector_safety)?;
+            let key = if consume_ownership {
+                plan.ownership = prepared.get(&(root.origin.source_id.clone(), canonical_path.clone())).cloned();
+                ConfiguredRootKey::Declaration { source_id: root.origin.source_id.clone(), canonical_path }
+            } else {
+                ConfiguredRootKey::LegacyPath(canonical_path)
+            };
+            plans.configured.insert(key, plan);
         }
         plans_by_connector.insert(*name, plans);
     }
@@ -9653,6 +10263,23 @@ fn sorted_discovered_paths(candidates: &[(String, i64, i64, PathBuf)]) -> Vec<St
     paths
 }
 
+/// Whether a previous run's completed input already covers this file under the
+/// profile the current configuration assembles (SRC05B-08).
+///
+/// `false` whenever the discovered role has no sealed equivalent: that role is
+/// refused by `prepare_source_input` anyway, so the file is read and the root
+/// fails with the real reason instead of being skipped on a technicality.
+fn source_input_already_complete(
+    plan: &LocalRootPlan,
+    role: crate::connectors::DiscoveredSourceRole,
+    relative: &str,
+) -> bool {
+    source_ingest::sealed_role_key(role).is_some_and(|role| {
+        plan.source_evidence
+            .contains(&(role.to_string(), relative.to_string()))
+    })
+}
+
 /// Scan one watermarks-enabled root and report what it covered.
 ///
 /// Full scan (no watermark row) hands the connector the root itself with
@@ -9682,8 +10309,50 @@ fn sorted_discovered_paths(candidates: &[(String, i64, i64, PathBuf)]) -> Vec<St
 /// Returns the outcome plus, separately, a fatal error the *callback* raised
 /// (the streaming producer's consumer-disconnected case, which stops the
 /// producer rather than being recorded as a scan error).
+///
+/// SRC05B-08: the returned outcome carries the root's own
+/// [`scan_root_meta::ScanRootMeta::watermarks_enabled`], so the persist stage
+/// can tell a root that keeps a watermark row from a `full_scan` root that
+/// must never have one.
 #[allow(clippy::too_many_arguments)]
 fn run_local_root_scan(
+    connector: &(dyn crate::connectors::Connector + Send),
+    connector_name: &'static str,
+    data_dir: &Path,
+    plan: &LocalRootPlan,
+    capture_fallback_roots: &[ScanRoot],
+    active_source_filter: &ActiveSessionSourceFilter,
+    on_conversation: &mut dyn FnMut(
+        &ScanRoot,
+        &scan_root_meta::ScanRootMeta,
+        NormalizedConversation,
+    ) -> Result<()>,
+    active_source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+    on_source_input: Option<&mut dyn FnMut(source_ingest::SourceInputJob) -> Result<()>>,
+) -> (RootScanOutcome, Option<anyhow::Error>) {
+    let (mut outcome, fatal) = run_local_root_scan_inner(
+        connector,
+        connector_name,
+        data_dir,
+        plan,
+        capture_fallback_roots,
+        active_source_filter,
+        on_conversation,
+        active_source_safety,
+        on_source_input,
+    );
+    outcome.watermarks_enabled = plan.meta.watermarks_enabled;
+    if plan.ownership.is_some() && let Some(error) = &outcome.error {
+        tracing::warn!(root_id = %plan.meta.root_id, connector = connector_name,
+            error, "source ownership unit failed");
+    }
+    (outcome, fatal)
+}
+
+/// [`run_local_root_scan`]'s body, with the outcome's `watermarks_enabled`
+/// left at its default: the wrapper above stamps it from the plan.
+#[allow(clippy::too_many_arguments)]
+fn run_local_root_scan_inner(
     connector: &(dyn crate::connectors::Connector + Send),
     connector_name: &'static str,
     data_dir: &Path,
@@ -9698,6 +10367,12 @@ fn run_local_root_scan(
         &scan_root_meta::ScanRootMeta,
         NormalizedConversation,
     ) -> Result<()>,
+    // SRC05B-07: the loaded fixed safety configuration and the sink for
+    // prepared inputs. When both are present the root takes the source-aware
+    // path instead of projecting conversations through the legacy callback;
+    // `None` keeps the legacy path byte-identical.
+    active_source_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+    mut on_source_input: Option<&mut dyn FnMut(source_ingest::SourceInputJob) -> Result<()>>,
 ) -> (RootScanOutcome, Option<anyhow::Error>) {
     let root_id = plan.meta.root_id.clone();
     let discovery_ctx = crate::connectors::ScanContext::with_roots(
@@ -9705,7 +10380,66 @@ fn run_local_root_scan(
         vec![plan.root.clone()],
         None,
     );
-    let discovered = match connector.discover_source_files(&discovery_ctx) {
+    let mut ownership_error = None;
+    let discovered = if let Some(prepared) = &plan.ownership {
+        let partition = match &prepared.partition {
+            Ok(partition) => partition,
+            Err(error) => return (
+                RootScanOutcome::failed_with_error(connector_name, &root_id, plan.meta.mirror_root, error),
+                None,
+            ),
+        };
+        let sources = prepared.sources.get(connector_name).map(Vec::as_slice).unwrap_or(&[]);
+        let outside = partition.outside_claims.iter()
+            .filter(|claim| claim.cass_connector == connector_name).count();
+        if outside > 0 {
+            tracing::info!(root_id, connector = connector_name, outside_count = outside,
+                "source discovery outside declaration");
+            if !source_ingest::supports_source_fidelity(connector_name) && connector_name != "opencode" {
+                ownership_error = Some("source_ownership_outside_unit".to_string());
+            }
+        }
+        let mut accepted = Vec::new();
+        let mut unresolved = 0usize;
+        let mut ambiguous = 0usize;
+        let mut invalid = 0usize;
+        for source in sources {
+            use source_ownership::SourceOwnershipDecision;
+            let Some(decision) = partition.decisions.get(&source.source_path) else { continue; };
+            let relative = source.source_path.strip_prefix(&plan.root.path).ok().and_then(Path::to_str);
+            if validate_discovered_source_path(source).is_err() || relative.is_none() {
+                invalid += 1;
+                continue;
+            }
+            if matches!(decision, SourceOwnershipDecision::Unresolved | SourceOwnershipDecision::Ambiguous) {
+                use sha2::Digest;
+                let relative_sha256 = format!("{:x}", sha2::Sha256::digest(relative.unwrap().as_bytes()));
+                tracing::warn!(root_id, connector = connector_name, relative_sha256,
+                    reason = ?decision, "source ownership refused");
+            }
+            match decision {
+                SourceOwnershipDecision::Owner(owner) if owner == connector_name => accepted.push(source.clone()),
+                SourceOwnershipDecision::LegacyUnchanged => accepted.push(source.clone()),
+                SourceOwnershipDecision::Owner(_) if source_ingest::supports_source_fidelity(connector_name) => {},
+                SourceOwnershipDecision::Owner(_) => invalid += 1,
+                SourceOwnershipDecision::Unresolved => unresolved += 1,
+                SourceOwnershipDecision::Ambiguous => ambiguous += 1,
+            }
+        }
+        if unresolved + ambiguous + invalid > 0 {
+            ownership_error = Some(format!(
+                "source_ownership_unresolved={unresolved} source_ownership_ambiguous={ambiguous} source_ownership_invalid={invalid}"
+            ));
+        }
+        if !source_ingest::supports_source_fidelity(connector_name) {
+            if let Some(error) = ownership_error.take() {
+                return (RootScanOutcome::failed_with_error(
+                    connector_name, &root_id, plan.meta.mirror_root, error,
+                ), None);
+            }
+        }
+        accepted
+    } else { match connector.discover_source_files(&discovery_ctx) {
         Ok(discovered) => discovered,
         Err(error) => {
             tracing::warn!(
@@ -9719,7 +10453,7 @@ fn run_local_root_scan(
                 None,
             );
         }
-    };
+    }};
 
     // Everything the connector would read under this root, with the size and
     // mtime the comparison below runs on.
@@ -9765,46 +10499,181 @@ fn run_local_root_scan(
     // report what it saw (spec hard constraint 11).
     let discovered_paths = sorted_discovered_paths(&candidates);
 
-    let (ctx, scanned_files) = if let Some(watermark) = plan.watermark {
-        let changed: Vec<(String, i64, i64, PathBuf)> = candidates
+    // What this root's own recorded state says to read. A root with no
+    // watermark row (`full_scan`) hands over its whole enumeration.
+    let metadata_selected: Vec<(String, i64, i64, PathBuf)> = match plan.watermark {
+        Some(watermark) => candidates
             .iter()
-            .filter(|(relative, size, mtime, _)| {
-                match plan.file_states.get(relative) {
-                    // No record for this path at this root: it has never been
-                    // read here, whatever its mtime says.
-                    None => true,
-                    Some((recorded_size, recorded_mtime)) => {
-                        if plan.meta.mirror_root {
-                            recorded_size != size || recorded_mtime != mtime
-                        } else {
-                            *mtime > watermark || recorded_size != size
-                        }
+            .filter(|(relative, size, mtime, _)| match plan.file_states.get(relative) {
+                // No record for this path at this root: it has never been
+                // read here, whatever its mtime says.
+                None => true,
+                Some((recorded_size, recorded_mtime)) => {
+                    if plan.meta.mirror_root {
+                        recorded_size != size || recorded_mtime != mtime
+                    } else {
+                        *mtime > watermark || recorded_size != size
                     }
                 }
             })
             .cloned()
-            .collect();
-        if changed.is_empty() {
-            // Nothing changed: the watermark still moves forward (this root
-            // and connector scanned cleanly), and no file state needs rewriting.
-            return (
-                RootScanOutcome {
-                    connector: connector_name.to_string(),
-                    root_id,
-                    succeeded: true,
-                    error: None,
-                    files: Vec::new(),
-                    discovered_paths,
-                    mirror_root: plan.meta.mirror_root,
-                },
-                None,
-            );
+            .collect(),
+        None => candidates.clone(),
+    };
+
+    // SRC05B-07: the source-aware branch. It runs *before* the legacy
+    // pre-parse capture and the connector's conversation scan, because on this
+    // path the sealed read *is* the scan: the connector reads the sealed
+    // locator itself and the records, links and receipt are written from what
+    // it proves.
+    //
+    // SRC05B-08: it runs on exactly the selection above, so an unchanged file
+    // is not read again -- plus one condition the legacy path does not have.
+    // A file the metadata comparison calls unchanged is still read unless a
+    // previous run's completed input proves the current profile already
+    // covered it, so a first entry from the legacy path, a staged / partial /
+    // failed input, a changed mapping or a changed fixed safety copy is read
+    // again rather than assumed done.
+    if let Some(sink) = on_source_input.as_mut() {
+        let safety = active_source_safety
+            .expect("the source-aware branch requires a loaded safety configuration");
+        let mut delivered: Vec<(String, i64, i64)> = Vec::with_capacity(candidates.len());
+        for discovered_file in &discovered {
+            if should_skip_active_session_source(
+                active_source_filter,
+                connector_name,
+                &plan.root.origin.source_id,
+                &discovered_file.source_path,
+            ) {
+                continue;
+            }
+            if should_skip_subagent_source(&discovered_file.source_path) {
+                continue;
+            }
+            let Some((relative, size, mtime, _)) = candidates
+                .iter()
+                .find(|(_, _, _, path)| path == &discovered_file.source_path)
+            else {
+                // Discovery handed over a file the candidate pass dropped;
+                // that is a contract violation, not something to skip quietly.
+                return (
+                    RootScanOutcome::failed_with_error(
+                        connector_name,
+                        &root_id,
+                        plan.meta.mirror_root,
+                        format!(
+                            "discovered source {} has no scan candidate",
+                            discovered_file.source_path.display()
+                        ),
+                    ),
+                    None,
+                );
+            };
+            let metadata_says_read = metadata_selected
+                .iter()
+                .any(|(selected, _, _, _)| selected == relative);
+            if !metadata_says_read
+                && source_input_already_complete(plan, discovered_file.role, relative)
+            {
+                continue;
+            }
+            let request = source_ingest::SourceInputRequest {
+                connector_name,
+                data_dir,
+                root: &plan.root,
+                meta: &plan.meta,
+                discovered: discovered_file,
+                safety,
+            };
+            match source_ingest::prepare_source_input(connector, &request) {
+                Ok(mut job) => {
+                    if plan.ownership.is_some() {
+                        let identity = IngestIdentity::for_meta(&plan.meta);
+                        for item in &mut job.conversations {
+                            inject_provenance(&mut item.conversation, &plan.root.origin, &identity);
+                            canonicalize_claude_external_id(connector_name, &mut item.conversation);
+                        }
+                    }
+                    if let Err(error) = sink(job) {
+                        // The consumer went away: stop this root, exactly as
+                        // the legacy callback's fatal path does.
+                        return (
+                            RootScanOutcome::failed(connector_name, &root_id, plan.meta.mirror_root),
+                            Some(error),
+                        );
+                    }
+                    delivered.push((relative.clone(), *size, *mtime));
+                }
+                Err(error) => {
+                    // A refused input is this root's failure. Its files must
+                    // not advance any watermark, so the whole root reports
+                    // failed rather than a clean enumeration with a gap.
+                    tracing::warn!(
+                        connector = connector_name,
+                        root = %plan.meta.canonical_path.display(),
+                        path = %discovered_file.source_path.display(),
+                        error = %error,
+                        "source-aware input refused; failing the root"
+                    );
+                    return (
+                        RootScanOutcome::failed_with_error(
+                            connector_name,
+                            &root_id,
+                            plan.meta.mirror_root,
+                            error.to_string(),
+                        ),
+                        None,
+                    );
+                }
+            }
         }
-        let scanned: Vec<(String, i64, i64)> = changed
+        record_scan_invocation();
+        if let Some(error) = ownership_error {
+            return (RootScanOutcome::failed_with_error(
+                connector_name, &root_id, plan.meta.mirror_root, error,
+            ), None);
+        }
+        return (
+            RootScanOutcome {
+                connector: connector_name.to_string(),
+                root_id,
+                succeeded: true,
+                error: None,
+                files: delivered,
+                discovered_paths,
+                mirror_root: plan.meta.mirror_root,
+                // Stamped by `run_local_root_scan` from the plan.
+                watermarks_enabled: true,
+            },
+            None,
+        );
+    }
+
+    if plan.watermark.is_some() && metadata_selected.is_empty() {
+        // Nothing changed: the watermark still moves forward (this root
+        // and connector scanned cleanly), and no file state needs rewriting.
+        return (
+            RootScanOutcome {
+                connector: connector_name.to_string(),
+                root_id,
+                succeeded: true,
+                error: None,
+                files: Vec::new(),
+                discovered_paths,
+                mirror_root: plan.meta.mirror_root,
+                // Stamped by `run_local_root_scan` from the plan.
+                watermarks_enabled: true,
+            },
+            None,
+        );
+    }
+
+    let (mut ctx, scanned_files) = if plan.watermark.is_some() {
+        let scanned: Vec<(String, i64, i64)> = metadata_selected
             .iter()
             .map(|(relative, size, mtime, _)| (relative.clone(), *size, *mtime))
             .collect();
-        let file_roots: Vec<ScanRoot> = changed
+        let file_roots: Vec<ScanRoot> = metadata_selected
             .iter()
             .map(|(_, _, _, path)| plan.root.with_path(path.clone()))
             .collect();
@@ -9824,19 +10693,35 @@ fn run_local_root_scan(
         (discovery_ctx.clone(), scanned)
     };
 
-    capture_connector_sources_before_parse(
-        connector,
-        &ctx,
-        data_dir,
-        connector_name,
-        capture_fallback_roots,
-        ctx.since_ts,
-        active_source_filter,
-    );
+    if plan.ownership.is_some() && connector_name == "gemini" && plan.watermark.is_some() {
+        if let Some(root) = ctx.scan_roots.first() {
+            ctx.data_dir = root.path.clone();
+        }
+    }
+    let selected_sources: Vec<_> = discovered.iter().filter(|source| {
+        plan.watermark.is_none() || metadata_selected.iter().any(|(_, _, _, path)| path == &source.source_path)
+    }).cloned().collect();
+    if plan.ownership.is_some() {
+        if selected_sources.is_empty() {
+            return (RootScanOutcome {
+                connector: connector_name.to_string(), root_id, succeeded: true,
+                discovered_paths, mirror_root: plan.meta.mirror_root, ..RootScanOutcome::default()
+            }, None);
+        }
+        capture_discovered_sources_before_parse(&selected_sources, data_dir, connector_name, active_source_filter);
+    } else {
+        capture_connector_sources_before_parse(
+            connector, &ctx, data_dir, connector_name, capture_fallback_roots,
+            ctx.since_ts, active_source_filter,
+        );
+    }
     record_scan_invocation();
 
     let mut fatal: Option<anyhow::Error> = None;
-    let scan_result = connector.scan_with_callback(&ctx, &mut |conversation| {
+    let mut callback = |conversation: NormalizedConversation| {
+        if plan.ownership.is_some() && !physical_carriers_cover_source(&selected_sources, &conversation.source_path) {
+            return Err(anyhow::anyhow!("source_ownership_unapproved_carrier"));
+        }
         if should_skip_active_session_source(
             active_source_filter,
             connector_name,
@@ -9853,7 +10738,17 @@ fn run_local_root_scan(
             return Err(anyhow::anyhow!("scan root callback failed"));
         }
         Ok(())
-    });
+    };
+    let scan_result = if plan.ownership.is_some() && connector_name == "opencode" {
+        franken_agent_detection::OpenCodeConnector::new()
+            .scan_with_default_locations(&ctx, &franken_agent_detection::OpenCodeDefaultLocations::default())
+            .and_then(|conversations| {
+                for conversation in conversations { callback(conversation)?; }
+                Ok(())
+            })
+    } else {
+        connector.scan_with_callback(&ctx, &mut callback)
+    };
 
     match scan_result {
         Ok(()) if fatal.is_none() => (
@@ -9865,6 +10760,8 @@ fn run_local_root_scan(
                 files: scanned_files,
                 discovered_paths,
                 mirror_root: plan.meta.mirror_root,
+                // Stamped by `run_local_root_scan` from the plan.
+                watermarks_enabled: true,
             },
             None,
         ),
@@ -9917,6 +10814,13 @@ fn persist_root_scan_outcomes(
 
     for outcome in outcomes {
         if !outcome.succeeded {
+            continue;
+        }
+        // SRC05B-08: a `full_scan` root keeps neither row. Its whole
+        // enumeration is read on every run, so a watermark or per-file state
+        // written here would be a row nothing may consult -- and the contract
+        // gives this root neither.
+        if !outcome.watermarks_enabled {
             continue;
         }
         let Some(watermark_ts) =
@@ -10233,9 +11137,24 @@ pub fn run_index(
     // without holding a `&mut IndexRunLockGuard`. The clone is cheap
     // (single Arc bump) and lives only inside this function.
     let progress_bump = Arc::clone(&index_run_lock.last_progress_at_ms_atomic);
+    // Task 19: the run's fixed safety configuration, prepared at most once.
+    // Only a branch that really ingests fills this slot; no_ingest, the absent
+    // early return and the canonical-only derived rebuild never touch it.
+    let mut run_source_safety: Option<Arc<source_ingest::FixedSafetyConfig>> = None;
     // The atomic-store bump runs once per "interesting" batch boundary
     // — currently used at the per-conversation completion ingest loop
     // and the lexical commit boundary; see `bump_index_run_lock_progress_atomic`.
+
+    // SRC05B-07 wired the source-aware path into the one-shot local-root scan.
+    // SRC05B-09A adds the explicit `--watch-once <path>` run to it. SRC05B-09B
+    // adds the resident `--watch` event cycle, which was the last entry point
+    // still refusing. The refusal used to sit here; it is gone because the
+    // event cycle now consumes the same verified source kernel
+    // (`resident_source_watch_trigger`), so no entry point runs the legacy
+    // conversation path under a flag that claims source completeness.
+    //
+    // The safety object itself is loaded ONCE inside the watch branch below and
+    // carried for the whole process, rather than re-resolved on every cycle.
 
     if can_skip_absent_explicit_watch_once_index_run(&opts) {
         let path_count = opts
@@ -10471,7 +11390,7 @@ pub fn run_index(
         ));
     }
 
-    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage)? {
+    if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, !opts.no_ingest)? {
         let now_ms = FrankenStorage::now_millis();
         persist_final_index_run_metadata(&storage, &opts.db_path, false, now_ms, now_ms, false)?;
         record_lexical_population_strategy_if_unset(
@@ -11282,6 +12201,13 @@ pub fn run_index(
                     additional_scan_roots_with_meta(&storage, &opts.data_dir)?;
                 let scan_roots_meta = Arc::new(scan_roots_meta);
 
+                // Task 19: prepare the run's fixed safety configuration once,
+                // before any watermark of this run is cleared. A failure to
+                // discover or publish it therefore leaves every watermark
+                // untouched.
+                let source_safety =
+                    ensure_run_source_safety(&opts, &mut run_source_safety)?;
+
                 // `cass index --full` clears the watermarks of the roots this
                 // run will scan (hard constraint 5: "只把当前扫描根的全部行置
                 // 零"), so the whole root is re-read while a fake home's or a
@@ -11308,6 +12234,7 @@ pub fn run_index(
                         scan_start_ts,
                         Some(&progress_bump),
                         &active_session_source_skips,
+                        Some(Arc::clone(&source_safety)),
                     )?;
                     // F4 (cass tech debt): a completed scan is a real
                     // forward-progress boundary; bump the atomic so the
@@ -11338,6 +12265,7 @@ pub fn run_index(
                         scan_start_ts,
                         Some(&progress_bump),
                         &active_session_source_skips,
+                        Some(Arc::clone(&source_safety)),
                     )?;
                     bump_index_run_lock_progress_atomic(&progress_bump);
                     scan_canonical_mutations =
@@ -11845,6 +12773,11 @@ pub fn run_index(
             close_storage_after_index(storage, &opts.db_path, "watch startup scan")?;
             anyhow::bail!(message);
         }
+        // Task 19: the watch branch prepares the same run-owned configuration
+        // once, before any root or explicit path is watched. This also covers
+        // the targeted watch-once entry point, whose startup scan was skipped.
+        let run_source_safety_for_watch =
+            ensure_run_source_safety(&opts, &mut run_source_safety)?;
         let additional_scan_roots =
             additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)?;
         let watch_roots = build_watch_roots(additional_scan_roots.clone());
@@ -11855,7 +12788,12 @@ pub fn run_index(
 
         if targeted_watch_once_only_run
             && watch_once_mode
-            && should_skip_unchanged_explicit_watch_once_paths(&opts, &storage, &watch_roots)?
+            && should_skip_unchanged_explicit_watch_once_paths(
+                &opts,
+                &storage,
+                &watch_roots,
+                !opts.no_ingest,
+            )?
         {
             let path_count = opts
                 .watch_once_paths
@@ -11926,6 +12864,16 @@ pub fn run_index(
         // Clone detector for the callback
         let detector_clone = stale_detector.clone();
 
+        // SRC05B-09B: the resident watch cycle reads through the verified
+        // source kernel, so a fixed safety configuration is loaded once for
+        // the whole process instead of being re-resolved on every cycle.
+        // Re-resolving would let a later cycle pick up an environment change
+        // the run never agreed to; the copy this process started with is the
+        // one every cycle must keep reading, and a copy that no longer matches
+        // is an explicit failure rather than a fallback to the legacy path.
+        // Task 19: the object is the run's own slot, prepared above.
+        let resident_source_safety_for_watch = Arc::clone(&run_source_safety_for_watch);
+
         let watch_result = watch_sources(
             opts.watch_once_paths.clone(),
             watch_roots.clone(),
@@ -11935,34 +12883,17 @@ pub fn run_index(
             move |paths, roots, is_rebuild| {
                 let mut semantic_delta = WatchSemanticDelta::default();
                 let indexed = if is_rebuild {
-                    if let Ok(mut g) = state.lock() {
-                        g.clear();
-                        if let Err(e) = save_watch_state(&opts_clone.data_dir, &g) {
-                            tracing::warn!("failed to save watch state: {e}");
-                        }
-                    }
-                    // Reset stale detector on rebuild
-                    detector_clone.reset();
-                    // For rebuild, trigger reindex on all active roots
-                    let all_root_paths: Vec<PathBuf> =
-                        roots.iter().map(|(_, root)| root.path.clone()).collect();
-                    let indexed = reindex_paths(
+                    run_watch_rebuild_cycle(
                         &opts_clone,
-                        all_root_paths,
                         roots,
                         &state,
                         &storage_for_watch,
-                        true,
-                    );
-                    finalize_watch_reindex_result(
-                        indexed,
+                        Some(&resident_source_safety_for_watch),
                         &detector_clone,
-                        opts_clone.progress.as_ref(),
-                        "watch rebuild reindex",
                     )
                 } else if watch_once_mode {
                     let indexed = finalize_watch_once_reindex_result(
-                        reindex_paths_with_semantic_delta(
+                        reindex_paths_with_semantic_delta_and_safety(
                             &opts_clone,
                             paths,
                             roots,
@@ -11970,6 +12901,7 @@ pub fn run_index(
                             &storage_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            Some(&resident_source_safety_for_watch),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -11984,7 +12916,7 @@ pub fn run_index(
                     indexed
                 } else {
                     finalize_watch_reindex_result(
-                        reindex_paths_with_semantic_delta(
+                        reindex_paths_with_semantic_delta_and_safety(
                             &opts_clone,
                             paths,
                             roots,
@@ -11992,6 +12924,7 @@ pub fn run_index(
                             &storage_for_watch,
                             false,
                             semantic_enabled.then_some(&mut semantic_delta),
+                            Some(&resident_source_safety_for_watch),
                         ),
                         &detector_clone,
                         opts_clone.progress.as_ref(),
@@ -13475,6 +14408,9 @@ fn ingest_batch_detailed(
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
         skipped_conversations: batch_outcome.skipped_conversations,
+        // The legacy batch path keeps its delta where it always has; the
+        // source-aware fields belong to the source-aware path.
+        ..NonWatchIngestOutcome::default()
     })
 }
 
@@ -15566,6 +16502,1263 @@ fn reset_storage(storage: &FrankenStorage) -> Result<()> {
     Ok(())
 }
 
+/// The declared roots one connector has that a selected path is read through
+/// (SRC05B-09A R3/R4).
+///
+/// `classify_paths` replaces a matched root's path with the path the watch
+/// event selected. That is legacy *selection* behaviour: it decides which files
+/// a cycle looks at, and it is not a declaration of a new root. Using the
+/// selected path as the source root would invent a root the operator never
+/// declared, and the same file would then carry two identities -- one from the
+/// one-shot source scan of its real root, one from a watch-once run. The
+/// selection therefore only decides *which* files are read; the root, its
+/// metadata, its origin/namespace and its parser context come from the same
+/// plan resolution (`build_connector_root_plans`) the one-shot source scan
+/// uses.
+///
+/// **Every** matching root is returned, never one winner. A path can be covered
+/// by more than one declared root -- `sources.toml` may name a directory that
+/// is also a connector's home root -- and a one-shot scan reads it through each
+/// of them, each carrying its own origin and namespace. Picking one by
+/// specificity, or letting a configured root take a path away from a home root,
+/// would invent a precedence the contract does not have and would drop the
+/// declaration it did not pick.
+///
+/// Both directions count: a root that contains the selection, and a root
+/// *inside* a selected directory. The only thing dropped is a second plan that
+/// would build the identical input for the same file -- same root path, same
+/// origin and same namespace.
+fn declared_plans_for_selection<'a>(
+    plans: &'a ConnectorRootPlans,
+    selected: &Path,
+) -> Vec<&'a LocalRootPlan> {
+    let canonical = scan_root_meta::canonicalize_root_path(selected);
+    let mut configured: Vec<&LocalRootPlan> = plans.configured.values().collect();
+    configured.sort_by(|left, right| left.meta.canonical_path.cmp(&right.meta.canonical_path));
+    let mut chosen: Vec<&LocalRootPlan> = Vec::new();
+    for plan in plans.home.iter().chain(configured) {
+        let root_path = &plan.meta.canonical_path;
+        if !canonical.starts_with(root_path) && !root_path.starts_with(&canonical) {
+            continue;
+        }
+        let duplicate = chosen.iter().any(|kept| {
+            kept.meta.canonical_path == plan.meta.canonical_path
+                && kept.meta.origin_host == plan.meta.origin_host
+                && kept.root.origin.source_id == plan.root.origin.source_id
+                && kept.root.origin.host == plan.root.origin.host
+        });
+        if !duplicate {
+            chosen.push(plan);
+        }
+    }
+    chosen
+}
+
+/// Whether one discovered file is part of what the caller selected.
+///
+/// A selected directory means everything under it; a selected file means that
+/// file. Paths are compared canonicalised as well as literally, because the
+/// caller may have named a path the connector spells differently.
+fn selection_contains(selected: &Path, selected_is_dir: bool, discovered: &Path) -> bool {
+    if discovered == selected {
+        return true;
+    }
+    let canonical_discovered = scan_root_meta::canonicalize_root_path(discovered);
+    let canonical_selected = scan_root_meta::canonicalize_root_path(selected);
+    if selected_is_dir {
+        canonical_discovered.starts_with(&canonical_selected)
+    } else {
+        canonical_discovered == canonical_selected
+    }
+}
+
+/// The bounded root metadata for a selected path that belongs to no declared
+/// root (SRC05B-09A R3).
+///
+/// An ad-hoc path is legitimate, and this keeps the parent-directory fallback
+/// it had: the directory that holds it is the root its relative locator is
+/// measured from. It claims nothing else -- no source name, no origin host, no
+/// watermark -- and it is never the identity of a declared root.
+///
+/// `watermarks_enabled` is `false`: this root has no `(root_id, connector)`
+/// watermark row and none is written, because an explicit watch-once run keeps
+/// no persistent watch state.
+fn ad_hoc_watch_once_root_meta(
+    connector: &str,
+    scan_root: &ScanRoot,
+) -> scan_root_meta::ScanRootMeta {
+    let canonical_path = scan_root_meta::canonicalize_root_path(&scan_root.path);
+    scan_root_meta::ScanRootMeta {
+        root_id: scan_root_meta::home_root_id(connector, &canonical_path),
+        origin_host: scan_root
+            .origin
+            .host
+            .clone()
+            .unwrap_or_else(|| crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string()),
+        readonly: false,
+        canonical_path,
+        source_name: AD_HOC_SOURCE_NAME.to_string(),
+        watermarks_enabled: false,
+        mirror_root: false,
+    }
+}
+
+/// The source name of the bounded root an ad-hoc selected path is read under.
+/// Deliberately not `home`: this root is nobody's declared root.
+const AD_HOC_SOURCE_NAME: &str = "explicit-watch-once";
+
+/// SRC05B-09A: the explicit `--watch-once` paths, read as sealed source inputs.
+///
+/// The selected paths decide *which* inputs are read and nothing else: each one
+/// is discovered through its own connector, sealed and committed through the
+/// same single-input kernel the one-shot source scan uses
+/// (`prepare_source_input` + `commit_source_input_dispatched`). No second
+/// scheduler, no second canonical write path, and no persistent watch
+/// bookkeeping -- an explicit watch-once run has no next cycle to protect.
+///
+/// An input's identity is the one its **declared root** gives it. A selected
+/// path under a home root or a configured root is read as that root's input --
+/// the same root, relative locator, origin/namespace, parser context and
+/// effective configuration mapping a one-shot source scan of that root
+/// produces -- so the two entry points agree on one identity for one file, and
+/// reading it through either is a verified replay of the other. A selected path
+/// that belongs to no declared root keeps a bounded parent-directory fallback
+/// and claims no declared identity.
+///
+/// The file's own path is what enters the descriptor, never the sealed blob's
+/// transport path.
+///
+/// The legacy loop's mtime-based short-circuit
+/// (`explicit_watch_once_root_unchanged_after_last_index`) does not carry over,
+/// on purpose. It skips a file whose mtime predates `last_indexed_at` and which
+/// already has a conversation row; a file whose source receipt is missing, or
+/// whose fixed safety copy changed, satisfies both while its input is still
+/// unfinished. This path therefore takes no such skip -- an input that is read
+/// again lands as a kernel-verified replay, so "nothing new" is proved by the
+/// source facts instead of assumed from a timestamp. The persistent watch
+/// high-water mark stays untouched as well, exactly as the legacy
+/// `explicit_watch_once` gate keeps it.
+///
+/// An input that cannot be prepared, or that does not commit, fails the run:
+/// unlike the resident loop, an explicit watch-once invocation has no next
+/// cycle in which the same work could be retried.
+///
+/// Task 35: the declarations are routed by their own ownership decision, and
+/// a refusal is reported instead of stopping the remaining selections. The
+/// caller runs every selected unit before it turns the collected failures into
+/// a non-zero exit, so one refused unit cannot hide a healthy sibling.
+fn reindex_explicit_watch_once_source_aware(
+    opts: &IndexOptions,
+    units: &[WatchRouteUnit],
+    storage: &Mutex<FrankenStorage>,
+    safety: &Arc<source_ingest::FixedSafetyConfig>,
+) -> Result<(usize, usize, Vec<String>)> {
+    reset_last_index_run_counters();
+    // Constructed exactly as the legacy loop constructs it for this mode:
+    // `opts.watch` is false on an explicit watch-once run.
+    let active_source_filter = ActiveSessionSourceFilter::new(false);
+    let mut total_indexed = 0usize;
+    let mut landed = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    // Task 35: this entry point consumes the units the router already decided.
+    // It does not enumerate every connector's declarations for a selected path
+    // again -- that re-reading is what pushed a legacy-owned file (Gemini)
+    // onto the sealed read when one declaration root held both kinds. Each
+    // unit carries its connector, its declaration plan and exactly the
+    // descriptors its own ownership decision accepted; a file another
+    // declaration owns is that declaration's unit, never this one's.
+    let factories = configured_connector_factories();
+    // The single-input key is the declaration key plus the input's own path
+    // and role: `(connector, source_id, root_id, canonical declaration root,
+    // source_path, role)`. Two overlapping sources that share the transitional
+    // local root id and even the same file still keep their own facts.
+    let mut seen: HashSet<(String, String, String, PathBuf, String, String)> = HashSet::new();
+
+    for unit in units {
+        if !unit.source_aware {
+            continue;
+        }
+        let Some((_, factory)) = factories
+            .iter()
+            .find(|(candidate, _)| *candidate == unit.connector)
+        else {
+            failures.push(format!("{}: connector is not registered", unit.connector));
+            continue;
+        };
+        let conn = factory();
+        let meta = &unit.plan.meta;
+        let scan_root = &unit.plan.root;
+        record_scan_invocation();
+        // A declared unit consumes the descriptors its own decision accepted.
+        // An ad-hoc unit discovers under its bounded root (the selection's
+        // directory or the selected file's parent), never the whole HOME, and
+        // keeps the original `explicit-watch-once` identity.
+        let discovered_files: Vec<crate::connectors::DiscoveredSourceFile> = if unit.adhoc {
+            let ctx = crate::connectors::ScanContext::with_roots(
+                opts.data_dir.clone(),
+                vec![unit.plan.root.clone()],
+                None,
+            );
+            match conn.discover_source_files(&ctx) {
+                Ok(found) => {
+                    let selection = unit
+                        .selection
+                        .as_deref()
+                        .unwrap_or(unit.plan.root.path.as_path());
+                    found
+                        .into_iter()
+                        .filter(|file| {
+                            selection_contains(selection, unit.selection_is_dir, &file.source_path)
+                        })
+                        .collect()
+                }
+                Err(error) => {
+                    failures.push(format!("{}: {error}", unit.plan.root.path.display()));
+                    continue;
+                }
+            }
+        } else {
+            unit.accepted.clone()
+        };
+        for discovered_file in &discovered_files {
+            if should_skip_active_session_source(
+                &active_source_filter,
+                unit.connector,
+                &discovered_file.origin.source_id,
+                &discovered_file.source_path,
+            ) {
+                continue;
+            }
+            if should_skip_subagent_source(&discovered_file.source_path) {
+                continue;
+            }
+            let key = (
+                unit.connector.to_string(),
+                meta.root_id.clone(),
+                scan_root.origin.source_id.clone(),
+                meta.canonical_path.clone(),
+                discovered_file.source_path.display().to_string(),
+                discovered_file.role.as_str().to_string(),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let request = source_ingest::SourceInputRequest {
+                connector_name: unit.connector,
+                data_dir: &opts.data_dir,
+                root: scan_root,
+                meta,
+                discovered: discovered_file,
+                safety,
+            };
+            let mut job = match source_ingest::prepare_source_input(conn.as_ref(), &request) {
+                Ok(job) => job,
+                Err(error) => {
+                    failures.push(format!(
+                        "{}: {error}",
+                        discovered_file.source_path.display()
+                    ));
+                    continue;
+                }
+            };
+            // The same order the one-shot source entry applies -- prepare,
+            // inject the declaration identity, canonicalize the Claude
+            // external id, then hand the job to the writer.
+            let identity = IngestIdentity::for_meta(meta);
+            for item in &mut job.conversations {
+                inject_provenance(&mut item.conversation, &scan_root.origin, &identity);
+                canonicalize_claude_external_id(unit.connector, &mut item.conversation);
+            }
+            let committed = {
+                let storage = storage
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+                source_ingest::commit_source_input_dispatched(&storage, &job, false)
+            };
+            match committed {
+                Ok(commit) if commit.outcome.is_success() => {
+                    total_indexed = total_indexed.saturating_add(commit.inserted_conversations);
+                    landed += 1;
+                    tracing::info!(
+                        target: "cass::scan_session",
+                        connector = unit.connector,
+                        root_id = %job.root_id,
+                        input = %commit.outcome.input_key().hex(),
+                        outcome = %commit.outcome.describe(),
+                        "source_input"
+                    );
+                }
+                Ok(commit) => failures.push(format!(
+                    "{}: the source input did not commit: {}",
+                    discovered_file.source_path.display(),
+                    commit.outcome.describe()
+                )),
+                Err(error) => failures.push(format!(
+                    "{}: the source input did not commit: {error}",
+                    discovered_file.source_path.display()
+                )),
+            }
+        }
+    }
+
+    // The same counter the one-shot source paths report, so `--json` says how
+    // many inputs this run carried into a commit instead of a bare zero.
+    if let Some(p) = opts.progress.as_ref()
+        && let Ok(mut stats) = p.stats.lock()
+    {
+        stats.source_inputs_committed = stats.source_inputs_committed.saturating_add(landed);
+    }
+
+    // Task 35: report instead of bailing here. The caller runs every selected
+    // unit first, then turns the collected failures into the non-zero exit, so
+    // a refused unit cannot hide a healthy sibling of this same invocation.
+    Ok((total_indexed, landed, failures))
+}
+
+/// SRC05B-09B: every connector's declared-root plans for one resident watch
+/// cycle, built with the run's fixed safety configuration.
+///
+/// This is the same call the one-shot source scan makes
+/// (`build_connector_root_plans` with `Some(safety)`), which is what puts a
+/// `full_scan` configured root on a plan here too.
+fn build_resident_source_plans(
+    opts: &IndexOptions,
+    storage: &Mutex<FrankenStorage>,
+    safety: &Arc<source_ingest::FixedSafetyConfig>,
+    force_full: bool,
+) -> Result<HashMap<&'static str, ConnectorRootPlans>> {
+    let storage = storage
+        .lock()
+        .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+    let (additional_roots, scan_roots_meta) =
+        additional_scan_roots_with_meta(&storage, &opts.data_dir)?;
+    // Task 35: the resident cycle consumes the same ownership partition the
+    // one-shot scan and watch-once use. The route already rejected what cannot
+    // be read safely; every surviving plan carries its partition so a root's
+    // own scan refuses another declaration's files.
+    let mut plans = build_connector_root_plans(
+        &storage,
+        &configured_connector_factories(),
+        &additional_roots,
+        &scan_roots_meta,
+        Some(safety),
+        true,
+        &opts.data_dir,
+    )?;
+    if force_full {
+        clear_plan_state_for_force_full(&mut plans);
+    }
+    Ok(plans)
+}
+
+/// A forced rebuild reads every file under the roots it covers, the same way
+/// the legacy rebuild path reindexes every active root. The recorded per-root
+/// state is exactly what would otherwise skip an unchanged file, so a rebuild
+/// drops it rather than carrying it in.
+///
+/// Extracted from the planner (Task 35) so the rule is testable without
+/// assembling a whole run; it is the same state the planner hands to the
+/// scan.
+fn clear_plan_state_for_force_full(plans: &mut HashMap<&'static str, ConnectorRootPlans>) {
+    for connector_plans in plans.values_mut() {
+        for plan in connector_plans
+            .home
+            .iter_mut()
+            .chain(connector_plans.configured.values_mut())
+        {
+            plan.watermark = None;
+            plan.file_states.clear();
+            plan.source_evidence.clear();
+        }
+    }
+}
+
+/// What one resident source-aware trigger contributed to its watch cycle.
+///
+/// This exists so the cycle's own result is the source path's real result
+/// rather than a constant: the caller accumulates
+/// [`Self::processed_conversations`] into the same counter the legacy branch
+/// feeds, and everything downstream of that counter -- the semantic catch-up
+/// gate and the stale detector -- reads it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ResidentSourceTriggerOutcome {
+    /// Conversations this trigger carried into a commit, counted the way the
+    /// legacy branch counts them: conversations read, not rows created. A
+    /// replayed input installed nothing and contributes nothing.
+    processed_conversations: usize,
+    /// Messages those commits inserted, for the run's counters.
+    inserted_messages: usize,
+    /// Inputs that reached a successful receipt outcome.
+    committed_inputs: usize,
+    /// Files the declared roots handed over.
+    delivered_files: usize,
+}
+
+/// SRC05B-09B + Task 35: one resident-watch unit, read through the verified
+/// source kernel.
+///
+/// The unit's declaration is already resolved by the cycle's route: this does
+/// not re-resolve a declaration from the watched path (a wide root would
+/// re-select declarations the event never touched), and it does not re-dispatch
+/// a connector (the owner was decided before any writer ran).
+///
+/// Everything the resident loop already owns stays with the loop: this reads
+/// one declared root, commits what it sealed, and reports what may move. The
+/// event collection, debounce, run lock, progress and shutdown are untouched.
+#[allow(clippy::too_many_arguments)]
+fn resident_source_watch_trigger(
+    opts: &IndexOptions,
+    storage: &Mutex<FrankenStorage>,
+    safety: &Arc<source_ingest::FixedSafetyConfig>,
+    plan: &LocalRootPlan,
+    kind: ConnectorKind,
+    root: &ScanRoot,
+    max_ts: Option<i64>,
+    trigger_index: usize,
+    trigger_total: usize,
+    skips: &SharedActiveSessionSourceSkips,
+    roots_read: &mut HashSet<(String, String, String, String)>,
+    pending_watch_watermarks: &mut HashMap<ConnectorKind, i64>,
+    watch_preserve_by_kind: &mut HashMap<ConnectorKind, bool>,
+    cycle_had_failure: &mut bool,
+) -> Result<ResidentSourceTriggerOutcome> {
+    let connector_name = kind.slug();
+
+    // The copy this process started with is the only one this cycle may read.
+    // A copy that no longer matches is an explicit failure of this trigger --
+    // loud, and with nothing read -- never a quiet fall back to the legacy
+    // path, which would be the very thing the flag is meant to rule out.
+    if let Err(error) = safety.recheck_bytes() {
+        tracing::error!(
+            connector = connector_name,
+            scan_root = %root.path.display(),
+            error = %error,
+            "the fixed safety copy no longer matches; this watch cycle read nothing for this root"
+        );
+        *cycle_had_failure = true;
+        watch_preserve_by_kind.insert(kind, true);
+        return Ok(ResidentSourceTriggerOutcome::default());
+    }
+
+    if let Some(p) = &opts.progress {
+        p.phase.store(1, Ordering::Relaxed);
+    }
+    record_lexical_population_strategy_if_unset(
+        opts.progress.as_ref(),
+        LexicalPopulationStrategy::IncrementalInline,
+        "resident_source_watch_applies_inline_lexical_updates_for_changed_paths",
+    );
+
+    let scan_start_ts = FrankenStorage::now_millis();
+    let scan_start = Instant::now();
+    let skips_observed_before = lock_active_session_source_skips(skips).observed;
+
+    let connector = kind.create_connector();
+    let active_source_filter = ActiveSessionSourceFilter::with_shared_skips(
+        opts.watch && opts.watch_once_paths.as_ref().is_none_or(Vec::is_empty),
+        Arc::clone(skips),
+    );
+
+    let mut outcomes: Vec<RootScanOutcome> = Vec::new();
+    let mut delivered = 0usize;
+    let mut root_failed = false;
+    let mut committed = 0usize;
+    let mut processed_conversations = 0usize;
+    let mut inserted_messages = 0usize;
+    let mut failed_root_ids: BTreeSet<String> = BTreeSet::new();
+    // The high-water mark of inputs this trigger held at once. Committing from
+    // the sink keeps it at one; a design that collected the root's jobs first
+    // would show the whole backlog here. Logged so the property is checkable
+    // from a real run rather than only from the shape of the code.
+    let mut sink_in_flight_high_water = 0usize;
+    let mut sink_in_flight = 0usize;
+
+    for plan in std::iter::once(plan) {
+        // One declared root is read once per cycle. Task 35: the key keeps the
+        // declaration's source_id, root_id and canonical root, so two sources
+        // that fall back to the same transitional local identity -- or two
+        // roots of one source -- are not folded into a single read by a
+        // physical path or a bare root_id.
+        let identity = (
+            connector_name.to_string(),
+            plan.root.origin.source_id.clone(),
+            plan.meta.root_id.clone(),
+            plan.meta.canonical_path.display().to_string(),
+        );
+        if !roots_read.insert(identity) {
+            continue;
+        }
+        let mut on_source_input = |job: source_ingest::SourceInputJob| {
+            // The input is committed as the root hands it over and dropped
+            // immediately, so its sealed text and its byte reservation are
+            // released before the next input is read. The atomic unit is
+            // still the whole input; what is gone is a buffer holding every
+            // input of the root. This is the batch path's kernel -- that path
+            // collects first only because its parallel scan owns no database
+            // handle, which is not true here.
+            sink_in_flight += 1;
+            sink_in_flight_high_water = sink_in_flight_high_water.max(sink_in_flight);
+            let job_conversations = job.conversations.len();
+            let job_root_id = job.root_id.clone();
+            let result = match storage.lock() {
+                Ok(storage) => source_ingest::commit_source_input_dispatched(&storage, &job, false),
+                Err(_) => Err(source_ingest::SourceIngestError::Storage {
+                    detail: "storage lock poisoned".to_string(),
+                }),
+            };
+            drop(job);
+            sink_in_flight -= 1;
+            match result {
+                Ok(commit) if commit.outcome.is_success() => {
+                    committed = committed.saturating_add(1);
+                    inserted_messages = inserted_messages.saturating_add(commit.inserted_messages);
+                    // A replay installed nothing, so it contributes nothing to
+                    // "what this cycle processed"; anything else counts the
+                    // conversations the input carried, which is the legacy
+                    // branch's own meaning for this number (conversations
+                    // read, not rows created) and is what makes
+                    // `--watch --semantic` see an append that extends an
+                    // existing conversation.
+                    if !matches!(
+                        commit.outcome,
+                        source_ingest::SourceInputOutcome::Completed { replay: true, .. }
+                    ) {
+                        processed_conversations =
+                            processed_conversations.saturating_add(job_conversations);
+                    }
+                    tracing::info!(
+                        target: "cass::scan_session",
+                        connector = connector_name,
+                        root_id = %job_root_id,
+                        input = %commit.outcome.input_key().hex(),
+                        outcome = %commit.outcome.describe(),
+                        "source_input"
+                    );
+                }
+                other => {
+                    // A discovery or a queued input is not a completed read:
+                    // the root only counts as done on a real receipt outcome.
+                    let reason = match other {
+                        Ok(commit) => commit.outcome.describe(),
+                        Err(error) => error.to_string(),
+                    };
+                    tracing::warn!(
+                        connector = connector_name,
+                        root_id = %job_root_id,
+                        reason = %reason,
+                        "resident watch: the source input did not commit; holding this root's progress"
+                    );
+                    root_failed = true;
+                    *cycle_had_failure = true;
+                    failed_root_ids.insert(job_root_id);
+                }
+            }
+            Ok(())
+        };
+        let (outcome, fatal) = run_local_root_scan(
+            connector.as_ref(),
+            connector_name,
+            &opts.data_dir,
+            plan,
+            &[],
+            &active_source_filter,
+            // The source-aware branch never projects a legacy conversation;
+            // reaching this callback would mean the branch did not run.
+            &mut |_, _, _| {
+                Err(anyhow::anyhow!(
+                    "the resident source-aware read tried to deliver a legacy conversation"
+                ))
+            },
+            Some(safety),
+            Some(&mut on_source_input),
+        );
+        if let Some(error) = fatal {
+            return Err(error);
+        }
+        delivered = delivered.saturating_add(outcome.files.len());
+        if !outcome.succeeded {
+            root_failed = true;
+            *cycle_had_failure = true;
+        }
+        outcomes.push(outcome);
+    }
+
+    let scan_ms = scan_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        connector = %connector_name,
+        scan_root = %root.path.display(),
+        trigger_index,
+        trigger_total,
+        delivered_files = delivered,
+        committed_inputs = committed,
+        processed_conversations,
+        sink_in_flight_high_water,
+        "resident_source_watch_trigger"
+    );
+    if !failed_root_ids.is_empty() {
+        for outcome in &mut outcomes {
+            if failed_root_ids.contains(&outcome.root_id) {
+                outcome.succeeded = false;
+            }
+        }
+    }
+    {
+        let storage = storage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+        // Per-root completion progress moves only for a root that both scanned
+        // and committed cleanly; `persist_root_scan_outcomes` applies the rest
+        // of the gate (active-session skips, exclusions) itself.
+        persist_root_scan_outcomes(&storage, &outcomes, skips, true, 0, scan_start_ts)?;
+        refresh_run_counters_in_stats(opts);
+    }
+    let index_ms = scan_start.elapsed().as_millis() as u64;
+
+    if let Some(p) = &opts.progress {
+        p.total
+            .fetch_add(processed_conversations, Ordering::Relaxed);
+        p.phase.store(2, Ordering::Relaxed);
+        if let Ok(mut stats) = p.stats.lock() {
+            stats.scan_ms = stats.scan_ms.saturating_add(scan_ms);
+            stats.index_ms = stats.index_ms.saturating_add(index_ms);
+            stats.total_conversations = stats
+                .total_conversations
+                .saturating_add(processed_conversations);
+            stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
+            stats.source_inputs_committed = stats.source_inputs_committed.saturating_add(committed);
+            stats.connectors.push(ConnectorStats {
+                name: connector_name.to_string(),
+                conversations: processed_conversations,
+                messages: inserted_messages,
+                scan_ms,
+                error: None,
+            });
+            if !stats
+                .agents_discovered
+                .iter()
+                .any(|name| name == connector_name)
+            {
+                stats.agents_discovered.push(connector_name.to_string());
+            }
+        }
+    }
+
+    // Same rule the legacy cycle applies to `last_indexed_at`: one failure
+    // anywhere in this cycle makes the run's own counters untrustworthy for
+    // this persist, so health/status keep reporting the previous run.
+    if root_failed || *cycle_had_failure {
+        tracing::warn!(
+            root_failed,
+            cycle_had_failure = *cycle_had_failure,
+            "skipping watch last_indexed_at update after a source-input failure this cycle"
+        );
+    } else {
+        let storage = storage
+            .lock()
+            .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
+        persist::with_ephemeral_writer(
+            &storage,
+            false,
+            "updating watch last_indexed_at",
+            |writer| {
+                let tx = writer
+                    .raw()
+                    .transaction_with_mode(crate::storage::api::TxMode::Immediate)?;
+                writer.set_last_indexed_at(FrankenStorage::now_millis())?;
+                persist_last_index_run_meta_counters(writer)?;
+                tx.commit()?;
+                Ok(())
+            },
+        )?;
+    }
+
+    let skips_observed_here = {
+        let state = lock_active_session_source_skips(skips);
+        state.observed && !skips_observed_before
+    };
+    // The per-kind holdback is this trigger's own outcome and nothing else.
+    // `cycle_had_failure` is deliberately absent: it is the cycle-wide flag
+    // that keeps the run's global counters from being written as a success,
+    // and letting it in here would let one kind's failure freeze an unrelated
+    // kind's own watermark for the same cycle. A sibling root of the *same*
+    // kind still holds its kind back, because that kind's own entry in
+    // `watch_preserve_by_kind` is already set and this function never clears
+    // it.
+    let holdback = root_failed || skips_observed_here || scan_path_exclusions_active();
+    if holdback {
+        // No ledger holds these back, so the shared watermark is their only
+        // retry protection: it stays where it was and the next event (or the
+        // next process) reads them again.
+        watch_preserve_by_kind.insert(kind, true);
+        tracing::info!(
+            ?kind,
+            scan_root = %root.path.display(),
+            "preserving the resident source watch watermark so an unfinished source input is retried"
+        );
+    } else if committed > 0
+        && let Some(ts_val) = max_ts
+    {
+        let entry = pending_watch_watermarks.entry(kind).or_insert(ts_val);
+        *entry = (*entry).max(ts_val);
+    }
+
+    Ok(ResidentSourceTriggerOutcome {
+        processed_conversations,
+        inserted_messages,
+        committed_inputs: committed,
+        delivered_files: delivered,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Task 35: fixed-mode watch routing
+//
+// The fixed safety configuration is a run-level choice. When it is present the
+// watch entries no longer start from `classify_paths`: the raw event paths are
+// routed against this cycle's source-root declarations first, the resolved
+// owner overrides the old kind hint, and a rejection is decided before any
+// writer runs. Everything below is private to this module; the connectors,
+// the sealed-input kernel and the persisted identity are the verified 24/32/34
+// primitives.
+// ---------------------------------------------------------------------------
+
+/// One executable unit the fixed-mode watch router produced.
+#[derive(Clone)]
+struct WatchRouteUnit {
+    /// The connector that reads this unit, from the declaration's decision.
+    connector: &'static str,
+    /// The watch capability of `connector`. A unit never exists for an owner
+    /// without one: that owner is rejected during routing.
+    kind: ConnectorKind,
+    /// The declaration's plan: root, metadata, watermark, per-file state and
+    /// the ownership partition shared with the one-shot scan.
+    plan: LocalRootPlan,
+    /// The root to read. For watch-once this carries the selected path (the
+    /// declaration's origin/meta still identify the input); for resident it is
+    /// the declaration root itself.
+    read_root: ScanRoot,
+    /// The explicit watch-once selection, if any.
+    selection: Option<PathBuf>,
+    selection_is_dir: bool,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
+    /// `true` when the owner supports the sealed source kernel; `false` when
+    /// the unit keeps the legacy message writer.
+    source_aware: bool,
+    /// The descriptors this unit's declaration owns inside its selection. The
+    /// source-aware read consumes exactly this set; it never re-discovers a
+    /// selected path across every connector, which would push another
+    /// declaration's legacy-owned file onto the sealed read.
+    accepted: Vec<crate::connectors::DiscoveredSourceFile>,
+    /// An explicit selection no declaration covers, read through the bounded
+    /// ad-hoc root its connector classifies to. The executor discovers under
+    /// that bounded root (never the whole HOME) and keeps the original
+    /// `explicit-watch-once` identity, so a first-batch selection outside any
+    /// declaration still produces its source facts.
+    adhoc: bool,
+}
+
+/// A unit that could not be routed. Decided before any writer runs, so a
+/// rejected unit can neither publish a new success state nor let a sibling of
+/// the same kind advance its shared watermark past it.
+struct WatchRouteRejection {
+    code: &'static str,
+    connector: String,
+    kind: Option<ConnectorKind>,
+    root_id: String,
+    relative_sha256: Option<String>,
+}
+
+/// One legacy read the fixed-mode router hands to the existing watch loop.
+#[derive(Clone)]
+struct LegacyWatchTrigger {
+    kind: ConnectorKind,
+    root: ScanRoot,
+    /// The declaration's metadata. `None` for the uncovered fallback, which
+    /// keeps the entry point's previous identity resolution.
+    meta: Option<scan_root_meta::ScanRootMeta>,
+    /// This trigger *is* the connector's native detect declaration. Its
+    /// identity is the transitional local/local one by contract; it must not
+    /// be re-resolved by path, which would let a configured declaration that
+    /// happens to name the same directory replace it.
+    native: bool,
+    /// The descriptors this unit's declaration verified (ownership-accepted
+    /// files inside its read scope). The legacy read consumes exactly this
+    /// set: it captures from it instead of re-discovering, and a conversation
+    /// outside it fails the unit before any writer. `None` for the uncovered
+    /// fallback, which keeps the entry point's previous behaviour; a native
+    /// unit fills it from its own detect-root discovery.
+    verified: Option<Arc<Vec<crate::connectors::DiscoveredSourceFile>>>,
+    min_ts: Option<i64>,
+    max_ts: Option<i64>,
+}
+
+#[derive(Default)]
+struct WatchRoute {
+    units: Vec<WatchRouteUnit>,
+    legacy: Vec<LegacyWatchTrigger>,
+    rejections: Vec<WatchRouteRejection>,
+    /// Paths no declaration covers. They keep the entry point's previous
+    /// classification instead of being dropped.
+    uncovered: Vec<PathBuf>,
+}
+
+fn ownership_relative_sha256(root: &Path, path: &Path) -> Option<String> {
+    use sha2::Digest;
+    let relative = path.strip_prefix(root).ok()?;
+    Some(format!("{:x}", sha2::Sha256::digest(relative.to_str()?.as_bytes())))
+}
+
+/// Every `(connector, declaration)` pair a selected path is read through.
+///
+/// The same containment rule `declared_plans_for_selection` applies, tagged
+/// with the connector whose plan it is. Sorted so a cycle's processing order
+/// is reproducible.
+fn declared_plan_candidates<'a>(
+    plans_by_connector: &'a HashMap<&'static str, ConnectorRootPlans>,
+    selected: &Path,
+) -> Vec<(&'static str, &'a LocalRootPlan)> {
+    let mut candidates: Vec<(&'static str, &'a LocalRootPlan)> = Vec::new();
+    for (name, plans) in plans_by_connector {
+        for plan in declared_plans_for_selection(plans, selected) {
+            candidates.push((*name, plan));
+        }
+    }
+    candidates.sort_by(|(left_name, left), (right_name, right)| {
+        left_name
+            .cmp(right_name)
+            .then_with(|| left.meta.canonical_path.cmp(&right.meta.canonical_path))
+            .then_with(|| left.root.origin.source_id.cmp(&right.root.origin.source_id))
+    });
+    candidates
+}
+
+fn path_modified_ms(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let elapsed = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_millis()).ok()
+}
+
+/// Route this cycle's raw paths against the declarations.
+///
+/// For every path the declarations that cover it are enumerated from
+/// discovery, not from the path's shape or the caller's kind hint. Each
+/// declaration's own ownership partition decides which connector owns the
+/// files inside the selection: the owner becomes the unit's reader, a
+/// first-batch owner without this build's watch capability is rejected, and
+/// unresolved/ambiguous evidence refuses the declaration's unit while its
+/// siblings continue.
+fn route_fixed_watch(
+    paths: Vec<PathBuf>,
+    plans_by_connector: &HashMap<&'static str, ConnectorRootPlans>,
+    explicit_watch_once: bool,
+) -> WatchRoute {
+    use source_ownership::SourceOwnershipDecision;
+
+    let mut route = WatchRoute::default();
+    // The native detect roots of this build, for the connectors that keep the
+    // legacy writer. A configured declaration never replaces the native
+    // declaration a connector reports for itself: both are real, and a file
+    // under both is read through both under their own identities. The two
+    // first-batch connectors are excluded because their home roots are already
+    // declared plans (source-aware units), not legacy reads.
+    let native_roots: Vec<(ConnectorKind, PathBuf)> = configured_connector_factories()
+        .into_iter()
+        .filter_map(|(slug, _)| ConnectorKind::from_slug(slug))
+        .filter(|kind| !matches!(kind, ConnectorKind::Claude | ConnectorKind::Codex))
+        .flat_map(|kind| {
+            kind.create_connector()
+                .detect()
+                .root_paths
+                .into_iter()
+                .map(move |path| (kind, path))
+        })
+        .collect();
+    let mut seen_legacy: HashSet<(ConnectorKind, PathBuf, bool)> = HashSet::new();
+    // One unit per declaration per selection. The same declaration is reached
+    // from every connector's copy of a configured root, so this key carries
+    // the declaration's full identity -- source, root id and canonical root.
+    // Two roots of one source both fall back to the transitional local root
+    // id, and only the canonical root keeps them apart.
+    let mut seen_units: HashSet<(String, String, String, PathBuf, Option<PathBuf>)> =
+        HashSet::new();
+    // A refusal keeps the declaration's canonical root as well: two roots of
+    // one source, both on the transitional local root id, must each be
+    // reported instead of folding into one.
+    let mut seen_rejections: HashSet<(String, String, PathBuf, String, &'static str)> =
+        HashSet::new();
+
+    for path in paths {
+        let selected = std::path::absolute(&path).unwrap_or(path);
+        let selection_is_dir = selected.is_dir();
+        let modified_ms = path_modified_ms(&selected);
+        let candidates = declared_plan_candidates(plans_by_connector, &selected);
+        let mut covered = false;
+
+        for (name, plan) in candidates {
+            let Some(ownership) = plan.ownership.as_ref() else {
+                continue;
+            };
+            let partition = match &ownership.partition {
+                Ok(partition) => partition,
+                Err(error) => {
+                    covered = true;
+                    let key = (
+                        name.to_string(),
+                        plan.meta.root_id.clone(),
+                        plan.meta.canonical_path.clone(),
+                        selected.display().to_string(),
+                        "source_ownership_incomplete_discovery",
+                    );
+                    if seen_rejections.insert(key) {
+                        route.rejections.push(WatchRouteRejection {
+                            code: "source_ownership_incomplete_discovery",
+                            connector: name.to_string(),
+                            kind: ConnectorKind::from_slug(name),
+                            root_id: plan.meta.root_id.clone(),
+                            relative_sha256: ownership_relative_sha256(&plan.root.path, &selected),
+                        });
+                        tracing::warn!(
+                            connector = name,
+                            root_id = %plan.meta.root_id,
+                            code = "source_ownership_incomplete_discovery",
+                            detail = %error,
+                            "fixed watch routing rejected a declaration"
+                        );
+                    }
+                    continue;
+                }
+            };
+            let Some(sources) = ownership.sources.get(name) else {
+                continue;
+            };
+            // Watch-once reads the selected path; resident reads the whole
+            // declaration the event belongs to. Both consume the declaration's
+            // own decision table, never the event path as a new root.
+            let scope = explicit_watch_once.then_some((selected.as_path(), selection_is_dir));
+            let mut decisions = Vec::new();
+            for source in sources {
+                if let Some((scope_path, scope_is_dir)) = scope
+                    && !selection_contains(scope_path, scope_is_dir, &source.source_path)
+                {
+                    continue;
+                }
+                if let Some(decision) = partition.decisions.get(&source.source_path) {
+                    decisions.push((source, decision.clone()));
+                }
+            }
+            if decisions.is_empty() {
+                continue;
+            }
+
+            let mut owned_here = false;
+            let mut rejected_here = false;
+            let mut accepted_sources: Vec<crate::connectors::DiscoveredSourceFile> = Vec::new();
+            for (source, decision) in &decisions {
+                match decision {
+                    SourceOwnershipDecision::Owner(owner) if owner == name => {
+                        owned_here = true;
+                        accepted_sources.push((*source).clone());
+                    }
+                    SourceOwnershipDecision::Owner(owner) => {
+                        if ConnectorKind::from_slug(owner).is_none() {
+                            covered = true;
+                            let key = (
+                                owner.clone(),
+                                plan.meta.root_id.clone(),
+                                plan.meta.canonical_path.clone(),
+                                selected.display().to_string(),
+                                "source_ownership_unsupported_watch",
+                            );
+                            if seen_rejections.insert(key) {
+                                route.rejections.push(WatchRouteRejection {
+                                    code: "source_ownership_unsupported_watch",
+                                    connector: owner.clone(),
+                                    kind: None,
+                                    root_id: plan.meta.root_id.clone(),
+                                    relative_sha256: ownership_relative_sha256(
+                                        &plan.root.path,
+                                        &source.source_path,
+                                    ),
+                                });
+                                tracing::warn!(
+                                    connector = owner.as_str(),
+                                    root_id = %plan.meta.root_id,
+                                    code = "source_ownership_unsupported_watch",
+                                    "fixed watch routing rejected an owner without a watch capability"
+                                );
+                            }
+                        }
+                    }
+                    SourceOwnershipDecision::LegacyUnchanged => {
+                        owned_here = true;
+                        accepted_sources.push((*source).clone());
+                    }
+                    SourceOwnershipDecision::Unresolved | SourceOwnershipDecision::Ambiguous => {
+                        covered = true;
+                        rejected_here = true;
+                        let code = if matches!(decision, SourceOwnershipDecision::Unresolved) {
+                            "source_ownership_unresolved"
+                        } else {
+                            "source_ownership_ambiguous"
+                        };
+                        let key = (
+                            name.to_string(),
+                            plan.meta.root_id.clone(),
+                            plan.meta.canonical_path.clone(),
+                            selected.display().to_string(),
+                            code,
+                        );
+                        if seen_rejections.insert(key) {
+                            route.rejections.push(WatchRouteRejection {
+                                code,
+                                connector: name.to_string(),
+                                kind: ConnectorKind::from_slug(name),
+                                root_id: plan.meta.root_id.clone(),
+                                relative_sha256: ownership_relative_sha256(
+                                    &plan.root.path,
+                                    &source.source_path,
+                                ),
+                            });
+                            tracing::warn!(
+                                connector = name,
+                                root_id = %plan.meta.root_id,
+                                code,
+                                "fixed watch routing rejected a source unit"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // A declaration whose evidence is incomplete is refused as a
+            // whole: its files are one indivisible unit, so a legal file beside
+            // an ambiguous one does not make the unit readable.
+            if rejected_here {
+                covered = true;
+                continue;
+            }
+            if !owned_here {
+                continue;
+            }
+            covered = true;
+            let Some(kind) = ConnectorKind::from_slug(name) else {
+                // The owner claimed the unit but this build has no watch
+                // capability for it. Reject rather than invent a kind.
+                let key = (
+                    name.to_string(),
+                    plan.meta.root_id.clone(),
+                    plan.meta.canonical_path.clone(),
+                    selected.display().to_string(),
+                    "source_ownership_unsupported_watch",
+                );
+                if seen_rejections.insert(key) {
+                    route.rejections.push(WatchRouteRejection {
+                        code: "source_ownership_unsupported_watch",
+                        connector: name.to_string(),
+                        kind: None,
+                        root_id: plan.meta.root_id.clone(),
+                        relative_sha256: ownership_relative_sha256(&plan.root.path, &selected),
+                    });
+                }
+                continue;
+            };
+            let unit_key = (
+                name.to_string(),
+                plan.root.origin.source_id.clone(),
+                plan.meta.root_id.clone(),
+                plan.meta.canonical_path.clone(),
+                explicit_watch_once.then(|| selected.clone()),
+            );
+            if !seen_units.insert(unit_key) {
+                continue;
+            }
+            let source_aware = source_ingest::supports_source_fidelity(name);
+            let read_root = if explicit_watch_once {
+                plan.root.with_path(selected.clone())
+            } else {
+                plan.root.clone()
+            };
+            if source_aware {
+                route.units.push(WatchRouteUnit {
+                    connector: name,
+                    kind,
+                    plan: plan.clone(),
+                    read_root,
+                    selection: explicit_watch_once.then(|| selected.clone()),
+                    selection_is_dir,
+                    min_ts: modified_ms,
+                    max_ts: modified_ms,
+                    source_aware: true,
+                    accepted: accepted_sources.clone(),
+                    adhoc: false,
+                });
+            } else {
+                route.legacy.push(LegacyWatchTrigger {
+                    kind,
+                    root: read_root,
+                    meta: Some(plan.meta.clone()),
+                    native: false,
+                    verified: Some(Arc::new(accepted_sources.clone())),
+                    min_ts: modified_ms,
+                    max_ts: modified_ms,
+                });
+            }
+        }
+
+        // The native legacy declaration of every connector that reports a
+        // detect root covering this path. A configured declaration beside it
+        // does not replace it: the file is read through both, each keeping its
+        // own source identity (the native one stays local/local).
+        for (kind, native_root) in &native_roots {
+            let covers = selected.starts_with(native_root)
+                || (selection_is_dir && native_root.starts_with(&selected));
+            if !covers {
+                continue;
+            }
+            let read_root = if explicit_watch_once {
+                ScanRoot::local(selected.clone())
+            } else {
+                ScanRoot::local(native_root.clone())
+            };
+            if !seen_legacy.insert((*kind, read_root.path.clone(), false)) {
+                continue;
+            }
+            covered = true;
+            route.legacy.push(LegacyWatchTrigger {
+                kind: *kind,
+                root: read_root,
+                meta: None,
+                native: true,
+                verified: None,
+                min_ts: modified_ms,
+                max_ts: modified_ms,
+            });
+        }
+
+        // An explicit selection no declaration covers keeps its bounded
+        // ad-hoc read when its connector supports the sealed kernel: the
+        // selected directory (or the parent of the selected file) is the
+        // root, the original `explicit-watch-once` identity is kept, and the
+        // executor discovers under that root only. A legacy connector keeps
+        // the legacy writer through the uncovered classification below.
+        if !covered
+            && explicit_watch_once
+            && let Some(kind) = explicit_watch_once_connector_hint(&selected)
+            && matches!(kind, ConnectorKind::Claude | ConnectorKind::Codex)
+        {
+            let bounded_root = if selection_is_dir {
+                selected.clone()
+            } else {
+                match selected.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+                    _ => selected.clone(),
+                }
+            };
+            let bounded = ScanRoot::local(bounded_root);
+            let meta = ad_hoc_watch_once_root_meta(kind.slug(), &bounded);
+            route.units.push(WatchRouteUnit {
+                connector: kind.slug(),
+                kind,
+                plan: LocalRootPlan {
+                    root: bounded.clone(),
+                    meta,
+                    watermark: None,
+                    file_states: HashMap::new(),
+                    source_evidence: HashSet::new(),
+                    ownership: None,
+                },
+                read_root: bounded,
+                selection: Some(selected.clone()),
+                selection_is_dir,
+                min_ts: modified_ms,
+                max_ts: modified_ms,
+                source_aware: true,
+                accepted: Vec::new(),
+                adhoc: true,
+            });
+            covered = true;
+        }
+
+        if !covered {
+            route.uncovered.push(selected);
+        }
+    }
+
+    route
+}
+
+/// Apply one route's rejections to the cycle's failure state (Task 35).
+///
+/// Everything here runs before any writer of the cycle: the caller invokes it
+/// immediately after routing, so a refused unit can neither publish a new
+/// success state nor let a sibling of the same kind advance the shared
+/// watermark past it. Returns whether the cycle must be treated as failed.
+fn apply_watch_rejections(
+    route: &WatchRoute,
+    watch_preserve_by_kind: &mut HashMap<ConnectorKind, bool>,
+) -> bool {
+    let mut cycle_had_failure = false;
+    for rejection in &route.rejections {
+        cycle_had_failure = true;
+        if let Some(kind) = rejection.kind {
+            watch_preserve_by_kind.insert(kind, true);
+        }
+        tracing::warn!(
+            connector = %rejection.connector,
+            root_id = %rejection.root_id,
+            code = rejection.code,
+            relative_sha256 = rejection.relative_sha256.as_deref().unwrap_or(""),
+            "fixed watch routing refused a unit before any writer ran"
+        );
+    }
+    cycle_had_failure
+}
+
+/// One rebuild cycle of the watch loop (Task 35 extraction).
+///
+/// This is the callback body the resident loop runs for `ReindexCommand::Full`
+/// and for the stale-rebuild action: the explicit clear of the old watch
+/// state, the forced reindex over every active root, and the stale detector
+/// update. Extracted verbatim so the cycle's own boundary is a production
+/// function a test can drive; it is not a second state machine.
+fn run_watch_rebuild_cycle(
+    opts: &IndexOptions,
+    roots: &[(ConnectorKind, ScanRoot)],
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    storage: &Mutex<FrankenStorage>,
+    safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+    detector: &StaleDetector,
+) -> usize {
+    if let Ok(mut g) = state.lock() {
+        g.clear();
+        if let Err(e) = save_watch_state(&opts.data_dir, &g) {
+            tracing::warn!("failed to save watch state: {e}");
+        }
+    }
+    // Reset stale detector on rebuild
+    detector.reset();
+    // For rebuild, trigger reindex on all active roots
+    let all_root_paths: Vec<PathBuf> = roots.iter().map(|(_, root)| root.path.clone()).collect();
+    let indexed = reindex_paths_with_semantic_delta_and_safety(
+        opts,
+        all_root_paths,
+        roots,
+        state,
+        storage,
+        true,
+        None,
+        safety,
+    );
+    finalize_watch_reindex_result(
+        indexed,
+        detector,
+        opts.progress.as_ref(),
+        "watch rebuild reindex",
+    )
+}
+
 /// Reindex paths and return the total number of conversations indexed.
 ///
 /// Returns `Ok(count)` where count is the number of conversations successfully indexed.
@@ -15592,19 +17785,104 @@ fn reindex_paths_with_semantic_delta(
     force_full: bool,
     semantic_delta: Option<&mut WatchSemanticDelta>,
 ) -> Result<usize> {
+    reindex_paths_with_semantic_delta_and_safety(
+        opts,
+        paths,
+        roots,
+        state,
+        storage,
+        force_full,
+        semantic_delta,
+        None,
+    )
+}
+
+/// [`reindex_paths_with_semantic_delta`], with the run's already-loaded fixed
+/// safety configuration threaded in.
+///
+/// SRC05B-09B: the resident watch loop holds the safety object it loaded when
+/// the process started, so a cycle never re-resolves it. Every other caller
+/// passes `None` and keeps the previous behaviour of loading it here.
+#[allow(clippy::too_many_arguments)]
+fn reindex_paths_with_semantic_delta_and_safety(
+    opts: &IndexOptions,
+    paths: Vec<PathBuf>,
+    roots: &[(ConnectorKind, ScanRoot)],
+    state: &Mutex<HashMap<ConnectorKind, i64>>,
+    storage: &Mutex<FrankenStorage>,
+    force_full: bool,
+    semantic_delta: Option<&mut WatchSemanticDelta>,
+    resident_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
+) -> Result<usize> {
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
-    let mut triggers = classify_paths(
-        paths,
-        roots,
-        opts.watch_once_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty()),
-    );
-    if triggers.is_empty() {
+    // SRC05B-09A/B + Task 35: a fixed safety configuration routes this cycle
+    // from the raw paths through the declarations' own ownership decisions,
+    // before any writer runs. Every other run keeps the previous
+    // classification exactly as it was.
+    let explicit_watch_once = opts
+        .watch_once_paths
+        .as_ref()
+        .is_some_and(|paths| !paths.is_empty());
+    let safety = match resident_safety {
+        Some(safety) => Some(Arc::clone(safety)),
+        None => load_source_safety(opts)?,
+    };
+
+    let mut fixed: Option<(
+        Arc<source_ingest::FixedSafetyConfig>,
+        HashMap<&'static str, ConnectorRootPlans>,
+        WatchRoute,
+    )> = None;
+    if let Some(safety) = safety.as_ref() {
+        let plans = build_resident_source_plans(opts, storage, safety, force_full)?;
+        let route = route_fixed_watch(paths.clone(), &plans, explicit_watch_once);
+        fixed = Some((Arc::clone(safety), plans, route));
+    }
+
+    // The legacy reads of this cycle: the declarations whose owner keeps the
+    // message writer, plus every raw path no declaration covers, which keeps
+    // the entry point's previous classification.
+    let mut triggers: Vec<LegacyWatchTrigger> = Vec::new();
+    if let Some((_, _, route)) = &fixed {
+        triggers.extend(route.legacy.iter().cloned());
+        if !route.uncovered.is_empty() {
+            for (kind, root, min_ts, max_ts) in
+                classify_paths(route.uncovered.clone(), roots, explicit_watch_once)
+            {
+                triggers.push(LegacyWatchTrigger {
+                    kind,
+                    root,
+                    meta: None,
+                    native: false,
+                    verified: None,
+                    min_ts,
+                    max_ts,
+                });
+            }
+        }
+    } else {
+        for (kind, root, min_ts, max_ts) in classify_paths(paths, roots, explicit_watch_once) {
+            triggers.push(LegacyWatchTrigger {
+                kind,
+                root,
+                meta: None,
+                native: false,
+                verified: None,
+                min_ts,
+                max_ts,
+            });
+        }
+    }
+
+    let has_fixed_work = fixed.as_ref().is_some_and(|(_, _, route)| {
+        !route.units.is_empty() || !route.rejections.is_empty()
+    });
+    if triggers.is_empty() && !has_fixed_work {
         return Ok(0);
     }
+
     // R3-N1 (任务书 #120b): `classify_paths` builds its batch map as a
     // `HashMap<(ConnectorKind, PathBuf), _>` and returns `.into_iter()`
     // straight off it -- HashMap iteration order is randomized per
@@ -15621,8 +17899,11 @@ fn reindex_paths_with_semantic_delta(
     // count, not per-session) and makes a watch cycle's processing order --
     // and therefore its log trace and its cross-trigger failure/persist
     // interactions below -- reproducible from the same inputs.
-    triggers.sort_by(|(kind_a, root_a, ..), (kind_b, root_b, ..)| {
-        kind_a.slug().cmp(kind_b.slug()).then_with(|| root_a.path.cmp(&root_b.path))
+    triggers.sort_by(|left, right| {
+        left.kind
+            .slug()
+            .cmp(right.kind.slug())
+            .then_with(|| left.root.path.cmp(&right.root.path))
     });
 
     // mission #117③: this function is called exactly once per watch/watch-once
@@ -15672,6 +17953,11 @@ fn reindex_paths_with_semantic_delta(
     // continuous loop's existing soft-fail-and-retry semantics are
     // untouched.
     let mut explicit_watch_once_prepare_failures: usize = 0;
+    // Rework R1-F1: runtime rejections of a fixed-mode watch unit -- a failed
+    // discovery, a failed scan, or a conversation outside the unit's verified
+    // descriptors. An explicit invocation has no next cycle, so these must
+    // reach the caller even after every healthy unit has landed.
+    let mut explicit_watch_once_runtime_failures: usize = 0;
     // R3-N1 (任务书 #120b): `scan_failed` below is declared fresh inside the
     // `for (kind, root, ...) in triggers` loop, once per trigger -- it only
     // ever reflects THIS trigger's own scan/prepare outcome. R2-N4 (#119c)
@@ -15690,11 +17976,101 @@ fn reindex_paths_with_semantic_delta(
     // cycle-wide values -- whether writing them this cycle is trustworthy
     // is a cycle-level question, not a per-kind one.
     let mut cycle_had_failure = false;
-    for (kind, _, _, _) in &triggers {
-        *remaining_triggers_by_kind.entry(*kind).or_default() += 1;
+    for trigger in &triggers {
+        *remaining_triggers_by_kind.entry(trigger.kind).or_default() += 1;
+    }
+    if let Some((_, _, route)) = &fixed {
+        for unit in &route.units {
+            *remaining_triggers_by_kind.entry(unit.kind).or_default() += 1;
+        }
     }
 
-    for (kind, root, min_ts, max_ts) in triggers {
+    // Task 35: every rejection is decided before any writer runs. A rejected
+    // unit poisons the cycle-wide success marker and its own kind's shared
+    // watermark; a kind this build has no capability for has no watermark to
+    // hold back, but still fails the cycle. A sibling of the same kind may
+    // finish its own legal work; it cannot publish a watermark past the
+    // failure.
+    if let Some((_, _, route)) = &fixed {
+        cycle_had_failure |= apply_watch_rejections(route, &mut watch_preserve_by_kind);
+    }
+
+    // Active-session skips detected by the source-aware branch land here, so
+    // the run reads them back when deciding whether a root's state may move.
+    let resident_source_skips: SharedActiveSessionSourceSkips =
+        SharedActiveSessionSourceSkips::default();
+    // The declared units this cycle already read, keyed by the declaration's
+    // full identity: `(connector, source_id, root_id, canonical root)`.
+    let mut resident_source_roots_read: HashSet<(String, String, String, String)> = HashSet::new();
+    let mut explicit_watch_once_failures: Vec<String> = Vec::new();
+
+    // Task 35: the source-capable units run first, in their own deterministic
+    // order, and the legacy triggers follow. Every rejection above has already
+    // been applied, so nothing here can publish a state the route refused.
+    if let Some((safety, _plans, route)) = &fixed {
+        if explicit_watch_once {
+            let (indexed, _landed, failures) =
+                reindex_explicit_watch_once_source_aware(opts, &route.units, storage, safety)?;
+            total_indexed = total_indexed.saturating_add(indexed);
+            explicit_watch_once_failures.extend(failures);
+            if !explicit_watch_once_failures.is_empty() {
+                cycle_had_failure = true;
+            }
+        } else {
+            let unit_total = route.units.len();
+            for (unit_index, unit) in route.units.iter().enumerate() {
+                if let Some(remaining) = remaining_triggers_by_kind.get_mut(&unit.kind) {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                let outcome = resident_source_watch_trigger(
+                    opts,
+                    storage,
+                    safety,
+                    &unit.plan,
+                    unit.kind,
+                    &unit.read_root,
+                    unit.max_ts,
+                    unit_index,
+                    unit_total,
+                    &resident_source_skips,
+                    &mut resident_source_roots_read,
+                    &mut pending_watch_watermarks,
+                    &mut watch_preserve_by_kind,
+                    &mut cycle_had_failure,
+                )?;
+                // The cycle's own result, in the shape the legacy branch
+                // produces: conversations this cycle processed. A cycle that
+                // read only through the source kernel must report them too, or
+                // the caller's result is zero and everything downstream of it
+                // -- the semantic catch-up gate and the stale detector -- sees
+                // a cycle that indexed nothing.
+                total_indexed = total_indexed.saturating_add(outcome.processed_conversations);
+                publish_watch_watermark_if_kind_complete(
+                    &opts.data_dir,
+                    state,
+                    unit.kind,
+                    &remaining_triggers_by_kind,
+                    &mut pending_watch_watermarks,
+                    &watch_preserve_by_kind,
+                )?;
+            }
+        }
+    }
+
+    // Task 35: one selected path can be covered by more than one declaration
+    // (the connector's native detect root and a configured declaration). The
+    // legacy "unchanged root" skip would drop the second identity after the
+    // first read, so it is bypassed for a root this cycle already read.
+    let mut legacy_roots_seen: HashSet<(ConnectorKind, PathBuf)> = HashSet::new();
+    for LegacyWatchTrigger { kind, root, meta, native, verified, min_ts, max_ts } in triggers {
+        // Rework R2-F1: a diagnostic names the declaration identity, never an
+        // original path. A native or uncovered fallback unit has no meta and
+        // keeps the transitional local identity.
+        let root_id = meta
+            .as_ref()
+            .map(|meta| meta.root_id.as_str())
+            .unwrap_or("local");
+
         if let Some(remaining) = remaining_triggers_by_kind.get_mut(&kind) {
             *remaining = remaining.saturating_sub(1);
         }
@@ -15720,10 +18096,6 @@ fn reindex_paths_with_semantic_delta(
             p.phase.store(1, Ordering::Relaxed);
         }
 
-        let explicit_watch_once = opts
-            .watch_once_paths
-            .as_ref()
-            .is_some_and(|paths| !paths.is_empty());
         let lexical_strategy_reason = if explicit_watch_once {
             "watch_once_targeted_reindex_applies_inline_lexical_updates_for_changed_paths"
         } else {
@@ -15735,11 +18107,14 @@ fn reindex_paths_with_semantic_delta(
             lexical_strategy_reason,
         );
         if explicit_watch_once && !force_full && semantic_delta.is_none() {
-            let unchanged = {
+            let first_read_of_root = legacy_roots_seen.insert((kind, root.path.clone()));
+            let unchanged = if first_read_of_root {
                 let storage = storage
                     .lock()
                     .map_err(|_| anyhow::anyhow!("storage lock poisoned"))?;
                 explicit_watch_once_root_unchanged_after_last_index(&storage, &root)?
+            } else {
+                false
             };
             if unchanged {
                 tracing::info!(
@@ -15810,21 +18185,80 @@ fn reindex_paths_with_semantic_delta(
             since_ts,
         );
 
-        capture_connector_sources_before_parse(
-            conn.as_ref(),
-            &ctx,
-            &opts.data_dir,
-            kind.slug(),
-            std::slice::from_ref(&root),
-            since_ts,
-            &active_source_filter,
-        );
+        // Task 35: a fixed-mode unit reads exactly the descriptors its
+        // declaration verified -- capture consumes that set instead of
+        // re-discovering through the fallback roots. A native declaration
+        // resolves its own detect root once; the uncovered fallback keeps the
+        // previous behaviour.
+        let mut unit_sources: Option<Vec<crate::connectors::DiscoveredSourceFile>> =
+            verified.as_deref().cloned();
+        if unit_sources.is_none()
+            && (meta.is_some() || native)
+        {
+            match conn.discover_source_files(&ctx) {
+                Ok(found) => unit_sources = Some(found),
+                Err(_error) => {
+                    // Rework R2-F1: the diagnostic carries the declaration
+                    // identity, the connector and a stable reason code only.
+                    // The formatted error can embed source paths, and the
+                    // scan root is an original path, so neither is printed.
+                    tracing::warn!(
+                        connector = kind.slug(),
+                        root_id,
+                        reason = "source_discovery_failed",
+                        "fixed watch unit discovery failed; holding its progress"
+                    );
+                    cycle_had_failure = true;
+                    if meta.is_some() || native {
+                        explicit_watch_once_runtime_failures += 1;
+                    }
+                    watch_preserve_by_kind.insert(kind, true);
+                    publish_watch_watermark_if_kind_complete(
+                        &opts.data_dir,
+                        state,
+                        kind,
+                        &remaining_triggers_by_kind,
+                        &mut pending_watch_watermarks,
+                        &watch_preserve_by_kind,
+                    )?;
+                    continue;
+                }
+            }
+        }
+        if let Some(sources) = &unit_sources {
+            capture_discovered_sources_before_parse(
+                sources,
+                &opts.data_dir,
+                kind.slug(),
+                &active_source_filter,
+            );
+        } else {
+            capture_connector_sources_before_parse(
+                conn.as_ref(),
+                &ctx,
+                &opts.data_dir,
+                kind.slug(),
+                std::slice::from_ref(&root),
+                since_ts,
+                &active_source_filter,
+            );
+        }
 
         // SCAN PHASE: IO-heavy, no locks held
         let scan_start = Instant::now();
         let mut scan_failed = false;
         record_scan_invocation();
-        let mut convs = match conn.scan(&ctx) {
+        // Task 35: a fixed-mode OpenCode unit uses the same bounded scan the
+        // one-shot source entry uses; the plain scan would add the
+        // environment-default database unconditionally.
+        let mut convs = match if unit_sources.is_some() && kind.slug() == "opencode" {
+            franken_agent_detection::OpenCodeConnector::new().scan_with_default_locations(
+                &ctx,
+                &franken_agent_detection::OpenCodeDefaultLocations::default(),
+            )
+        } else {
+            conn.scan(&ctx)
+        } {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(
@@ -15842,6 +18276,11 @@ fn reindex_paths_with_semantic_delta(
                 // same cycle must not persist as if this failure never
                 // happened.
                 cycle_had_failure = true;
+                // Count every fixed-mode runtime failure here, including the
+                // uncovered legacy fallback (meta=None/native=false): the
+                // final gate decides whether this run is a fixed explicit
+                // watch-once, never the unit's metadata shape.
+                explicit_watch_once_runtime_failures += 1;
                 Vec::new()
             }
         };
@@ -15873,13 +18312,46 @@ fn reindex_paths_with_semantic_delta(
         // PR8 C3: the watched root's identity comes from its `ScanRootMeta`
         // exactly as it does on the streaming and batch paths -- a watch pass
         // must not stamp a different `identity_host` on the same session.
-        let watch_root_identity = storage
-            .lock()
-            .map(|guard| {
-                identity_for_watch_root(&guard, &opts.data_dir, kind.slug(), &root)
-            })
-            .unwrap_or_else(|_| IngestIdentity::local());
+        //
+        // Task 35: a routed unit already carries the declaration's metadata, so
+        // the fixed-mode read uses that identity directly and never re-selects
+        // a source by path. The uncovered fallback keeps the previous
+        // resolution.
+        let watch_root_identity = match &meta {
+            Some(meta) => IngestIdentity::for_meta(meta),
+            // A native detect declaration keeps the transitional local/local
+            // identity by contract. Resolving it by path would let a
+            // configured declaration that names the same directory replace it,
+            // which is exactly the declaration identity this path must keep.
+            None if native => IngestIdentity::local(),
+            None => storage
+                .lock()
+                .map(|guard| {
+                    identity_for_watch_root(&guard, &opts.data_dir, kind.slug(), &root)
+                })
+                .unwrap_or_else(|_| IngestIdentity::local()),
+        };
         for conv in convs {
+            // Task 35: a conversation whose physical carrier is outside the
+            // unit's verified descriptors fails this unit before any writer;
+            // it is never silently folded into the declaration.
+            if let Some(sources) = &unit_sources
+                && !physical_carriers_cover_source(sources, &conv.source_path)
+            {
+                // Rework R2-F1: identity, connector and a stable reason code.
+                // The scan root is an original path, so it is not printed.
+                tracing::warn!(
+                    connector = kind.slug(),
+                    root_id,
+                    reason = "source_outside_verified_descriptors",
+                    "fixed watch unit produced a source outside its verified descriptors; \
+                     failing the unit instead of writing it"
+                );
+                scan_failed = true;
+                cycle_had_failure = true;
+                explicit_watch_once_runtime_failures += 1;
+                continue;
+            }
             let source_kind = capture_source_kind_for(kind.slug(), conv.source_path.clone());
             match prepare_conversation_for_ingest(&opts.data_dir, kind.slug(), conn.as_ref(), &root.origin, &watch_root_identity, Some(&root), source_kind, conv) {
                 Ok(prepared) => prepared_convs.push(prepared),
@@ -16202,6 +18674,36 @@ fn reindex_paths_with_semantic_delta(
         anyhow::bail!(
             "cass index --watch-once: {explicit_watch_once_prepare_failures} session(s) failed capture/prepare and were skipped without landing any rows"
         );
+    }
+
+    // Rework R1-F1: an explicit fixed-mode invocation has no next cycle, so a
+    // unit that failed at runtime -- discovery, scan, or a conversation
+    // outside its verified descriptors -- must not be hidden by a successful
+    // exit. Healthy units have already landed; this only turns the run's own
+    // result into a failure the caller can see.
+    if explicit_watch_once && fixed.is_some() && explicit_watch_once_runtime_failures > 0 {
+        anyhow::bail!(
+            "cass index --watch-once: {explicit_watch_once_runtime_failures} fixed watch unit(s) failed at runtime (discovery, scan, or a source outside their verified descriptors)"
+        );
+    }
+
+    // Task 35: an explicit invocation has no next cycle. Every refused unit --
+    // an unsupported owner, unresolved or ambiguous evidence, or a sealed input
+    // that did not land -- is reported after the healthy units have run.
+    if explicit_watch_once {
+        let mut failures = explicit_watch_once_failures;
+        if let Some((_, _, route)) = &fixed {
+            for rejection in &route.rejections {
+                failures.push(format!("{}: {}", rejection.connector, rejection.code));
+            }
+        }
+        if !failures.is_empty() {
+            anyhow::bail!(
+                "cass index --watch-once: {} source input(s) did not land: {}",
+                failures.len(),
+                failures.join("; ")
+            );
+        }
     }
 
     Ok(total_indexed)
@@ -17159,7 +19661,7 @@ pub(crate) fn remote_mirror_candidates(
 /// What a configured remote path's mirror directory resolves to on this
 /// machine, before the root is built.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MirrorRootChoice {
+pub(crate) enum MirrorRootChoice {
     /// No mirror layout for this path exists here yet.
     Absent,
     /// The one directory this path's mirror lives in, canonicalized.
@@ -17175,7 +19677,7 @@ enum MirrorRootChoice {
 ///
 /// The comparison is on canonical paths, so a legacy sibling that is a symlink
 /// to the primary is one directory, not two.
-fn choose_configured_mirror_root(
+pub(crate) fn choose_configured_mirror_root(
     source: &SourceDefinition,
     data_dir: &Path,
     path: &str,
@@ -17812,7 +20314,7 @@ mod capture_source_kind_for_tests {
 /// exclusion.rs's unmodified pairing logic rather than adding a new
 /// `PairingCandidate` variant, which is outside this round's "只加
 /// events_from_blob/RecallSrc/PreparedConversation" authorization.
-fn build_pairing_candidates(
+pub(crate) fn build_pairing_candidates(
     conv: &NormalizedConversation,
 ) -> Vec<crate::indexer::exclusion::PairingCandidate> {
     use crate::indexer::exclusion::{PairedTool, PairingCandidate};
@@ -17852,8 +20354,11 @@ fn judge_and_redact_reparsed(
     events: &[crate::indexer::exclusion::RawEvent],
     blob_relative_path: &str,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
+    redaction_enabled: bool,
 ) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
-    use crate::indexer::exclusion::{PairingContext, apply, apply_sibling, decide, field_map_for};
+    use crate::indexer::exclusion::{
+        PairingContext, apply_sibling, apply_with_redaction, decide, field_map_for,
+    };
 
     let candidates = build_pairing_candidates(conv);
     let pairing_ctx = PairingContext::build(&candidates);
@@ -17896,7 +20401,18 @@ fn judge_and_redact_reparsed(
         // unredacted also means this needs no `redaction_enabled()` check --
         // there is nothing here for that switch to gate.
         let pre_redaction_content = conv.messages[idx].content.clone();
-        let marker = apply(&mut conv.messages[idx], &decision, &mut redactor, blob_relative_path, idx as u32, field_map);
+        // SRC05B-07: the enabled-ness is stated by the caller here. The
+        // legacy transport passes the process-wide switch; the source-aware
+        // path passes `true`, because its own contract always desensitises.
+        let marker = apply_with_redaction(
+            &mut conv.messages[idx],
+            &decision,
+            &mut redactor,
+            blob_relative_path,
+            idx as u32,
+            field_map,
+            redaction_enabled,
+        );
         if let Some(title) = conv.title.as_ref().filter(|t| !t.is_empty())
             && pre_redaction_content.contains(title.as_str())
         {
@@ -17931,6 +20447,23 @@ pub(crate) fn judge_reparsed_conversation(
     blob_relative_path: &str,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
 ) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
+    judge_reparsed_conversation_with_redaction(
+        conv,
+        events,
+        blob_relative_path,
+        paths_cfg,
+        crate::indexer::redact_secrets::redaction_enabled(),
+    )
+}
+
+/// The explicitly-enabled core of [`judge_reparsed_conversation`].
+pub(crate) fn judge_reparsed_conversation_with_redaction(
+    conv: &mut NormalizedConversation,
+    events: &[crate::indexer::exclusion::RawEvent],
+    blob_relative_path: &str,
+    paths_cfg: &crate::sources::config::ExcludedContextPaths,
+    redaction_enabled: bool,
+) -> Vec<Option<crate::indexer::exclusion::ExcludedMarker>> {
     // R1-N16 (任务书 #118b): meta 三键之二（mission #116⑥）候选总数在这里
     // 计，与 `events`/`conv.messages` 是否对齐无关（分母不应因为对齐失败而
     // 缩水）——候选口径与 R3 锚点定义一致（`agent_slug=="codex" && idx==0 &&
@@ -17957,7 +20490,7 @@ pub(crate) fn judge_reparsed_conversation(
     // exclusion rather than a wrong one) instead of silently judging
     // against misaligned events.
     if events.len() == conv.messages.len() {
-        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg)
+        judge_and_redact_reparsed(conv, events, blob_relative_path, paths_cfg, redaction_enabled)
     } else {
         record_event_align_failed();
         // R2-N7 (任务书 #129): name the session, not just count it.
@@ -18357,38 +20890,7 @@ fn capture_connector_sources_before_parse(
 ) {
     match connector.discover_source_files(ctx) {
         Ok(sources) if !sources.is_empty() => {
-            let primary_source_count = sources
-                .iter()
-                .filter(|source| {
-                    source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
-                })
-                .count();
-            let defer_primary_sources =
-                primary_source_count > PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT;
-            if defer_primary_sources {
-                tracing::info!(
-                    provider,
-                    primary_source_count,
-                    limit = PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT,
-                    "deferring large primary source raw-mirror capture to per-conversation streaming path"
-                );
-            }
-            for source in sources {
-                if should_skip_active_session_source(
-                    active_source_filter,
-                    provider,
-                    &source.origin.source_id,
-                    &source.source_path,
-                ) {
-                    continue;
-                }
-                if defer_primary_sources
-                    && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
-                {
-                    continue;
-                }
-                capture_discovered_source_file_before_parse(data_dir, provider, &source);
-            }
+            capture_discovered_sources_before_parse(&sources, data_dir, provider, active_source_filter);
         }
         Ok(_) => {
             for root in fallback_roots {
@@ -18417,6 +20919,31 @@ fn capture_connector_sources_before_parse(
                 );
             }
         }
+    }
+}
+
+fn capture_discovered_sources_before_parse(
+    sources: &[crate::connectors::DiscoveredSourceFile],
+    data_dir: &Path,
+    provider: &str,
+    active_source_filter: &ActiveSessionSourceFilter,
+) {
+    let primary_source_count = sources.iter().filter(|source| {
+        source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
+    }).count();
+    let defer_primary_sources = primary_source_count > PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT;
+    if defer_primary_sources {
+        tracing::info!(provider, primary_source_count, limit = PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT,
+            "deferring large primary source raw-mirror capture to per-conversation streaming path");
+    }
+    for source in sources {
+        if should_skip_active_session_source(active_source_filter, provider, &source.origin.source_id, &source.source_path) {
+            continue;
+        }
+        if defer_primary_sources && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog {
+            continue;
+        }
+        capture_discovered_source_file_before_parse(data_dir, provider, source);
     }
 }
 
@@ -18481,7 +21008,44 @@ fn capture_discovered_source_file_before_parse(
     }
 }
 
-fn validate_discovered_source_path(
+/// Prepare the run's fixed safety configuration exactly once.
+///
+/// Task 19: the slot belongs to `run_index` and lives as long as the run. The
+/// first branch that really ingests fills it; every later branch clones the
+/// same `Arc` and never re-discovers the live configuration. An empty slot
+/// means no branch has prepared it yet -- it does not mean "no configuration".
+fn ensure_run_source_safety(
+    opts: &IndexOptions,
+    slot: &mut Option<Arc<source_ingest::FixedSafetyConfig>>,
+) -> Result<Arc<source_ingest::FixedSafetyConfig>> {
+    if let Some(existing) = slot.as_ref() {
+        return Ok(Arc::clone(existing));
+    }
+    let prepared = source_ingest::prepare_source_safety(
+        &opts.data_dir,
+        opts.source_safety_config.as_deref(),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    *slot = Some(Arc::clone(&prepared));
+    Ok(prepared)
+}
+
+/// Load the caller-supplied fixed safety configuration, when one was given.
+///
+/// A misconfigured copy is a startup failure, not something to discover at the
+/// first discovered file: the operator learns before any index work runs.
+fn load_source_safety(
+    opts: &IndexOptions,
+) -> Result<Option<Arc<source_ingest::FixedSafetyConfig>>> {
+    match &opts.source_safety_config {
+        None => Ok(None),
+        Some(path) => source_ingest::load_fixed_safety_config(path)
+            .map(|config| Some(Arc::new(config)))
+            .map_err(|error| anyhow::anyhow!("{error}")),
+    }
+}
+
+pub(crate) fn validate_discovered_source_path(
     source: &crate::connectors::DiscoveredSourceFile,
 ) -> Result<(), &'static str> {
     if source.scan_root.as_os_str().is_empty() {
@@ -19192,7 +21756,7 @@ pub mod persist {
         }
     }
 
-    fn begin_concurrent_writes_enabled() -> bool {
+    pub(crate) fn begin_concurrent_writes_enabled() -> bool {
         dotenvy::var("CASS_INDEXER_BEGIN_CONCURRENT")
             .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
             .unwrap_or(false)
@@ -19315,7 +21879,7 @@ pub mod persist {
             })
     }
 
-    fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage, defer_checkpoints: bool) {
+    pub(crate) fn apply_begin_concurrent_writer_tuning(storage: &FrankenStorage, defer_checkpoints: bool) {
         let cache_kib = begin_concurrent_writer_cache_kib();
         let pragma = format!("PRAGMA cache_size = -{cache_kib};");
         if let Err(err) = storage.raw().execute(&pragma, &[]) {
@@ -19970,12 +22534,29 @@ pub mod persist {
 
     pub(crate) fn map_to_internal_with_redactor(
         prepared: &crate::indexer::exclusion::PreparedConversation,
+        redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+    ) -> Conversation {
+        // The legacy transport keeps reading the process-wide switch. The
+        // source-aware path states the answer itself (SRC05B-07 hard
+        // constraint 2: the new path is always desensitising), so it calls
+        // [`map_to_internal_with_explicit_redaction`] directly.
+        map_to_internal_with_explicit_redaction(
+            prepared,
+            redactor,
+            super::redact_secrets::redaction_enabled(),
+        )
+    }
+
+    /// The explicitly-enabled core of [`map_to_internal_with_redactor`].
+    pub(crate) fn map_to_internal_with_explicit_redaction(
+        prepared: &crate::indexer::exclusion::PreparedConversation,
         mut redactor: Option<&mut super::redact_secrets::MemoizingRedactor>,
+        redaction_enabled: bool,
     ) -> Conversation {
         let conv = &prepared.conv;
         // Extract provenance from metadata (P2.2)
         let (source_id, origin_host) = extract_provenance(&conv.metadata);
-        let should_redact = super::redact_secrets::redaction_enabled();
+        let should_redact = redaction_enabled;
 
         Conversation {
             id: None,
@@ -21804,6 +24385,7 @@ pub mod persist {
                 embedder: "fnv1a-384".to_string(),
                 progress: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             }
         }
 
@@ -23525,6 +26107,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(opts, None)?;
 
@@ -23903,6 +26486,8 @@ mod tests {
             // criterion plays no part here.
             watermark: None,
             file_states: std::collections::HashMap::new(),
+            source_evidence: HashSet::new(),
+            ownership: None,
         };
         let connector = SilentDiscoveryConnector {
             sources: vec![
@@ -23931,6 +26516,8 @@ mod tests {
                 parsed.push(conversation.source_path.clone());
                 Ok(())
             },
+            None,
+            None,
         );
 
         assert!(
@@ -24018,6 +26605,8 @@ mod tests {
                 .iter()
                 .map(|(relative, size, mtime)| ((*relative).to_string(), (*size, *mtime)))
                 .collect(),
+            source_evidence: HashSet::new(),
+            ownership: None,
         }
     }
 
@@ -24102,6 +26691,8 @@ mod tests {
             &[],
             &active_filter,
             &mut |_root, _meta, _conversation| Ok(()),
+            None,
+            None,
         );
         assert!(
             fatal.is_none(),
@@ -24321,6 +26912,7 @@ mod tests {
                 Vec::new()
             },
             mirror_root: true,
+            watermarks_enabled: true,
         };
 
         persist_root_scan_outcomes(
@@ -25184,6 +27776,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -25197,6 +27790,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         .expect("failed scan should not abort batch indexing");
         *FAILING_EXPLICIT_FILE_ROOT
@@ -30151,6 +32745,7 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         );
@@ -30240,6 +32835,7 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         );
@@ -30298,6 +32894,7 @@ mod tests {
                 embedder: "fastembed".to_string(),
                 progress: Some(std::sync::Arc::clone(&progress)),
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         );
@@ -30360,6 +32957,7 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         );
@@ -30427,6 +33025,7 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         );
@@ -30500,6 +33099,7 @@ mod tests {
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         // `run_index(watch=true)` blocks forever inside `watch_sources`'s
         // long-lived loop if the startup-scan failure does NOT short-circuit
@@ -30581,6 +33181,7 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         );
@@ -30660,6 +33261,7 @@ mod tests {
                 progress: None,
                 watch_once_paths: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         )
@@ -32120,6 +34722,7 @@ mod tests {
                 full_scan_source_ids: Arc::new(HashSet::new()),
                 local_root_plans: Arc::new(HashMap::new()),
                 scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
+                source_safety: None,
                 progress: Some(progress.clone()),
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -32188,6 +34791,7 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let mutations = run_streaming_index_with_connector_factories(
@@ -32205,6 +34809,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         .context(
             "configured remote roots should scan from the root despite the global watermark",
@@ -32273,6 +34878,7 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let mutations = run_streaming_index_with_connector_factories(
@@ -32286,6 +34892,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         .context("configured local roots should keep the connector incremental watermark")?;
 
@@ -32319,6 +34926,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let error = run_streaming_index_with_connector_factories(
@@ -32332,6 +34940,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         .expect_err("producer panic should abort streaming indexing");
         let message = error.to_string();
@@ -32383,6 +34992,7 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -32400,6 +35010,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         .context(
             "configured remote roots should scan from the root despite the global watermark",
@@ -32469,6 +35080,7 @@ mod tests {
             embedder: String::from("fastembed"),
             progress: Some(progress),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -32482,6 +35094,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         .context("configured local roots should keep the connector incremental watermark")?;
 
@@ -32523,6 +35136,7 @@ mod tests {
                 embedder: String::from("fastembed"),
                 progress: Some(progress.clone()),
                 watch_interval_secs: 30,
+                source_safety_config: None,
             };
 
             let mutations = run_batch_index_with_connector_factories(
@@ -32536,6 +35150,7 @@ mod tests {
                 FrankenStorage::now_millis(),
                 None,
                 &SharedActiveSessionSourceSkips::default(),
+                None,
             )?;
 
             assert_eq!(
@@ -32606,6 +35221,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let mutations = run_batch_index_with_connector_factories(
@@ -32619,6 +35235,7 @@ mod tests {
             FrankenStorage::now_millis(),
             None,
             &SharedActiveSessionSourceSkips::default(),
+            None,
         )
         // W2-6 Task丙续: message updated to the DB-domain framing (see the
         // sibling streaming test's rationale).
@@ -32695,6 +35312,7 @@ mod tests {
                 full_scan_source_ids: Arc::new(HashSet::new()),
                 local_root_plans: Arc::new(HashMap::new()),
                 scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
+                source_safety: None,
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -32766,6 +35384,7 @@ mod tests {
                 full_scan_source_ids: Arc::new(HashSet::new()),
                 local_root_plans: Arc::new(HashMap::new()),
                 scan_roots_meta: Arc::new(crate::indexer::scan_root_meta::ScanRootMetaIndex::new()),
+                source_safety: None,
                 progress: None,
                 active_source_filter: Arc::new(ActiveSessionSourceFilter::default()),
             },
@@ -33875,6 +36494,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         }
     }
 
@@ -34461,6 +37081,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
         let state = Mutex::new(HashMap::new());
@@ -34534,6 +37155,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         let storage = FrankenStorage::open(&data_dir.join("agent_search.db")).unwrap();
         let state = Mutex::new(HashMap::new());
@@ -34591,6 +37213,7 @@ mod tests {
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         run_index(opts(&data_dir, &session), None).unwrap();
@@ -34664,6 +37287,7 @@ normalization="l2"
             embedder: "watch-test".to_string(),
             progress: Some(progress),
             watch_interval_secs: 30,
+            source_safety_config: None,
         }
     }
 
@@ -34732,6 +37356,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(seed_opts, None)?;
 
@@ -34794,6 +37419,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(force_rebuild_opts, None)?;
 
@@ -34901,6 +37527,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(seed_opts, None)?;
 
@@ -34935,6 +37562,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(full_opts, None)?;
 
@@ -35013,6 +37641,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(seed_opts, None)?;
 
@@ -35050,6 +37679,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
         run_index(full_opts, None)?;
 
@@ -35462,6 +38092,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         // Manually set up dependencies for reindex_paths
@@ -35550,6 +38181,7 @@ normalization="l2"
             progress: Some(progress.clone()),
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -35635,6 +38267,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -35703,6 +38336,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -35828,6 +38462,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -35940,6 +38575,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36018,6 +38654,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36100,6 +38737,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36188,6 +38826,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36278,6 +38917,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36426,6 +39066,7 @@ normalization="l2"
             progress: Some(progress.clone()),
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36499,6 +39140,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36592,6 +39234,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: Some(vec![amp_file.clone()]),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36676,6 +39319,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36802,6 +39446,7 @@ normalization="l2"
             progress: None,
             watch_once_paths: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36916,6 +39561,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -36970,6 +39616,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -37055,6 +39702,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -37124,6 +39772,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: Some(progress.clone()),
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -37196,6 +39845,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -37221,6 +39871,7 @@ normalization="l2"
                 &opts,
                 &guard,
                 &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
+                false,
             )
             .unwrap()
         };
@@ -37241,6 +39892,7 @@ normalization="l2"
                 &opts,
                 &guard,
                 &[(ConnectorKind::Amp, ScanRoot::local(amp_dir.clone()))],
+                false,
             )
             .unwrap()
         };
@@ -37251,7 +39903,7 @@ normalization="l2"
 
         let startup_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard).unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, false).unwrap()
         };
         assert!(
             startup_skip,
@@ -37317,6 +39969,7 @@ normalization="l2"
             embedder: "fastembed".to_string(),
             progress: None,
             watch_interval_secs: 30,
+            source_safety_config: None,
         };
 
         let storage = FrankenStorage::open(&opts.db_path).unwrap();
@@ -40656,5 +43309,1210 @@ normalization="l2"
         assert_eq!(state.committed_conversation_id, Some(999));
         assert_eq!(state.processed_conversations, 5);
         assert_eq!(state.committed_offset, 5);
+    }
+
+    /// SRC05B-08 (R4): the source-aware branch's consumer-disconnect path is
+    /// the real producer/consumer seam, not a constructed outcome. The sink
+    /// sends on a bounded channel whose receiver is already gone -- exactly
+    /// what the streaming producer's `deliver_source_input` does -- and the
+    /// root must come back failed, with the disconnect as the fatal error and
+    /// no file claimed as handed over.
+    #[test]
+    fn source_root_scan_stops_when_the_consumer_is_gone() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let projects = temp.path().join("home/.claude/projects/proj");
+        std::fs::create_dir_all(&projects).expect("mkdir projects");
+        let session = projects.join("session.jsonl");
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "parentUuid": null,
+                "cwd": "/synthetic/project",
+                "sessionId": "sess-disconnect",
+                "version": "2.0.37",
+                "type": "user",
+                "message": {"role": "user", "content": "synthetic disconnect question"},
+                "uuid": "sess-disconnect-user",
+                "timestamp": "2026-01-01T00:00:00.000Z"
+            }),
+            serde_json::json!({
+                "parentUuid": "sess-disconnect-user",
+                "cwd": "/synthetic/project",
+                "sessionId": "sess-disconnect",
+                "version": "2.0.37",
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "synthetic disconnect answer"}]
+                },
+                "uuid": "sess-disconnect-assistant",
+                "timestamp": "2026-01-01T00:00:01.000Z"
+            })
+        );
+        std::fs::write(&session, body).expect("write session");
+
+        let copy = temp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &copy,
+            include_bytes!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed safety copy");
+        let safety = Arc::new(
+            source_ingest::load_fixed_safety_config(&copy).expect("load the fixed copy"),
+        );
+
+        let projects_root = temp.path().join("home/.claude/projects");
+        let root = ScanRoot::local(projects_root.clone());
+        let plan = LocalRootPlan {
+            root: root.clone(),
+            meta: scan_root_meta::ScanRootMeta {
+                root_id: scan_root_meta::home_root_id("claude", &projects_root),
+                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+                readonly: false,
+                canonical_path: projects_root,
+                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+                watermarks_enabled: true,
+                mirror_root: false,
+            },
+            // No watermark: the whole root is enumerated, so a candidate is
+            // always handed over and the sink is always reached.
+            watermark: None,
+            file_states: HashMap::new(),
+            source_evidence: HashSet::new(),
+            ownership: None,
+        };
+
+        let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+        let (tx, rx) = bounded::<IndexMessage>(STREAMING_CHANNEL_SIZE);
+        drop(rx);
+        let mut sink = |job: source_ingest::SourceInputJob| -> Result<()> {
+            tx.send(IndexMessage::SourceInput {
+                connector_name: "claude",
+                job: Box::new(job),
+                byte_reservation: 0,
+            })
+            .map_err(|_| {
+                anyhow::Error::new(StreamingConsumerDisconnected { connector_name: "claude" })
+            })
+        };
+
+        let filter = ActiveSessionSourceFilter::default();
+        let (outcome, fatal) = run_local_root_scan(
+            &connector,
+            "claude",
+            &data_dir,
+            &plan,
+            &[],
+            &filter,
+            &mut |_root, _meta, _conversation| Ok(()),
+            Some(&safety),
+            Some(&mut sink),
+        );
+
+        assert!(
+            !outcome.succeeded,
+            "a root whose consumer is gone is not a clean scan: {outcome:?}"
+        );
+        let fatal = fatal.expect("the disconnect is the callback's fatal error");
+        assert!(
+            is_streaming_consumer_disconnected(&fatal),
+            "the fatal error is the consumer disconnect itself: {fatal:?}"
+        );
+        assert!(
+            outcome.files.is_empty() && outcome.discovered_paths.is_empty(),
+            "a failed root claims neither a file list nor a complete enumeration: {outcome:?}"
+        );
+        assert!(
+            outcome.watermarks_enabled,
+            "the wrapper still stamps the root's own watermark flag: {outcome:?}"
+        );
+    }
+
+    /// Sorted manifest file names in `data_dir`'s raw mirror. A capture under a
+    /// different session key produces a *different* manifest id, so comparing
+    /// these is a claim about identity rather than about a count.
+    fn mirror_manifest_ids(data_dir: &Path) -> Vec<String> {
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        let Ok(entries) = std::fs::read_dir(&manifest_root) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<String> = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// A synthetic Claude Code session, the smallest one the connector parses
+    /// into a conversation.
+    fn synthetic_claude_session(id: &str, question: &str, answer: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "parentUuid": null,
+                "cwd": "/synthetic/project",
+                "sessionId": id,
+                "version": "2.0.37",
+                "type": "user",
+                "message": {"role": "user", "content": question},
+                "uuid": format!("{id}-user"),
+                "timestamp": "2026-01-01T00:00:00.000Z"
+            }),
+            serde_json::json!({
+                "parentUuid": format!("{id}-user"),
+                "cwd": "/synthetic/project",
+                "sessionId": id,
+                "version": "2.0.37",
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": answer}]
+                },
+                "uuid": format!("{id}-assistant"),
+                "timestamp": "2026-01-01T00:00:01.000Z"
+            })
+        )
+    }
+
+    /// R3 (ruling fe72d5a7, 原料捕获身份): the reverse direction is clean too.
+    ///
+    /// `run_local_root_scan` has two branches -- the source-aware one that
+    /// seals and proves an input, and the legacy one that projects a
+    /// conversation and captures the file before parsing it. A tree the source
+    /// branch has already sealed must survive a pass through the legacy branch
+    /// unchanged, because both capture a file under the *same* raw-mirror
+    /// session identity: the legacy constant, not the declaration's namespace.
+    /// Were they different, the second pass would refuse the capture
+    /// (`E-MANIFEST-SESSION-KEY-CONFLICT`) instead of merging it.
+    ///
+    /// The legacy pass here is the real one -- `(None, None)`: no safety
+    /// configuration and no source sink -- over the same root the source pass
+    /// just sealed, so its own scan and its own pre-parse capture both run.
+    /// This is the second half of r3, which used to drive a second CLI process
+    /// for it; it lives here because what it pins is the two branches of this
+    /// function, not a CLI contract.
+    #[test]
+    fn source_then_legacy_capture_identity_stays() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let projects_root = temp.path().join("home/.claude/projects");
+        let session = projects_root.join("proj/session.jsonl");
+        std::fs::create_dir_all(session.parent().expect("session parent"))
+            .expect("mkdir session dir");
+        std::fs::write(
+            &session,
+            synthetic_claude_session("sess-reverse", "the reverse question", "the reverse answer"),
+        )
+        .expect("write session");
+
+        let copy = temp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &copy,
+            include_bytes!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed safety copy");
+        let safety = Arc::new(
+            source_ingest::load_fixed_safety_config(&copy).expect("load the fixed copy"),
+        );
+
+        let root = ScanRoot::local(projects_root.clone());
+        let plan = LocalRootPlan {
+            root: root.clone(),
+            meta: scan_root_meta::ScanRootMeta {
+                root_id: scan_root_meta::home_root_id("claude", &projects_root),
+                origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+                readonly: false,
+                canonical_path: projects_root,
+                source_name: scan_root_meta::HOME_SOURCE_NAME.to_string(),
+                watermarks_enabled: true,
+                mirror_root: false,
+            },
+            // No watermark, so the whole root is enumerated and the
+            // changed-file criterion plays no part in either pass.
+            watermark: None,
+            file_states: HashMap::new(),
+            source_evidence: HashSet::new(),
+            ownership: None,
+        };
+
+        let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+        let filter = ActiveSessionSourceFilter::default();
+
+        // 1) The real source path seals the input.
+        let mut sealed = 0usize;
+        let mut sink = |_job: source_ingest::SourceInputJob| -> Result<()> {
+            sealed += 1;
+            Ok(())
+        };
+        let (outcome, fatal) = run_local_root_scan(
+            &connector,
+            "claude",
+            &data_dir,
+            &plan,
+            &[],
+            &filter,
+            &mut |_root, _meta, _conversation| Ok(()),
+            Some(&safety),
+            Some(&mut sink),
+        );
+        assert!(
+            fatal.is_none(),
+            "the source pass has no fatal error: {fatal:?}"
+        );
+        assert!(
+            outcome.succeeded,
+            "the source pass seals the session: {outcome:?}"
+        );
+        assert_eq!(sealed, 1, "the source pass sealed exactly one input");
+        let sealed_manifests = mirror_manifest_ids(&data_dir);
+        assert_eq!(
+            sealed_manifests.len(),
+            1,
+            "the source pass captured the session exactly once: {sealed_manifests:?}"
+        );
+
+        // 2) The legacy branch over the same, already-sealed root.
+        let mut parsed: Vec<std::path::PathBuf> = Vec::new();
+        let (legacy, fatal) = run_local_root_scan(
+            &connector,
+            "claude",
+            &data_dir,
+            &plan,
+            &[],
+            &filter,
+            &mut |_root, _meta, conversation| {
+                parsed.push(conversation.source_path.clone());
+                Ok(())
+            },
+            None,
+            None,
+        );
+        assert!(
+            fatal.is_none(),
+            "the legacy pass has no fatal error: {fatal:?}"
+        );
+        assert!(
+            legacy.succeeded,
+            "the legacy pass scans the root cleanly: {legacy:?}"
+        );
+        assert!(
+            parsed.iter().any(|path| path == &session),
+            "the legacy pass really parsed the synthetic session instead of \
+             scanning nothing: {parsed:?}"
+        );
+        assert_eq!(
+            mirror_manifest_ids(&data_dir),
+            sealed_manifests,
+            "the legacy capture merged into the source capture and relabelled none"
+        );
+        assert_eq!(
+            count_files_under(&data_dir.join("raw-mirror/v1/blobs")),
+            1,
+            "one unchanged file keeps one blob across both passes"
+        );
+    }
+
+    mod ordinary_ownership_tests {
+        use super::*;
+        use crate::connectors::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext};
+
+        // These counters belong only to this module. All four tests share the
+        // repository serial_test lock with the existing environment tests.
+        static SCANS: AtomicUsize = AtomicUsize::new(0);
+        static GOOD_DISCOVERIES: AtomicUsize = AtomicUsize::new(0);
+        static BAD_DISCOVERIES: AtomicUsize = AtomicUsize::new(0);
+        struct EmptyHome;
+        impl Connector for EmptyHome {
+            fn detect(&self) -> DetectionResult {
+                DetectionResult { detected: true, evidence: Vec::new(), root_paths: Vec::new() }
+            }
+            fn scan(&self, _: &ScanContext) -> Result<Vec<NormalizedConversation>> {
+                SCANS.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+        fn empty_factory() -> Box<dyn Connector + Send> { Box::new(EmptyHome) }
+        struct Discovery { fails: bool }
+        impl Connector for Discovery {
+            fn detect(&self) -> DetectionResult { DetectionResult::not_found() }
+            fn scan(&self, _: &ScanContext) -> Result<Vec<NormalizedConversation>> { Ok(Vec::new()) }
+            fn discover_source_files(&self, ctx: &ScanContext) -> Result<Vec<DiscoveredSourceFile>> {
+                if self.fails {
+                    BAD_DISCOVERIES.fetch_add(1, Ordering::SeqCst);
+                    anyhow::bail!("synthetic discovery failure");
+                }
+                GOOD_DISCOVERIES.fetch_add(1, Ordering::SeqCst);
+                let root = &ctx.scan_roots[0];
+                Ok(vec![DiscoveredSourceFile::new("claude_code", root,
+                    root.path.join("projects/p/session.jsonl"), DiscoveredSourceRole::PrimarySessionLog, true)])
+            }
+        }
+        fn good_factory() -> Box<dyn Connector + Send> { Box::new(Discovery { fails: false }) }
+        fn bad_factory() -> Box<dyn Connector + Send> { Box::new(Discovery { fails: true }) }
+
+        fn safety(temp: &TempDir) -> Arc<source_ingest::FixedSafetyConfig> {
+            let path = temp.path().join("safety.toml");
+            std::fs::write(&path, include_bytes!("../../config/excluded_context_paths.toml")).unwrap();
+            Arc::new(source_ingest::load_fixed_safety_config(&path).unwrap())
+        }
+
+        #[test]
+        #[serial]
+        fn e1_empty_home_plans_never_use_legacy_writers() {
+            let temp = TempDir::new().unwrap();
+            let home = temp.path().join("empty-home");
+            std::fs::create_dir_all(&home).unwrap();
+            let _home = set_env_var("HOME", home.to_str().unwrap());
+            let _xdg = set_env_var("XDG_CONFIG_HOME", home.to_str().unwrap());
+            let _codex = set_env_var("CODEX_HOME", home.join(".codex").to_str().unwrap());
+            let _claude = unset_env_var("CLAUDE_CONFIG_DIR");
+            let _exclude = unset_env_var("CASS_EXCLUDE_PATHS");
+            let _ = safety(&temp);
+            for streaming in [false, true] {
+                for name in ["claude", "codex"] {
+                    for enabled in [false, true] {
+                        let data = temp.path().join(format!("{streaming}-{name}-{enabled}"));
+                        std::fs::create_dir_all(&data).unwrap();
+                        let db_path = data.join("db.sqlite");
+                        let storage = FrankenStorage::open(&db_path).unwrap();
+                        ensure_fts_schema(&storage);
+                        let opts = IndexOptions {
+                            no_ingest: false, full: false, force_rebuild: false, watch: false,
+                            watch_once_paths: None, db_path, data_dir: data.clone(), semantic: false,
+                            embedder: "fastembed".into(), progress: Some(Arc::new(IndexingProgress::default())),
+                            watch_interval_secs: 30,
+                            model_api: None,
+                            source_safety_config: enabled.then(|| temp.path().join("safety.toml")),
+                        };
+                        let runner = if streaming { run_streaming_index_with_connector_factories } else { run_batch_index_with_connector_factories };
+                        // Task 19: the factory consumes the prepared object; this
+                        // low-level dispatch test loads the explicit copy it set
+                        // on the options, exactly as the production wrapper did.
+                        let source_safety = load_source_safety(&opts).unwrap();
+                        let before = SCANS.load(Ordering::SeqCst);
+                        runner(&storage, &opts, None, LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                            Vec::new(), vec![(name, empty_factory as ConnectorFactory)],
+                            &scan_root_meta::ScanRootMetaIndex::new(), FrankenStorage::now_millis(), None,
+                            &SharedActiveSessionSourceSkips::default(), source_safety).unwrap();
+                        assert_eq!(SCANS.load(Ordering::SeqCst) - before, usize::from(!enabled));
+                        for table in ["conversations", "messages", "source_inputs"] {
+                            assert_eq!(storage.raw().query_row_map(&format!("SELECT COUNT(*) FROM {table}"), &[], |r| r.get_typed::<i64>(0)).unwrap(), 0);
+                        }
+                        assert!(crate::raw_mirror::manifest_views(&data).unwrap().is_empty());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn e2_incomplete_discovery_cannot_prove_unique_owner() {
+            let root = ScanRoot::local(PathBuf::from("/synthetic/declaration"));
+            let good = [("claude", good_factory as ConnectorFactory)];
+            let normal = prepare_root_ownership(Path::new("/synthetic/data"), &root, None, &good);
+            assert_eq!(normal.partition.unwrap().decisions[&root.path.join("projects/p/session.jsonl")], source_ownership::SourceOwnershipDecision::Owner("claude".into()));
+            for factories in [
+                vec![("claude", good_factory as ConnectorFactory), ("codex", bad_factory as ConnectorFactory)],
+                vec![("codex", bad_factory as ConnectorFactory), ("claude", good_factory as ConnectorFactory)],
+            ] {
+                let before_good = GOOD_DISCOVERIES.load(Ordering::SeqCst);
+                let before_bad = BAD_DISCOVERIES.load(Ordering::SeqCst);
+                let result = prepare_root_ownership(Path::new("/synthetic/data"), &root, None, &factories);
+                assert_eq!(result.partition.unwrap_err(), "source_ownership_incomplete_discovery");
+                assert_eq!(GOOD_DISCOVERIES.load(Ordering::SeqCst) - before_good, 1);
+                assert_eq!(BAD_DISCOVERIES.load(Ordering::SeqCst) - before_bad, 1);
+            }
+            let other = ScanRoot::local(PathBuf::from("/synthetic/other"));
+            assert!(prepare_root_ownership(Path::new("/synthetic/data"), &other, None, &good).partition.is_ok());
+        }
+
+        #[test]
+        #[serial]
+        fn e3_physical_carriers_cover_only_their_logical_sessions() {
+            let root = ScanRoot::local(PathBuf::from("/synthetic/root"));
+            let database = DiscoveredSourceFile::new("opencode", &root, root.path.join("opencode.db"), DiscoveredSourceRole::SqliteDatabase, true);
+            let sources = [database];
+            for path in ["opencode.db", "opencode.db/id%2Fencoded"] {
+                assert!(physical_carriers_cover_source(&sources, &root.path.join(path)));
+            }
+            for path in ["neighbor.db", "opencode.db/one/two", "opencode.db/../escape"] {
+                assert!(!physical_carriers_cover_source(&sources, &root.path.join(path)));
+            }
+            assert!(!physical_carriers_cover_source(&[], &root.path.join("opencode.db")));
+            let file = [DiscoveredSourceFile::new("claude_code", &root, root.path.join("log.jsonl"), DiscoveredSourceRole::PrimarySessionLog, true)];
+            assert!(physical_carriers_cover_source(&file, &root.path.join("log.jsonl")));
+            assert!(!physical_carriers_cover_source(&file, &root.path.join("log.jsonl/child")));
+        }
+
+        #[test]
+        #[serial]
+        fn e4_fallback_plans_keep_declared_identity() {
+            let temp = TempDir::new().unwrap();
+            let _home = set_env_var("HOME", temp.path().to_str().unwrap());
+            let _xdg = set_env_var("XDG_CONFIG_HOME", temp.path().to_str().unwrap());
+            let _claude = unset_env_var("CLAUDE_CONFIG_DIR");
+            let root_path = temp.path().join("declared");
+            std::fs::create_dir_all(&root_path).unwrap();
+            let root = ScanRoot::remote(root_path.clone(), Origin::remote("one"), Some(Platform::Linux));
+            let other = ScanRoot::remote(root_path.clone(), Origin::remote("two"), Some(Platform::Linux));
+            let storage = FrankenStorage::open(&temp.path().join("db.sqlite")).unwrap();
+            let config = safety(&temp);
+            let factories = [("claude", good_factory as ConnectorFactory)];
+            let mut index = scan_root_meta::ScanRootMetaIndex::new();
+            let build = |index: &scan_root_meta::ScanRootMetaIndex, enabled| build_connector_root_plans(
+                &storage, &factories, &[root.clone(), other.clone()], index, Some(&config), enabled, temp.path()).unwrap();
+            let old = build(&index, false);
+            assert!(old["claude"].configured_for(&root).is_none());
+            let plans = build(&index, true);
+            let plan = plans["claude"].configured_for(&root).unwrap();
+            assert_eq!((plan.meta.root_id.as_str(), plan.meta.origin_host.as_str()), ("local", "local"));
+            assert!(!plan.meta.readonly && !plan.meta.watermarks_enabled && !plan.meta.mirror_root);
+            assert!(index.get("one", &root_path).is_none());
+            let meta = scan_root_meta::ScanRootMeta {
+                root_id: "cfg:one:exact".into(), origin_host: "precise-host".into(), readonly: true,
+                canonical_path: root_path.clone(), source_name: "one".into(), watermarks_enabled: false, mirror_root: true,
+            };
+            index.insert(meta.clone());
+            let plans = build(&index, true);
+            assert_eq!(plans["claude"].configured_for(&root).unwrap().meta, meta);
+            assert_eq!(plans["claude"].configured_for(&other).unwrap().root.origin.source_id, "two");
+            assert_eq!(plans["claude"].configured_for(&other).unwrap().meta.source_name, "two");
+            assert_eq!(plans["claude"].configured.len(), 2);
+            assert_eq!(index.get("one", &root_path), Some(&meta));
+            assert!(index.get("two", &root_path).is_none());
+            let mut other_meta = meta.clone();
+            other_meta.source_name = "two".into();
+            other_meta.root_id = "cfg:two:exact".into();
+            other_meta.origin_host = "other-host".into();
+            index.insert(other_meta.clone());
+            let plans = build(&index, true);
+            assert_eq!(plans["claude"].configured_for(&root).unwrap().meta, meta);
+            assert_eq!(plans["claude"].configured_for(&other).unwrap().meta, other_meta);
+        }
+    }
+
+    /// Every file under `dir`, at any depth: the raw mirror shards blobs into
+    /// sub-directories, so counting one level would describe the layout rather
+    /// than the content.
+    fn count_files_under(dir: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    count_files_under(&path)
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 35: fixed-mode watch routing, unit level
+//
+// Every fixture below is synthetic. The routing consumes the real discovery
+// (`prepare_root_ownership`) and the real router; no connector, parser or
+// ownership algorithm is reimplemented here.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod task35_watch_routing_tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    struct Task35Env {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl Drop for Task35Env {
+        fn drop(&mut self) {
+            // SAFETY: the caller is `#[serial]`, and the previous value is
+            // restored immediately after the cycle under test.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn task35_set_env(key: &'static str, value: &str) -> Task35Env {
+        let previous = std::env::var(key).ok();
+        // SAFETY: see `Task35Env::drop`.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Task35Env { key, previous }
+    }
+
+    /// A synthetic Claude Code session in the shape the connector parses.
+    fn task35_claude_jsonl(uuid: &str) -> String {
+        let lines = [
+            serde_json::json!({
+                "parentUuid": null,
+                "cwd": "/synthetic/project",
+                "sessionId": uuid,
+                "version": "2.0.37",
+                "type": "user",
+                "message": {"role": "user", "content": "rework claude question"},
+                "uuid": format!("{uuid}-user"),
+                "timestamp": "2026-01-01T00:00:00.000Z"
+            }),
+            serde_json::json!({
+                "parentUuid": format!("{uuid}-user"),
+                "cwd": "/synthetic/project",
+                "sessionId": uuid,
+                "version": "2.0.37",
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-4",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "rework claude answer"}]
+                },
+                "uuid": format!("{uuid}-assistant"),
+                "timestamp": "2026-01-01T00:00:01.000Z"
+            }),
+        ];
+        let mut body = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push('\n');
+        body
+    }
+
+    /// The buffer a test-thread tracing subscriber writes into.
+    #[derive(Clone, Default)]
+    struct Task35LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Task35LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One `key=value` field's value from a rendered log line, with the quotes
+    /// a string field may carry stripped. Mirrors the existing trigger-line
+    /// parser: the field's semantic value is what a test asserts, not whether
+    /// the formatter quoted it.
+    fn task35_log_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let needle = format!("{key}=");
+        let start = line.find(&needle)? + needle.len();
+        let rest = &line[start..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        Some(rest[..end].trim_matches('"'))
+    }
+
+    /// Run `f` under a current-thread subscriber and return its result plus the
+    /// WARN-and-above log text. This is the existing `tracing_subscriber`
+    /// mechanism the module's other tests use; nothing here changes production.
+    fn task35_capture_logs<R>(f: impl FnOnce() -> R) -> (R, String) {
+        let writer = Task35LogBuffer::default();
+        let drain = writer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let bytes = drain.0.lock().expect("log buffer lock").clone();
+        (result, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A synthetic Gemini session in the frozen fixture's own shape.
+    fn task35_gemini_json(session_id: &str, body: &str) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../tests/fixtures/gemini/hash123/chats/session-test.json"
+        ))
+        .expect("the frozen Gemini fixture parses");
+        value["sessionId"] = serde_json::Value::String(session_id.to_string());
+        value["messages"][0]["content"] = serde_json::Value::String(body.to_string());
+        serde_json::to_vec_pretty(&value).expect("serialize the Gemini session")
+    }
+
+    fn write_fixture(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("fixture parent");
+        }
+        std::fs::write(path, body).expect("fixture file");
+    }
+
+    fn declared_root(path: &Path, source_id: &str) -> ScanRoot {
+        let mut root = ScanRoot::local(path.to_path_buf());
+        root.origin.source_id = source_id.to_string();
+        root.origin.host = Some(source_id.to_string());
+        root
+    }
+
+    fn declared_meta(path: &Path, root_id: &str, source_name: &str) -> scan_root_meta::ScanRootMeta {
+        scan_root_meta::ScanRootMeta {
+            root_id: root_id.to_string(),
+            origin_host: crate::storage::sqlite::DEFAULT_IDENTITY_HOST.to_string(),
+            readonly: false,
+            canonical_path: scan_root_meta::canonicalize_root_path(path),
+            source_name: source_name.to_string(),
+            watermarks_enabled: true,
+            mirror_root: false,
+        }
+    }
+
+    /// One declaration's plan, prepared exactly as the production planner
+    /// prepares a configured root: real discovery, real partition, one shared
+    /// ownership object per declaration.
+    fn declared_plan(
+        data_dir: &Path,
+        path: &Path,
+        source_id: &str,
+        root_id: &str,
+    ) -> LocalRootPlan {
+        let factories = configured_connector_factories();
+        let root = declared_root(path, source_id);
+        let ownership = Arc::new(prepare_root_ownership(data_dir, &root, None, &factories));
+        LocalRootPlan {
+            root,
+            meta: declared_meta(path, root_id, source_id),
+            watermark: None,
+            file_states: std::collections::HashMap::new(),
+            source_evidence: std::collections::HashSet::new(),
+            ownership: Some(ownership),
+        }
+    }
+
+    fn insert_plan(
+        plans: &mut std::collections::HashMap<&'static str, ConnectorRootPlans>,
+        connector: &'static str,
+        plan: &LocalRootPlan,
+    ) {
+        let entry = plans.entry(connector).or_default();
+        entry.configured.insert(
+            ConfiguredRootKey::Declaration {
+                source_id: plan.root.origin.source_id.clone(),
+                canonical_path: plan.meta.canonical_path.clone(),
+            },
+            plan.clone(),
+        );
+    }
+
+    /// U1: routing starts from the raw paths and the declarations, so a wrong
+    /// old kind hint or an empty legacy classification cannot drop a file the
+    /// ownership decision names.
+    #[test]
+    fn task35_raw_paths_route_before_kind_hints() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let root_path = temp.path().join("declared");
+        let rollout = root_path.join("sessions/rollout-task35-u1.jsonl");
+        write_fixture(
+            &rollout,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"task35-u1\"}}\n",
+        );
+
+        let plan = declared_plan(&data_dir, &root_path, "u1-source", "u1-decl");
+        let mut plans = std::collections::HashMap::new();
+        insert_plan(&mut plans, "claude", &plan);
+        insert_plan(&mut plans, "codex", &plan);
+
+        // The legacy classification of this path: empty when no watch root
+        // covers it, and a Claude hint when a root does. Neither decides the
+        // read.
+        let empty_classification = classify_paths(vec![rollout.clone()], &[], true);
+        assert!(
+            empty_classification.is_empty(),
+            "the fixture must not be classified by the legacy watch roots"
+        );
+        let hinted = classify_paths(
+            vec![rollout.clone()],
+            &[(ConnectorKind::Claude, ScanRoot::local(root_path.clone()))],
+            true,
+        );
+        assert_eq!(hinted.len(), 1, "the hint classification produces one trigger");
+        assert_eq!(
+            hinted[0].0,
+            ConnectorKind::Claude,
+            "the legacy entry point would read this file as Claude"
+        );
+
+        let route = route_fixed_watch(vec![rollout.clone()], &plans, true);
+        assert!(
+            route.rejections.is_empty(),
+            "the codex rollout is a clean ownership decision"
+        );
+        assert_eq!(route.units.len(), 1, "exactly the owner's unit is built");
+        let unit = &route.units[0];
+        assert_eq!(unit.connector, "codex", "the declaration's owner overrides the hint");
+        assert_eq!(unit.plan.meta.root_id, "u1-decl", "the declaration identity is kept");
+        assert_eq!(unit.plan.root.origin.source_id, "u1-source");
+        assert_eq!(
+            unit.selection.as_deref(),
+            Some(rollout.as_path()),
+            "the explicit selection is carried, not the whole root"
+        );
+        assert!(unit.source_aware, "codex supports the sealed kernel");
+        assert!(
+            route.uncovered.is_empty(),
+            "a declared path is never handed back to the legacy classifier"
+        );
+    }
+
+    /// U2: every refusal is known before any writer runs, and a healthy
+    /// sibling of the same kind is still routed.
+    #[test]
+    #[serial]
+    fn task35_preflight_failures_hold_back_before_writer() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+
+        let root_a = temp.path().join("declared-a");
+        let healthy_codex = root_a.join("sessions/rollout-task35-u2.jsonl");
+        let unresolved = root_a.join("notes.json");
+        let ambiguous = root_a.join("projects/p/chats/session-u2.json");
+        write_fixture(&healthy_codex, "{}\n");
+        write_fixture(&unresolved, "{}\n");
+        write_fixture(&ambiguous, "{}\n");
+
+        let root_b = temp.path().join("declared-b");
+        let healthy_claude = root_b.join("projects/p/session-u2.jsonl");
+        write_fixture(&healthy_claude, "{}\n");
+
+        let plan_a = declared_plan(&data_dir, &root_a, "u2-a", "u2-a-decl");
+        let plan_b = declared_plan(&data_dir, &root_b, "u2-b", "u2-b-decl");
+        let mut plans = std::collections::HashMap::new();
+        for connector in ["claude", "codex"] {
+            insert_plan(&mut plans, connector, &plan_a);
+            insert_plan(&mut plans, connector, &plan_b);
+        }
+
+        // The verified OpenHands sample: the same layout the control-plane
+        // probe used. The real discovery of this build runs over it, and the
+        // real resolver must name OpenHands for both event paths before any
+        // watch behavior is asserted.
+        let root_openhands = temp.path().join("declared-openhands");
+        let events = root_openhands.join("conversation/events");
+        let mut openhands_events = Vec::new();
+        for (index, (name, role, text)) in [
+            ("event-00000-user.json", "user", "synthetic openhands user turn"),
+            (
+                "event-00001-assistant.json",
+                "assistant",
+                "synthetic openhands assistant turn",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let event = events.join(name);
+            write_fixture(
+                &event,
+                &format!(
+                    "{{\"id\":\"event-{index}\",\"kind\":\"MessageEvent\",\"source\":\"{role}\",\
+                     \"llm_message\":{{\"role\":\"{role}\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}]}}}}"
+                ),
+            );
+            openhands_events.push(event);
+        }
+        let plan_openhands = declared_plan(&data_dir, &root_openhands, "u2-oh", "u2-oh-decl");
+        insert_plan(&mut plans, "claude", &plan_openhands);
+        insert_plan(&mut plans, "openhands", &plan_openhands);
+        {
+            let ownership = plan_openhands
+                .ownership
+                .as_ref()
+                .expect("a fixed-mode declaration carries its partition");
+            assert_eq!(
+                ownership.sources.get("openhands").map(Vec::len),
+                Some(2),
+                "the real OpenHands discovery claims both event files"
+            );
+            assert!(
+                ownership.sources.get("claude").map(Vec::len).unwrap_or(0) >= 2,
+                "the real Claude discovery claims the same json files"
+            );
+            let partition = ownership.partition.as_ref().expect("complete discovery");
+            for event in &openhands_events {
+                assert_eq!(
+                    partition.decisions.get(event),
+                    Some(&source_ownership::SourceOwnershipDecision::Owner(
+                        "openhands".to_string()
+                    )),
+                    "the real resolver names OpenHands for {}",
+                    event.display()
+                );
+            }
+        }
+
+        let mut routed_paths = vec![
+            healthy_codex.clone(),
+            unresolved.clone(),
+            ambiguous.clone(),
+            healthy_claude.clone(),
+        ];
+        routed_paths.extend(openhands_events.iter().cloned());
+        let route = route_fixed_watch(routed_paths, &plans, true);
+        assert!(
+            route
+                .rejections
+                .iter()
+                .any(|r| r.code == "source_ownership_unsupported_watch"
+                    && r.connector == "openhands"),
+            "the router refuses the owner this build has no watch capability for"
+        );
+        let codes: Vec<&str> = route.rejections.iter().map(|r| r.code).collect();
+        assert!(
+            codes.contains(&"source_ownership_unresolved"),
+            "a file with no usable evidence is refused: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"source_ownership_ambiguous"),
+            "a file two declarations claim is refused: {codes:?}"
+        );
+        for rejection in &route.rejections {
+            if rejection.code == "source_ownership_unsupported_watch" {
+                assert!(
+                    rejection.kind.is_none(),
+                    "an owner without a watch capability has no kind to hold back"
+                );
+            } else {
+                assert!(
+                    rejection.kind.is_some(),
+                    "a refusal with a known kind participates in the holdback"
+                );
+            }
+            assert!(rejection.relative_sha256.is_some());
+        }
+
+        let connectors: Vec<&str> = route.units.iter().map(|u| u.connector).collect();
+        assert!(
+            connectors.contains(&"codex") && connectors.contains(&"claude"),
+            "healthy units of both kinds are routed although a sibling was refused: {connectors:?}"
+        );
+
+        let mut holdback: std::collections::HashMap<ConnectorKind, bool> =
+            std::collections::HashMap::new();
+        let failed = apply_watch_rejections(&route, &mut holdback);
+        assert!(failed, "the cycle is marked failed before any writer runs");
+        assert_eq!(
+            holdback.get(&ConnectorKind::Claude).copied(),
+            Some(true),
+            "the refused declaration's kind is held back"
+        );
+
+        // Rework R1-F1, part two: a runtime rejection inside a fixed-mode
+        // explicit watch-once must reach the caller after the healthy unit has
+        // already landed. The after-capture hook creates a new, valid Gemini
+        // session after routing has fixed this cycle's descriptors, so the
+        // legacy directory scan produces a source the unit never verified.
+        let temp = TempDir::new().expect("tempdir");
+        let home = temp.path().join("home");
+        let xdg = temp.path().join("xdg-config");
+        let data_dir = temp.path().join("data");
+        for dir in [&home, &xdg, &data_dir] {
+            std::fs::create_dir_all(dir).expect("mkdir isolated dir");
+        }
+        let _home = task35_set_env("HOME", home.to_str().expect("utf-8 home"));
+        let _xdg_config =
+            task35_set_env("XDG_CONFIG_HOME", xdg.to_str().expect("utf-8 xdg config"));
+        let _xdg_data = task35_set_env(
+            "XDG_DATA_HOME",
+            home.join(".local/share").to_str().expect("utf-8 xdg data"),
+        );
+        let _codex_home =
+            task35_set_env("CODEX_HOME", home.join(".codex").to_str().expect("utf-8 codex"));
+        let _claude_config = task35_set_env(
+            "CLAUDE_CONFIG_DIR",
+            home.join(".claude").to_str().expect("utf-8 claude"),
+        );
+        let _ignore_sources = task35_set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+
+        let root = temp.path().join("declared");
+        let claude_file = root.join("projects/p/one.jsonl");
+        write_fixture(&claude_file, &task35_claude_jsonl("sess-rework-claude"));
+        let gemini_file = root.join("hash/chats/session-one.json");
+        write_fixture(
+            &gemini_file,
+            &String::from_utf8(task35_gemini_json("sess-rework-gemini", "rework gemini body"))
+                .expect("utf-8 gemini body"),
+        );
+
+        let late_path = root.join("hash/chats/session-late.json");
+        let late_body = task35_gemini_json("sess-rework-late", "rework late body");
+        let hook_path = late_path.clone();
+        let _hook = crate::indexer::source_ingest::test_hooks::arm_after_capture(
+            move |_captured: &Path| {
+                std::fs::create_dir_all(hook_path.parent().expect("late parent"))
+                    .expect("mkdir late dir");
+                std::fs::write(&hook_path, &late_body).expect("write the late gemini session");
+            },
+        );
+
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        let mut source = crate::sources::provenance::Source::remote("rework", "host-rework");
+        source.kind = crate::sources::provenance::SourceKind::Local;
+        source.config_json = Some(serde_json::json!({
+            "paths": [root.to_str().expect("utf-8 root")]
+        }));
+        storage.upsert_source(&source).expect("register the declaration");
+        let safety_copy = temp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &safety_copy,
+            include_str!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed safety copy");
+
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: Some(vec![root.clone()]),
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            no_ingest: false,
+            embedder: "infinity".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+            model_api: None,
+            source_safety_config: Some(safety_copy),
+        };
+        let state = Mutex::new(std::collections::HashMap::new());
+        let storage = Mutex::new(storage);
+        let (result, logs) = task35_capture_logs(|| {
+            reindex_paths_with_semantic_delta_and_safety(
+                &opts,
+                vec![root.clone()],
+                &[],
+                &state,
+                &storage,
+                false,
+                None,
+                None,
+            )
+        });
+
+        assert!(
+            crate::indexer::source_ingest::test_hooks::hits()
+                .iter()
+                .any(|hit| *hit == "after_capture"),
+            "the after-capture hook must have fired"
+        );
+        assert!(late_path.exists(), "the hook created the late session");
+        let storage = storage.into_inner().expect("storage lock");
+        let count = |sql: &str| {
+            storage
+                .raw()
+                .query_row_map(sql, &[], |row| row.get_typed::<i64>(0))
+                .unwrap_or_else(|error| panic!("{sql}: {error}"))
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM source_inputs WHERE connector='claude_code' AND state='complete'"),
+            1,
+            "the healthy Claude input still lands"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM messages WHERE content LIKE '%rework late body%'"),
+            0,
+            "the unverified late file is never written"
+        );
+        assert!(
+            result.is_err(),
+            "a fixed-mode explicit watch-once with a runtime rejection must return Err, got {result:?}"
+        );
+
+        // Rework R2-F1: the new member-rejection diagnostic carries the
+        // declaration identity, the connector and a stable reason code, and
+        // names no original path or body.
+        let root_text = root.to_str().expect("utf-8 root");
+        let late_text = late_path.to_str().expect("utf-8 late");
+        let event_lines: Vec<&str> = logs
+            .lines()
+            .filter(|line| {
+                line.contains("fixed watch unit produced a source outside its verified descriptors")
+            })
+            .collect();
+        assert!(
+            !event_lines.is_empty(),
+            "the member-rejection event must be logged: {logs}"
+        );
+        for line in event_lines {
+            assert_eq!(
+                task35_log_field(line, "reason"),
+                Some("source_outside_verified_descriptors"),
+                "the event carries its stable reason code: {line}"
+            );
+            assert!(
+                task35_log_field(line, "connector").is_some(),
+                "the event names its connector: {line}"
+            );
+            assert!(
+                task35_log_field(line, "root_id").is_some(),
+                "the event names its declaration identity: {line}"
+            );
+            assert!(
+                !line.contains(root_text),
+                "the diagnostic must not print the declaration directory: {line}"
+            );
+            assert!(
+                !line.contains(late_text),
+                "the diagnostic must not print the late file path: {line}"
+            );
+            assert!(
+                !line.contains("scan_root="),
+                "the diagnostic must not print a scan root: {line}"
+            );
+            assert!(
+                !line.contains("rework late body"),
+                "the diagnostic must not print the body: {line}"
+            );
+        }
+    }
+
+    /// U3: a forced rebuild may drop the old per-root state, but a refused
+    /// unit publishes no new success state -- its watermark and file state stay
+    /// exactly where they were.
+    ///
+    /// The cycle is the production rebuild callback (`run_watch_rebuild_cycle`),
+    /// not a hand-assembled sequence: it clears the old watch state, runs the
+    /// real forced reindex over the active roots, and the refused declaration
+    /// never reaches a writer.
+    #[test]
+    #[serial]
+    fn task35_force_full_rejects_without_new_success_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let home = temp.path().join("home");
+        let xdg = temp.path().join("xdg-config");
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::create_dir_all(&xdg).expect("xdg dir");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let _home = task35_set_env("HOME", home.to_str().expect("utf-8 home"));
+        let _xdg_config = task35_set_env("XDG_CONFIG_HOME", xdg.to_str().expect("utf-8 xdg"));
+        let _xdg_data = task35_set_env("XDG_DATA_HOME", home.join(".local/share").to_str().expect("utf-8 xdg data"));
+        let _codex_home = task35_set_env("CODEX_HOME", home.join(".codex").to_str().expect("utf-8 codex home"));
+        let _claude_config = task35_set_env("CLAUDE_CONFIG_DIR", home.join(".claude").to_str().expect("utf-8 claude home"));
+        let _ignore_sources = task35_set_env("CASS_IGNORE_SOURCES_CONFIG", "1");
+
+        let root_path = temp.path().join("declared");
+        let rejected = root_path.join("notes.json");
+        write_fixture(&rejected, "{}\n");
+        let safety_copy = temp.path().join("fixed-safety.toml");
+        std::fs::write(
+            &safety_copy,
+            include_str!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed safety copy");
+
+        let db_path = data_dir.join("agent_search.db");
+        let storage = FrankenStorage::open(&db_path).expect("open storage");
+        // The declaration: a local DB source over the synthetic root.
+        let mut source = crate::sources::provenance::Source::remote("u3-source", "host-u3");
+        source.kind = crate::sources::provenance::SourceKind::Local;
+        source.config_json = Some(serde_json::json!({
+            "paths": [root_path.to_str().expect("utf-8 root")]
+        }));
+        storage.upsert_source(&source).expect("register the declaration");
+        // The state a previous cycle left behind, under the transitional local
+        // identity this DB fallback declaration resolves to.
+        storage
+            .set_scan_watermark("local", "claude", 111)
+            .expect("seed watermark");
+        storage
+            .upsert_scan_file_state("local", "claude", "notes.json", 7, 222, 111)
+            .expect("seed file state");
+
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path: db_path.clone(),
+            data_dir: data_dir.clone(),
+            semantic: false,
+            no_ingest: false,
+            embedder: "infinity".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+            model_api: None,
+            source_safety_config: Some(safety_copy.clone()),
+        };
+        let roots = vec![(ConnectorKind::Claude, ScanRoot::local(root_path.clone()))];
+        let state = Mutex::new(std::collections::HashMap::from([(
+            ConnectorKind::Claude,
+            999,
+        )]));
+        let storage = Mutex::new(storage);
+        let safety = load_source_safety(&opts)
+            .expect("load the fixed safety copy")
+            .expect("a fixed safety copy was supplied");
+        let detector = StaleDetector::from_env();
+
+        let indexed = run_watch_rebuild_cycle(
+            &opts,
+            &roots,
+            &state,
+            &storage,
+            Some(&safety),
+            &detector,
+        );
+        assert_eq!(indexed, 0, "the refused unit indexed nothing");
+
+        // The permitted force_full clear of the old watch state happened...
+        assert!(
+            state.lock().expect("state lock").is_empty(),
+            "the rebuild clears the old watch state before the cycle"
+        );
+        // ...but the refused unit published no new success state.
+        let storage = storage.into_inner().expect("storage lock");
+        assert_eq!(
+            storage
+                .get_scan_watermark("local", "claude")
+                .expect("read watermark"),
+            Some(111),
+            "the refused unit advanced no watermark"
+        );
+        let states = storage
+            .scan_file_states_for_root_connector("local", "claude")
+            .expect("read file states");
+        assert_eq!(
+            states.get("notes.json").copied(),
+            Some((7, 222)),
+            "the refused unit rewrote no file state"
+        );
+        assert_eq!(
+            storage
+                .raw()
+                .query_row_map(
+                    "SELECT COUNT(*) FROM source_inputs",
+                    &[],
+                    |row| row.get_typed::<i64>(0),
+                )
+                .expect("count source inputs"),
+            0,
+            "no writer ran for the refused declaration"
+        );
     }
 }

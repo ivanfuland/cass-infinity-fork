@@ -2,6 +2,7 @@ pub mod doctor_e2e_runner;
 pub mod doctor_fixture;
 pub mod e2e_log;
 pub mod search_asset_simulation;
+pub mod source_legacy_seed;
 pub mod timeout;
 
 // =============================================================================

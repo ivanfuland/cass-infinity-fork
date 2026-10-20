@@ -308,6 +308,7 @@ fn readonly_root_untouched() {
                 embedder: "fastembed".to_string(),
                 progress: None,
                 watch_interval_secs: 30,
+                source_safety_config: None,
             },
             None,
         )

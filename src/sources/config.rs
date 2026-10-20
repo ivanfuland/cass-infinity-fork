@@ -1015,6 +1015,93 @@ impl ExcludedContextPaths {
         let parsed: Self = toml::from_str(&content)?;
         Ok(parsed)
     }
+
+    /// P0/C5 (2026-10-15 execution contract v2): the strict tier walk the
+    /// source-fidelity preparation uses to discover the operator's live rule
+    /// file once, before that run freezes it into a private copy.
+    ///
+    /// Parsing and per-field defaults are the same as [`Self::load`]; only the
+    /// *path selection* is tightened, and the legacy entry keeps its own
+    /// semantics unchanged.
+    ///
+    /// A configured `XDG_CONFIG_HOME` is the single candidate and never falls
+    /// through to a platform or home tier. Without it the tiers are walked in
+    /// order and each one decides its own turn through `fs::metadata`: a real
+    /// `NotFound` moves on to the next tier, while `PermissionDenied` and every
+    /// other error stop the load. `Path::exists()` reports both of those as
+    /// absent, which would silently widen a narrowed rule set -- exactly the
+    /// false default [`Self::load_from_candidate`] was fixed to stop.
+    pub fn load_for_source_fidelity() -> Result<Self, ConfigError> {
+        Self::load_for_source_fidelity_from_parts(
+            dotenvy::var("XDG_CONFIG_HOME").ok().map(PathBuf::from),
+            dirs::config_dir(),
+            dirs::home_dir(),
+        )
+    }
+
+    /// The tier walk above, with every ambient input supplied by the caller.
+    ///
+    /// Production reaches it through [`Self::load_for_source_fidelity`]; the
+    /// tests pass synthetic tiers, so both the discovering entry and the
+    /// selection core are covered without touching a process-wide environment
+    /// variable.
+    fn load_for_source_fidelity_from_parts(
+        xdg_config_home: Option<PathBuf>,
+        platform_config_dir: Option<PathBuf>,
+        home_dir: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
+        let candidate =
+            excluded_context_paths_fidelity_candidate(xdg_config_home, platform_config_dir, home_dir)?;
+        let content = match candidate {
+            Some(path) => std::fs::read_to_string(&path)?,
+            None => EXCLUDED_CONTEXT_PATHS_BUILTIN_DEFAULT.to_string(),
+        };
+
+        let parsed: Self = toml::from_str(&content)?;
+        Ok(parsed)
+    }
+}
+
+/// P0/C5: the one live rule file the fidelity preparation freezes.
+///
+/// The tiers are the same ones [`excluded_context_paths_path`] resolves, but a
+/// tier decides its own turn through `fs::metadata` rather than
+/// `Path::exists()`, so "genuinely missing" and "present but unreadable" are
+/// different outcomes: the first continues to the next tier, the second is an
+/// error. An explicit `XDG_CONFIG_HOME` *is* the tier list, so it can never
+/// fall through to the platform or home tier.
+fn excluded_context_paths_fidelity_candidate(
+    xdg_config_home: Option<PathBuf>,
+    platform_config_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    let mut tiers: Vec<PathBuf> = Vec::new();
+    match xdg_config_home {
+        Some(xdg_config) => {
+            tiers.push(xdg_config.join("cass").join(EXCLUDED_CONTEXT_PATHS_FILENAME));
+        }
+        None => {
+            if let Some(platform) = platform_config_dir {
+                tiers.push(platform.join("cass").join(EXCLUDED_CONTEXT_PATHS_FILENAME));
+            }
+            if let Some(home) = home_dir {
+                tiers.push(
+                    home.join(".config")
+                        .join("cass")
+                        .join(EXCLUDED_CONTEXT_PATHS_FILENAME),
+                );
+            }
+        }
+    }
+
+    for tier in tiers {
+        match std::fs::metadata(&tier) {
+            Ok(_) => return Ok(Some(tier)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve the excluded-context path config file location. Mirrors
@@ -3313,6 +3400,279 @@ Host production !legacy-prod
             !projects_mapping.unwrap().from.contains("//"),
             "Path mapping should not contain double slashes: {}",
             projects_mapping.unwrap().from
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_fidelity_tests {
+    //! P0/C5 (2026-10-15 execution contract v2): the strict tier walk that
+    //! freezes the live rule file.
+    //!
+    //! Every case drives [`ExcludedContextPaths::load_for_source_fidelity_from_parts`],
+    //! the very selection core the discovering entry calls, with synthetic
+    //! tiers -- so the tier decision is exercised without a process-wide
+    //! environment variable, and a locked tier cannot be mistaken for an
+    //! absent one.
+
+    use super::*;
+
+    /// R3-N6 (任务书 #129): `id -u` == 0. Root bypasses directory permission
+    /// bits, so a test whose premise is "the bit blocks the caller" has to be
+    /// skipped there rather than assert something that cannot be true.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|uid| uid.trim() == "0")
+            .unwrap_or(false)
+    }
+
+    /// Refuse to pass without the premise this module's counterexamples rest
+    /// on. A case that quietly returned success at root would report a
+    /// capability bit as working when it was never exercised.
+    #[cfg(unix)]
+    fn assert_permission_bits_block() {
+        assert!(
+            !running_as_root(),
+            "this counterexample needs a directory permission bit to block the caller, and \
+             root bypasses those bits"
+        );
+    }
+
+    /// The refusal really is the permission error, not a default fallback
+    /// wearing a different shape.
+    #[cfg(unix)]
+    fn assert_permission_denied(err: ConfigError, what: &str) {
+        match err {
+            ConfigError::Read(io) => assert_eq!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{what}: expected the underlying PermissionDenied, got {}",
+                io.kind()
+            ),
+            other => panic!("{what}: expected ConfigError::Read, got {other:?}"),
+        }
+    }
+
+    fn write_rules(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("rule file parent")).expect("mkdir rule file");
+        std::fs::write(path, contents).expect("write rule file");
+    }
+
+    fn platform_tier_file(root: &Path) -> PathBuf {
+        root.join("cass").join(EXCLUDED_CONTEXT_PATHS_FILENAME)
+    }
+
+    fn home_tier_file(root: &Path) -> PathBuf {
+        root.join(".config")
+            .join("cass")
+            .join(EXCLUDED_CONTEXT_PATHS_FILENAME)
+    }
+
+    fn xdg_tier_file(root: &Path) -> PathBuf {
+        root.join("cass").join(EXCLUDED_CONTEXT_PATHS_FILENAME)
+    }
+
+    #[test]
+    fn high_tier_permission_denied_does_not_fall_back() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_permission_bits_block();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let platform_root = temp.path().join("platform");
+            let home_root = temp.path().join("home");
+            let high = platform_tier_file(&platform_root);
+            let low = home_tier_file(&home_root);
+            write_rules(&high, "memory_files = [\"HIGH.md\"]\n");
+            write_rules(&low, "memory_files = [\"LOW.md\"]\n");
+
+            // The high tier's file really is there; only its directory is not
+            // traversable, which `Path::exists()` cannot tell from "missing".
+            std::fs::set_permissions(&platform_root, std::fs::Permissions::from_mode(0o000))
+                .expect("lock the high tier");
+            let result = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+                None,
+                Some(platform_root.clone()),
+                Some(home_root.clone()),
+            );
+            std::fs::set_permissions(&platform_root, std::fs::Permissions::from_mode(0o700))
+                .expect("unlock the high tier");
+
+            let err = result.expect_err(
+                "an unreadable high tier must refuse, not fall through to the readable low tier",
+            );
+            assert_permission_denied(err, "an unreadable high tier");
+            // The low tier was never the reason: it is intact and unused.
+            assert_eq!(
+                std::fs::read_to_string(&low).expect("read the low tier"),
+                "memory_files = [\"LOW.md\"]\n"
+            );
+
+            // Control: with the lock lifted the same tiers resolve the high
+            // one, so the refusal above is about the permission, not about a
+            // fixture that never had a high tier.
+            let loaded = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+                None,
+                Some(platform_root.clone()),
+                Some(home_root),
+            )
+            .expect("the readable high tier resolves");
+            assert_eq!(loaded.memory_files, vec!["HIGH.md"]);
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("skipping: this platform has no blocking directory permission bit");
+        }
+    }
+
+    #[test]
+    fn not_found_can_fall_back() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let platform_root = temp.path().join("platform");
+        let home_root = temp.path().join("home");
+        std::fs::create_dir_all(&platform_root).expect("mkdir the high tier");
+        write_rules(&home_tier_file(&home_root), "memory_files = [\"LOW.md\"]\n");
+
+        // The high tier is genuinely absent, so the walk continues.
+        let loaded = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            None,
+            Some(platform_root.clone()),
+            Some(home_root.clone()),
+        )
+        .expect("a missing high tier continues to the low one");
+        let defaults = ExcludedContextPaths::default();
+        assert_eq!(loaded.memory_files, vec!["LOW.md"]);
+        // Fields the low tier does not mention keep their built-in default.
+        assert_eq!(loaded.injection_only_files, defaults.injection_only_files);
+        assert_eq!(loaded.workspace_scoped_files, defaults.workspace_scoped_files);
+        assert_eq!(loaded.project_read_documents, defaults.project_read_documents);
+
+        // No tier present at all: the built-in default is the real bottom tier.
+        let empty = temp.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("mkdir the empty tier");
+        let loaded = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            None,
+            Some(empty.clone()),
+            Some(empty.join("home")),
+        )
+        .expect("no tier present falls back to the built-in default");
+        assert_eq!(loaded, defaults);
+    }
+
+    #[test]
+    fn explicit_xdg_is_unique_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_root = temp.path().join("xdg");
+        let platform_root = temp.path().join("platform");
+        let home_root = temp.path().join("home");
+        write_rules(&xdg_tier_file(&xdg_root), "memory_files = [\"XDG.md\"]\n");
+        write_rules(
+            &platform_tier_file(&platform_root),
+            "memory_files = [\"HIGH.md\"]\n",
+        );
+        write_rules(&home_tier_file(&home_root), "memory_files = [\"LOW.md\"]\n");
+
+        let loaded = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            Some(xdg_root.clone()),
+            Some(platform_root.clone()),
+            Some(home_root.clone()),
+        )
+        .expect("the explicit candidate resolves");
+        assert_eq!(
+            loaded.memory_files,
+            vec!["XDG.md"],
+            "an explicit XDG_CONFIG_HOME is the only candidate"
+        );
+
+        // A missing explicit candidate is the built-in default -- never the
+        // platform or home tier that is sitting right there.
+        let missing = temp.path().join("empty-xdg");
+        std::fs::create_dir_all(&missing).expect("mkdir the empty xdg tier");
+        let loaded = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            Some(missing.clone()),
+            Some(platform_root.clone()),
+            Some(home_root.clone()),
+        )
+        .expect("a missing explicit candidate uses the built-in default");
+        assert_eq!(
+            loaded,
+            ExcludedContextPaths::default(),
+            "a missing explicit candidate must not fall through to another tier"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_permission_bits_block();
+
+            // ... and an unreadable explicit candidate is an error, not a
+            // silent default.
+            std::fs::set_permissions(&xdg_root, std::fs::Permissions::from_mode(0o000))
+                .expect("lock the explicit tier");
+            let result = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+                Some(xdg_root.clone()),
+                Some(platform_root),
+                Some(home_root),
+            );
+            // The result is taken before the directory is restored, so the
+            // assertion below reads what the call really produced.
+            std::fs::set_permissions(&xdg_root, std::fs::Permissions::from_mode(0o700))
+                .expect("unlock the explicit tier");
+            let err = result.expect_err("an unreadable explicit candidate must refuse");
+            assert_permission_denied(err, "an unreadable explicit candidate");
+        }
+    }
+
+    #[test]
+    fn malformed_or_wrong_type_rejected() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_root = temp.path().join("xdg");
+        let xdg_file = xdg_tier_file(&xdg_root);
+
+        write_rules(&xdg_file, "this is not valid toml [[[\n");
+        let err = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            Some(xdg_root.clone()),
+            None,
+            None,
+        )
+        .expect_err("invalid TOML in the discovered tier must refuse");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected ConfigError::Parse, got {err:?}"
+        );
+
+        write_rules(&xdg_file, "memory_files = \"not-an-array\"\n");
+        let err = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            Some(xdg_root.clone()),
+            None,
+            None,
+        )
+        .expect_err("a scalar where an array is required must refuse");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected ConfigError::Parse, got {err:?}"
+        );
+
+        // A missing *key* is still that field's default, which is not a failure.
+        write_rules(&xdg_file, "injection_only_files = [\"CUSTOM.local.md\"]\n");
+        let loaded = ExcludedContextPaths::load_for_source_fidelity_from_parts(
+            Some(xdg_root.clone()),
+            None,
+            None,
+        )
+        .expect("a partial override still parses");
+        assert_eq!(loaded.injection_only_files, vec!["CUSTOM.local.md"]);
+        assert_eq!(
+            loaded.memory_files,
+            ExcludedContextPaths::default().memory_files
         );
     }
 }
