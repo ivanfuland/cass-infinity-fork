@@ -3189,9 +3189,21 @@ fn safety_pass(
             let mut raw = vec![0u8; usize::try_from(length).map_err(|_| SourceIngestError::Capture {
                 detail: "a record is too large for this platform".to_string(),
             })?];
+            // try_clone shares the OS cursor with the framing reader. Preserve
+            // its buffered read-ahead position while re-reading this record.
+            let framing_position = bytes_handle.stream_position().map_err(|_| {
+                SourceIngestError::Capture {
+                    detail: "the sealed framing position could not be read".to_string(),
+                }
+            })?;
             bytes_handle
                 .seek(SeekFrom::Start(locator.byte_start))
                 .and_then(|_| bytes_handle.read_exact(&mut raw))
+                .and_then(|_| {
+                    bytes_handle
+                        .seek(SeekFrom::Start(framing_position))
+                        .map(|_| ())
+                })
                 .map_err(|_| SourceIngestError::Capture {
                     detail: "a record could not be re-read from the sealed input".to_string(),
                 })?;
