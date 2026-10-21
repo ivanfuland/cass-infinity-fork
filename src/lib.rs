@@ -7021,6 +7021,15 @@ async fn execute_cli(
     stdout_is_tty: bool,
     stderr_is_tty: bool,
 ) -> CliResult<()> {
+    // clap does not apply a child argument's conflicts to a global value
+    // supplied before that subcommand. Check the resolved root option too.
+    if command_requests_recall(cli.command.as_ref()) && cli.robot_format.is_some() {
+        return Err(CliError::usage(
+            "--recall cannot be combined with --robot-format",
+            None,
+        ));
+    }
+
     let command = cli.command.clone().unwrap_or_else(|| {
         if cli.robot_format.is_some() || robot_format_from_env().is_some() {
             Commands::Triage {

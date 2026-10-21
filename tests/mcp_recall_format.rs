@@ -85,6 +85,25 @@ fn recall_conflicts_are_usage_errors_before_querying() {
             "--recall",
             "--json",
         ],
+        vec![
+            "expand",
+            "missing.jsonl",
+            "--line",
+            "1",
+            "--recall",
+            "--robot-format",
+            "json",
+        ],
+        vec![
+            "--robot-format",
+            "json",
+            "expand",
+            "missing.jsonl",
+            "--line",
+            "1",
+            "--recall",
+        ],
+        vec!["--robot-format", "json", "search", "query", "--recall"],
         vec!["sessions", "--recall", "--json"],
         vec!["sessions", "--recall", "--robot-format", "jsonl"],
         vec!["timeline", "--recall", "--json"],
@@ -95,7 +114,9 @@ fn recall_conflicts_are_usage_errors_before_querying() {
             .env("CASS_DATA_DIR", home.path().join("data"))
             .args(&args)
             .assert()
-            .code(2);
+            .code(2)
+            .stdout(predicates::str::is_empty())
+            .stderr(predicates::str::contains("--recall"));
     }
     assert!(!home.path().join("data").exists());
 }
