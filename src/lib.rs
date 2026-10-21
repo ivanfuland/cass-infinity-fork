@@ -49,9 +49,10 @@ pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
-pub mod regression;
+pub mod recall_output;
 pub(crate) mod recipes_robot_docs;
 pub(crate) mod recovery_support_bundle;
+pub mod regression;
 pub mod release_verify;
 pub mod repro_capsule;
 pub mod resource_plan;
@@ -681,6 +682,9 @@ pub enum Commands {
         /// and the search runs against the existing index (non-fatal).
         #[arg(long, visible_alias = "catch-up", default_value_t = false)]
         refresh: bool,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format", "display", "fields"])]
+        recall: bool,
     },
     /// Build a deterministic answer pack for agent handoffs
     Pack {
@@ -1406,6 +1410,9 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format"])]
+        recall: bool,
     },
     /// Resolve a session path into a ready-to-run resume command for its
     /// native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini,
@@ -1588,6 +1595,9 @@ pub enum Commands {
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format"])]
+        recall: bool,
     },
     /// Show activity timeline for a time range
     Timeline {
@@ -1619,6 +1629,9 @@ pub enum Commands {
         /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
         #[arg(long)]
         source: Option<String>,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format"])]
+        recall: bool,
     },
     /// Export encrypted searchable archive for static hosting (P4.x)
     Pages {
@@ -3108,6 +3121,8 @@ pub enum RobotTopic {
 /// Output format for robot/automation mode
 #[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum RobotFormat {
+    #[value(skip)]
+    Recall,
     /// Pretty-printed JSON object (default, backward compatible)
     #[default]
     Json,
@@ -4699,6 +4714,7 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
     let is_bool = matches!(
         name.as_str(),
         "json"
+            | "recall"
             | "robot"
             | "robot-meta"
             | "robot_meta"
@@ -6864,6 +6880,7 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
     let is_robot_mode = raw_args
         .iter()
         .any(|s| s == "--json" || s == "--robot" || s == "-json" || s == "-robot")
+        || command_requests_recall(cli.command.as_ref())
         || cli.robot_format.is_some()
         || robot_format_from_env().is_some()
         || matches!(&cli.command, Some(Commands::Capabilities { .. }))
@@ -7418,6 +7435,7 @@ async fn execute_cli(
                     daemon,
                     no_daemon,
                     refresh,
+                    recall: _,
                 } => {
                     // Validate mutually exclusive flags
                     if daemon && no_daemon {
@@ -7531,7 +7549,11 @@ async fn execute_cli(
                     // (robot_format > --json > env > robot_auto > display),
                     // so `--display table|lines|markdown` actually wins when
                     // no structured format was asked for.
-                    let effective_format = cli.robot_format.or_else(robot_format_from_env);
+                    let effective_format = if command_requests_recall(cli.command.as_ref()) {
+                        Some(RobotFormat::Recall)
+                    } else {
+                        cli.robot_format.or_else(robot_format_from_env)
+                    };
 
                     // P09: preserve the values the frozen `RequestBinding`
                     // needs but the legacy flow folds away before
@@ -9269,6 +9291,7 @@ async fn execute_cli(
                     since,
                     json,
                     data_dir,
+                    recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_sessions(
@@ -9363,6 +9386,7 @@ async fn execute_cli(
                     line,
                     context,
                     json,
+                    recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_expand(
@@ -9383,6 +9407,7 @@ async fn execute_cli(
                     json,
                     group_by,
                     source,
+                    recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_timeline(
@@ -21618,7 +21643,43 @@ fn describe_command(cli: &Cli) -> String {
     }
 }
 
+fn command_requests_recall(command: Option<&Commands>) -> bool {
+    matches!(
+        command,
+        Some(
+            Commands::Search { recall: true, .. }
+                | Commands::Expand { recall: true, .. }
+                | Commands::Sessions { recall: true, .. }
+                | Commands::Timeline { recall: true, .. }
+        )
+    )
+}
+
+fn recall_cli_error(error: impl std::fmt::Display) -> CliError {
+    CliError {
+        code: 9,
+        kind: "recall_invalid",
+        message: error.to_string(),
+        hint: None,
+        retryable: false,
+    }
+}
+
+fn output_recall_value(
+    tool: recall_output::RecallTool,
+    payload: &serde_json::Value,
+) -> CliResult<()> {
+    println!(
+        "{}",
+        recall_output::encode(tool, payload).map_err(recall_cli_error)?
+    );
+    Ok(())
+}
+
 fn resolve_subcommand_structured_format(cli: &Cli, json: bool) -> Option<RobotFormat> {
+    if command_requests_recall(cli.command.as_ref()) {
+        return Some(RobotFormat::Recall);
+    }
     cli.robot_format
         .or(if json { Some(RobotFormat::Json) } else { None })
         .or_else(robot_format_from_env)
@@ -25350,6 +25411,8 @@ fn run_cli_search(
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    let robot_meta = robot_meta || robot_format == Some(RobotFormat::Recall);
+
     freeze_search_model_api(&mut semantic_opts, mode, dry_run)?;
 
     // Start timing for robot_meta elapsed_ms
@@ -25542,6 +25605,9 @@ fn run_cli_search(
             "_meta": meta,
         });
 
+        if effective_robot == Some(RobotFormat::Recall) {
+            return output_recall_value(recall_output::RecallTool::Search, &output);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
@@ -27646,7 +27712,7 @@ fn resolve_pack_render_format(
         Some(RobotFormat::Compact) => Ok(PackRenderFormat::CompactJson),
         Some(RobotFormat::Jsonl) => Ok(PackRenderFormat::Jsonl),
         Some(RobotFormat::Toon) => Ok(PackRenderFormat::Toon),
-        Some(RobotFormat::Sessions) => Err(CliError {
+        Some(RobotFormat::Sessions | RobotFormat::Recall) => Err(CliError {
             code: 2,
             kind: CliErrorKind::PackUnsupportedFormat.kind_str(),
             message: "cass pack does not support --robot-format sessions".to_string(),
@@ -29071,6 +29137,7 @@ fn toon_encode_options_from_env() -> toon::EncodeOptions {
 
 fn output_structured_value(payload: serde_json::Value, format: RobotFormat) -> CliResult<()> {
     match format {
+        RobotFormat::Recall => return Err(recall_cli_error("recall tool identity is required")),
         RobotFormat::Json => {
             println!(
                 "{}",
@@ -29421,6 +29488,49 @@ fn output_robot_results(
     out: &mut dyn std::io::Write,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
+
+    if format == RobotFormat::Recall {
+        let mut buffer = Vec::new();
+        output_robot_results(
+            query,
+            limit,
+            cursor_page_limit,
+            offset,
+            result,
+            RobotFormat::Json,
+            include_meta,
+            elapsed_ms,
+            fields,
+            truncation_budgets,
+            max_tokens,
+            request_id,
+            input_cursor,
+            has_more_results,
+            total_matches_exact,
+            state_meta,
+            search_completeness,
+            index_freshness,
+            storage_integrity,
+            warning,
+            aggregations,
+            total_matches,
+            explanation,
+            timed_out,
+            timeout_ms,
+            search_mode_meta,
+            search_ms,
+            rerank_ms,
+            rerank_applied,
+            rerank_requested,
+            window,
+            &mut buffer,
+        )?;
+        let payload = serde_json::from_slice(&buffer).map_err(recall_cli_error)?;
+        let encoded = recall_output::encode(recall_output::RecallTool::Search, &payload)
+            .map_err(recall_cli_error)?;
+        writeln!(out, "{encoded}").map_err(recall_cli_error)?;
+        return Ok(());
+    }
 
     if matches!(format, RobotFormat::Sessions) {
         // Output unique session paths only, one per line.
@@ -30067,6 +30177,7 @@ fn output_robot_results(
     };
 
     match format {
+        RobotFormat::Recall => unreachable!("recall is handled before JSON rendering"),
         RobotFormat::Json => {
             let mut payload = serde_json::json!({
                 "query": query,
@@ -81341,6 +81452,9 @@ fn run_sessions(
 
     if let Some(fmt) = structured_format {
         let payload = serde_json::json!({ "sessions": entries });
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(recall_output::RecallTool::Sessions, &payload);
+        }
         return output_structured_value(payload, fmt);
     }
 
@@ -82928,6 +83042,7 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
         match fmt {
+            RobotFormat::Recall => return Err(recall_cli_error("recall is not available for introspect")),
             RobotFormat::Json => {
                 let _ = serde_json::to_writer_pretty(&mut stdout, &response);
                 let _ = writeln!(stdout);
@@ -98049,6 +98164,12 @@ fn run_expand(
                 })
             })
             .collect();
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(
+                recall_output::RecallTool::Expand,
+                &serde_json::Value::Array(output),
+            );
+        }
         return output_structured_value(serde_json::Value::Array(output), fmt);
     }
 
@@ -98529,6 +98650,9 @@ fn run_timeline(
                 })
             }
         };
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(recall_output::RecallTool::Timeline, &output);
+        }
         return output_structured_value(output, fmt);
     }
 

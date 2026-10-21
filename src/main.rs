@@ -99,7 +99,10 @@ fn is_robot_mode_args() -> bool {
     let args: Vec<String> = std::env::args().collect();
     let command_name = raw_command_name(&args);
     for (index, arg) in args.iter().enumerate() {
-        if matches!(arg.as_str(), "--json" | "--robot" | "-json" | "-robot") {
+        if matches!(
+            arg.as_str(),
+            "--recall" | "--json" | "--robot" | "-json" | "-robot"
+        ) {
             return true;
         }
         if arg == "--robot-format" || arg.starts_with("--robot-format=") {

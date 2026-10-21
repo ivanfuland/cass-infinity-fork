@@ -903,6 +903,16 @@
           ]
         },
         {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2386,6 +2396,16 @@
           "required": false
         },
         {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2814,6 +2834,16 @@
           ]
         },
         {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2902,6 +2932,16 @@
           "arg_type": "option",
           "value_type": "string",
           "required": false
+        },
+        {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "robot-format",
