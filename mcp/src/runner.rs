@@ -18,8 +18,10 @@ use quick_xml::{Reader, XmlVersion};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use crate::admission::{Admission, AdmissionOutcome, Permit};
+use crate::admission::{Admission, AdmissionOutcome, Permit, Waiter};
 use crate::config::Config;
 use crate::tools::{FixedProfiles, RecallTool, ToolCall};
 
@@ -43,12 +45,35 @@ pub const INVALID_RECALL: &str = "invalid_recall";
 pub const CASS_EXIT: &str = "cass_exit";
 pub const RESULT_TOO_LARGE: &str = "result_too_large";
 pub const BUSY: &str = "busy";
+pub const CANCELLED: &str = "cancelled";
+pub const TIMEOUT: &str = "deadline_exceeded";
 
 impl ToolError {
     pub fn result_too_large(message: impl Into<String>) -> Self {
         Self {
             code: RESULT_TOO_LARGE,
             message: message.into(),
+            cli_exit_code: None,
+        }
+    }
+
+    /// The SDK token was cancelled before this request's result could be
+    /// published. The SDK may terminate such a request without any tool result
+    /// (C4); the internal terminal state and the child reaping are unaffected.
+    pub fn cancelled() -> Self {
+        Self {
+            code: CANCELLED,
+            message: "the request was cancelled before its result was published".to_string(),
+            cli_exit_code: None,
+        }
+    }
+
+    /// The fixed total deadline elapsed before this request's result could be
+    /// published.
+    pub fn timeout() -> Self {
+        Self {
+            code: TIMEOUT,
+            message: "the request deadline elapsed before its result was published".to_string(),
             cli_exit_code: None,
         }
     }
@@ -101,6 +126,83 @@ impl ToolError {
     }
 }
 
+/// The one lifecycle control for a request.
+///
+/// The token is the SDK's own `RequestContext.ct` (a standard
+/// [`CancellationToken`]), and the deadline is fixed once, from the instant the
+/// handler received the call. The same value travels through admission, the
+/// waiting queue, the supervised child and the final publication; it is never
+/// recomputed on a dequeue, a hand-over, a retry or a session change.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestControl {
+    ct: CancellationToken,
+    deadline: Instant,
+}
+
+/// The reason a request must not publish a success, in the fixed order:
+/// explicit cancellation first, then the total deadline. (C10)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overdue {
+    Cancelled,
+    TimedOut,
+}
+
+impl RequestControl {
+    fn new(ct: CancellationToken, received: Instant, timeout: Duration) -> Self {
+        Self {
+            ct,
+            // `checked_add` can only fail for a duration no fixed timeout can
+            // reach; such a request must fail closed, at once, rather than run
+            // without a bound.
+            deadline: received.checked_add(timeout).unwrap_or(received),
+        }
+    }
+
+    /// The first event that is already observable at this decision point.
+    /// Cancellation outranks the deadline; both outrank an overflow, a non-zero
+    /// exit, a format error and a success.
+    fn overdue(&self) -> Option<Overdue> {
+        if self.ct.is_cancelled() {
+            return Some(Overdue::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Some(Overdue::TimedOut);
+        }
+        None
+    }
+
+    /// The failure a caller must publish instead of a pending success. Every
+    /// decision point that could publish a success calls this at its own last
+    /// synchronous moment.
+    pub(crate) fn observed_failure(&self) -> Option<ToolError> {
+        self.overdue().map(Overdue::into_error)
+    }
+
+    /// The absolute deadline fixed at the receipt of the call. Only the
+    /// paused-clock units read it, to prove that a queue delay or a hand-over
+    /// never moves it.
+    #[cfg(test)]
+    fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+
+impl Overdue {
+    fn into_error(self) -> ToolError {
+        match self {
+            Self::Cancelled => ToolError::cancelled(),
+            Self::TimedOut => ToolError::timeout(),
+        }
+    }
+
+    fn into_supervised(self) -> Supervised {
+        match self {
+            Self::Cancelled => Supervised::Cancelled,
+            Self::TimedOut => Supervised::TimedOut,
+        }
+    }
+}
+
 /// The fixed startup values every call reuses, plus the one shared pool.
 #[derive(Debug)]
 pub struct Runner {
@@ -111,6 +213,7 @@ pub struct Runner {
     rerank_profile: String,
     max_output_bytes: usize,
     terminate_grace: Duration,
+    request_timeout: Duration,
     admission: Arc<Admission>,
 }
 
@@ -124,8 +227,15 @@ impl Runner {
             rerank_profile: config.rerank_profile.clone(),
             max_output_bytes: config.max_output_bytes,
             terminate_grace: Duration::from_millis(config.terminate_grace_ms),
+            request_timeout: Duration::from_millis(config.request_timeout_ms),
             admission: Admission::new(config.max_concurrent, config.max_queued),
         }
+    }
+
+    /// Fix the one lifecycle control for a call, from the instant the handler
+    /// received it. The deadline is absolute from that instant.
+    pub(crate) fn control(&self, ct: CancellationToken, received: Instant) -> RequestControl {
+        RequestControl::new(ct, received, self.request_timeout)
     }
 
     /// Run one validated call. On success the returned string is the
@@ -138,7 +248,16 @@ impl Runner {
     /// child, both pipes, the combined byte count, the `wait` and the permit;
     /// the caller only awaits its result. Dropping the caller's future
     /// therefore never drops the child, its reaping duty, or an active slot.
-    pub async fn run(&self, tool: RecallTool, call: &ToolCall) -> Result<String, ToolError> {
+    ///
+    /// `control` is the one lifecycle value for the whole request: the same
+    /// token and the same absolute deadline are used before admission, while
+    /// waiting, while the child runs, and at the final publication.
+    pub async fn run(
+        &self,
+        tool: RecallTool,
+        call: &ToolCall,
+        control: RequestControl,
+    ) -> Result<String, ToolError> {
         let profiles = FixedProfiles {
             api_config: &self.api_config,
             embedding_profile: &self.embedding_profile,
@@ -146,9 +265,15 @@ impl Runner {
         };
         let argv = call.argv(&profiles);
 
+        // A valid request is checked before it can take a queue position or
+        // start a child.
+        if let Some(error) = control.observed_failure() {
+            return Err(error);
+        }
+
         let permit = match self.admission.enter() {
             AdmissionOutcome::Running(permit) => permit,
-            AdmissionOutcome::Queued(waiter) => waiter.wait().await,
+            AdmissionOutcome::Queued(waiter) => wait_for_slot(&control, waiter).await?,
             AdmissionOutcome::Busy => {
                 return Err(ToolError::busy(
                     "the execution pool and its waiting queue are both full",
@@ -156,7 +281,15 @@ impl Runner {
             }
         };
 
-        self.run_admitted(tool, argv, permit).await
+        // Between the grant and the spawn the same control is checked again: an
+        // already cancelled or expired request returns the slot without
+        // creating a child.
+        if let Some(error) = control.observed_failure() {
+            drop(permit);
+            return Err(error);
+        }
+
+        self.run_admitted(tool, argv, permit, control).await
     }
 
     /// Run one call that already owns a slot. The permit travels with the
@@ -167,6 +300,7 @@ impl Runner {
         tool: RecallTool,
         argv: Vec<OsString>,
         permit: Permit,
+        control: RequestControl,
     ) -> Result<String, ToolError> {
         let mut command = Command::new(&self.cass_bin);
         command
@@ -198,6 +332,7 @@ impl Runner {
 
         let supervised = tokio::spawn(supervise_holding(
             permit,
+            control,
             child,
             stdout,
             stderr,
@@ -224,6 +359,10 @@ impl Runner {
                     None,
                 ));
             }
+            // Both were already decided inside the supervising task, after its
+            // own child was terminated and waited for.
+            Supervised::Cancelled => return Err(ToolError::cancelled()),
+            Supervised::TimedOut => return Err(ToolError::timeout()),
         };
 
         if !status.success() {
@@ -248,6 +387,28 @@ enum Supervised {
     },
     TooLarge,
     ReadFailed,
+    /// The SDK token was cancelled while this request still owned the child.
+    Cancelled,
+    /// The fixed total deadline elapsed while this request still owned the
+    /// child.
+    TimedOut,
+}
+
+/// Wait for the queue position to be granted, giving the already-observable
+/// cancellation and deadline priority over the grant.
+///
+/// All three branches can be ready in the same observation; `biased` picks the
+/// cancellation, then the deadline, then the grant. When a later branch loses,
+/// its future is dropped, which returns the queue position — or an
+/// already-granted but unclaimed slot — exactly once through the existing
+/// [`Waiter`] cleanup. The FIFO order itself is unchanged.
+async fn wait_for_slot(control: &RequestControl, waiter: Waiter) -> Result<Permit, ToolError> {
+    tokio::select! {
+        biased;
+        _ = control.ct.cancelled() => Err(ToolError::cancelled()),
+        _ = tokio::time::sleep_until(control.deadline) => Err(ToolError::timeout()),
+        permit = waiter.wait() => Ok(permit),
+    }
 }
 
 /// Own the admission slot for exactly as long as this task owns the child.
@@ -258,13 +419,14 @@ enum Supervised {
 /// cannot free the slot while the child is still running or being reaped.
 async fn supervise_holding(
     permit: Permit,
+    control: RequestControl,
     child: Child,
     stdout: ChildStdout,
     stderr: ChildStderr,
     budget: usize,
     grace: Duration,
 ) -> Supervised {
-    let outcome = supervise(child, stdout, stderr, budget, grace).await;
+    let outcome = supervise(child, stdout, stderr, budget, grace, &control).await;
     drop(permit);
     outcome
 }
@@ -275,12 +437,18 @@ async fn supervise_holding(
 /// read requests at most the remaining budget plus one probe byte, so a small
 /// remaining budget never consumes a full chunk beyond it. A non-zero exit
 /// observed in the same window never overrides the overflow.
+///
+/// Cancellation and the total deadline are observed in the same loop, with the
+/// fixed priority `cancel > deadline > overflow > exit > format > success`.
+/// Once a failure is decided it is never rewritten by a later event: the
+/// reaping below already belongs to that one terminal state.
 async fn supervise(
     mut child: Child,
     mut stdout: ChildStdout,
     mut stderr: ChildStderr,
     budget: usize,
     grace: Duration,
+    control: &RequestControl,
 ) -> Supervised {
     let mut captured_stdout = Vec::new();
     let mut captured_stderr = Vec::new();
@@ -298,6 +466,16 @@ async fn supervise(
         let want = (budget - total).saturating_add(1).min(READ_CHUNK_BYTES);
         tokio::select! {
             biased;
+            // The first two branches give cancellation and the deadline the
+            // fixed priority over every other event in the same observation.
+            _ = control.ct.cancelled() => {
+                failure = Some(Supervised::Cancelled);
+                break;
+            }
+            _ = tokio::time::sleep_until(control.deadline) => {
+                failure = Some(Supervised::TimedOut);
+                break;
+            }
             read = stdout.read(&mut stdout_buffer[..want]), if stdout_open => {
                 match read {
                     Ok(0) => stdout_open = false,
@@ -356,6 +534,15 @@ async fn supervise(
     if let Some(failure) = failure {
         reap(&mut child, grace).await;
         return failure;
+    }
+
+    // Nothing is determined yet: this is the supervisor's last decision point.
+    // A cancellation or an elapsed deadline that is already observable here
+    // replaces the pending success; `wait` still has to report before the
+    // permit is dropped.
+    if let Some(overdue) = control.overdue() {
+        reap(&mut child, grace).await;
+        return overdue.into_supervised();
     }
 
     match status {
@@ -589,7 +776,20 @@ mod tests {
         let stdout_probe = stdout.as_fd().try_clone_to_owned().expect("dup stdout");
         let stderr_probe = stderr.as_fd().try_clone_to_owned().expect("dup stderr");
 
-        let outcome = supervise(child, stdout, stderr, BUDGET, Duration::from_millis(200)).await;
+        let control = RequestControl::new(
+            CancellationToken::new(),
+            Instant::now(),
+            Duration::from_secs(60),
+        );
+        let outcome = supervise(
+            child,
+            stdout,
+            stderr,
+            BUDGET,
+            Duration::from_millis(200),
+            &control,
+        )
+        .await;
         assert!(
             matches!(outcome, Supervised::TooLarge),
             "the probe must classify the over-budget stream"
@@ -667,8 +867,14 @@ mod tests {
             _ => panic!("the first request must take the free slot"),
         };
 
+        let control = RequestControl::new(
+            CancellationToken::new(),
+            Instant::now(),
+            Duration::from_secs(60),
+        );
         let handle = tokio::spawn(supervise_holding(
             permit,
+            control,
             child,
             stdout,
             stderr,
@@ -711,6 +917,322 @@ mod tests {
         );
         drop(permit);
         assert_eq!(admission.counters(), (0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ticket 15: the cancellation and deadline decision paths.
+    //
+    // These use a paused clock and the standard cancellation token, and they
+    // call the production helpers (`RequestControl::observed_failure`,
+    // `wait_for_slot`, `supervise`, `supervise_holding`) instead of a mirror
+    // implementation. The end-to-end HTTP cases prove the same behaviour with
+    // real sockets and real processes.
+    // -----------------------------------------------------------------------
+
+    /// Poll once with a waker that does nothing. Every step of the protocol is
+    /// decided under the state lock or by the mock clock, so a single poll is
+    /// enough to observe "pending" or "ready" without sleeping.
+    fn poll_once<F: std::future::Future>(
+        future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        future.poll(&mut context)
+    }
+
+    fn take_running(outcome: AdmissionOutcome) -> Permit {
+        match outcome {
+            AdmissionOutcome::Running(permit) => permit,
+            _ => panic!("expected an execution slot"),
+        }
+    }
+
+    fn take_queued(outcome: AdmissionOutcome) -> Waiter {
+        match outcome {
+            AdmissionOutcome::Queued(waiter) => waiter,
+            _ => panic!("expected a queue position"),
+        }
+    }
+
+    /// Let the timer driver process every timer that is due. Each zero-length
+    /// sleep is one more timer at the current instant, so awaiting it also
+    /// processes the earlier ones.
+    async fn drive_timers() {
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::ZERO).await;
+        }
+    }
+
+    /// Cancellation outranks the deadline, and both outrank a success that is
+    /// only pending. Every candidate is already ready in the same observation.
+    #[tokio::test]
+    async fn cancellation_outranks_the_deadline_and_a_pending_success() {
+        tokio::time::pause();
+        let start = Instant::now();
+        let token = CancellationToken::new();
+
+        // Cancel and deadline both ready: the cancellation is chosen.
+        let both = RequestControl::new(token.clone(), start, Duration::ZERO);
+        token.cancel();
+        assert_eq!(
+            both.observed_failure().expect("a decided failure").code,
+            CANCELLED
+        );
+
+        // Deadline only: the deadline is chosen, never a pending success.
+        let expired = RequestControl::new(CancellationToken::new(), start, Duration::ZERO);
+        assert_eq!(
+            expired.observed_failure().expect("a decided failure").code,
+            TIMEOUT
+        );
+
+        // Neither: a success may still be published.
+        let pending =
+            RequestControl::new(CancellationToken::new(), start, Duration::from_millis(100));
+        assert!(pending.observed_failure().is_none());
+    }
+
+    /// A grant that is already ready loses to an elapsed deadline, and to a
+    /// cancellation; the dropped waiter returns the slot exactly once.
+    #[tokio::test]
+    async fn a_grant_that_is_already_ready_loses_to_the_deadline_and_to_cancellation() {
+        tokio::time::pause();
+
+        // Deadline against a ready grant.
+        let start = Instant::now();
+        let admission = Admission::new(1, 1);
+        let holder = take_running(admission.enter());
+        let waiter = take_queued(admission.enter());
+        let control =
+            RequestControl::new(CancellationToken::new(), start, Duration::from_millis(100));
+        let mut waiting = Box::pin(wait_for_slot(&control, waiter));
+        assert!(poll_once(waiting.as_mut()).is_pending());
+        drop(holder);
+        assert_eq!(
+            admission.counters(),
+            (1, 0),
+            "the slot is already handed to the waiter"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        // The registered sleep only becomes ready once the timer driver
+        // processed it, so give the driver one pass before the next poll.
+        drive_timers().await;
+        match poll_once(waiting.as_mut()) {
+            std::task::Poll::Ready(Err(error)) => assert_eq!(error.code, TIMEOUT),
+            _ => panic!("the elapsed deadline must win over an already granted slot"),
+        }
+        assert_eq!(
+            admission.counters(),
+            (0, 0),
+            "the unclaimed slot must be returned exactly once"
+        );
+
+        // Cancellation against a ready grant and an elapsed deadline.
+        let start = Instant::now();
+        let admission = Admission::new(1, 1);
+        let holder = take_running(admission.enter());
+        let waiter = take_queued(admission.enter());
+        let token = CancellationToken::new();
+        let control = RequestControl::new(token.clone(), start, Duration::from_millis(100));
+        let mut waiting = Box::pin(wait_for_slot(&control, waiter));
+        assert!(poll_once(waiting.as_mut()).is_pending());
+        drop(holder);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        token.cancel();
+        match poll_once(waiting.as_mut()) {
+            std::task::Poll::Ready(Err(error)) => assert_eq!(error.code, CANCELLED),
+            _ => panic!("the cancellation must win over both the grant and the deadline"),
+        }
+        assert_eq!(
+            admission.counters(),
+            (0, 0),
+            "a cancelled hand-over must not leak the slot or the queue position"
+        );
+    }
+
+    /// A request that spends most of its budget waiting still carries the
+    /// original absolute deadline into the supervision. The grant does not
+    /// start a fresh budget.
+    #[tokio::test]
+    async fn a_queue_delay_does_not_reset_the_absolute_deadline() {
+        tokio::time::pause();
+        let start = Instant::now();
+        let admission = Admission::new(1, 1);
+        let holder = take_running(admission.enter());
+        let waiter = take_queued(admission.enter());
+        let control =
+            RequestControl::new(CancellationToken::new(), start, Duration::from_millis(100));
+
+        // 90 of the 100 ms are spent waiting before the grant exists.
+        tokio::time::advance(Duration::from_millis(90)).await;
+        drop(holder);
+        let mut waiting = Box::pin(wait_for_slot(&control, waiter));
+        let permit = match poll_once(waiting.as_mut()) {
+            std::task::Poll::Ready(Ok(permit)) => permit,
+            _ => panic!("the grant must be taken while the original deadline still holds"),
+        };
+        assert_eq!(
+            control.deadline(),
+            start + Duration::from_millis(100),
+            "the grant must not have moved the deadline to the hand-over instant"
+        );
+        assert!(
+            control.observed_failure().is_none(),
+            "90 ms must still be inside the original deadline"
+        );
+
+        // Only ten of the original hundred milliseconds are left.
+        tokio::time::advance(Duration::from_millis(9)).await;
+        assert!(
+            control.observed_failure().is_none(),
+            "99 ms must still be inside the original deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(
+            control.observed_failure().expect("a decided failure").code,
+            TIMEOUT,
+            "the grant must not have reset the deadline"
+        );
+        drop(permit);
+        assert_eq!(admission.counters(), (0, 0));
+    }
+
+    /// A success that has not been published yet cannot be published after a
+    /// cancellation or the deadline was observed, and the first observed
+    /// reason does not change afterwards.
+    #[tokio::test]
+    async fn an_unpublished_success_yields_to_cancellation_and_to_the_deadline() {
+        tokio::time::pause();
+        let start = Instant::now();
+
+        // Inside the budget: the pending success may be published.
+        let control =
+            RequestControl::new(CancellationToken::new(), start, Duration::from_millis(100));
+        tokio::time::advance(Duration::from_millis(90)).await;
+        assert!(control.observed_failure().is_none());
+
+        // The deadline is observed before the publication.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert_eq!(
+            control.observed_failure().expect("a decided failure").code,
+            TIMEOUT
+        );
+
+        // A cancellation is observed first and keeps its reason even after the
+        // deadline passes.
+        let start = Instant::now();
+        let token = CancellationToken::new();
+        let cancelled = RequestControl::new(token.clone(), start, Duration::from_millis(100));
+        token.cancel();
+        assert_eq!(
+            cancelled
+                .observed_failure()
+                .expect("a decided failure")
+                .code,
+            CANCELLED
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            cancelled
+                .observed_failure()
+                .expect("a decided failure")
+                .code,
+            CANCELLED,
+            "the first observed reason must not be rewritten"
+        );
+    }
+
+    /// A failure that was already decided is never rewritten by a later
+    /// cancellation, and its permit is still held until `wait` returns.
+    #[tokio::test]
+    async fn a_determined_overflow_is_not_rewritten_by_a_late_cancellation() {
+        use std::path::Path;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cass-mcp-t15-late-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create sandbox");
+        let term = dir.join("term");
+        let chunk = "W".repeat(1024);
+        let script = format!(
+            "term='{term}'\n\
+             trap 'printf t > \"$term\"' TERM\n\
+             printf '%s' '{chunk}{chunk}{chunk}{chunk}'\n\
+             while :; do sleep 0.02; done\n",
+            term = term.display(),
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn flooding child");
+        let pid = child.id().expect("child pid");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let admission = Admission::new(1, 1);
+        let permit = take_running(admission.enter());
+        let token = CancellationToken::new();
+        let control = RequestControl::new(token.clone(), Instant::now(), Duration::from_secs(60));
+        let handle = tokio::spawn(supervise_holding(
+            permit,
+            control,
+            child,
+            stdout,
+            stderr,
+            1024,
+            Duration::from_millis(1000),
+        ));
+
+        // The overflow is decided first; the reaping SIGTERM arrives next and
+        // the child ignores it, so it is still alive inside the grace.
+        let mut term_seen = false;
+        for _ in 0..2000 {
+            if term.exists() {
+                term_seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(term_seen, "the child never observed the reaping SIGTERM");
+        assert_eq!(
+            admission.counters(),
+            (1, 0),
+            "the permit must still be held while the reaping child is alive"
+        );
+        assert!(
+            Path::new("/proc").join(pid.to_string()).exists(),
+            "the child must still be alive inside the forced-kill grace"
+        );
+
+        token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the supervisor must finish")
+            .expect("the supervising task");
+        assert!(
+            matches!(outcome, Supervised::TooLarge),
+            "the late cancellation must not rewrite the decided overflow"
+        );
+        assert_eq!(
+            admission.counters(),
+            (0, 0),
+            "the permit is released exactly once, after the wait"
+        );
+        assert!(
+            !Path::new("/proc").join(pid.to_string()).exists(),
+            "the child must be waited before the permit is released"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -80,6 +80,49 @@ The queue order is decided under one lock when the request registers. It is
 never inferred from network arrival times, and the server exposes no pool
 metrics or test endpoint.
 
+## Request deadline and cancellation
+
+`--request-timeout-ms` bounds one whole request. The absolute deadline is fixed
+once, when the server receives the `tools/call`, before any argument is
+processed. The same deadline and the same SDK cancellation token travel through
+admission, the waiting queue, the child's whole lifetime and the final
+publication. A hand-over from the queue to execution never starts a fresh
+budget.
+
+- A valid request checks both signals before it can take a queue position or
+  start a child. An already cancelled or expired request returns
+  `error.code = cancelled` or `error.code = deadline_exceeded` without touching the pool.
+- While waiting, the request watches cancellation, the deadline and the grant
+  of its queue position together. Cancellation outranks the deadline, and both
+  outrank an already granted slot. A request that is cancelled or expires at
+  the same moment it is granted never starts a child, and its queue position or
+  granted slot is returned exactly once.
+- After the grant, and before the child starts, the same two signals are
+  checked again. A failure returns the slot without creating a process.
+- While the child runs, cancellation and the deadline are observed beside both
+  output pipes and `wait`. The fixed priority in one observation is:
+  cancellation, then the deadline, then the output budget, then a non-zero
+  exit, then a malformed envelope, then success. The first decided failure is
+  never rewritten by a later event: an output overflow that is already decided
+  keeps `result_too_large` even if the SDK cancellation arrives during the
+  termination grace.
+- A cancelled or expired request stops reading, closes both pipes, sends
+  `SIGTERM` to its own child only, waits `--terminate-grace-ms`, force-kills
+  that child if it is still alive, and waits for it. The execution slot is
+  released exactly once, after that `wait`. No process is ever selected by
+  name or port.
+- Termination runs first, so a response may arrive later than the deadline. A
+  deadline observed while the connection is still open is delivered as
+  `error.code = deadline_exceeded`.
+- Building and measuring the final serialized tool result is part of the same
+  lifecycle. If a cancellation or an elapsed deadline is already observable
+  after the result exists, it replaces both the pending success and its budget
+  failure. That check and the return carry no `await`, so one request publishes
+  at most one result; an event that arrives after that point publishes nothing.
+- A cancelled request may end without any tool result. That is the SDK's
+  protocol termination and does not change the child reaping or the slot
+  release.
+
 ## Output budget
 
 `--max-output-bytes` is one budget applied at two layers.
@@ -130,6 +173,8 @@ single top-level `error` object:
 |---|---|
 | Invalid or unknown request input | `invalid_argument` |
 | Execution slots and waiting queue are both full | `busy` |
+| The request was cancelled through the SDK token before its result was published | `cancelled` |
+| The fixed total deadline elapsed before the result was published | `deadline_exceeded` |
 | CLI `usage` | `invalid_argument` |
 | CLI `identity_unavailable` | `identity_unavailable` |
 | CLI `stale_reference` | `stale_reference` |
@@ -156,9 +201,23 @@ above. It accepts both protocol lifecycles that the SDK negotiates:
   `MCP-Protocol-Version: 2026-07-28`, and include the required `_meta` keys on
   each request.
 
-Both lifecycles call the same shared runner. Cancellation follows the SDK's
-native handling for the negotiated protocol; a cancelled request may not receive
-a tool result.
+Both lifecycles call the same shared runner, and every session shares one
+execution pool; a session never gets its own slots. Cancellation follows the
+SDK's native handling for the negotiated protocol:
+
+- `2025-11-25`: a `notifications/cancelled` for one request id cancels exactly
+  that request through the SDK token. The same request id in another session is
+  a different request and is not affected. A disconnect is not a cancellation:
+  a request whose client went away keeps running until its own total deadline.
+- `2026-07-28`: the path is stateless, and a client disconnect cancels the
+  in-flight request through the SDK token. A cancellation notification is not
+  promised to work on this path.
+
+The server never treats the HTTP `202` of a cancellation notification as proof
+that the request stopped. When the SDK still allows a reply, the error result
+uses the same `isError` shape and error code as any other failure; when the SDK
+terminates the request without a reply, only the child reaping and the slot
+release are observable.
 
 ## Example
 
@@ -191,12 +250,11 @@ endpoint at `/mcp`.
   wiring and a default-enable acceptance; a successful RPC call alone does not
   mean the recall result was cleaned. Dynamic scripts, batched calls, and
   `wait` segmented results fall outside that shape and are not covered.
-- This entry point bounds execution slots and waiting positions, but it does
-  not yet implement the total request deadline or explicit cancellation. Those
-  gates start a per-request deadline when the request enters the pool and end a
-  queued or running request; they are separate work and are not wired here.
-  Do not deploy this server to production until those gates and the final
-  integration pass.
+- This entry point bounds execution slots, waiting positions and one total
+  deadline per request. The request deadline, explicit cancellation, the
+  termination grace and the single slot release are wired here; the capacity
+  numbers are still deployment measurements, not defaults of this program.
+  Do not deploy this server to production until the final integration pass.
 - Model work stays inside the CLI. This server does not choose a retrieval
   strategy, retry model calls, or reinterpret an empty but successful result as
   a failure.

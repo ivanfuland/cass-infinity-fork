@@ -37,3 +37,14 @@ clap = { version = "=4.6.1", features = ["derive"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
 chrono = { version = "=0.4.44", features = ["std", "clock"] }
+# The SDK's `RequestContext.ct` is a `tokio_util::sync::CancellationToken`, and
+# the SDK does not re-export the type. This edge is declared explicitly so the
+# handler can use that exact token; the package is already locked at 0.7.20 and
+# no feature beyond the default-free set is requested.
+tokio-util = { version = "=0.7.20", default-features = false }
+
+[dev-dependencies]
+# The paused-clock units for the cancellation/deadline decision paths need the
+# Tokio test-util feature. Production dependencies are unchanged: this only
+# adds the feature to the test build of the already-locked Tokio 1.54.1.
+tokio = { version = "=1.54.1", features = ["test-util"] }

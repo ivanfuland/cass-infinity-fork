@@ -22,9 +22,10 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use tokio::time::Instant;
 
 use crate::config::{Config, Origin, SERVER_NAME};
-use crate::runner::{Runner, ToolError};
+use crate::runner::{RequestControl, Runner, ToolError};
 use crate::tools;
 
 /// MCP handler for the companion program.
@@ -45,9 +46,20 @@ impl CassMcpServer {
     /// The single success exit: a legal recall envelope that no longer fits
     /// the serialized-result budget becomes one `result_too_large` error, never
     /// a partial body.
-    fn success_response(&self, stdout: String) -> CallToolResponse {
+    ///
+    /// Building and measuring the exact SDK result is part of the request
+    /// lifecycle. After the result exists, a cancellation or an elapsed
+    /// deadline that is already observable replaces both the pending success
+    /// and its budget failure. The check and the return carry no `await`, so
+    /// this is the one publication point; a late event cannot publish a second
+    /// result.
+    fn success_response(&self, stdout: String, control: &RequestControl) -> CallToolResponse {
         let result = CallToolResult::success(vec![ContentBlock::text(stdout)]);
-        if serialized_len(&result) <= self.max_output_bytes {
+        let fits = serialized_len(&result) <= self.max_output_bytes;
+        if let Some(error) = control.observed_failure() {
+            return self.error_response(&error);
+        }
+        if fits {
             return result.into();
         }
         self.error_response(&ToolError::result_too_large(
@@ -108,19 +120,31 @@ impl ServerHandler for CassMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        // The one lifecycle control starts here, before this handler processes
+        // any argument: the absolute deadline is fixed once, from the instant
+        // the call was received, and is shared by admission, the waiting
+        // queue, the supervised child and the final publication. The token is
+        // the SDK's own `RequestContext.ct`, so a negotiated `2025-11-25`
+        // target cancellation and a `2026-07-28` stateless disconnect both
+        // cancel this same request.
+        let received = Instant::now();
         let Some(tool) = tools::RecallTool::from_name(&request.name) else {
             return Err(McpError::method_not_found::<CallToolRequestMethod>());
         };
 
+        // Input validation happens before any resource exists: an illegal
+        // argument is still a plain `invalid_argument` and never takes a queue
+        // position or starts a child.
         let call = match tools::parse(tool, request.arguments.as_ref()) {
             Ok(call) => call,
             Err(error) => return Ok(self.error_response(&error)),
         };
 
-        match self.runner.run(tool, &call).await {
-            Ok(stdout) => Ok(self.success_response(stdout)),
+        let control = self.runner.control(context.ct.clone(), received);
+        match self.runner.run(tool, &call, control.clone()).await {
+            Ok(stdout) => Ok(self.success_response(stdout, &control)),
             Err(error) => Ok(self.error_response(&error)),
         }
     }
