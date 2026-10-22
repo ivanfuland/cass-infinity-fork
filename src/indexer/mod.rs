@@ -5,6 +5,10 @@ pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
 pub mod quarantine_retry;
+/// Ticket 05: v2 MCP recall judgment and source extraction. Declared but not
+/// wired into the default producer; the ingest switch is a later ticket.
+#[allow(dead_code)]
+pub(crate) mod recall_v2;
 pub mod redact_secrets;
 pub mod refresh_ledger;
 pub mod scan_root_meta;

@@ -20,7 +20,9 @@ impl RecallTool {
         }
     }
 
-    fn accepts(self, value: &Value) -> bool {
+    /// Crate-visible so the v2 recall judgment reuses the same shape check;
+    /// the codec's own semantics and output are unchanged.
+    pub(crate) fn accepts(self, value: &Value) -> bool {
         let objects = |v: &Value| v.as_array().is_some_and(|a| a.iter().all(Value::is_object));
         match self {
             Self::Search => value.get("hits").is_some_and(objects),

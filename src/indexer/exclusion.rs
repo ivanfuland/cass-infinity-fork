@@ -1041,7 +1041,7 @@ pub struct Decision {
 /// `tool_call_id` this decision was actually resolved for -- a `Some(id)`
 /// decision would then also clear an unrelated sibling result block that
 /// happens to carry no id of its own.
-fn tool_result_block_indices(event: &RawEvent, tool_call_id: Option<&str>) -> Vec<u32> {
+pub(super) fn tool_result_block_indices(event: &RawEvent, tool_call_id: Option<&str>) -> Vec<u32> {
     match tool_call_id {
         Some(id) => event
             .blocks
@@ -1573,7 +1573,7 @@ fn blake3_hex(text: &str) -> String {
 /// `parse_error`); only non-JSON, or JSON that is neither shape, is a parse
 /// failure. `line_number` is the only optional per-hit field (real
 /// responses always carry `source_id`/`source_path`).
-fn parse_recall_hits(content: &str) -> Result<RecallSrc, String> {
+pub(super) fn parse_recall_hits(content: &str) -> Result<RecallSrc, String> {
     let value: serde_json::Value = serde_json::from_str(content).map_err(|e| format!("invalid JSON: {e}"))?;
     if value.get("error").is_some() {
         // Error-shaped response (`{"error":"cass_exit","code","stderr"}`):
