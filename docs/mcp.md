@@ -52,6 +52,35 @@ request. The query is always the last argv element after a literal `--`; a query
 that begins with `--` stays data. No command adds `--db`, refresh, catch-up, or
 any management subcommand.
 
+## Output budget
+
+`--max-output-bytes` is one budget applied at two layers.
+
+1. While the companion runs, stdout and stderr share one byte counter. Reading
+   uses fixed small chunks and stores at most the budget across both streams;
+   the first chunk that would cross it stops both reads immediately, without
+   waiting for the producer to close its pipes.
+2. The final tool result must also fit. The measured object is the compact
+   serialized SDK `CallToolResult` the server returns for protocol `2026-07-28`,
+   including `resultType: "complete"`, the text escaping, and `isError`. The
+   JSON-RPC envelope, SSE framing, and HTTP frame are not counted.
+
+The startup minimum is 125 bytes: that is the measured serialized size of the
+largest fixed error code after every optional field is removed. A value below
+125 is rejected as invalid configuration before the version probe and before
+any listener exists. The measured size is counted in UTF-8 bytes, never in
+characters.
+
+When either layer is exceeded the call returns `isError: true` with
+`result_too_large`; no partial recall body is forwarded. The server terminates
+only that request's own child, waits for its exit, and only then publishes the
+error. A non-zero exit observed in the same window never overrides the
+overflow.
+
+An error result keeps its fixed `error.code` and `isError`. If it does not fit
+the budget, the optional `message` is removed first, then the optional
+`cli_exit_code`; the code itself is never changed and no second error is sent.
+
 ## Results and errors
 
 A successful call returns the CLI stdout unchanged as one `type: "text"` content
@@ -75,6 +104,7 @@ single top-level `error` object:
 | CLI `stale_reference` | `stale_reference` |
 | CLI `model_unavailable` | `model_unavailable` |
 | CLI `recall_invalid` | `invalid_recall` |
+| Combined stdout+stderr or the final tool result exceeds `--max-output-bytes` | `result_too_large` |
 | Any other non-zero CLI exit, unparseable stderr, signal, or spawn failure | `cass_exit` |
 | Illegal stdout envelope or payload shape | `invalid_recall` |
 
@@ -130,11 +160,12 @@ endpoint at `/mcp`.
   wiring and a default-enable acceptance; a successful RPC call alone does not
   mean the recall result was cleaned. Dynamic scripts, batched calls, and
   `wait` segmented results fall outside that shape and are not covered.
-- This entry point does not yet include the complete resource gates: output
-  byte budgets for streaming reads, the global concurrency/queue/FIFO system,
-  and total-deadline cancellation with child reaping are separate work. Do not
-  deploy this server to production until those gates and the final integration
-  pass.
+- This entry point still does not include the complete resource gates: the
+  global concurrency/queue/FIFO system and total-deadline cancellation are
+  separate work. The output budget above covers read-time bytes, the final
+  tool result, and reaping that request's own child; it does not add queueing,
+  a total deadline, or SDK cancellation handling. Do not deploy this server to
+  production until those gates and the final integration pass.
 - Model work stays inside the CLI. This server does not choose a retrieval
   strategy, retry model calls, or reinterpret an empty but successful result as
   a failure.

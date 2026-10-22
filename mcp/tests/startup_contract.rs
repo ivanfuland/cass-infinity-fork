@@ -15,6 +15,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rmcp::model::CallToolResult;
+
 const BIN: &str = env!("CARGO_BIN_EXE_cass-mcp");
 const MCP_VERSION_WORD: &str = "cass-mcp 0.6.17";
 const EXPECTED_CASS_VERSION: &str = "cass 0.6.17";
@@ -236,8 +238,19 @@ fn start_server(fixture: &Fixture, public_origin: &str) -> ServerProc {
 
 fn start_server_on(fixture: &Fixture, bind: &str, public_origin: &str) -> ServerProc {
     let bind: SocketAddr = bind.parse().expect("valid bind address");
+    start_server_with_args(fixture, fixture.args(bind, public_origin))
+}
+
+fn start_server_with_budget(fixture: &Fixture, public_origin: &str, budget: usize) -> ServerProc {
+    let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid bind address");
+    let mut args = fixture.args(bind, public_origin);
+    set_option(&mut args, "--max-output-bytes", &budget.to_string());
+    start_server_with_args(fixture, args)
+}
+
+fn start_server_with_args(fixture: &Fixture, args: Vec<String>) -> ServerProc {
     let mut child = Command::new(BIN)
-        .args(fixture.args(bind, public_origin))
+        .args(args)
         .env("HOME", &fixture.home)
         .env("XDG_CONFIG_HOME", fixture.home.join("config"))
         .env("XDG_DATA_HOME", fixture.home.join("data"))
@@ -867,6 +880,62 @@ fn invalid_numeric_values_are_rejected() {
             expect_rejected(&format!("{option} {value}"), &fixture, &args);
         }
     }
+}
+
+/// The lowest representable budget must start, and the service must be able
+/// to deliver a standard error body at that budget. One byte below it is
+/// rejected before the version probe and before any listener exists.
+#[test]
+fn output_budget_minimum_is_enforced_before_the_version_probe() {
+    let bind: SocketAddr = "127.0.0.1:0".parse().expect("valid bind address");
+
+    let fixture = Fixture::new("budget-below", EXPECTED_CASS_VERSION, 0);
+    let mut args = fixture.args(bind, PUBLIC_ORIGIN);
+    set_option(&mut args, "--max-output-bytes", "124");
+    expect_rejected("max-output-bytes 124", &fixture, &args);
+
+    let fixture = Fixture::new("budget-min", EXPECTED_CASS_VERSION, 0);
+    let server = start_server_with_budget(&fixture, PUBLIC_ORIGIN, 125);
+    let host = format!("127.0.0.1:{}", server.address.port());
+    let (session, _) = initialize_session(&server, &host, &[]);
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": { "name": "cass_sessions", "arguments": { "limit": 0 } }
+    })
+    .to_string();
+    let response = post_session(&server, &host, &session, &body);
+    assert_eq!(response.status, 200, "tools/call body: {}", response.body);
+    let value = response_payload(&response);
+    let result = &value["result"];
+    assert_eq!(result["isError"], true, "expected a tool error: {value}");
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected one text block: {value}"));
+    let error: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("error text is not JSON: {text}"));
+    assert_eq!(error["error"]["code"], "invalid_argument");
+    assert!(
+        canonical_wire_len(result) <= 125,
+        "the error body must fit the minimum budget"
+    );
+    assert_eq!(
+        fixture.invocations(),
+        vec!["--version".to_string()],
+        "invalid input must not start the companion process"
+    );
+}
+
+/// The 2026 tool result (with `resultType: complete`) for a received result.
+fn canonical_wire_len(result: &serde_json::Value) -> usize {
+    let mut parsed: CallToolResult =
+        serde_json::from_value(result.clone()).expect("result deserializes as a tool result");
+    parsed.result_type = Some(rmcp::model::ResultType::COMPLETE);
+    serde_json::to_vec(&parsed)
+        .expect("serialize SDK tool result")
+        .len()
 }
 
 #[test]

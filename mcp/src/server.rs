@@ -24,19 +24,68 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 
 use crate::config::{Config, Origin, SERVER_NAME};
-use crate::runner::Runner;
+use crate::runner::{Runner, ToolError};
 use crate::tools;
 
 /// MCP handler for the companion program.
 #[derive(Clone, Debug)]
 pub struct CassMcpServer {
     runner: Arc<Runner>,
+    max_output_bytes: usize,
 }
 
 impl CassMcpServer {
-    fn new(runner: Arc<Runner>) -> Self {
-        Self { runner }
+    fn new(runner: Arc<Runner>, max_output_bytes: usize) -> Self {
+        Self {
+            runner,
+            max_output_bytes,
+        }
     }
+
+    /// The single success exit: a legal recall envelope that no longer fits
+    /// the serialized-result budget becomes one `result_too_large` error, never
+    /// a partial body.
+    fn success_response(&self, stdout: String) -> CallToolResponse {
+        let result = CallToolResult::success(vec![ContentBlock::text(stdout)]);
+        if serialized_len(&result) <= self.max_output_bytes {
+            return result.into();
+        }
+        self.error_response(&ToolError::result_too_large(
+            "the recall result exceeded the configured output budget",
+        ))
+    }
+
+    /// The single error exit, shared by input validation and every runner
+    /// failure. The body is reduced in the fixed order: drop the optional
+    /// message, then the optional CLI exit status. The code, `isError` and the
+    /// single text block always stay.
+    fn error_response(&self, error: &ToolError) -> CallToolResponse {
+        let full = CallToolResult::error(vec![ContentBlock::text(error.to_json())]);
+        if serialized_len(&full) <= self.max_output_bytes {
+            return full.into();
+        }
+
+        let without_message =
+            CallToolResult::error(vec![ContentBlock::text(error.render(false, true))]);
+        if serialized_len(&without_message) <= self.max_output_bytes {
+            return without_message.into();
+        }
+
+        let minimal = CallToolResult::error(vec![ContentBlock::text(error.render(false, false))]);
+        debug_assert!(
+            serialized_len(&minimal) <= self.max_output_bytes,
+            "the configured budget must keep every fixed error code representable"
+        );
+        minimal.into()
+    }
+}
+
+/// Compact bytes of the SDK tool result, including `resultType: complete`.
+/// The JSON-RPC, SSE, and HTTP framing around it are not part of this budget.
+fn serialized_len(result: &CallToolResult) -> usize {
+    serde_json::to_vec(result)
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
 }
 
 impl ServerHandler for CassMcpServer {
@@ -67,18 +116,14 @@ impl ServerHandler for CassMcpServer {
 
         let call = match tools::parse(tool, request.arguments.as_ref()) {
             Ok(call) => call,
-            Err(error) => return Ok(error_result(&error).into()),
+            Err(error) => return Ok(self.error_response(&error)),
         };
 
         match self.runner.run(tool, &call).await {
-            Ok(stdout) => Ok(CallToolResult::success(vec![ContentBlock::text(stdout)]).into()),
-            Err(error) => Ok(error_result(&error).into()),
+            Ok(stdout) => Ok(self.success_response(stdout)),
+            Err(error) => Ok(self.error_response(&error)),
         }
     }
-}
-
-fn error_result(error: &crate::runner::ToolError) -> CallToolResult {
-    CallToolResult::error(vec![ContentBlock::text(error.to_json())])
 }
 
 /// Build the Streamable HTTP service mounted at `/mcp`.
@@ -119,8 +164,9 @@ pub fn service(
         .with_allowed_hosts(hosts);
 
     let runner = Arc::new(Runner::new(config));
+    let max_output_bytes = config.max_output_bytes;
     StreamableHttpService::new(
-        move || Ok(CassMcpServer::new(Arc::clone(&runner))),
+        move || Ok(CassMcpServer::new(Arc::clone(&runner), max_output_bytes)),
         Default::default(),
         sdk_config,
     )
