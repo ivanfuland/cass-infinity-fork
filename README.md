@@ -44,6 +44,37 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 
 ---
 
+## 🧱 Building the API-only fork and MCP companion
+
+`scripts/setup-cass-fork.sh` is the only supported build entry. It clones the fork into a dedicated build directory, pins the `asupersync` sibling, and builds the ORT-free feature set.
+
+The default mode builds and installs the `cass` CLI only:
+
+```bash
+INSTALL_PATH="$HOME/bin/cass" bash scripts/setup-cass-fork.sh
+```
+
+Set `MCP_INSTALL_PATH` to build the paired `cass` + `cass-mcp` candidates from one frozen commit:
+
+```bash
+env -u CARGO_TARGET_DIR \
+  INSTALL_PATH="$HOME/candidates/cass" \
+  MCP_INSTALL_PATH="$HOME/candidates/cass-mcp" \
+  bash scripts/setup-cass-fork.sh
+```
+
+Paired mode rules:
+
+- Both targets must be absolute, must not already exist, and must resolve to different files. Any existing file, directory or dangling symlink stops the run before cloning or building.
+- `CARGO_TARGET_DIR` must be unset, even when its value is empty. The CLI and the MCP package use their own lock files and target directories.
+- Both programs are built and verified before either is published. Verification covers the source commit, each package's declared version, a real `strings` and `ldd` probe for ONNX symbols, and the binary SHA256.
+- Candidates are staged in their own parent directory and published with `ln -T`, which never overwrites an existing path. If the second publish fails, the first new candidate is kept and the command exits non-zero.
+- A successful paired run prints one `PAIR_OK` line with the source commit, both versions, both SHA256 values and the four probe counts. Save it together with the two absolute paths; it is the evidence for downstream consumption.
+
+Legacy single-CLI mode keeps the previous install and `.prev` backup behaviour. See [docs/mcp.md](docs/mcp.md) for the server itself.
+
+---
+
 ## 🤖 Agent Quickstart (Robot Mode)
 
 ⚠️ **Never run bare `cass` in an agent context** — it launches the interactive TUI. Always use `--robot` or `--json`.

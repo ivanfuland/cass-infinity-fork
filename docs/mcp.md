@@ -9,6 +9,40 @@ forwards exactly one recall envelope per successful call.
 The server requires the companion binary to report exactly `cass 0.6.17`. The
 version is probed once before the listener binds; a mismatch stops startup.
 
+## Building the paired candidate
+
+`cass-mcp` is built beside the CLI from the same frozen commit by
+`scripts/setup-cass-fork.sh`. Set `MCP_INSTALL_PATH` to enable paired mode:
+
+```bash
+env -u CARGO_TARGET_DIR \
+  INSTALL_PATH=/abs/path/candidates/cass \
+  MCP_INSTALL_PATH=/abs/path/candidates/cass-mcp \
+  FORK_REPO=<repository> FORK_REF=<full commit> \
+  bash scripts/setup-cass-fork.sh
+```
+
+The script builds the root CLI with
+`--release --locked --no-default-features --features qr,encryption` and this
+package with `--release --locked --manifest-path mcp/Cargo.toml`. The MCP
+package keeps its own `Cargo.lock` and `mcp/target` directory; it is never
+merged into the root runtime.
+
+Both binaries must pass the version check and real `strings`/`ldd` probes for
+ONNX symbols before either is published. Candidates are staged in their own
+parent directory and linked with `ln -T`, so an existing path is never
+overwritten. A failed second publish exits non-zero, leaves the first new
+candidate in place and prints no success record.
+
+On success the script prints one line:
+
+```
+PAIR_OK source_commit=<sha> cass_version=0.6.17 mcp_version=0.6.17 cass_sha256=<sha> mcp_sha256=<sha> cli_strings_hits=0 cli_ldd_hits=0 mcp_strings_hits=0 mcp_ldd_hits=0
+```
+
+Record that line together with the two absolute paths. The legacy mode without
+`MCP_INSTALL_PATH` still builds and installs only the CLI.
+
 ## Tools
 
 | Tool | Required input | Optional input |
