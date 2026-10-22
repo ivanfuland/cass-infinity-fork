@@ -26,7 +26,7 @@
 //! input is one unit of work and may not be split into several independent
 //! conversations commits.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,7 +45,11 @@ pub(crate) const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 /// The fixed safety-config copy's own epoch. Constraint 4: this epoch covers
 /// the lossless-copy cleanup and key-collision semantics, which the redaction
 /// regex fingerprint alone does not.
-pub(crate) const SOURCE_EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
+///
+/// Task10: the default producer now writes the complete second epoch. The two
+/// fixed reader identities above stay separate, so epoch 1 material still
+/// verifies under its own version.
+pub(crate) const SOURCE_EXCLUSION_EPOCH: &str = SOURCE_EXCLUSION_EPOCH_V2;
 
 /// The first exclusion-rule epoch as a fixed reader identity.
 ///
@@ -56,9 +60,8 @@ pub(crate) const SOURCE_EXCLUSION_EPOCH_V1: &str = "cass-source-exclusion/1";
 
 /// The second exclusion-rule epoch (C05).
 ///
-/// This build can read and export materials that name it, but it is not the
-/// producer default: [`SOURCE_EXCLUSION_EPOCH`] stays `/1` until the separate
-/// enablement task switches it.
+/// Task10 moved the producer default to this epoch; the first epoch stays a
+/// fixed reader identity.
 pub(crate) const SOURCE_EXCLUSION_EPOCH_V2: &str = "cass-source-exclusion/2";
 
 /// The safety contract's domain tag.
@@ -2879,6 +2882,10 @@ struct JudgedConversation {
 struct SafetyPass {
     staged: Pass2Result,
     judged: Vec<JudgedConversation>,
+    /// Task10: the v2 `Preserve(Some(reason))` outcomes this input really
+    /// judged, one count per fixed reason. The map is the run's own record of
+    /// what this input left uncovered; it is empty for a v1 input.
+    recall_uncovered: BTreeMap<String, u64>,
 }
 
 /// The one judged payload a record's claim produced.
@@ -3283,6 +3290,11 @@ fn safety_pass(
     let mut scanned = 0usize;
     let mut decisions: Vec<(usize, usize, u64, JudgedDecision)> = Vec::new();
     let mut bodies_by_ordinal: BTreeMap<u64, Vec<ExcludedBody>> = BTreeMap::new();
+    // Task10: one count per fixed uncovered reason. A message is counted once
+    // even when several claims of the same record resolve to it, so the map
+    // cannot inflate with the number of claims.
+    let mut recall_uncovered: BTreeMap<String, u64> = BTreeMap::new();
+    let mut recall_counted: BTreeSet<(usize, usize)> = BTreeSet::new();
 
     let mut scan = source_facts::FramingStream::new(&mut reader, format);
     while !scan.is_done() {
@@ -3392,8 +3404,8 @@ fn safety_pass(
                         // The v2 entry reads this record's real raw JSON, so the
                         // current host's frozen single-call wrapper and the
                         // source metadata both come from the record itself. A
-                        // preserved candidate keeps its body; its uncovered
-                        // counters belong to the enablement task.
+                        // preserved candidate keeps its body and contributes
+                        // one bounded uncovered count to this input.
                         match crate::indexer::recall_v2::decide_for_record(
                             &conversations[conv_idx],
                             msg_idx,
@@ -3405,7 +3417,16 @@ fn safety_pass(
                             crate::indexer::recall_v2::Outcome::Exclude(exclusion) => {
                                 Some(JudgedDecision::V2(exclusion))
                             }
-                            crate::indexer::recall_v2::Outcome::Preserve(_) => None,
+                            crate::indexer::recall_v2::Outcome::Preserve(reason) => {
+                                if let Some(reason) = reason
+                                    && recall_counted.insert((conv_idx, msg_idx))
+                                {
+                                    *recall_uncovered
+                                        .entry(reason.as_str().to_string())
+                                        .or_insert(0) += 1;
+                                }
+                                None
+                            }
                         }
                     } else {
                         crate::indexer::exclusion::decide(
@@ -3640,6 +3661,7 @@ fn safety_pass(
             diagnostics: diagnostics_count,
         },
         judged,
+        recall_uncovered,
     })
 }
 
@@ -3895,6 +3917,13 @@ pub(crate) struct SourceInputCommit {
     /// Canonical rows this commit created, for the run's own counters.
     pub(crate) inserted_conversations: usize,
     pub(crate) inserted_messages: usize,
+    /// Task10: the recognized recall candidates this commit's input left
+    /// uncovered, per fixed reason. Only a successful commit carries the
+    /// values its own judgment produced; a refusal or a transient attempt
+    /// carries the empty map, so an unfinished attempt never enters the run's
+    /// totals.
+    pub(crate) recall_uncovered_total: u64,
+    pub(crate) recall_uncovered_by_reason: BTreeMap<String, u64>,
 }
 
 /// The typed storage error a `SourceIngestError` carries, when it carries one.
@@ -3956,6 +3985,8 @@ fn busy_transient_commit(job: &SourceInputJob) -> SourceInputCommit {
         delta: Vec::new(),
         inserted_conversations: 0,
         inserted_messages: 0,
+        recall_uncovered_total: 0,
+        recall_uncovered_by_reason: BTreeMap::new(),
     }
 }
 
@@ -4891,6 +4922,11 @@ pub(crate) fn commit_source_input(
     let input_key = *job.input.input_key();
     let records = prepared.safety.staged.records.len() as u64;
     let judged_conversations = prepared.safety.judged.len() as u64;
+    // Task10: the values this input's own second pass just produced. They are
+    // attached only to a successful outcome below; a refusal or a transient
+    // attempt reports none, so an unfinished input cannot enter a run total.
+    let recall_uncovered_by_reason = prepared.safety.recall_uncovered.clone();
+    let recall_uncovered_total = recall_uncovered_by_reason.values().copied().sum();
 
     let outcome = {
         let conn = storage.raw();
@@ -4931,6 +4967,8 @@ pub(crate) fn commit_source_input(
                             delta,
                             inserted_conversations,
                             inserted_messages,
+                            recall_uncovered_total,
+                            recall_uncovered_by_reason,
                         })
                     }
                     Err(reason) => Ok(SourceInputCommit {
@@ -4942,6 +4980,8 @@ pub(crate) fn commit_source_input(
                         delta: Vec::new(),
                         inserted_conversations,
                         inserted_messages,
+                        recall_uncovered_total,
+                        recall_uncovered_by_reason,
                     }),
                 }
             }
@@ -4956,6 +4996,8 @@ pub(crate) fn commit_source_input(
                 delta: Vec::new(),
                 inserted_conversations: 0,
                 inserted_messages: 0,
+                recall_uncovered_total,
+                recall_uncovered_by_reason,
             }),
             source_facts::SourceActivationOutcome::PublishedFailure { state, .. } => {
                 Ok(SourceInputCommit {
@@ -4966,6 +5008,8 @@ pub(crate) fn commit_source_input(
                     delta: Vec::new(),
                     inserted_conversations: 0,
                     inserted_messages: 0,
+                    recall_uncovered_total: 0,
+                    recall_uncovered_by_reason: BTreeMap::new(),
                 })
             }
             source_facts::SourceActivationOutcome::StagedOnly { state, .. } => {
@@ -4977,6 +5021,8 @@ pub(crate) fn commit_source_input(
                     delta: Vec::new(),
                     inserted_conversations: 0,
                     inserted_messages: 0,
+                    recall_uncovered_total: 0,
+                    recall_uncovered_by_reason: BTreeMap::new(),
                 })
             }
         },
@@ -11128,5 +11174,271 @@ mod id_body_conflict_tests {
             observed,
             "the mixed user record emits a RawEvent and its off-role tool_use id is registered"
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_activate_v2_tests {
+    //! Task10: the switched default is an identity change, not a renamed
+    //! number. A material this build completed under epoch 1 keeps its own
+    //! receipt, and that receipt cannot stand in for the epoch-2 identity of
+    //! the same bytes.
+
+    use super::*;
+
+    /// The legacy unwrapped search shape, which the v1 rule set has always
+    /// recognized and the v2 parser still accepts. The call is the full
+    /// server-namespaced MCP name, so both epochs really exclude it.
+    const RECALL_BODY: &str = "{\"hits\":[{\"content\":\"T10 lib hit\",\"line_number\":7,\"source_id\":\"local\",\"source_path\":\"/synthetic/t10/prior.jsonl\"}]}";
+
+    fn claude_body() -> Vec<u8> {
+        let lines = [
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-22T00:00:00.000Z", "uuid": "t10-lib-u1",
+                "message": {"role": "user", "content": "T10 lib user prose stays"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-22T00:00:01.000Z", "uuid": "t10-lib-a1",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_t10_lib", "name": "mcp__cass-mcp__cass_search",
+                     "input": {"query": "lib"}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-22T00:00:02.000Z", "uuid": "t10-lib-u2",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_t10_lib", "content": RECALL_BODY}
+                ]}
+            }),
+        ];
+        let mut body = String::new();
+        for line in lines {
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        body.into_bytes()
+    }
+
+    /// One synthetic source shared by both isolated databases, so the only
+    /// identity difference between the two inputs is the rule epoch itself.
+    struct World {
+        temp: tempfile::TempDir,
+        root: crate::connectors::ScanRoot,
+        meta: crate::indexer::scan_root_meta::ScanRootMeta,
+        discovered: crate::connectors::DiscoveredSourceFile,
+    }
+
+    fn world() -> World {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let scan_path = temp.path().join("home/.claude/projects/t10");
+        std::fs::create_dir_all(&scan_path).expect("mkdir scan root");
+        let source_path = scan_path.join("session.jsonl");
+        std::fs::write(&source_path, claude_body()).expect("write the session");
+        let root = crate::connectors::ScanRoot::local(scan_path.clone());
+        let meta = crate::indexer::scan_root_meta::ScanRootMeta {
+            root_id: "home:claude:t10-lib".to_string(),
+            origin_host: "local".to_string(),
+            readonly: false,
+            canonical_path: scan_path.clone(),
+            source_name: "claude".to_string(),
+            watermarks_enabled: true,
+            mirror_root: false,
+        };
+        let discovered = crate::connectors::DiscoveredSourceFile {
+            provider_slug: "claude_code".to_string(),
+            scan_root: scan_path,
+            source_path,
+            role: crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            origin: crate::connectors::Origin::local(),
+            platform: None,
+            required_for_reconstruction: true,
+            size_bytes: None,
+            modified_at_ms: None,
+        };
+        World { temp, root, meta, discovered }
+    }
+
+    fn safety(data_dir: &Path, epoch: &str) -> Arc<FixedSafetyConfig> {
+        let path = data_dir.join("fixed-safety.toml");
+        std::fs::create_dir_all(data_dir).expect("mkdir the data directory");
+        std::fs::write(
+            &path,
+            include_bytes!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed copy");
+        Arc::new(
+            load_fixed_safety_config_for_code_version(&path, &fixed_code_version(epoch))
+                .expect("the fixed copy loads under the named epoch"),
+        )
+    }
+
+    fn prepare(
+        world: &World,
+        data_dir: &Path,
+        safety: &Arc<FixedSafetyConfig>,
+    ) -> SourceInputJob {
+        let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+        let request = SourceInputRequest {
+            connector_name: "claude",
+            data_dir,
+            root: &world.root,
+            meta: &world.meta,
+            discovered: &world.discovered,
+            safety,
+        };
+        prepare_source_input(&connector, &request).expect("the synthetic input prepares")
+    }
+
+    fn open(data_dir: &Path) -> crate::storage::sqlite::FrankenStorage {
+        std::fs::create_dir_all(data_dir).expect("mkdir the data directory");
+        crate::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
+            .expect("open the database")
+    }
+
+    /// The exact activation request this input really committed, read back
+    /// through the existing builder from the rows its database stores.
+    fn activation_request(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        job: &SourceInputJob,
+    ) -> crate::storage::source_facts::SourceActivationRequest {
+        let conn = storage.raw();
+        conn.with_tx(crate::storage::api::TxMode::Deferred, |tx| {
+            let input_id = crate::storage::source_facts::registered_source_input_id(
+                tx,
+                job.input.input_key(),
+            )
+            .map_err(|error| source_ingest_error_to_storage(SourceIngestError::Verify(error)))?
+            .expect("the committed input is registered");
+            build_activation_request(
+                tx,
+                input_id,
+                job.input.input_key(),
+                &job.normalizer_id,
+                &job.safety_contract_id,
+                job,
+            )
+            .map(|plan| plan.request)
+            .map_err(source_ingest_error_to_storage)
+        })
+        .expect("build the activation request")
+    }
+
+    fn verify(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        request: &crate::storage::source_facts::SourceActivationRequest,
+    ) -> std::result::Result<
+        crate::storage::source_facts::SourceReceiptMatch,
+        String,
+    > {
+        let conn = storage.raw();
+        conn.with_tx(crate::storage::api::TxMode::Deferred, |tx| {
+            crate::storage::source_facts::verify_source_receipt_in_tx(tx, request)
+                .map_err(|error| source_ingest_error_to_storage(SourceIngestError::Install(error)))
+        })
+        .map_err(|error| format!("{error:?}"))
+    }
+
+    fn marker_versions(storage: &crate::storage::sqlite::FrankenStorage) -> Vec<u64> {
+        let db = storage.raw();
+        let rows: Vec<String> = db
+            .query_all_map(
+                "SELECT json(excluded) FROM messages WHERE excluded IS NOT NULL ORDER BY id",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("query the markers");
+        rows.into_iter()
+            .map(|text| {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).expect("a marker is JSON");
+                value["rule_version"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("no rule_version in {value}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mcp_activate_v2_v1_receipt_never_completes_the_v2_identity() {
+        let world = world();
+
+        // Database A holds one real epoch-1 completion.
+        let data_a = world.temp.path().join("data-a");
+        let storage_a = open(&data_a);
+        let v1 = safety(&data_a, SOURCE_EXCLUSION_EPOCH_V1);
+        let job_v1 = prepare(&world, &data_a, &v1);
+        let first = commit_source_input(&storage_a, &job_v1).expect("the v1 commit");
+        assert!(
+            matches!(
+                first.outcome,
+                SourceInputOutcome::Completed { replay: false, .. }
+            ),
+            "the v1 commit is a real install: {:?}",
+            first.outcome
+        );
+        assert_eq!(marker_versions(&storage_a), vec![1], "the v1 marker is rule version 1");
+
+        // Database B holds one real epoch-2 completion of the same bytes. Each
+        // database proves its own identity on its own; no database carries
+        // both, which would be the cancelled mixed-history capability.
+        let data_b = world.temp.path().join("data-b");
+        let storage_b = open(&data_b);
+        let v2 = safety(&data_b, SOURCE_EXCLUSION_EPOCH_V2);
+        let job_v2 = prepare(&world, &data_b, &v2);
+        assert_ne!(
+            job_v1.input.input_key(),
+            job_v2.input.input_key(),
+            "each epoch's identity is its own"
+        );
+        let second = commit_source_input(&storage_b, &job_v2).expect("the v2 commit");
+        assert!(
+            matches!(
+                second.outcome,
+                SourceInputOutcome::Completed { replay: false, .. }
+            ),
+            "the v2 commit is a real install in its own database: {:?}",
+            second.outcome
+        );
+        assert!(
+            marker_versions(&storage_b).contains(&2),
+            "the v2 judgment ran: {:?}",
+            marker_versions(&storage_b)
+        );
+
+        // The two exact requests, each read back from the database that really
+        // completed it.
+        let request_v1 = activation_request(&storage_a, &job_v1);
+        let request_v2 = activation_request(&storage_b, &job_v2);
+
+        // Positive control: database A's receipt really verifies for its own
+        // request.
+        match verify(&storage_a, &request_v1).expect("the v1 request verifies") {
+            crate::storage::source_facts::SourceReceiptMatch::VerifiedReplay { .. } => {}
+            other => panic!(
+                "the stored v1 completion must verify for its own request: {other:?}"
+            ),
+        }
+
+        // 10-AC4: the exact epoch-2 request against the database that holds
+        // only the epoch-1 completion is never a replay. An unregistered input
+        // is an existing refusal, not a completion.
+        match verify(&storage_a, &request_v2) {
+            Ok(crate::storage::source_facts::SourceReceiptMatch::VerifiedReplay { .. }) => {
+                panic!("an epoch-1 receipt must never verify as the epoch-2 completion")
+            }
+            Ok(other) => println!("T10 v2 request in the v1-only database: {other:?}"),
+            Err(error) => println!("T10 v2 request in the v1-only database refused: {error}"),
+        }
+        // The check wrote nothing.
+        assert_eq!(marker_versions(&storage_a), vec![1], "the v1 database is unchanged");
+        let complete_a: i64 = storage_a
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM source_inputs WHERE state = 'complete'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("count the v1 database's complete inputs");
+        assert_eq!(complete_a, 1, "the v1 database keeps its one completion");
     }
 }

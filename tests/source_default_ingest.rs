@@ -1279,6 +1279,122 @@ fn default_resident() {
 // A2: one run keeps one fixed configuration; a damaged copy is refused
 // ---------------------------------------------------------------------------
 
+/// Task10: the resident trigger's commit receive point contributes the same
+/// uncovered counts as the one-shot paths, and its structured source-ingest
+/// event names only the static reason and the count.
+#[test]
+fn default_resident_reports_recall_uncovered() {
+    let fixture = Fixture::new();
+    fixture.create_home_roots();
+
+    let mut resident = Resident::start(&fixture, None);
+    assert!(
+        resident.wait_for(WATCH_READY_MARKER, Duration::from_secs(180)),
+        "the un-flagged resident loop must reach its event cycle: {}",
+        resident.log()
+    );
+
+    // One ordinary user turn and one Cass pipeline: a recognized candidate
+    // whose syntax the first version cannot prove, so it stays whole and is
+    // counted once as `unsupported_shell`.
+    let session = vec![
+        serde_json::json!({
+            "cwd": "/synthetic/project",
+            "sessionId": "sess-resident-uncovered",
+            "version": "2.0.37",
+            "type": "user",
+            "message": {"role": "user", "content": "the resident uncovered question"},
+            "uuid": "sess-resident-uncovered-user",
+            "timestamp": "2026-01-01T00:00:00.000Z"
+        }),
+        serde_json::json!({
+            "parentUuid": "sess-resident-uncovered-user",
+            "cwd": "/synthetic/project",
+            "sessionId": "sess-resident-uncovered",
+            "version": "2.0.37",
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_resident_uncovered",
+                    "name": "Bash",
+                    "input": {"command": "cass search \"resident needle\" --recall | head -5"}
+                }]
+            },
+            "uuid": "sess-resident-uncovered-assistant",
+            "timestamp": "2026-01-01T00:00:01.000Z"
+        }),
+        serde_json::json!({
+            "parentUuid": "sess-resident-uncovered-assistant",
+            "cwd": "/synthetic/project",
+            "sessionId": "sess-resident-uncovered",
+            "version": "2.0.37",
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_resident_uncovered",
+                    "content": "the resident pipeline output stays"
+                }]
+            },
+            "uuid": "sess-resident-uncovered-result",
+            "timestamp": "2026-01-01T00:00:02.000Z"
+        }),
+    ];
+    fixture.write_claude_session(
+        "default-resident-uncovered/session.jsonl",
+        &session,
+    );
+
+    resident.poll_until(
+        "the uncovered input to complete through the event cycle",
+        Duration::from_secs(240),
+        || {
+            let db = fixture.try_open_db()?;
+            (complete_inputs(&db) >= 1).then_some(())
+        },
+    );
+    resident.poll_until(
+        "the resident source_input event to carry the uncovered count",
+        Duration::from_secs(120),
+        || {
+            resident
+                .log()
+                .contains("recall_uncovered_total=1")
+                .then_some(())
+        },
+    );
+    let log = resident.log();
+    resident.stop();
+
+    assert!(
+        log.contains("recall_uncovered_reasons=unsupported_shell=1"),
+        "the event names the static reason and its count: {log}"
+    );
+    assert!(
+        !log.contains("resident needle"),
+        "the event carries no source text or argument: {log}"
+    );
+
+    let db = fixture.open_db();
+    assert_eq!(complete_inputs(&db), 1, "the event-cycle input completed");
+    assert!(
+        count_like(&db, "the resident pipeline output stays") > 0,
+        "the uncovered candidate's body is preserved"
+    );
+    assert!(
+        count(&db, "SELECT COUNT(*) FROM messages WHERE excluded IS NOT NULL") == 0,
+        "no exclusion marker is written for the preserved candidate"
+    );
+    drop(db);
+    assert_auto_identity(&fixture, "default_resident_reports_recall_uncovered");
+}
+
+// ---------------------------------------------------------------------------
+// A2: one run keeps one fixed configuration; a damaged copy is refused
+// ---------------------------------------------------------------------------
 #[test]
 fn fixed_run_ignores_live_change() {
     let fixture = Fixture::new();

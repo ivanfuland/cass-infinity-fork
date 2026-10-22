@@ -975,6 +975,133 @@ fn complete_unpaired_recall(payload: &Value) -> bool {
     false
 }
 
+/// C01/C06/C07 hint: does this `exec` call's own text name one of the four
+/// Cass reads?
+///
+/// Only literal evidence is read: the frozen C07 single-call expression, the
+/// four complete MCP method literals inside an otherwise unsupported script,
+/// or one JSON string `cmd` value that decodes to a Cass-headed command. No
+/// variable, template, loop or other script text is interpreted, and nothing
+/// is executed.
+fn exec_text_names_a_cass_call(expression: &str) -> bool {
+    if let Some((target, input)) = parse_exec_literal(expression) {
+        return match target {
+            ExecTarget::Mcp(_) => true,
+            ExecTarget::Cli => input
+                .get("cmd")
+                .and_then(Value::as_str)
+                .is_some_and(cli_names_cass),
+        };
+    }
+    if [
+        "tools.mcp__cass_mcp__cass_search",
+        "tools.mcp__cass_mcp__cass_expand",
+        "tools.mcp__cass_mcp__cass_sessions",
+        "tools.mcp__cass_mcp__cass_timeline",
+    ]
+    .iter()
+    .any(|method| expression.contains(method))
+    {
+        return true;
+    }
+    json_string_cmd(expression).is_some_and(|command| cli_names_cass(&command))
+}
+
+/// True when the command head is Cass, whether or not its syntax is one of the
+/// frozen read commands. `Ok(None)` is the only answer that proves it is not.
+fn cli_names_cass(command: &str) -> bool {
+    !matches!(parse_cli(command), Ok(None))
+}
+
+/// The first JSON string `cmd` value in the text that names a Cass command.
+///
+/// Every `"cmd": "..."` pair is scanned, so an earlier ordinary command (a
+/// date, a local script) does not hide a later Cass one. A quoted key and a
+/// quoted value are required, so an arbitrary script is never parsed as JSON.
+fn json_string_cmd(text: &str) -> Option<String> {
+    static CMD_VALUE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = CMD_VALUE.get_or_init(|| {
+        regex::Regex::new(r#""cmd"\s*:\s*("(?:[^"\\]|\\.)*")"#).expect("a fixed regex")
+    });
+    for capture in pattern.captures_iter(text) {
+        let Some(raw) = capture.get(1) else { continue };
+        let Ok(command) = serde_json::from_str::<String>(raw.as_str()) else {
+            continue;
+        };
+        if cli_names_cass(&command) {
+            return Some(command);
+        }
+    }
+    None
+}
+
+/// Does this result block declare a complete C04 envelope? Accepts the one
+/// string form or the blocks of an `input_text` array, and looks one JSON
+/// application layer down at the `output`/`content` text only.
+fn output_declares_recall(output: &Value) -> bool {
+    match output {
+        Value::String(text) => text_declares_recall(text),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(input_text_block_text)
+            .any(text_declares_recall),
+        _ => false,
+    }
+}
+
+/// Does this text declare a complete C04 envelope? One JSON application layer
+/// is inspected for the `output` string or a `content` block's `text` only;
+/// the application's own exit/error/completion fields are deliberately not
+/// checked here. Those strict checks stay in the C07 exclusion path, so an
+/// unqualified application state still preserves the body and its diagnostic.
+fn text_declares_recall(text: &str) -> bool {
+    if declares_recall_wrapper(text) {
+        return true;
+    }
+    let Some(application) = application_object(text) else {
+        return false;
+    };
+    if application
+        .get("output")
+        .and_then(Value::as_str)
+        .is_some_and(declares_recall_wrapper)
+    {
+        return true;
+    }
+    application
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .any(declares_recall_wrapper)
+        })
+}
+
+/// Whether this `exec` record is a recall candidate at all.
+///
+/// The answer only decides whether a diagnostic is reported: `false` means the
+/// row is ordinary work and stays preserved with no count, and `true` only
+/// lets the existing strict C07 checks run. It never authorizes an exclusion.
+fn exec_recall_candidate_hint(args: Option<&Value>, raw_record: &Value) -> bool {
+    let named_call = match args {
+        Some(Value::String(expression)) => exec_text_names_a_cass_call(expression),
+        // An object argument is not a supported C07 form; its `cmd` string is
+        // read as the same hint and nothing else.
+        Some(Value::Object(members)) => members
+            .get("cmd")
+            .and_then(Value::as_str)
+            .is_some_and(cli_names_cass),
+        _ => false,
+    };
+    named_call
+        || raw_record
+            .get("payload")
+            .and_then(|payload| payload.get("output"))
+            .is_some_and(output_declares_recall)
+}
+
 /// Ticket 07 entry: C07 judgment against the *original* record, while every
 /// other path delegates to the already-verified [`decide`].
 ///
@@ -1017,6 +1144,16 @@ pub(crate) fn decide_for_record(
     // Other paired tools keep the verified MCP/direct-CLI/R2/R3 judgment.
     if call.tool_name != "exec" {
         return decide(msg, idx, event, ctx, agent_slug, paths_cfg);
+    }
+
+    // Task10: an `exec` whose own call text and result show no Cass evidence is
+    // ordinary work (a date literal, a local script, a plain pipeline). It
+    // stays preserved without a diagnostic, so the uncovered counters describe
+    // real candidates rather than every exec call. This hint can only remove a
+    // count; it never authorizes an exclusion, and a recognized candidate
+    // still runs every strict check below.
+    if !exec_recall_candidate_hint(call.args.as_ref(), raw_record) {
+        return Outcome::Preserve(None);
     }
 
     // From here on this is a candidate `exec` call. Every missing proof is a
@@ -3072,6 +3209,123 @@ mod tests {
 
     fn assert_preserved(outcome: Outcome, reason: UncoveredReason) {
         assert_eq!(outcome, Outcome::Preserve(Some(reason)));
+    }
+
+    /// Task10: the candidate hint separates ordinary `exec` work (a date
+    /// literal, a local script) from a recognized Cass call, using literal
+    /// evidence only.
+    #[test]
+    fn mcp_activate_v2_hint_separates_ordinary_exec_from_cass_candidates() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let cass_result = result_raw_record(
+            Some("call-t10"),
+            &cli_output_string(&cli_application(&wrapper)),
+            "custom_tool_call_output",
+        );
+        let ordinary_result = result_raw_record(
+            Some("call-t10"),
+            &Value::String("2026-10-22".to_string()),
+            "custom_tool_call_output",
+        );
+
+        for expression in [
+            cli_expression("cass search needle --recall"),
+            cli_expression("cass search needle --recall | head -5"),
+            mcp_expression("mcp__cass_mcp__cass_sessions", json!({"limit": 5})),
+            "const r = await tools.exec_command({\"cmd\":\"cass search needle --recall\"}); text(r);"
+                .to_string(),
+            "text(await tools.mcp__cass_mcp__cass_timeline({\"group_by\":\"hour\"}));".to_string(),
+        ] {
+            assert!(
+                exec_recall_candidate_hint(Some(&Value::String(expression.clone())), &ordinary_result),
+                "a Cass call literal is a candidate: {expression}"
+            );
+        }
+        for expression in [
+            cli_expression("date +%F"),
+            "const d = new Date(); text(await tools.exec_command({\"cmd\":\"echo \" + d.toISOString()}));"
+                .to_string(),
+            "text(await tools.wait({\"cell_id\":\"1\"}));".to_string(),
+            "text(await tools.exec_command({\"cmd\":42}));".to_string(),
+        ] {
+            assert!(
+                !exec_recall_candidate_hint(Some(&Value::String(expression.clone())), &ordinary_result),
+                "ordinary work is not a candidate: {expression}"
+            );
+        }
+
+        // An object argument is never a supported C07 form; only its `cmd`
+        // string is read as the hint.
+        assert!(!exec_recall_candidate_hint(
+            Some(&json!({"cmd": "ls -la"})),
+            &ordinary_result
+        ));
+        assert!(exec_recall_candidate_hint(
+            Some(&json!({"cmd": "cass sessions --limit 5 --recall"})),
+            &ordinary_result
+        ));
+
+        // A complete result envelope is evidence even without call evidence.
+        assert!(exec_recall_candidate_hint(
+            Some(&Value::String("for (;;) {}".to_string())),
+            &cass_result
+        ));
+        assert!(!exec_recall_candidate_hint(
+            Some(&Value::String("for (;;) {}".to_string())),
+            &ordinary_result
+        ));
+        assert!(!exec_recall_candidate_hint(None, &json!({})));
+
+        // An earlier ordinary command must not hide a later Cass command.
+        let date_then_cass = "const a = await tools.exec_command({\"cmd\":\"date +%F\"}); \
+                              const b = await tools.exec_command({\"cmd\":\"cass search x --recall\"}); text(b);"
+            .to_string();
+        assert!(
+            exec_recall_candidate_hint(Some(&Value::String(date_then_cass.clone())), &ordinary_result),
+            "the scan continues past a non-Cass cmd: {date_then_cass}"
+        );
+        // ...and a script whose commands are all ordinary stays uncounted.
+        let date_then_echo = "const a = await tools.exec_command({\"cmd\":\"date +%F\"}); \
+                              const b = await tools.exec_command({\"cmd\":\"echo done\"}); text(b);"
+            .to_string();
+        assert!(!exec_recall_candidate_hint(
+            Some(&Value::String(date_then_echo)),
+            &ordinary_result
+        ));
+
+        // A declaration is evidence even when the application's own state is
+        // not qualified for exclusion: the strict C07 checks still own the
+        // delete decision, so the body stays and its diagnostic is counted.
+        let failed_cli = Value::String(
+            json!({"exit_code": 1, "session_id": "s-1", "output": wrapper}).to_string(),
+        );
+        let failed_cli_record = result_raw_record(
+            Some("call-t10"),
+            &failed_cli,
+            "custom_tool_call_output",
+        );
+        let unknown_script = "for (;;) {}".to_string();
+        assert!(exec_recall_candidate_hint(
+            Some(&Value::String(unknown_script.clone())),
+            &failed_cli_record
+        ));
+        let (outcome, _, _) = exec_outcome(&unknown_script, failed_cli);
+        assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+
+        let failed_mcp = Value::String(
+            json!({"isError": true, "content": [{"type": "text", "text": wrapper}]}).to_string(),
+        );
+        let failed_mcp_record = result_raw_record(
+            Some("call-t10"),
+            &failed_mcp,
+            "custom_tool_call_output",
+        );
+        assert!(exec_recall_candidate_hint(
+            Some(&Value::String(unknown_script.clone())),
+            &failed_mcp_record
+        ));
+        let (outcome, _, _) = exec_outcome(&unknown_script, failed_mcp);
+        assert_preserved(outcome, UncoveredReason::UnsupportedShell);
     }
 
     #[test]

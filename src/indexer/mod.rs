@@ -1023,6 +1023,33 @@ pub struct IndexingStats {
     /// loaded, or when `CASS_IGNORE_SOURCES_CONFIG` short-circuited it.
     #[serde(default)]
     pub sources_config_error: Option<String>,
+    /// Task10: recognized recall candidates this run's successful inputs left
+    /// uncovered, and the same count per fixed reason. Only an input this run
+    /// actually re-judged contributes; the total always equals the map's sum.
+    pub recall_uncovered_total: u64,
+    pub recall_uncovered_by_reason: BTreeMap<String, u64>,
+}
+
+/// Task10: fold one successful input's uncovered counts into the run's map.
+fn accumulate_recall_uncovered(
+    target: &mut BTreeMap<String, u64>,
+    source: &BTreeMap<String, u64>,
+) {
+    for (reason, count) in source {
+        let entry = target.entry(reason.clone()).or_insert(0);
+        *entry = entry.saturating_add(*count);
+    }
+}
+
+/// Task10: the static reason/count text a structured source-ingest event
+/// carries. It names only the four fixed reasons and their counts, so no
+/// source text or argument can reach the log through it.
+fn recall_uncovered_reasons_field(by_reason: &BTreeMap<String, u64>) -> String {
+    by_reason
+        .iter()
+        .map(|(reason, count)| format!("{reason}={count}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -8350,6 +8377,8 @@ fn run_streaming_consumer(
     let mut failed_source_roots: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut source_inputs_committed = 0usize;
     let mut source_inputs_pending_recovery = 0usize;
+    // Task10: one map per run; only a successful input's own judgment folds in.
+    let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
 
     // Card 3 (flat combining, §14.2): when enabled and at least one
     // additional producer is live, we opportunistically drain pending
@@ -8415,6 +8444,10 @@ fn run_streaming_consumer(
                         // end is the existing hole/backfill path.
                         total_conversations += commit.inserted_conversations;
                         total_messages += commit.inserted_messages;
+                        accumulate_recall_uncovered(
+                            &mut recall_uncovered_by_reason,
+                            &commit.recall_uncovered_by_reason,
+                        );
                         ingest_outcome.canonical_mutations =
                             ingest_outcome.canonical_mutations.accumulate(
                                 crate::indexer::CanonicalMutationCounts {
@@ -8429,6 +8462,10 @@ fn run_streaming_consumer(
                             root_id = %root_id,
                             input = %commit.outcome.input_key().hex(),
                             outcome = %commit.outcome.describe(),
+                            recall_uncovered_total = commit.recall_uncovered_total,
+                            recall_uncovered_reasons = %recall_uncovered_reasons_field(
+                                &commit.recall_uncovered_by_reason
+                            ),
                             "source_input"
                         );
                         if let Some(p) = progress {
@@ -8772,6 +8809,8 @@ fn run_streaming_consumer(
         stats.total_messages = total_messages;
         stats.source_inputs_committed = source_inputs_committed;
         stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
+        stats.recall_uncovered_by_reason = recall_uncovered_by_reason.clone();
+        stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
         stats.quarantined_conversations = stats
             .quarantined_conversations
             .saturating_add(ingest_outcome.quarantined_conversations);
@@ -9399,6 +9438,7 @@ fn run_batch_index_with_connector_factories(
     // decision reads it.
     let mut source_inputs_committed = 0usize;
     let mut source_inputs_pending_recovery = 0usize;
+    let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
     let mut pending_source_mutations = crate::indexer::CanonicalMutationCounts::default();
     let mut pending_batches = pending_batches;
     for pending in pending_batches.iter_mut() {
@@ -9420,6 +9460,22 @@ fn run_batch_index_with_connector_factories(
                     ) {
                         source_inputs_pending_recovery += 1;
                     }
+                    accumulate_recall_uncovered(
+                        &mut recall_uncovered_by_reason,
+                        &commit.recall_uncovered_by_reason,
+                    );
+                    tracing::info!(
+                        target: "cass::scan_session",
+                        connector = pending.name,
+                        root_id = %root_id,
+                        input = %commit.outcome.input_key().hex(),
+                        outcome = %commit.outcome.describe(),
+                        recall_uncovered_total = commit.recall_uncovered_total,
+                        recall_uncovered_reasons = %recall_uncovered_reasons_field(
+                            &commit.recall_uncovered_by_reason
+                        ),
+                        "source_input"
+                    );
                     pending_source_mutations =
                         pending_source_mutations.accumulate(crate::indexer::CanonicalMutationCounts {
                             inserted_conversations: commit.inserted_conversations,
@@ -9569,6 +9625,8 @@ fn run_batch_index_with_connector_factories(
         stats.total_messages = total_messages;
         stats.source_inputs_committed = source_inputs_committed;
         stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
+        stats.recall_uncovered_by_reason = recall_uncovered_by_reason.clone();
+        stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
         stats.quarantined_conversations = stats
             .quarantined_conversations
             .saturating_add(ingest_outcome.quarantined_conversations);
@@ -16663,6 +16721,7 @@ fn reindex_explicit_watch_once_source_aware(
     let active_source_filter = ActiveSessionSourceFilter::new(false);
     let mut total_indexed = 0usize;
     let mut landed = 0usize;
+    let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
 
     // Task 35: this entry point consumes the units the router already decided.
@@ -16784,12 +16843,20 @@ fn reindex_explicit_watch_once_source_aware(
                 Ok(commit) if commit.outcome.is_success() => {
                     total_indexed = total_indexed.saturating_add(commit.inserted_conversations);
                     landed += 1;
+                    accumulate_recall_uncovered(
+                        &mut recall_uncovered_by_reason,
+                        &commit.recall_uncovered_by_reason,
+                    );
                     tracing::info!(
                         target: "cass::scan_session",
                         connector = unit.connector,
                         root_id = %job.root_id,
                         input = %commit.outcome.input_key().hex(),
                         outcome = %commit.outcome.describe(),
+                        recall_uncovered_total = commit.recall_uncovered_total,
+                        recall_uncovered_reasons = %recall_uncovered_reasons_field(
+                            &commit.recall_uncovered_by_reason
+                        ),
                         "source_input"
                     );
                 }
@@ -16812,6 +16879,8 @@ fn reindex_explicit_watch_once_source_aware(
         && let Ok(mut stats) = p.stats.lock()
     {
         stats.source_inputs_committed = stats.source_inputs_committed.saturating_add(landed);
+        accumulate_recall_uncovered(&mut stats.recall_uncovered_by_reason, &recall_uncovered_by_reason);
+        stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
     }
 
     // Task 35: report instead of bailing here. The caller runs every selected
@@ -16970,6 +17039,7 @@ fn resident_source_watch_trigger(
     let mut committed = 0usize;
     let mut processed_conversations = 0usize;
     let mut inserted_messages = 0usize;
+    let mut recall_uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
     let mut failed_root_ids: BTreeSet<String> = BTreeSet::new();
     // The high-water mark of inputs this trigger held at once. Committing from
     // the sink keeps it at one; a design that collected the root's jobs first
@@ -17017,6 +17087,10 @@ fn resident_source_watch_trigger(
                 Ok(commit) if commit.outcome.is_success() => {
                     committed = committed.saturating_add(1);
                     inserted_messages = inserted_messages.saturating_add(commit.inserted_messages);
+                    accumulate_recall_uncovered(
+                        &mut recall_uncovered_by_reason,
+                        &commit.recall_uncovered_by_reason,
+                    );
                     // A replay installed nothing, so it contributes nothing to
                     // "what this cycle processed"; anything else counts the
                     // conversations the input carried, which is the legacy
@@ -17037,6 +17111,10 @@ fn resident_source_watch_trigger(
                         root_id = %job_root_id,
                         input = %commit.outcome.input_key().hex(),
                         outcome = %commit.outcome.describe(),
+                        recall_uncovered_total = commit.recall_uncovered_total,
+                        recall_uncovered_reasons = %recall_uncovered_reasons_field(
+                            &commit.recall_uncovered_by_reason
+                        ),
                         "source_input"
                     );
                 }
@@ -17131,6 +17209,11 @@ fn resident_source_watch_trigger(
                 .saturating_add(processed_conversations);
             stats.total_messages = stats.total_messages.saturating_add(inserted_messages);
             stats.source_inputs_committed = stats.source_inputs_committed.saturating_add(committed);
+            accumulate_recall_uncovered(
+                &mut stats.recall_uncovered_by_reason,
+                &recall_uncovered_by_reason,
+            );
+            stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
             stats.connectors.push(ConnectorStats {
                 name: connector_name.to_string(),
                 conversations: processed_conversations,

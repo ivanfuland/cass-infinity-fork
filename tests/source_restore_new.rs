@@ -25,12 +25,12 @@ use tempfile::TempDir;
 
 const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 const MAPPING_DOMAIN: &str = "cass-source-mapping/2";
-const EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
+const EXCLUSION_EPOCH: &str = "cass-source-exclusion/2";
 const NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 const SAFETY_CONTRACT: &str = "cass.source-safety/1";
 const REDACTION_FINGERPRINT: &str =
     "redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
-const CODE_VERSION: &str = "cass-source-exclusion/1+redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
+const CODE_VERSION: &str = "cass-source-exclusion/2+redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
 const FIXED_SAFETY: &str = "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n";
 const ID_GUARD_FIXED: &str = "memory_files = [\"USER.md\"]\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = [\"exec\"]\n";
 const CONTEXT_SCHEMA: &str = "cass.restore-source-contexts/1";

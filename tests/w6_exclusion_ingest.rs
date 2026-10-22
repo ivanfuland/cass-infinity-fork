@@ -540,20 +540,19 @@ fn transport_chain_equivalence_across_ingestion_modes() {
 
 /// codex `rollout-*.jsonl` fixture: idx=0 host-shell wrapper (anchor 3,
 /// excluded), idx=1 a `cass_search` tool_call (not itself excluded) whose
-/// idx=2 `tool_result` embeds a synthetic Anthropic-shaped API key (anchor
-/// 1, bare codex name per R11) so the excluded row's `sha256` can be proven
-/// to hash the *redacted* text, not the raw secret, idx=3 a real user
-/// follow-up (not excluded). Filename must start with `rollout-`
-/// (`CodexConnector::is_rollout_file` filters on this even for an explicit
-/// single-file `ScanRoot::local` scan, T2b.2 finding); the path must ALSO
-/// sit under a `.codex/sessions/` ancestor -- `classify_paths`
-/// (`src/indexer/mod.rs`, `classify_paths_hints_codex_connector_for_
-/// explicit_codex_paths`) matches an explicit `--watch-once`/in-process
-/// path to a connector by that directory shape, not filename alone; a flat
-/// tempdir path is silently classified as "no connector" and produces zero
-/// rows with no error. Returns the file path and the raw (pre-redaction)
-/// `function_call_output` string so callers can independently compute the
-/// expected redacted hash.
+/// idx=2 `tool_result` is an ordinary unwrapped JSON result, idx=3 a real user
+/// follow-up (not excluded). Under the v2 rules this build now writes by
+/// default (Task10), a bare codex name alone is not proof of a recall (C06):
+/// idx2 is preserved byte-for-byte and carries no exclusion marker. Filename
+/// must start with `rollout-` (`CodexConnector::is_rollout_file` filters on
+/// this even for an explicit single-file `ScanRoot::local` scan, T2b.2
+/// finding); the path must ALSO sit under a `.codex/sessions/` ancestor --
+/// `classify_paths` (`src/indexer/mod.rs`, `classify_paths_hints_codex_
+/// connector_for_explicit_codex_paths`) matches an explicit `--watch-once`/
+/// in-process path to a connector by that directory shape, not filename alone;
+/// a flat tempdir path is silently classified as "no connector" and produces
+/// zero rows with no error. Returns the file path and the raw (unmodified)
+/// `function_call_output` string so callers can compare the preserved body.
 fn write_codex_host_shell_session(dir: &std::path::Path) -> (std::path::PathBuf, String) {
     let sessions_dir = dir.join(".codex").join("sessions").join("2026").join("09");
     std::fs::create_dir_all(&sessions_dir).expect("mkdir .codex/sessions/2026/09");
@@ -618,15 +617,13 @@ fn read_message_rows_single_conversation(
 }
 
 /// Judge case B.10 #1 (codex half): the CLI subprocess ingests the codex
-/// host-shell fixture; both anchors fire (idx0 anchor 3, idx2 anchor 1),
-/// the tool_call row (idx1) and the trailing user follow-up (idx3) survive
-/// byte-for-byte, row count is preserved (4 in, 4 out), and the anchor-1
-/// row's `excluded.sha256` is the hash of the *redacted* recall output, not
-/// the raw one (proving a real secret got scrubbed, not a no-op pass).
+/// host-shell fixture; the host-shell anchor still fires (idx0 anchor 3), the
+/// tool_call row (idx1) and the trailing user follow-up (idx3) survive
+/// byte-for-byte, row count is preserved (4 in, 4 out), and the bare-name
+/// ordinary result (idx2) is preserved with no marker -- the v2 rule the
+/// producer now writes by default.
 #[test]
 fn normal_ingest_codex_host_shell_and_bare_name_recall_positive() {
-    use sha2::{Digest, Sha256};
-
     let home_tmp = tempfile::TempDir::new().expect("home tempdir");
     let home = home_tmp.path();
     let data_dir = home.join("cass-data");
@@ -664,18 +661,31 @@ fn normal_ingest_codex_host_shell_and_bare_name_recall_positive() {
     assert_eq!(*idx1_idx, 1);
     assert!(!excluded1, "tool_call row must not itself be excluded: {:?}", rows[1]);
 
-    // idx2: tool_result carrying the synthetic secret, excluded via anchor 1.
-    let (idx2_idx, _role2, content2, excluded2, reason2, sha2_hex, ..) = &rows[2];
+    // idx2: a bare codex name with an ordinary unwrapped result is not proof
+    // of a recall under v2 (C06), so the body is preserved and no marker is
+    // written. The old sample is kept as it was; no wrapper was added to it.
+    let (idx2_idx, _role2, content2, excluded2, reason2, ..) = &rows[2];
     assert_eq!(*idx2_idx, 2);
-    assert!(*excluded2, "idx2 (tool_result) must be excluded (anchor 1): {:?}", rows[2]);
-    assert_eq!(reason2.as_deref(), Some("cass_recall"));
-    assert_eq!(content2, "", "excluded content must be empty: {:?}", rows[2]);
-    let redacted = coding_agent_search::indexer::redact_secrets::redact_text(&raw_recall_output).into_owned();
-    assert_ne!(redacted, raw_recall_output, "fixture sanity: the synthetic secret must actually get redacted, otherwise this assertion is vacuous");
-    let expected_sha = format!("{:x}", Sha256::digest(redacted.as_bytes()));
-    let raw_sha = format!("{:x}", Sha256::digest(raw_recall_output.as_bytes()));
-    assert_eq!(sha2_hex.as_deref(), Some(expected_sha.as_str()), "excluded.sha256 must hash the redacted text");
-    assert_ne!(sha2_hex.as_deref(), Some(raw_sha.as_str()), "excluded.sha256 must NOT equal the raw (unredacted) text's hash");
+    assert!(
+        !excluded2,
+        "the bare-name ordinary result must be preserved under v2: {:?}",
+        rows[2]
+    );
+    assert_eq!(reason2, &None, "a preserved row carries no exclusion reason");
+    // The body is preserved as canonical content, which still carries the
+    // ordinary secret redaction; no wrapper was added to the old sample and no
+    // exclusion marker was written.
+    let redacted =
+        coding_agent_search::indexer::redact_secrets::redact_text(&raw_recall_output)
+            .into_owned();
+    assert_ne!(
+        redacted, raw_recall_output,
+        "fixture sanity: the synthetic secret must actually get redacted"
+    );
+    assert_eq!(
+        content2, &redacted,
+        "the preserved result keeps its canonical (redacted) body"
+    );
 
     // idx3: trailing follow-up, untouched byte-for-byte.
     let (idx3_idx, _role3, content3, excluded3, ..) = &rows[3];
@@ -1017,7 +1027,8 @@ fn status_json_last_index_counters_survive_a_failed_run() {
 
 /// Writes (or overwrites) a codex `rollout-*.jsonl` fixture at a FIXED path:
 /// idx0 host-shell wrapper (anchor 3), idx1 `cass_search` tool_call, idx2
-/// its `tool_result` carrying `recall_content` (anchor 1, bare codex name),
+/// its `tool_result` carrying `recall_content` (bare codex name -- preserved,
+/// not excluded, under the v2 rules this build now writes by default),
 /// idx3 a real user follow-up. Unlike `write_codex_host_shell_session`
 /// (which picks its own path under a caller-given directory), this variant
 /// takes the full path so two calls can target the exact same session
@@ -1086,7 +1097,10 @@ fn mirror_restore_apply_carries_excluded_marker_through_to_candidate_db() {
     let a_rows = read_message_rows_single_conversation(&a_db);
     assert_eq!(a_rows.len(), 4, "sanity: A must have the fixture's 4 rows: {a_rows:?}");
     let a_excluded_count = a_rows.iter().filter(|r| r.3).count();
-    assert_eq!(a_excluded_count, 2, "sanity: both anchors (3 and 1) must have fired in A: {a_rows:?}");
+    assert_eq!(
+        a_excluded_count, 1,
+        "sanity: only the host-shell anchor fires in A under v2; the bare-name result is preserved: {a_rows:?}"
+    );
 
     // B: a brand-new, empty candidate DB (current schema, zero rows) --
     // `plan_mirror_restore` opens it read-only, so it must already exist as
@@ -1186,8 +1200,8 @@ fn mirror_restore_handles_secret_bearing_excluded_bodies_without_skipping_exclud
     let a_rows = read_message_rows_single_conversation(&a_db);
     assert_eq!(
         a_rows.iter().filter(|r| r.3).count(),
-        2,
-        "sanity: the host-shell and the secret-bearing recall hits must both be excluded in A: {a_rows:?}"
+        1,
+        "sanity: the host-shell anchor fires in A under v2; the bare-name result is preserved: {a_rows:?}"
     );
 
     let candidate_db = root.path().join("candidate.db");
@@ -1335,8 +1349,8 @@ fn mirror_restore_apply_fails_loud_on_broken_excluded_context_paths_config() {
     write_codex_host_shell_session_at(&session_path, "MIRROR-RESTORE-B6-RECALL-BODY");
 
     // Seed ingest with a WORKING config (no override file exists yet) --
-    // this must produce a raw-mirror with the fixture's two exclusion
-    // markers intact, same as the positive judgment above.
+    // this must produce a raw-mirror with the host-shell marker intact; the
+    // bare-name result is preserved under v2.
     let data_dir_a = root.path().join("data-a");
     std::fs::create_dir_all(&data_dir_a).expect("mkdir data_dir_a");
     let ingest_output = cass_cmd(&data_dir_a, &home)
@@ -1348,8 +1362,8 @@ fn mirror_restore_apply_fails_loud_on_broken_excluded_context_paths_config() {
     assert_eq!(a_rows.len(), 4, "sanity: seed must have the fixture's 4 rows: {a_rows:?}");
     assert_eq!(
         a_rows.iter().filter(|r| r.3).count(),
-        2,
-        "sanity: both anchors must have fired during seed ingest: {a_rows:?}"
+        1,
+        "sanity: the host-shell anchor fired during seed ingest under v2: {a_rows:?}"
     );
 
     // NOW break the config, between ingest and restore -- an operator

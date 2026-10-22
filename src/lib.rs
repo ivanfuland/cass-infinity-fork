@@ -88393,6 +88393,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "messages": { "type": ["integer", "null"] },
                 "quarantined_conversations": { "type": "integer" },
                 "lexical_update_deferred": { "type": "boolean" },
+                "recall_uncovered_total": { "type": "integer" },
+                "recall_uncovered_by_reason": { "type": "object" },
                 "indexing_stats": response_schema_opaque_object(),
                 "error": { "type": ["string", "null"] }
             }
@@ -91505,6 +91507,12 @@ fn run_index_with_data(
             let mut payload = cli_error_json_payload(err, elapsed_ms);
             if let Ok(stats) = index_progress.stats.lock() {
                 if let Some(model_api) = &stats.model_api { payload["model_api"] = model_api.clone(); }
+                // Task10: the error envelope carries the same run totals as the
+                // success envelope, taken from the one stats snapshot.
+                payload["recall_uncovered_total"] =
+                    serde_json::json!(stats.recall_uncovered_total);
+                payload["recall_uncovered_by_reason"] =
+                    serde_json::json!(stats.recall_uncovered_by_reason);
             }
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
@@ -91630,6 +91638,16 @@ fn run_index_with_data(
             map.insert(
                 "indexing_stats".to_string(),
                 serde_json::to_value(&*stats).unwrap_or_default(),
+            );
+            // Task10: the same two values `indexing_stats` carries, read from
+            // the same locked snapshot, so the two surfaces cannot disagree.
+            map.insert(
+                "recall_uncovered_total".to_string(),
+                serde_json::json!(stats.recall_uncovered_total),
+            );
+            map.insert(
+                "recall_uncovered_by_reason".to_string(),
+                serde_json::json!(stats.recall_uncovered_by_reason),
             );
         }
 

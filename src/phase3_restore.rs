@@ -22594,8 +22594,9 @@ workspace_scoped_files = []\nproject_read_documents = []\n";
             crate::storage::source_facts::effective_four_arrays_digest(&empty_arrays()).hex()
         );
 
-        // Epoch 1 keeps its own epoch, and the producer default has not moved.
-        assert_eq!(SOURCE_EXCLUSION_EPOCH, "cass-source-exclusion/1");
+        // Epoch 1 keeps its own epoch, and the producer default now writes the
+        // second epoch (Task10).
+        assert_eq!(SOURCE_EXCLUSION_EPOCH, "cass-source-exclusion/2");
         let v1 = load_fixed_safety_config_for_code_version(&path, &version(SOURCE_EXCLUSION_EPOCH_V1))
             .expect("a v1 fixed copy loads");
         let profile_v1 = source_profile_material(&v1).expect("the v1 profile assembles");
@@ -22607,8 +22608,8 @@ workspace_scoped_files = []\nproject_read_documents = []\n";
             source_profile_material(&default)
                 .expect("the default profile assembles")
                 .exclusion_epoch,
-            SOURCE_EXCLUSION_EPOCH_V1,
-            "the default loader still names the v1 epoch"
+            SOURCE_EXCLUSION_EPOCH_V2,
+            "the default loader names the second epoch"
         );
 
         // A version this build cannot read is refused, never downgraded.
@@ -22684,11 +22685,14 @@ workspace_scoped_files = []\nproject_read_documents = []\n";
     }
 
     #[test]
-    fn mcp_restore_v2_staging_route_keeps_the_current_default() {
-        // The current default is still the v1 epoch, and it preserves the
-        // direct CLI recall exactly as it always did.
+    fn mcp_restore_v2_staging_route_follows_each_material_version() {
+        // An explicit v1 material keeps the v1 epoch, and that route preserves
+        // the direct CLI recall exactly as it always did.
         let temp_v1 = tempfile::TempDir::new().expect("tempdir");
-        let job_v1 = prepare_job(temp_v1.path(), None);
+        let job_v1 = prepare_job(
+            temp_v1.path(),
+            Some(&version(SOURCE_EXCLUSION_EPOCH_V1)),
+        );
         assert_eq!(
             job_v1.input.safety_identity().code_version(),
             version(SOURCE_EXCLUSION_EPOCH_V1)
@@ -22711,6 +22715,32 @@ workspace_scoped_files = []\nproject_read_documents = []\n";
             conversation_v1.prepared.excluded.iter().all(Option::is_none),
             "the v1 route writes no recall marker"
         );
+
+        // The current default is the second epoch (Task10), and it cleans the
+        // body with marker 2 just like the explicit copy.
+        let temp_default = tempfile::TempDir::new().expect("tempdir");
+        let job_default = prepare_job(temp_default.path(), None);
+        assert_eq!(
+            job_default.input.safety_identity().code_version(),
+            version(SOURCE_EXCLUSION_EPOCH_V2),
+            "the default loader names the second epoch"
+        );
+        let preview_default =
+            preview_source_input_safety(&job_default).expect("the default preview");
+        let conversation_default = preview_default
+            .conversations
+            .first()
+            .expect("one projected conversation");
+        assert_eq!(conversation_default.prepared.conv.messages.len(), 3);
+        assert_eq!(
+            conversation_default.prepared.conv.messages[2].content, "",
+            "the default route clears the recall body"
+        );
+        let marker_default = conversation_default.prepared.excluded[2]
+            .as_ref()
+            .expect("the default route excludes the recall result");
+        assert_eq!(marker_default.rule_version, 2);
+        assert_eq!(marker_default.reason, ExclusionReason::CassRecall);
 
         // The same entry on an explicit v2 configuration cleans the body and
         // stamps marker 2.
