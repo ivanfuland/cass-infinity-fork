@@ -7482,6 +7482,19 @@ async fn execute_cli(
                         rerank_limit,
                     )?;
 
+                    // 04: an explicit --since/--until that cannot be parsed is
+                    // a usage error, never a silent fallback to the default
+                    // window. Resolved here, before `refresh_index_inline` and
+                    // before any ingest, database access or model work.
+                    let time_filter = TimeFilter::new_search_strict(
+                        days,
+                        today,
+                        yesterday,
+                        week,
+                        since.as_deref(),
+                        until.as_deref(),
+                    )?;
+
                     // PR9 09a: `--vector-search-mode` is an independent
                     // dimension from `--mode`, but lexical search has no
                     // vector leg at all -- silently accepting the flag there
@@ -7609,14 +7622,7 @@ async fn execute_cli(
                         wrap,
                         progress,
                         robot_mode,
-                        TimeFilter::new(
-                            days,
-                            today,
-                            yesterday,
-                            week,
-                            since.as_deref(),
-                            until.as_deref(),
-                        ),
+                        time_filter,
                         aggregate,
                         explain,
                         dry_run,
@@ -23235,6 +23241,61 @@ impl TimeFilter {
 
         TimeFilter { since, until }
     }
+
+    /// Strict constructor for the `search` command.
+    ///
+    /// Convenience ranges (`--today`, `--yesterday`, `--week`, `--days`) come
+    /// from the unchanged `TimeFilter::new`. An explicit `--since`/`--until`
+    /// value is parsed exactly once with the command's existing parser, and a
+    /// value that does not parse is a usage error instead of a silent fallback
+    /// to the default window. The merged window must not run backwards.
+    fn new_search_strict(
+        days: Option<u32>,
+        today: bool,
+        yesterday: bool,
+        week: bool,
+        since_str: Option<&str>,
+        until_str: Option<&str>,
+    ) -> CliResult<Self> {
+        let mut filter = Self::new(days, today, yesterday, week, None, None);
+        if let Some(raw) = since_str {
+            filter.since = Some(
+                parse_datetime_str(raw)
+                    .ok_or_else(|| invalid_time_argument("--since", raw, SEARCH_TIME_FORMS))?,
+            );
+        }
+        if let Some(raw) = until_str {
+            filter.until = Some(
+                parse_datetime_str(raw)
+                    .ok_or_else(|| invalid_time_argument("--until", raw, SEARCH_TIME_FORMS))?,
+            );
+        }
+        if let (Some(since), Some(until)) = (filter.since, filter.until)
+            && since > until
+        {
+            return Err(CliError::usage(
+                "--since resolves to a time after --until (empty range)",
+                Some(format!(
+                    "Computed window start ({since}ms) is after end ({until}ms). \
+                     Check the --since/--until values; relative offsets like `-7d` mean \"7 days ago\"."
+                )),
+            ));
+        }
+        Ok(filter)
+    }
+}
+
+const SEARCH_TIME_FORMS: &str = "YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, an RFC3339 timestamp, \
+     'today', 'yesterday', or a relative offset like -7d / -24h";
+
+const FLEXIBLE_TIME_FORMS: &str = "YYYY-MM-DD, an RFC3339 timestamp with an offset, \
+     'today', 'yesterday', or a relative offset like -7d / -24h";
+
+fn invalid_time_argument(flag: &str, raw: &str, accepted: &str) -> CliError {
+    CliError::usage(
+        format!("Invalid {flag} value '{raw}'."),
+        Some(format!("Use {accepted}.")),
+    )
 }
 
 fn parse_datetime_str(s: &str) -> Option<i64> {
@@ -81278,6 +81339,22 @@ fn run_sessions(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
 
+    // 04: an explicit --since that cannot be parsed is a usage error. Resolve
+    // it before the database is opened so a missing database cannot mask it.
+    let since_ms: Option<i64> = match since {
+        None => None,
+        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
+                 'today', 'yesterday', or a relative offset like -7d / -24h."
+            ),
+            hint: Some("Example: cass sessions --since -7d".into()),
+            retryable: false,
+        })?),
+    };
+
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
         (Some(path), _) => Some(normalize_session_filter_path(path)?),
@@ -81295,19 +81372,6 @@ fn run_sessions(
         Some(n) => Some(n),
         None if current_determined_workspace => Some(1),
         None => Some(10),
-    };
-    let since_ms: Option<i64> = match since {
-        None => None,
-        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!(
-                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
-                 'today', 'yesterday', or a relative offset like -7d / -24h."
-            ),
-            hint: Some("Example: cass sessions --since -7d".into()),
-            retryable: false,
-        })?),
     };
 
     // cass#323: enumerate conversations WITHOUT joining messages. The old
@@ -98887,6 +98951,26 @@ fn run_timeline(
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
+    // 04: resolve explicit times strictly before the database is opened, so an
+    // unparseable value is a usage error instead of being folded into the
+    // default window or masked by a missing database. `--today` keeps its
+    // original priority over explicit values, but it does not excuse a value
+    // that cannot be parsed.
+    let since_ms = match since {
+        Some(raw) => Some(
+            parse_datetime_flexible(raw)
+                .ok_or_else(|| invalid_time_argument("--since", raw, FLEXIBLE_TIME_FORMS))?,
+        ),
+        None => None,
+    };
+    let until_ms = match until {
+        Some(raw) => Some(
+            parse_datetime_flexible(raw)
+                .ok_or_else(|| invalid_time_argument("--until", raw, FLEXIBLE_TIME_FORMS))?,
+        ),
+        None => None,
+    };
+
     let db_path = analytics_db_path(data_dir, db_override.as_ref());
     let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
@@ -98903,12 +98987,9 @@ fn run_timeline(
         };
         (local_start.timestamp_millis(), now.timestamp_millis())
     } else {
-        let start = since
-            .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp_millis());
-        let end = until
-            .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| now.timestamp_millis());
+        let start =
+            since_ms.unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp_millis());
+        let end = until_ms.unwrap_or_else(|| now.timestamp_millis());
         (start, end)
     };
 
