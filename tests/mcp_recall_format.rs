@@ -235,7 +235,23 @@ fn real_four_commands_keep_the_existing_json_payloads() {
         let text = std::str::from_utf8(&output).unwrap();
         let recalled = decode(text, tool).unwrap();
         if tool == RecallTool::Search {
-            assert_eq!(recalled["hits"], normal["hits"]);
+            let mut original_hits = recalled["hits"].clone();
+            for hit in original_hits.as_array_mut().unwrap() {
+                assert!(
+                    hit.as_object_mut()
+                        .unwrap()
+                        .remove("content_sha256")
+                        .is_some()
+                );
+            }
+            assert!(
+                normal["hits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|hit| hit.get("content_sha256").is_none())
+            );
+            assert_eq!(original_hits, normal["hits"]);
             let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
             assert_eq!(keys(&recalled), keys(&normal));
             assert_eq!(keys(&recalled["_meta"]), keys(&normal["_meta"]));

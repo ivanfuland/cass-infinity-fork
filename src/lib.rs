@@ -21664,6 +21664,18 @@ fn command_requests_recall(command: Option<&Commands>) -> bool {
     )
 }
 
+impl From<crate::search::query::RecallIdentityUnavailable> for CliError {
+    fn from(error: crate::search::query::RecallIdentityUnavailable) -> Self {
+        Self {
+            code: 9,
+            kind: "identity_unavailable",
+            message: error.to_string(),
+            hint: Some("Search again after the index is stable.".into()),
+            retryable: false,
+        }
+    }
+}
+
 fn recall_cli_error(error: impl std::fmt::Display) -> CliError {
     CliError {
         code: 9,
@@ -25582,7 +25594,7 @@ fn run_cli_search(
     // P09: a rerank first lookup fetches the full, un-projected hit body so
     // both the frozen window and the rerank input are complete regardless of
     // the display projection. The closed path keeps its display-driven mask.
-    let search_field_mask = if rerank_on {
+    let search_field_mask = if rerank_on || robot_format == Some(RobotFormat::Recall) {
         crate::search::query::FieldMask::FULL
     } else {
         field_mask
@@ -27225,13 +27237,26 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
 
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
+        let recall = format == RobotFormat::Recall;
+        let identities = if recall {
+            crate::search::query::resolve_recall_hit_identities(&db_path, &display_result.hits)?
+        } else {
+            Vec::new()
+        };
+        let mut recall_buffer = Vec::new();
+        let mut stdout = std::io::stdout();
+        let sink: &mut dyn std::io::Write = if recall {
+            &mut recall_buffer
+        } else {
+            &mut stdout
+        };
         output_robot_results(
             &query,
             limit,
             cursor_page_limit,
             offset,
             &display_result,
-            format,
+            if recall { RobotFormat::Json } else { format },
             robot_meta,
             elapsed_ms,
             &fields,
@@ -27261,8 +27286,14 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
             window.as_ref(),
             // PR9 task 08: the one production sink -- same stdout the seven
             // former inline `std::io::stdout()` sites wrote to.
-            &mut std::io::stdout(),
+            sink,
+            recall.then_some(identities.as_slice()),
         )?;
+        if recall {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&recall_buffer).map_err(recall_cli_error)?;
+            output_recall_value(recall_output::RecallTool::Search, &payload)?;
+        }
     } else {
         // PR9 task 08: the plain-text surface of the same fact JSON/JSONL
         // carry as `search_precision` -- printed once, ahead of any hit line,
@@ -29495,50 +29526,12 @@ fn output_robot_results(
     // `SearchResult` and read back what the real serializer emitted. The one
     // production caller passes stdout; unit tests pass a `Vec<u8>`.
     out: &mut dyn std::io::Write,
+    recall_identities: Option<&[crate::search::query::RecallHitIdentity]>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
 
     if format == RobotFormat::Recall {
-        let mut buffer = Vec::new();
-        output_robot_results(
-            query,
-            limit,
-            cursor_page_limit,
-            offset,
-            result,
-            RobotFormat::Json,
-            include_meta,
-            elapsed_ms,
-            fields,
-            truncation_budgets,
-            max_tokens,
-            request_id,
-            input_cursor,
-            has_more_results,
-            total_matches_exact,
-            state_meta,
-            search_completeness,
-            index_freshness,
-            storage_integrity,
-            warning,
-            aggregations,
-            total_matches,
-            explanation,
-            timed_out,
-            timeout_ms,
-            search_mode_meta,
-            search_ms,
-            rerank_ms,
-            rerank_applied,
-            rerank_requested,
-            window,
-            &mut buffer,
-        )?;
-        let payload = serde_json::from_slice(&buffer).map_err(recall_cli_error)?;
-        let encoded = recall_output::encode(recall_output::RecallTool::Search, &payload)
-            .map_err(recall_cli_error)?;
-        writeln!(out, "{encoded}").map_err(recall_cli_error)?;
-        return Ok(());
+        return Err(recall_cli_error("search recall requires indexed message identity"));
     }
 
     if matches!(format, RobotFormat::Sessions) {
@@ -29610,6 +29603,7 @@ fn output_robot_results(
     // must fall through to the slower `match format` path below (the one
     // that actually emits them) instead of silently bypassing it here.
     if matches!(format, RobotFormat::Json)
+        && recall_identities.is_none()
         && summary_projection
         && !needs_truncation
         && max_tokens.is_none()
@@ -29750,6 +29744,7 @@ fn output_robot_results(
     // `--robot-meta`) silent no-op this item reports: this exact fast path
     // is what a bare `cass search ... --json --rerank` hits.
     if matches!(format, RobotFormat::Json)
+        && recall_identities.is_none()
         && all_fields_requested
         && !needs_truncation
         && max_tokens.is_none()
@@ -29984,6 +29979,21 @@ fn output_robot_results(
                     serde_json::json!(hit.rerank_score),
                 );
             }
+        }
+    }
+
+    // Identity must be attached before the existing budget/cursor projection.
+    // The digest itself was resolved from full DB text before display cropping.
+    if let Some(identities) = recall_identities {
+        if identities.len() != filtered_hits.len() {
+            return Err(recall_cli_error("search identity projection count differs"));
+        }
+        for (hit, identity) in filtered_hits.iter_mut().zip(identities) {
+            let map = hit
+                .as_object_mut()
+                .ok_or_else(|| recall_cli_error("invalid hit"))?;
+            let value = serde_json::to_value(identity).map_err(recall_cli_error)?;
+            map.extend(value.as_object().expect("identity is an object").clone());
         }
     }
 
@@ -31040,6 +31050,7 @@ mod pr9_candidate_meta_output_tests {
             window.is_some(),
             window,
             &mut sink,
+            None,
         )
         .expect("render robot output");
         String::from_utf8(sink).expect("utf-8 robot output")
