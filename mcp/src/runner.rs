@@ -330,12 +330,13 @@ impl Runner {
             ));
         };
 
-        // The same control decides the captured bytes too: the child is waited
-        // and the capture is ready, but this request's outcome is not decided
-        // yet. A cancellation or the total deadline that arrived while the
-        // caller was not polled still outranks a not-yet-determined exit
-        // status, format error or success (C10). Failures the supervisor had
-        // already decided returned above and keep their cause.
+        // The same control decides the captured bytes too: when the exit was
+        // successful, the capture is ready but this request's outcome is not
+        // decided yet. A cancellation or the total deadline that arrived while
+        // the caller was not polled still outranks that pending success or a
+        // format error (C10). A non-zero exit was already decided by the
+        // supervisor and is classified below before this gate; failures the
+        // supervisor had already decided returned above and keep their cause.
         let decision = control.clone();
 
         let supervised = tokio::spawn(supervise_holding(
@@ -373,16 +374,21 @@ impl Runner {
             Supervised::TimedOut => return Err(ToolError::timeout()),
         };
 
-        // This candidate result is still undecided, so the same control rules
-        // it in its own synchronous moment. The check carries no `await`: one
-        // request publishes at most one outcome.
-        if let Some(error) = decision.observed_failure() {
-            return Err(error);
-        }
-
+        // A non-zero exit was decided by the supervisor, whose direct child is
+        // already waited and whose captured bytes are kept. It is classified
+        // before the pending-success gate, so a cancellation or a deadline
+        // that arrives after that decision cannot replace the cause.
         if !status.success() {
             let code = status.code();
             return Err(classify_exit(&stderr, code));
+        }
+
+        // The exit was successful, so this candidate result is still
+        // undecided. The same control rules it in its own synchronous moment.
+        // The check carries no `await`: one request publishes at most one
+        // outcome.
+        if let Some(error) = decision.observed_failure() {
+            return Err(error);
         }
 
         let stdout = std::str::from_utf8(&stdout)
@@ -446,17 +452,20 @@ async fn supervise_holding(
     outcome
 }
 
-/// Own the child until both pipes reach EOF and `wait` reports. Every byte
-/// stored on either stream counts against the same budget; the first chunk
-/// that would cross it stops both reads and moves straight to reaping. Each
-/// read requests at most the remaining budget plus one probe byte, so a small
-/// remaining budget never consumes a full chunk beyond it. A non-zero exit
-/// observed in the same window never overrides the overflow.
+/// Own the child until both pipes reach EOF and `wait` reports, or until a
+/// non-zero `wait` decides the failure. Every byte stored on either stream
+/// counts against the same budget; the first chunk that would cross it stops
+/// both reads and moves straight to reaping. Each read requests at most the
+/// remaining budget plus one probe byte, so a small remaining budget never
+/// consumes a full chunk beyond it. A non-zero exit observed in the same
+/// window never overrides the overflow.
 ///
 /// Cancellation and the total deadline are observed in the same loop, with the
 /// fixed priority `cancel > deadline > overflow > exit > format > success`.
 /// Once a failure is decided it is never rewritten by a later event: the
-/// reaping below already belongs to that one terminal state.
+/// reaping below already belongs to that one terminal state. A non-zero exit
+/// is such a decision: its direct child was already waited, so it does not
+/// wait for a descendant that still holds a read end open.
 async fn supervise(
     mut child: Child,
     mut stdout: ChildStdout,
@@ -474,6 +483,7 @@ async fn supervise(
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut failure: Option<Supervised> = None;
+    let mut exit_decided = false;
 
     while stdout_open || stderr_open || status.is_none() {
         // `total <= budget` always holds. The extra byte is the only probe
@@ -531,7 +541,19 @@ async fn supervise(
             }
             waited = child.wait(), if status.is_none() => {
                 match waited {
-                    Ok(observed) => status = Some(observed),
+                    Ok(observed) => {
+                        status = Some(observed);
+                        // A non-zero exit is this request's own decided
+                        // failure. Its direct child was just waited and the
+                        // bytes an earlier read branch already took are kept,
+                        // so it never waits for a descendant that still holds
+                        // a read end open. A later cancellation or deadline
+                        // must not rewrite this cause.
+                        if !observed.success() {
+                            exit_decided = true;
+                            break;
+                        }
+                    }
                     Err(_) => {
                         failure = Some(Supervised::ReadFailed);
                         break;
@@ -553,9 +575,10 @@ async fn supervise(
 
     // Nothing is determined yet: this is the supervisor's last decision point.
     // A cancellation or an elapsed deadline that is already observable here
-    // replaces the pending success; `wait` still has to report before the
-    // permit is dropped.
-    if let Some(overdue) = control.overdue() {
+    // replaces a pending success; `wait` still has to report before the permit
+    // is dropped. A decided non-zero exit is not a pending success and never
+    // reaches this gate.
+    if !exit_decided && let Some(overdue) = control.overdue() {
         reap(&mut child, grace).await;
         return overdue.into_supervised();
     }
@@ -1249,6 +1272,197 @@ mod tests {
             "the child must be waited before the permit is released"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Ticket 18c: a non-zero exit that the supervisor already waited is a
+    // decided failure. A cancellation or the total deadline that arrives
+    // afterwards must not replace it.
+    // -----------------------------------------------------------------------
+
+    /// A descendant recorded by exact PID, killed by that PID only. `Drop`
+    /// runs on the assertion-failure path too, so no bounded `sleep` outlives
+    /// the test as an orphan.
+    struct RecordedDescendant {
+        pid: i32,
+        file: std::path::PathBuf,
+    }
+
+    impl RecordedDescendant {
+        fn read(file: &std::path::Path) -> Self {
+            let pid = read_pid(file);
+            Self {
+                pid,
+                file: file.to_path_buf(),
+            }
+        }
+    }
+
+    /// Read an exact PID the child recorded. The direct child is only read,
+    /// never killed: it was already waited, so its number may be reused.
+    fn read_pid(file: &std::path::Path) -> i32 {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("{} carries no pid", file.display()))
+    }
+
+    impl Drop for RecordedDescendant {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+            }
+            let limit = std::time::Instant::now() + Duration::from_secs(5);
+            while std::path::Path::new("/proc")
+                .join(self.pid.to_string())
+                .exists()
+                && std::time::Instant::now() < limit
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
+
+    /// One real child prints a short stderr line, leaves a descendant holding
+    /// the stderr pipe, and exits 7. The supervisor must decide that exit and
+    /// release the permit while the caller is deliberately not polled; a
+    /// cancellation or the deadline then lands in that window.
+    async fn a_waited_nonzero_exit_then(cancel: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        for _ in 0..5 {
+            let dir = std::env::temp_dir().join(format!(
+                "cc-cass-t18c-nonzero-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let executable = dir.join("fake-cass");
+            let direct_file = dir.join("direct.pid");
+            let holder_file = dir.join("holder.pid");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\n\
+                     printf '%s\\n' \"$$\" > '{direct}'\n\
+                     sleep 30 >/dev/null &\n\
+                     printf '%s\\n' \"$!\" > '{holder}'\n\
+                     printf 'fixture failing\\n' >&2\n\
+                     exit 7\n",
+                    direct = direct_file.display(),
+                    holder = holder_file.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let admission = Admission::new(1, 1);
+            let runner = Runner {
+                cass_bin: executable,
+                data_dir: dir.clone(),
+                api_config: dir.join("api.toml"),
+                embedding_profile: "fixed".into(),
+                rerank_profile: "fixed".into(),
+                max_output_bytes: 4096,
+                terminate_grace: Duration::from_millis(50),
+                request_timeout: Duration::from_secs(30),
+                admission: Arc::clone(&admission),
+            };
+            let args = serde_json::json!({});
+            let call = crate::tools::parse(RecallTool::Sessions, args.as_object()).unwrap();
+            let token = CancellationToken::new();
+            let control = RequestControl::new(
+                token.clone(),
+                Instant::now(),
+                if cancel {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_millis(300)
+                },
+            );
+            let deadline = control.deadline;
+            let mut pending = Box::pin(runner.run(RecallTool::Sessions, &call, control));
+            let first = poll_once(pending.as_mut());
+            if let std::task::Poll::Ready(Err(error)) = &first
+                && (error.code == CASS_EXIT || error.code == TIMEOUT)
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+            assert!(
+                first.is_pending(),
+                "the first poll already returned {first:?}"
+            );
+
+            // The supervisor decides the non-zero exit and drops the permit
+            // before the caller is polled again.
+            for _ in 0..2000 {
+                if admission.counters() == (0, 0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                admission.counters(),
+                (0, 0),
+                "the supervisor never decided the waited non-zero exit"
+            );
+            let direct = read_pid(&direct_file);
+            let holder = RecordedDescendant::read(&holder_file);
+            assert!(
+                !std::path::Path::new("/proc")
+                    .join(direct.to_string())
+                    .exists(),
+                "the direct child must be waited when its non-zero exit is decided"
+            );
+
+            if cancel {
+                token.cancel();
+            } else {
+                tokio::time::sleep_until(deadline).await;
+            }
+            let outcome = match poll_once(pending.as_mut()) {
+                std::task::Poll::Ready(outcome) => outcome,
+                std::task::Poll::Pending => {
+                    panic!("the decided non-zero exit was already available")
+                }
+            };
+            let error = outcome.expect_err("a non-zero exit must remain a failure");
+            println!(
+                "MEASURED waited-nonzero cancel={cancel} code={} cli_exit_code={:?} \
+                 direct={direct} holder={}",
+                error.code, error.cli_exit_code, holder.pid
+            );
+            assert_eq!(
+                error.code, CASS_EXIT,
+                "a late control event must not rewrite the waited non-zero exit"
+            );
+            assert_eq!(error.cli_exit_code, Some(7));
+            assert_eq!(
+                admission.counters(),
+                (0, 0),
+                "the permit is released exactly once, after the wait"
+            );
+
+            drop(holder);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        panic!("the waited non-zero window could not be built in five attempts");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waited_nonzero_exit_is_not_rewritten_by_a_late_cancellation() {
+        a_waited_nonzero_exit_then(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_waited_nonzero_exit_is_not_rewritten_by_a_late_deadline() {
+        a_waited_nonzero_exit_then(false).await;
     }
 }
 

@@ -154,6 +154,15 @@ case "$mode" in
     cat "$dir/answer.$sub.stdout"
     exit 0
     ;;
+  latefd)
+    # One `sleep` process is the only descendant, so the recorded `$!` is the
+    # exact PID that holds the inherited stderr pipe. It has a bounded life;
+    # the test also kills that exact PID and waits for it to disappear.
+    sleep 2 >/dev/null &
+    printf '%s\n' "$!" > "$dir/holder.$token"
+    printf 'fixture failing\n' >&2
+    exit 7
+    ;;
   *)
     while [ ! -f "$dir/release.$token" ]; do sleep 0.02; done
     cat "$dir/answer.$sub.stdout"
@@ -1538,5 +1547,151 @@ fn a_2026_disconnect_cancels_the_request_before_its_deadline() {
     fixture.release("m2");
     assert_success(&next.recv_tool(OBSERVE));
     assert_eq!(fixture.pids().len(), 2);
+    assert!(fixture.live_pids().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 18c-AC1: an already-waited non-zero exit is kept before the deadline
+// ---------------------------------------------------------------------------
+
+/// The descendant that holds the stderr pipe after its direct parent exited.
+/// It is recorded by exact PID and killed by that PID only, never by name.
+/// `Drop` runs on the assertion-failure path too, so the test leaves no
+/// orphan behind.
+struct HolderGuard {
+    pid: i32,
+    path: PathBuf,
+}
+
+impl HolderGuard {
+    fn recorded(path: &Path) -> Self {
+        wait_for(|| path.exists(), &format!("{} to appear", path.display()));
+        let pid = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("{} carries no pid", path.display()));
+        Self {
+            pid,
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        if alive(self.pid) {
+            unsafe {
+                libc::kill(self.pid, libc::SIGKILL);
+            }
+        }
+        // A bounded wait for the exact PID to be gone; never by name.
+        let limit = Instant::now() + Duration::from_secs(10);
+        while alive(self.pid) && Instant::now() < limit {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn a_nonzero_exit_already_waited_is_kept_before_the_request_deadline() {
+    const TIMEOUT_MS: u64 = 1_200;
+
+    let fixture = Fixture::new("nonzero-before-deadline");
+    fixture.set_mode("e7", "latefd");
+    let server = start_server(&fixture, 1, 1, TIMEOUT_MS, 300);
+    let session = initialize(&server);
+
+    let fired = Instant::now();
+    let call = fire_2025(
+        &server,
+        &session,
+        1,
+        "cass_search",
+        json!({ "query": "e7" }),
+        "e7",
+    );
+
+    wait_for(|| fixture.ready("e7"), "the controlled CLI never started");
+    let direct = fixture
+        .pid_for("e7")
+        .expect("the controlled CLI recorded its pid");
+    let holder = HolderGuard::recorded(&fixture.dir.join("holder.e7"));
+
+    // The direct child's own exit is observed through its exact PID. This is
+    // the product's `wait` becoming visible to the test, not a log line.
+    let (reaped_tx, reaped_rx) = mpsc::channel();
+    let watcher = thread::spawn(move || {
+        let limit = Instant::now() + OBSERVE;
+        while Instant::now() < limit {
+            if !alive(direct) {
+                let _ = reaped_tx.send(Some(Instant::now()));
+                return;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let _ = reaped_tx.send(None);
+    });
+
+    let result = call.recv_tool(OBSERVE);
+    let answered = fired.elapsed();
+    let reaped = reaped_rx.recv_timeout(OBSERVE).expect("the PID watcher");
+    let _ = watcher.join();
+
+    println!(
+        "MEASURED nonzero-before-deadline: direct={direct} holder={} answered={answered:?} \
+         reaped_after_start={:?} deadline={TIMEOUT_MS}ms holder_alive={}",
+        holder.pid,
+        reaped.map(|at| at.duration_since(fired)),
+        alive(holder.pid),
+    );
+
+    assert_error_code(&result, "cass_exit");
+    let value: Value = serde_json::from_str(result_text(&result)).expect("error text is JSON");
+    assert_eq!(
+        value["error"]["cli_exit_code"], 7,
+        "the real CLI exit code must be kept: {value}"
+    );
+    assert!(
+        answered < Duration::from_millis(TIMEOUT_MS),
+        "the decided non-zero exit must be published before the request deadline: {answered:?}"
+    );
+    let reaped_after_start = reaped.expect("the direct child was never waited");
+    assert!(
+        reaped_after_start.duration_since(fired) < Duration::from_millis(TIMEOUT_MS),
+        "the direct child must be waited before the request deadline"
+    );
+    assert!(
+        !alive(direct),
+        "the direct child must be waited before the error is published"
+    );
+    assert!(
+        alive(holder.pid),
+        "the descendant must still hold the stderr pipe when the decided failure is published"
+    );
+
+    // Terminate the recorded descendant by its exact PID before a neighbour
+    // needs the slot, and prove it is gone.
+    drop(holder);
+
+    let next = fire_2025(
+        &server,
+        &session,
+        2,
+        "cass_search",
+        json!({ "query": "q8" }),
+        "q8",
+    );
+    wait_for(
+        || fixture.ready("q8"),
+        "the slot must return after the kept non-zero result",
+    );
+    fixture.release("q8");
+    assert_success(&next.recv_tool(OBSERVE));
+    assert_eq!(
+        fixture.pids().len(),
+        2,
+        "only the failed call and its neighbour may start a child"
+    );
     assert!(fixture.live_pids().is_empty());
 }
