@@ -5,9 +5,8 @@ pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
 pub mod quarantine;
 pub mod quarantine_retry;
-/// Ticket 05: v2 MCP recall judgment and source extraction. Declared but not
-/// wired into the default producer; the ingest switch is a later ticket.
-#[allow(dead_code)]
+/// Ticket 05 / Task10: v2 MCP recall judgment and source extraction.
+/// `source_ingest` applies it as the default rule epoch (2).
 pub(crate) mod recall_v2;
 pub mod redact_secrets;
 pub mod refresh_ledger;
