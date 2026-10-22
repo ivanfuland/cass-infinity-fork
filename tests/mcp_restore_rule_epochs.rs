@@ -1546,12 +1546,13 @@ fn mcp_restore_v2_nonempty_cli_recover_and_export() {
 }
 
 // ---------------------------------------------------------------------------
-// 09-AC2: every one-key material mutation is refused before any write
+// 09-AC2: every single-fact material mutation is refused before any write
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum Mutation {
     RemoveProfileKey,
+    MissingRootSourceProfile,
     UnknownCodeVersion,
     EpochMismatch,
     RedactionFingerprint,
@@ -1564,11 +1565,22 @@ enum Mutation {
 fn mutate(world: &World, journal: &mut Json, mutation: Mutation) {
     match mutation {
         Mutation::RemoveProfileKey => {
+            // One key inside the profile object: the rest of the profile, the
+            // contexts, their digest and every planned binding stay as they are.
             journal["source_profile"]
                 .as_object_mut()
                 .expect("the profile is an object")
                 .remove("exclusion_epoch")
                 .expect("the key is present before removal");
+        }
+        Mutation::MissingRootSourceProfile => {
+            // The journal's own `source_profile` member is absent, while the
+            // contexts, their digest and every planned binding stay intact.
+            journal
+                .as_object_mut()
+                .expect("the journal is an object")
+                .remove("source_profile")
+                .expect("the member is present before removal");
         }
         Mutation::UnknownCodeVersion => {
             journal["source_profile"]["code_version"] =
@@ -1602,6 +1614,10 @@ fn mutate(world: &World, journal: &mut Json, mutation: Mutation) {
 fn mcp_restore_rule_epochs_reject_bad_v2_material_without_writes() {
     let cases = [
         ("remove-profile-key", Mutation::RemoveProfileKey),
+        (
+            "missing-root-source-profile",
+            Mutation::MissingRootSourceProfile,
+        ),
         ("unknown-code-version", Mutation::UnknownCodeVersion),
         ("epoch-code-version-mismatch", Mutation::EpochMismatch),
         ("redaction-fingerprint", Mutation::RedactionFingerprint),
@@ -1617,6 +1633,9 @@ fn mcp_restore_rule_epochs_reject_bad_v2_material_without_writes() {
         let before_counts = counts(&world.db);
         let before_blobs = sealed_blobs(&setup);
         mutate(world, &mut journal, mutation);
+        // The exact material the CLI is about to refuse, so the position of
+        // each mutation is auditable instead of inferred from the case name.
+        write_evidence_json(case, "journal.mutated.json", &journal);
         let journal_path = write_journal(world, &journal, "journal.json");
         let before_journal = fs::read(&journal_path).expect("read the planned journal");
 
