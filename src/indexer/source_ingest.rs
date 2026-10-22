@@ -47,6 +47,13 @@ pub(crate) const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 /// regex fingerprint alone does not.
 pub(crate) const SOURCE_EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
 
+/// The first exclusion-rule epoch as a fixed reader identity.
+///
+/// Readers accept this epoch whatever epoch the current producer writes, so it
+/// is deliberately separate from [`SOURCE_EXCLUSION_EPOCH`], which names the
+/// producer default and may move when the enablement task switches it.
+pub(crate) const SOURCE_EXCLUSION_EPOCH_V1: &str = "cass-source-exclusion/1";
+
 /// The second exclusion-rule epoch (C05).
 ///
 /// This build can read and export materials that name it, but it is not the
@@ -513,8 +520,12 @@ fn fixed_code_version(epoch: &str) -> String {
 /// epoch this build can read is accepted. Comparing the whole string keeps a
 /// longer suffix, a different fingerprint, a missing separator and any
 /// whitespace change from passing; a prefix test would accept several of them.
+///
+/// The accepted epochs are the two fixed reader identities, not the current
+/// producer default: moving [`SOURCE_EXCLUSION_EPOCH`] must not remove epoch 1
+/// from what this reader can verify.
 pub(crate) fn exclusion_epoch_for_code_version(code_version: &str) -> Option<&'static str> {
-    [SOURCE_EXCLUSION_EPOCH, SOURCE_EXCLUSION_EPOCH_V2]
+    [SOURCE_EXCLUSION_EPOCH_V1, SOURCE_EXCLUSION_EPOCH_V2]
         .into_iter()
         .find(|epoch| fixed_code_version(epoch) == code_version)
 }
@@ -8230,7 +8241,7 @@ project_read_documents = []\nworkspace_scoped_files = []\n";
     }
 
     fn v1() -> String {
-        fixed_code_version(SOURCE_EXCLUSION_EPOCH)
+        fixed_code_version(SOURCE_EXCLUSION_EPOCH_V1)
     }
 
     fn v2() -> String {
@@ -8239,24 +8250,31 @@ project_read_documents = []\nworkspace_scoped_files = []\n";
 
     #[test]
     fn mcp_export_epoch_selection_is_exact() {
-        assert_eq!(exclusion_epoch_for_code_version(&v1()), Some(SOURCE_EXCLUSION_EPOCH));
+        assert_eq!(
+            SOURCE_EXCLUSION_EPOCH_V1, "cass-source-exclusion/1",
+            "the first reader epoch is a fixed literal"
+        );
+        assert_eq!(
+            exclusion_epoch_for_code_version(&v1()),
+            Some(SOURCE_EXCLUSION_EPOCH_V1)
+        );
         assert_eq!(exclusion_epoch_for_code_version(&v2()), Some(SOURCE_EXCLUSION_EPOCH_V2));
 
         let fingerprint = crate::indexer::redact_secrets::redaction_algorithm_fingerprint();
         let rejected = [
             String::new(),
-            SOURCE_EXCLUSION_EPOCH.to_string(),
+            SOURCE_EXCLUSION_EPOCH_V1.to_string(),
             SOURCE_EXCLUSION_EPOCH_V2.to_string(),
             "cass-source-exclusion/3".to_string(),
-            format!("{SOURCE_EXCLUSION_EPOCH}+"),
-            format!("{SOURCE_EXCLUSION_EPOCH}+{fingerprint}+"),
-            format!("{SOURCE_EXCLUSION_EPOCH}++{fingerprint}"),
-            format!("{SOURCE_EXCLUSION_EPOCH}+{fingerprint} "),
-            format!(" {SOURCE_EXCLUSION_EPOCH}+{fingerprint}"),
-            format!("{SOURCE_EXCLUSION_EPOCH}\t+{fingerprint}"),
-            format!("{SOURCE_EXCLUSION_EPOCH}+redact-v0:{fingerprint}"),
-            format!("{SOURCE_EXCLUSION_EPOCH}+{}", fingerprint.to_uppercase()),
-            format!("{SOURCE_EXCLUSION_EPOCH}+{fingerprint}-extra"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint}+"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}++{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint} "),
+            format!(" {SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}\t+{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+redact-v0:{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{}", fingerprint.to_uppercase()),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint}-extra"),
             format!("{SOURCE_EXCLUSION_EPOCH_V2}+{fingerprint}+{fingerprint}"),
         ];
         for value in rejected {
@@ -8276,12 +8294,12 @@ project_read_documents = []\nworkspace_scoped_files = []\n";
         let default_loaded = load_fixed_safety_config(&path).expect("the default copy loads");
         assert_eq!(
             default_loaded.config().code_version,
-            v1(),
-            "the default loader still produces the epoch-1 producer identity"
+            fixed_code_version(SOURCE_EXCLUSION_EPOCH),
+            "the default loader follows the current producer default"
         );
 
         for (requested, epoch) in [
-            (v1(), SOURCE_EXCLUSION_EPOCH),
+            (v1(), SOURCE_EXCLUSION_EPOCH_V1),
             (v2(), SOURCE_EXCLUSION_EPOCH_V2),
         ] {
             let loaded = load_fixed_safety_config_for_code_version(&path, &requested)
@@ -8301,7 +8319,7 @@ project_read_documents = []\nworkspace_scoped_files = []\n";
         for unsupported in [
             String::new(),
             "cass-source-exclusion/3".to_string(),
-            SOURCE_EXCLUSION_EPOCH.to_string(),
+            SOURCE_EXCLUSION_EPOCH_V1.to_string(),
             format!("{}x", v2()),
         ] {
             let err = load_fixed_safety_config_for_code_version(&path, &unsupported)
