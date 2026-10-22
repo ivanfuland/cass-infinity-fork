@@ -4,7 +4,7 @@
 //! companion CASS binary or opens a listening socket.
 
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -230,15 +230,12 @@ fn split_authority(authority: &str) -> Result<(String, Option<u16>), String> {
         let (host, tail) = rest
             .split_once(']')
             .ok_or_else(|| "origin has an unterminated IPv6 literal".to_string())?;
-        if host.is_empty() {
-            return Err("origin has an empty host".to_string());
-        }
-        if !host
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.')
-        {
-            return Err("origin has an invalid IPv6 literal".to_string());
-        }
+        // Brackets are only legal around an IPv6 address. Parse the literal
+        // instead of accepting any hex/colon text, so `[:::]` and bracketed
+        // IPv4 forms are rejected before they reach the SDK.
+        let address: Ipv6Addr = host
+            .parse()
+            .map_err(|_| "origin has an invalid IPv6 literal".to_string())?;
         let port = if tail.is_empty() {
             None
         } else {
@@ -247,7 +244,7 @@ fn split_authority(authority: &str) -> Result<(String, Option<u16>), String> {
                 .ok_or_else(|| "origin has an invalid authority".to_string())?;
             Some(parse_port(digits)?)
         };
-        return Ok((host.to_ascii_lowercase(), port));
+        return Ok((address.to_string(), port));
     }
 
     let mut parts = authority.split(':');

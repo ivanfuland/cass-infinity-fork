@@ -178,7 +178,6 @@ fn set_option(args: &mut [String], option: &str, value: &str) {
 
 struct Run {
     status: ExitStatus,
-    stdout: String,
     stderr: String,
 }
 
@@ -215,7 +214,6 @@ fn wait_with_deadline(mut child: Child, deadline: Duration) -> Run {
     let output = child.wait_with_output().expect("collect cass-mcp output");
     Run {
         status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
@@ -547,6 +545,48 @@ fn alternate_loopback_bind_serves_requests_without_origin() {
     assert_eq!(fixture.invocations(), vec!["--version".to_string()]);
 }
 
+/// A valid IPv6 loopback bind and its matching Origin stay usable.
+#[test]
+fn ipv6_loopback_bind_serves_requests_without_origin() {
+    let fixture = Fixture::new("ipv6-bind", EXPECTED_CASS_VERSION, 0);
+    let server = start_server_on(&fixture, "[::1]:0", PUBLIC_ORIGIN);
+    assert!(server.address.is_ipv6(), "expected an IPv6 listener");
+    let port = server.address.port();
+    let host = format!("[::1]:{port}");
+
+    let response = post(&server, &host, &[], &initialize_body());
+    assert_eq!(
+        response.status, 200,
+        "initialize without Origin on [::1] failed; body: {}",
+        response.body
+    );
+    let value = json_body(&response.body);
+    assert_eq!(value["result"]["serverInfo"]["name"], "cass-mcp");
+
+    let origin = format!("http://[::1]:{port}");
+    let response = post(&server, &host, &[("Origin", origin.as_str())], &initialize_body());
+    assert_eq!(
+        response.status, 200,
+        "initialize with Origin {origin} failed; body: {}",
+        response.body
+    );
+
+    let response = post(&server, &host, &[], &tools_list_body());
+    assert_eq!(
+        response.status, 200,
+        "tools/list without Origin on [::1] failed; body: {}",
+        response.body
+    );
+    let value = json_body(&response.body);
+    assert_eq!(
+        value["result"]["tools"].as_array().map(Vec::len),
+        Some(0),
+        "tools/list must stay empty until ticket 12: {value}"
+    );
+
+    assert_eq!(fixture.invocations(), vec!["--version".to_string()]);
+}
+
 // ---------------------------------------------------------------------------
 // 11-AC3: configuration rejection before listener and subprocess
 // ---------------------------------------------------------------------------
@@ -666,7 +706,7 @@ fn invalid_paths_and_profiles_are_rejected() {
 
     // Unreadable api-config, unless the test user can bypass permissions.
     let fixture = Fixture::new("paths", EXPECTED_CASS_VERSION, 0);
-    let mut args = fixture.args(bind, PUBLIC_ORIGIN);
+    let args = fixture.args(bind, PUBLIC_ORIGIN);
     set_mode(&fixture.api_config, 0o000);
     if fs::File::open(&fixture.api_config).is_err() {
         expect_rejected("unreadable api-config", &fixture, &args);
@@ -722,6 +762,8 @@ fn invalid_public_origins_are_rejected() {
         "http://*.example.com",
         "http://example.com:0",
         "http://[::1",
+        "http://[:::]",
+        "http://[127.0.0.1]",
         "http://::1:80",
         "http://example.com:99999",
     ] {
@@ -916,6 +958,14 @@ fn disallowed_origins_are_rejected() {
         ),
         ("origin wildcard", vec!["http://*".to_string()]),
         ("origin null", vec!["null".to_string()]),
+        (
+            "bracketed IPv4 origin",
+            vec![format!("http://[127.0.0.1]:{port}")],
+        ),
+        (
+            "malformed IPv6 origin",
+            vec![format!("http://[:::]:{port}")],
+        ),
         (
             "scheme mismatch",
             vec![format!("https://127.0.0.1:{port}")],
