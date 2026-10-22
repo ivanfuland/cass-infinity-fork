@@ -211,8 +211,10 @@ enum Supervised {
 
 /// Own the child until both pipes reach EOF and `wait` reports. Every byte
 /// stored on either stream counts against the same budget; the first chunk
-/// that would cross it stops both reads and moves straight to reaping. A
-/// non-zero exit observed in the same window never overrides the overflow.
+/// that would cross it stops both reads and moves straight to reaping. Each
+/// read requests at most the remaining budget plus one probe byte, so a small
+/// remaining budget never consumes a full chunk beyond it. A non-zero exit
+/// observed in the same window never overrides the overflow.
 async fn supervise(
     mut child: Child,
     mut stdout: ChildStdout,
@@ -231,9 +233,12 @@ async fn supervise(
     let mut failure: Option<Supervised> = None;
 
     while stdout_open || stderr_open || status.is_none() {
+        // `total <= budget` always holds. The extra byte is the only probe
+        // allowed past the budget; the small buffer is reused, not resized.
+        let want = (budget - total).saturating_add(1).min(READ_CHUNK_BYTES);
         tokio::select! {
             biased;
-            read = stdout.read(&mut stdout_buffer), if stdout_open => {
+            read = stdout.read(&mut stdout_buffer[..want]), if stdout_open => {
                 match read {
                     Ok(0) => stdout_open = false,
                     Ok(n) => match reserve(budget, total, n) {
@@ -252,7 +257,7 @@ async fn supervise(
                     }
                 }
             }
-            read = stderr.read(&mut stderr_buffer), if stderr_open => {
+            read = stderr.read(&mut stderr_buffer[..want]), if stderr_open => {
                 match read {
                     Ok(0) => stderr_open = false,
                     Ok(n) => match reserve(budget, total, n) {
@@ -465,4 +470,87 @@ fn decode_recall(input: &str, expected: RecallTool) -> Result<Value, ToolError> 
         return Err(invalid());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::AsFd;
+
+    /// The combined read path may consume at most one probe byte beyond the
+    /// budget, even when a single read could take far more. The duplicate read
+    /// ends stay open across `supervise`, so what it left unread is measurable.
+    #[tokio::test]
+    async fn read_probe_consumes_at_most_budget_plus_one() {
+        const WRITTEN: usize = 4096;
+        const BUDGET: usize = 125;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cass-mcp-read-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create probe dir");
+        let ready = dir.join("ready");
+        let chunk = "W".repeat(1024);
+        let script = format!(
+            "printf '%s' '{chunk}{chunk}{chunk}{chunk}'\n\
+             printf '%s' '{chunk}{chunk}{chunk}{chunk}' >&2\n\
+             : > '{ready}'\n\
+             exec sleep 30\n",
+            ready = ready.display(),
+        );
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn probing child");
+        let mut ready_seen = false;
+        for _ in 0..1000 {
+            if ready.exists() {
+                ready_seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready_seen, "probe child never finished writing");
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let stdout_probe = stdout.as_fd().try_clone_to_owned().expect("dup stdout");
+        let stderr_probe = stderr.as_fd().try_clone_to_owned().expect("dup stderr");
+
+        let outcome = supervise(child, stdout, stderr, BUDGET, Duration::from_millis(200)).await;
+        assert!(
+            matches!(outcome, Supervised::TooLarge),
+            "the probe must classify the over-budget stream"
+        );
+
+        let mut stdout_left = Vec::new();
+        std::fs::File::from(stdout_probe)
+            .read_to_end(&mut stdout_left)
+            .expect("read leftover stdout");
+        let mut stderr_left = Vec::new();
+        std::fs::File::from(stderr_probe)
+            .read_to_end(&mut stderr_left)
+            .expect("read leftover stderr");
+        let consumed = (WRITTEN - stdout_left.len()) + (WRITTEN - stderr_left.len());
+        println!("consumed={consumed} allowed={}", BUDGET + 1);
+
+        assert!(
+            consumed <= BUDGET + 1,
+            "consumed {consumed} bytes; at most {} are allowed",
+            BUDGET + 1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

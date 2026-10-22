@@ -186,6 +186,7 @@ impl Fixture {
              {trap}\
              if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '{version}'; exit 0; fi\n\
              printf '%s\\n' \"$$\" >> '{pids}'\n\
+             printf '%s\\n' \"$$\" > '{pids}'.\"$1\"\n\
              {body}",
             version = EXPECTED_CASS_VERSION,
             pids = self.pids.display(),
@@ -231,6 +232,15 @@ impl Fixture {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The exact business child PID recorded for one subcommand. The PID is
+    /// written by the child itself, so the assertion names the process the
+    /// server was required to reap rather than any PID at hand.
+    fn pid_for(&self, subcommand: &str) -> Option<i32> {
+        fs::read_to_string(format!("{}.{subcommand}", self.pids.display()))
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
     }
 
     fn release(&self) {
@@ -765,13 +775,14 @@ fn streaming_stdout_over_budget_fails_before_producer_eof() {
         !fixture.release.exists(),
         "the server must answer before the producer is released"
     );
+    let pid = fixture
+        .pid_for("sessions")
+        .expect("the business child PID must be recorded");
+    assert!(
+        !pid_alive(pid),
+        "child {pid} must already be reaped when the response arrives"
+    );
     fixture.release();
-    for pid in fixture.business_pids() {
-        assert!(
-            wait_until(Duration::from_secs(5), || !pid_alive(pid)),
-            "child {pid} must be reaped before the response is published"
-        );
-    }
 }
 
 #[test]
@@ -794,13 +805,14 @@ fn streaming_stderr_over_budget_fails_before_producer_eof() {
         !fixture.release.exists(),
         "the server must answer before the producer is released"
     );
+    let pid = fixture
+        .pid_for("sessions")
+        .expect("the business child PID must be recorded");
+    assert!(
+        !pid_alive(pid),
+        "child {pid} must already be reaped when the response arrives"
+    );
     fixture.release();
-    for pid in fixture.business_pids() {
-        assert!(
-            wait_until(Duration::from_secs(5), || !pid_alive(pid)),
-            "child {pid} must be reaped before the response is published"
-        );
-    }
 }
 
 #[test]
@@ -819,13 +831,14 @@ fn combined_streams_over_budget_drains_both_pipes() {
         !fixture.release.exists(),
         "the combined budget must trip while both producers still hold"
     );
+    let pid = fixture
+        .pid_for("sessions")
+        .expect("the business child PID must be recorded");
+    assert!(
+        !pid_alive(pid),
+        "child {pid} must already be reaped when the response arrives"
+    );
     fixture.release();
-    for pid in fixture.business_pids() {
-        assert!(
-            wait_until(Duration::from_secs(5), || !pid_alive(pid)),
-            "child {pid} must be reaped before the response is published"
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -962,12 +975,13 @@ fn over_budget_wins_over_a_nonzero_exit() {
     let result = client.call(&session, "cass_sessions", json!({}));
 
     assert_error_code(&result, "result_too_large");
-    for pid in fixture.business_pids() {
-        assert!(
-            wait_until(Duration::from_secs(5), || !pid_alive(pid)),
-            "child {pid} must be reaped before the response is published"
-        );
-    }
+    let pid = fixture
+        .pid_for("sessions")
+        .expect("the business child PID must be recorded");
+    assert!(
+        !pid_alive(pid),
+        "child {pid} must already be reaped when the response arrives"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,11 +1025,19 @@ fn term_ignoring_child_is_killed_after_grace_and_neighbor_request_succeeds() {
         !fixture.release.exists(),
         "the over-limit request must not wait for the producer to be released"
     );
-    fixture.release();
-
-    let holder_pid = fixture.business_pids()[0];
+    let holder_pid = fixture
+        .pid_for("sessions")
+        .expect("the over-limit child PID must be recorded");
     assert!(
         !pid_alive(holder_pid),
         "the TERM-ignoring child {holder_pid} must be force-killed and waited before the response"
     );
+    let neighbor_pid = fixture
+        .pid_for("timeline")
+        .expect("the neighbor child PID must be recorded");
+    assert!(
+        !pid_alive(neighbor_pid),
+        "the neighbor child {neighbor_pid} must also be waited before its response"
+    );
+    fixture.release();
 }

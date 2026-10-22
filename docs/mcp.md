@@ -57,9 +57,11 @@ any management subcommand.
 `--max-output-bytes` is one budget applied at two layers.
 
 1. While the companion runs, stdout and stderr share one byte counter. Reading
-   uses fixed small chunks and stores at most the budget across both streams;
-   the first chunk that would cross it stops both reads immediately, without
-   waiting for the producer to close its pipes.
+   uses fixed small chunks, stores at most the budget across both streams, and
+   requests at most the remaining budget plus one probe byte per read, so a
+   small remaining budget never consumes a full chunk past it. The first byte
+   past the budget stops both reads immediately, without waiting for the
+   producer to close its pipes.
 2. The final tool result must also fit. The measured object is the compact
    serialized SDK `CallToolResult` the server returns for protocol `2026-07-28`,
    including `resultType: "complete"`, the text escaping, and `isError`. The
