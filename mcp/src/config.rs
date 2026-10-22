@@ -17,6 +17,12 @@ pub const EXPECTED_CASS_VERSION: &str = "cass 0.6.17";
 /// MCP implementation name advertised to clients.
 pub const SERVER_NAME: &str = "cass-mcp";
 
+/// The lowest `--max-output-bytes` that can still carry every fixed error
+/// code after the optional message and CLI exit status are removed. Measured
+/// against the real SDK tool-result serialization (`resultType: complete`), not
+/// a performance default.
+pub const MIN_MAX_OUTPUT_BYTES: usize = 125;
+
 /// Validated startup configuration.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -122,8 +128,10 @@ impl Config {
         if self.max_queued == 0 {
             return Err("--max-queued must be greater than zero".to_string());
         }
-        if self.max_output_bytes == 0 {
-            return Err("--max-output-bytes must be greater than zero".to_string());
+        if self.max_output_bytes < MIN_MAX_OUTPUT_BYTES {
+            return Err(format!(
+                "--max-output-bytes must be at least {MIN_MAX_OUTPUT_BYTES} bytes"
+            ));
         }
         if self.request_timeout_ms == 0 {
             return Err("--request-timeout-ms must be greater than zero".to_string());
