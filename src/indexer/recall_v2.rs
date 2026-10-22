@@ -25,7 +25,7 @@
 
 use serde_json::Value;
 
-use crate::connectors::NormalizedMessage;
+use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::indexer::exclusion::{
     self, BlockKind, Decision, ExcludedMarker, ExclusionAnchor, ExclusionReason, ExtraFieldMap,
     PairingContext, RawEvent, RecallHit, RecallSrc,
@@ -777,6 +777,333 @@ pub(crate) fn decide(
             }
             Err(_) => Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
         },
+    }
+}
+
+// ============================================================================
+// Ticket 07: the current host's synchronous single-call wrapper (C07).
+//
+// A Codex `custom_tool_call` named `exec` may carry its free-form input as a
+// JavaScript literal. Only one exact shape is recognized:
+//
+//     text(await tools.exec_command(J));
+//     text(await tools.mcp__cass_mcp__cass_{search,expand,sessions,timeline}(J));
+//
+// `J` must be one complete JSON object. Nothing here executes JavaScript or
+// Shell; the text is split only at the fixed outer prefix/suffix and handed
+// to `serde_json`. The original whole body, the R4 pairing result and the R7
+// copy clearing are untouched.
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecTarget {
+    /// `tools.exec_command` whose `cmd` is one proven CASS read command.
+    Cli,
+    /// One of the four `tools.mcp__cass_mcp__cass_*` method names.
+    Mcp(RecallTool),
+}
+
+/// Split the fixed C07 expression and parse `J` as one JSON object. Any
+/// other JavaScript shape (unquoted keys, variables, templates, loops,
+/// multiple calls/statements, unknown methods) returns `None`.
+fn parse_exec_literal(expression: &str) -> Option<(ExecTarget, Value)> {
+    let body = expression.trim().strip_prefix("text(await tools.")?.strip_suffix("));")?;
+    let open = body.find('(')?;
+    let method = &body[..open];
+    let input = &body[open + 1..];
+    let target = match method {
+        "exec_command" => ExecTarget::Cli,
+        "mcp__cass_mcp__cass_search" => ExecTarget::Mcp(RecallTool::Search),
+        "mcp__cass_mcp__cass_expand" => ExecTarget::Mcp(RecallTool::Expand),
+        "mcp__cass_mcp__cass_sessions" => ExecTarget::Mcp(RecallTool::Sessions),
+        "mcp__cass_mcp__cass_timeline" => ExecTarget::Mcp(RecallTool::Timeline),
+        _ => return None,
+    };
+    let value: Value = serde_json::from_str(input).ok()?;
+    value.is_object().then_some((target, value))
+}
+
+/// One `input_text` block's text, with no other block type accepted.
+fn input_text_block_text(block: &Value) -> Option<&str> {
+    let object = block.as_object()?;
+    if object.get("type").and_then(Value::as_str) != Some("input_text") {
+        return None;
+    }
+    object.get("text").and_then(Value::as_str)
+}
+
+/// The fixed transport description, exactly three lines:
+/// `Script completed`, `Wall time NUMBER seconds`, `Output:`.
+/// NUMBER is a non-negative finite number; `Script running` and other
+/// segmented forms are not accepted.
+fn transport_header_is_exact(text: &str) -> bool {
+    let mut lines = text.split('\n');
+    if lines.next() != Some("Script completed") {
+        return false;
+    }
+    let Some(wall) = lines.next() else { return false };
+    let Some(number) = wall.strip_prefix("Wall time ").and_then(|rest| rest.strip_suffix(" seconds"))
+    else {
+        return false;
+    };
+    let Ok(value) = number.parse::<f64>() else { return false };
+    if !value.is_finite() || value < 0.0 {
+        return false;
+    }
+    lines.next() == Some("Output:") && lines.next().is_none()
+}
+
+/// The application result text from `payload.output`: either one JSON string
+/// or an array of `input_text` blocks holding exactly one application block,
+/// optionally preceded by the one exact transport description block.
+fn application_text(payload_output: &Value) -> Option<&str> {
+    match payload_output {
+        Value::String(text) => Some(text.as_str()),
+        Value::Array(blocks) if blocks.len() == 1 => input_text_block_text(&blocks[0]),
+        Value::Array(blocks) if blocks.len() == 2 => {
+            let header = input_text_block_text(&blocks[0])?;
+            if !transport_header_is_exact(header) {
+                return None;
+            }
+            input_text_block_text(&blocks[1])
+        }
+        _ => None,
+    }
+}
+
+/// The application JSON must be one complete object, with no other JSON or
+/// text before or after it (outer JSON whitespace is allowed).
+fn application_object(text: &str) -> Option<Value> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value.is_object().then_some(value)
+}
+
+const CLI_TRANSPORT_FIELDS: &[&str] =
+    &["output", "exit_code", "chunk_id", "wall_time_seconds", "original_token_count"];
+
+/// `exec_command` application object: integer `exit_code` 0, no `session_id`
+/// at all (including null), `output` is the complete C04 text, and no other
+/// application data hides behind unknown fields.
+fn cli_application_output(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if object.get("exit_code").and_then(Value::as_i64) != Some(0) {
+        return None;
+    }
+    if object.contains_key("session_id") {
+        return None;
+    }
+    if object.keys().any(|key| !CLI_TRANSPORT_FIELDS.contains(&key.as_str())) {
+        return None;
+    }
+    object.get("output").and_then(Value::as_str)
+}
+
+/// MCP application object: `isError` absent or boolean false, `content` is
+/// exactly one `type: "text"` block whose text is the complete C04 wrapper.
+/// Only `content`/`isError` and the optional SDK completion metadata
+/// `resultType` are supported. `resultType` may be absent (the 2025 protocol
+/// omits it) or the string `"complete"` (the 2026 protocol); `null`, a
+/// non-string, `task`, `input_required` and any other value are not a
+/// completed result and must stay.
+fn mcp_application_text(value: &Value) -> Option<&str> {
+    let object = value.as_object()?;
+    if object
+        .keys()
+        .any(|key| key != "content" && key != "isError" && key != "resultType")
+    {
+        return None;
+    }
+    match object.get("isError") {
+        None | Some(Value::Bool(false)) => {}
+        _ => return None,
+    }
+    if let Some(result_type) = object.get("resultType")
+        && result_type.as_str() != Some("complete")
+    {
+        return None;
+    }
+    let content = object.get("content")?.as_array()?;
+    if content.len() != 1 {
+        return None;
+    }
+    let block = content[0].as_object()?;
+    if block.keys().any(|key| key != "type" && key != "text") {
+        return None;
+    }
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    block.get("text").and_then(Value::as_str)
+}
+
+/// `response_item` / `payload.type = custom_tool_call_output`, or `None`.
+fn custom_tool_output_payload(raw_record: &Value) -> Option<&Value> {
+    if raw_record.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = raw_record.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
+        return None;
+    }
+    Some(payload)
+}
+
+fn decode_any_tool(text: &str) -> bool {
+    [
+        RecallTool::Search,
+        RecallTool::Expand,
+        RecallTool::Sessions,
+        RecallTool::Timeline,
+    ]
+    .iter()
+    .any(|tool| recall_output::decode(text, *tool).is_ok())
+}
+
+/// Ticket 07 C07 result shape without an R4 pair: a complete single
+/// application result that decodes as one of the four C04 tools. This only
+/// counts an `unpaired_result` diagnostic; it never authorizes deletion.
+fn complete_unpaired_recall(payload: &Value) -> bool {
+    let Some(output) = payload.get("output") else { return false };
+    let Some(text) = application_text(output) else { return false };
+    let Some(application) = application_object(text) else { return false };
+    if let Some(wrapper) = mcp_application_text(&application) {
+        return decode_any_tool(wrapper);
+    }
+    if let Some(wrapper) = cli_application_output(&application) {
+        return decode_any_tool(wrapper);
+    }
+    false
+}
+
+/// Ticket 07 entry: C07 judgment against the *original* record, while every
+/// other path delegates to the already-verified [`decide`].
+///
+/// The new facts used here are only:
+/// * the source call row's real position (`paired_call_index_for`) and its
+///   `extra.raw_role`, so a same-named `function_call` is not mistaken for
+///   the supported `custom_tool_call` shape;
+/// * the raw `payload.output` block structure, so the transport description
+///   and the one application result are proved without guessing from the
+///   flattened `NormalizedMessage.content`;
+/// * the existing result-block locator, so an ambiguous/mismatched result is
+///   never revived.
+///
+/// `raw_record` is read only; this function mutates nothing. `apply` later
+/// hashes and clears the original complete body, still measured over this
+/// message's full projected text, never over the inner XML.
+pub(crate) fn decide_for_record(
+    conv: &NormalizedConversation,
+    idx: usize,
+    event: &RawEvent,
+    ctx: &PairingContext,
+    paths_cfg: &ExcludedContextPaths,
+    raw_record: &Value,
+) -> Outcome {
+    let Some(msg) = conv.messages.get(idx) else {
+        return Outcome::Preserve(None);
+    };
+    let agent_slug = conv.agent_slug.as_str();
+    if agent_slug != "codex" || msg.role != "tool_result" {
+        return decide(msg, idx, event, ctx, agent_slug, paths_cfg);
+    }
+
+    let Some(call) = ctx.paired_call_for(idx) else {
+        if custom_tool_output_payload(raw_record).is_some_and(complete_unpaired_recall) {
+            return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        }
+        return decide(msg, idx, event, ctx, agent_slug, paths_cfg);
+    };
+
+    // Other paired tools keep the verified MCP/direct-CLI/R2/R3 judgment.
+    if call.tool_name != "exec" {
+        return decide(msg, idx, event, ctx, agent_slug, paths_cfg);
+    }
+
+    // From here on this is a candidate `exec` call. Every missing proof is a
+    // bounded preserve, never an exclusion and never a legacy fallback that
+    // could delete an ordinary same-named tool's output.
+    let Some(call_idx) = ctx.paired_call_index_for(idx) else {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    };
+    let Some(source_row) = conv.messages.get(call_idx) else {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    };
+    if source_row.role != "tool_call"
+        || source_row.extra.get("raw_role").and_then(Value::as_str) != Some("custom_tool_call")
+    {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    }
+    let Some(args) = call.args.as_ref() else {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    };
+    let Value::String(expression) = args else {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    };
+    let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
+    if target_blocks.is_empty() {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    }
+
+    let Some(payload) = custom_tool_output_payload(raw_record) else {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    };
+    if let Some(raw_call_id) = payload.get("call_id").and_then(Value::as_str)
+        && call.tool_call_id.as_deref() != Some(raw_call_id)
+    {
+        // Another row's output cannot stand in for this call.
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    }
+
+    let Some((target, input)) = parse_exec_literal(expression) else {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    };
+    let (tool, source_args) = match target {
+        ExecTarget::Cli => {
+            let Some(command) = input.get("cmd").and_then(Value::as_str) else {
+                return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+            };
+            match parse_cli(command) {
+                Ok(Some(invocation)) => (invocation.tool, invocation.args),
+                // A proven CASS expression whose command is not one frozen
+                // read command is unsupported, not "not Cass".
+                _ => return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell)),
+            }
+        }
+        ExecTarget::Mcp(tool) => (tool, input.clone()),
+    };
+
+    let Some(output) = payload.get("output") else {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    };
+    let Some(application) = application_text(output).and_then(application_object) else {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    };
+    let wrapper = match target {
+        ExecTarget::Cli => cli_application_output(&application),
+        ExecTarget::Mcp(_) => mcp_application_text(&application),
+    };
+    let Some(wrapper) = wrapper else {
+        return Outcome::Preserve(Some(UncoveredReason::UnsupportedShell));
+    };
+    if recall_output::decode(wrapper, tool).is_err() {
+        return Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat));
+    }
+
+    let decision = Decision {
+        reason: ExclusionReason::CassRecall,
+        anchor: ExclusionAnchor {
+            tool_call_id: call.tool_call_id.clone(),
+            // The actual shell tool (`exec`), never a disguised MCP name.
+            tool_name: Some(call.tool_name.clone()),
+            paths: None,
+            shell: None,
+        },
+        event_key: event.event_key.clone(),
+        target_blocks,
+    };
+    match parse_result(tool, wrapper, &source_args) {
+        Ok(src) => Outcome::Exclude(Exclusion { decision, src: Some(src), parse_error: None }),
+        Err(_) => Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat)),
     }
 }
 
@@ -2578,6 +2905,933 @@ mod tests {
             Outcome::Preserve(Some(UncoveredReason::UnsupportedShell))
         );
         assert_eq!(assigned.content, sessions_value().to_string());
+    }
+
+    // ==========================================================================
+    // Ticket 07: C07 synchronous single-call wrapper (`mcp_v2_exec_`).
+    // ==========================================================================
+
+    use franken_agent_detection::NormalizedInvocation;
+    use std::path::PathBuf;
+
+    fn flatten_output(output: &Value) -> String {
+        match output {
+            Value::String(text) => text.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        }
+    }
+
+    fn header_text(wall: &str) -> String {
+        format!("Script completed\nWall time {wall} seconds\nOutput:")
+    }
+
+    /// The array output of one CLI application result, with the exact
+    /// transport description in front.
+    fn cli_output(wall: &str, application: &Value) -> Value {
+        json!([
+            {"type": "input_text", "text": header_text(wall)},
+            {"type": "input_text", "text": application.to_string()},
+        ])
+    }
+
+    /// The string output form: one JSON application result, no header.
+    fn cli_output_string(application: &Value) -> Value {
+        Value::String(application.to_string())
+    }
+
+    fn mcp_output(application: &Value) -> Value {
+        json!([{"type": "input_text", "text": application.to_string()}])
+    }
+
+    fn cli_application(wrapper: &str) -> Value {
+        json!({"exit_code": 0, "output": wrapper, "wall_time_seconds": 0.25, "chunk_id": "c1"})
+    }
+
+    fn mcp_application(wrapper: &str) -> Value {
+        json!({"content": [{"type": "text", "text": wrapper}]})
+    }
+
+    /// The actual 2026-07-28 SDK result shape: `content`/`isError` plus the
+    /// protocol completion metadata `resultType = "complete"`. The old 2025
+    /// protocol omits `resultType`, so both shapes must be accepted.
+    fn mcp_application_2026(wrapper: &str) -> Value {
+        json!({
+            "content": [{"type": "text", "text": wrapper}],
+            "isError": false,
+            "resultType": "complete",
+        })
+    }
+
+    fn cli_expression(command: &str) -> String {
+        format!("text(await tools.exec_command({}));", json!({"cmd": command}))
+    }
+
+    fn mcp_expression(method: &str, input: Value) -> String {
+        format!("text(await tools.{method}({input}));")
+    }
+
+    fn codex_message(role: &str, content: &str, extra: Value) -> NormalizedMessage {
+        NormalizedMessage {
+            idx: 0,
+            role: role.to_string(),
+            author: None,
+            created_at: None,
+            content: content.to_string(),
+            extra,
+            snippets: Vec::new(),
+            invocations: Vec::new(),
+        }
+    }
+
+    fn codex_call_row(expression: &str, call_id: Option<&str>, raw_role: &str) -> NormalizedMessage {
+        let mut row = codex_message(
+            "tool_call",
+            "",
+            json!({"raw_role": raw_role, "tool_call_id": call_id}),
+        );
+        row.invocations = vec![NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: "exec".to_string(),
+            raw_name: None,
+            call_id: call_id.map(str::to_string),
+            arguments: Some(Value::String(expression.to_string())),
+        }];
+        row
+    }
+
+    fn codex_result_row(output: &Value, raw_record: &Value) -> NormalizedMessage {
+        codex_message("tool_result", &flatten_output(output), raw_record.clone())
+    }
+
+    fn codex_conversation(messages: Vec<NormalizedMessage>) -> NormalizedConversation {
+        NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: PathBuf::from("/srv/cc/rollout-t07.jsonl"),
+            started_at: None,
+            ended_at: None,
+            metadata: json!({}),
+            messages,
+        }
+    }
+
+    fn result_raw_record(call_id: Option<&str>, output: &Value, payload_type: &str) -> Value {
+        json!({
+            "type": "response_item",
+            "timestamp": "2026-10-22T00:00:01Z",
+            "payload": {"type": payload_type, "call_id": call_id, "output": output},
+        })
+    }
+
+    /// Two-message Codex pair: one `exec` custom_tool_call and its
+    /// custom_tool_call_output, with the same block facts R4/`apply` use.
+    fn exec_fixture(
+        expression: &str,
+        output: Value,
+    ) -> (NormalizedConversation, Vec<RawEvent>, Value) {
+        let call_id = "call-t07";
+        let raw_record = result_raw_record(Some(call_id), &output, "custom_tool_call_output");
+        let call = codex_call_row(expression, Some(call_id), "custom_tool_call");
+        let result = codex_result_row(&output, &raw_record);
+        let conv = codex_conversation(vec![call, result]);
+        let events = vec![
+            RawEvent {
+                event_key: "line:1".into(),
+                blocks: vec![RawBlock {
+                    index: 0,
+                    kind: BlockKind::ToolUse,
+                    tool_use_id: Some(call_id.into()),
+                    tool_name: Some("exec".into()),
+                    args: Some(Value::String(expression.into())),
+                }],
+            },
+            RawEvent {
+                event_key: "line:2".into(),
+                blocks: vec![tool_result_block(0, Some(call_id))],
+            },
+        ];
+        (conv, events, raw_record)
+    }
+
+    fn exec_outcome(expression: &str, output: Value) -> (Outcome, NormalizedConversation, Value) {
+        let (conv, events, raw_record) = exec_fixture(expression, output);
+        let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        (
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &raw_record),
+            conv,
+            raw_record,
+        )
+    }
+
+    fn assert_preserved(outcome: Outcome, reason: UncoveredReason) {
+        assert_eq!(outcome, Outcome::Preserve(Some(reason)));
+    }
+
+    #[test]
+    fn mcp_v2_exec_real_codex_cli_header_apply_hashes_original_full_body() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let application = cli_application(&wrapper);
+        let output = cli_output("0.25", &application);
+        let expression = cli_expression("cass search \"needle\" --recall");
+
+        let call_line = json!({
+            "type": "response_item",
+            "timestamp": "2026-10-22T00:00:00Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": expression,
+                "call_id": "call-t07",
+            },
+        });
+        let result_line = json!({
+            "type": "response_item",
+            "timestamp": "2026-10-22T00:00:01Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-t07",
+                "output": output,
+            },
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-t07.jsonl");
+        std::fs::write(&path, format!("{call_line}\n{result_line}\n")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let factory = crate::connectors::get_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == "codex")
+            .expect("codex connector factory must be registered")
+            .1;
+        let connector = factory();
+        let scan_ctx = crate::connectors::ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![crate::connectors::ScanRoot::local(path.clone())],
+            None,
+        );
+        let mut convs = connector.scan(&scan_ctx).expect("real codex scan must succeed");
+        assert_eq!(convs.len(), 1);
+        let mut conv = convs.pop().unwrap();
+        assert_eq!(conv.agent_slug, "codex");
+        assert_eq!(conv.messages.len(), 2);
+        assert_eq!(conv.messages[0].role, "tool_call");
+        assert_eq!(conv.messages[0].extra["raw_role"], "custom_tool_call");
+        assert_eq!(
+            conv.messages[0].invocations[0].arguments,
+            Some(Value::String(expression.clone())),
+            "the real connector must keep the literal JavaScript as Value::String"
+        );
+        assert_eq!(conv.messages[1].role, "tool_result");
+        assert_eq!(conv.messages[1].extra["raw_role"], "custom_tool_call_output");
+
+        let original = conv.messages[1].content.clone();
+        assert!(original.starts_with("Script completed\nWall time 0.25 seconds\nOutput:\n"));
+        assert!(original.contains("\"exit_code\":0"));
+        assert!(
+            original.contains(&serde_json::to_string(&wrapper).unwrap()),
+            "the projected body carries the complete application JSON, not only the inner XML"
+        );
+
+        let events = exclusion::events_from_blob("codex", &path);
+        assert_eq!(events.len(), 2);
+        let pairing = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        assert_eq!(pairing.paired_call_index_for(1), Some(0));
+
+        let Outcome::Exclude(judged) =
+            decide_for_record(&conv, 1, &events[1], &pairing, &paths_cfg(), &result_line)
+        else {
+            panic!("a real paired C07 CLI result must be excluded");
+        };
+        assert_eq!(judged.decision.reason, ExclusionReason::CassRecall);
+        assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("exec"));
+        assert_eq!(judged.decision.anchor.tool_call_id.as_deref(), Some("call-t07"));
+        assert_eq!(judged.decision.event_key, "line:2");
+        assert_eq!(judged.decision.target_blocks, vec![0]);
+        assert_eq!(judged.src.as_ref(), Some(&search_src()));
+        assert!(judged.parse_error.is_none());
+
+        let marker = apply_with_redaction(
+            &mut conv.messages[1],
+            &judged,
+            &mut MemoizingRedactor::new(),
+            path.to_str().unwrap(),
+            1,
+            field_map_for("codex"),
+            false,
+        );
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(conv.messages[1].content, "");
+        assert_eq!(marker.bytes, original.len() as u64);
+        assert_eq!(marker.sha256, sha256_hex(&original));
+        assert_eq!(marker.raw.event_key, "line:2");
+        assert_eq!(marker.raw.blocks, vec![0]);
+        assert_eq!(marker.src, Some(search_src()));
+        assert_eq!(conv.messages[1].extra["payload"]["output"]["redacted"], json!(true));
+        assert_eq!(std::fs::read(&path).unwrap(), before, "raw mirror bytes stay untouched");
+
+        // R7's same-event sibling copy clearing is unchanged: the sibling's
+        // own ordinary text must survive.
+        let mut sibling = codex_message(
+            "user",
+            "ordinary sibling prose",
+            json!({"type": "response_item", "payload": {"type": "custom_tool_call_output", "output": output}}),
+        );
+        exclusion::apply_sibling(&mut sibling, &marker, field_map_for("codex"));
+        assert_eq!(sibling.content, "ordinary sibling prose");
+        assert_eq!(sibling.extra["payload"]["output"]["redacted"], json!(true));
+    }
+
+    #[test]
+    fn mcp_v2_exec_real_codex_mcp_single_block_excludes_without_header() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let application = mcp_application(&wrapper);
+        let output = mcp_output(&application);
+        let expression = mcp_expression("mcp__cass_mcp__cass_search", json!({"query": "needle"}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-t07-mcp.jsonl");
+        let call_line = json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "input": expression, "call_id": "call-m"},
+        });
+        let result_line = json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "call-m", "output": output},
+        });
+        std::fs::write(&path, format!("{call_line}\n{result_line}\n")).unwrap();
+
+        let connector = crate::connectors::get_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == "codex")
+            .unwrap()
+            .1();
+        let scan_ctx = crate::connectors::ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![crate::connectors::ScanRoot::local(path.clone())],
+            None,
+        );
+        let mut conv = connector.scan(&scan_ctx).unwrap().pop().unwrap();
+        let original = conv.messages[1].content.clone();
+        assert_eq!(original, application.to_string());
+        let events = exclusion::events_from_blob("codex", &path);
+        let pairing = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        let Outcome::Exclude(judged) =
+            decide_for_record(&conv, 1, &events[1], &pairing, &paths_cfg(), &result_line)
+        else {
+            panic!("a real paired C07 MCP result must be excluded");
+        };
+        assert_eq!(judged.src.as_ref(), Some(&search_src()));
+        let marker = apply_with_redaction(
+            &mut conv.messages[1],
+            &judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            1,
+            field_map_for("codex"),
+            false,
+        );
+        assert_eq!(marker.sha256, sha256_hex(&original));
+        assert_eq!(marker.bytes, original.len() as u64);
+        assert_eq!(conv.messages[1].extra["payload"]["output"]["redacted"], json!(true));
+    }
+
+    #[test]
+    fn mcp_v2_exec_real_codex_2026_result_type_complete_excludes() {
+        // Real 2026-07-28 SDK result: `content`, `isError: false` and
+        // `resultType: "complete"`. The field is protocol completion
+        // metadata, not a second application body, so the one C04 wrapper
+        // must still be decoded, excluded and hashed over the whole body.
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let application = mcp_application_2026(&wrapper);
+        let output = mcp_output(&application);
+        let expression = mcp_expression("mcp__cass_mcp__cass_search", json!({"query": "needle"}));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-t07-2026.jsonl");
+        let call_line = json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "input": expression, "call_id": "call-2026"},
+        });
+        let result_line = json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "call-2026", "output": output},
+        });
+        std::fs::write(&path, format!("{call_line}\n{result_line}\n")).unwrap();
+
+        let connector = crate::connectors::get_connector_factories()
+            .into_iter()
+            .find(|(name, _)| *name == "codex")
+            .unwrap()
+            .1();
+        let scan_ctx = crate::connectors::ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![crate::connectors::ScanRoot::local(path.clone())],
+            None,
+        );
+        let mut conv = connector.scan(&scan_ctx).unwrap().pop().unwrap();
+        let original = conv.messages[1].content.clone();
+        assert_eq!(original, application.to_string());
+        assert!(original.contains("\"resultType\":\"complete\""));
+        let events = exclusion::events_from_blob("codex", &path);
+        let pairing = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        let Outcome::Exclude(judged) =
+            decide_for_record(&conv, 1, &events[1], &pairing, &paths_cfg(), &result_line)
+        else {
+            panic!("the actual 2026 content/isError/resultType result must be excluded");
+        };
+        assert_eq!(judged.decision.reason, ExclusionReason::CassRecall);
+        assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("exec"));
+        assert_eq!(judged.src.as_ref(), Some(&search_src()));
+        assert!(judged.parse_error.is_none());
+
+        let marker = apply_with_redaction(
+            &mut conv.messages[1],
+            &judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            1,
+            field_map_for("codex"),
+            false,
+        );
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(marker.sha256, sha256_hex(&original));
+        assert_eq!(marker.bytes, original.len() as u64);
+        assert_eq!(conv.messages[1].extra["payload"]["output"]["redacted"], json!(true));
+    }
+
+    #[test]
+    fn mcp_v2_exec_result_type_missing_or_complete_excludes_other_values_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let expression = mcp_expression("mcp__cass_mcp__cass_search", json!({"query": "needle"}));
+
+        // Missing (2025 protocol) and string "complete" (2026 protocol) are
+        // both completed results. `isError` may be absent or boolean false.
+        for application in [
+            json!({"content": [{"type": "text", "text": wrapper}]}),
+            json!({"content": [{"type": "text", "text": wrapper}], "isError": false}),
+            mcp_application_2026(&wrapper),
+        ] {
+            let (outcome, _, _) = exec_outcome(&expression, mcp_output(&application));
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("a completed result must be excluded: {application}");
+            };
+            assert_eq!(judged.src.as_ref(), Some(&search_src()));
+        }
+
+        // Every other value is not a completed result and must stay.
+        for result_type in [
+            json!(null),
+            json!("task"),
+            json!("input_required"),
+            json!("Complete"),
+            json!(""),
+            json!(1),
+            json!(true),
+            json!(["complete"]),
+            json!({"kind": "complete"}),
+        ] {
+            let application = json!({
+                "content": [{"type": "text", "text": wrapper}],
+                "isError": false,
+                "resultType": result_type.clone(),
+            });
+            let (outcome, _, _) = exec_outcome(&expression, mcp_output(&application));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_four_cli_commands_exclude_with_expected_sources() {
+        let sha = "a".repeat(64);
+        let expand_command = format!(
+            "cass expand /srv/sessions/e.jsonl --source local --message-id 3 --expected-content-sha256 {sha} --recall"
+        );
+        let cases: Vec<(RecallTool, String, Value)> = vec![
+            (
+                RecallTool::Search,
+                "cass search \"needle\" --recall".to_string(),
+                search_value(),
+            ),
+            (RecallTool::Expand, expand_command, expand_value()),
+            (
+                RecallTool::Sessions,
+                "cass sessions --limit 5 --recall".to_string(),
+                sessions_value(),
+            ),
+            (
+                RecallTool::Timeline,
+                "cass timeline --group-by hour --recall".to_string(),
+                timeline_value(),
+            ),
+        ];
+        for (tool, command, value) in cases {
+            let wrapper = recall_output::encode(tool, &value).unwrap();
+            let expression = cli_expression(&command);
+            let (outcome, _, _) =
+                exec_outcome(&expression, cli_output_string(&cli_application(&wrapper)));
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("{command} must be excluded");
+            };
+            assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("exec"));
+            assert!(judged.parse_error.is_none());
+            match tool {
+                RecallTool::Expand => assert_eq!(
+                    judged.src.unwrap().hits[0].line_number,
+                    Some(3),
+                    "expand source uses the proven CLI args and the unique target line"
+                ),
+                RecallTool::Search => assert_eq!(judged.src.unwrap(), search_src()),
+                RecallTool::Sessions => assert_eq!(judged.src.unwrap(), sessions_src()),
+                RecallTool::Timeline => assert_eq!(judged.src.unwrap(), timeline_src()),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_four_mcp_methods_exclude_with_expected_sources() {
+        let cases: Vec<(RecallTool, &str, Value)> = vec![
+            (RecallTool::Search, "mcp__cass_mcp__cass_search", search_value()),
+            (RecallTool::Expand, "mcp__cass_mcp__cass_expand", expand_value()),
+            (RecallTool::Sessions, "mcp__cass_mcp__cass_sessions", sessions_value()),
+            (RecallTool::Timeline, "mcp__cass_mcp__cass_timeline", timeline_value()),
+        ];
+        for (tool, method, value) in cases {
+            let wrapper = recall_output::encode(tool, &value).unwrap();
+            let expression = mcp_expression(
+                method,
+                json!({"source_id": "local", "source_path": "/srv/sessions/e.jsonl"}),
+            );
+            let (outcome, _, _) = exec_outcome(&expression, mcp_output(&mcp_application(&wrapper)));
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("{method} must be excluded");
+            };
+            assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("exec"));
+            assert!(judged.parse_error.is_none());
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_json_data_may_hold_parens_semicolons_closing_tag_and_unicode() {
+        let value = json!({"hits": [{
+            "source_id": "local",
+            "source_path": "/srv/sessions/中文.jsonl",
+            "line_number": 4,
+            "content": "a ); </cass_recall> b"
+        }]});
+        let wrapper = recall_output::encode(RecallTool::Search, &value).unwrap();
+        let command = "cass search \"a); </cass_recall> 中文\" --recall";
+        let (outcome, _, _) =
+            exec_outcome(&cli_expression(command), cli_output_string(&cli_application(&wrapper)));
+        let Outcome::Exclude(judged) = outcome else {
+            panic!("quoted metacharacters inside JSON are data");
+        };
+        assert_eq!(judged.src.unwrap().sessions, vec!["/srv/sessions/中文.jsonl"]);
+    }
+
+    #[test]
+    fn mcp_v2_exec_unpaired_complete_c04_counts_unpaired_but_never_excludes() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let output = cli_output_string(&cli_application(&wrapper));
+        let raw_record = result_raw_record(None, &output, "custom_tool_call_output");
+        let conv = codex_conversation(vec![codex_result_row(&output, &raw_record)]);
+        let event = RawEvent {
+            event_key: "line:1".into(),
+            blocks: vec![tool_result_block(0, None)],
+        };
+        assert_eq!(
+            decide_for_record(&conv, 0, &event, &PairingContext::default(), &paths_cfg(), &raw_record),
+            Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+        );
+
+        // An unknown application result with no recall evidence falls back
+        // to the legacy conservative result.
+        let bad_output = Value::String(json!({"hello": "world"}).to_string());
+        let bad_raw = result_raw_record(None, &bad_output, "custom_tool_call_output");
+        let bad_conv = codex_conversation(vec![codex_result_row(&bad_output, &bad_raw)]);
+        assert_eq!(
+            decide_for_record(&bad_conv, 0, &event, &PairingContext::default(), &paths_cfg(), &bad_raw),
+            Outcome::Preserve(None)
+        );
+
+        // Ordinary user text is never a candidate.
+        let user = codex_message("user", "the assistant ran text(await tools.exec_command(...))", json!({}));
+        let user_conv = codex_conversation(vec![user]);
+        assert_eq!(
+            decide_for_record(&user_conv, 0, &event, &PairingContext::default(), &paths_cfg(), &json!({})),
+            Outcome::Preserve(None)
+        );
+    }
+
+    #[test]
+    fn mcp_v2_exec_idx_out_of_bounds_preserves_without_reason() {
+        let conv = codex_conversation(vec![codex_message("user", "hi", json!({}))]);
+        let event = RawEvent { event_key: "line:1".into(), blocks: Vec::new() };
+        assert_eq!(
+            decide_for_record(&conv, 9, &event, &PairingContext::default(), &paths_cfg(), &json!({})),
+            Outcome::Preserve(None)
+        );
+    }
+
+    #[test]
+    fn mcp_v2_exec_multiple_application_blocks_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let application = cli_application(&wrapper).to_string();
+        let expression = cli_expression("cass search needle --recall");
+        for output in [
+            json!([
+                {"type": "input_text", "text": application},
+                {"type": "input_text", "text": application},
+            ]),
+            json!([
+                {"type": "input_text", "text": header_text("0.1")},
+                {"type": "input_text", "text": application},
+                {"type": "input_text", "text": application},
+            ]),
+            json!([
+                {"type": "input_text", "text": application},
+                {"type": "input_text", "text": header_text("0.1")},
+            ]),
+            json!([
+                {"type": "input_text", "text": header_text("0.1")},
+                {"type": "input_text", "text": application},
+                {"type": "input_text", "text": "extra host text"},
+            ]),
+        ] {
+            let (outcome, _, _) = exec_outcome(&expression, output);
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_header_shapes_and_block_types_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let application = cli_application(&wrapper).to_string();
+        let expression = cli_expression("cass search needle --recall");
+        let headers = [
+            "Script running\nWall time 0.1 seconds\nOutput:".to_string(),
+            "Script completed\nWall time 0.1 seconds:\nOutput:".to_string(),
+            "Script completed\nWall time -1 seconds\nOutput:".to_string(),
+            "Script completed\nWall time NaN seconds\nOutput:".to_string(),
+            "Script completed\nWall time 0.1 seconds".to_string(),
+            "Script completed\nOutput:\nWall time 0.1 seconds".to_string(),
+        ];
+        for header in headers {
+            let (outcome, _, _) = exec_outcome(
+                &expression,
+                json!([
+                    {"type": "input_text", "text": header},
+                    {"type": "input_text", "text": application},
+                ]),
+            );
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+        for block_type in ["text", "output_text", ""] {
+            let (outcome, _, _) = exec_outcome(
+                &expression,
+                json!([{"type": block_type, "text": application}]),
+            );
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_cli_application_transport_fields_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let expression = cli_expression("cass search needle --recall");
+        let cases = [
+            json!({"exit_code": 0, "session_id": null, "output": wrapper}),
+            json!({"exit_code": 0, "session_id": "s-1", "output": wrapper}),
+            json!({"exit_code": 1, "output": wrapper}),
+            json!({"exit_code": 0.0, "output": wrapper}),
+            json!({"exit_code": 0}),
+            json!({"exit_code": 0, "output": wrapper, "stdout": "second copy"}),
+        ];
+        for application in cases {
+            let (outcome, _, _) = exec_outcome(&expression, cli_output_string(&application));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_mcp_application_shape_preserves() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let expression = mcp_expression("mcp__cass_mcp__cass_search", json!({"query": "needle"}));
+        let cases = [
+            json!({"isError": true, "content": [{"type": "text", "text": wrapper}]}),
+            json!({"isError": "false", "content": [{"type": "text", "text": wrapper}]}),
+            json!({"content": []}),
+            json!({"content": [
+                {"type": "text", "text": wrapper},
+                {"type": "text", "text": wrapper}
+            ]}),
+            json!({"content": [{"type": "input_text", "text": wrapper}]}),
+            json!({"content": [{"type": "text", "text": wrapper}], "structuredContent": {"hits": []}}),
+            json!({"isError": false}),
+        ];
+        for application in cases {
+            let (outcome, _, _) = exec_outcome(&expression, mcp_output(&application));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_broken_or_wrong_tool_c04_preserves_invalid_format() {
+        let truncated = "<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\": []}";
+        let cases = [
+            (cli_expression("cass search needle --recall"), truncated.to_string(), false),
+            (
+                cli_expression("cass search needle --recall"),
+                recall_output::encode(RecallTool::Sessions, &sessions_value()).unwrap(),
+                false,
+            ),
+            (
+                mcp_expression("mcp__cass_mcp__cass_expand", json!({"message_id": 1})),
+                recall_output::encode(RecallTool::Search, &search_value()).unwrap(),
+                true,
+            ),
+        ];
+        for (expression, wrapper, is_mcp) in cases {
+            let output = if is_mcp {
+                mcp_output(&mcp_application(&wrapper))
+            } else {
+                cli_output_string(&cli_application(&wrapper))
+            };
+            let (outcome, _, _) = exec_outcome(&expression, output);
+            assert_preserved(outcome, UncoveredReason::InvalidRecallFormat);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_dynamic_javascript_and_unknown_methods_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let output = cli_output_string(&cli_application(&wrapper));
+        let valid_command = json!({"cmd": "cass search needle --recall"});
+        let expressions = [
+            format!("const r = await tools.exec_command({valid_command}); text(r);"),
+            "text(await tools.exec_command({cmd: \"cass search needle\"}));".to_string(),
+            "text(await tools.exec_command(`{\"cmd\":\"cass search needle\"}`));".to_string(),
+            "for (let i = 0; i < 2; i++) { text(await tools.exec_command({\"cmd\":\"cass search needle\"})); }".to_string(),
+            format!(
+                "text(await tools.exec_command({valid_command})); text(await tools.exec_command({valid_command}));"
+            ),
+            "text(await tools.exec_command([1, 2]));".to_string(),
+            "text(await tools.exec_command({\"cmd\":\"cass search needle\"}))".to_string(),
+            "text(await tools.wait({\"cell_id\":\"1\"}));".to_string(),
+            "text(await tools.mcp__other_mcp__cass_search({\"query\":\"x\"}));".to_string(),
+            "text(await tools.exec_command({\"cmd\":\"rg needle\"}));".to_string(),
+            "text(await tools.exec_command({\"cmd\":\"cass search needle | head\"}));".to_string(),
+            "text(await tools.exec_command({\"cmd\":42}));".to_string(),
+        ];
+        for expression in expressions {
+            let (outcome, _, _) = exec_outcome(&expression, output.clone());
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_exec_function_call_or_nonstring_args_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let output = cli_output_string(&cli_application(&wrapper));
+        let expression = cli_expression("cass search needle --recall");
+
+        let (mut conv, events, raw_record) = exec_fixture(&expression, output.clone());
+        conv.messages[0].extra["raw_role"] = json!("function_call");
+        let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        assert_preserved(
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnsupportedShell,
+        );
+
+        let (mut conv, events, raw_record) = exec_fixture(&expression, output.clone());
+        conv.messages[0].invocations[0].arguments = Some(json!({"cmd": "cass search needle --recall"}));
+        let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        assert_preserved(
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnsupportedShell,
+        );
+
+        let (mut conv, events, raw_record) = exec_fixture(&expression, output);
+        conv.messages[0].invocations[0].arguments = None;
+        let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        assert_preserved(
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnpairedResult,
+        );
+    }
+
+    #[test]
+    fn mcp_v2_exec_raw_record_shape_and_call_id_mismatch_preserve() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let output = cli_output_string(&cli_application(&wrapper));
+        let expression = cli_expression("cass search needle --recall");
+
+        let (conv, events, _) = exec_fixture(&expression, output.clone());
+        let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        let mismatched = result_raw_record(Some("other-call"), &output, "custom_tool_call_output");
+        assert_preserved(
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &mismatched),
+            UncoveredReason::UnpairedResult,
+        );
+
+        let plain = result_raw_record(Some("call-t07"), &output, "function_call_output");
+        assert_preserved(
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &plain),
+            UncoveredReason::UnsupportedShell,
+        );
+
+        assert_preserved(
+            decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &json!([1, 2])),
+            UncoveredReason::UnsupportedShell,
+        );
+    }
+
+    #[test]
+    fn mcp_v2_exec_r4_ambiguity_and_future_calls_never_exclude() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let output = cli_output_string(&cli_application(&wrapper));
+        let raw_record = result_raw_record(None, &output, "custom_tool_call_output");
+        let result = codex_result_row(&output, &raw_record);
+
+        // Duplicate id (R1-B5): no pair.
+        let duplicate = vec![
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("dup".into()),
+                tool_name: "exec".into(),
+                args: Some(Value::String(cli_expression("cass search x --recall"))),
+            }),
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("dup".into()),
+                tool_name: "exec".into(),
+                args: Some(Value::String(cli_expression("cass search x --recall"))),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("dup".into()) },
+        ];
+        let ctx = PairingContext::build(&duplicate);
+        assert!(ctx.paired_call_for(2).is_none());
+        assert!(ctx.paired_call_index_for(2).is_none());
+        let conv = codex_conversation(vec![
+            codex_call_row(&cli_expression("cass search x --recall"), Some("dup"), "custom_tool_call"),
+            codex_call_row(&cli_expression("cass search x --recall"), Some("dup"), "custom_tool_call"),
+            result.clone(),
+        ]);
+        let event = RawEvent { event_key: "line:3".into(), blocks: vec![tool_result_block(0, Some("dup"))] };
+        assert_preserved(
+            decide_for_record(&conv, 2, &event, &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnpairedResult,
+        );
+
+        // Result before its call: no pair.
+        let future = vec![
+            PairingCandidate::ToolResult { tool_call_id: Some("late".into()) },
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("late".into()),
+                tool_name: "exec".into(),
+                args: Some(Value::String(cli_expression("cass search x --recall"))),
+            }),
+        ];
+        let ctx = PairingContext::build(&future);
+        assert!(ctx.paired_call_index_for(0).is_none());
+        let conv = codex_conversation(vec![
+            result.clone(),
+            codex_call_row(&cli_expression("cass search x --recall"), Some("late"), "custom_tool_call"),
+        ]);
+        let event = RawEvent { event_key: "line:1".into(), blocks: vec![tool_result_block(0, Some("late"))] };
+        assert_preserved(
+            decide_for_record(&conv, 0, &event, &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnpairedResult,
+        );
+
+        // Two id-less calls: ambiguous, no pair.
+        let ambiguous = vec![
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: None,
+                tool_name: "exec".into(),
+                args: Some(Value::String(cli_expression("cass search x --recall"))),
+            }),
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: None,
+                tool_name: "exec".into(),
+                args: Some(Value::String(cli_expression("cass search x --recall"))),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: None },
+        ];
+        let ctx = PairingContext::build(&ambiguous);
+        assert!(ctx.paired_call_index_for(2).is_none());
+        let conv = codex_conversation(vec![
+            codex_call_row(&cli_expression("cass search x --recall"), None, "custom_tool_call"),
+            codex_call_row(&cli_expression("cass search x --recall"), None, "custom_tool_call"),
+            result.clone(),
+        ]);
+        let event = RawEvent { event_key: "line:3".into(), blocks: vec![tool_result_block(0, None)] };
+        assert_preserved(
+            decide_for_record(&conv, 2, &event, &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnpairedResult,
+        );
+
+        // Turn boundary clears the id-less candidate: no pair.
+        let bounded = vec![
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: None,
+                tool_name: "exec".into(),
+                args: Some(Value::String(cli_expression("cass search x --recall"))),
+            }),
+            PairingCandidate::TurnBoundary,
+            PairingCandidate::ToolResult { tool_call_id: None },
+        ];
+        let ctx = PairingContext::build(&bounded);
+        assert!(ctx.paired_call_index_for(2).is_none());
+        let conv = codex_conversation(vec![
+            codex_call_row(&cli_expression("cass search x --recall"), None, "custom_tool_call"),
+            codex_message("user", "next turn", json!({})),
+            result,
+        ]);
+        let event = RawEvent { event_key: "line:3".into(), blocks: vec![tool_result_block(0, None)] };
+        assert_preserved(
+            decide_for_record(&conv, 2, &event, &ctx, &paths_cfg(), &raw_record),
+            UncoveredReason::UnpairedResult,
+        );
+    }
+
+    #[test]
+    fn mcp_v2_exec_non_custom_tool_and_non_codex_delegate_to_decide() {
+        // A paired non-exec tool keeps the verified MCP/CLI/R2/R3 judgment.
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let (mut message, event, ctx) =
+            fixture("mcp__cass-mcp__cass_search", json!({}), &wrapper);
+        let conv = codex_conversation(vec![
+            codex_message("tool_call", "", json!({"raw_role": "custom_tool_call"})),
+            std::mem::replace(&mut message, msg("tool_result", "")),
+        ]);
+        assert_eq!(
+            decide_for_record(&conv, 1, &event, &ctx, &paths_cfg(), &json!({})),
+            decide(&conv.messages[1], 1, &event, &ctx, "codex", &paths_cfg())
+        );
+
+        // claude_code is not the C07 path; the same strong-identity result is
+        // excluded exactly as the verified v2 entry does.
+        let (claude_message, claude_event, claude_ctx) =
+            fixture("mcp__cass-mcp__cass_search", json!({}), &wrapper);
+        let claude_conv = codex_conversation(vec![
+            codex_message("tool_call", "", json!({})),
+            claude_message,
+        ]);
+        let mut claude_conv = claude_conv;
+        claude_conv.agent_slug = "claude_code".to_string();
+        let Outcome::Exclude(judged) =
+            decide_for_record(&claude_conv, 1, &claude_event, &claude_ctx, &paths_cfg(), &json!({}))
+        else {
+            panic!("non-codex rows keep the verified v2 result");
+        };
+        assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("mcp__cass-mcp__cass_search"));
+        assert_eq!(judged.src.as_ref(), Some(&search_src()));
     }
 
     #[test]
