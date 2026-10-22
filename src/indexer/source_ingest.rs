@@ -687,6 +687,37 @@ pub(crate) fn load_restore_fixed_safety(
     Ok(loaded)
 }
 
+/// Task09: a test-only fixed configuration carrying an arbitrary code version.
+///
+/// Every production loader refuses a version this build cannot read before it
+/// builds a [`FixedSafetyConfig`], so the restore profile factory's own
+/// unknown-version refusal can only be reached with a hand-built value. Crate
+/// tests only; it grants nothing to a production caller.
+#[cfg(test)]
+pub(crate) fn test_fixed_safety_with_code_version(
+    code_version: &str,
+    bytes: &[u8],
+    identity: &str,
+    arrays: crate::sources::config::ExcludedContextPaths,
+) -> FixedSafetyConfig {
+    let config = SourceSafetyConfig {
+        code_version: code_version.to_string(),
+        desensitization_enabled: true,
+        config_source_identity: identity.to_string(),
+        fixed_config_bytes: bytes.to_vec(),
+        effective_four_arrays: arrays,
+    };
+    config
+        .verify()
+        .expect("a hand-built test configuration must still verify");
+    FixedSafetyConfig {
+        original_path: identity.to_string(),
+        bytes_sha256: Sha256Digest::of(bytes),
+        bytes: bytes.to_vec(),
+        config,
+    }
+}
+
 /// P0/C5 (2026-10-15 execution contract v2): the fixed configuration one run
 /// consumes.
 ///
@@ -2850,6 +2881,17 @@ struct SafetyPass {
     judged: Vec<JudgedConversation>,
 }
 
+/// The one judged payload a record's claim produced.
+///
+/// Each rule epoch keeps its own payload: the legacy decision, or the v2
+/// exclusion (that same legacy decision plus the source and parse facts v2
+/// keeps). Only the apply entry differs; the body proof, the sibling pass and
+/// every write after it are shared.
+enum JudgedDecision {
+    Legacy(crate::indexer::exclusion::Decision),
+    V2(crate::indexer::recall_v2::Exclusion),
+}
+
 /// The text an array of content parts renders to, mirroring the connector's own
 /// expansion: a bare string is itself, a text-ish block contributes its `text`,
 /// and every other block kind contributes nothing. `None` when `value` is not
@@ -3183,7 +3225,18 @@ fn safety_pass(
     verified: &crate::raw_mirror::VerifiedRawMirrorCapture,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
 ) -> Result<SafetyPass, SourceIngestError> {
-    use crate::indexer::exclusion::{Decision, ExcludedMarker, PairingContext};
+    use crate::indexer::exclusion::{ExcludedMarker, PairingContext};
+
+    // The rule epoch this input really ran under, taken from its own verified
+    // safety identity. A version this build cannot read is a configuration
+    // refusal; it is never papered over with the producer default.
+    let code_version = job.input.safety_identity().code_version();
+    let Some(rule_epoch) = exclusion_epoch_for_code_version(code_version) else {
+        return Err(SourceIngestError::Config {
+            detail: "code_version_unsupported".to_string(),
+        });
+    };
+    let v2_rules = rule_epoch == SOURCE_EXCLUSION_EPOCH_V2;
 
     let fad_name = fad_connector_name(job.connector_name);
     // One mutable copy of each projected conversation: the judgment mutates
@@ -3228,7 +3281,7 @@ fn safety_pass(
     let mut parse_failed = 0u64;
     let mut diagnostics_count = 0u64;
     let mut scanned = 0usize;
-    let mut decisions: Vec<(usize, usize, u64, Decision)> = Vec::new();
+    let mut decisions: Vec<(usize, usize, u64, JudgedDecision)> = Vec::new();
     let mut bodies_by_ordinal: BTreeMap<u64, Vec<ExcludedBody>> = BTreeMap::new();
 
     let mut scan = source_facts::FramingStream::new(&mut reader, format);
@@ -3335,14 +3388,37 @@ fn safety_pass(
                             ),
                         });
                     };
-                    if let Some(decision) = crate::indexer::exclusion::decide(
-                        message,
-                        msg_idx,
-                        event,
-                        &pairing[conv_idx],
-                        &conversations[conv_idx].agent_slug,
-                        paths_cfg,
-                    ) {
+                    let judged = if v2_rules {
+                        // The v2 entry reads this record's real raw JSON, so the
+                        // current host's frozen single-call wrapper and the
+                        // source metadata both come from the record itself. A
+                        // preserved candidate keeps its body; its uncovered
+                        // counters belong to the enablement task.
+                        match crate::indexer::recall_v2::decide_for_record(
+                            &conversations[conv_idx],
+                            msg_idx,
+                            event,
+                            &pairing[conv_idx],
+                            paths_cfg,
+                            &json,
+                        ) {
+                            crate::indexer::recall_v2::Outcome::Exclude(exclusion) => {
+                                Some(JudgedDecision::V2(exclusion))
+                            }
+                            crate::indexer::recall_v2::Outcome::Preserve(_) => None,
+                        }
+                    } else {
+                        crate::indexer::exclusion::decide(
+                            message,
+                            msg_idx,
+                            event,
+                            &pairing[conv_idx],
+                            &conversations[conv_idx].agent_slug,
+                            paths_cfg,
+                        )
+                        .map(JudgedDecision::Legacy)
+                    };
+                    if let Some(decision) = judged {
                         bodies_by_ordinal
                             .entry(locator.ordinal)
                             .or_default()
@@ -3481,15 +3557,28 @@ fn safety_pass(
         .collect();
     for (conv_idx, msg_idx, _, decision) in &decisions {
         let pre_redaction_content = conversations[*conv_idx].messages[*msg_idx].content.clone();
-        let marker = crate::indexer::exclusion::apply_with_redaction(
-            &mut conversations[*conv_idx].messages[*msg_idx],
-            decision,
-            &mut redactor,
-            &blob_label,
-            *msg_idx as u32,
-            field_maps[*conv_idx],
-            true,
-        );
+        // Each epoch applies through its own entry; the body proof, the hash,
+        // the anchor and the raw reference stay the one shared implementation.
+        let marker = match decision {
+            JudgedDecision::Legacy(decision) => crate::indexer::exclusion::apply_with_redaction(
+                &mut conversations[*conv_idx].messages[*msg_idx],
+                decision,
+                &mut redactor,
+                &blob_label,
+                *msg_idx as u32,
+                field_maps[*conv_idx],
+                true,
+            ),
+            JudgedDecision::V2(exclusion) => crate::indexer::recall_v2::apply_with_redaction(
+                &mut conversations[*conv_idx].messages[*msg_idx],
+                exclusion,
+                &mut redactor,
+                &blob_label,
+                *msg_idx as u32,
+                field_maps[*conv_idx],
+                true,
+            ),
+        };
         if let Some(title) = conversations[*conv_idx].title.as_ref().filter(|t| !t.is_empty())
             && pre_redaction_content.contains(title.as_str())
         {
