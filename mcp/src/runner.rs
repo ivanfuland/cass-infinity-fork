@@ -330,6 +330,14 @@ impl Runner {
             ));
         };
 
+        // The same control decides the captured bytes too: the child is waited
+        // and the capture is ready, but this request's outcome is not decided
+        // yet. A cancellation or the total deadline that arrived while the
+        // caller was not polled still outranks a not-yet-determined exit
+        // status, format error or success (C10). Failures the supervisor had
+        // already decided returned above and keep their cause.
+        let decision = control.clone();
+
         let supervised = tokio::spawn(supervise_holding(
             permit,
             control,
@@ -364,6 +372,13 @@ impl Runner {
             Supervised::Cancelled => return Err(ToolError::cancelled()),
             Supervised::TimedOut => return Err(ToolError::timeout()),
         };
+
+        // This candidate result is still undecided, so the same control rules
+        // it in its own synchronous moment. The check carries no `await`: one
+        // request publishes at most one outcome.
+        if let Some(error) = decision.observed_failure() {
+            return Err(error);
+        }
 
         if !status.success() {
             let code = status.code();
@@ -1234,5 +1249,126 @@ mod tests {
             "the child must be waited before the permit is released"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod controller_capture_boundary {
+    use super::*;
+    use std::future::Future;
+    use std::os::unix::fs::PermissionsExt;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
+        let mut cx = Context::from_waker(Waker::noop());
+        f.poll(&mut cx)
+    }
+    async fn captured_then_stop(cancel: bool) {
+        // Building this window writes a fake binary and execs it immediately.
+        // Another test in the same process can fork between the write and the
+        // exec, which leaves the file write-open in the child for a moment and
+        // makes the exec fail with ETXTBSY. On a loaded host the short fixture
+        // deadline can also elapse before the first poll. Both failures happen
+        // before the request could reach the captured bytes, so rebuild the
+        // window a bounded number of times. The behavioral assertions below do
+        // not change.
+        for _ in 0..5 {
+            let dir = std::env::temp_dir().join(format!(
+                "cc-cass-t15b-capture-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let executable = dir.join("fake-cass");
+            std::fs::write(
+                &executable,
+                "#!/bin/sh\nprintf '%s' 'not a recall wrapper'\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let admission = Admission::new(1, 1);
+            let runner = Runner {
+                cass_bin: executable,
+                data_dir: dir.clone(),
+                api_config: dir.join("api.toml"),
+                embedding_profile: "fixed".into(),
+                rerank_profile: "fixed".into(),
+                max_output_bytes: 4096,
+                terminate_grace: Duration::from_millis(50),
+                request_timeout: Duration::from_secs(30),
+                admission: Arc::clone(&admission),
+            };
+            let args = serde_json::json!({});
+            let call = crate::tools::parse(RecallTool::Sessions, args.as_object()).unwrap();
+            let token = CancellationToken::new();
+            let control = RequestControl::new(
+                token.clone(),
+                Instant::now(),
+                if cancel {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_millis(300)
+                },
+            );
+            let deadline = control.deadline;
+            let mut pending = Box::pin(runner.run(RecallTool::Sessions, &call, control));
+            let first = poll_once(pending.as_mut());
+            if let Poll::Ready(Err(error)) = &first
+                && (error.code == CASS_EXIT || error.code == TIMEOUT)
+            {
+                let _ = std::fs::remove_dir_all(&dir);
+                continue;
+            }
+            assert!(
+                first.is_pending(),
+                "the first poll already returned {first:?}"
+            );
+            assert_eq!(admission.counters(), (1, 0));
+            for _ in 0..1000 {
+                if admission.counters() == (0, 0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(
+                admission.counters(),
+                (0, 0),
+                "the child was waited and Captured is ready, but caller is deliberately not polled yet"
+            );
+            if cancel {
+                token.cancel();
+            } else {
+                tokio::time::sleep_until(deadline).await;
+            }
+            let outcome = match poll_once(pending.as_mut()) {
+                Poll::Ready(x) => x,
+                Poll::Pending => panic!("captured result was already available"),
+            };
+            println!("controller_capture_boundary cancel={cancel} observed={outcome:?}");
+            let expected = if cancel { CANCELLED } else { TIMEOUT };
+            assert_eq!(
+                outcome.unwrap_err().code,
+                expected,
+                "a still-undecided captured result must observe cancel/deadline before choosing a new format error"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        panic!("the un-polled capture window could not be built in five attempts");
+    }
+    // A current-thread runtime keeps the first poll pending: the supervising
+    // task cannot finish before this test's own first poll, so the
+    // un-polled-capture window is constructed deterministically even while the
+    // rest of the private set runs in parallel.
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_cancel_after_capture_before_format_error_wins() {
+        captured_then_stop(true).await;
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn controller_deadline_after_capture_before_format_error_wins() {
+        captured_then_stop(false).await;
     }
 }
