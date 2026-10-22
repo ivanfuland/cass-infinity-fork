@@ -5,7 +5,9 @@
 //! configuration never starts a subprocess or a listener.
 
 mod config;
+mod runner;
 mod server;
+mod tools;
 
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};

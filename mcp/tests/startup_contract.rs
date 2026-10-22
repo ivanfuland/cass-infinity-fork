@@ -305,8 +305,8 @@ fn post(
     body: &str,
 ) -> HttpResponse {
     let address: SocketAddr = (server.address.ip(), server.address.port()).into();
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(10))
-        .expect("connect to cass-mcp");
+    let mut stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(10)).expect("connect to cass-mcp");
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("set read timeout");
@@ -431,10 +431,6 @@ fn tools_list_body() -> String {
     .to_string()
 }
 
-fn protocol_headers() -> Vec<(&'static str, &'static str)> {
-    vec![("MCP-Protocol-Version", PROTOCOL_VERSION)]
-}
-
 fn json_body(body: &str) -> serde_json::Value {
     serde_json::from_str(body).unwrap_or_else(|error| panic!("invalid JSON body: {error}: {body}"))
 }
@@ -444,6 +440,94 @@ fn free_port() -> u16 {
     let port = listener.local_addr().expect("ephemeral address").port();
     drop(listener);
     port
+}
+
+/// JSON-RPC payload of a JSON or SSE response. Legacy session mode answers
+/// `2025-11-25` requests with SSE; stateless requests stay plain JSON.
+fn response_payload(response: &HttpResponse) -> serde_json::Value {
+    if response
+        .header("content-type")
+        .is_some_and(|value| value.contains("text/event-stream"))
+    {
+        sse_payloads(&response.body)
+            .into_iter()
+            .last()
+            .unwrap_or_else(|| panic!("SSE response carried no JSON event: {}", response.body))
+    } else {
+        json_body(&response.body)
+    }
+}
+
+fn sse_payloads(body: &str) -> Vec<serde_json::Value> {
+    let mut payloads = Vec::new();
+    let mut data = String::new();
+    let flush = |data: &mut String, payloads: &mut Vec<serde_json::Value>| {
+        if !data.is_empty() {
+            if let Ok(value) = serde_json::from_str(data) {
+                payloads.push(value);
+            }
+            data.clear();
+        }
+    };
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if line.is_empty() {
+            flush(&mut data, &mut payloads);
+        }
+    }
+    flush(&mut data, &mut payloads);
+    payloads
+}
+
+/// POST a JSON-RPC message inside an established session.
+fn post_session(server: &ServerProc, host: &str, session: &str, body: &str) -> HttpResponse {
+    post(
+        server,
+        host,
+        &[
+            ("MCP-Protocol-Version", PROTOCOL_VERSION),
+            ("Mcp-Session-Id", session),
+        ],
+        body,
+    )
+}
+
+/// Complete the `2025-11-25` handshake and return the session id with the
+/// initialize result. `extra_headers` carries any Origin under test.
+fn initialize_session(
+    server: &ServerProc,
+    host: &str,
+    extra_headers: &[(&str, &str)],
+) -> (String, serde_json::Value) {
+    let mut headers = extra_headers.to_vec();
+    headers.push(("MCP-Protocol-Version", PROTOCOL_VERSION));
+    let response = post(server, host, &headers, &initialize_body());
+    assert_eq!(response.status, 200, "initialize body: {}", response.body);
+    let session = response
+        .header("mcp-session-id")
+        .unwrap_or_else(|| {
+            panic!(
+                "initialize must return Mcp-Session-Id: {:?}",
+                response.headers
+            )
+        })
+        .to_string();
+    let value = response_payload(&response);
+
+    let notification =
+        serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string();
+    let response = post_session(server, host, &session, &notification);
+    assert_eq!(
+        response.status, 202,
+        "initialized notification body: {}",
+        response.body
+    );
+
+    (session, value)
 }
 
 // ---------------------------------------------------------------------------
@@ -474,19 +558,11 @@ fn initialize_and_tools_list_are_served() {
     let server = start_server(&fixture, PUBLIC_ORIGIN);
     let host = format!("127.0.0.1:{}", server.address.port());
 
-    let response = post(&server, &host, &protocol_headers(), &initialize_body());
-    assert_eq!(response.status, 200, "initialize body: {}", response.body);
-    assert_eq!(
-        response.header("content-type"),
-        Some("application/json"),
-        "stateless JSON responses are configured"
-    );
+    let (session, value) = initialize_session(&server, &host, &[]);
     assert!(
-        response.header("mcp-session-id").is_none(),
-        "legacy session mode must stay disabled"
+        !session.is_empty(),
+        "the 2025-11-25 handshake must establish a session"
     );
-
-    let value = json_body(&response.body);
     assert_eq!(value["result"]["protocolVersion"], PROTOCOL_VERSION);
     assert_eq!(value["result"]["serverInfo"]["name"], "cass-mcp");
     assert_eq!(value["result"]["serverInfo"]["version"], "0.6.17");
@@ -495,15 +571,25 @@ fn initialize_and_tools_list_are_served() {
         "tools capability must be advertised: {value}"
     );
 
-    let response = post(&server, &host, &protocol_headers(), &tools_list_body());
+    let response = post_session(&server, &host, &session, &tools_list_body());
     assert_eq!(response.status, 200, "tools/list body: {}", response.body);
-    let value = json_body(&response.body);
+    let value = response_payload(&response);
     let tools = value["result"]["tools"]
         .as_array()
         .unwrap_or_else(|| panic!("tools/list must return a tools array: {value}"));
-    assert!(
-        tools.is_empty(),
-        "tools/list must stay empty until ticket 12: {tools:?}"
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "cass_search",
+            "cass_expand",
+            "cass_sessions",
+            "cass_timeline"
+        ],
+        "ticket 12 registers exactly the four read tools"
     );
 
     assert_eq!(fixture.invocation_count(), 1);
@@ -511,7 +597,7 @@ fn initialize_and_tools_list_are_served() {
 }
 
 /// Any loopback address is a legal `--bind` value, not only `127.0.0.1`.
-/// A request without an Origin must reach `initialize` and an empty
+/// A request without an Origin must reach `initialize` and the four-tool
 /// `tools/list` over real HTTP on such an address.
 #[test]
 fn alternate_loopback_bind_serves_requests_without_origin() {
@@ -520,26 +606,20 @@ fn alternate_loopback_bind_serves_requests_without_origin() {
     assert_eq!(server.address.ip().to_string(), "127.0.0.2");
     let host = format!("127.0.0.2:{}", server.address.port());
 
-    let response = post(&server, &host, &[], &initialize_body());
-    assert_eq!(
-        response.status, 200,
-        "initialize without Origin on 127.0.0.2 failed; body: {}",
-        response.body
-    );
-    let value = json_body(&response.body);
+    let (session, value) = initialize_session(&server, &host, &[]);
     assert_eq!(value["result"]["serverInfo"]["name"], "cass-mcp");
 
-    let response = post(&server, &host, &[], &tools_list_body());
+    let response = post_session(&server, &host, &session, &tools_list_body());
     assert_eq!(
         response.status, 200,
         "tools/list without Origin on 127.0.0.2 failed; body: {}",
         response.body
     );
-    let value = json_body(&response.body);
+    let value = response_payload(&response);
     assert_eq!(
         value["result"]["tools"].as_array().map(Vec::len),
-        Some(0),
-        "tools/list must stay empty until ticket 12: {value}"
+        Some(4),
+        "ticket 12 advertises four tools: {value}"
     );
 
     assert_eq!(fixture.invocations(), vec!["--version".to_string()]);
@@ -554,34 +634,36 @@ fn ipv6_loopback_bind_serves_requests_without_origin() {
     let port = server.address.port();
     let host = format!("[::1]:{port}");
 
-    let response = post(&server, &host, &[], &initialize_body());
-    assert_eq!(
-        response.status, 200,
-        "initialize without Origin on [::1] failed; body: {}",
-        response.body
-    );
-    let value = json_body(&response.body);
+    let (session, value) = initialize_session(&server, &host, &[]);
     assert_eq!(value["result"]["serverInfo"]["name"], "cass-mcp");
 
     let origin = format!("http://[::1]:{port}");
-    let response = post(&server, &host, &[("Origin", origin.as_str())], &initialize_body());
+    let response = post(
+        &server,
+        &host,
+        &[
+            ("Origin", origin.as_str()),
+            ("MCP-Protocol-Version", PROTOCOL_VERSION),
+        ],
+        &initialize_body(),
+    );
     assert_eq!(
         response.status, 200,
         "initialize with Origin {origin} failed; body: {}",
         response.body
     );
 
-    let response = post(&server, &host, &[], &tools_list_body());
+    let response = post_session(&server, &host, &session, &tools_list_body());
     assert_eq!(
         response.status, 200,
         "tools/list without Origin on [::1] failed; body: {}",
         response.body
     );
-    let value = json_body(&response.body);
+    let value = response_payload(&response);
     assert_eq!(
         value["result"]["tools"].as_array().map(Vec::len),
-        Some(0),
-        "tools/list must stay empty until ticket 12: {value}"
+        Some(4),
+        "ticket 12 advertises four tools: {value}"
     );
 
     assert_eq!(fixture.invocations(), vec!["--version".to_string()]);
@@ -596,32 +678,29 @@ fn expanded_ipv6_public_origin_matches_its_exact_origin() {
     let server = start_server(&fixture, origin);
     let host = format!("127.0.0.1:{}", server.address.port());
 
-    let response = post(&server, &host, &[("Origin", origin)], &initialize_body());
-    assert_eq!(
-        response.status, 200,
-        "configured Origin {origin} must be allowed; body: {}",
-        response.body
-    );
-    let value = json_body(&response.body);
+    let (session, value) = initialize_session(&server, &host, &[("Origin", origin)]);
     assert_eq!(value["result"]["serverInfo"]["name"], "cass-mcp");
 
-    let response = post(&server, &host, &[("Origin", origin)], &tools_list_body());
+    let response = post_session(&server, &host, &session, &tools_list_body());
     assert_eq!(
         response.status, 200,
         "tools/list with configured Origin {origin} failed; body: {}",
         response.body
     );
-    let value = json_body(&response.body);
+    let value = response_payload(&response);
     assert_eq!(
         value["result"]["tools"].as_array().map(Vec::len),
-        Some(0),
-        "tools/list must stay empty until ticket 12: {value}"
+        Some(4),
+        "ticket 12 advertises four tools: {value}"
     );
 
     let response = post(
         &server,
         &host,
-        &[("Origin", "http://[::1]:8080")],
+        &[
+            ("Origin", "http://[::1]:8080"),
+            ("MCP-Protocol-Version", PROTOCOL_VERSION),
+        ],
         &initialize_body(),
     );
     assert_eq!(
@@ -1010,10 +1089,7 @@ fn disallowed_origins_are_rejected() {
             "malformed IPv6 origin",
             vec![format!("http://[:::]:{port}")],
         ),
-        (
-            "scheme mismatch",
-            vec![format!("https://127.0.0.1:{port}")],
-        ),
+        ("scheme mismatch", vec![format!("https://127.0.0.1:{port}")]),
         (
             "duplicate origin headers",
             vec![
@@ -1045,8 +1121,16 @@ fn portless_public_origin_is_pinned_to_the_scheme_default_port() {
 
     for (label, origin, expected) in [
         ("origin without port", "http://portless.example", 200),
-        ("origin with default port", "http://portless.example:80", 200),
-        ("origin with another port", "http://portless.example:81", 403),
+        (
+            "origin with default port",
+            "http://portless.example:80",
+            200,
+        ),
+        (
+            "origin with another port",
+            "http://portless.example:81",
+            403,
+        ),
     ] {
         let headers = [("Origin", origin)];
         let response = post(&server, &host, &headers, &initialize_body());
