@@ -27161,6 +27161,336 @@ fn score_search_first_window(
     })
 }
 
+/// Ticket 20: the fixed, bounded refusal a recall carries when a requested
+/// model path was never realized. The text is generic on purpose: no provider
+/// name, profile body, endpoint, credential or hit body can leak through it.
+const RECALL_MODEL_UNAVAILABLE_MESSAGE: &str =
+    "recall refused: the requested model search path was not applied";
+const RECALL_MODEL_UNAVAILABLE_HINT: &str =
+    "Re-run with a working model configuration, or use --mode lexical when lexical results are acceptable.";
+
+fn recall_model_unavailable_error() -> CliError {
+    CliError {
+        code: 9,
+        kind: "model_unavailable",
+        message: RECALL_MODEL_UNAVAILABLE_MESSAGE.to_string(),
+        hint: Some(RECALL_MODEL_UNAVAILABLE_HINT.to_string()),
+        retryable: false,
+    }
+}
+
+/// Ticket 20: did an explicitly requested model path fail to materialize on a
+/// result that a recall would otherwise publish as a success?
+///
+/// The predicate reads only already-resolved facts. It never re-derives state
+/// from the JSON projection, never re-runs retrieval, and never learns which
+/// model, endpoint or profile produced the failure.
+///
+/// * A defaulted mode is not an explicit model choice, so its lexical
+///   degradation is allowed. An explicit `semantic`/`hybrid` request that
+///   realized lexical, carried a fallback tier, or reported a degraded semantic
+///   leg is a known retrieval fault even when it produced zero hits.
+/// * A non-empty page whose rerank was requested but not applied is the second
+///   known fault. An empty page never needs a rerank, so `applied=false` there
+///   stays a legal empty result.
+fn recall_model_quality_violation(
+    requested: crate::search::query::SearchMode,
+    realized: crate::search::query::SearchMode,
+    mode_defaulted: bool,
+    fallback_tier: Option<&'static str>,
+    semantic_degraded: bool,
+    hits_empty: bool,
+    rerank_requested: bool,
+    rerank_applied: bool,
+) -> Option<&'static str> {
+    use crate::search::query::SearchMode;
+    let explicit_semantic_choice = !mode_defaulted
+        && matches!(requested, SearchMode::Semantic | SearchMode::Hybrid);
+    let semantic_not_realized =
+        realized == SearchMode::Lexical || fallback_tier.is_some() || semantic_degraded;
+    if explicit_semantic_choice && semantic_not_realized {
+        return Some("semantic_not_realized");
+    }
+    if !hits_empty && rerank_requested && !rerank_applied {
+        return Some("rerank_not_applied");
+    }
+    None
+}
+
+#[cfg(test)]
+mod mcp_recall_models_guard_tests {
+    use super::recall_model_quality_violation;
+    use crate::search::query::SearchMode;
+
+    const DEGRADED: Option<&'static str> = Some("lexical");
+
+    /// All eight guard inputs, so each case reads as one state. "Hits present"
+    /// is `hits_empty = false`; rerank is requested/applied as named.
+    fn violation(
+        requested: SearchMode,
+        realized: SearchMode,
+        defaulted: bool,
+        fallback_tier: Option<&'static str>,
+        semantic_degraded: bool,
+        hits_empty: bool,
+        rerank_requested: bool,
+        rerank_applied: bool,
+    ) -> Option<&'static str> {
+        recall_model_quality_violation(
+            requested,
+            realized,
+            defaulted,
+            fallback_tier,
+            semantic_degraded,
+            hits_empty,
+            rerank_requested,
+            rerank_applied,
+        )
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_explicit_hybrid_realized_lexical_is_refused_with_and_without_hits() {
+        for hits_empty in [false, true] {
+            assert_eq!(
+                violation(
+                    SearchMode::Hybrid,
+                    SearchMode::Lexical,
+                    false,
+                    None,
+                    false,
+                    hits_empty,
+                    false,
+                    false,
+                ),
+                Some("semantic_not_realized"),
+                "an explicit hybrid request realized as lexical is a known fault, hits_empty={hits_empty}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_explicit_semantic_realized_lexical_is_refused() {
+        assert_eq!(
+            violation(
+                SearchMode::Semantic,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some("semantic_not_realized")
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_fallback_tier_alone_is_refused() {
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Hybrid,
+                false,
+                DEGRADED,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some("semantic_not_realized"),
+            "a fallback tier refuses even when realized still names the semantic mode"
+        );
+        assert_eq!(
+            violation(
+                SearchMode::Semantic,
+                SearchMode::Semantic,
+                false,
+                DEGRADED,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some("semantic_not_realized")
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_semantic_degraded_alone_is_refused() {
+        for requested in [SearchMode::Semantic, SearchMode::Hybrid] {
+            assert_eq!(
+                violation(
+                    requested,
+                    requested,
+                    false,
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                ),
+                Some("semantic_not_realized"),
+                "semantic_degraded is an independent fault signal for {requested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_defaulted_degradation_is_allowed() {
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Lexical,
+                true,
+                DEGRADED,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None,
+            "a defaulted mode is not an explicit model choice"
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_explicit_lexical_never_requires_a_model() {
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        // Even a stray degradation flag on a lexical request is not a semantic
+        // refusal: the caller asked for lexical explicitly.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                DEGRADED,
+                true,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_healthy_semantic_request_is_allowed() {
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Hybrid,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            violation(
+                SearchMode::Semantic,
+                SearchMode::Semantic,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_rerank_boundaries() {
+        // Non-empty hits + requested + not applied: refused.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+            ),
+            Some("rerank_not_applied")
+        );
+        // Applied: fine.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                true,
+                true,
+            ),
+            None
+        );
+        // Not requested: fine.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        // Legal zero candidates: applied=false is not a fault.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                true,
+                true,
+                false,
+            ),
+            None
+        );
+        // A defaulted degradation does not excuse a non-empty unapplied rerank.
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Lexical,
+                true,
+                DEGRADED,
+                false,
+                false,
+                true,
+                false,
+            ),
+            Some("rerank_not_applied")
+        );
+    }
+}
+
 /// P09: the shared search renderer -- everything from the display budget down.
 /// Both the first lookup and a continuation page build a [`SearchRenderInput`]
 /// and land here, so the two cannot drift in their JSON/human projection.
@@ -27200,6 +27530,28 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
         wrap,
         highlight,
     } = inp;
+
+    // Ticket 20: a recall success must not hide a requested model path that was
+    // never realized. Checked here -- before the display budget, the live state
+    // read, the recall identity projection and any stdout write -- so a known
+    // retrieval fault is never masked by a later identity error and never
+    // leaves a success wrapper behind. Every other output format keeps its
+    // existing behaviour.
+    if effective_robot == Some(RobotFormat::Recall)
+        && recall_model_quality_violation(
+            mode_meta.requested,
+            mode_meta.realized,
+            mode_meta.defaulted,
+            mode_meta.fallback_tier,
+            display_result.semantic_degraded,
+            display_result.hits.is_empty(),
+            rerank_requested,
+            rerank_applied,
+        )
+        .is_some()
+    {
+        return Err(recall_model_unavailable_error());
+    }
 
     // Derive per-field budgets, preferring snippet > content > title
     let (snippet_budget, content_budget, title_budget, fallback_budget) = {
