@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use coding_agent_search::raw_mirror::manifest_views;
 use coding_agent_search::recall_output::{self, RecallTool};
+use coding_agent_search::storage::api::{Conn, OpenOptions};
 use coding_agent_search::storage::source_facts::decode_expected_manifest_header;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -152,15 +153,14 @@ impl Fixture {
         cmd.output().expect("spawn cass index")
     }
 
-    fn open_db(&self) -> rusqlite::Connection {
-        let db = rusqlite::Connection::open_with_flags(
-            self.db(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    fn open_db(&self) -> Conn {
+        Conn::open_read_with(
+            &self.db(),
+            OpenOptions {
+                busy_timeout: Duration::from_secs(30),
+            },
         )
-        .expect("open the database read-only");
-        db.busy_timeout(Duration::from_secs(30))
-            .expect("busy timeout");
-        db
+        .expect("open the database read-only through the storage facade")
     }
 }
 
@@ -505,18 +505,459 @@ fn build_world(fixture: &Fixture) -> World {
 }
 
 // ---------------------------------------------------------------------------
+// Task18a: native full-name MCP calls that carry no captured arguments.
+//
+// Every value below is a literal fixture in this file. The eight missing-args
+// calls (four per agent) are paired with valid C04 envelopes and omit
+// `input`/`arguments` entirely. The two normal-args searches are the controls
+// that prove the same shape still excludes when arguments exist. The
+// preservation controls (bare name without args, ordinary same-named tool,
+// another server, unpaired result, C07 without a literal) exercise the
+// unchanged rules and must keep their bodies.
+// ---------------------------------------------------------------------------
+
+const NATIVE_CLAUDE_PROSE: &str = "t18a native claude prose stays";
+const NATIVE_CODEX_PROSE: &str = "t18a native codex prose stays";
+const NATIVE_ORDINARY_OUTPUT: &str = "t18a ordinary same-named output stays";
+const NATIVE_C07_MISSING_OUTPUT: &str = "t18a c07 missing literal output stays";
+const NATIVE_CLAUDE_SEARCH_BODY: &str = "t18a claude native search body";
+const NATIVE_CODEX_SEARCH_BODY: &str = "t18a codex native search body";
+const NATIVE_CLAUDE_CONTROL_BODY: &str = "t18a claude control search body";
+const NATIVE_CODEX_CONTROL_BODY: &str = "t18a codex control search body";
+const NATIVE_CLAUDE_BARE_BODY: &str = "t18a claude bare missing args body stays";
+const NATIVE_CODEX_BARE_BODY: &str = "t18a codex bare missing args body stays";
+const NATIVE_OTHER_SERVER_BODY: &str = "t18a other-server body stays";
+const NATIVE_CLAUDE_OTHER_MISSING_OUTPUT: &str =
+    "t18a claude other-server missing args output stays";
+const NATIVE_CODEX_OTHER_MISSING_OUTPUT: &str = "t18a codex other-server missing args output stays";
+const NATIVE_UNPAIRED_BODY: &str = "t18a unpaired candidate body stays";
+
+fn native_search_value(body: &str) -> Value {
+    json!({"hits": [
+        {"source_id": "local", "source_path": "/synthetic/t18a/hit.jsonl", "line_number": 4, "content": body},
+    ]})
+}
+
+/// The exact full server-namespaced tool names this fixture exercises.
+fn native_full_name(tool: RecallTool) -> &'static str {
+    match tool {
+        RecallTool::Search => "mcp__cass-mcp__cass_search",
+        RecallTool::Expand => "mcp__cass-mcp__cass_expand",
+        RecallTool::Sessions => "mcp__cass-mcp__cass_sessions",
+        RecallTool::Timeline => "mcp__cass-mcp__cass_timeline",
+    }
+}
+
+fn native_expand_value() -> Value {
+    json!([
+        {"line": 1, "role": "user", "is_target": false, "content": "t18a expand before"},
+        {"line": 2, "role": "assistant", "is_target": true, "content": "t18a expand target"},
+    ])
+}
+
+fn native_sessions_value() -> Value {
+    json!({"sessions": [{"source_id": "local", "path": "/synthetic/t18a/list.jsonl"}]})
+}
+
+fn native_timeline_value() -> Value {
+    json!({"range": {"start": 1, "end": 2}, "total_sessions": 1,
+           "groups": {"hour": [{"source_id": "local", "source_path": "/synthetic/t18a/t.jsonl"}]}})
+}
+
+struct NativeWorld {
+    claude_path: PathBuf,
+    codex_path: PathBuf,
+    claude_bytes: Vec<u8>,
+    codex_bytes: Vec<u8>,
+    /// call id -> the exact result body that must be excluded and hashed.
+    excluded_bodies: Vec<(&'static str, String)>,
+}
+
+/// One Claude session: four native full-name calls without `input`, one
+/// normal-args search control, and the preservation controls.
+fn write_claude_native_session(
+    fixture: &Fixture,
+) -> (PathBuf, Vec<u8>, Vec<(&'static str, String)>) {
+    let mut excluded = Vec::new();
+    let mut lines = vec![json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:00.000Z", "uuid": "t18a-u0",
+        "message": {"role": "user", "content": NATIVE_CLAUDE_PROSE}
+    })];
+
+    let missing: [(&'static str, RecallTool, Value); 4] = [
+        (
+            "toolu_t18a_n_search",
+            RecallTool::Search,
+            native_search_value(NATIVE_CLAUDE_SEARCH_BODY),
+        ),
+        (
+            "toolu_t18a_n_expand",
+            RecallTool::Expand,
+            native_expand_value(),
+        ),
+        (
+            "toolu_t18a_n_sessions",
+            RecallTool::Sessions,
+            native_sessions_value(),
+        ),
+        (
+            "toolu_t18a_n_timeline",
+            RecallTool::Timeline,
+            native_timeline_value(),
+        ),
+    ];
+    for (offset, (id, tool, value)) in missing.into_iter().enumerate() {
+        let call_sec = 1 + offset * 2;
+        let result_sec = call_sec + 1;
+        lines.push(json!({
+            "type": "assistant",
+            "timestamp": format!("2026-01-03T00:00:{call_sec:02}.000Z"),
+            "uuid": format!("t18a-a-{id}"),
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": native_full_name(tool)}
+            ]}
+        }));
+        let body = wrapper(tool, &value);
+        lines.push(json!({
+            "type": "user",
+            "timestamp": format!("2026-01-03T00:00:{result_sec:02}.000Z"),
+            "uuid": format!("t18a-r-{id}"),
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": body}
+            ]}
+        }));
+        excluded.push((id, body));
+    }
+
+    // The normal-args control: the same full name, with its captured input.
+    let control = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_CLAUDE_CONTROL_BODY),
+    );
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:09.000Z", "uuid": "t18a-a-control",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_t18a_c_search", "name": "mcp__cass-mcp__cass_search",
+             "input": {"query": "t18a control query"}}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:10.000Z", "uuid": "t18a-r-control",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_c_search", "content": control}
+        ]}
+    }));
+    excluded.push(("toolu_t18a_c_search", control));
+
+    // Preservation control: a bare name without arguments keeps its result.
+    let bare = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_CLAUDE_BARE_BODY),
+    );
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:11.000Z", "uuid": "t18a-a-bare",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_t18a_bare_missing", "name": "cass_search"}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:12.000Z", "uuid": "t18a-r-bare",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_bare_missing", "content": bare}
+        ]}
+    }));
+
+    // Preservation control: an ordinary same-named tool.
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:13.000Z", "uuid": "t18a-a-ordinary",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_t18a_ordinary", "name": "cass_search",
+             "input": {"query": "t18a ordinary query"}}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:14.000Z", "uuid": "t18a-r-ordinary",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_ordinary", "content": NATIVE_ORDINARY_OUTPUT}
+        ]}
+    }));
+
+    // Preservation control: another server's same-suffixed tool.
+    let other = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_OTHER_SERVER_BODY),
+    );
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:15.000Z", "uuid": "t18a-a-other",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_t18a_other", "name": "mcp__other-mcp__cass_search",
+             "input": {"query": "t18a other server query"}}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:16.000Z", "uuid": "t18a-r-other",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_other", "content": other}
+        ]}
+    }));
+
+    // Preservation control: another server's tool without captured input.
+    // An unknown identity must fall back to the legacy judgment before any
+    // argument gate, so this row adds no v2 uncovered count.
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:16.500Z", "uuid": "t18a-a-other-missing",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_t18a_other_missing", "name": "mcp__other-mcp__cass_search"}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:16.750Z", "uuid": "t18a-r-other-missing",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_other_missing",
+             "content": NATIVE_CLAUDE_OTHER_MISSING_OUTPUT}
+        ]}
+    }));
+
+    // Preservation control: a complete envelope whose call row is missing.
+    let unpaired = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_UNPAIRED_BODY),
+    );
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:17.000Z", "uuid": "t18a-u-unpaired",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_unpaired", "content": unpaired}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:18.000Z", "uuid": "t18a-a-end",
+        "message": {"role": "assistant", "content": "t18a claude answer"}
+    }));
+
+    let body = jsonl(&lines);
+    let path = fixture
+        .home()
+        .join(".claude/projects/t18a-native/session.jsonl");
+    std::fs::create_dir_all(path.parent().expect("claude native project parent"))
+        .expect("mkdir claude native project");
+    std::fs::write(&path, body.as_bytes()).expect("write the claude native session");
+    (path, body.into_bytes(), excluded)
+}
+
+/// One Codex rollout: the same eight missing-args targets as native
+/// `function_call` rows, the normal-args control, and the preservation
+/// controls including a C07 `exec` without a literal.
+fn write_codex_native_session(
+    fixture: &Fixture,
+) -> (PathBuf, Vec<u8>, Vec<(&'static str, String)>) {
+    let mut excluded = Vec::new();
+    let mut lines = vec![
+        json!({
+            "timestamp": "2026-01-03T00:00:00.000Z",
+            "type": "session_meta",
+            "payload": {"id": "t18a-codex", "cwd": "/synthetic/project", "cli_version": "0.42.0"}
+        }),
+        json!({
+            "timestamp": "2026-01-03T00:00:01.000Z",
+            "type": "response_item",
+            "payload": {"type": "message", "id": "t18a-codex-u", "role": "user",
+                        "content": [{"type": "input_text", "text": NATIVE_CODEX_PROSE}]}
+        }),
+    ];
+
+    let missing: [(&'static str, RecallTool, Value); 4] = [
+        (
+            "call_t18a_n_search",
+            RecallTool::Search,
+            native_search_value(NATIVE_CODEX_SEARCH_BODY),
+        ),
+        (
+            "call_t18a_n_expand",
+            RecallTool::Expand,
+            native_expand_value(),
+        ),
+        (
+            "call_t18a_n_sessions",
+            RecallTool::Sessions,
+            native_sessions_value(),
+        ),
+        (
+            "call_t18a_n_timeline",
+            RecallTool::Timeline,
+            native_timeline_value(),
+        ),
+    ];
+    for (offset, (id, tool, value)) in missing.into_iter().enumerate() {
+        let call_sec = 2 + offset * 2;
+        let result_sec = call_sec + 1;
+        lines.push(json!({
+            "timestamp": format!("2026-01-03T00:00:{call_sec:02}.000Z"),
+            "type": "response_item",
+            "payload": {"type": "function_call", "id": format!("fc-{id}"),
+                        "name": native_full_name(tool), "call_id": id}
+        }));
+        let body = wrapper(tool, &value);
+        lines.push(json!({
+            "timestamp": format!("2026-01-03T00:00:{result_sec:02}.000Z"),
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": id, "output": body}
+        }));
+        excluded.push((id, body));
+    }
+
+    let control = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_CODEX_CONTROL_BODY),
+    );
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:10.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "id": "fc-t18a-control",
+                    "name": "mcp__cass-mcp__cass_search",
+                    "arguments": "{\"query\":\"t18a control query\"}",
+                    "call_id": "call_t18a_c_search"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:11.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_c_search", "output": control}
+    }));
+    excluded.push(("call_t18a_c_search", control));
+
+    // Preservation control: a bare name without arguments keeps its result.
+    let bare = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_CODEX_BARE_BODY),
+    );
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:12.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "id": "fc-t18a-bare",
+                    "name": "cass_search", "call_id": "call_t18a_bare_missing"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:13.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_bare_missing", "output": bare}
+    }));
+
+    // Preservation control: an ordinary same-named tool.
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:14.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "id": "fc-t18a-ordinary",
+                    "name": "cass_search", "arguments": "{\"query\":\"t18a ordinary query\"}",
+                    "call_id": "call_t18a_ordinary"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:15.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_ordinary",
+                    "output": NATIVE_ORDINARY_OUTPUT}
+    }));
+
+    // Preservation control: another server's same-suffixed tool.
+    let other = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_OTHER_SERVER_BODY),
+    );
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:16.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "id": "fc-t18a-other",
+                    "name": "mcp__other-mcp__cass_search",
+                    "arguments": "{\"query\":\"t18a other server query\"}",
+                    "call_id": "call_t18a_other"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:17.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_other", "output": other}
+    }));
+
+    // Preservation control: another server's tool without captured arguments.
+    // The unknown identity falls back to the legacy judgment, so this row adds
+    // no v2 uncovered count.
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:17.500Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "id": "fc-t18a-other-missing",
+                    "name": "mcp__other-mcp__cass_search",
+                    "call_id": "call_t18a_other_missing"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:17.750Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_other_missing",
+                    "output": NATIVE_CODEX_OTHER_MISSING_OUTPUT}
+    }));
+
+    // Preservation control: a complete envelope whose call row is missing.
+    let unpaired = wrapper(
+        RecallTool::Search,
+        &native_search_value(NATIVE_UNPAIRED_BODY),
+    );
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:18.000Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_unpaired", "output": unpaired}
+    }));
+
+    // Preservation control: a C07 `exec` with no literal at all.
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:19.000Z",
+        "type": "response_item",
+        "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "call_t18a_c07_missing"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:20.000Z",
+        "type": "response_item",
+        "payload": {"type": "custom_tool_call_output", "call_id": "call_t18a_c07_missing",
+                    "output": NATIVE_C07_MISSING_OUTPUT}
+    }));
+
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:21.000Z",
+        "type": "response_item",
+        "payload": {"type": "message", "id": "t18a-codex-a", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "t18a codex answer"}]}
+    }));
+
+    let body = jsonl(&lines);
+    let path = fixture
+        .home()
+        .join(".codex/sessions/2026/01/rollout-t18a-native.jsonl");
+    std::fs::create_dir_all(path.parent().expect("codex native rollout parent"))
+        .expect("mkdir codex native rollout");
+    std::fs::write(&path, body.as_bytes()).expect("write the codex native rollout");
+    (path, body.into_bytes(), excluded)
+}
+
+fn build_native_world(fixture: &Fixture) -> NativeWorld {
+    let (claude_path, claude_bytes, mut excluded_bodies) = write_claude_native_session(fixture);
+    let (codex_path, codex_bytes, codex_excluded) = write_codex_native_session(fixture);
+    excluded_bodies.extend(codex_excluded);
+    NativeWorld {
+        claude_path,
+        codex_path,
+        claude_bytes,
+        codex_bytes,
+        excluded_bodies,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Readers
 // ---------------------------------------------------------------------------
 
-fn complete_input_code_versions(db: &rusqlite::Connection) -> Vec<String> {
-    let mut stmt = db
-        .prepare("SELECT expected_manifest_bin FROM source_inputs ORDER BY id")
-        .expect("prepare the manifest query");
-    let rows: Vec<Vec<u8>> = stmt
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .expect("query the manifests")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect the manifests");
+fn complete_input_code_versions(db: &Conn) -> Vec<String> {
+    let rows: Vec<Vec<u8>> = db
+        .query_all_map(
+            "SELECT expected_manifest_bin FROM source_inputs ORDER BY id",
+            &[],
+            |row| row.get_typed::<Vec<u8>>(0),
+        )
+        .expect("query the manifests");
     rows.into_iter()
         .map(|bytes| {
             let (_manifest, safety) =
@@ -531,15 +972,14 @@ fn complete_input_code_versions(db: &rusqlite::Connection) -> Vec<String> {
 /// `messages.excluded` is stored as SQLite JSONB, so the marker is read back
 /// through SQLite's own `json()` decoder (the same read
 /// `tests/mcp_restore_rule_epochs.rs` uses). The stored format is not touched.
-fn marker_rule_versions(db: &rusqlite::Connection) -> Vec<u64> {
-    let mut stmt = db
-        .prepare("SELECT json(excluded) FROM messages WHERE excluded IS NOT NULL ORDER BY id")
-        .expect("prepare the marker query");
-    let rows: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query the markers")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect the markers");
+fn marker_rule_versions(db: &Conn) -> Vec<u64> {
+    let rows: Vec<String> = db
+        .query_all_map(
+            "SELECT json(excluded) FROM messages WHERE excluded IS NOT NULL ORDER BY id",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )
+        .expect("query the markers");
     rows.into_iter()
         .map(|text| {
             let value: Value = serde_json::from_str(&text).expect("a marker is JSON");
@@ -550,14 +990,11 @@ fn marker_rule_versions(db: &rusqlite::Connection) -> Vec<u64> {
         .collect()
 }
 
-fn message_contents(db: &rusqlite::Connection) -> Vec<String> {
-    let mut stmt = db
-        .prepare("SELECT content FROM messages ORDER BY id")
-        .expect("prepare the body query");
-    stmt.query_map([], |row| row.get::<_, String>(0))
-        .expect("query the bodies")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect the bodies")
+fn message_contents(db: &Conn) -> Vec<String> {
+    db.query_all_map("SELECT content FROM messages ORDER BY id", &[], |row| {
+        row.get_typed::<String>(0)
+    })
+    .expect("query the bodies")
 }
 
 /// The sealed blobs' bytes, keyed by the original path they were captured from.
@@ -657,22 +1094,16 @@ fn assert_activation_db(fixture: &Fixture, world: &World, label: &str) {
     }
 
     // At least two agents really produced markers (not a pure-function claim).
-    let by_agent: Vec<(String, i64)> = {
-        let mut stmt = db
-            .prepare(
-                "SELECT a.slug, COUNT(*) FROM messages m
-                 JOIN conversations c ON c.id = m.conversation_id
-                 JOIN agents a ON a.id = c.agent_id
-                 WHERE m.excluded IS NOT NULL GROUP BY a.slug ORDER BY a.slug",
-            )
-            .expect("prepare the per-agent marker query");
-        stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .expect("query the per-agent markers")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect the per-agent markers")
-    };
+    let by_agent: Vec<(String, i64)> = db
+        .query_all_map(
+            "SELECT a.slug, COUNT(*) FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             JOIN agents a ON a.id = c.agent_id
+             WHERE m.excluded IS NOT NULL GROUP BY a.slug ORDER BY a.slug",
+            &[],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )
+        .expect("query the per-agent markers");
     assert_eq!(
         by_agent.len(),
         2,
@@ -879,4 +1310,302 @@ fn mcp_activate_v2_watch_once() {
     assert_eq!(report["success"], json!(true), "watch-once: success=true");
     assert_activation_json(&report, "watch-once");
     assert_activation_db(&fixture, &world, "watch-once");
+}
+
+// ---------------------------------------------------------------------------
+// Task18a: native full-name calls without captured arguments
+// ---------------------------------------------------------------------------
+
+const NATIVE_MARKER_IDS: [&str; 10] = [
+    "toolu_t18a_n_search",
+    "toolu_t18a_n_expand",
+    "toolu_t18a_n_sessions",
+    "toolu_t18a_n_timeline",
+    "toolu_t18a_c_search",
+    "call_t18a_n_search",
+    "call_t18a_n_expand",
+    "call_t18a_n_sessions",
+    "call_t18a_n_timeline",
+    "call_t18a_c_search",
+];
+
+/// Every stored marker, decoded with SQLite's own `json()` (`messages.excluded`
+/// is JSONB). The stored format is not touched.
+fn marker_json(db: &Conn) -> Vec<Value> {
+    let rows: Vec<String> = db
+        .query_all_map(
+            "SELECT json(excluded) FROM messages WHERE excluded IS NOT NULL ORDER BY id",
+            &[],
+            |row| row.get_typed::<String>(0),
+        )
+        .expect("query the marker JSON");
+    rows.into_iter()
+        .map(|text| serde_json::from_str(&text).expect("a marker is JSON"))
+        .collect()
+}
+
+/// The literal uncovered matrix of this case under the original rules: two
+/// ordinary same-named tools (`ambiguous_tool_identity`) and four preserved
+/// candidates (`unpaired_result`: the two bare names without args and the two
+/// unpaired envelopes). The eight missing-args strong results are excluded.
+/// Neither other-server control adds a count, with or without captured args:
+/// an unknown identity goes back through the legacy judgment before any
+/// argument gate. The C07 control has no Cass evidence and adds nothing.
+fn assert_native_activation_json(report: &Value, label: &str) {
+    assert_eq!(
+        report["recall_uncovered_total"].as_u64(),
+        Some(6),
+        "{label}: six literal preservation controls are counted: {report}"
+    );
+    assert_eq!(
+        report["recall_uncovered_by_reason"],
+        json!({"ambiguous_tool_identity": 2, "unpaired_result": 4}),
+        "{label}: the two conservative reasons only"
+    );
+    let stats = &report["indexing_stats"];
+    assert_eq!(
+        stats["recall_uncovered_total"],
+        report["recall_uncovered_total"]
+    );
+    assert_eq!(
+        stats["recall_uncovered_by_reason"],
+        report["recall_uncovered_by_reason"]
+    );
+}
+
+fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &str) {
+    let db = fixture.open_db();
+
+    let versions = complete_input_code_versions(&db);
+    assert!(
+        !versions.is_empty(),
+        "{label}: the inputs carry expected-manifest headers"
+    );
+    for version in &versions {
+        assert!(
+            version.starts_with("cass-source-exclusion/2+"),
+            "{label}: the producer's code version is epoch 2: {version}"
+        );
+    }
+
+    let mut by_id = std::collections::BTreeMap::new();
+    for marker in marker_json(&db) {
+        let id = marker["anchor"]["tool_call_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: marker without a call id: {marker}"))
+            .to_string();
+        assert!(
+            by_id.insert(id.clone(), marker).is_none(),
+            "{label}: one marker per call id ({id})"
+        );
+    }
+    assert_eq!(
+        by_id.len(),
+        10,
+        "{label}: ten supported results are excluded: {:?}",
+        by_id.keys().collect::<Vec<_>>()
+    );
+    for id in NATIVE_MARKER_IDS {
+        assert!(by_id.contains_key(id), "{label}: missing marker for {id}");
+    }
+    for marker in by_id.values() {
+        assert_eq!(
+            marker["rule_version"].as_u64(),
+            Some(2),
+            "{label}: every marker is rule version 2: {marker}"
+        );
+        assert!(
+            marker["parse_error"].is_null(),
+            "{label}: a valid envelope carries no parse error: {marker}"
+        );
+    }
+    for (id, body) in &world.excluded_bodies {
+        let marker = by_id
+            .get(*id)
+            .unwrap_or_else(|| panic!("{label}: no marker for {id}"));
+        assert_eq!(
+            marker["bytes"].as_u64(),
+            Some(body.len() as u64),
+            "{label}: {id} keeps the complete original body byte count"
+        );
+        assert_eq!(
+            marker["sha256"].as_str(),
+            Some(sha256_hex(body.as_bytes()).as_str()),
+            "{label}: {id} keeps the complete original body hash"
+        );
+    }
+
+    // Source extraction still comes from the result payload alone.
+    assert_eq!(
+        by_id["toolu_t18a_n_search"]["src"]["hits"][0]["source_path"],
+        json!("/synthetic/t18a/hit.jsonl"),
+        "{label}: the claude native search source is read from the envelope"
+    );
+    assert_eq!(
+        by_id["call_t18a_n_search"]["src"]["hits"][0]["source_path"],
+        json!("/synthetic/t18a/hit.jsonl"),
+        "{label}: the codex native search source is read from the envelope"
+    );
+    assert_eq!(
+        by_id["toolu_t18a_n_sessions"]["src"]["sessions"],
+        json!(["/synthetic/t18a/list.jsonl"]),
+        "{label}: sessions source"
+    );
+    assert_eq!(
+        by_id["toolu_t18a_n_timeline"]["src"]["sessions"],
+        json!(["/synthetic/t18a/t.jsonl"]),
+        "{label}: timeline source"
+    );
+    for id in ["toolu_t18a_n_expand", "call_t18a_n_expand"] {
+        assert_eq!(
+            by_id[id]["src"]["sessions"],
+            json!([]),
+            "{label}: an expand without arguments fabricates no source ({id})"
+        );
+    }
+
+    let by_agent: Vec<(String, i64)> = db
+        .query_all_map(
+            "SELECT a.slug, COUNT(*) FROM messages m
+             JOIN conversations c ON c.id = m.conversation_id
+             JOIN agents a ON a.id = c.agent_id
+             WHERE m.excluded IS NOT NULL GROUP BY a.slug ORDER BY a.slug",
+            &[],
+            |row| Ok((row.get_typed::<String>(0)?, row.get_typed::<i64>(1)?)),
+        )
+        .expect("query the per-agent markers");
+    assert_eq!(
+        by_agent.len(),
+        2,
+        "{label}: both agents carry exclusions: {by_agent:?}"
+    );
+    for (agent, count) in &by_agent {
+        assert_eq!(
+            *count, 5,
+            "{label}: five exclusions for {agent}: {by_agent:?}"
+        );
+    }
+
+    let bodies = message_contents(&db);
+    for (id, body) in &world.excluded_bodies {
+        assert!(
+            !bodies.iter().any(|retained| retained == body),
+            "{label}: the excluded body of {id} is not retained"
+        );
+    }
+    for text in [
+        NATIVE_CLAUDE_PROSE,
+        NATIVE_CODEX_PROSE,
+        NATIVE_ORDINARY_OUTPUT,
+        NATIVE_C07_MISSING_OUTPUT,
+        NATIVE_CLAUDE_OTHER_MISSING_OUTPUT,
+        NATIVE_CODEX_OTHER_MISSING_OUTPUT,
+    ] {
+        assert!(
+            bodies.iter().any(|body| body == text),
+            "{label}: {text} stays"
+        );
+    }
+    for (id, text) in [
+        (
+            "bare claude",
+            wrapper(
+                RecallTool::Search,
+                &native_search_value(NATIVE_CLAUDE_BARE_BODY),
+            ),
+        ),
+        (
+            "bare codex",
+            wrapper(
+                RecallTool::Search,
+                &native_search_value(NATIVE_CODEX_BARE_BODY),
+            ),
+        ),
+        (
+            "other server",
+            wrapper(
+                RecallTool::Search,
+                &native_search_value(NATIVE_OTHER_SERVER_BODY),
+            ),
+        ),
+        (
+            "unpaired",
+            wrapper(
+                RecallTool::Search,
+                &native_search_value(NATIVE_UNPAIRED_BODY),
+            ),
+        ),
+    ] {
+        assert!(
+            bodies.iter().any(|body| body == &text),
+            "{label}: the {id} control keeps its body"
+        );
+    }
+    drop(db);
+
+    let blobs = mirror_blobs(fixture);
+    assert_eq!(
+        blobs.len(),
+        2,
+        "{label}: one sealed blob per input: {blobs:?}"
+    );
+    for (original_path, bytes) in &blobs {
+        let expected = if original_path == &world.claude_path.to_string_lossy() {
+            &world.claude_bytes
+        } else if original_path == &world.codex_path.to_string_lossy() {
+            &world.codex_bytes
+        } else {
+            panic!("{label}: unexpected mirror original path {original_path}");
+        };
+        assert_eq!(
+            bytes, expected,
+            "{label}: the raw mirror keeps the original bytes of {original_path}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&world.claude_path).expect("re-read the claude native session"),
+        world.claude_bytes,
+        "{label}: the live claude source is byte-for-byte unchanged"
+    );
+    assert_eq!(
+        std::fs::read(&world.codex_path).expect("re-read the codex native rollout"),
+        world.codex_bytes,
+        "{label}: the live codex source is byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn mcp_activate_v2_native_missing_args() {
+    let fixture = Fixture::new();
+    let world = build_native_world(&fixture);
+    let case = CaseDir::new("mcp_activate_v2_native", "missing-args-default");
+    let data_dir_text = fixture.data_dir().to_string_lossy().into_owned();
+    let argv = ["index", "--data-dir", data_dir_text.as_str(), "--json"];
+    let output = fixture.index(&[], &[]);
+    write_evidence(&case, &argv, &[], &output);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "native missing args: the index run succeeds; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("the index output is one JSON object");
+    assert_eq!(
+        report["success"],
+        json!(true),
+        "native missing args: success=true"
+    );
+    assert_native_activation_json(&report, "native-missing-args");
+    assert_native_activation_db(&fixture, &world, "native-missing-args");
+
+    case.write_json(
+        "expected-activation.json",
+        &json!({
+            "claude_sha256": sha256_hex(&world.claude_bytes),
+            "codex_sha256": sha256_hex(&world.codex_bytes),
+            "report": report,
+        }),
+    );
 }

@@ -276,14 +276,17 @@ endpoint at `/mcp`.
 
 ## Known limitations
 
-- This entry point has no embedded Codex cleaning adapter. A later adapter must
-  recognize exactly one limited shape:
+- The ingest producer runs the v2 rule epoch by default. That epoch recognizes
+  the single `<cass_recall version="1" tool="cass_NAME">` envelope produced by
+  the CLI, and one fixed Codex literal:
+  `text(await tools.exec_command(J));` or
   `text(await tools.mcp__cass_mcp__cass_NAME(J));`
   where `NAME` is `search`, `expand`, `sessions`, or `timeline`, and `J` is a
-  JSON object literal. Recognizing that shape still requires the cleaning
-  wiring and a default-enable acceptance; a successful RPC call alone does not
-  mean the recall result was cleaned. Dynamic scripts, batched calls, and
-  `wait` segmented results fall outside that shape and are not covered.
+  JSON object literal. This server only forwards the CLI's envelope; it never
+  produces or rewrites it, and a successful RPC call alone does not mean the
+  recall result was cleaned. Dynamic scripts, batched calls, and `wait`
+  segmented results fall outside that shape: they are preserved and reported
+  as uncovered diagnostics, not cleaned.
 - This entry point bounds execution slots, waiting positions and one total
   deadline per request. The request deadline, explicit cancellation, the
   termination grace and the single slot release are wired here; the capacity
