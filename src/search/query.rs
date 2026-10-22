@@ -1708,7 +1708,7 @@ struct SearchHitKey {
     content_hash: u64,
 }
 
-fn normalized_search_source_id_sql_expr(
+pub(crate) fn normalized_search_source_id_sql_expr(
     source_id_column: &str,
     origin_kind_column: &str,
     origin_host_column: &str,

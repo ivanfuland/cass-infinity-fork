@@ -2812,7 +2812,21 @@
           "description": "Line number to show context around",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-id",
+          "description": "Exact indexed message ID to expand (requires --source and --expected-content-sha256)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "expected-content-sha256",
+          "description": "SHA256 of the complete indexed message content from search output",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "context",

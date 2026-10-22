@@ -1588,10 +1588,16 @@ pub enum Commands {
         source: Option<String>,
         /// Line number to show context around
         #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
-        line: usize,
+        line: Option<usize>,
+        /// Exact indexed message ID to expand (requires --source and --expected-content-sha256)
+        #[arg(long, alias = "message_id", allow_hyphen_values = true)]
+        message_id: Option<String>,
+        /// SHA256 of the complete indexed message content from search output
+        #[arg(long, alias = "expected_content_sha256")]
+        expected_content_sha256: Option<String>,
         /// Number of messages before/after (default: 3)
-        #[arg(long, short = 'C', default_value_t = 3)]
-        context: usize,
+        #[arg(long, short = 'C', default_value = "3", allow_hyphen_values = true)]
+        context: String,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
@@ -9393,19 +9399,73 @@ async fn execute_cli(
                     path,
                     source,
                     line,
+                    message_id,
+                    expected_content_sha256,
                     context,
                     json,
                     recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_expand(
-                        &path,
-                        cli.db.clone(),
-                        source.as_deref(),
-                        line,
-                        context,
-                        structured_format,
-                    )?;
+                    let context = parse_expand_context(&context)?;
+                    match (line, message_id) {
+                        (Some(line), None) => run_expand(
+                            &path,
+                            cli.db.clone(),
+                            source.as_deref(),
+                            line,
+                            context,
+                            structured_format,
+                        )?,
+                        (None, Some(raw_message_id)) => {
+                            let message_id = parse_expand_message_id(&raw_message_id)?;
+                            let source_id = source.as_deref().ok_or_else(|| {
+                                CliError::usage(
+                                    "--message-id requires --source",
+                                    Some(
+                                        "Use the source_id field from search output, e.g. --source local"
+                                            .to_string(),
+                                    ),
+                                )
+                            })?;
+                            let expected_content_sha256 =
+                                expected_content_sha256.as_deref().ok_or_else(|| {
+                                    CliError::usage(
+                                        "--message-id requires --expected-content-sha256",
+                                        Some(
+                                            "Use the content_sha256 field from search output without modification"
+                                                .to_string(),
+                                        ),
+                                    )
+                                })?;
+                            run_expand_by_message_id(
+                                &path,
+                                cli.db.clone(),
+                                source_id,
+                                message_id,
+                                expected_content_sha256,
+                                context,
+                                structured_format,
+                            )?;
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(CliError::usage(
+                                "--line and --message-id cannot be combined",
+                                Some(
+                                    "Use --line for a file line, or --message-id with --source and --expected-content-sha256"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                        (None, None) => {
+                            return Err(CliError::usage(
+                                "cass expand requires exactly one of --line or --message-id",
+                                Some(
+                                    "Use --line for a file line, or --message-id with --source and --expected-content-sha256"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                    }
                 }
                 Commands::Timeline {
                     since,
@@ -83844,6 +83904,7 @@ const INTEGER_ARG_NAMES: &[&str] = &[
     "freshness-window-seconds",
     "days",
     "line",
+    "message-id",
     "context",
     "stale-threshold",
     "timeout",
@@ -98151,7 +98212,12 @@ fn run_expand(
     })?;
 
     let start = target_idx.saturating_sub(context);
-    let end = (target_idx + context + 1).min(messages.len());
+    // Saturated so `--context usize::MAX` cannot wrap the end past the start
+    // and leave the window without a target.
+    let end = target_idx
+        .saturating_add(context)
+        .saturating_add(1)
+        .min(messages.len());
 
     let context_messages: Vec<_> = messages[start..end]
         .iter()
@@ -98227,6 +98293,365 @@ fn run_expand(
         start + 1,
         end,
         messages.len()
+    );
+    Ok(())
+}
+
+/// Parse `--context` for `cass expand` so out-of-range integers are rejected
+/// as usage before any database read.
+fn parse_expand_context(value: &str) -> CliResult<usize> {
+    value.trim().parse::<usize>().map_err(|_| {
+        CliError::usage(
+            format!(
+                "--context must be a non-negative integer that fits this platform; got '{value}'"
+            ),
+            Some("Use a whole number of messages, e.g. --context 3.".to_string()),
+        )
+    })
+}
+
+/// Parse `--message-id` as a positive SQLite integer.
+fn parse_expand_message_id(value: &str) -> CliResult<i64> {
+    let parsed = value.trim().parse::<i64>().map_err(|_| {
+        CliError::usage(
+            format!(
+                "--message-id must be a positive integer that fits a SQLite row ID; got '{value}'"
+            ),
+            Some("Use the positive message_id field from search output.".to_string()),
+        )
+    })?;
+    if parsed <= 0 {
+        return Err(CliError::usage(
+            format!("--message-id must be a positive integer; got {parsed}"),
+            Some("Use the positive message_id field from search output.".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a 64-character hexadecimal SHA256 value into its bytes.
+fn parse_expand_expected_content_sha256(value: &str) -> CliResult<[u8; 32]> {
+    fn usage(message: String) -> CliError {
+        CliError::usage(
+            message,
+            Some("Use the content_sha256 field from search output without modification.".to_string()),
+        )
+    }
+
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return Err(usage(format!(
+            "--expected-content-sha256 must be exactly 64 hexadecimal characters; got {} characters",
+            value.chars().count()
+        )));
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let mut digest = [0u8; 32];
+    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+        let (Some(high), Some(low)) = (nibble(chunk[0]), nibble(chunk[1])) else {
+            return Err(usage(
+                "--expected-content-sha256 must contain only hexadecimal characters".to_string(),
+            ));
+        };
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+/// Expand one indexed message located by its row ID.
+///
+/// The ID lookup, source/path check, body digest check and context selection
+/// all run inside one read-only, deferred transaction, so a concurrent index
+/// update cannot make the three observations disagree. The original session
+/// file is never read: only the stored, cleaned message content is returned.
+fn run_expand_by_message_id(
+    path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: &str,
+    message_id: i64,
+    expected_content_sha256: &str,
+    context: usize,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use sha2::{Digest, Sha256};
+
+    if message_id <= 0 {
+        return Err(CliError::usage(
+            format!("--message-id must be a positive integer; got {message_id}"),
+            Some("Use the positive message_id field from search output.".to_string()),
+        ));
+    }
+    validate_followup_source_id(source_id, "cass expand")?;
+    let expected_content_sha256 = parse_expand_expected_content_sha256(expected_content_sha256)?;
+    let normalized_source_id = canonical_followup_source_id(Some(source_id))
+        .unwrap_or_else(|| crate::sources::provenance::LOCAL_SOURCE_ID.to_string());
+    let requested_source_path = path.to_string_lossy().to_string();
+
+    let message_not_found = |message: String| CliError {
+        code: 3,
+        kind: "message_not_found",
+        message,
+        hint: Some("Search again and use the current message_id from the hits.".to_string()),
+        retryable: false,
+    };
+    let source_mismatch = |message: String| CliError {
+        code: 3,
+        kind: "source_mismatch",
+        message,
+        hint: Some(
+            "Use source_id and source_path exactly as returned by cass search.".to_string(),
+        ),
+        retryable: false,
+    };
+
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+        &db_path,
+        Duration::from_secs(5),
+    )
+    .map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::DbOpen.kind_str(),
+        message: format!(
+            "Cannot open the index database at {}: {err}",
+            db_path.display()
+        ),
+        hint: Some("Run 'cass index --full' or pass an existing --db path.".to_string()),
+        retryable: false,
+    })?;
+    crate::storage::sqlite::ensure_readonly_schema_current(&conn).map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!(
+            "The index database at {} cannot be read by this binary: {err}",
+            db_path.display()
+        ),
+        hint: Some("Rebuild the index with this cass version.".to_string()),
+        retryable: false,
+    })?;
+    let tx = conn.transaction().map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::DbError.kind_str(),
+        message: format!("Cannot start a read transaction on the index: {err}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let source_expr = crate::search::query::normalized_search_source_id_sql_expr(
+        "c.source_id",
+        "s.kind",
+        "c.origin_host",
+    );
+    let target_sql = format!(
+        "SELECT m.id, m.conversation_id, m.idx, m.content, c.source_path, ({source_expr}), \
+                CASE WHEN m.excluded IS NULL THEN 1 ELSE 0 END \
+         FROM messages m \
+         JOIN conversations c ON c.id = m.conversation_id \
+         LEFT JOIN sources s ON s.id = c.source_id \
+         WHERE m.id = ?1"
+    );
+    let targets: Vec<(i64, i64, i64, String, String, String, i64)> = tx
+        .query_all_map(&target_sql, &[ParamValue::from(message_id)], |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+                row.get_typed(6)?,
+            ))
+        })
+        .map_err(|err| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to read indexed message {message_id}: {err}"),
+            hint: None,
+            retryable: false,
+        })?;
+    let [(_, conversation_id, _, content, source_path, stored_source_id, readable)] =
+        targets.as_slice()
+    else {
+        return Err(message_not_found(format!(
+            "Indexed message {message_id} was not found"
+        )));
+    };
+    if *readable == 0 {
+        return Err(message_not_found(format!(
+            "Indexed message {message_id} is excluded and cannot be expanded"
+        )));
+    }
+    if *source_path != requested_source_path {
+        return Err(source_mismatch(format!(
+            "Indexed message {message_id} belongs to source path '{source_path}', not '{requested_source_path}'"
+        )));
+    }
+    if *stored_source_id != normalized_source_id {
+        return Err(source_mismatch(format!(
+            "Indexed message {message_id} belongs to source '{stored_source_id}', not '{normalized_source_id}'"
+        )));
+    }
+    let actual_content_sha256: [u8; 32] = Sha256::digest(content.as_bytes()).into();
+    if actual_content_sha256 != expected_content_sha256 {
+        return Err(CliError {
+            code: 3,
+            kind: "stale_reference",
+            message: format!(
+                "Indexed message {message_id} no longer has the expected content digest"
+            ),
+            hint: Some("Search again: the stored message changed since the hit was produced.".to_string()),
+            retryable: false,
+        });
+    }
+
+    let session_sql = "SELECT m.id, m.idx, m.role, m.content \
+         FROM messages m \
+         WHERE m.conversation_id = ?1 AND m.excluded IS NULL \
+         ORDER BY m.idx ASC";
+    let session_rows: Vec<(i64, i64, String, String)> = tx
+        .query_all_map(session_sql, &[ParamValue::from(*conversation_id)], |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+            ))
+        })
+        .map_err(|err| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to read the conversation for message {message_id}: {err}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+    let mut lines: Vec<(usize, String, String)> = Vec::with_capacity(session_rows.len());
+    let mut target_position = None;
+    for (row_id, idx, role, row_content) in &session_rows {
+        let line = usize::try_from(*idx)
+            .ok()
+            .and_then(|idx| idx.checked_add(1))
+            .ok_or_else(|| CliError {
+                code: 9,
+                kind: CliErrorKind::DbError.kind_str(),
+                message: format!("Indexed message {row_id} has an invalid message index {idx}"),
+                hint: Some("Rebuild the index with this cass version.".to_string()),
+                retryable: false,
+            })?;
+        if *row_id == message_id {
+            target_position = Some(lines.len());
+        }
+        lines.push((line, role.clone(), row_content.clone()));
+    }
+    let target_position = target_position.ok_or_else(|| {
+        message_not_found(format!(
+            "Indexed message {message_id} was not found in its conversation"
+        ))
+    })?;
+    tx.commit().map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::DbError.kind_str(),
+        message: format!("Failed to finish the read transaction: {err}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let start = target_position.saturating_sub(context);
+    let end = target_position
+        .saturating_add(context)
+        .saturating_add(1)
+        .min(lines.len());
+    let context_messages: Vec<(usize, String, String, bool)> = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, (line, role, content))| {
+            let is_target = start + offset == target_position;
+            (*line, role.clone(), content.clone(), is_target)
+        })
+        .collect();
+    let target_count = context_messages.iter().filter(|(_, _, _, is_target)| *is_target).count();
+    if target_count != 1 {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::Unknown.kind_str(),
+            message: format!(
+                "Expand failed to select exactly one target for message {message_id}; selected {target_count}"
+            ),
+            hint: None,
+            retryable: false,
+        });
+    }
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let output: Vec<serde_json::Value> = context_messages
+            .iter()
+            .map(|(line_num, role, content, is_target)| {
+                serde_json::json!({
+                    "line": line_num,
+                    "role": role,
+                    "is_target": is_target,
+                    "content": content,
+                })
+            })
+            .collect();
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(
+                recall_output::RecallTool::Expand,
+                &serde_json::Value::Array(output),
+            );
+        }
+        return output_structured_value(serde_json::Value::Array(output), fmt);
+    }
+
+    println!(
+        "\n📍 Context around message {} in {}\n",
+        message_id,
+        path.display()
+    );
+    println!("{}", "─".repeat(60));
+
+    for (line_num, role, content, is_target) in &context_messages {
+        let preview: String = content.chars().take(300).collect();
+        let marker = if *is_target { ">>>" } else { "   " };
+        let role_icon = match role.as_str() {
+            "user" => "👤",
+            "assistant" => "🤖",
+            _ => "📝",
+        };
+
+        println!(
+            "{} L{:>4} {} {}",
+            marker,
+            line_num,
+            role_icon,
+            role.to_uppercase()
+        );
+        println!("        {}", preview.replace('\n', " "));
+        if content.len() > 300 {
+            println!("        ... ({} more chars)", content.len() - 300);
+        }
+        println!();
+    }
+
+    println!("{}", "─".repeat(60));
+    println!(
+        "Showing messages {} to {} of {} total",
+        start + 1,
+        end,
+        lines.len()
     );
     Ok(())
 }
