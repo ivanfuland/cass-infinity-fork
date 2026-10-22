@@ -52,6 +52,34 @@ request. The query is always the last argv element after a literal `--`; a query
 that begins with `--` stays data. No command adds `--db`, refresh, catch-up, or
 any management subcommand.
 
+## Execution pool
+
+One pool serves the whole process, all four tools and every SDK session. It is
+created once, at startup, from the fixed options `--max-concurrent` (P) and
+`--max-queued` (Q). Both must be positive; no default exists.
+
+- A request takes an execution slot only when a slot is free **and** nobody is
+  waiting. A slot that is being reaped still counts, so a child that ignores
+  `SIGTERM` cannot let another child start early.
+- Otherwise the request is registered in one bounded queue, in strict arrival
+  order. A request that arrives after a slot was released cannot take that slot
+  ahead of the queue head.
+- When the slots and the queue are both full the call returns
+  `isError: true` with `error.code` = `busy` before any child exists.
+- Input validation happens before admission. An illegal input is always
+  `invalid_argument`, even while the pool is full, and never occupies a slot or
+  a queue position.
+- A slot is released exactly once, after that request's own child was waited
+  for. A normal exit, a non-zero CLI exit, a refused spawn, an unreadable pipe
+  and an over-budget read all return the slot. Dropping the caller's request
+  future does not release it early: the permit lives in the same task that owns
+  the child and its `wait`, and a dropped waiting request frees its queue
+  position (or returns a slot it was already granted).
+
+The queue order is decided under one lock when the request registers. It is
+never inferred from network arrival times, and the server exposes no pool
+metrics or test endpoint.
+
 ## Output budget
 
 `--max-output-bytes` is one budget applied at two layers.
@@ -101,6 +129,7 @@ single top-level `error` object:
 | Condition | `error.code` |
 |---|---|
 | Invalid or unknown request input | `invalid_argument` |
+| Execution slots and waiting queue are both full | `busy` |
 | CLI `usage` | `invalid_argument` |
 | CLI `identity_unavailable` | `identity_unavailable` |
 | CLI `stale_reference` | `stale_reference` |
@@ -162,12 +191,12 @@ endpoint at `/mcp`.
   wiring and a default-enable acceptance; a successful RPC call alone does not
   mean the recall result was cleaned. Dynamic scripts, batched calls, and
   `wait` segmented results fall outside that shape and are not covered.
-- This entry point still does not include the complete resource gates: the
-  global concurrency/queue/FIFO system and total-deadline cancellation are
-  separate work. The output budget above covers read-time bytes, the final
-  tool result, and reaping that request's own child; it does not add queueing,
-  a total deadline, or SDK cancellation handling. Do not deploy this server to
-  production until those gates and the final integration pass.
+- This entry point bounds execution slots and waiting positions, but it does
+  not yet implement the total request deadline or explicit cancellation. Those
+  gates start a per-request deadline when the request enters the pool and end a
+  queued or running request; they are separate work and are not wired here.
+  Do not deploy this server to production until those gates and the final
+  integration pass.
 - Model work stays inside the CLI. This server does not choose a retrieval
   strategy, retry model calls, or reinterpret an empty but successful result as
   a failure.

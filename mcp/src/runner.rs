@@ -1,7 +1,8 @@
 //! Direct subprocess execution of the companion CASS binary, plus the fixed
 //! result and error mapping.
 //!
-//! One [`Runner`] is shared by every SDK session. It never uses a shell: each
+//! One [`Runner`] is shared by every SDK session, and it owns the one
+//! [`Admission`] pool for the whole service. It never uses a shell: each
 //! argument is one argv element, `stdin` is closed, inherited `CASS_*`
 //! variables are removed for the child, and `CASS_DATA_DIR` is set to the
 //! configured directory.
@@ -9,6 +10,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use quick_xml::events::Event;
@@ -17,6 +19,7 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
+use crate::admission::{Admission, AdmissionOutcome, Permit};
 use crate::config::Config;
 use crate::tools::{FixedProfiles, RecallTool, ToolCall};
 
@@ -39,11 +42,21 @@ pub const MODEL_UNAVAILABLE: &str = "model_unavailable";
 pub const INVALID_RECALL: &str = "invalid_recall";
 pub const CASS_EXIT: &str = "cass_exit";
 pub const RESULT_TOO_LARGE: &str = "result_too_large";
+pub const BUSY: &str = "busy";
 
 impl ToolError {
     pub fn result_too_large(message: impl Into<String>) -> Self {
         Self {
             code: RESULT_TOO_LARGE,
+            message: message.into(),
+            cli_exit_code: None,
+        }
+    }
+
+    /// The pool and its bounded queue are both full. No child is created.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self {
+            code: BUSY,
             message: message.into(),
             cli_exit_code: None,
         }
@@ -88,7 +101,7 @@ impl ToolError {
     }
 }
 
-/// The fixed startup values every call reuses.
+/// The fixed startup values every call reuses, plus the one shared pool.
 #[derive(Debug)]
 pub struct Runner {
     cass_bin: PathBuf,
@@ -98,6 +111,7 @@ pub struct Runner {
     rerank_profile: String,
     max_output_bytes: usize,
     terminate_grace: Duration,
+    admission: Arc<Admission>,
 }
 
 impl Runner {
@@ -110,6 +124,7 @@ impl Runner {
             rerank_profile: config.rerank_profile.clone(),
             max_output_bytes: config.max_output_bytes,
             terminate_grace: Duration::from_millis(config.terminate_grace_ms),
+            admission: Admission::new(config.max_concurrent, config.max_queued),
         }
     }
 
@@ -117,9 +132,12 @@ impl Runner {
     /// unmodified CLI stdout, already proven to be a legal C04 envelope for
     /// this tool. On failure it is a fixed tool error.
     ///
-    /// One supervising task owns the child, both pipes, the combined byte
-    /// count, and the `wait`; the caller only awaits its result. Dropping the
-    /// caller's future therefore never drops the child or its reaping duty.
+    /// Every request asks the one service-wide pool first: it either takes a
+    /// slot, is registered in the bounded queue in arrival order, or is refused
+    /// with `busy` before any child exists. One supervising task owns the
+    /// child, both pipes, the combined byte count, the `wait` and the permit;
+    /// the caller only awaits its result. Dropping the caller's future
+    /// therefore never drops the child, its reaping duty, or an active slot.
     pub async fn run(&self, tool: RecallTool, call: &ToolCall) -> Result<String, ToolError> {
         let profiles = FixedProfiles {
             api_config: &self.api_config,
@@ -128,6 +146,28 @@ impl Runner {
         };
         let argv = call.argv(&profiles);
 
+        let permit = match self.admission.enter() {
+            AdmissionOutcome::Running(permit) => permit,
+            AdmissionOutcome::Queued(waiter) => waiter.wait().await,
+            AdmissionOutcome::Busy => {
+                return Err(ToolError::busy(
+                    "the execution pool and its waiting queue are both full",
+                ));
+            }
+        };
+
+        self.run_admitted(tool, argv, permit).await
+    }
+
+    /// Run one call that already owns a slot. The permit travels with the
+    /// child: a failed spawn or a failed pipe setup drops it here, and once a
+    /// child exists it belongs to the supervising task until `wait` returns.
+    async fn run_admitted(
+        &self,
+        tool: RecallTool,
+        argv: Vec<OsString>,
+        permit: Permit,
+    ) -> Result<String, ToolError> {
         let mut command = Command::new(&self.cass_bin);
         command
             .args(argv.iter().map(OsString::as_os_str))
@@ -156,7 +196,8 @@ impl Runner {
             ));
         };
 
-        let supervised = tokio::spawn(supervise(
+        let supervised = tokio::spawn(supervise_holding(
+            permit,
             child,
             stdout,
             stderr,
@@ -207,6 +248,25 @@ enum Supervised {
     },
     TooLarge,
     ReadFailed,
+}
+
+/// Own the admission slot for exactly as long as this task owns the child.
+///
+/// The permit is moved into the same task that holds the child and its `wait`,
+/// so it is released only after [`supervise`] returns — which it does only
+/// after `wait` reported. Dropping the caller's future detaches this task and
+/// cannot free the slot while the child is still running or being reaped.
+async fn supervise_holding(
+    permit: Permit,
+    child: Child,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    budget: usize,
+    grace: Duration,
+) -> Supervised {
+    let outcome = supervise(child, stdout, stderr, budget, grace).await;
+    drop(permit);
+    outcome
 }
 
 /// Own the child until both pipes reach EOF and `wait` reports. Every byte
@@ -551,6 +611,106 @@ mod tests {
             "consumed {consumed} bytes; at most {} are allowed",
             BUDGET + 1
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dropping the future that awaits the supervising task must not release
+    /// the slot. The permit lives in the task that owns the child until `wait`
+    /// returned, so an abandoned HTTP request can never free a slot while its
+    /// child still runs.
+    #[tokio::test]
+    async fn dropping_the_outer_await_keeps_the_slot_until_the_child_is_waited() {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            future.poll(&mut context)
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "cass-mcp-t14-own-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create sandbox");
+        let ready = dir.join("ready");
+        let release = dir.join("release");
+        let script = format!(
+            "printf 'READY\\n' > '{ready}'\n\
+             while [ ! -f '{release}' ]; do sleep 0.02; done\n\
+             exit 0\n",
+            ready = ready.display(),
+            release = release.display(),
+        );
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn controlled child");
+        let pid = child.id().expect("child pid");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+
+        let admission = Admission::new(1, 1);
+        let permit = match admission.enter() {
+            AdmissionOutcome::Running(permit) => permit,
+            _ => panic!("the first request must take the free slot"),
+        };
+
+        let handle = tokio::spawn(supervise_holding(
+            permit,
+            child,
+            stdout,
+            stderr,
+            1024,
+            Duration::from_millis(200),
+        ));
+        for _ in 0..1000 {
+            if ready.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready.exists(), "the controlled child never started");
+
+        // Abandon the outer await, exactly like a dropped HTTP request future.
+        drop(handle);
+
+        // The slot is still taken: the next request may queue, never run.
+        let waiter = match admission.enter() {
+            AdmissionOutcome::Queued(waiter) => waiter,
+            AdmissionOutcome::Running(_) => {
+                panic!("dropping the outer await released an active slot")
+            }
+            AdmissionOutcome::Busy => panic!("a queue position was available"),
+        };
+        let mut waiting = Box::pin(waiter.wait());
+        assert!(
+            poll_once(waiting.as_mut()).is_pending(),
+            "the slot must stay taken while the child runs"
+        );
+
+        // Only after the child exits and is waited may the slot come back.
+        std::fs::write(&release, b"go").expect("release the controlled child");
+        let permit = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the slot must be released once the child was waited");
+        assert!(
+            !std::path::Path::new("/proc").join(pid.to_string()).exists(),
+            "the child must be waited before the slot is released"
+        );
+        drop(permit);
+        assert_eq!(admission.counters(), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

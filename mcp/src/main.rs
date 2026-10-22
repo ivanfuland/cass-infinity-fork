@@ -4,6 +4,7 @@
 //! companion CASS binary version, then bind the loopback listener. A rejected
 //! configuration never starts a subprocess or a listener.
 
+mod admission;
 mod config;
 mod runner;
 mod server;
