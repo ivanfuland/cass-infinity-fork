@@ -122,10 +122,14 @@ endpoint at `/mcp`.
 
 ## Known limitations
 
-- The current Codex adapter cleans only the JSON literal single-call form
-  `text(await tools.mcp__cass_mcp__cass_NAME(J))`. Dynamic scripts, batched
-  calls, and `wait` segmented results are not guaranteed to be cleaned, even
-  when the tool call itself succeeds.
+- This entry point has no embedded Codex cleaning adapter. A later adapter must
+  recognize exactly one limited shape:
+  `text(await tools.mcp__cass_mcp__cass_NAME(J));`
+  where `NAME` is `search`, `expand`, `sessions`, or `timeline`, and `J` is a
+  JSON object literal. Recognizing that shape still requires the cleaning
+  wiring and a default-enable acceptance; a successful RPC call alone does not
+  mean the recall result was cleaned. Dynamic scripts, batched calls, and
+  `wait` segmented results fall outside that shape and are not covered.
 - This entry point does not yet include the complete resource gates: output
   byte budgets for streaming reads, the global concurrency/queue/FIFO system,
   and total-deadline cancellation with child reaping are separate work. Do not

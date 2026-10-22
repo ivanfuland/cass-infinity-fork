@@ -351,10 +351,11 @@ pub fn parse(tool: RecallTool, arguments: Option<&JsonObject>) -> Result<ToolCal
     };
     for key in arguments.keys() {
         if !allowed.contains(&key.as_str()) {
-            return Err(ToolError::invalid_argument(format!(
-                "`{key}` is not a field of {}",
-                tool.name()
-            )));
+            // Fixed text: a rejected key is caller data and must never be
+            // echoed back in the error body.
+            return Err(ToolError::invalid_argument(
+                "arguments contain a field that this tool does not accept",
+            ));
         }
     }
 

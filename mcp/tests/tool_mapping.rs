@@ -1049,6 +1049,60 @@ fn invalid_arguments_never_start_a_subprocess() {
     );
 }
 
+#[test]
+fn unknown_field_error_does_not_echo_request_data() {
+    let fixture = Fixture::new("unknown-field-echo");
+    let (server, session) = session_client(&fixture);
+    let mut client = Client::new(&server);
+
+    // Both the query and the rejected key carry the same unique sentinel, so
+    // any echo of caller data would show it verbatim.
+    let sentinel = "t12_unique_query_value_not_for_error_echo";
+    let cases = [
+        (
+            "cass_search",
+            json!({
+                "query": sentinel,
+                "t12_unique_query_value_not_for_error_echo": sentinel
+            }),
+        ),
+        (
+            "cass_expand",
+            json!({
+                "message_id": 1,
+                "source_id": "local",
+                "source_path": "/srv/x",
+                "expected_content_sha256": "a".repeat(64),
+                "t12_unique_query_value_not_for_error_echo": sentinel
+            }),
+        ),
+        (
+            "cass_sessions",
+            json!({ "t12_unique_query_value_not_for_error_echo": sentinel }),
+        ),
+        (
+            "cass_timeline",
+            json!({ "t12_unique_query_value_not_for_error_echo": sentinel }),
+        ),
+    ];
+
+    for (tool, arguments) in cases {
+        let result = client.call_2025(&session, tool, arguments);
+        assert_is_error(&result);
+        assert_eq!(error_code(&result), "invalid_argument", "[{tool}]");
+        let text = result_text(&result);
+        assert!(
+            !text.contains(sentinel) && !text.contains("t12_unique"),
+            "[{tool}] the error must not echo the rejected key or query: {text}"
+        );
+    }
+
+    assert!(
+        fixture.calls().is_empty(),
+        "an unknown field must not start a business subprocess"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12-AC3: one original XML text block on success
 // ---------------------------------------------------------------------------
