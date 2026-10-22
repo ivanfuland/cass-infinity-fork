@@ -297,7 +297,8 @@ fn alive(pid: i32) -> bool {
 
 const SEARCH_ENVELOPE: &str =
     r#"<cass_recall version="1" tool="cass_search">{"hits":[]}</cass_recall>"#;
-const EXPAND_ENVELOPE: &str = r#"<cass_recall version="1" tool="cass_expand">[]</cass_recall>"#;
+const EXPAND_ENVELOPE: &str =
+    r#"<cass_recall version="1" tool="cass_expand">[{"is_target":true}]</cass_recall>"#;
 const SESSIONS_ENVELOPE: &str =
     r#"<cass_recall version="1" tool="cass_sessions">{"sessions":[]}</cass_recall>"#;
 const TIMELINE_ENVELOPE: &str = r#"<cass_recall version="1" tool="cass_timeline">{"range":{"start":0,"end":0},"total_sessions":0,"groups":{}}</cass_recall>"#;

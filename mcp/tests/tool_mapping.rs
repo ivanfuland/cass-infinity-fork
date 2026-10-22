@@ -678,6 +678,7 @@ fn search_hit_payload() -> String {
             "message_id": 1,
             "source_id": "local",
             "source_path": "/srv/central/session.jsonl",
+            "line_number": 7,
             "content_sha256": "a".repeat(64),
             "content": "the <tag> & \"quoted\" text"
         }]
@@ -1234,6 +1235,213 @@ fn invalid_recall_output_is_rejected() {
     let result = client.call_2025(&session, "cass_search", json!({ "query": "q" }));
     assert_is_error(&result);
     assert_eq!(error_code(&result), "invalid_recall", "[invalid UTF-8]");
+}
+
+// ---------------------------------------------------------------------------
+// 18d-AC1 / 18d-AC2: false-success results are rejected at the accept boundary
+// ---------------------------------------------------------------------------
+
+const IDENTITY_SENTINEL: &str = "MCP18D-ID-PRIVATE-7731";
+const EXPAND_SENTINEL: &str = "MCP18D-EXPAND-PRIVATE-4416";
+
+fn search_payload_with_hit(hit: Value) -> String {
+    json!({ "query": "q", "hits": [hit] }).to_string()
+}
+
+/// Every hit must carry `source_id`, `source_path`, `message_id`,
+/// `line_number`, and `content_sha256` with the C02 types and ranges.
+/// Missing, null, blank, wrong-type, and out-of-range values are
+/// `invalid_recall`, and the original payload is never forwarded. Empty hits
+/// stay legal, and a complete hit is forwarded byte for byte.
+#[test]
+fn mcp_result_identity_rejects_malformed_hits() {
+    let fixture = Fixture::new("mcp-result-identity");
+    let (server, session) = session_client(&fixture);
+    let mut client = Client::new(&server);
+
+    let legal = json!({
+        "message_id": 1,
+        "source_id": "local",
+        "source_path": "/srv/central/session.jsonl",
+        "line_number": 0,
+        "content_sha256": "a".repeat(64),
+        "content": format!("{IDENTITY_SENTINEL} only on success"),
+        "extension_field": { "kept": true }
+    });
+    let drop = |key: &str| {
+        let mut hit = legal.clone();
+        hit.as_object_mut().expect("hit is an object").remove(key);
+        hit
+    };
+    let set = |key: &str, value: Value| {
+        let mut hit = legal.clone();
+        hit.as_object_mut()
+            .expect("hit is an object")
+            .insert(key.to_string(), value);
+        hit
+    };
+
+    let cases: Vec<(&str, Value)> = vec![
+        ("missing source_id", drop("source_id")),
+        ("missing source_path", drop("source_path")),
+        ("missing message_id", drop("message_id")),
+        ("missing line_number", drop("line_number")),
+        ("missing content_sha256", drop("content_sha256")),
+        ("null source_id", set("source_id", Value::Null)),
+        ("null source_path", set("source_path", Value::Null)),
+        ("null message_id", set("message_id", Value::Null)),
+        ("null line_number", set("line_number", Value::Null)),
+        ("null content_sha256", set("content_sha256", Value::Null)),
+        ("blank source_id", set("source_id", json!("   "))),
+        ("blank source_path", set("source_path", json!("\t"))),
+        ("non-string source_id", set("source_id", json!(7))),
+        (
+            "non-string source_path",
+            set("source_path", json!(["/srv"])),
+        ),
+        ("message_id zero", set("message_id", json!(0))),
+        ("message_id negative", set("message_id", json!(-3))),
+        ("message_id fraction", set("message_id", json!(1.5))),
+        ("message_id bool", set("message_id", json!(true))),
+        ("message_id string", set("message_id", json!("1"))),
+        (
+            "message_id above i64",
+            set("message_id", json!(i64::MAX as u64 + 1)),
+        ),
+        ("line_number negative", set("line_number", json!(-1))),
+        ("line_number fraction", set("line_number", json!(2.5))),
+        ("line_number bool", set("line_number", json!(false))),
+        ("line_number string", set("line_number", json!("3"))),
+        (
+            "content_sha256 short",
+            set("content_sha256", json!("a".repeat(63))),
+        ),
+        (
+            "content_sha256 long",
+            set("content_sha256", json!("a".repeat(65))),
+        ),
+        (
+            "content_sha256 uppercase",
+            set("content_sha256", json!("A".repeat(64))),
+        ),
+        (
+            "content_sha256 non-hex",
+            set("content_sha256", json!("g".repeat(64))),
+        ),
+        ("content_sha256 number", set("content_sha256", json!(64))),
+    ];
+
+    for (label, hit) in cases {
+        let stdout = envelope("cass_search", &search_payload_with_hit(hit));
+        fixture.answer(&stdout, "", 0);
+        let result = client.call_2025(&session, "cass_search", json!({ "query": "q" }));
+        assert_is_error(&result);
+        assert_eq!(error_code(&result), "invalid_recall", "[{label}]");
+        assert!(
+            !result_text(&result).contains(IDENTITY_SENTINEL),
+            "[{label}] no original payload may be forwarded"
+        );
+    }
+
+    let mut boundary = legal.clone();
+    boundary
+        .as_object_mut()
+        .expect("hit is an object")
+        .insert("message_id".to_string(), json!(i64::MAX));
+    for (label, hit) in [("complete hit", legal), ("i64::MAX message_id", boundary)] {
+        let stdout = envelope("cass_search", &search_payload_with_hit(hit));
+        fixture.answer(&stdout, "", 0);
+        let result = client.call_2025(&session, "cass_search", json!({ "query": "q" }));
+        assert_success(&result);
+        assert_eq!(result_text(&result), stdout, "[{label}] original bytes");
+    }
+
+    fixture.answer(SEARCH_EMPTY, "", 0);
+    let result = client.call_2025(&session, "cass_search", json!({ "query": "q" }));
+    assert_success(&result);
+    assert_eq!(result_text(&result), SEARCH_EMPTY, "empty hits stay legal");
+}
+
+/// A successful expand carries an object array whose entries all state a
+/// boolean `is_target`, with exactly one `true`. Empty, zero-target,
+/// two-target, missing, and non-boolean markers are `invalid_recall`; one
+/// target with a `false` neighbour stays legal and forwards original bytes.
+#[test]
+fn mcp_result_expand_requires_exactly_one_target() {
+    let fixture = Fixture::new("mcp-result-expand");
+    let (server, session) = session_client(&fixture);
+    let mut client = Client::new(&server);
+    let arguments = json!({
+        "message_id": 1,
+        "source_id": "local",
+        "source_path": "/srv/central/session.jsonl",
+        "expected_content_sha256": "a".repeat(64)
+    });
+    let target = json!({
+        "line": 3,
+        "role": "user",
+        "is_target": true,
+        "content": format!("{EXPAND_SENTINEL} only on success")
+    });
+    let neighbour = json!({
+        "line": 4,
+        "role": "assistant",
+        "is_target": false,
+        "content": "after"
+    });
+
+    let cases: Vec<(&str, Value)> = vec![
+        ("empty array", json!([])),
+        ("zero targets", json!([neighbour])),
+        ("two targets", json!([target, target])),
+        (
+            "missing is_target",
+            json!([{ "line": 3, "content": EXPAND_SENTINEL }]),
+        ),
+        (
+            "non-bool number is_target",
+            json!([{ "line": 3, "is_target": 1, "content": EXPAND_SENTINEL }]),
+        ),
+        (
+            "non-bool string is_target",
+            json!([{ "line": 3, "is_target": "true", "content": EXPAND_SENTINEL }]),
+        ),
+        (
+            "null is_target",
+            json!([{ "line": 3, "is_target": null, "content": EXPAND_SENTINEL }]),
+        ),
+        (
+            "neighbour without is_target",
+            json!([target, { "line": 4, "content": EXPAND_SENTINEL }]),
+        ),
+        ("object instead of array", json!({ "is_target": true })),
+    ];
+
+    for (label, payload) in cases {
+        let stdout = envelope("cass_expand", &payload.to_string());
+        fixture.answer(&stdout, "", 0);
+        let result = client.call_2025(&session, "cass_expand", arguments.clone());
+        assert_is_error(&result);
+        assert_eq!(error_code(&result), "invalid_recall", "[{label}]");
+        assert!(
+            !result_text(&result).contains(EXPAND_SENTINEL),
+            "[{label}] no original payload may be forwarded"
+        );
+    }
+
+    for (label, payload) in [
+        ("one target", json!([target])),
+        (
+            "one target with false neighbour",
+            json!([neighbour, target]),
+        ),
+    ] {
+        let stdout = envelope("cass_expand", &payload.to_string());
+        fixture.answer(&stdout, "", 0);
+        let result = client.call_2025(&session, "cass_expand", arguments.clone());
+        assert_success(&result);
+        assert_eq!(result_text(&result), stdout, "[{label}] original bytes");
+    }
 }
 
 #[test]

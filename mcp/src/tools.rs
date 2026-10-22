@@ -39,7 +39,12 @@ impl RecallTool {
         Self::ALL.into_iter().find(|tool| tool.name() == name)
     }
 
-    /// Shape check shared with the CLI recall envelope (C04).
+    /// MCP result check for this tool's successful payload.
+    ///
+    /// The CLI owns the same C04 envelope. This check is the MCP-side guard
+    /// that a success result carries the C02 identity and target invariants
+    /// before any of its bytes reach the caller. It only validates; no value
+    /// is trimmed, converted, or rewritten.
     pub fn accepts(self, value: &Value) -> bool {
         let objects = |value: &Value| {
             value
@@ -47,8 +52,20 @@ impl RecallTool {
                 .is_some_and(|array| array.iter().all(Value::is_object))
         };
         match self {
-            Self::Search => value.get("hits").is_some_and(objects),
-            Self::Expand => objects(value),
+            Self::Search => value
+                .get("hits")
+                .and_then(Value::as_array)
+                .is_some_and(|hits| hits.iter().all(hit_has_identity)),
+            Self::Expand => value.as_array().is_some_and(|messages| {
+                messages
+                    .iter()
+                    .all(|message| message.get("is_target").is_some_and(Value::is_boolean))
+                    && messages
+                        .iter()
+                        .filter(|message| message.get("is_target") == Some(&Value::Bool(true)))
+                        .count()
+                        == 1
+            }),
             Self::Sessions => value.get("sessions").is_some_and(objects),
             Self::Timeline => {
                 value.get("range").is_some_and(Value::is_object)
@@ -58,6 +75,39 @@ impl RecallTool {
             }
         }
     }
+}
+
+/// The C02 identity of one search hit, checked in place.
+///
+/// `source_id` and `source_path` are non-blank strings, `message_id` is an
+/// integer in `1..=i64::MAX`, `line_number` is a non-negative integer, and
+/// `content_sha256` is exactly 64 lowercase ASCII hex characters. Unknown
+/// extra fields are ignored.
+fn hit_has_identity(hit: &Value) -> bool {
+    let non_blank = |key: &str| {
+        hit.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+    };
+    let integer = |key: &str, minimum: u64, maximum: u64| {
+        hit.get(key)
+            .and_then(Value::as_u64)
+            .is_some_and(|number| (minimum..=maximum).contains(&number))
+    };
+    hit.is_object()
+        && non_blank("source_id")
+        && non_blank("source_path")
+        && integer("message_id", 1, i64::MAX as u64)
+        && integer("line_number", 0, u64::MAX)
+        && hit
+            .get("content_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
 }
 
 /// Startup values fixed for every call. Request input cannot override them.
