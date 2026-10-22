@@ -617,6 +617,47 @@ fn invalid_integers_and_digests_fail_before_the_database_is_opened() {
         "--json",
     ]);
     assert_error(&neither, "neither locator", 2, "usage");
+
+    // F03-1: the digest argument belongs only to the message-id form. The
+    // legacy line entry must reject it instead of silently returning a body
+    // selected by physical line without any verification.
+    let line_with_invalid_digest = fixture.run(&[
+        "--color=never",
+        "--db",
+        missing_db,
+        "expand",
+        fixture.source_str(),
+        "--line",
+        "1",
+        "--expected-content-sha256",
+        "not-a-digest",
+        "--json",
+    ]);
+    assert_error(
+        &line_with_invalid_digest,
+        "line with invalid digest",
+        2,
+        "usage",
+    );
+
+    let line_with_valid_digest = fixture.run(&[
+        "--color=never",
+        "--db",
+        missing_db,
+        "expand",
+        fixture.source_str(),
+        "--line",
+        "1",
+        "--expected-content-sha256",
+        ok_sha.as_str(),
+        "--json",
+    ]);
+    assert_error(
+        &line_with_valid_digest,
+        "line with digest but no message id",
+        2,
+        "usage",
+    );
 }
 
 #[test]

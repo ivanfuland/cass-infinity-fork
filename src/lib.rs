@@ -9408,14 +9408,28 @@ async fn execute_cli(
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     let context = parse_expand_context(&context)?;
                     match (line, message_id) {
-                        (Some(line), None) => run_expand(
-                            &path,
-                            cli.db.clone(),
-                            source.as_deref(),
-                            line,
-                            context,
-                            structured_format,
-                        )?,
+                        (Some(line), None) => {
+                            // The digest only belongs to the message-id form. Accepting it
+                            // silently here would let callers believe a body was verified
+                            // while the legacy path still selects by physical file line.
+                            if expected_content_sha256.is_some() {
+                                return Err(CliError::usage(
+                                    "--expected-content-sha256 requires --message-id",
+                                    Some(
+                                        "Use --message-id to verify a content digest; --line expands by file line without a digest"
+                                            .to_string(),
+                                    ),
+                                ));
+                            }
+                            run_expand(
+                                &path,
+                                cli.db.clone(),
+                                source.as_deref(),
+                                line,
+                                context,
+                                structured_format,
+                            )?;
+                        }
                         (None, Some(raw_message_id)) => {
                             let message_id = parse_expand_message_id(&raw_message_id)?;
                             let source_id = source.as_deref().ok_or_else(|| {
