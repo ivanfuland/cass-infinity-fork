@@ -230,12 +230,16 @@ fn cli_option<'a>(tool: RecallTool, name: &'a str) -> Option<CliOption<'a>> {
     }
 }
 
-/// The two relative-time filters document `-7d`/`-24h` style values, and the
-/// current CLI admits them with `allow_hyphen_values`.
+/// The relative-time filters of search, sessions and timeline document
+/// `-7d`/`-24h` style values, and the current CLI admits them with
+/// `allow_hyphen_values`; both the space and the equals form stay literal.
 fn cli_option_accepts_hyphen_value(tool: RecallTool, canonical: &str) -> bool {
     matches!(
         (tool, canonical),
-        (RecallTool::Search | RecallTool::Timeline, "since" | "until")
+        (
+            RecallTool::Search | RecallTool::Sessions | RecallTool::Timeline,
+            "since" | "until"
+        )
     )
 }
 
@@ -271,10 +275,10 @@ fn looks_like_env_assignment(word: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Decode the first `max` words the way the shell would for quote removal,
-/// ignoring every construct the scanner rejects. Used only to decide whether
-/// the command head is Cass before the stricter syntax pass.
-fn leading_words(command: &str, max: usize) -> Vec<String> {
+/// Read one shell word with quote removal. The word ends at whitespace or at
+/// an unquoted command separator, so `cass; echo …` still exposes `cass` as
+/// the first literal command head.
+fn read_leading_word(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Quote {
         None,
@@ -282,65 +286,79 @@ fn leading_words(command: &str, max: usize) -> Vec<String> {
         Double,
     }
 
-    let mut words = Vec::new();
-    let mut chars = command.chars().peekable();
-    loop {
-        while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
-            chars.next();
-        }
-        if chars.peek().is_none() || words.len() == max {
-            break;
-        }
-        let mut word = String::new();
-        let mut quote = Quote::None;
-        while let Some(&c) = chars.peek() {
-            match quote {
-                Quote::None => match c {
-                    ' ' | '\t' | '\n' | '\r' => break,
-                    '\'' => {
-                        chars.next();
-                        quote = Quote::Single;
+    while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+        chars.next();
+    }
+    if chars.peek().is_none() {
+        return None;
+    }
+    let mut word = String::new();
+    let mut quote = Quote::None;
+    while let Some(&c) = chars.peek() {
+        match quote {
+            Quote::None => match c {
+                ' ' | '\t' | '\n' | '\r' => break,
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' => break,
+                '\'' => {
+                    chars.next();
+                    quote = Quote::Single;
+                }
+                '"' => {
+                    chars.next();
+                    quote = Quote::Double;
+                }
+                '\\' => {
+                    chars.next();
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
                     }
-                    '"' => {
-                        chars.next();
-                        quote = Quote::Double;
-                    }
+                }
+                _ => {
+                    word.push(c);
+                    chars.next();
+                }
+            },
+            Quote::Single => {
+                chars.next();
+                if c == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Quote::Double => {
+                chars.next();
+                match c {
+                    '"' => quote = Quote::None,
                     '\\' => {
-                        chars.next();
                         if let Some(escaped) = chars.next() {
                             word.push(escaped);
                         }
                     }
-                    _ => {
-                        word.push(c);
-                        chars.next();
-                    }
-                },
-                Quote::Single => {
-                    chars.next();
-                    if c == '\'' {
-                        quote = Quote::None;
-                    } else {
-                        word.push(c);
-                    }
-                }
-                Quote::Double => {
-                    chars.next();
-                    match c {
-                        '"' => quote = Quote::None,
-                        '\\' => {
-                            if let Some(escaped) = chars.next() {
-                                word.push(escaped);
-                            }
-                        }
-                        _ => word.push(c),
-                    }
+                    _ => word.push(c),
                 }
             }
         }
-        words.push(word);
     }
-    words
+    Some(word)
+}
+
+/// The first word that is not a `NAME=value` assignment, plus whether any
+/// assignment prefix was skipped. There is deliberately no numeric limit:
+/// any number of leading assignments still makes the later Cass head a
+/// preserved candidate. Used only to decide whether the head is Cass before
+/// the stricter syntax pass.
+fn command_head_word(command: &str) -> Option<(String, bool)> {
+    let mut chars = command.chars().peekable();
+    let mut had_assignment = false;
+    while let Some(word) = read_leading_word(&mut chars) {
+        if looks_like_env_assignment(&word) {
+            had_assignment = true;
+            continue;
+        }
+        return Some((word, had_assignment));
+    }
+    None
 }
 
 /// Reject every dynamic or compound shell construct **outside quotes** and
@@ -553,16 +571,13 @@ fn parse_subcommand<'a>(
 /// frozen read commands. Executes nothing.
 pub(crate) fn parse_cli(command: &str) -> Result<Option<CliInvocation>, UncoveredReason> {
     let unsupported = UncoveredReason::UnsupportedShell;
-    let words = leading_words(command, 16);
-    let mut head_index = 0;
-    while words.get(head_index).is_some_and(|word| looks_like_env_assignment(word)) {
-        head_index += 1;
-    }
-    let Some(head) = words.get(head_index) else { return Ok(None) };
-    if !is_cass_command_head(head) {
+    let Some((head, had_assignment_prefix)) = command_head_word(command) else {
+        return Ok(None);
+    };
+    if !is_cass_command_head(&head) {
         return Ok(None);
     }
-    if head_index > 0 {
+    if had_assignment_prefix {
         return Err(unsupported);
     }
     scan_dynamic_shell(command).map_err(|()| unsupported)?;
@@ -1905,6 +1920,8 @@ mod tests {
             "/usr/local/bin/cassx search auth",
             "/usr/bin/cass-fork search auth",
             "echo cass search auth",
+            "echo cass; echo ordinary",
+            "echo cass | cat",
             "FOO=1 echo cass",
         ] {
             assert_not_cass(command);
@@ -2039,6 +2056,8 @@ mod tests {
             "cass sessions",
             "cass sessions --limit 10 --workspace /w --since 2026-01-01 --recall",
             "cass sessions --limit=10 --since=-7d --json",
+            "cass sessions --since -7d --json",
+            "cass sessions --since -24h --recall",
             "cass timeline",
             "cass timeline --since -7d --until now --agent a --agent=b --source s \
              --group-by hour --json",
@@ -2086,6 +2105,11 @@ mod tests {
         for command in [
             "cass search a | cat",
             "cass search a|cat",
+            "cass; echo ordinary",
+            "cass;echo",
+            "cass|cat",
+            "cass>out",
+            "cass&",
             "cass search a; cass search b",
             "cass search a;b",
             "cass search a && echo",
@@ -2473,6 +2497,87 @@ mod tests {
             panic!("expand line mode without --source is still a proven read command");
         };
         assert_eq!(no_source_judged.src, Some(RecallSrc::default()));
+    }
+
+    #[test]
+    fn mcp_v2_cli_env_assignment_prefix_has_no_word_cap() {
+        for count in [1usize, 17, 40] {
+            let assignments: Vec<String> =
+                (0..count).map(|index| format!("VAR{index}=literal")).collect();
+            let prefix = assignments.join(" ");
+            assert_unsupported(&format!("{prefix} cass sessions --json"));
+            assert_unsupported(&format!("{prefix} /usr/bin/cass search auth"));
+            assert_not_cass(&format!("{prefix} echo cass"));
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_rework_sessions_since_and_compound_head_are_attributed() {
+        // F06-1: the space form of the already-supported sessions --since is
+        // a proven Sessions read; its literal value is not re-interpreted.
+        let (mut message, event, ctx) = fixture(
+            "Bash",
+            json!({"command": "cass sessions --since -7d --json"}),
+            &sessions_value().to_string(),
+        );
+        let Outcome::Exclude(judged) =
+            decide(&message, 1, &event, &ctx, "claude_code", &paths_cfg())
+        else {
+            panic!("sessions --since -7d must be attributed to the Sessions read command");
+        };
+        assert_eq!(judged.decision.reason, ExclusionReason::CassRecall);
+        assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(judged.src, Some(sessions_src()));
+        let marker = apply_with_redaction(
+            &mut message,
+            &judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            0,
+            field_map_for("claude_code"),
+            false,
+        );
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(message.content, "");
+
+        // F06-2: a separator glued to the head still leaves Cass as the first
+        // literal command head; the compound command is preserved, not claimed.
+        for command in ["cass; echo ordinary", "cass;echo"] {
+            let (compound, compound_event, compound_ctx) =
+                fixture("Bash", json!({"command": command}), "ordinary output");
+            assert_eq!(
+                decide(
+                    &compound,
+                    1,
+                    &compound_event,
+                    &compound_ctx,
+                    "claude_code",
+                    &paths_cfg()
+                ),
+                Outcome::Preserve(Some(UncoveredReason::UnsupportedShell)),
+                "{command}"
+            );
+            assert_eq!(compound.content, "ordinary output");
+        }
+
+        // F06-3: no numeric cap on the assignment prefix.
+        let assignments: Vec<String> =
+            (0..17).map(|index| format!("VAR{index}=literal")).collect();
+        let command = format!("{} cass sessions --json", assignments.join(" "));
+        let (assigned, assigned_event, assigned_ctx) =
+            fixture("Bash", json!({"command": command}), &sessions_value().to_string());
+        assert_eq!(
+            decide(
+                &assigned,
+                1,
+                &assigned_event,
+                &assigned_ctx,
+                "claude_code",
+                &paths_cfg()
+            ),
+            Outcome::Preserve(Some(UncoveredReason::UnsupportedShell))
+        );
+        assert_eq!(assigned.content, sessions_value().to_string());
     }
 
     #[test]
