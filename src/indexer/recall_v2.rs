@@ -673,7 +673,9 @@ fn legacy_outcome(
 ///    locatable result block is preserved as `unpaired_result`; a bare
 ///    identity also needs captured arguments before it can be excluded — it
 ///    must **not** fall back to the legacy R1 rule, whose bare-name alias
-///    would delete an ordinary same-named tool's output;
+///    would delete an ordinary same-named tool's output. An unrecognized tool
+///    name is never a v2 candidate: it returns to the unchanged legacy
+///    judgment before any argument check;
 /// 4. a strong identity is excluded whatever the output is (damaged output
 ///    is excluded with `src = None` and a bounded `parse_error`). Its exact
 ///    full name proves attribution, so a missing argument capture does not
@@ -739,22 +741,20 @@ pub(crate) fn decide(
         }
     }
 
-    let kind = classify_tool(&call.tool_name, agent_slug);
-
-    // Task18a: a strong identity is proven by its exact full server-namespaced
-    // name, so a missing argument capture must not downgrade a completed
-    // recall to `unpaired_result`. Every other path keeps the unchanged
-    // argument gate, including a paired non-Cass tool, whose pre-existing
-    // `unpaired_result` diagnostic stays exactly as it was.
-    if !matches!(kind, Some(CandidateKind::Strong(_))) {
-        let Some(_args) = call.args.as_ref() else {
-            return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
-        };
-    }
-
-    let Some(kind) = kind else {
+    let Some(kind) = classify_tool(&call.tool_name, agent_slug) else {
+        // An unknown tool — including another server's same-suffixed name — is
+        // not a Cass candidate here. It goes back through the unchanged legacy
+        // judgment BEFORE any argument check, so a missing capture never turns
+        // it into a v2 `unpaired_result`.
         return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
     };
+
+    // Only a bare identity still needs captured arguments before it can be
+    // excluded. The exact full server-namespaced name of a strong identity
+    // proves attribution without them.
+    if matches!(kind, CandidateKind::Bare(_)) && call.args.is_none() {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    }
 
     let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
     if target_blocks.is_empty() {
@@ -1598,8 +1598,8 @@ mod tests {
         let (m, event, ctx) = fixture_without_args("mcp__other-mcp__cass_search", &content);
         assert_eq!(
             decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()),
-            Outcome::Preserve(Some(UncoveredReason::UnpairedResult)),
-            "another server's tool keeps the unchanged paired-no-args preservation"
+            Outcome::Preserve(None),
+            "an unknown identity falls back to the legacy judgment before any argument gate"
         );
     }
 

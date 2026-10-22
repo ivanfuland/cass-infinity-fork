@@ -527,6 +527,9 @@ const NATIVE_CODEX_CONTROL_BODY: &str = "t18a codex control search body";
 const NATIVE_CLAUDE_BARE_BODY: &str = "t18a claude bare missing args body stays";
 const NATIVE_CODEX_BARE_BODY: &str = "t18a codex bare missing args body stays";
 const NATIVE_OTHER_SERVER_BODY: &str = "t18a other-server body stays";
+const NATIVE_CLAUDE_OTHER_MISSING_OUTPUT: &str =
+    "t18a claude other-server missing args output stays";
+const NATIVE_CODEX_OTHER_MISSING_OUTPUT: &str = "t18a codex other-server missing args output stays";
 const NATIVE_UNPAIRED_BODY: &str = "t18a unpaired candidate body stays";
 
 fn native_search_value(body: &str) -> Value {
@@ -698,6 +701,23 @@ fn write_claude_native_session(
         ]}
     }));
 
+    // Preservation control: another server's tool without captured input.
+    // An unknown identity must fall back to the legacy judgment before any
+    // argument gate, so this row adds no v2 uncovered count.
+    lines.push(json!({
+        "type": "assistant", "timestamp": "2026-01-03T00:00:16.500Z", "uuid": "t18a-a-other-missing",
+        "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_t18a_other_missing", "name": "mcp__other-mcp__cass_search"}
+        ]}
+    }));
+    lines.push(json!({
+        "type": "user", "timestamp": "2026-01-03T00:00:16.750Z", "uuid": "t18a-r-other-missing",
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_t18a_other_missing",
+             "content": NATIVE_CLAUDE_OTHER_MISSING_OUTPUT}
+        ]}
+    }));
+
     // Preservation control: a complete envelope whose call row is missing.
     let unpaired = wrapper(
         RecallTool::Search,
@@ -853,6 +873,23 @@ fn write_codex_native_session(
         "timestamp": "2026-01-03T00:00:17.000Z",
         "type": "response_item",
         "payload": {"type": "function_call_output", "call_id": "call_t18a_other", "output": other}
+    }));
+
+    // Preservation control: another server's tool without captured arguments.
+    // The unknown identity falls back to the legacy judgment, so this row adds
+    // no v2 uncovered count.
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:17.500Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "id": "fc-t18a-other-missing",
+                    "name": "mcp__other-mcp__cass_search",
+                    "call_id": "call_t18a_other_missing"}
+    }));
+    lines.push(json!({
+        "timestamp": "2026-01-03T00:00:17.750Z",
+        "type": "response_item",
+        "payload": {"type": "function_call_output", "call_id": "call_t18a_other_missing",
+                    "output": NATIVE_CODEX_OTHER_MISSING_OUTPUT}
     }));
 
     // Preservation control: a complete envelope whose call row is missing.
@@ -1307,11 +1344,13 @@ fn marker_json(db: &Conn) -> Vec<Value> {
         .collect()
 }
 
-/// The literal uncovered matrix of this case: two ordinary same-named tools
-/// (`ambiguous_tool_identity`) and four preserved candidates
-/// (`unpaired_result`). The eight missing-args results are excluded, and the
-/// other-server and C07 controls are never candidates, so neither adds a
-/// count.
+/// The literal uncovered matrix of this case under the original rules: two
+/// ordinary same-named tools (`ambiguous_tool_identity`) and four preserved
+/// candidates (`unpaired_result`: the two bare names without args and the two
+/// unpaired envelopes). The eight missing-args strong results are excluded.
+/// Neither other-server control adds a count, with or without captured args:
+/// an unknown identity goes back through the legacy judgment before any
+/// argument gate. The C07 control has no Cass evidence and adds nothing.
 fn assert_native_activation_json(report: &Value, label: &str) {
     assert_eq!(
         report["recall_uncovered_total"].as_u64(),
@@ -1459,6 +1498,8 @@ fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &s
         NATIVE_CODEX_PROSE,
         NATIVE_ORDINARY_OUTPUT,
         NATIVE_C07_MISSING_OUTPUT,
+        NATIVE_CLAUDE_OTHER_MISSING_OUTPUT,
+        NATIVE_CODEX_OTHER_MISSING_OUTPUT,
     ] {
         assert!(
             bodies.iter().any(|body| body == text),
