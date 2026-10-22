@@ -47,6 +47,13 @@ pub(crate) const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 /// regex fingerprint alone does not.
 pub(crate) const SOURCE_EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
 
+/// The second exclusion-rule epoch (C05).
+///
+/// This build can read and export materials that name it, but it is not the
+/// producer default: [`SOURCE_EXCLUSION_EPOCH`] stays `/1` until the separate
+/// enablement task switches it.
+pub(crate) const SOURCE_EXCLUSION_EPOCH_V2: &str = "cass-source-exclusion/2";
+
 /// The safety contract's domain tag.
 pub(crate) const SOURCE_SAFETY_CONTRACT: &str = "cass.source-safety/1";
 
@@ -487,6 +494,52 @@ const FOUR_ARRAY_KEYS: [&str; 4] = [
 /// carries `#[serde(default)]` on every field: a deserialised value alone
 /// cannot distinguish "the key was there" from "a live default was filled in".
 pub(crate) fn load_fixed_safety_config(path: &Path) -> Result<FixedSafetyConfig, SourceIngestError> {
+    let code_version = fixed_code_version(SOURCE_EXCLUSION_EPOCH);
+    load_fixed_safety_config_for_code_version(path, &code_version)
+}
+
+/// The fixed code version one exclusion epoch combines with the current
+/// redaction fingerprint.
+fn fixed_code_version(epoch: &str) -> String {
+    format!(
+        "{epoch}+{}",
+        crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
+    )
+}
+
+/// The exclusion-rule epoch a fixed `code_version` names, or `None`.
+///
+/// Only the exact `<epoch>+<current redaction fingerprint>` spelling of an
+/// epoch this build can read is accepted. Comparing the whole string keeps a
+/// longer suffix, a different fingerprint, a missing separator and any
+/// whitespace change from passing; a prefix test would accept several of them.
+pub(crate) fn exclusion_epoch_for_code_version(code_version: &str) -> Option<&'static str> {
+    [SOURCE_EXCLUSION_EPOCH, SOURCE_EXCLUSION_EPOCH_V2]
+        .into_iter()
+        .find(|epoch| fixed_code_version(epoch) == code_version)
+}
+
+/// Load and verify the caller's fixed copy under one already-named rule epoch.
+///
+/// The version is checked against the epochs this build can read before the
+/// copy is touched, and the loaded configuration carries exactly that version.
+/// The refusal carries one short reason and never the caller's spelling.
+pub(crate) fn load_fixed_safety_config_for_code_version(
+    path: &Path,
+    code_version: &str,
+) -> Result<FixedSafetyConfig, SourceIngestError> {
+    if exclusion_epoch_for_code_version(code_version).is_none() {
+        return Err(SourceIngestError::Config {
+            detail: "code_version_unsupported".to_string(),
+        });
+    }
+    load_with_fixed_version(path, code_version)
+}
+
+fn load_with_fixed_version(
+    path: &Path,
+    code_version: &str,
+) -> Result<FixedSafetyConfig, SourceIngestError> {
     // The identity names an absolute UTF-8 path, resolved once here. A
     // relative spelling would make the identity depend on the process's working
     // directory, so it is made absolute first -- and deliberately *without*
@@ -552,7 +605,7 @@ pub(crate) fn load_fixed_safety_config(path: &Path) -> Result<FixedSafetyConfig,
     // The new path always desensitises. The legacy environment switch may turn
     // the legacy path's redaction off; it can never turn this one off.
     let config = SourceSafetyConfig {
-        code_version: format!("{SOURCE_EXCLUSION_EPOCH}+{}", crate::indexer::redact_secrets::redaction_algorithm_fingerprint()),
+        code_version: code_version.to_string(),
         desensitization_enabled: true,
         config_source_identity: original_path.clone(),
         fixed_config_bytes: bytes.clone(),
@@ -597,11 +650,11 @@ pub(crate) fn load_restore_fixed_safety(
     if identity.trim().is_empty() {
         return Err(refuse("blank_identity"));
     }
-    let mut loaded =
-        load_fixed_safety_config(path).map_err(|_| refuse("fixed_copy_unusable"))?;
-    if loaded.config.code_version != code_version {
+    if exclusion_epoch_for_code_version(code_version).is_none() {
         return Err(refuse("code_version_unsupported"));
     }
+    let mut loaded = load_fixed_safety_config_for_code_version(path, code_version)
+        .map_err(|_| refuse("fixed_copy_unusable"))?;
     let verified = loaded
         .config
         .verify()
@@ -1081,6 +1134,15 @@ impl SourceProfile {
         let effective_config_digest = canonical_digest(effective_config)?;
         let identity = safety.config.verify().map_err(SourceIngestError::Verify)?;
         let redaction = crate::indexer::redact_secrets::redaction_algorithm_fingerprint();
+        // The epoch this input really ran under, taken from its own fixed
+        // configuration. A version this build cannot read is a configuration
+        // refusal, not something to paper over with the current default.
+        let epoch =
+            exclusion_epoch_for_code_version(&safety.config.code_version).ok_or_else(|| {
+                SourceIngestError::Config {
+                    detail: "code_version_unsupported".to_string(),
+                }
+            })?;
 
         let normalizer = serde_json::json!([
             SOURCE_NORMALIZER_DOMAIN,
@@ -1090,7 +1152,7 @@ impl SourceProfile {
         ]);
         let safety_array = serde_json::json!([
             SOURCE_SAFETY_CONTRACT,
-            SOURCE_EXCLUSION_EPOCH,
+            epoch,
             redaction,
             safety.config_source_identity(),
             identity.fixed_config_sha256().hex(),
@@ -8135,6 +8197,170 @@ mod restore_fixed_safety_tests {
         recheck_cell("auto", "missing");
         recheck_cell("explicit", "changed");
         recheck_cell("explicit", "missing");
+    }
+}
+
+/// Task08: rule-epoch selection for fixed code versions.
+///
+/// Every case builds its own fixed copy under a `TempDir`; none reads the real
+/// `HOME`/`XDG_CONFIG_HOME` or sets a process environment variable, so the
+/// default parallel run stays independent.
+#[cfg(test)]
+mod mcp_export_epoch_tests {
+    use super::*;
+    use crate::sources::config::ExcludedContextPaths;
+
+    const EMPTY_TOML: &str = "injection_only_files = []\nmemory_files = []\n\
+project_read_documents = []\nworkspace_scoped_files = []\n";
+
+    fn empty_arrays() -> ExcludedContextPaths {
+        ExcludedContextPaths {
+            memory_files: vec![],
+            injection_only_files: vec![],
+            workspace_scoped_files: vec![],
+            project_read_documents: vec![],
+        }
+    }
+
+    fn fixed_copy(dir: &Path) -> PathBuf {
+        let path = dir.join("fixed").join("epoch-fixed.toml");
+        std::fs::create_dir_all(path.parent().expect("fixed parent")).expect("mkdir fixed");
+        std::fs::write(&path, EMPTY_TOML).expect("write fixed copy");
+        path
+    }
+
+    fn v1() -> String {
+        fixed_code_version(SOURCE_EXCLUSION_EPOCH)
+    }
+
+    fn v2() -> String {
+        fixed_code_version(SOURCE_EXCLUSION_EPOCH_V2)
+    }
+
+    #[test]
+    fn mcp_export_epoch_selection_is_exact() {
+        assert_eq!(exclusion_epoch_for_code_version(&v1()), Some(SOURCE_EXCLUSION_EPOCH));
+        assert_eq!(exclusion_epoch_for_code_version(&v2()), Some(SOURCE_EXCLUSION_EPOCH_V2));
+
+        let fingerprint = crate::indexer::redact_secrets::redaction_algorithm_fingerprint();
+        let rejected = [
+            String::new(),
+            SOURCE_EXCLUSION_EPOCH.to_string(),
+            SOURCE_EXCLUSION_EPOCH_V2.to_string(),
+            "cass-source-exclusion/3".to_string(),
+            format!("{SOURCE_EXCLUSION_EPOCH}+"),
+            format!("{SOURCE_EXCLUSION_EPOCH}+{fingerprint}+"),
+            format!("{SOURCE_EXCLUSION_EPOCH}++{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH}+{fingerprint} "),
+            format!(" {SOURCE_EXCLUSION_EPOCH}+{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH}\t+{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH}+redact-v0:{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH}+{}", fingerprint.to_uppercase()),
+            format!("{SOURCE_EXCLUSION_EPOCH}+{fingerprint}-extra"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V2}+{fingerprint}+{fingerprint}"),
+        ];
+        for value in rejected {
+            assert_eq!(
+                exclusion_epoch_for_code_version(&value),
+                None,
+                "the version {value:?} must not select an epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_export_epoch_loader_pins_the_requested_version() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = fixed_copy(temp.path());
+
+        let default_loaded = load_fixed_safety_config(&path).expect("the default copy loads");
+        assert_eq!(
+            default_loaded.config().code_version,
+            v1(),
+            "the default loader still produces the epoch-1 producer identity"
+        );
+
+        for (requested, epoch) in [
+            (v1(), SOURCE_EXCLUSION_EPOCH),
+            (v2(), SOURCE_EXCLUSION_EPOCH_V2),
+        ] {
+            let loaded = load_fixed_safety_config_for_code_version(&path, &requested)
+                .expect("a supported version loads");
+            assert_eq!(loaded.config().code_version, requested);
+            assert_eq!(
+                exclusion_epoch_for_code_version(&loaded.config().code_version),
+                Some(epoch)
+            );
+            let verified = loaded.config().verify().expect("the copy verifies");
+            assert_eq!(verified.code_version(), requested);
+            // The arrays and bytes are the same material for both epochs.
+            assert_eq!(loaded.config().effective_four_arrays, empty_arrays());
+            assert_eq!(loaded.config().fixed_config_bytes, EMPTY_TOML.as_bytes());
+        }
+
+        for unsupported in [
+            String::new(),
+            "cass-source-exclusion/3".to_string(),
+            SOURCE_EXCLUSION_EPOCH.to_string(),
+            format!("{}x", v2()),
+        ] {
+            let err = load_fixed_safety_config_for_code_version(&path, &unsupported)
+                .expect_err("an unsupported version is refused");
+            match err {
+                SourceIngestError::Config { detail } => {
+                    assert_eq!(detail, "code_version_unsupported");
+                }
+                other => panic!("expected a Config refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_export_epoch_profile_follows_the_config_version() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = fixed_copy(temp.path());
+        let effective = serde_json::json!({
+            "schema": "cass.source-parser-context/1",
+            "connector": "claude_code",
+            "roots": [{
+                "path": "/synthetic/epoch-root",
+                "origin": {"kind": "local", "host": null, "source_version": null},
+                "platform": null,
+                "workspace_rewrites": [],
+            }],
+            "role": "primary_session_log",
+        });
+
+        let v1_config = load_fixed_safety_config_for_code_version(&path, &v1()).expect("v1 copy");
+        let v1_a = SourceProfile::assemble(&v1_config, &effective).expect("v1 profile");
+        let v1_b = SourceProfile::assemble(&v1_config, &effective).expect("v1 profile again");
+        assert_eq!(v1_a, v1_b, "one version keeps one profile");
+
+        let v2_config = load_fixed_safety_config_for_code_version(&path, &v2()).expect("v2 copy");
+        let v2_profile = SourceProfile::assemble(&v2_config, &effective).expect("v2 profile");
+        assert_eq!(
+            v1_a.normalizer_id, v2_profile.normalizer_id,
+            "the normalizer identity does not carry the exclusion epoch"
+        );
+        assert_eq!(
+            v1_a.effective_config_digest,
+            v2_profile.effective_config_digest
+        );
+        assert_ne!(
+            v1_a.safety_contract_id, v2_profile.safety_contract_id,
+            "the safety identity separates the two rule epochs"
+        );
+
+        let mut unknown = v2_config;
+        unknown.config.code_version = format!("{SOURCE_EXCLUSION_EPOCH_V2}+redact-v0:deadbeef");
+        let err = SourceProfile::assemble(&unknown, &effective)
+            .expect_err("an unreadable version is refused");
+        match err {
+            SourceIngestError::Config { detail } => {
+                assert_eq!(detail, "code_version_unsupported");
+            }
+            other => panic!("expected a Config refusal, got {other:?}"),
+        }
     }
 }
 
