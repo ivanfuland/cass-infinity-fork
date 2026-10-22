@@ -2,10 +2,10 @@
 # test-setup-cass-mcp.sh — control-flow tests for the paired candidate mode of
 # scripts/setup-cass-fork.sh, plus legacy single-CLI compatibility.
 #
-# MOCK BOUNDARY: this script replaces cargo, rustup, strings, ldd, ln and the
-# asupersync git sibling with fakes earlier in PATH. Every case runs in its own
-# temp directory with an isolated HOME and a throwaway local git origin. These
-# cases prove branch and publication boundaries only. They are NOT release
+# MOCK BOUNDARY: this script replaces cargo, rustup, strings, ldd, ln, sha256sum
+# and the asupersync git sibling with fakes earlier in PATH. Every case runs in
+# its own temp directory with an isolated HOME and a throwaway local git origin.
+# These cases prove branch and publication boundaries only. They are NOT release
 # evidence: the real paired release is produced by the shipped script against
 # the private source mirror in the task run root.
 #
@@ -134,6 +134,24 @@ if [ -n "\${FAKE_LN_FAIL_DEST:-}" ] && [ "\$dest" = "\$FAKE_LN_FAIL_DEST" ]; the
 fi
 exec "$REAL_LN" "\$@"
 FAKE_LN
+
+REAL_SHA256=$(command -v sha256sum)
+cat > "$MOCKS/sha256sum" <<FAKE_SHA
+#!/usr/bin/env bash
+set -u
+if [ -n "\${FAKE_LOG:-}" ]; then printf 'sha256sum args=%s\n' "\$*" >> "\$FAKE_LOG/sha256sum-calls.log"; fi
+if [ "\${FAKE_SHA_FAIL_STAGE:-0}" = "1" ]; then
+  for a in "\$@"; do
+    case "\$a" in
+      */.cass-pair-stage.*)
+        echo "fake sha256sum: controlled stage digest failure" >&2
+        exit 74
+        ;;
+    esac
+  done
+fi
+exec "$REAL_SHA256" "\$@"
+FAKE_SHA
 
 chmod +x "$MOCKS"/*
 
@@ -479,6 +497,20 @@ case_second_publish_fail() {
   end_case
 }
 
+case_stage_digest_probe_failure() {
+  begin_case stage-digest-probe-failure
+  local rc=0
+  run_setup "$CASE_DIR" INSTALL_PATH="$CLI_TARGET" MCP_INSTALL_PATH="$MCP_TARGET" FAKE_SHA_FAIL_STAGE=1 || rc=$?
+  assert_rc_nonzero "$rc"
+  assert_contains "$CASE_DIR/setup.log" "stage SHA256 probe itself failed"
+  assert_no_path "$CLI_TARGET"
+  assert_no_path "$MCP_TARGET"
+  assert_not_contains "$CASE_DIR/setup.log" "PAIR_OK"
+  assert_no_stage "$(dirname "$CLI_TARGET")"
+  assert_no_stage "$(dirname "$MCP_TARGET")"
+  end_case
+}
+
 case_old_single_cli() {
   begin_case old-single-cli
   mkdir -p "$(dirname "$CLI_TARGET")"
@@ -531,6 +563,7 @@ case_source_commit_changed
 case_source_dirty
 case_paired_success
 case_second_publish_fail
+case_stage_digest_probe_failure
 case_old_single_cli
 case_old_mode_cargo_target_dir_not_rejected
 

@@ -180,14 +180,19 @@ publish_candidate() {
   stage=$(mktemp "$parent/.cass-pair-stage.XXXXXX") || die publish "$label: cannot create stage file in $parent"
   if ! cp -p "$src" "$stage"; then rm -f "$stage"; die publish "$label: copy into stage failed"; fi
   if [ ! -x "$stage" ]; then rm -f "$stage"; die publish "$label: staged copy lost the executable bit"; fi
-  got=$(sha256sum "$stage" | awk '{print $1}')
+  got=$(sha256sum "$stage" | awk '{print $1}') || {
+    rm -f "$stage"
+    die publish "$label: stage SHA256 probe itself failed; cleaned the stage (nothing published)"
+  }
   if [ "$got" != "$want_sha" ]; then rm -f "$stage"; die publish "$label: staged SHA256 $got != built SHA256 $want_sha"; fi
   if ! ln -T -- "$stage" "$dest"; then
     rm -f "$stage"
     die publish "$label: ln -T refused to publish $dest (target appeared?); already-published candidates are kept"
   fi
   rm -f "$stage"
-  got=$(sha256sum "$dest" | awk '{print $1}')
+  got=$(sha256sum "$dest" | awk '{print $1}') || {
+    die publish "$label: published SHA256 probe itself failed (the candidate stays published; nothing was overwritten)"
+  }
   [ "$got" = "$want_sha" ] || die publish "$label: published SHA256 $got != built SHA256 $want_sha"
 }
 
