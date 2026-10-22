@@ -39,11 +39,10 @@ const RULE_VERSION: u32 = 2;
 
 /// Why a recognized recall candidate was not excluded, or why a bare-name
 /// result was preserved. The strings are the frozen diagnostic reasons from
-/// C1/05; [`UnsupportedShell`](Self::UnsupportedShell) is reserved for
-/// ticket 06 (limited direct-CLI syntax) and is never produced here.
+/// C1/05; [`UnsupportedShell`](Self::UnsupportedShell) belongs to ticket 06's
+/// limited direct-CLI syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UncoveredReason {
-    #[allow(dead_code)] // reserved for ticket 06
     UnsupportedShell,
     UnpairedResult,
     AmbiguousToolIdentity,
@@ -129,6 +128,486 @@ fn known_cass_tool_name(name: &str) -> bool {
     full_name_tool(name).is_some() || bare_name_tool(name).is_some()
 }
 
+// ============================================================================
+// Ticket 06: limited direct-CLI syntax (C06 + C3).
+//
+// A direct `Bash`/`exec_command` invocation is only recognized when the whole
+// command is a single simple command whose head is Cass and whose arguments
+// fit the frozen read-only table below. Nothing here executes a shell, reads
+// a file or an environment variable, resolves a path or consults a model.
+// ============================================================================
+
+/// One recognized direct-CLI read invocation. `args` exists only so
+/// [`parse_result`] can extract expand's source from the actual PATH and
+/// `--source`; the other tools carry an empty object.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CliInvocation {
+    pub(crate) tool: RecallTool,
+    pub(crate) args: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliValueKind {
+    Text,
+    /// Decimal non-negative literal; no range re-interpretation.
+    Number,
+    /// 64 hex digits (C2's content digest form).
+    Sha256,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CliOption<'a> {
+    Value { canonical: &'a str, kind: CliValueKind, repeatable: bool },
+    Flag { canonical: &'a str },
+}
+
+/// The frozen per-tool option table. Names outside these arms are syntax
+/// beyond the subset and preserve the result (`unsupported_shell`).
+fn cli_option<'a>(tool: RecallTool, name: &'a str) -> Option<CliOption<'a>> {
+    use CliOption::{Flag, Value};
+    use CliValueKind::{Number, Sha256, Text};
+    match tool {
+        RecallTool::Search => match name {
+            "agent" => Some(Value { canonical: name, kind: Text, repeatable: true }),
+            "workspace" => Some(Value { canonical: name, kind: Text, repeatable: true }),
+            "source" | "since" | "until" | "mode" | "embedding-profile" | "rerank-profile"
+            | "api-config" | "cursor" | "vector-search-mode" | "fields" | "request-id" => {
+                Some(Value { canonical: name, kind: Text, repeatable: false })
+            }
+            "rrf-limit" | "rerank-limit" | "offset" | "max-content-length" | "max-tokens" => {
+                Some(Value { canonical: name, kind: Number, repeatable: false })
+            }
+            "rerank" | "no-model-fallback" | "robot-meta" | "recall" => {
+                Some(Flag { canonical: name })
+            }
+            "json" | "robot" => Some(Flag { canonical: "json" }),
+            _ => None,
+        },
+        RecallTool::Expand => match name {
+            "source" => Some(Value { canonical: "source", kind: Text, repeatable: false }),
+            "source-id" | "source_id" => {
+                Some(Value { canonical: "source", kind: Text, repeatable: false })
+            }
+            "line" => Some(Value { canonical: "line", kind: Number, repeatable: false }),
+            "line-number" | "line_number" => {
+                Some(Value { canonical: "line", kind: Number, repeatable: false })
+            }
+            "message-id" => {
+                Some(Value { canonical: "message-id", kind: Number, repeatable: false })
+            }
+            "message_id" => {
+                Some(Value { canonical: "message-id", kind: Number, repeatable: false })
+            }
+            "expected-content-sha256" => {
+                Some(Value { canonical: "expected-content-sha256", kind: Sha256, repeatable: false })
+            }
+            "expected_content_sha256" => {
+                Some(Value { canonical: "expected-content-sha256", kind: Sha256, repeatable: false })
+            }
+            "context" => Some(Value { canonical: "context", kind: Number, repeatable: false }),
+            "json" | "robot" => Some(Flag { canonical: "json" }),
+            "recall" => Some(Flag { canonical: "recall" }),
+            _ => None,
+        },
+        RecallTool::Sessions => match name {
+            "workspace" | "since" => {
+                Some(Value { canonical: name, kind: Text, repeatable: false })
+            }
+            "limit" => Some(Value { canonical: "limit", kind: Number, repeatable: false }),
+            "json" | "robot" => Some(Flag { canonical: "json" }),
+            "recall" => Some(Flag { canonical: "recall" }),
+            _ => None,
+        },
+        RecallTool::Timeline => match name {
+            "since" | "until" | "source" | "group-by" => {
+                Some(Value { canonical: name, kind: Text, repeatable: false })
+            }
+            "agent" => Some(Value { canonical: "agent", kind: Text, repeatable: true }),
+            "json" | "robot" => Some(Flag { canonical: "json" }),
+            "recall" => Some(Flag { canonical: "recall" }),
+            _ => None,
+        },
+    }
+}
+
+/// The relative-time filters of search, sessions and timeline document
+/// `-7d`/`-24h` style values, and the current CLI admits them with
+/// `allow_hyphen_values`; both the space and the equals form stay literal.
+fn cli_option_accepts_hyphen_value(tool: RecallTool, canonical: &str) -> bool {
+    matches!(
+        (tool, canonical),
+        (
+            RecallTool::Search | RecallTool::Sessions | RecallTool::Timeline,
+            "since" | "until"
+        )
+    )
+}
+
+fn cli_value_matches(kind: CliValueKind, value: &str) -> bool {
+    match kind {
+        CliValueKind::Text => true,
+        CliValueKind::Number => !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()),
+        CliValueKind::Sha256 => value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+    }
+}
+
+fn is_cass_command_head(word: &str) -> bool {
+    if word == "cass" || word == "cass-infinity" {
+        return true;
+    }
+    if word.starts_with('/') {
+        let base = word.rsplit_once('/').map(|(_, base)| base).unwrap_or(word);
+        return base == "cass" || base == "cass-infinity";
+    }
+    false
+}
+
+/// `NAME=value` prefix. Any such prefix in front of a Cass head is outside
+/// the supported subset (the command could still be Cass, so the result is
+/// preserved rather than handed to the legacy rules).
+fn looks_like_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else { return false };
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Read one shell word with quote removal. The word ends at whitespace or at
+/// an unquoted command separator, so `cass; echo …` still exposes `cass` as
+/// the first literal command head.
+fn read_leading_word(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    while matches!(chars.peek(), Some(' ' | '\t' | '\n' | '\r')) {
+        chars.next();
+    }
+    if chars.peek().is_none() {
+        return None;
+    }
+    let mut word = String::new();
+    let mut quote = Quote::None;
+    while let Some(&c) = chars.peek() {
+        match quote {
+            Quote::None => match c {
+                ' ' | '\t' | '\n' | '\r' => break,
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' => break,
+                '\'' => {
+                    chars.next();
+                    quote = Quote::Single;
+                }
+                '"' => {
+                    chars.next();
+                    quote = Quote::Double;
+                }
+                '\\' => {
+                    chars.next();
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
+                    }
+                }
+                _ => {
+                    word.push(c);
+                    chars.next();
+                }
+            },
+            Quote::Single => {
+                chars.next();
+                if c == '\'' {
+                    quote = Quote::None;
+                } else {
+                    word.push(c);
+                }
+            }
+            Quote::Double => {
+                chars.next();
+                match c {
+                    '"' => quote = Quote::None,
+                    '\\' => {
+                        if let Some(escaped) = chars.next() {
+                            word.push(escaped);
+                        }
+                    }
+                    _ => word.push(c),
+                }
+            }
+        }
+    }
+    Some(word)
+}
+
+/// The first word that is not a `NAME=value` assignment, plus whether any
+/// assignment prefix was skipped. There is deliberately no numeric limit:
+/// any number of leading assignments still makes the later Cass head a
+/// preserved candidate. Used only to decide whether the head is Cass before
+/// the stricter syntax pass.
+fn command_head_word(command: &str) -> Option<(String, bool)> {
+    let mut chars = command.chars().peekable();
+    let mut had_assignment = false;
+    while let Some(word) = read_leading_word(&mut chars) {
+        if looks_like_env_assignment(&word) {
+            had_assignment = true;
+            continue;
+        }
+        return Some((word, had_assignment));
+    }
+    None
+}
+
+/// Reject every dynamic or compound shell construct **outside quotes** and
+/// every expansion inside double quotes. Quoted metacharacters are data:
+/// `cass search "a|b"` mode is accepted, `cass search a | b` is not.
+fn scan_dynamic_shell(command: &str) -> Result<(), ()> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scan {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut chars = command.chars().peekable();
+    let mut state = Scan::None;
+    let mut at_word_start = true;
+    while let Some(c) = chars.next() {
+        match state {
+            Scan::None => match c {
+                '\'' => {
+                    state = Scan::Single;
+                    at_word_start = false;
+                }
+                '"' => {
+                    state = Scan::Double;
+                    at_word_start = false;
+                }
+                '\\' => match chars.next() {
+                    None | Some('\n') => return Err(()),
+                    Some(_) => at_word_start = false,
+                },
+                ' ' | '\t' => at_word_start = true,
+                '\n' => return Err(()),
+                '|' | ';' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '*' | '?' | '[' | ']'
+                | '$' | '`' => return Err(()),
+                '#' if at_word_start => return Err(()),
+                '~' if at_word_start => return Err(()),
+                _ => at_word_start = false,
+            },
+            Scan::Single => {
+                if c == '\'' {
+                    state = Scan::None;
+                }
+            }
+            Scan::Double => match c {
+                '"' => state = Scan::None,
+                '\\' => match chars.next() {
+                    None | Some('\n') => return Err(()),
+                    Some('$' | '`' | '"' | '\\') => {}
+                    Some(_) => {}
+                },
+                '$' | '`' => return Err(()),
+                _ => {}
+            },
+        }
+    }
+    if state == Scan::None { Ok(()) } else { Err(()) }
+}
+
+fn parse_subcommand<'a>(
+    tool: RecallTool,
+    tokens: &'a [String],
+) -> Result<Option<CliInvocation>, UncoveredReason> {
+    let unsupported = UncoveredReason::UnsupportedShell;
+    let mut positionals: Vec<&'a str> = Vec::new();
+    let mut values: Vec<(&'a str, &'a str)> = Vec::new();
+    let mut flags: Vec<&'a str> = Vec::new();
+    let mut options_done = false;
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        if !options_done {
+            if token == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if matches!(token, "--help" | "-h" | "--version" | "-V") {
+                return Err(unsupported);
+            }
+            if let Some(body) = token.strip_prefix("--") {
+                let (name, inline) = match body.split_once('=') {
+                    Some((name, value)) => (name, Some(value)),
+                    None => (body, None),
+                };
+                match cli_option(tool, name) {
+                    Some(CliOption::Flag { canonical }) => {
+                        if inline.is_some() || flags.contains(&canonical) {
+                            return Err(unsupported);
+                        }
+                        flags.push(canonical);
+                    }
+                    Some(CliOption::Value { canonical, kind, repeatable }) => {
+                        let value = match inline {
+                            Some(value) => value,
+                            None => {
+                                i += 1;
+                                let Some(next) = tokens.get(i) else {
+                                    return Err(unsupported);
+                                };
+                                let next = next.as_str();
+                                // `help`/`version` in option position never proves a
+                                // recall, even when a value slot is next.
+                                if matches!(next, "--help" | "-h" | "--version" | "-V" | "--") {
+                                    return Err(unsupported);
+                                }
+                                // The current CLI accepts dash-leading relative
+                                // offsets for since/until; every other value option
+                                // rejects a dash-leading token as a missing value.
+                                if next.starts_with('-')
+                                    && !cli_option_accepts_hyphen_value(tool, canonical)
+                                {
+                                    return Err(unsupported);
+                                }
+                                next
+                            }
+                        };
+                        if !cli_value_matches(kind, value)
+                            || (!repeatable && values.iter().any(|(seen, _)| *seen == canonical))
+                        {
+                            return Err(unsupported);
+                        }
+                        values.push((canonical, value));
+                    }
+                    None => return Err(unsupported),
+                }
+                i += 1;
+                continue;
+            }
+            if token.len() > 1 && token.starts_with('-') {
+                let (canonical, kind) = match (tool, token) {
+                    (RecallTool::Expand, "-n") => ("line", CliValueKind::Number),
+                    (RecallTool::Expand, "-C") => ("context", CliValueKind::Number),
+                    _ => return Err(unsupported),
+                };
+                i += 1;
+                let Some(next) = tokens.get(i) else { return Err(unsupported) };
+                if next.starts_with('-') || !cli_value_matches(kind, next) {
+                    return Err(unsupported);
+                }
+                if values.iter().any(|(seen, _)| *seen == canonical) {
+                    return Err(unsupported);
+                }
+                values.push((canonical, next.as_str()));
+                i += 1;
+                continue;
+            }
+        }
+        positionals.push(token);
+        i += 1;
+    }
+
+    let value_of = |name: &str| {
+        values.iter().find(|(canonical, _)| *canonical == name).map(|(_, value)| *value)
+    };
+    let has_flag = |name: &str| flags.contains(&name);
+    let recall_conflicts = has_flag("recall")
+        && (has_flag("json")
+            || (tool == RecallTool::Search && value_of("fields").is_some()));
+    if recall_conflicts {
+        return Err(unsupported);
+    }
+
+    match tool {
+        RecallTool::Search => {
+            if positionals.len() != 1 {
+                return Err(unsupported);
+            }
+            Ok(Some(CliInvocation { tool, args: Value::Object(serde_json::Map::new()) }))
+        }
+        RecallTool::Expand => {
+            if positionals.len() != 1 {
+                return Err(unsupported);
+            }
+            let path = positionals[0];
+            let line = value_of("line");
+            let message_id = value_of("message-id");
+            let sha = value_of("expected-content-sha256");
+            let source = value_of("source");
+            let located = match (line, message_id, sha) {
+                (Some(_), None, None) => true,
+                (None, Some(_), Some(_)) => source.is_some(),
+                _ => false,
+            };
+            if !located {
+                return Err(unsupported);
+            }
+            let mut args = serde_json::Map::new();
+            args.insert("source_path".to_string(), Value::String(path.to_string()));
+            if let Some(source) = source {
+                args.insert("source_id".to_string(), Value::String(source.to_string()));
+            }
+            Ok(Some(CliInvocation { tool, args: Value::Object(args) }))
+        }
+        RecallTool::Sessions | RecallTool::Timeline => {
+            if !positionals.is_empty() {
+                return Err(unsupported);
+            }
+            Ok(Some(CliInvocation { tool, args: Value::Object(serde_json::Map::new()) }))
+        }
+    }
+}
+
+/// Parse one captured shell command into the limited direct-CLI form.
+///
+/// `Ok(None)` means the head is not Cass at all (ordinary shell work stays on
+/// the legacy path); `Err(UnsupportedShell)` means the head **is** Cass but
+/// the syntax is outside C06's subset, so the result must be preserved and
+/// diagnosed instead of silently excluded. `Ok(Some(_))` is one of the four
+/// frozen read commands. Executes nothing.
+pub(crate) fn parse_cli(command: &str) -> Result<Option<CliInvocation>, UncoveredReason> {
+    let unsupported = UncoveredReason::UnsupportedShell;
+    let Some((head, had_assignment_prefix)) = command_head_word(command) else {
+        return Ok(None);
+    };
+    if !is_cass_command_head(&head) {
+        return Ok(None);
+    }
+    if had_assignment_prefix {
+        return Err(unsupported);
+    }
+    scan_dynamic_shell(command).map_err(|()| unsupported)?;
+    let tokens = shell_words::split(command).map_err(|_| unsupported)?;
+    let Some((head_token, rest)) = tokens.split_first() else { return Err(unsupported) };
+    if !is_cass_command_head(head_token) {
+        return Ok(None);
+    }
+    let Some((subcommand, args)) = rest.split_first() else { return Err(unsupported) };
+    let tool = match subcommand.as_str() {
+        "search" => RecallTool::Search,
+        "expand" => RecallTool::Expand,
+        "sessions" => RecallTool::Sessions,
+        "timeline" => RecallTool::Timeline,
+        _ => return Err(unsupported),
+    };
+    parse_subcommand(tool, args)
+}
+
+/// Which captured argument key holds the shell command for this
+/// connector/tool pair. Exact names only: a shared suffix or another
+/// connector's tool name proves nothing.
+fn shell_command_key(tool_name: &str, agent_slug: &str) -> Option<&'static str> {
+    match (agent_slug, tool_name) {
+        ("claude_code", "Bash") => Some("command"),
+        ("codex", "exec_command") => Some("cmd"),
+        _ => None,
+    }
+}
+
 /// True when the raw text contains any `cass_recall` opening tag. Used only
 /// to separate "looks like a wrapper but is invalid" from "plain output" for
 /// bare-name candidates; it is never used to extract a payload.
@@ -185,13 +664,18 @@ fn legacy_outcome(
 /// 1. non-`tool_result` rows, unknown connectors and non-Cass tools fall back
 ///    to the unchanged legacy judgment (R2/R3 still apply, now with marker 2
 ///    when they fire through this entry);
-/// 2. a recognized Cass candidate that lacks R4 pairing, captured args or a
+/// 2. a paired `Bash`/`exec_command` call is first read as a direct CLI
+///    command (ticket 06): a non-Cass head keeps the legacy path, an
+///    unsupported Cass syntax is preserved as `unsupported_shell`, and a
+///    proven read command still needs the captured args and a uniquely
+///    locatable result block before it can be excluded;
+/// 3. a recognized Cass candidate that lacks R4 pairing, captured args or a
 ///    uniquely locatable result block is preserved as `unpaired_result` — it
 ///    must **not** fall back to the legacy R1 rule, whose bare-name alias
 ///    would delete an ordinary same-named tool's output;
-/// 3. a strong identity is excluded whatever the output is (damaged output
+/// 4. a strong identity is excluded whatever the output is (damaged output
 ///    is excluded with `src = None` and a bounded `parse_error`);
-/// 4. a bare identity is excluded only after the whole result decodes as a
+/// 5. a bare identity is excluded only after the whole result decodes as a
 ///    complete C04 envelope for that exact tool.
 pub(crate) fn decide(
     msg: &NormalizedMessage,
@@ -212,6 +696,44 @@ pub(crate) fn decide(
             legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg)
         };
     };
+
+    if let Some(command_key) = shell_command_key(&call.tool_name, agent_slug) {
+        let Some(args) = call.args.as_ref() else {
+            return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        };
+        let Some(command) = args.get(command_key).and_then(Value::as_str) else {
+            return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
+        };
+        match parse_cli(command) {
+            Ok(None) => return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg),
+            Err(reason) => return Outcome::Preserve(Some(reason)),
+            Ok(Some(invocation)) => {
+                let target_blocks =
+                    exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
+                if target_blocks.is_empty() {
+                    return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+                }
+                let decision = Decision {
+                    reason: ExclusionReason::CassRecall,
+                    anchor: ExclusionAnchor {
+                        tool_call_id: call.tool_call_id.clone(),
+                        // The actual shell tool name, never an MCP name.
+                        tool_name: Some(call.tool_name.clone()),
+                        paths: None,
+                        shell: None,
+                    },
+                    event_key: event.event_key.clone(),
+                    target_blocks,
+                };
+                let (src, parse_error) =
+                    match parse_result(invocation.tool, &msg.content, &invocation.args) {
+                        Ok(src) => (Some(src), None),
+                        Err(reason) => (None, Some(reason.to_string())),
+                    };
+                return Outcome::Exclude(Exclusion { decision, src, parse_error });
+            }
+        }
+    }
 
     let Some(kind) = classify_tool(&call.tool_name, agent_slug) else {
         return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
@@ -1298,5 +1820,810 @@ mod tests {
             "ambiguous_tool_identity"
         );
         assert_eq!(UncoveredReason::InvalidRecallFormat.as_str(), "invalid_recall_format");
+    }
+
+    // -- Ticket 06: limited direct-CLI syntax ------------------------------
+
+    fn cli_sha() -> String {
+        "0123456789abcdef".repeat(4)
+    }
+
+    fn assert_unsupported(command: &str) {
+        assert_eq!(
+            parse_cli(command),
+            Err(UncoveredReason::UnsupportedShell),
+            "{command}"
+        );
+    }
+
+    fn assert_not_cass(command: &str) {
+        assert_eq!(parse_cli(command), Ok(None), "{command}");
+    }
+
+    fn expand_value() -> Value {
+        json!([
+            {"line": 2, "role": "user", "is_target": false, "content": "before"},
+            {"line": 3, "role": "assistant", "is_target": true, "content": "target"},
+        ])
+    }
+
+    fn expand_src() -> RecallSrc {
+        RecallSrc {
+            sessions: vec!["/srv/sessions/e.jsonl".into()],
+            hits: vec![RecallHit {
+                source_id: "local".into(),
+                source_path: "/srv/sessions/e.jsonl".into(),
+                line_number: Some(3),
+            }],
+        }
+    }
+
+    fn sessions_value() -> Value {
+        json!({"sessions": [{"source_id": "local", "path": "/srv/sessions/list.jsonl"}]})
+    }
+
+    fn sessions_src() -> RecallSrc {
+        RecallSrc {
+            sessions: vec!["/srv/sessions/list.jsonl".into()],
+            hits: vec![RecallHit {
+                source_id: "local".into(),
+                source_path: "/srv/sessions/list.jsonl".into(),
+                line_number: None,
+            }],
+        }
+    }
+
+    fn timeline_value() -> Value {
+        json!({"range": {"start": 1, "end": 2}, "total_sessions": 1,
+               "groups": {"hour": [{"source_id": "local", "source_path": "/srv/sessions/t.jsonl"}]}})
+    }
+
+    fn timeline_src() -> RecallSrc {
+        RecallSrc {
+            sessions: vec!["/srv/sessions/t.jsonl".into()],
+            hits: vec![RecallHit {
+                source_id: "local".into(),
+                source_path: "/srv/sessions/t.jsonl".into(),
+                line_number: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_parse_cli_recognizes_four_commands_and_cass_heads() {
+        for (command, tool) in [
+            ("cass search auth --recall", RecallTool::Search),
+            (
+                "cass-infinity expand /srv/sessions/e.jsonl -n 3 --json",
+                RecallTool::Expand,
+            ),
+            ("/usr/local/bin/cass sessions --limit 5 --recall", RecallTool::Sessions),
+            (
+                "/opt/bin/cass-infinity timeline --group-by day --json",
+                RecallTool::Timeline,
+            ),
+        ] {
+            let invocation = parse_cli(command).unwrap().unwrap();
+            assert_eq!(invocation.tool, tool, "{command}");
+        }
+        for command in [
+            "cass search auth --recall",
+            "cass sessions --limit 5 --recall",
+            "cass timeline --group-by day --json",
+        ] {
+            assert_eq!(parse_cli(command).unwrap().unwrap().args, json!({}), "{command}");
+        }
+
+        for command in [
+            "./cass search auth",
+            "cassx search auth",
+            "/usr/local/bin/cassx search auth",
+            "/usr/bin/cass-fork search auth",
+            "echo cass search auth",
+            "echo cass; echo ordinary",
+            "echo cass | cat",
+            "FOO=1 echo cass",
+        ] {
+            assert_not_cass(command);
+        }
+
+        for command in ["cass", "cass --help", "cass help", "cass refresh", "cass current"] {
+            assert_unsupported(command);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_parse_cli_search_option_table_and_boundaries() {
+        for command in [
+            "cass search --mode hybrid --vector-search-mode=exact --rerank --rrf-limit 200 \
+             --rerank-limit=5 --api-config=P --embedding-profile E --rerank-profile R \
+             --no-model-fallback --recall --agent a --agent=b --workspace /w \
+             --workspace=/w2 --max-content-length 100 --max-tokens=50 --request-id r1 \
+             --offset 0 -- \"auth query\"",
+            "cass search --recall --robot-meta query",
+            "cass search --since -7d query",
+            "cass search --since=-7d --until now query",
+            "cass search query --agent a --agent b",
+        ] {
+            assert!(matches!(parse_cli(command), Ok(Some(_))), "{command}");
+        }
+
+        for command in [
+            "cass search q --source a --source b",
+            "cass search q --rerank --rerank",
+            "cass search q --json --robot",
+            "cass search q --json --json",
+            "cass search q --recall --json",
+            "cass search q --recall --robot",
+            "cass search q --recall --fields minimal",
+            "cass search q --rrf-limit abc",
+            "cass search q --rrf-limit=",
+            "cass search q --rrf-limit -1",
+            "cass search q --source",
+            "cass search q --source --recall",
+            "cass search q extra",
+            "cass search",
+            "cass search --",
+            "cass search q -- bar",
+            "cass search q --bogus",
+            "cass search q --days 7",
+            "cass search q --sessions-from -",
+            "cass search q --help",
+            "cass search --version",
+            "cass search q --recall=true",
+        ] {
+            assert_unsupported(command);
+        }
+
+        // `--` turns `--help` into query data only when it is the single query.
+        assert_eq!(
+            parse_cli("cass search -- --help").unwrap().unwrap().tool,
+            RecallTool::Search
+        );
+        assert_eq!(
+            parse_cli("cass search --recall -- --help").unwrap().unwrap().tool,
+            RecallTool::Search
+        );
+    }
+
+    #[test]
+    fn mcp_v2_cli_parse_cli_expand_location_modes_and_aliases() {
+        let sha = cli_sha();
+        let message_mode = format!(
+            "cass expand /srv/sessions/e.jsonl --source local --message-id 42 \
+             --expected-content-sha256 {sha} --context 3 --recall"
+        );
+        let invocation = parse_cli(&message_mode).unwrap().unwrap();
+        assert_eq!(invocation.tool, RecallTool::Expand);
+        assert_eq!(
+            invocation.args,
+            json!({"source_path": "/srv/sessions/e.jsonl", "source_id": "local"})
+        );
+
+        let alias_mode = format!(
+            "cass expand /srv/sessions/e.jsonl --source_id local --message_id=42 \
+             --expected_content_sha256={sha} --recall"
+        );
+        assert_eq!(
+            parse_cli(&alias_mode).unwrap().unwrap().args,
+            invocation.args,
+            "published aliases normalize to the frozen table"
+        );
+
+        for command in [
+            "cass expand /srv/sessions/e.jsonl -n 3 --recall".to_string(),
+            "cass expand /srv/sessions/e.jsonl --line 3 --source local --recall".to_string(),
+            "cass expand /srv/sessions/e.jsonl --line-number=3 -C 2 --recall".to_string(),
+            "cass expand /srv/sessions/e.jsonl --line_number 3 --context=2 --json".to_string(),
+            "cass expand /srv/sessions/e.jsonl -n 3".to_string(),
+        ] {
+            assert!(matches!(parse_cli(&command), Ok(Some(_))), "{command}");
+        }
+
+        for command in [
+            "cass expand /srv/sessions/e.jsonl --recall".to_string(),
+            "cass expand -n 3 --recall".to_string(),
+            "cass expand /a /b -n 3".to_string(),
+            "cass expand /srv/sessions/e.jsonl -n abc".to_string(),
+            "cass expand /srv/sessions/e.jsonl -n -3".to_string(),
+            "cass expand /srv/sessions/e.jsonl --context nope".to_string(),
+            "cass expand /srv/sessions/e.jsonl -n 3 --line 4".to_string(),
+            "cass expand /srv/sessions/e.jsonl -n 3 --source a --source b".to_string(),
+            "cass expand /srv/sessions/e.jsonl -n 3 --bogus".to_string(),
+            format!(
+                "cass expand /srv/sessions/e.jsonl -n 3 --source local --message-id 42 \
+                 --expected-content-sha256 {sha}"
+            ),
+            format!(
+                "cass expand /srv/sessions/e.jsonl -n 3 --expected-content-sha256 {sha}"
+            ),
+            "cass expand /srv/sessions/e.jsonl --source local --message-id 42".to_string(),
+            format!(
+                "cass expand /srv/sessions/e.jsonl --message-id 42 --expected-content-sha256 {sha}"
+            ),
+            "cass expand /srv/sessions/e.jsonl --message-id 42 --source local \
+             --expected-content-sha256 abc"
+                .to_string(),
+            "cass expand /srv/sessions/e.jsonl -n 3 --recall --json".to_string(),
+        ] {
+            assert_unsupported(&command);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_parse_cli_sessions_and_timeline_shapes() {
+        for command in [
+            "cass sessions",
+            "cass sessions --limit 10 --workspace /w --since 2026-01-01 --recall",
+            "cass sessions --limit=10 --since=-7d --json",
+            "cass sessions --since -7d --json",
+            "cass sessions --since -24h --recall",
+            "cass timeline",
+            "cass timeline --since -7d --until now --agent a --agent=b --source s \
+             --group-by hour --json",
+            "cass timeline --group-by=day --recall",
+        ] {
+            assert!(matches!(parse_cli(command), Ok(Some(_))), "{command}");
+        }
+
+        for command in [
+            "cass sessions extra",
+            "cass sessions --limit -1",
+            "cass sessions --limit abc",
+            "cass sessions --current",
+            "cass sessions --recall --json",
+            "cass sessions --recall --robot",
+            "cass timeline extra",
+            "cass timeline --today",
+            "cass timeline --source a --source b",
+            "cass timeline --agent a --recall --json",
+            "cass timeline --group-by",
+        ] {
+            assert_unsupported(command);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_quoted_metacharacters_are_data_and_real_operators_preserved() {
+        for command in [
+            "cass search \"a|b\" --recall",
+            "cass search 'a&b' --json",
+            "cass search \"a<b>c\"",
+            "cass search 'a;b'",
+            "cass search '$(touch nope)'",
+            "cass search '`touch nope`'",
+            "cass search \"a\\$b\"",
+            "cass search a\\|b",
+            "cass search a\\&b",
+            "cass search \"a b\"",
+            "cass search 'a`b'",
+            "cass search a~b",
+        ] {
+            assert!(matches!(parse_cli(command), Ok(Some(_))), "{command}");
+        }
+
+        for command in [
+            "cass search a | cat",
+            "cass search a|cat",
+            "cass; echo ordinary",
+            "cass;echo",
+            "cass|cat",
+            "cass>out",
+            "cass&",
+            "cass search a; cass search b",
+            "cass search a;b",
+            "cass search a && echo",
+            "cass search a&b",
+            "cass search a > out",
+            "cass search a>out",
+            "cass search a < in",
+            "cass search $(touch marker)",
+            "cass search `touch marker`",
+            "cass search $HOME",
+            "cass search \"a$b\"",
+            "cass search \"a`b`\"",
+            "cass search a\nb",
+            "cass search *",
+            "cass search ?",
+            "cass search [ab]",
+            "cass search {a,b}",
+            "cass search (a)",
+            "cass search ~/x",
+            "cass search a # comment",
+            "cass search a &",
+            "FOO=1 cass search a",
+            "A=1 B=2 cass search a",
+            "FOO=1 /usr/bin/cass search a",
+            "cass search \"unclosed",
+            "cass search 'unclosed",
+            "cass search a\\",
+            "cass search a\\\nb",
+        ] {
+            assert_unsupported(command);
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_parse_cli_never_executes_or_touches_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("executed");
+        let marker = marker.to_string_lossy().to_string();
+
+        for command in [
+            format!("cass search \"$(touch {marker})\""),
+            format!("cass search x | tee {marker}"),
+            format!("cass search x > {marker}"),
+            format!("cass search `touch {marker}`"),
+        ] {
+            assert_unsupported(&command);
+            assert!(!std::path::Path::new(&marker).exists(), "{command} must not run");
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_four_commands_json_and_recall_exclude_apply_marker2() {
+        let cases = [
+            (
+                RecallTool::Search,
+                "cass search \"auth error\" --recall",
+                search_value(),
+                search_src(),
+            ),
+            (
+                RecallTool::Expand,
+                "cass expand /srv/sessions/e.jsonl --source local -n 3 --recall",
+                expand_value(),
+                expand_src(),
+            ),
+            (
+                RecallTool::Sessions,
+                "cass sessions --limit 5 --recall",
+                sessions_value(),
+                sessions_src(),
+            ),
+            (
+                RecallTool::Timeline,
+                "cass timeline --since 2026-01-01 --group-by hour --recall",
+                timeline_value(),
+                timeline_src(),
+            ),
+        ];
+
+        for (tool, command, value, expected_src) in cases {
+            for recall in [false, true] {
+                let content = if recall {
+                    recall_output::encode(tool, &value).unwrap()
+                } else {
+                    value.to_string()
+                };
+                let (mut message, event, ctx) =
+                    fixture("Bash", json!({ "command": command }), &content);
+                message.extra = json!({
+                    "message": {"content": [{"type": "tool_result", "text": content.clone()}]},
+                    "toolUseResult": content.clone(),
+                });
+                message.snippets = vec![NormalizedSnippet {
+                    file_path: Some(std::path::PathBuf::from("/srv/a.rs")),
+                    start_line: Some(1),
+                    end_line: Some(2),
+                    language: Some("rust".into()),
+                    snippet_text: Some("fn copied() {}".into()),
+                }];
+
+                let Outcome::Exclude(judged) =
+                    decide(&message, 1, &event, &ctx, "claude_code", &paths_cfg())
+                else {
+                    panic!("{tool:?} direct CLI must be excluded (recall={recall})");
+                };
+                assert_eq!(judged.decision.reason, ExclusionReason::CassRecall);
+                assert_eq!(judged.decision.target_blocks, vec![0]);
+                assert_eq!(
+                    judged.decision.anchor.tool_name.as_deref(),
+                    Some("Bash"),
+                    "the actual shell tool name is kept"
+                );
+                assert_eq!(judged.decision.anchor.tool_call_id.as_deref(), Some("t1"));
+                assert_eq!(judged.src.as_ref(), Some(&expected_src), "{tool:?} source");
+                assert!(judged.parse_error.is_none());
+
+                let original = content.clone();
+                let marker = apply_with_redaction(
+                    &mut message,
+                    &judged,
+                    &mut MemoizingRedactor::new(),
+                    "blobs/blake3/ab/abcd.raw",
+                    7,
+                    field_map_for("claude_code"),
+                    false,
+                );
+                assert_eq!(marker.rule_version, 2);
+                assert_eq!(message.content, "", "body must be cleared");
+                assert_eq!(marker.bytes, original.len() as u64);
+                assert_eq!(marker.sha256, sha256_hex(&original));
+                assert_eq!(marker.src, Some(expected_src.clone()));
+                assert_eq!(marker.parse_error, None);
+                assert_eq!(marker.anchor, judged.decision.anchor);
+                assert_eq!(marker.raw.blob, "blobs/blake3/ab/abcd.raw");
+                assert_eq!(marker.raw.idx, 7);
+                assert_eq!(marker.raw.event_key, "ek1");
+                assert_eq!(marker.raw.blocks, vec![0]);
+                assert_eq!(message.extra["message"]["content"][0]["text"]["redacted"], json!(true));
+                assert_eq!(message.extra["toolUseResult"]["redacted"], json!(true));
+                assert_eq!(message.snippets[0].snippet_text, Some(String::new()));
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_codex_exec_command_uses_cmd_and_keeps_actual_anchor() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let (mut message, event, ctx) = fixture(
+            "exec_command",
+            json!({"cmd": "cass search auth --recall"}),
+            &wrapper,
+        );
+        let Outcome::Exclude(judged) =
+            decide(&message, 1, &event, &ctx, "codex", &paths_cfg())
+        else {
+            panic!("codex exec_command must be recognized through cmd");
+        };
+        assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(judged.src, Some(search_src()));
+
+        let marker = apply_with_redaction(
+            &mut message,
+            &judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            0,
+            field_map_for("codex"),
+            false,
+        );
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(message.content, "");
+
+        // The wrong captured key proves nothing and stays on the legacy path.
+        let (wrong_key, wrong_event, wrong_ctx) = fixture(
+            "exec_command",
+            json!({"command": "cass search auth --recall"}),
+            &wrapper,
+        );
+        assert_eq!(
+            decide(&wrong_key, 1, &wrong_event, &wrong_ctx, "codex", &paths_cfg()),
+            Outcome::Preserve(None)
+        );
+        assert_eq!(wrong_key.content, wrapper);
+
+        // claude_code's Bash reads `command`, not `cmd`.
+        let (wrong_agent_key, wrong_agent_event, wrong_agent_ctx) =
+            fixture("Bash", json!({"cmd": "cass search auth --recall"}), &wrapper);
+        assert_eq!(
+            decide(
+                &wrong_agent_key,
+                1,
+                &wrong_agent_event,
+                &wrong_agent_ctx,
+                "claude_code",
+                &paths_cfg()
+            ),
+            Outcome::Preserve(None)
+        );
+    }
+
+    #[test]
+    fn mcp_v2_cli_r4_counterexamples_do_not_delete() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+
+        // Missing captured args on a known shell tool is not proof.
+        let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
+        let no_args = PairingContext::build(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("t1".into()),
+                tool_name: "Bash".into(),
+                args: None,
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("t1".into()) },
+        ]);
+        assert_eq!(
+            decide(&msg("tool_result", &wrapper), 1, &event, &no_args, "claude_code", &paths_cfg()),
+            Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+        );
+
+        // Wrong result block id.
+        let (message, _, ctx) =
+            fixture("Bash", json!({"command": "cass search auth --recall"}), &wrapper);
+        let wrong_id_event =
+            RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t2"))] };
+        assert_eq!(
+            decide(&message, 1, &wrong_id_event, &ctx, "claude_code", &paths_cfg()),
+            Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+        );
+
+        // Two id-less result blocks: ambiguous target.
+        let ambiguous_event = RawEvent {
+            event_key: "ek1".into(),
+            blocks: vec![tool_result_block(0, None), tool_result_block(1, None)],
+        };
+        let ambiguous_ctx = PairingContext::build(&[
+            PairingCandidate::TurnBoundary,
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: None,
+                tool_name: "Bash".into(),
+                args: Some(json!({"command": "cass search auth --recall"})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: None },
+        ]);
+        assert_eq!(
+            decide(
+                &message,
+                2,
+                &ambiguous_event,
+                &ambiguous_ctx,
+                "claude_code",
+                &paths_cfg()
+            ),
+            Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+        );
+        assert_eq!(message.content, wrapper);
+    }
+
+    #[test]
+    fn mcp_v2_cli_unsupported_shell_and_non_cass_outputs_are_preserved() {
+        for command in [
+            "cass search auth --bogus",
+            "cass refresh",
+            "cass search auth | tee out.txt",
+            "cass search $(echo auth)",
+            "cass search --help",
+            "FOO=1 cass search auth",
+            "cass sessions-from x",
+            "cass search \"unclosed",
+        ] {
+            let (message, event, ctx) =
+                fixture("Bash", json!({"command": command}), "body");
+            assert_eq!(
+                decide(&message, 1, &event, &ctx, "claude_code", &paths_cfg()),
+                Outcome::Preserve(Some(UncoveredReason::UnsupportedShell)),
+                "{command}"
+            );
+            assert_eq!(message.content, "body");
+        }
+
+        // XML tags in a non-Cass command's output prove no Cassandra identity.
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).unwrap();
+        let (echo_message, echo_event, echo_ctx) = fixture(
+            "Bash",
+            json!({"command": "echo '<cass_recall version=\"1\" tool=\"cass_search\">'"}),
+            &wrapper,
+        );
+        assert_eq!(
+            decide(&echo_message, 1, &echo_event, &echo_ctx, "claude_code", &paths_cfg()),
+            Outcome::Preserve(None)
+        );
+        assert_eq!(echo_message.content, wrapper);
+
+        // Unsupported connectors keep the legacy path untouched.
+        let (unknown, unknown_event, unknown_ctx) =
+            fixture("Bash", json!({"command": "cass search auth --recall"}), &wrapper);
+        assert_eq!(
+            decide(&unknown, 1, &unknown_event, &unknown_ctx, "openclaw", &paths_cfg()),
+            Outcome::Preserve(None)
+        );
+        assert_eq!(unknown.content, wrapper);
+    }
+
+    #[test]
+    fn mcp_v2_cli_damaged_empty_and_error_results_keep_bounded_sources() {
+        // Damaged strong CLI output: excluded with the bounded reason.
+        let (mut damaged, event, ctx) =
+            fixture("Bash", json!({"command": "cass search auth --recall"}), "not a recall body");
+        let Outcome::Exclude(judged) =
+            decide(&damaged, 1, &event, &ctx, "claude_code", &paths_cfg())
+        else {
+            panic!("a proven direct CLI result is excluded even when damaged");
+        };
+        assert!(judged.src.is_none());
+        assert_eq!(judged.parse_error.as_deref(), Some("invalid_recall_format"));
+        let marker = apply_with_redaction(
+            &mut damaged,
+            &judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            0,
+            field_map_for("claude_code"),
+            false,
+        );
+        assert_eq!(marker.parse_error.as_deref(), Some("invalid_recall_format"));
+        assert_eq!(damaged.content, "");
+
+        // Error-shaped JSON: no invented source, no parse error.
+        let (mut error_message, error_event, error_ctx) = fixture(
+            "Bash",
+            json!({"command": "cass search auth --json"}),
+            r#"{"error": "cass_exit", "code": 3}"#,
+        );
+        let Outcome::Exclude(error_judged) =
+            decide(&error_message, 1, &error_event, &error_ctx, "claude_code", &paths_cfg())
+        else {
+            panic!("a proven direct CLI error result is excluded");
+        };
+        assert_eq!(error_judged.src, Some(RecallSrc::default()));
+        assert!(error_judged.parse_error.is_none());
+        apply_with_redaction(
+            &mut error_message,
+            &error_judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            0,
+            field_map_for("claude_code"),
+            false,
+        );
+        assert_eq!(error_message.content, "");
+
+        // Empty results: no fake source.
+        for (command, content) in [
+            ("cass expand /srv/sessions/e.jsonl -n 3 --json", "[]"),
+            ("cass sessions --json", r#"{"sessions": []}"#),
+            (
+                "cass timeline --json",
+                r#"{"range": {"start": 1, "end": 2}, "total_sessions": 0, "groups": {}}"#,
+            ),
+        ] {
+            let (message, event, ctx) =
+                fixture("Bash", json!({"command": command}), content);
+            let Outcome::Exclude(judged) =
+                decide(&message, 1, &event, &ctx, "claude_code", &paths_cfg())
+            else {
+                panic!("{command} must be excluded");
+            };
+            assert_eq!(judged.src, Some(RecallSrc::default()), "{command}");
+            assert!(judged.parse_error.is_none(), "{command}");
+        }
+
+        // Expand line mode without --source cannot invent a source id.
+        let (no_source, no_source_event, no_source_ctx) = fixture(
+            "Bash",
+            json!({"command": "cass expand /srv/sessions/e.jsonl -n 3 --json"}),
+            &expand_value().to_string(),
+        );
+        let Outcome::Exclude(no_source_judged) = decide(
+            &no_source,
+            1,
+            &no_source_event,
+            &no_source_ctx,
+            "claude_code",
+            &paths_cfg(),
+        ) else {
+            panic!("expand line mode without --source is still a proven read command");
+        };
+        assert_eq!(no_source_judged.src, Some(RecallSrc::default()));
+    }
+
+    #[test]
+    fn mcp_v2_cli_env_assignment_prefix_has_no_word_cap() {
+        for count in [1usize, 17, 40] {
+            let assignments: Vec<String> =
+                (0..count).map(|index| format!("VAR{index}=literal")).collect();
+            let prefix = assignments.join(" ");
+            assert_unsupported(&format!("{prefix} cass sessions --json"));
+            assert_unsupported(&format!("{prefix} /usr/bin/cass search auth"));
+            assert_not_cass(&format!("{prefix} echo cass"));
+        }
+    }
+
+    #[test]
+    fn mcp_v2_cli_rework_sessions_since_and_compound_head_are_attributed() {
+        // F06-1: the space form of the already-supported sessions --since is
+        // a proven Sessions read; its literal value is not re-interpreted.
+        let (mut message, event, ctx) = fixture(
+            "Bash",
+            json!({"command": "cass sessions --since -7d --json"}),
+            &sessions_value().to_string(),
+        );
+        let Outcome::Exclude(judged) =
+            decide(&message, 1, &event, &ctx, "claude_code", &paths_cfg())
+        else {
+            panic!("sessions --since -7d must be attributed to the Sessions read command");
+        };
+        assert_eq!(judged.decision.reason, ExclusionReason::CassRecall);
+        assert_eq!(judged.decision.anchor.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(judged.src, Some(sessions_src()));
+        let marker = apply_with_redaction(
+            &mut message,
+            &judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            0,
+            field_map_for("claude_code"),
+            false,
+        );
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(message.content, "");
+
+        // F06-2: a separator glued to the head still leaves Cass as the first
+        // literal command head; the compound command is preserved, not claimed.
+        for command in ["cass; echo ordinary", "cass;echo"] {
+            let (compound, compound_event, compound_ctx) =
+                fixture("Bash", json!({"command": command}), "ordinary output");
+            assert_eq!(
+                decide(
+                    &compound,
+                    1,
+                    &compound_event,
+                    &compound_ctx,
+                    "claude_code",
+                    &paths_cfg()
+                ),
+                Outcome::Preserve(Some(UncoveredReason::UnsupportedShell)),
+                "{command}"
+            );
+            assert_eq!(compound.content, "ordinary output");
+        }
+
+        // F06-3: no numeric cap on the assignment prefix.
+        let assignments: Vec<String> =
+            (0..17).map(|index| format!("VAR{index}=literal")).collect();
+        let command = format!("{} cass sessions --json", assignments.join(" "));
+        let (assigned, assigned_event, assigned_ctx) =
+            fixture("Bash", json!({"command": command}), &sessions_value().to_string());
+        assert_eq!(
+            decide(
+                &assigned,
+                1,
+                &assigned_event,
+                &assigned_ctx,
+                "claude_code",
+                &paths_cfg()
+            ),
+            Outcome::Preserve(Some(UncoveredReason::UnsupportedShell))
+        );
+        assert_eq!(assigned.content, sessions_value().to_string());
+    }
+
+    #[test]
+    fn mcp_v2_cli_v1_has_no_direct_cli_rule_and_legacy_bash_still_fires() {
+        // v1 is unchanged: it never recognizes a direct CLI command.
+        let (message, event, ctx) = fixture(
+            "Bash",
+            json!({"command": "cass search auth --recall"}),
+            "body",
+        );
+        assert!(
+            exclusion::decide(&message, 1, &event, &ctx, "claude_code", &paths_cfg()).is_none()
+        );
+
+        // A non-Cass Bash command still reaches the legacy R2 rule through v2.
+        let read_event = RawEvent { event_key: "ek4".into(), blocks: vec![tool_result_block(0, Some("r2"))] };
+        let read_ctx = PairingContext::build(&[
+            PairingCandidate::ToolCall(PairedTool {
+                tool_call_id: Some("r2".into()),
+                tool_name: "Bash".into(),
+                args: Some(json!({"command": "cat /srv/cc-workspace/MEMORY.md"})),
+            }),
+            PairingCandidate::ToolResult { tool_call_id: Some("r2".into()) },
+        ]);
+        let mut read_message = msg("tool_result", "file body");
+        let Outcome::Exclude(read_judged) = decide(
+            &mut read_message,
+            1,
+            &read_event,
+            &read_ctx,
+            "claude_code",
+            &paths_cfg(),
+        ) else {
+            panic!("non-Cass Bash keeps the legacy R2 path");
+        };
+        assert_eq!(read_judged.decision.reason, ExclusionReason::ContextFileRead);
+        let marker = apply_with_redaction(
+            &mut read_message,
+            &read_judged,
+            &mut MemoizingRedactor::new(),
+            "blob",
+            0,
+            field_map_for("claude_code"),
+            false,
+        );
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(read_message.content, "");
     }
 }
