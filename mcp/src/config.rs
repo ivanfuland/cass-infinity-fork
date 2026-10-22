@@ -230,11 +230,12 @@ fn split_authority(authority: &str) -> Result<(String, Option<u16>), String> {
         let (host, tail) = rest
             .split_once(']')
             .ok_or_else(|| "origin has an unterminated IPv6 literal".to_string())?;
-        // Brackets are only legal around an IPv6 address. Parse the literal
-        // instead of accepting any hex/colon text, so `[:::]` and bracketed
-        // IPv4 forms are rejected before they reach the SDK.
-        let address: Ipv6Addr = host
-            .parse()
+        // Brackets are only legal around an IPv6 address. Validate the literal
+        // with the standard parser, then keep the caller's lowercased text:
+        // the SDK matches Origins by exact text, so a configured spelling such
+        // as `[0:0:0:0:0:0:0:1]` must stay that spelling. No compression or
+        // alias rewriting happens here.
+        host.parse::<Ipv6Addr>()
             .map_err(|_| "origin has an invalid IPv6 literal".to_string())?;
         let port = if tail.is_empty() {
             None
@@ -244,7 +245,7 @@ fn split_authority(authority: &str) -> Result<(String, Option<u16>), String> {
                 .ok_or_else(|| "origin has an invalid authority".to_string())?;
             Some(parse_port(digits)?)
         };
-        return Ok((address.to_string(), port));
+        return Ok((host.to_ascii_lowercase(), port));
     }
 
     let mut parts = authority.split(':');

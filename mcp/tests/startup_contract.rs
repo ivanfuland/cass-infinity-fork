@@ -587,6 +587,50 @@ fn ipv6_loopback_bind_serves_requests_without_origin() {
     assert_eq!(fixture.invocations(), vec!["--version".to_string()]);
 }
 
+/// A configured IPv6 origin must be callable with exactly that spelling.
+/// Equivalent compressed spellings are not accepted as aliases.
+#[test]
+fn expanded_ipv6_public_origin_matches_its_exact_origin() {
+    let fixture = Fixture::new("origin-expanded-ipv6", EXPECTED_CASS_VERSION, 0);
+    let origin = "http://[0:0:0:0:0:0:0:1]:8080";
+    let server = start_server(&fixture, origin);
+    let host = format!("127.0.0.1:{}", server.address.port());
+
+    let response = post(&server, &host, &[("Origin", origin)], &initialize_body());
+    assert_eq!(
+        response.status, 200,
+        "configured Origin {origin} must be allowed; body: {}",
+        response.body
+    );
+    let value = json_body(&response.body);
+    assert_eq!(value["result"]["serverInfo"]["name"], "cass-mcp");
+
+    let response = post(&server, &host, &[("Origin", origin)], &tools_list_body());
+    assert_eq!(
+        response.status, 200,
+        "tools/list with configured Origin {origin} failed; body: {}",
+        response.body
+    );
+    let value = json_body(&response.body);
+    assert_eq!(
+        value["result"]["tools"].as_array().map(Vec::len),
+        Some(0),
+        "tools/list must stay empty until ticket 12: {value}"
+    );
+
+    let response = post(
+        &server,
+        &host,
+        &[("Origin", "http://[::1]:8080")],
+        &initialize_body(),
+    );
+    assert_eq!(
+        response.status, 403,
+        "a different spelling of the same address is not an alias; body: {}",
+        response.body
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 11-AC3: configuration rejection before listener and subprocess
 // ---------------------------------------------------------------------------
