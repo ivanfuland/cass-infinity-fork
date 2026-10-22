@@ -2958,6 +2958,8 @@ schemas: (auto-generated from contract)
     - lexical_update_deferred: boolean
     - messages: ?
     - quarantined_conversations: integer
+    - recall_uncovered_by_reason: object
+    - recall_uncovered_total: integer
     - success: boolean
   introspect:
     - api_version: integer
