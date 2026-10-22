@@ -22,7 +22,8 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 
 use crate::indexer::source_ingest::{
-    FixedSafetyConfig, SourceProfile, load_fixed_safety_config, load_restore_fixed_safety,
+    FixedSafetyConfig, SourceProfile, exclusion_epoch_for_code_version,
+    load_fixed_safety_config_for_code_version, load_restore_fixed_safety,
 };
 use crate::storage::source_facts::{
     AttemptHistory, DiagnosticsEnvelope, RawSourceFactsRecord, Sha256Digest, SourceFactsFilter,
@@ -453,10 +454,8 @@ struct ProfileMaterials {
 
 const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 const MAPPING_DOMAIN: &str = "cass-source-mapping/2";
-const EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
 const REDACTION_FINGERPRINT: &str =
     "redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
-const CODE_VERSION: &str = "cass-source-exclusion/1+redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
 
 const PROFILE_KEYS: [&str; 12] = [
     "normalizer_id",
@@ -593,10 +592,16 @@ fn parse_profile_item(value: &StrictValue) -> Result<ProfileMaterial, ExportErro
 fn check_referenced_versions(material: &ProfileMaterial) -> Result<(), ExportError> {
     if material.fad_pin != FAD_PIN
         || material.mapping_domain != MAPPING_DOMAIN
-        || material.exclusion_epoch != EXCLUSION_EPOCH
         || material.redaction_fingerprint != REDACTION_FINGERPRINT
-        || material.code_version != CODE_VERSION
     {
+        return Err(ExportError::ProfileInvalid);
+    }
+    // The profile's own code version decides which rule epoch it was captured
+    // under; the epoch field must name that same epoch. An unreadable version
+    // and a version/epoch disagreement are both a profile refusal.
+    let epoch = exclusion_epoch_for_code_version(&material.code_version)
+        .ok_or(ExportError::ProfileInvalid)?;
+    if material.exclusion_epoch != epoch {
         return Err(ExportError::ProfileInvalid);
     }
     Ok(())
@@ -614,8 +619,11 @@ fn load_restored(material: &ProfileMaterial) -> Result<FixedSafetyConfig, Export
         }
         Ok(_) => {}
     }
-    let loaded = load_fixed_safety_config(&material.fixed_copy_path)
-        .map_err(|_| ExportError::ProfileInvalid)?;
+    let loaded = load_fixed_safety_config_for_code_version(
+        &material.fixed_copy_path,
+        &material.code_version,
+    )
+    .map_err(|_| ExportError::ProfileInvalid)?;
     if loaded.bytes_sha256() != &material.fixed_config_sha256 {
         return Err(ExportError::ProfileMismatch);
     }
