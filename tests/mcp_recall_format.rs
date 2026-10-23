@@ -271,6 +271,99 @@ fn real_four_commands_keep_the_existing_json_payloads() {
 }
 
 #[test]
+fn mcp_recall_literal_query_after_double_dash_keeps_the_human_error_mode() {
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let data = home.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    // Every run gets a fresh empty HOME/XDG tree, an empty CASS_DATA_DIR and no
+    // CASS_API_CONFIG, so no production database, model or API is touched.
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+        for (key, _) in std::env::vars_os() {
+            let key = key.to_string_lossy();
+            if key.starts_with("CASS_") || key == "TOON_DEFAULT_FORMAT" {
+                cmd.env_remove(key.as_ref());
+            }
+        }
+        let output = cmd
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("xdg"))
+            .env("XDG_CACHE_HOME", home.path().join("cache"))
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("CASS_DATA_DIR", &data)
+            .env("NO_COLOR", "1")
+            .env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            output.status.code(),
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let json_error = |stderr: &str| -> Value {
+        let value: Value = serde_json::from_str(stderr.trim())
+            .unwrap_or_else(|err| panic!("stderr is not a JSON envelope ({err}): {stderr}"));
+        assert!(value["error"]["kind"].is_string(), "no kind: {stderr}");
+        value
+    };
+
+    // `--` ends option parsing: these two differ only in query text, so both
+    // must take the human-readable fatal-error path.
+    let literal_recall = run(&["search", "--", "--recall"]);
+    let literal_plain = run(&["search", "--", "--ordinaryquery"]);
+    assert_ne!(literal_plain.0, Some(0), "search did not fail");
+    assert_eq!(literal_recall.0, literal_plain.0, "exit code changed");
+    assert!(literal_recall.1.is_empty() && literal_plain.1.is_empty());
+    assert!(
+        !literal_plain.2.trim_start().starts_with('{'),
+        "plain query unexpectedly robot-shaped: {}",
+        literal_plain.2
+    );
+    assert!(
+        !literal_recall.2.trim_start().starts_with('{'),
+        "literal --recall query leaked a robot error envelope: {}",
+        literal_recall.2
+    );
+    assert_eq!(literal_recall.2, literal_plain.2);
+
+    // Real output options before `--` still select the structured error.
+    let json_before = run(&["search", "--json", "--", "--ordinaryquery"]);
+    let recall_before = run(&["search", "--recall", "--", "--ordinaryquery"]);
+    let json_before_error = json_error(&json_before.2);
+    assert_eq!(json_before.0, literal_plain.0);
+    for (label, output) in [("--json", &json_before), ("--recall", &recall_before)] {
+        assert_eq!(output.0, literal_plain.0, "{label}: exit code changed");
+        assert!(output.1.is_empty(), "{label}: stdout not empty");
+        assert_eq!(
+            json_error(&output.2)["error"],
+            json_before_error["error"],
+            "{label}: envelope drifted"
+        );
+    }
+    assert_eq!(
+        json_before_error["error"]["message"],
+        Value::String(literal_plain.2.trim().to_owned())
+    );
+
+    // A real `--json` before `--` plus literal `--recall` data after it stays JSON.
+    let json_then_literal_recall = run(&["search", "--json", "--", "--recall"]);
+    assert_eq!(json_then_literal_recall.0, literal_plain.0);
+    assert!(json_then_literal_recall.1.is_empty());
+    assert_eq!(
+        json_error(&json_then_literal_recall.2)["error"],
+        json_before_error["error"]
+    );
+
+    assert!(!data.join("agent_search.db").exists());
+}
+
+#[test]
 fn recall_is_discoverable_only_on_the_four_read_commands() {
     use std::process::Command;
     let home = tempfile::tempdir().unwrap();
