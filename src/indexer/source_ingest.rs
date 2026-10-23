@@ -26,7 +26,7 @@
 //! input is one unit of work and may not be split into several independent
 //! conversations commits.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,7 +45,24 @@ pub(crate) const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 /// The fixed safety-config copy's own epoch. Constraint 4: this epoch covers
 /// the lossless-copy cleanup and key-collision semantics, which the redaction
 /// regex fingerprint alone does not.
-pub(crate) const SOURCE_EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
+///
+/// Task10: the default producer now writes the complete second epoch. The two
+/// fixed reader identities above stay separate, so epoch 1 material still
+/// verifies under its own version.
+pub(crate) const SOURCE_EXCLUSION_EPOCH: &str = SOURCE_EXCLUSION_EPOCH_V2;
+
+/// The first exclusion-rule epoch as a fixed reader identity.
+///
+/// Readers accept this epoch whatever epoch the current producer writes, so it
+/// is deliberately separate from [`SOURCE_EXCLUSION_EPOCH`], which names the
+/// producer default and may move when the enablement task switches it.
+pub(crate) const SOURCE_EXCLUSION_EPOCH_V1: &str = "cass-source-exclusion/1";
+
+/// The second exclusion-rule epoch (C05).
+///
+/// Task10 moved the producer default to this epoch; the first epoch stays a
+/// fixed reader identity.
+pub(crate) const SOURCE_EXCLUSION_EPOCH_V2: &str = "cass-source-exclusion/2";
 
 /// The safety contract's domain tag.
 pub(crate) const SOURCE_SAFETY_CONTRACT: &str = "cass.source-safety/1";
@@ -487,6 +504,56 @@ const FOUR_ARRAY_KEYS: [&str; 4] = [
 /// carries `#[serde(default)]` on every field: a deserialised value alone
 /// cannot distinguish "the key was there" from "a live default was filled in".
 pub(crate) fn load_fixed_safety_config(path: &Path) -> Result<FixedSafetyConfig, SourceIngestError> {
+    let code_version = fixed_code_version(SOURCE_EXCLUSION_EPOCH);
+    load_fixed_safety_config_for_code_version(path, &code_version)
+}
+
+/// The fixed code version one exclusion epoch combines with the current
+/// redaction fingerprint.
+fn fixed_code_version(epoch: &str) -> String {
+    format!(
+        "{epoch}+{}",
+        crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
+    )
+}
+
+/// The exclusion-rule epoch a fixed `code_version` names, or `None`.
+///
+/// Only the exact `<epoch>+<current redaction fingerprint>` spelling of an
+/// epoch this build can read is accepted. Comparing the whole string keeps a
+/// longer suffix, a different fingerprint, a missing separator and any
+/// whitespace change from passing; a prefix test would accept several of them.
+///
+/// The accepted epochs are the two fixed reader identities, not the current
+/// producer default: moving [`SOURCE_EXCLUSION_EPOCH`] must not remove epoch 1
+/// from what this reader can verify.
+pub(crate) fn exclusion_epoch_for_code_version(code_version: &str) -> Option<&'static str> {
+    [SOURCE_EXCLUSION_EPOCH_V1, SOURCE_EXCLUSION_EPOCH_V2]
+        .into_iter()
+        .find(|epoch| fixed_code_version(epoch) == code_version)
+}
+
+/// Load and verify the caller's fixed copy under one already-named rule epoch.
+///
+/// The version is checked against the epochs this build can read before the
+/// copy is touched, and the loaded configuration carries exactly that version.
+/// The refusal carries one short reason and never the caller's spelling.
+pub(crate) fn load_fixed_safety_config_for_code_version(
+    path: &Path,
+    code_version: &str,
+) -> Result<FixedSafetyConfig, SourceIngestError> {
+    if exclusion_epoch_for_code_version(code_version).is_none() {
+        return Err(SourceIngestError::Config {
+            detail: "code_version_unsupported".to_string(),
+        });
+    }
+    load_with_fixed_version(path, code_version)
+}
+
+fn load_with_fixed_version(
+    path: &Path,
+    code_version: &str,
+) -> Result<FixedSafetyConfig, SourceIngestError> {
     // The identity names an absolute UTF-8 path, resolved once here. A
     // relative spelling would make the identity depend on the process's working
     // directory, so it is made absolute first -- and deliberately *without*
@@ -552,7 +619,7 @@ pub(crate) fn load_fixed_safety_config(path: &Path) -> Result<FixedSafetyConfig,
     // The new path always desensitises. The legacy environment switch may turn
     // the legacy path's redaction off; it can never turn this one off.
     let config = SourceSafetyConfig {
-        code_version: format!("{SOURCE_EXCLUSION_EPOCH}+{}", crate::indexer::redact_secrets::redaction_algorithm_fingerprint()),
+        code_version: code_version.to_string(),
         desensitization_enabled: true,
         config_source_identity: original_path.clone(),
         fixed_config_bytes: bytes.clone(),
@@ -597,11 +664,11 @@ pub(crate) fn load_restore_fixed_safety(
     if identity.trim().is_empty() {
         return Err(refuse("blank_identity"));
     }
-    let mut loaded =
-        load_fixed_safety_config(path).map_err(|_| refuse("fixed_copy_unusable"))?;
-    if loaded.config.code_version != code_version {
+    if exclusion_epoch_for_code_version(code_version).is_none() {
         return Err(refuse("code_version_unsupported"));
     }
+    let mut loaded = load_fixed_safety_config_for_code_version(path, code_version)
+        .map_err(|_| refuse("fixed_copy_unusable"))?;
     let verified = loaded
         .config
         .verify()
@@ -621,6 +688,37 @@ pub(crate) fn load_restore_fixed_safety(
         .verify()
         .map_err(|_| refuse("identity_unverified"))?;
     Ok(loaded)
+}
+
+/// Task09: a test-only fixed configuration carrying an arbitrary code version.
+///
+/// Every production loader refuses a version this build cannot read before it
+/// builds a [`FixedSafetyConfig`], so the restore profile factory's own
+/// unknown-version refusal can only be reached with a hand-built value. Crate
+/// tests only; it grants nothing to a production caller.
+#[cfg(test)]
+pub(crate) fn test_fixed_safety_with_code_version(
+    code_version: &str,
+    bytes: &[u8],
+    identity: &str,
+    arrays: crate::sources::config::ExcludedContextPaths,
+) -> FixedSafetyConfig {
+    let config = SourceSafetyConfig {
+        code_version: code_version.to_string(),
+        desensitization_enabled: true,
+        config_source_identity: identity.to_string(),
+        fixed_config_bytes: bytes.to_vec(),
+        effective_four_arrays: arrays,
+    };
+    config
+        .verify()
+        .expect("a hand-built test configuration must still verify");
+    FixedSafetyConfig {
+        original_path: identity.to_string(),
+        bytes_sha256: Sha256Digest::of(bytes),
+        bytes: bytes.to_vec(),
+        config,
+    }
 }
 
 /// P0/C5 (2026-10-15 execution contract v2): the fixed configuration one run
@@ -1081,6 +1179,15 @@ impl SourceProfile {
         let effective_config_digest = canonical_digest(effective_config)?;
         let identity = safety.config.verify().map_err(SourceIngestError::Verify)?;
         let redaction = crate::indexer::redact_secrets::redaction_algorithm_fingerprint();
+        // The epoch this input really ran under, taken from its own fixed
+        // configuration. A version this build cannot read is a configuration
+        // refusal, not something to paper over with the current default.
+        let epoch =
+            exclusion_epoch_for_code_version(&safety.config.code_version).ok_or_else(|| {
+                SourceIngestError::Config {
+                    detail: "code_version_unsupported".to_string(),
+                }
+            })?;
 
         let normalizer = serde_json::json!([
             SOURCE_NORMALIZER_DOMAIN,
@@ -1090,7 +1197,7 @@ impl SourceProfile {
         ]);
         let safety_array = serde_json::json!([
             SOURCE_SAFETY_CONTRACT,
-            SOURCE_EXCLUSION_EPOCH,
+            epoch,
             redaction,
             safety.config_source_identity(),
             identity.fixed_config_sha256().hex(),
@@ -2775,6 +2882,21 @@ struct JudgedConversation {
 struct SafetyPass {
     staged: Pass2Result,
     judged: Vec<JudgedConversation>,
+    /// Task10: the v2 `Preserve(Some(reason))` outcomes this input really
+    /// judged, one count per fixed reason. The map is the run's own record of
+    /// what this input left uncovered; it is empty for a v1 input.
+    recall_uncovered: BTreeMap<String, u64>,
+}
+
+/// The one judged payload a record's claim produced.
+///
+/// Each rule epoch keeps its own payload: the legacy decision, or the v2
+/// exclusion (that same legacy decision plus the source and parse facts v2
+/// keeps). Only the apply entry differs; the body proof, the sibling pass and
+/// every write after it are shared.
+enum JudgedDecision {
+    Legacy(crate::indexer::exclusion::Decision),
+    V2(crate::indexer::recall_v2::Exclusion),
 }
 
 /// The text an array of content parts renders to, mirroring the connector's own
@@ -3110,7 +3232,18 @@ fn safety_pass(
     verified: &crate::raw_mirror::VerifiedRawMirrorCapture,
     paths_cfg: &crate::sources::config::ExcludedContextPaths,
 ) -> Result<SafetyPass, SourceIngestError> {
-    use crate::indexer::exclusion::{Decision, ExcludedMarker, PairingContext};
+    use crate::indexer::exclusion::{ExcludedMarker, PairingContext};
+
+    // The rule epoch this input really ran under, taken from its own verified
+    // safety identity. A version this build cannot read is a configuration
+    // refusal; it is never papered over with the producer default.
+    let code_version = job.input.safety_identity().code_version();
+    let Some(rule_epoch) = exclusion_epoch_for_code_version(code_version) else {
+        return Err(SourceIngestError::Config {
+            detail: "code_version_unsupported".to_string(),
+        });
+    };
+    let v2_rules = rule_epoch == SOURCE_EXCLUSION_EPOCH_V2;
 
     let fad_name = fad_connector_name(job.connector_name);
     // One mutable copy of each projected conversation: the judgment mutates
@@ -3155,8 +3288,13 @@ fn safety_pass(
     let mut parse_failed = 0u64;
     let mut diagnostics_count = 0u64;
     let mut scanned = 0usize;
-    let mut decisions: Vec<(usize, usize, u64, Decision)> = Vec::new();
+    let mut decisions: Vec<(usize, usize, u64, JudgedDecision)> = Vec::new();
     let mut bodies_by_ordinal: BTreeMap<u64, Vec<ExcludedBody>> = BTreeMap::new();
+    // Task10: one count per fixed uncovered reason. A message is counted once
+    // even when several claims of the same record resolve to it, so the map
+    // cannot inflate with the number of claims.
+    let mut recall_uncovered: BTreeMap<String, u64> = BTreeMap::new();
+    let mut recall_counted: BTreeSet<(usize, usize)> = BTreeSet::new();
 
     let mut scan = source_facts::FramingStream::new(&mut reader, format);
     while !scan.is_done() {
@@ -3262,14 +3400,46 @@ fn safety_pass(
                             ),
                         });
                     };
-                    if let Some(decision) = crate::indexer::exclusion::decide(
-                        message,
-                        msg_idx,
-                        event,
-                        &pairing[conv_idx],
-                        &conversations[conv_idx].agent_slug,
-                        paths_cfg,
-                    ) {
+                    let judged = if v2_rules {
+                        // The v2 entry reads this record's real raw JSON, so the
+                        // current host's frozen single-call wrapper and the
+                        // source metadata both come from the record itself. A
+                        // preserved candidate keeps its body and contributes
+                        // one bounded uncovered count to this input.
+                        match crate::indexer::recall_v2::decide_for_record(
+                            &conversations[conv_idx],
+                            msg_idx,
+                            event,
+                            &pairing[conv_idx],
+                            paths_cfg,
+                            &json,
+                        ) {
+                            crate::indexer::recall_v2::Outcome::Exclude(exclusion) => {
+                                Some(JudgedDecision::V2(exclusion))
+                            }
+                            crate::indexer::recall_v2::Outcome::Preserve(reason) => {
+                                if let Some(reason) = reason
+                                    && recall_counted.insert((conv_idx, msg_idx))
+                                {
+                                    *recall_uncovered
+                                        .entry(reason.as_str().to_string())
+                                        .or_insert(0) += 1;
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        crate::indexer::exclusion::decide(
+                            message,
+                            msg_idx,
+                            event,
+                            &pairing[conv_idx],
+                            &conversations[conv_idx].agent_slug,
+                            paths_cfg,
+                        )
+                        .map(JudgedDecision::Legacy)
+                    };
+                    if let Some(decision) = judged {
                         bodies_by_ordinal
                             .entry(locator.ordinal)
                             .or_default()
@@ -3408,15 +3578,28 @@ fn safety_pass(
         .collect();
     for (conv_idx, msg_idx, _, decision) in &decisions {
         let pre_redaction_content = conversations[*conv_idx].messages[*msg_idx].content.clone();
-        let marker = crate::indexer::exclusion::apply_with_redaction(
-            &mut conversations[*conv_idx].messages[*msg_idx],
-            decision,
-            &mut redactor,
-            &blob_label,
-            *msg_idx as u32,
-            field_maps[*conv_idx],
-            true,
-        );
+        // Each epoch applies through its own entry; the body proof, the hash,
+        // the anchor and the raw reference stay the one shared implementation.
+        let marker = match decision {
+            JudgedDecision::Legacy(decision) => crate::indexer::exclusion::apply_with_redaction(
+                &mut conversations[*conv_idx].messages[*msg_idx],
+                decision,
+                &mut redactor,
+                &blob_label,
+                *msg_idx as u32,
+                field_maps[*conv_idx],
+                true,
+            ),
+            JudgedDecision::V2(exclusion) => crate::indexer::recall_v2::apply_with_redaction(
+                &mut conversations[*conv_idx].messages[*msg_idx],
+                exclusion,
+                &mut redactor,
+                &blob_label,
+                *msg_idx as u32,
+                field_maps[*conv_idx],
+                true,
+            ),
+        };
         if let Some(title) = conversations[*conv_idx].title.as_ref().filter(|t| !t.is_empty())
             && pre_redaction_content.contains(title.as_str())
         {
@@ -3478,6 +3661,7 @@ fn safety_pass(
             diagnostics: diagnostics_count,
         },
         judged,
+        recall_uncovered,
     })
 }
 
@@ -3733,6 +3917,13 @@ pub(crate) struct SourceInputCommit {
     /// Canonical rows this commit created, for the run's own counters.
     pub(crate) inserted_conversations: usize,
     pub(crate) inserted_messages: usize,
+    /// Task10: the recognized recall candidates this commit's input left
+    /// uncovered, per fixed reason. Only a successful commit carries the
+    /// values its own judgment produced; a refusal or a transient attempt
+    /// carries the empty map, so an unfinished attempt never enters the run's
+    /// totals.
+    pub(crate) recall_uncovered_total: u64,
+    pub(crate) recall_uncovered_by_reason: BTreeMap<String, u64>,
 }
 
 /// The typed storage error a `SourceIngestError` carries, when it carries one.
@@ -3794,6 +3985,8 @@ fn busy_transient_commit(job: &SourceInputJob) -> SourceInputCommit {
         delta: Vec::new(),
         inserted_conversations: 0,
         inserted_messages: 0,
+        recall_uncovered_total: 0,
+        recall_uncovered_by_reason: BTreeMap::new(),
     }
 }
 
@@ -4729,6 +4922,11 @@ pub(crate) fn commit_source_input(
     let input_key = *job.input.input_key();
     let records = prepared.safety.staged.records.len() as u64;
     let judged_conversations = prepared.safety.judged.len() as u64;
+    // Task10: the values this input's own second pass just produced. They are
+    // attached only to a successful outcome below; a refusal or a transient
+    // attempt reports none, so an unfinished input cannot enter a run total.
+    let recall_uncovered_by_reason = prepared.safety.recall_uncovered.clone();
+    let recall_uncovered_total = recall_uncovered_by_reason.values().copied().sum();
 
     let outcome = {
         let conn = storage.raw();
@@ -4769,6 +4967,8 @@ pub(crate) fn commit_source_input(
                             delta,
                             inserted_conversations,
                             inserted_messages,
+                            recall_uncovered_total,
+                            recall_uncovered_by_reason,
                         })
                     }
                     Err(reason) => Ok(SourceInputCommit {
@@ -4780,6 +4980,8 @@ pub(crate) fn commit_source_input(
                         delta: Vec::new(),
                         inserted_conversations,
                         inserted_messages,
+                        recall_uncovered_total,
+                        recall_uncovered_by_reason,
                     }),
                 }
             }
@@ -4794,6 +4996,8 @@ pub(crate) fn commit_source_input(
                 delta: Vec::new(),
                 inserted_conversations: 0,
                 inserted_messages: 0,
+                recall_uncovered_total,
+                recall_uncovered_by_reason,
             }),
             source_facts::SourceActivationOutcome::PublishedFailure { state, .. } => {
                 Ok(SourceInputCommit {
@@ -4804,6 +5008,8 @@ pub(crate) fn commit_source_input(
                     delta: Vec::new(),
                     inserted_conversations: 0,
                     inserted_messages: 0,
+                    recall_uncovered_total: 0,
+                    recall_uncovered_by_reason: BTreeMap::new(),
                 })
             }
             source_facts::SourceActivationOutcome::StagedOnly { state, .. } => {
@@ -4815,6 +5021,8 @@ pub(crate) fn commit_source_input(
                     delta: Vec::new(),
                     inserted_conversations: 0,
                     inserted_messages: 0,
+                    recall_uncovered_total: 0,
+                    recall_uncovered_by_reason: BTreeMap::new(),
                 })
             }
         },
@@ -8138,6 +8346,177 @@ mod restore_fixed_safety_tests {
     }
 }
 
+/// Task08: rule-epoch selection for fixed code versions.
+///
+/// Every case builds its own fixed copy under a `TempDir`; none reads the real
+/// `HOME`/`XDG_CONFIG_HOME` or sets a process environment variable, so the
+/// default parallel run stays independent.
+#[cfg(test)]
+mod mcp_export_epoch_tests {
+    use super::*;
+    use crate::sources::config::ExcludedContextPaths;
+
+    const EMPTY_TOML: &str = "injection_only_files = []\nmemory_files = []\n\
+project_read_documents = []\nworkspace_scoped_files = []\n";
+
+    fn empty_arrays() -> ExcludedContextPaths {
+        ExcludedContextPaths {
+            memory_files: vec![],
+            injection_only_files: vec![],
+            workspace_scoped_files: vec![],
+            project_read_documents: vec![],
+        }
+    }
+
+    fn fixed_copy(dir: &Path) -> PathBuf {
+        let path = dir.join("fixed").join("epoch-fixed.toml");
+        std::fs::create_dir_all(path.parent().expect("fixed parent")).expect("mkdir fixed");
+        std::fs::write(&path, EMPTY_TOML).expect("write fixed copy");
+        path
+    }
+
+    fn v1() -> String {
+        fixed_code_version(SOURCE_EXCLUSION_EPOCH_V1)
+    }
+
+    fn v2() -> String {
+        fixed_code_version(SOURCE_EXCLUSION_EPOCH_V2)
+    }
+
+    #[test]
+    fn mcp_export_epoch_selection_is_exact() {
+        assert_eq!(
+            SOURCE_EXCLUSION_EPOCH_V1, "cass-source-exclusion/1",
+            "the first reader epoch is a fixed literal"
+        );
+        assert_eq!(
+            exclusion_epoch_for_code_version(&v1()),
+            Some(SOURCE_EXCLUSION_EPOCH_V1)
+        );
+        assert_eq!(exclusion_epoch_for_code_version(&v2()), Some(SOURCE_EXCLUSION_EPOCH_V2));
+
+        let fingerprint = crate::indexer::redact_secrets::redaction_algorithm_fingerprint();
+        let rejected = [
+            String::new(),
+            SOURCE_EXCLUSION_EPOCH_V1.to_string(),
+            SOURCE_EXCLUSION_EPOCH_V2.to_string(),
+            "cass-source-exclusion/3".to_string(),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint}+"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}++{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint} "),
+            format!(" {SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}\t+{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+redact-v0:{fingerprint}"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{}", fingerprint.to_uppercase()),
+            format!("{SOURCE_EXCLUSION_EPOCH_V1}+{fingerprint}-extra"),
+            format!("{SOURCE_EXCLUSION_EPOCH_V2}+{fingerprint}+{fingerprint}"),
+        ];
+        for value in rejected {
+            assert_eq!(
+                exclusion_epoch_for_code_version(&value),
+                None,
+                "the version {value:?} must not select an epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_export_epoch_loader_pins_the_requested_version() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = fixed_copy(temp.path());
+
+        let default_loaded = load_fixed_safety_config(&path).expect("the default copy loads");
+        assert_eq!(
+            default_loaded.config().code_version,
+            fixed_code_version(SOURCE_EXCLUSION_EPOCH),
+            "the default loader follows the current producer default"
+        );
+
+        for (requested, epoch) in [
+            (v1(), SOURCE_EXCLUSION_EPOCH_V1),
+            (v2(), SOURCE_EXCLUSION_EPOCH_V2),
+        ] {
+            let loaded = load_fixed_safety_config_for_code_version(&path, &requested)
+                .expect("a supported version loads");
+            assert_eq!(loaded.config().code_version, requested);
+            assert_eq!(
+                exclusion_epoch_for_code_version(&loaded.config().code_version),
+                Some(epoch)
+            );
+            let verified = loaded.config().verify().expect("the copy verifies");
+            assert_eq!(verified.code_version(), requested);
+            // The arrays and bytes are the same material for both epochs.
+            assert_eq!(loaded.config().effective_four_arrays, empty_arrays());
+            assert_eq!(loaded.config().fixed_config_bytes, EMPTY_TOML.as_bytes());
+        }
+
+        for unsupported in [
+            String::new(),
+            "cass-source-exclusion/3".to_string(),
+            SOURCE_EXCLUSION_EPOCH_V1.to_string(),
+            format!("{}x", v2()),
+        ] {
+            let err = load_fixed_safety_config_for_code_version(&path, &unsupported)
+                .expect_err("an unsupported version is refused");
+            match err {
+                SourceIngestError::Config { detail } => {
+                    assert_eq!(detail, "code_version_unsupported");
+                }
+                other => panic!("expected a Config refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_export_epoch_profile_follows_the_config_version() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = fixed_copy(temp.path());
+        let effective = serde_json::json!({
+            "schema": "cass.source-parser-context/1",
+            "connector": "claude_code",
+            "roots": [{
+                "path": "/synthetic/epoch-root",
+                "origin": {"kind": "local", "host": null, "source_version": null},
+                "platform": null,
+                "workspace_rewrites": [],
+            }],
+            "role": "primary_session_log",
+        });
+
+        let v1_config = load_fixed_safety_config_for_code_version(&path, &v1()).expect("v1 copy");
+        let v1_a = SourceProfile::assemble(&v1_config, &effective).expect("v1 profile");
+        let v1_b = SourceProfile::assemble(&v1_config, &effective).expect("v1 profile again");
+        assert_eq!(v1_a, v1_b, "one version keeps one profile");
+
+        let v2_config = load_fixed_safety_config_for_code_version(&path, &v2()).expect("v2 copy");
+        let v2_profile = SourceProfile::assemble(&v2_config, &effective).expect("v2 profile");
+        assert_eq!(
+            v1_a.normalizer_id, v2_profile.normalizer_id,
+            "the normalizer identity does not carry the exclusion epoch"
+        );
+        assert_eq!(
+            v1_a.effective_config_digest,
+            v2_profile.effective_config_digest
+        );
+        assert_ne!(
+            v1_a.safety_contract_id, v2_profile.safety_contract_id,
+            "the safety identity separates the two rule epochs"
+        );
+
+        let mut unknown = v2_config;
+        unknown.config.code_version = format!("{SOURCE_EXCLUSION_EPOCH_V2}+redact-v0:deadbeef");
+        let err = SourceProfile::assemble(&unknown, &effective)
+            .expect_err("an unreadable version is refused");
+        match err {
+            SourceIngestError::Config { detail } => {
+                assert_eq!(detail, "code_version_unsupported");
+            }
+            other => panic!("expected a Config refusal, got {other:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod native_format_tests {
     //! The closed format-selection table (native-format addendum v2, interface
@@ -10795,5 +11174,271 @@ mod id_body_conflict_tests {
             observed,
             "the mixed user record emits a RawEvent and its off-role tool_use id is registered"
         );
+    }
+}
+
+#[cfg(test)]
+mod mcp_activate_v2_tests {
+    //! Task10: the switched default is an identity change, not a renamed
+    //! number. A material this build completed under epoch 1 keeps its own
+    //! receipt, and that receipt cannot stand in for the epoch-2 identity of
+    //! the same bytes.
+
+    use super::*;
+
+    /// The legacy unwrapped search shape, which the v1 rule set has always
+    /// recognized and the v2 parser still accepts. The call is the full
+    /// server-namespaced MCP name, so both epochs really exclude it.
+    const RECALL_BODY: &str = "{\"hits\":[{\"content\":\"T10 lib hit\",\"line_number\":7,\"source_id\":\"local\",\"source_path\":\"/synthetic/t10/prior.jsonl\"}]}";
+
+    fn claude_body() -> Vec<u8> {
+        let lines = [
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-22T00:00:00.000Z", "uuid": "t10-lib-u1",
+                "message": {"role": "user", "content": "T10 lib user prose stays"}
+            }),
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-10-22T00:00:01.000Z", "uuid": "t10-lib-a1",
+                "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_t10_lib", "name": "mcp__cass-mcp__cass_search",
+                     "input": {"query": "lib"}}
+                ]}
+            }),
+            serde_json::json!({
+                "type": "user", "timestamp": "2026-10-22T00:00:02.000Z", "uuid": "t10-lib-u2",
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_t10_lib", "content": RECALL_BODY}
+                ]}
+            }),
+        ];
+        let mut body = String::new();
+        for line in lines {
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        body.into_bytes()
+    }
+
+    /// One synthetic source shared by both isolated databases, so the only
+    /// identity difference between the two inputs is the rule epoch itself.
+    struct World {
+        temp: tempfile::TempDir,
+        root: crate::connectors::ScanRoot,
+        meta: crate::indexer::scan_root_meta::ScanRootMeta,
+        discovered: crate::connectors::DiscoveredSourceFile,
+    }
+
+    fn world() -> World {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let scan_path = temp.path().join("home/.claude/projects/t10");
+        std::fs::create_dir_all(&scan_path).expect("mkdir scan root");
+        let source_path = scan_path.join("session.jsonl");
+        std::fs::write(&source_path, claude_body()).expect("write the session");
+        let root = crate::connectors::ScanRoot::local(scan_path.clone());
+        let meta = crate::indexer::scan_root_meta::ScanRootMeta {
+            root_id: "home:claude:t10-lib".to_string(),
+            origin_host: "local".to_string(),
+            readonly: false,
+            canonical_path: scan_path.clone(),
+            source_name: "claude".to_string(),
+            watermarks_enabled: true,
+            mirror_root: false,
+        };
+        let discovered = crate::connectors::DiscoveredSourceFile {
+            provider_slug: "claude_code".to_string(),
+            scan_root: scan_path,
+            source_path,
+            role: crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            origin: crate::connectors::Origin::local(),
+            platform: None,
+            required_for_reconstruction: true,
+            size_bytes: None,
+            modified_at_ms: None,
+        };
+        World { temp, root, meta, discovered }
+    }
+
+    fn safety(data_dir: &Path, epoch: &str) -> Arc<FixedSafetyConfig> {
+        let path = data_dir.join("fixed-safety.toml");
+        std::fs::create_dir_all(data_dir).expect("mkdir the data directory");
+        std::fs::write(
+            &path,
+            include_bytes!("../../config/excluded_context_paths.toml"),
+        )
+        .expect("write the fixed copy");
+        Arc::new(
+            load_fixed_safety_config_for_code_version(&path, &fixed_code_version(epoch))
+                .expect("the fixed copy loads under the named epoch"),
+        )
+    }
+
+    fn prepare(
+        world: &World,
+        data_dir: &Path,
+        safety: &Arc<FixedSafetyConfig>,
+    ) -> SourceInputJob {
+        let connector = crate::connectors::claude_code::ClaudeCodeConnector::new();
+        let request = SourceInputRequest {
+            connector_name: "claude",
+            data_dir,
+            root: &world.root,
+            meta: &world.meta,
+            discovered: &world.discovered,
+            safety,
+        };
+        prepare_source_input(&connector, &request).expect("the synthetic input prepares")
+    }
+
+    fn open(data_dir: &Path) -> crate::storage::sqlite::FrankenStorage {
+        std::fs::create_dir_all(data_dir).expect("mkdir the data directory");
+        crate::storage::sqlite::FrankenStorage::open(&data_dir.join("agent_search.db"))
+            .expect("open the database")
+    }
+
+    /// The exact activation request this input really committed, read back
+    /// through the existing builder from the rows its database stores.
+    fn activation_request(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        job: &SourceInputJob,
+    ) -> crate::storage::source_facts::SourceActivationRequest {
+        let conn = storage.raw();
+        conn.with_tx(crate::storage::api::TxMode::Deferred, |tx| {
+            let input_id = crate::storage::source_facts::registered_source_input_id(
+                tx,
+                job.input.input_key(),
+            )
+            .map_err(|error| source_ingest_error_to_storage(SourceIngestError::Verify(error)))?
+            .expect("the committed input is registered");
+            build_activation_request(
+                tx,
+                input_id,
+                job.input.input_key(),
+                &job.normalizer_id,
+                &job.safety_contract_id,
+                job,
+            )
+            .map(|plan| plan.request)
+            .map_err(source_ingest_error_to_storage)
+        })
+        .expect("build the activation request")
+    }
+
+    fn verify(
+        storage: &crate::storage::sqlite::FrankenStorage,
+        request: &crate::storage::source_facts::SourceActivationRequest,
+    ) -> std::result::Result<
+        crate::storage::source_facts::SourceReceiptMatch,
+        String,
+    > {
+        let conn = storage.raw();
+        conn.with_tx(crate::storage::api::TxMode::Deferred, |tx| {
+            crate::storage::source_facts::verify_source_receipt_in_tx(tx, request)
+                .map_err(|error| source_ingest_error_to_storage(SourceIngestError::Install(error)))
+        })
+        .map_err(|error| format!("{error:?}"))
+    }
+
+    fn marker_versions(storage: &crate::storage::sqlite::FrankenStorage) -> Vec<u64> {
+        let db = storage.raw();
+        let rows: Vec<String> = db
+            .query_all_map(
+                "SELECT json(excluded) FROM messages WHERE excluded IS NOT NULL ORDER BY id",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("query the markers");
+        rows.into_iter()
+            .map(|text| {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).expect("a marker is JSON");
+                value["rule_version"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("no rule_version in {value}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mcp_activate_v2_v1_receipt_never_completes_the_v2_identity() {
+        let world = world();
+
+        // Database A holds one real epoch-1 completion.
+        let data_a = world.temp.path().join("data-a");
+        let storage_a = open(&data_a);
+        let v1 = safety(&data_a, SOURCE_EXCLUSION_EPOCH_V1);
+        let job_v1 = prepare(&world, &data_a, &v1);
+        let first = commit_source_input(&storage_a, &job_v1).expect("the v1 commit");
+        assert!(
+            matches!(
+                first.outcome,
+                SourceInputOutcome::Completed { replay: false, .. }
+            ),
+            "the v1 commit is a real install: {:?}",
+            first.outcome
+        );
+        assert_eq!(marker_versions(&storage_a), vec![1], "the v1 marker is rule version 1");
+
+        // Database B holds one real epoch-2 completion of the same bytes. Each
+        // database proves its own identity on its own; no database carries
+        // both, which would be the cancelled mixed-history capability.
+        let data_b = world.temp.path().join("data-b");
+        let storage_b = open(&data_b);
+        let v2 = safety(&data_b, SOURCE_EXCLUSION_EPOCH_V2);
+        let job_v2 = prepare(&world, &data_b, &v2);
+        assert_ne!(
+            job_v1.input.input_key(),
+            job_v2.input.input_key(),
+            "each epoch's identity is its own"
+        );
+        let second = commit_source_input(&storage_b, &job_v2).expect("the v2 commit");
+        assert!(
+            matches!(
+                second.outcome,
+                SourceInputOutcome::Completed { replay: false, .. }
+            ),
+            "the v2 commit is a real install in its own database: {:?}",
+            second.outcome
+        );
+        assert!(
+            marker_versions(&storage_b).contains(&2),
+            "the v2 judgment ran: {:?}",
+            marker_versions(&storage_b)
+        );
+
+        // The two exact requests, each read back from the database that really
+        // completed it.
+        let request_v1 = activation_request(&storage_a, &job_v1);
+        let request_v2 = activation_request(&storage_b, &job_v2);
+
+        // Positive control: database A's receipt really verifies for its own
+        // request.
+        match verify(&storage_a, &request_v1).expect("the v1 request verifies") {
+            crate::storage::source_facts::SourceReceiptMatch::VerifiedReplay { .. } => {}
+            other => panic!(
+                "the stored v1 completion must verify for its own request: {other:?}"
+            ),
+        }
+
+        // 10-AC4: the exact epoch-2 request against the database that holds
+        // only the epoch-1 completion is never a replay. An unregistered input
+        // is an existing refusal, not a completion.
+        match verify(&storage_a, &request_v2) {
+            Ok(crate::storage::source_facts::SourceReceiptMatch::VerifiedReplay { .. }) => {
+                panic!("an epoch-1 receipt must never verify as the epoch-2 completion")
+            }
+            Ok(other) => println!("T10 v2 request in the v1-only database: {other:?}"),
+            Err(error) => println!("T10 v2 request in the v1-only database refused: {error}"),
+        }
+        // The check wrote nothing.
+        assert_eq!(marker_versions(&storage_a), vec![1], "the v1 database is unchanged");
+        let complete_a: i64 = storage_a
+            .raw()
+            .query_row_map(
+                "SELECT COUNT(*) FROM source_inputs WHERE state = 'complete'",
+                &[],
+                |row| row.get_typed(0),
+            )
+            .expect("count the v1 database's complete inputs");
+        assert_eq!(complete_a, 1, "the v1 database keeps its one completion");
     }
 }

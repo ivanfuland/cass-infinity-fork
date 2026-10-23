@@ -2009,8 +2009,8 @@ fn parse_expand_with_context() {
             ..
         }) => {
             assert_eq!(path.to_str().unwrap(), "/path/to/session.jsonl");
-            assert_eq!(line, 100);
-            assert_eq!(context, 5);
+            assert_eq!(line, Some(100));
+            assert_eq!(context, "5");
         }
         other => panic!("expected expand command, got {other:?}"),
     }

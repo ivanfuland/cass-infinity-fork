@@ -26,11 +26,15 @@ use tempfile::TempDir;
 const FAD_PIN: &str = "61f975f3b56f8dabc4ecbe1dae4102c1ea6b16e5";
 const MAPPING_DOMAIN: &str = "cass-source-mapping/2";
 const EXCLUSION_EPOCH: &str = "cass-source-exclusion/1";
+/// The epoch the current producer writes (Task10). Kept apart from
+/// [`EXCLUSION_EPOCH`], which the fixed v1 calibration vector above still
+/// names.
+const CURRENT_EXCLUSION_EPOCH: &str = "cass-source-exclusion/2";
 const NORMALIZER_DOMAIN: &str = "cass.source-normalizer/1";
 const SAFETY_CONTRACT: &str = "cass.source-safety/1";
 const REDACTION_FINGERPRINT: &str =
     "redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
-const CODE_VERSION: &str = "cass-source-exclusion/1+redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
+const CURRENT_CODE_VERSION: &str = "cass-source-exclusion/2+redact-v1:fe8bda3a83e4f2f4fe85f0de5c84428140bfa658b7865706c43877488ec2bb47";
 const FIXED_SAFETY: &str = "memory_files = []\ninjection_only_files = []\nworkspace_scoped_files = []\nproject_read_documents = []\n";
 const CONTEXT_SCHEMA: &str = "cass.restore-source-contexts/1";
 
@@ -984,10 +988,10 @@ fn expected_profile(world: &World, explicit_identity: bool) -> serde_json::Value
         "fixed_copy_path": published_path,
         "fixed_config_sha256": fixed_sha,
         "effective_four_arrays_sha256": four_arrays_digest(),
-        "code_version": CODE_VERSION,
+        "code_version": CURRENT_CODE_VERSION,
         "fad_pin": FAD_PIN,
         "mapping_domain": MAPPING_DOMAIN,
-        "exclusion_epoch": EXCLUSION_EPOCH,
+        "exclusion_epoch": CURRENT_EXCLUSION_EPOCH,
         "redaction_fingerprint": REDACTION_FINGERPRINT,
         "desensitization_enabled": true,
     })
@@ -1079,7 +1083,7 @@ fn expected_binding(declaration: &serde_json::Value, payload: &Payload) -> serde
 fn safety_contract(config_identity: &str) -> String {
     sha256_canonical(&serde_json::json!([
         SAFETY_CONTRACT,
-        EXCLUSION_EPOCH,
+        CURRENT_EXCLUSION_EPOCH,
         REDACTION_FINGERPRINT,
         config_identity,
         sha256_hex(FIXED_SAFETY.as_bytes()),

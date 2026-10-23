@@ -12073,17 +12073,20 @@ fn validate_restore_source_structure(
     if source_contexts_digest(contexts)? != *expected_digest {
         return Err(SourceRestoreError::MaterialMismatch);
     }
-    let expected_code_version = format!(
-        "{}+{}",
-        crate::indexer::source_ingest::SOURCE_EXCLUSION_EPOCH,
-        crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
-    );
+    // The profile's own code version decides which rule epoch this material was
+    // captured under; the epoch field must name that same epoch. An unreadable
+    // version and a version/epoch disagreement are both a material refusal, and
+    // neither is replaced by the current producer default. The exact
+    // `<epoch>+<redaction fingerprint>` spelling is what the reader accepts, so
+    // the separate code-version comparison would only repeat it.
+    let epoch =
+        crate::indexer::source_ingest::exclusion_epoch_for_code_version(&profile.code_version)
+            .ok_or(SourceRestoreError::MaterialMismatch)?;
     if profile.fad_pin != crate::indexer::source_ingest::FAD_PIN
         || profile.mapping_domain != crate::indexer::source_ingest::SOURCE_MAPPING_DOMAIN
-        || profile.exclusion_epoch != crate::indexer::source_ingest::SOURCE_EXCLUSION_EPOCH
+        || profile.exclusion_epoch != epoch
         || profile.redaction_fingerprint
             != crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
-        || profile.code_version != expected_code_version
         || !profile.desensitization_enabled
     {
         return Err(SourceRestoreError::MaterialMismatch);
@@ -17784,6 +17787,13 @@ fn source_profile_material(
         .config()
         .verify()
         .map_err(|_| SourceRestoreError::MaterialMismatch)?;
+    // The epoch this copy really ran under, taken from its own version rather
+    // than the producer default: an enablement task may move the default, and
+    // a profile must still name the material it came from.
+    let exclusion_epoch = crate::indexer::source_ingest::exclusion_epoch_for_code_version(
+        &safety.config().code_version,
+    )
+    .ok_or(SourceRestoreError::MaterialMismatch)?;
     Ok(SourceProfileMaterial {
         config_source_identity: safety.config_source_identity().to_string(),
         fixed_copy_path: safety.original_path().to_string(),
@@ -17792,7 +17802,7 @@ fn source_profile_material(
         code_version: safety.config().code_version.clone(),
         fad_pin: crate::indexer::source_ingest::FAD_PIN.to_string(),
         mapping_domain: crate::indexer::source_ingest::SOURCE_MAPPING_DOMAIN.to_string(),
-        exclusion_epoch: crate::indexer::source_ingest::SOURCE_EXCLUSION_EPOCH.to_string(),
+        exclusion_epoch: exclusion_epoch.to_string(),
         redaction_fingerprint: crate::indexer::redact_secrets::redaction_algorithm_fingerprint(),
         desensitization_enabled: true,
     })
@@ -22439,5 +22449,340 @@ mod source_replace_private_tests {
         std::fs::create_dir_all(&side_dir).expect("create the r1 side evidence directory");
         std::fs::write(side_dir.join("cases.jsonl"), side_rows.join("\n") + "\n")
             .expect("write the r1 side cases");
+    }
+}
+
+// ===========================================================================
+// Task09 · the restore profile and the staging route follow the material
+// ===========================================================================
+
+/// Task09 keeps one rule epoch per material instead of the global producer
+/// default.
+///
+/// Both cases build their own fixed copy under a `TempDir` and set no process
+/// environment variable, so the default parallel run stays independent.
+#[cfg(test)]
+mod mcp_restore_rule_epoch_tests {
+    use super::*;
+    use crate::indexer::exclusion::ExclusionReason;
+    use crate::indexer::source_ingest::{
+        SOURCE_EXCLUSION_EPOCH, SOURCE_EXCLUSION_EPOCH_V1, SOURCE_EXCLUSION_EPOCH_V2,
+        SourceInputJob, load_fixed_safety_config, load_fixed_safety_config_for_code_version,
+        preview_source_input_safety, test_fixed_safety_with_code_version,
+    };
+    use crate::phase3_restore::source_contexts::{
+        RestoreSourceContextDeclaration, RestoreSourceContextOrigin,
+    };
+    use crate::storage::source_facts::Sha256Digest;
+    use franken_agent_detection::SourceInputRole;
+    use std::sync::Arc;
+
+    const FIXED_TOML: &str = "memory_files = []\ninjection_only_files = []\n\
+workspace_scoped_files = []\nproject_read_documents = []\n";
+
+    const RECALL_BODY: &str = "<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\":[{\"content\":\"we picked per-feature worktrees\",\"line_number\":7,\"source_id\":\"local\",\"source_path\":\"/synthetic/t09/prior.jsonl\"}]}</cass_recall>";
+
+    /// One ordinary user turn, one direct `Bash` CLI recall and its result.
+    ///
+    /// The lines are encoded, not spliced: the recall body carries quotes of
+    /// its own, so a string substitution would produce an unparsable record.
+    fn claude_bash_cli_session() -> Vec<u8> {
+        let lines = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-01-02T00:00:00.000Z",
+                "uuid": "t09-bash-u1",
+                "message": {"role": "user", "content": "T09 bash user prose stays"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-02T00:00:01.000Z",
+                "uuid": "t09-bash-a1",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_t09_bash",
+                        "name": "Bash",
+                        "input": {"command": "cass search \"worktree decision\" --recall"}
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-01-02T00:00:02.000Z",
+                "uuid": "t09-bash-u2",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_t09_bash",
+                        "content": RECALL_BODY
+                    }]
+                }
+            }),
+        ];
+        let mut out = Vec::new();
+        for line in lines {
+            out.extend_from_slice(
+                serde_json::to_string(&line)
+                    .expect("a fixture line encodes")
+                    .as_bytes(),
+            );
+            out.push(b'\n');
+        }
+        out
+    }
+
+    fn version(epoch: &str) -> String {
+        format!(
+            "{epoch}+{}",
+            crate::indexer::redact_secrets::redaction_algorithm_fingerprint()
+        )
+    }
+
+    fn fixed_copy(dir: &Path) -> PathBuf {
+        let path = dir.join("fixed").join("t09-fixed.toml");
+        std::fs::create_dir_all(path.parent().expect("fixed parent")).expect("mkdir fixed");
+        std::fs::write(&path, FIXED_TOML).expect("write the fixed copy");
+        path
+    }
+
+    fn empty_arrays() -> crate::sources::config::ExcludedContextPaths {
+        crate::sources::config::ExcludedContextPaths {
+            memory_files: vec![],
+            injection_only_files: vec![],
+            workspace_scoped_files: vec![],
+            project_read_documents: vec![],
+        }
+    }
+
+    #[test]
+    fn mcp_restore_v2_profile_material_uses_the_material_version() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = fixed_copy(temp.path());
+        let fingerprint = crate::indexer::redact_secrets::redaction_algorithm_fingerprint();
+
+        // The material's own version decides the epoch it records.
+        let v2 = load_fixed_safety_config_for_code_version(&path, &version(SOURCE_EXCLUSION_EPOCH_V2))
+            .expect("a v2 fixed copy loads");
+        let profile = source_profile_material(&v2).expect("the v2 profile assembles");
+        assert_eq!(profile.exclusion_epoch, SOURCE_EXCLUSION_EPOCH_V2);
+        assert_eq!(profile.exclusion_epoch, "cass-source-exclusion/2");
+        assert_eq!(profile.code_version, version(SOURCE_EXCLUSION_EPOCH_V2));
+        assert_eq!(profile.redaction_fingerprint, fingerprint);
+        assert_eq!(profile.fad_pin, crate::indexer::source_ingest::FAD_PIN);
+        assert_eq!(
+            profile.mapping_domain,
+            crate::indexer::source_ingest::SOURCE_MAPPING_DOMAIN
+        );
+        assert!(profile.desensitization_enabled);
+        assert_eq!(
+            profile.config_source_identity,
+            std::path::absolute(&path)
+                .expect("absolute fixed path")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            profile.fixed_copy_path,
+            profile.config_source_identity,
+            "an explicit copy names its own path"
+        );
+        assert_eq!(profile.fixed_config_sha256, Sha256Digest::of(FIXED_TOML.as_bytes()).hex());
+        assert_eq!(
+            profile.effective_four_arrays_sha256,
+            crate::storage::source_facts::effective_four_arrays_digest(&empty_arrays()).hex()
+        );
+
+        // Epoch 1 keeps its own epoch, and the producer default now writes the
+        // second epoch (Task10).
+        assert_eq!(SOURCE_EXCLUSION_EPOCH, "cass-source-exclusion/2");
+        let v1 = load_fixed_safety_config_for_code_version(&path, &version(SOURCE_EXCLUSION_EPOCH_V1))
+            .expect("a v1 fixed copy loads");
+        let profile_v1 = source_profile_material(&v1).expect("the v1 profile assembles");
+        assert_eq!(profile_v1.exclusion_epoch, SOURCE_EXCLUSION_EPOCH_V1);
+        assert_eq!(profile_v1.code_version, version(SOURCE_EXCLUSION_EPOCH_V1));
+        assert_ne!(profile.exclusion_epoch, profile_v1.exclusion_epoch);
+        let default = load_fixed_safety_config(&path).expect("the default copy loads");
+        assert_eq!(
+            source_profile_material(&default)
+                .expect("the default profile assembles")
+                .exclusion_epoch,
+            SOURCE_EXCLUSION_EPOCH_V2,
+            "the default loader names the second epoch"
+        );
+
+        // A version this build cannot read is refused, never downgraded.
+        let unknown = test_fixed_safety_with_code_version(
+            "cass-source-exclusion/9+deadbeef",
+            FIXED_TOML.as_bytes(),
+            "T09_UNKNOWN_IDENTITY",
+            empty_arrays(),
+        );
+        assert_eq!(
+            source_profile_material(&unknown).err(),
+            Some(SourceRestoreError::MaterialMismatch)
+        );
+    }
+
+    fn prepare_job(dir: &Path, code_version: Option<&str>) -> SourceInputJob {
+        let live = dir.join("home/.claude/projects/t09/session.jsonl");
+        std::fs::create_dir_all(live.parent().expect("live parent")).expect("mkdir live parent");
+        std::fs::write(&live, claude_bash_cli_session()).expect("write the session");
+        let data_dir = dir.join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir data");
+        let capture = crate::raw_mirror::capture_source_file_with_identity(
+            crate::raw_mirror::RawMirrorCaptureInput {
+                data_dir: &data_dir,
+                provider: "claude",
+                source_id: "local",
+                origin_kind: "local",
+                origin_host: None,
+                source_path: &live,
+                db_links: &[],
+            },
+            crate::raw_mirror::RawMirrorSessionIdentity {
+                identity_host: crate::raw_mirror::RAW_MIRROR_LOCAL_IDENTITY_HOST,
+                external_id: None,
+            },
+        )
+        .expect("capture the fixture");
+        let declaration = RestoreSourceContextDeclaration {
+            manifest_id: capture.manifest_id.clone(),
+            identity_namespace: "T09_NAMESPACE".to_string(),
+            connector: "claude_code".to_string(),
+            scan_root: live
+                .parent()
+                .expect("live parent")
+                .to_string_lossy()
+                .into_owned(),
+            relative_locator: "session.jsonl".to_string(),
+            role: SourceInputRole::PrimarySessionLog,
+            origin: RestoreSourceContextOrigin {
+                source_id: "local".to_string(),
+                kind: franken_agent_detection::types::SourceKind::Local,
+                host: None,
+                source_version: None,
+            },
+            platform: None,
+            workspace_rewrites: Vec::new(),
+        };
+        let fixed = fixed_copy(dir);
+        let safety = match code_version {
+            Some(code_version) => {
+                load_fixed_safety_config_for_code_version(&fixed, code_version)
+                    .expect("the requested version loads")
+            }
+            None => load_fixed_safety_config(&fixed).expect("the default copy loads"),
+        };
+        source_binding::prepare_declared_restore_source_input(
+            &data_dir,
+            &capture,
+            &declaration,
+            Arc::new(safety),
+        )
+        .expect("the declared input prepares")
+    }
+
+    #[test]
+    fn mcp_restore_v2_staging_route_follows_each_material_version() {
+        // An explicit v1 material keeps the v1 epoch, and that route preserves
+        // the direct CLI recall exactly as it always did.
+        let temp_v1 = tempfile::TempDir::new().expect("tempdir");
+        let job_v1 = prepare_job(
+            temp_v1.path(),
+            Some(&version(SOURCE_EXCLUSION_EPOCH_V1)),
+        );
+        assert_eq!(
+            job_v1.input.safety_identity().code_version(),
+            version(SOURCE_EXCLUSION_EPOCH_V1)
+        );
+        let preview_v1 = preview_source_input_safety(&job_v1).expect("the v1 preview");
+        let conversation_v1 = preview_v1
+            .conversations
+            .first()
+            .expect("one projected conversation");
+        assert_eq!(conversation_v1.prepared.conv.messages.len(), 3);
+        assert_eq!(
+            conversation_v1.prepared.conv.messages[0].content,
+            "T09 bash user prose stays"
+        );
+        assert_eq!(
+            conversation_v1.prepared.conv.messages[2].content, RECALL_BODY,
+            "the v1 route keeps the direct CLI recall body"
+        );
+        assert!(
+            conversation_v1.prepared.excluded.iter().all(Option::is_none),
+            "the v1 route writes no recall marker"
+        );
+
+        // The current default is the second epoch (Task10), and it cleans the
+        // body with marker 2 just like the explicit copy.
+        let temp_default = tempfile::TempDir::new().expect("tempdir");
+        let job_default = prepare_job(temp_default.path(), None);
+        assert_eq!(
+            job_default.input.safety_identity().code_version(),
+            version(SOURCE_EXCLUSION_EPOCH_V2),
+            "the default loader names the second epoch"
+        );
+        let preview_default =
+            preview_source_input_safety(&job_default).expect("the default preview");
+        let conversation_default = preview_default
+            .conversations
+            .first()
+            .expect("one projected conversation");
+        assert_eq!(conversation_default.prepared.conv.messages.len(), 3);
+        assert_eq!(
+            conversation_default.prepared.conv.messages[2].content, "",
+            "the default route clears the recall body"
+        );
+        let marker_default = conversation_default.prepared.excluded[2]
+            .as_ref()
+            .expect("the default route excludes the recall result");
+        assert_eq!(marker_default.rule_version, 2);
+        assert_eq!(marker_default.reason, ExclusionReason::CassRecall);
+
+        // The same entry on an explicit v2 configuration cleans the body and
+        // stamps marker 2.
+        let temp_v2 = tempfile::TempDir::new().expect("tempdir");
+        let job_v2 = prepare_job(
+            temp_v2.path(),
+            Some(&version(SOURCE_EXCLUSION_EPOCH_V2)),
+        );
+        assert_eq!(
+            job_v2.input.safety_identity().code_version(),
+            version(SOURCE_EXCLUSION_EPOCH_V2)
+        );
+        assert_ne!(
+            job_v2.safety_contract_id, job_v1.safety_contract_id,
+            "each input's safety identity is its own"
+        );
+        let preview_v2 = preview_source_input_safety(&job_v2).expect("the v2 preview");
+        let conversation_v2 = preview_v2
+            .conversations
+            .first()
+            .expect("one projected conversation");
+        assert_eq!(conversation_v2.prepared.conv.messages.len(), 3);
+        assert_eq!(
+            conversation_v2.prepared.conv.messages[0].content,
+            "T09 bash user prose stays",
+            "the ordinary user prose is kept"
+        );
+        assert_eq!(
+            conversation_v2.prepared.conv.messages[2].content, "",
+            "the v2 route clears the recall body"
+        );
+        let marker = conversation_v2.prepared.excluded[2]
+            .as_ref()
+            .expect("the v2 route excludes the recall result");
+        assert_eq!(marker.rule_version, 2);
+        assert_eq!(marker.reason, ExclusionReason::CassRecall);
+        assert_eq!(marker.anchor.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(marker.anchor.tool_call_id.as_deref(), Some("toolu_t09_bash"));
+        assert_eq!(marker.sha256, Sha256Digest::of(RECALL_BODY.as_bytes()).hex());
+        assert_eq!(marker.bytes, RECALL_BODY.len() as u64);
+        assert_eq!(marker.raw.event_key, "t09-bash-u2");
+        assert_eq!(marker.raw.blocks, vec![0]);
+        assert!(conversation_v2.prepared.excluded[0].is_none());
     }
 }

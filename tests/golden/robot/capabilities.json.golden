@@ -903,6 +903,16 @@
           ]
         },
         {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2386,6 +2396,16 @@
           "required": false
         },
         {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2792,7 +2812,21 @@
           "description": "Line number to show context around",
           "arg_type": "option",
           "value_type": "integer",
-          "required": true
+          "required": false
+        },
+        {
+          "name": "message-id",
+          "description": "Exact indexed message ID to expand (requires --source and --expected-content-sha256)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false
+        },
+        {
+          "name": "expected-content-sha256",
+          "description": "SHA256 of the complete indexed message content from search output",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": false
         },
         {
           "name": "context",
@@ -2806,6 +2840,16 @@
         {
           "name": "json",
           "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
           "arg_type": "flag",
           "required": false,
           "enum_values": [
@@ -2902,6 +2946,16 @@
           "arg_type": "option",
           "value_type": "string",
           "required": false
+        },
+        {
+          "name": "recall",
+          "description": "Wrap the JSON result once for recall pollution exclusion",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "robot-format",

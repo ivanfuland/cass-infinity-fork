@@ -626,6 +626,12 @@ pub enum PairingCandidate {
 #[derive(Debug, Clone, Default)]
 pub struct PairingContext {
     resolved: HashMap<usize, PairedTool>,
+    /// Ticket 07: the original call row's session position for a resolved
+    /// result. Recorded only on the two existing success branches below, so
+    /// a consumer can read the real source row (`extra.raw_role`) without
+    /// re-deriving or guessing the pairing. No condition, order or outcome
+    /// of R4 changes.
+    resolved_call_indices: HashMap<usize, usize>,
 }
 
 impl PairingContext {
@@ -664,6 +670,7 @@ impl PairingContext {
         }
 
         let mut resolved: HashMap<usize, PairedTool> = HashMap::new();
+        let mut resolved_call_indices: HashMap<usize, usize> = HashMap::new();
         let mut unpaired: Vec<usize> = Vec::new();
         for (idx, c) in candidates.iter().enumerate() {
             match c {
@@ -674,8 +681,9 @@ impl PairingContext {
                         // B03: `call_idx < idx` -- see the `by_id` construction
                         // above. A call at or after this result's own position
                         // cannot be the call that produced it.
-                        if let Some((_, pt)) = by_id.get(id.as_str()).filter(|(call_idx, _)| *call_idx < idx) {
+                        if let Some((call_idx, pt)) = by_id.get(id.as_str()).filter(|(call_idx, _)| *call_idx < idx) {
                             resolved.insert(idx, (*pt).clone());
+                            resolved_call_indices.insert(idx, *call_idx);
                             if let Some(pos) = unpaired.iter().position(|&i| {
                                 matches!(&candidates[i], PairingCandidate::ToolCall(p) if p.tool_call_id.as_deref() == Some(id.as_str()))
                             }) {
@@ -688,6 +696,7 @@ impl PairingContext {
                         let call_idx = unpaired.remove(0);
                         if let PairingCandidate::ToolCall(pt) = &candidates[call_idx] {
                             resolved.insert(idx, pt.clone());
+                            resolved_call_indices.insert(idx, call_idx);
                         }
                     }
                     // 0 or >=2 unpaired candidates -> R4: not excluded,
@@ -696,11 +705,19 @@ impl PairingContext {
                 }
             }
         }
-        PairingContext { resolved }
+        PairingContext { resolved, resolved_call_indices }
     }
 
     pub fn paired_call_for(&self, idx: usize) -> Option<&PairedTool> {
         self.resolved.get(&idx)
+    }
+
+    /// Ticket 07: the original call row's session position for a result that
+    /// R4 resolved, or `None` when R4 did not pair this position. This is a
+    /// fact getter over the existing success branches; it does not re-run or
+    /// relax R4, and it never guesses a pair from matching arguments.
+    pub(crate) fn paired_call_index_for(&self, idx: usize) -> Option<usize> {
+        self.resolved_call_indices.get(&idx).copied()
     }
 }
 
@@ -1041,7 +1058,7 @@ pub struct Decision {
 /// `tool_call_id` this decision was actually resolved for -- a `Some(id)`
 /// decision would then also clear an unrelated sibling result block that
 /// happens to carry no id of its own.
-fn tool_result_block_indices(event: &RawEvent, tool_call_id: Option<&str>) -> Vec<u32> {
+pub(super) fn tool_result_block_indices(event: &RawEvent, tool_call_id: Option<&str>) -> Vec<u32> {
     match tool_call_id {
         Some(id) => event
             .blocks
@@ -1573,7 +1590,7 @@ fn blake3_hex(text: &str) -> String {
 /// `parse_error`); only non-JSON, or JSON that is neither shape, is a parse
 /// failure. `line_number` is the only optional per-hit field (real
 /// responses always carry `source_id`/`source_path`).
-fn parse_recall_hits(content: &str) -> Result<RecallSrc, String> {
+pub(super) fn parse_recall_hits(content: &str) -> Result<RecallSrc, String> {
     let value: serde_json::Value = serde_json::from_str(content).map_err(|e| format!("invalid JSON: {e}"))?;
     if value.get("error").is_some() {
         // Error-shaped response (`{"error":"cass_exit","code","stderr"}`):
@@ -2179,7 +2196,7 @@ mod tests {
         // (unlike the fixture above) to model the real-world shape R2-B4
         // names explicitly: the call itself carries an id (from its own
         // connector event), yet the paired `ToolResult` block has none.
-        let ctx_with_id = PairingContext { resolved: ctx.resolved.iter().map(|(&idx, pt)| (idx, PairedTool { tool_call_id: Some("t1".into()), ..pt.clone() })).collect() };
+        let ctx_with_id = PairingContext { resolved: ctx.resolved.iter().map(|(&idx, pt)| (idx, PairedTool { tool_call_id: Some("t1".into()), ..pt.clone() })).collect(), ..Default::default() };
         let m = msg("tool_result", "{}");
         assert!(
             decide(&m, 2, &event, &ctx_with_id, "claude_code", &paths_cfg()).is_none(),

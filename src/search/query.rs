@@ -1487,6 +1487,104 @@ pub struct SearchHit {
     pub rerank_score: Option<f64>,
 }
 
+/// Identity of the stored, complete message behind one recall hit. This is
+/// deliberately separate from SearchHit so ordinary JSON keeps its field set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RecallHitIdentity {
+    pub message_id: i64,
+    pub source_id: String,
+    pub source_path: String,
+    pub line_number: usize,
+    pub content_sha256: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Search hits cannot be uniquely matched to indexed messages")]
+pub struct RecallIdentityUnavailable;
+
+/// Resolve all hits before emitting any recall output. Line numbers are only
+/// descriptive output; they never select a candidate message.
+pub fn resolve_recall_hit_identities(
+    db_path: &Path,
+    hits: &[SearchHit],
+) -> std::result::Result<Vec<RecallHitIdentity>, RecallIdentityUnavailable> {
+    resolve_recall_hit_identities_inner(db_path, hits).map_err(|_| RecallIdentityUnavailable)
+}
+
+fn resolve_recall_hit_identities_inner(
+    db_path: &Path,
+    hits: &[SearchHit],
+) -> Result<Vec<RecallHitIdentity>> {
+    use sha2::{Digest, Sha256};
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = open_search_hydration_sqlite(db_path, Duration::from_secs(5))?;
+    let tx = conn.transaction()?;
+    let source_expr =
+        normalized_search_source_id_sql_expr("c.source_id", "s.kind", "c.origin_host");
+    let mut resolved = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let mut clauses = vec![
+            "c.source_path = ?".to_string(),
+            "m.content = ? COLLATE BINARY".to_string(),
+            "a.slug = ?".to_string(),
+            "m.excluded IS NULL".to_string(),
+        ];
+        let mut params = vec![
+            ParamValue::from(hit.source_path.clone()),
+            ParamValue::from(hit.content.clone()),
+            ParamValue::from(hit.agent.clone()),
+        ];
+        if !hit.source_id.trim().is_empty() {
+            clauses.push(format!("({source_expr}) = ?"));
+            params.push(ParamValue::from(normalized_search_hit_source_id(hit)));
+        }
+        if let Some(id) = hit.message_id {
+            clauses.push("m.id = ?".to_string());
+            params.push(ParamValue::from(id));
+        }
+        if let Some(id) = hit.conversation_id {
+            clauses.push("c.id = ?".to_string());
+            params.push(ParamValue::from(id));
+        }
+        let sql = format!(
+            "SELECT m.id, {source_expr}, c.source_path, m.idx, m.content \
+             FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id LEFT JOIN sources s ON s.id = c.source_id WHERE {} LIMIT 2",
+            clauses.join(" AND ")
+        );
+        let rows: Vec<(i64, String, String, i64, String)> =
+            tx.query_all_map(&sql, &params, |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    row.get_typed(1)?,
+                    row.get_typed(2)?,
+                    row.get_typed(3)?,
+                    row.get_typed(4)?,
+                ))
+            })?;
+        let [(message_id, source_id, source_path, idx, content)] = rows.as_slice() else {
+            return Err(anyhow!(
+                "indexed message identity is not unique or no longer matches"
+            ));
+        };
+        let line_number = usize::try_from(*idx)
+            .ok()
+            .and_then(|i| i.checked_add(1))
+            .ok_or_else(|| anyhow!("indexed message has no valid line number"))?;
+        resolved.push(RecallHitIdentity {
+            message_id: *message_id,
+            source_id: source_id.clone(),
+            source_path: source_path.clone(),
+            line_number,
+            content_sha256: hex::encode(Sha256::digest(content.as_bytes())),
+        });
+    }
+    tx.commit()?;
+    Ok(resolved)
+}
+
 static LAZY_FIELDS_ENABLED: Lazy<bool> = Lazy::new(|| {
     dotenvy::var("CASS_LAZY_FIELDS")
         .ok()
@@ -1610,7 +1708,7 @@ struct SearchHitKey {
     content_hash: u64,
 }
 
-fn normalized_search_source_id_sql_expr(
+pub(crate) fn normalized_search_source_id_sql_expr(
     source_id_column: &str,
     origin_kind_column: &str,
     origin_host_column: &str,

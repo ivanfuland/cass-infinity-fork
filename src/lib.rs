@@ -49,9 +49,10 @@ pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
-pub mod regression;
+pub mod recall_output;
 pub(crate) mod recipes_robot_docs;
 pub(crate) mod recovery_support_bundle;
+pub mod regression;
 pub mod release_verify;
 pub mod repro_capsule;
 pub mod resource_plan;
@@ -681,6 +682,9 @@ pub enum Commands {
         /// and the search runs against the existing index (non-fatal).
         #[arg(long, visible_alias = "catch-up", default_value_t = false)]
         refresh: bool,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format", "display", "fields"])]
+        recall: bool,
     },
     /// Build a deterministic answer pack for agent handoffs
     Pack {
@@ -1406,6 +1410,9 @@ pub enum Commands {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format"])]
+        recall: bool,
     },
     /// Resolve a session path into a ready-to-run resume command for its
     /// native harness (Claude Code, Codex, OpenCode, pi_agent, Gemini,
@@ -1581,13 +1588,22 @@ pub enum Commands {
         source: Option<String>,
         /// Line number to show context around
         #[arg(long, short = 'n', alias = "line-number", alias = "line_number")]
-        line: usize,
+        line: Option<usize>,
+        /// Exact indexed message ID to expand (requires --source and --expected-content-sha256)
+        #[arg(long, alias = "message_id", allow_hyphen_values = true)]
+        message_id: Option<String>,
+        /// SHA256 of the complete indexed message content from search output
+        #[arg(long, alias = "expected_content_sha256")]
+        expected_content_sha256: Option<String>,
         /// Number of messages before/after (default: 3)
-        #[arg(long, short = 'C', default_value_t = 3)]
-        context: usize,
+        #[arg(long, short = 'C', default_value = "3", allow_hyphen_values = true)]
+        context: String,
         /// Output as JSON (`--robot` also works)
         #[arg(long, visible_alias = "robot")]
         json: bool,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format"])]
+        recall: bool,
     },
     /// Show activity timeline for a time range
     Timeline {
@@ -1619,6 +1635,9 @@ pub enum Commands {
         /// Filter by source: 'local', 'remote', 'all', or a specific source hostname
         #[arg(long)]
         source: Option<String>,
+        /// Wrap the JSON result once for recall pollution exclusion
+        #[arg(long, conflicts_with_all = ["json", "robot_format"])]
+        recall: bool,
     },
     /// Export encrypted searchable archive for static hosting (P4.x)
     Pages {
@@ -3108,6 +3127,8 @@ pub enum RobotTopic {
 /// Output format for robot/automation mode
 #[derive(Copy, Clone, Debug, Default, ValueEnum, PartialEq, Eq)]
 pub enum RobotFormat {
+    #[value(skip)]
+    Recall,
     /// Pretty-printed JSON object (default, backward compatible)
     #[default]
     Json,
@@ -4699,6 +4720,7 @@ fn search_like_option_value_count(command: &str, arg: &str) -> Option<usize> {
     let is_bool = matches!(
         name.as_str(),
         "json"
+            | "recall"
             | "robot"
             | "robot-meta"
             | "robot_meta"
@@ -6864,6 +6886,7 @@ pub async fn run_with_parsed(parsed: ParsedCli) -> CliResult<()> {
     let is_robot_mode = raw_args
         .iter()
         .any(|s| s == "--json" || s == "--robot" || s == "-json" || s == "-robot")
+        || command_requests_recall(cli.command.as_ref())
         || cli.robot_format.is_some()
         || robot_format_from_env().is_some()
         || matches!(&cli.command, Some(Commands::Capabilities { .. }))
@@ -7004,6 +7027,15 @@ async fn execute_cli(
     stdout_is_tty: bool,
     stderr_is_tty: bool,
 ) -> CliResult<()> {
+    // clap does not apply a child argument's conflicts to a global value
+    // supplied before that subcommand. Check the resolved root option too.
+    if command_requests_recall(cli.command.as_ref()) && cli.robot_format.is_some() {
+        return Err(CliError::usage(
+            "--recall cannot be combined with --robot-format",
+            None,
+        ));
+    }
+
     let command = cli.command.clone().unwrap_or_else(|| {
         if cli.robot_format.is_some() || robot_format_from_env().is_some() {
             Commands::Triage {
@@ -7418,6 +7450,7 @@ async fn execute_cli(
                     daemon,
                     no_daemon,
                     refresh,
+                    recall: _,
                 } => {
                     // Validate mutually exclusive flags
                     if daemon && no_daemon {
@@ -7447,6 +7480,19 @@ async fn execute_cli(
                         rerank,
                         rrf_limit,
                         rerank_limit,
+                    )?;
+
+                    // 04: an explicit --since/--until that cannot be parsed is
+                    // a usage error, never a silent fallback to the default
+                    // window. Resolved here, before `refresh_index_inline` and
+                    // before any ingest, database access or model work.
+                    let time_filter = TimeFilter::new_search_strict(
+                        days,
+                        today,
+                        yesterday,
+                        week,
+                        since.as_deref(),
+                        until.as_deref(),
                     )?;
 
                     // PR9 09a: `--vector-search-mode` is an independent
@@ -7531,7 +7577,11 @@ async fn execute_cli(
                     // (robot_format > --json > env > robot_auto > display),
                     // so `--display table|lines|markdown` actually wins when
                     // no structured format was asked for.
-                    let effective_format = cli.robot_format.or_else(robot_format_from_env);
+                    let effective_format = if command_requests_recall(cli.command.as_ref()) {
+                        Some(RobotFormat::Recall)
+                    } else {
+                        cli.robot_format.or_else(robot_format_from_env)
+                    };
 
                     // P09: preserve the values the frozen `RequestBinding`
                     // needs but the legacy flow folds away before
@@ -7572,14 +7622,7 @@ async fn execute_cli(
                         wrap,
                         progress,
                         robot_mode,
-                        TimeFilter::new(
-                            days,
-                            today,
-                            yesterday,
-                            week,
-                            since.as_deref(),
-                            until.as_deref(),
-                        ),
+                        time_filter,
                         aggregate,
                         explain,
                         dry_run,
@@ -9269,6 +9312,7 @@ async fn execute_cli(
                     since,
                     json,
                     data_dir,
+                    recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_sessions(
@@ -9361,18 +9405,87 @@ async fn execute_cli(
                     path,
                     source,
                     line,
+                    message_id,
+                    expected_content_sha256,
                     context,
                     json,
+                    recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_expand(
-                        &path,
-                        cli.db.clone(),
-                        source.as_deref(),
-                        line,
-                        context,
-                        structured_format,
-                    )?;
+                    let context = parse_expand_context(&context)?;
+                    match (line, message_id) {
+                        (Some(line), None) => {
+                            // The digest only belongs to the message-id form. Accepting it
+                            // silently here would let callers believe a body was verified
+                            // while the legacy path still selects by physical file line.
+                            if expected_content_sha256.is_some() {
+                                return Err(CliError::usage(
+                                    "--expected-content-sha256 requires --message-id",
+                                    Some(
+                                        "Use --message-id to verify a content digest; --line expands by file line without a digest"
+                                            .to_string(),
+                                    ),
+                                ));
+                            }
+                            run_expand(
+                                &path,
+                                cli.db.clone(),
+                                source.as_deref(),
+                                line,
+                                context,
+                                structured_format,
+                            )?;
+                        }
+                        (None, Some(raw_message_id)) => {
+                            let message_id = parse_expand_message_id(&raw_message_id)?;
+                            let source_id = source.as_deref().ok_or_else(|| {
+                                CliError::usage(
+                                    "--message-id requires --source",
+                                    Some(
+                                        "Use the source_id field from search output, e.g. --source local"
+                                            .to_string(),
+                                    ),
+                                )
+                            })?;
+                            let expected_content_sha256 =
+                                expected_content_sha256.as_deref().ok_or_else(|| {
+                                    CliError::usage(
+                                        "--message-id requires --expected-content-sha256",
+                                        Some(
+                                            "Use the content_sha256 field from search output without modification"
+                                                .to_string(),
+                                        ),
+                                    )
+                                })?;
+                            run_expand_by_message_id(
+                                &path,
+                                cli.db.clone(),
+                                source_id,
+                                message_id,
+                                expected_content_sha256,
+                                context,
+                                structured_format,
+                            )?;
+                        }
+                        (Some(_), Some(_)) => {
+                            return Err(CliError::usage(
+                                "--line and --message-id cannot be combined",
+                                Some(
+                                    "Use --line for a file line, or --message-id with --source and --expected-content-sha256"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                        (None, None) => {
+                            return Err(CliError::usage(
+                                "cass expand requires exactly one of --line or --message-id",
+                                Some(
+                                    "Use --line for a file line, or --message-id with --source and --expected-content-sha256"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                    }
                 }
                 Commands::Timeline {
                     since,
@@ -9383,6 +9496,7 @@ async fn execute_cli(
                     json,
                     group_by,
                     source,
+                    recall: _,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_timeline(
@@ -21618,7 +21732,55 @@ fn describe_command(cli: &Cli) -> String {
     }
 }
 
+fn command_requests_recall(command: Option<&Commands>) -> bool {
+    matches!(
+        command,
+        Some(
+            Commands::Search { recall: true, .. }
+                | Commands::Expand { recall: true, .. }
+                | Commands::Sessions { recall: true, .. }
+                | Commands::Timeline { recall: true, .. }
+        )
+    )
+}
+
+impl From<crate::search::query::RecallIdentityUnavailable> for CliError {
+    fn from(error: crate::search::query::RecallIdentityUnavailable) -> Self {
+        Self {
+            code: 9,
+            kind: "identity_unavailable",
+            message: error.to_string(),
+            hint: Some("Search again after the index is stable.".into()),
+            retryable: false,
+        }
+    }
+}
+
+fn recall_cli_error(error: impl std::fmt::Display) -> CliError {
+    CliError {
+        code: 9,
+        kind: "recall_invalid",
+        message: error.to_string(),
+        hint: None,
+        retryable: false,
+    }
+}
+
+fn output_recall_value(
+    tool: recall_output::RecallTool,
+    payload: &serde_json::Value,
+) -> CliResult<()> {
+    println!(
+        "{}",
+        recall_output::encode(tool, payload).map_err(recall_cli_error)?
+    );
+    Ok(())
+}
+
 fn resolve_subcommand_structured_format(cli: &Cli, json: bool) -> Option<RobotFormat> {
+    if command_requests_recall(cli.command.as_ref()) {
+        return Some(RobotFormat::Recall);
+    }
     cli.robot_format
         .or(if json { Some(RobotFormat::Json) } else { None })
         .or_else(robot_format_from_env)
@@ -23079,6 +23241,61 @@ impl TimeFilter {
 
         TimeFilter { since, until }
     }
+
+    /// Strict constructor for the `search` command.
+    ///
+    /// Convenience ranges (`--today`, `--yesterday`, `--week`, `--days`) come
+    /// from the unchanged `TimeFilter::new`. An explicit `--since`/`--until`
+    /// value is parsed exactly once with the command's existing parser, and a
+    /// value that does not parse is a usage error instead of a silent fallback
+    /// to the default window. The merged window must not run backwards.
+    fn new_search_strict(
+        days: Option<u32>,
+        today: bool,
+        yesterday: bool,
+        week: bool,
+        since_str: Option<&str>,
+        until_str: Option<&str>,
+    ) -> CliResult<Self> {
+        let mut filter = Self::new(days, today, yesterday, week, None, None);
+        if let Some(raw) = since_str {
+            filter.since = Some(
+                parse_datetime_str(raw)
+                    .ok_or_else(|| invalid_time_argument("--since", raw, SEARCH_TIME_FORMS))?,
+            );
+        }
+        if let Some(raw) = until_str {
+            filter.until = Some(
+                parse_datetime_str(raw)
+                    .ok_or_else(|| invalid_time_argument("--until", raw, SEARCH_TIME_FORMS))?,
+            );
+        }
+        if let (Some(since), Some(until)) = (filter.since, filter.until)
+            && since > until
+        {
+            return Err(CliError::usage(
+                "--since resolves to a time after --until (empty range)",
+                Some(format!(
+                    "Computed window start ({since}ms) is after end ({until}ms). \
+                     Check the --since/--until values; relative offsets like `-7d` mean \"7 days ago\"."
+                )),
+            ));
+        }
+        Ok(filter)
+    }
+}
+
+const SEARCH_TIME_FORMS: &str = "YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, an RFC3339 timestamp, \
+     'today', 'yesterday', or a relative offset like -7d / -24h";
+
+const FLEXIBLE_TIME_FORMS: &str = "YYYY-MM-DD, an RFC3339 timestamp with an offset, \
+     'today', 'yesterday', or a relative offset like -7d / -24h";
+
+fn invalid_time_argument(flag: &str, raw: &str, accepted: &str) -> CliError {
+    CliError::usage(
+        format!("Invalid {flag} value '{raw}'."),
+        Some(format!("Use {accepted}.")),
+    )
 }
 
 fn parse_datetime_str(s: &str) -> Option<i64> {
@@ -25350,6 +25567,8 @@ fn run_cli_search(
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    let robot_meta = robot_meta || robot_format == Some(RobotFormat::Recall);
+
     freeze_search_model_api(&mut semantic_opts, mode, dry_run)?;
 
     // Start timing for robot_meta elapsed_ms
@@ -25510,7 +25729,7 @@ fn run_cli_search(
     // P09: a rerank first lookup fetches the full, un-projected hit body so
     // both the frozen window and the rerank input are complete regardless of
     // the display projection. The closed path keeps its display-driven mask.
-    let search_field_mask = if rerank_on {
+    let search_field_mask = if rerank_on || robot_format == Some(RobotFormat::Recall) {
         crate::search::query::FieldMask::FULL
     } else {
         field_mask
@@ -25542,6 +25761,9 @@ fn run_cli_search(
             "_meta": meta,
         });
 
+        if effective_robot == Some(RobotFormat::Recall) {
+            return output_recall_value(recall_output::RecallTool::Search, &output);
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
@@ -26939,6 +27161,336 @@ fn score_search_first_window(
     })
 }
 
+/// Ticket 20: the fixed, bounded refusal a recall carries when a requested
+/// model path was never realized. The text is generic on purpose: no provider
+/// name, profile body, endpoint, credential or hit body can leak through it.
+const RECALL_MODEL_UNAVAILABLE_MESSAGE: &str =
+    "recall refused: the requested model search path was not applied";
+const RECALL_MODEL_UNAVAILABLE_HINT: &str =
+    "Re-run with a working model configuration, or use --mode lexical when lexical results are acceptable.";
+
+fn recall_model_unavailable_error() -> CliError {
+    CliError {
+        code: 9,
+        kind: "model_unavailable",
+        message: RECALL_MODEL_UNAVAILABLE_MESSAGE.to_string(),
+        hint: Some(RECALL_MODEL_UNAVAILABLE_HINT.to_string()),
+        retryable: false,
+    }
+}
+
+/// Ticket 20: did an explicitly requested model path fail to materialize on a
+/// result that a recall would otherwise publish as a success?
+///
+/// The predicate reads only already-resolved facts. It never re-derives state
+/// from the JSON projection, never re-runs retrieval, and never learns which
+/// model, endpoint or profile produced the failure.
+///
+/// * A defaulted mode is not an explicit model choice, so its lexical
+///   degradation is allowed. An explicit `semantic`/`hybrid` request that
+///   realized lexical, carried a fallback tier, or reported a degraded semantic
+///   leg is a known retrieval fault even when it produced zero hits.
+/// * A non-empty page whose rerank was requested but not applied is the second
+///   known fault. An empty page never needs a rerank, so `applied=false` there
+///   stays a legal empty result.
+fn recall_model_quality_violation(
+    requested: crate::search::query::SearchMode,
+    realized: crate::search::query::SearchMode,
+    mode_defaulted: bool,
+    fallback_tier: Option<&'static str>,
+    semantic_degraded: bool,
+    hits_empty: bool,
+    rerank_requested: bool,
+    rerank_applied: bool,
+) -> Option<&'static str> {
+    use crate::search::query::SearchMode;
+    let explicit_semantic_choice = !mode_defaulted
+        && matches!(requested, SearchMode::Semantic | SearchMode::Hybrid);
+    let semantic_not_realized =
+        realized == SearchMode::Lexical || fallback_tier.is_some() || semantic_degraded;
+    if explicit_semantic_choice && semantic_not_realized {
+        return Some("semantic_not_realized");
+    }
+    if !hits_empty && rerank_requested && !rerank_applied {
+        return Some("rerank_not_applied");
+    }
+    None
+}
+
+#[cfg(test)]
+mod mcp_recall_models_guard_tests {
+    use super::recall_model_quality_violation;
+    use crate::search::query::SearchMode;
+
+    const DEGRADED: Option<&'static str> = Some("lexical");
+
+    /// All eight guard inputs, so each case reads as one state. "Hits present"
+    /// is `hits_empty = false`; rerank is requested/applied as named.
+    fn violation(
+        requested: SearchMode,
+        realized: SearchMode,
+        defaulted: bool,
+        fallback_tier: Option<&'static str>,
+        semantic_degraded: bool,
+        hits_empty: bool,
+        rerank_requested: bool,
+        rerank_applied: bool,
+    ) -> Option<&'static str> {
+        recall_model_quality_violation(
+            requested,
+            realized,
+            defaulted,
+            fallback_tier,
+            semantic_degraded,
+            hits_empty,
+            rerank_requested,
+            rerank_applied,
+        )
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_explicit_hybrid_realized_lexical_is_refused_with_and_without_hits() {
+        for hits_empty in [false, true] {
+            assert_eq!(
+                violation(
+                    SearchMode::Hybrid,
+                    SearchMode::Lexical,
+                    false,
+                    None,
+                    false,
+                    hits_empty,
+                    false,
+                    false,
+                ),
+                Some("semantic_not_realized"),
+                "an explicit hybrid request realized as lexical is a known fault, hits_empty={hits_empty}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_explicit_semantic_realized_lexical_is_refused() {
+        assert_eq!(
+            violation(
+                SearchMode::Semantic,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some("semantic_not_realized")
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_fallback_tier_alone_is_refused() {
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Hybrid,
+                false,
+                DEGRADED,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some("semantic_not_realized"),
+            "a fallback tier refuses even when realized still names the semantic mode"
+        );
+        assert_eq!(
+            violation(
+                SearchMode::Semantic,
+                SearchMode::Semantic,
+                false,
+                DEGRADED,
+                false,
+                false,
+                false,
+                false,
+            ),
+            Some("semantic_not_realized")
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_semantic_degraded_alone_is_refused() {
+        for requested in [SearchMode::Semantic, SearchMode::Hybrid] {
+            assert_eq!(
+                violation(
+                    requested,
+                    requested,
+                    false,
+                    None,
+                    true,
+                    false,
+                    false,
+                    false,
+                ),
+                Some("semantic_not_realized"),
+                "semantic_degraded is an independent fault signal for {requested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_defaulted_degradation_is_allowed() {
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Lexical,
+                true,
+                DEGRADED,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None,
+            "a defaulted mode is not an explicit model choice"
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_explicit_lexical_never_requires_a_model() {
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        // Even a stray degradation flag on a lexical request is not a semantic
+        // refusal: the caller asked for lexical explicitly.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                DEGRADED,
+                true,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_healthy_semantic_request_is_allowed() {
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Hybrid,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            violation(
+                SearchMode::Semantic,
+                SearchMode::Semantic,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_recall_models_guard_rerank_boundaries() {
+        // Non-empty hits + requested + not applied: refused.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+            ),
+            Some("rerank_not_applied")
+        );
+        // Applied: fine.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                true,
+                true,
+            ),
+            None
+        );
+        // Not requested: fine.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+            ),
+            None
+        );
+        // Legal zero candidates: applied=false is not a fault.
+        assert_eq!(
+            violation(
+                SearchMode::Lexical,
+                SearchMode::Lexical,
+                false,
+                None,
+                false,
+                true,
+                true,
+                false,
+            ),
+            None
+        );
+        // A defaulted degradation does not excuse a non-empty unapplied rerank.
+        assert_eq!(
+            violation(
+                SearchMode::Hybrid,
+                SearchMode::Lexical,
+                true,
+                DEGRADED,
+                false,
+                false,
+                true,
+                false,
+            ),
+            Some("rerank_not_applied")
+        );
+    }
+}
+
 /// P09: the shared search renderer -- everything from the display budget down.
 /// Both the first lookup and a continuation page build a [`SearchRenderInput`]
 /// and land here, so the two cannot drift in their JSON/human projection.
@@ -26978,6 +27530,28 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
         wrap,
         highlight,
     } = inp;
+
+    // Ticket 20: a recall success must not hide a requested model path that was
+    // never realized. Checked here -- before the display budget, the live state
+    // read, the recall identity projection and any stdout write -- so a known
+    // retrieval fault is never masked by a later identity error and never
+    // leaves a success wrapper behind. Every other output format keeps its
+    // existing behaviour.
+    if effective_robot == Some(RobotFormat::Recall)
+        && recall_model_quality_violation(
+            mode_meta.requested,
+            mode_meta.realized,
+            mode_meta.defaulted,
+            mode_meta.fallback_tier,
+            display_result.semantic_degraded,
+            display_result.hits.is_empty(),
+            rerank_requested,
+            rerank_applied,
+        )
+        .is_some()
+    {
+        return Err(recall_model_unavailable_error());
+    }
 
     // Derive per-field budgets, preferring snippet > content > title
     let (snippet_budget, content_budget, title_budget, fallback_budget) = {
@@ -27150,13 +27724,26 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
 
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
+        let recall = format == RobotFormat::Recall;
+        let identities = if recall {
+            crate::search::query::resolve_recall_hit_identities(&db_path, &display_result.hits)?
+        } else {
+            Vec::new()
+        };
+        let mut recall_buffer = Vec::new();
+        let mut stdout = std::io::stdout();
+        let sink: &mut dyn std::io::Write = if recall {
+            &mut recall_buffer
+        } else {
+            &mut stdout
+        };
         output_robot_results(
             &query,
             limit,
             cursor_page_limit,
             offset,
             &display_result,
-            format,
+            if recall { RobotFormat::Json } else { format },
             robot_meta,
             elapsed_ms,
             &fields,
@@ -27186,8 +27773,14 @@ fn render_search_output(inp: SearchRenderInput) -> CliResult<()> {
             window.as_ref(),
             // PR9 task 08: the one production sink -- same stdout the seven
             // former inline `std::io::stdout()` sites wrote to.
-            &mut std::io::stdout(),
+            sink,
+            recall.then_some(identities.as_slice()),
         )?;
+        if recall {
+            let payload: serde_json::Value =
+                serde_json::from_slice(&recall_buffer).map_err(recall_cli_error)?;
+            output_recall_value(recall_output::RecallTool::Search, &payload)?;
+        }
     } else {
         // PR9 task 08: the plain-text surface of the same fact JSON/JSONL
         // carry as `search_precision` -- printed once, ahead of any hit line,
@@ -27646,7 +28239,7 @@ fn resolve_pack_render_format(
         Some(RobotFormat::Compact) => Ok(PackRenderFormat::CompactJson),
         Some(RobotFormat::Jsonl) => Ok(PackRenderFormat::Jsonl),
         Some(RobotFormat::Toon) => Ok(PackRenderFormat::Toon),
-        Some(RobotFormat::Sessions) => Err(CliError {
+        Some(RobotFormat::Sessions | RobotFormat::Recall) => Err(CliError {
             code: 2,
             kind: CliErrorKind::PackUnsupportedFormat.kind_str(),
             message: "cass pack does not support --robot-format sessions".to_string(),
@@ -29071,6 +29664,7 @@ fn toon_encode_options_from_env() -> toon::EncodeOptions {
 
 fn output_structured_value(payload: serde_json::Value, format: RobotFormat) -> CliResult<()> {
     match format {
+        RobotFormat::Recall => return Err(recall_cli_error("recall tool identity is required")),
         RobotFormat::Json => {
             println!(
                 "{}",
@@ -29419,8 +30013,13 @@ fn output_robot_results(
     // `SearchResult` and read back what the real serializer emitted. The one
     // production caller passes stdout; unit tests pass a `Vec<u8>`.
     out: &mut dyn std::io::Write,
+    recall_identities: Option<&[crate::search::query::RecallHitIdentity]>,
 ) -> CliResult<()> {
     use std::io::{BufWriter, Write};
+
+    if format == RobotFormat::Recall {
+        return Err(recall_cli_error("search recall requires indexed message identity"));
+    }
 
     if matches!(format, RobotFormat::Sessions) {
         // Output unique session paths only, one per line.
@@ -29491,6 +30090,7 @@ fn output_robot_results(
     // must fall through to the slower `match format` path below (the one
     // that actually emits them) instead of silently bypassing it here.
     if matches!(format, RobotFormat::Json)
+        && recall_identities.is_none()
         && summary_projection
         && !needs_truncation
         && max_tokens.is_none()
@@ -29631,6 +30231,7 @@ fn output_robot_results(
     // `--robot-meta`) silent no-op this item reports: this exact fast path
     // is what a bare `cass search ... --json --rerank` hits.
     if matches!(format, RobotFormat::Json)
+        && recall_identities.is_none()
         && all_fields_requested
         && !needs_truncation
         && max_tokens.is_none()
@@ -29868,6 +30469,21 @@ fn output_robot_results(
         }
     }
 
+    // Identity must be attached before the existing budget/cursor projection.
+    // The digest itself was resolved from full DB text before display cropping.
+    if let Some(identities) = recall_identities {
+        if identities.len() != filtered_hits.len() {
+            return Err(recall_cli_error("search identity projection count differs"));
+        }
+        for (hit, identity) in filtered_hits.iter_mut().zip(identities) {
+            let map = hit
+                .as_object_mut()
+                .ok_or_else(|| recall_cli_error("invalid hit"))?;
+            let value = serde_json::to_value(identity).map_err(recall_cli_error)?;
+            map.extend(value.as_object().expect("identity is an object").clone());
+        }
+    }
+
     // Clamp hits to token budget if provided (approx 4 chars per token)
     let jsonl_meta_emitted = matches!(format, RobotFormat::Jsonl)
         && (include_meta
@@ -30067,6 +30683,7 @@ fn output_robot_results(
     };
 
     match format {
+        RobotFormat::Recall => unreachable!("recall is handled before JSON rendering"),
         RobotFormat::Json => {
             let mut payload = serde_json::json!({
                 "query": query,
@@ -30920,6 +31537,7 @@ mod pr9_candidate_meta_output_tests {
             window.is_some(),
             window,
             &mut sink,
+            None,
         )
         .expect("render robot output");
         String::from_utf8(sink).expect("utf-8 robot output")
@@ -81073,6 +81691,22 @@ fn run_sessions(
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
 
+    // 04: an explicit --since that cannot be parsed is a usage error. Resolve
+    // it before the database is opened so a missing database cannot mask it.
+    let since_ms: Option<i64> = match since {
+        None => None,
+        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!(
+                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
+                 'today', 'yesterday', or a relative offset like -7d / -24h."
+            ),
+            hint: Some("Example: cass sessions --since -7d".into()),
+            retryable: false,
+        })?),
+    };
+
     let conn = open_franken_analytics_db(data_dir_override, db_override.as_ref())?;
     let target_workspace = match (workspace, current) {
         (Some(path), _) => Some(normalize_session_filter_path(path)?),
@@ -81090,19 +81724,6 @@ fn run_sessions(
         Some(n) => Some(n),
         None if current_determined_workspace => Some(1),
         None => Some(10),
-    };
-    let since_ms: Option<i64> = match since {
-        None => None,
-        Some(raw) => Some(parse_datetime_flexible(raw).ok_or_else(|| CliError {
-            code: 2,
-            kind: CliErrorKind::Usage.kind_str(),
-            message: format!(
-                "Invalid --since value '{raw}'. Use YYYY-MM-DD, YYYY-MM-DDTHH:MM:SS, \
-                 'today', 'yesterday', or a relative offset like -7d / -24h."
-            ),
-            hint: Some("Example: cass sessions --since -7d".into()),
-            retryable: false,
-        })?),
     };
 
     // cass#323: enumerate conversations WITHOUT joining messages. The old
@@ -81341,6 +81962,9 @@ fn run_sessions(
 
     if let Some(fmt) = structured_format {
         let payload = serde_json::json!({ "sessions": entries });
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(recall_output::RecallTool::Sessions, &payload);
+        }
         return output_structured_value(payload, fmt);
     }
 
@@ -82928,6 +83552,7 @@ fn run_introspect(output_format: Option<RobotFormat>) -> CliResult<()> {
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
         match fmt {
+            RobotFormat::Recall => return Err(recall_cli_error("recall is not available for introspect")),
             RobotFormat::Json => {
                 let _ = serde_json::to_writer_pretty(&mut stdout, &response);
                 let _ = writeln!(stdout);
@@ -83709,6 +84334,7 @@ const INTEGER_ARG_NAMES: &[&str] = &[
     "freshness-window-seconds",
     "days",
     "line",
+    "message-id",
     "context",
     "stale-threshold",
     "timeout",
@@ -87767,6 +88393,8 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "messages": { "type": ["integer", "null"] },
                 "quarantined_conversations": { "type": "integer" },
                 "lexical_update_deferred": { "type": "boolean" },
+                "recall_uncovered_total": { "type": "integer" },
+                "recall_uncovered_by_reason": { "type": "object" },
                 "indexing_stats": response_schema_opaque_object(),
                 "error": { "type": ["string", "null"] }
             }
@@ -90879,6 +91507,12 @@ fn run_index_with_data(
             let mut payload = cli_error_json_payload(err, elapsed_ms);
             if let Ok(stats) = index_progress.stats.lock() {
                 if let Some(model_api) = &stats.model_api { payload["model_api"] = model_api.clone(); }
+                // Task10: the error envelope carries the same run totals as the
+                // success envelope, taken from the one stats snapshot.
+                payload["recall_uncovered_total"] =
+                    serde_json::json!(stats.recall_uncovered_total);
+                payload["recall_uncovered_by_reason"] =
+                    serde_json::json!(stats.recall_uncovered_by_reason);
             }
             if let Some(active_index) = &active_index_error {
                 payload["active_index"] = active_index.to_json();
@@ -91004,6 +91638,16 @@ fn run_index_with_data(
             map.insert(
                 "indexing_stats".to_string(),
                 serde_json::to_value(&*stats).unwrap_or_default(),
+            );
+            // Task10: the same two values `indexing_stats` carries, read from
+            // the same locked snapshot, so the two surfaces cannot disagree.
+            map.insert(
+                "recall_uncovered_total".to_string(),
+                serde_json::json!(stats.recall_uncovered_total),
+            );
+            map.insert(
+                "recall_uncovered_by_reason".to_string(),
+                serde_json::json!(stats.recall_uncovered_by_reason),
             );
         }
 
@@ -98016,7 +98660,12 @@ fn run_expand(
     })?;
 
     let start = target_idx.saturating_sub(context);
-    let end = (target_idx + context + 1).min(messages.len());
+    // Saturated so `--context usize::MAX` cannot wrap the end past the start
+    // and leave the window without a target.
+    let end = target_idx
+        .saturating_add(context)
+        .saturating_add(1)
+        .min(messages.len());
 
     let context_messages: Vec<_> = messages[start..end]
         .iter()
@@ -98049,6 +98698,12 @@ fn run_expand(
                 })
             })
             .collect();
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(
+                recall_output::RecallTool::Expand,
+                &serde_json::Value::Array(output),
+            );
+        }
         return output_structured_value(serde_json::Value::Array(output), fmt);
     }
 
@@ -98086,6 +98741,365 @@ fn run_expand(
         start + 1,
         end,
         messages.len()
+    );
+    Ok(())
+}
+
+/// Parse `--context` for `cass expand` so out-of-range integers are rejected
+/// as usage before any database read.
+fn parse_expand_context(value: &str) -> CliResult<usize> {
+    value.trim().parse::<usize>().map_err(|_| {
+        CliError::usage(
+            format!(
+                "--context must be a non-negative integer that fits this platform; got '{value}'"
+            ),
+            Some("Use a whole number of messages, e.g. --context 3.".to_string()),
+        )
+    })
+}
+
+/// Parse `--message-id` as a positive SQLite integer.
+fn parse_expand_message_id(value: &str) -> CliResult<i64> {
+    let parsed = value.trim().parse::<i64>().map_err(|_| {
+        CliError::usage(
+            format!(
+                "--message-id must be a positive integer that fits a SQLite row ID; got '{value}'"
+            ),
+            Some("Use the positive message_id field from search output.".to_string()),
+        )
+    })?;
+    if parsed <= 0 {
+        return Err(CliError::usage(
+            format!("--message-id must be a positive integer; got {parsed}"),
+            Some("Use the positive message_id field from search output.".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Parse a 64-character hexadecimal SHA256 value into its bytes.
+fn parse_expand_expected_content_sha256(value: &str) -> CliResult<[u8; 32]> {
+    fn usage(message: String) -> CliError {
+        CliError::usage(
+            message,
+            Some("Use the content_sha256 field from search output without modification.".to_string()),
+        )
+    }
+
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 {
+        return Err(usage(format!(
+            "--expected-content-sha256 must be exactly 64 hexadecimal characters; got {} characters",
+            value.chars().count()
+        )));
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    };
+    let mut digest = [0u8; 32];
+    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+        let (Some(high), Some(low)) = (nibble(chunk[0]), nibble(chunk[1])) else {
+            return Err(usage(
+                "--expected-content-sha256 must contain only hexadecimal characters".to_string(),
+            ));
+        };
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+/// Expand one indexed message located by its row ID.
+///
+/// The ID lookup, source/path check, body digest check and context selection
+/// all run inside one read-only, deferred transaction, so a concurrent index
+/// update cannot make the three observations disagree. The original session
+/// file is never read: only the stored, cleaned message content is returned.
+fn run_expand_by_message_id(
+    path: &Path,
+    db_override: Option<PathBuf>,
+    source_id: &str,
+    message_id: i64,
+    expected_content_sha256: &str,
+    context: usize,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use sha2::{Digest, Sha256};
+
+    if message_id <= 0 {
+        return Err(CliError::usage(
+            format!("--message-id must be a positive integer; got {message_id}"),
+            Some("Use the positive message_id field from search output.".to_string()),
+        ));
+    }
+    validate_followup_source_id(source_id, "cass expand")?;
+    let expected_content_sha256 = parse_expand_expected_content_sha256(expected_content_sha256)?;
+    let normalized_source_id = canonical_followup_source_id(Some(source_id))
+        .unwrap_or_else(|| crate::sources::provenance::LOCAL_SOURCE_ID.to_string());
+    let requested_source_path = path.to_string_lossy().to_string();
+
+    let message_not_found = |message: String| CliError {
+        code: 3,
+        kind: "message_not_found",
+        message,
+        hint: Some("Search again and use the current message_id from the hits.".to_string()),
+        retryable: false,
+    };
+    let source_mismatch = |message: String| CliError {
+        code: 3,
+        kind: "source_mismatch",
+        message,
+        hint: Some(
+            "Use source_id and source_path exactly as returned by cass search.".to_string(),
+        ),
+        retryable: false,
+    };
+
+    let db_path = db_override.unwrap_or_else(default_db_path);
+    let conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+        &db_path,
+        Duration::from_secs(5),
+    )
+    .map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::DbOpen.kind_str(),
+        message: format!(
+            "Cannot open the index database at {}: {err}",
+            db_path.display()
+        ),
+        hint: Some("Run 'cass index --full' or pass an existing --db path.".to_string()),
+        retryable: false,
+    })?;
+    crate::storage::sqlite::ensure_readonly_schema_current(&conn).map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!(
+            "The index database at {} cannot be read by this binary: {err}",
+            db_path.display()
+        ),
+        hint: Some("Rebuild the index with this cass version.".to_string()),
+        retryable: false,
+    })?;
+    let tx = conn.transaction().map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::DbError.kind_str(),
+        message: format!("Cannot start a read transaction on the index: {err}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let source_expr = crate::search::query::normalized_search_source_id_sql_expr(
+        "c.source_id",
+        "s.kind",
+        "c.origin_host",
+    );
+    let target_sql = format!(
+        "SELECT m.id, m.conversation_id, m.idx, m.content, c.source_path, ({source_expr}), \
+                CASE WHEN m.excluded IS NULL THEN 1 ELSE 0 END \
+         FROM messages m \
+         JOIN conversations c ON c.id = m.conversation_id \
+         LEFT JOIN sources s ON s.id = c.source_id \
+         WHERE m.id = ?1"
+    );
+    let targets: Vec<(i64, i64, i64, String, String, String, i64)> = tx
+        .query_all_map(&target_sql, &[ParamValue::from(message_id)], |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+                row.get_typed(4)?,
+                row.get_typed(5)?,
+                row.get_typed(6)?,
+            ))
+        })
+        .map_err(|err| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to read indexed message {message_id}: {err}"),
+            hint: None,
+            retryable: false,
+        })?;
+    let [(_, conversation_id, _, content, source_path, stored_source_id, readable)] =
+        targets.as_slice()
+    else {
+        return Err(message_not_found(format!(
+            "Indexed message {message_id} was not found"
+        )));
+    };
+    if *readable == 0 {
+        return Err(message_not_found(format!(
+            "Indexed message {message_id} is excluded and cannot be expanded"
+        )));
+    }
+    if *source_path != requested_source_path {
+        return Err(source_mismatch(format!(
+            "Indexed message {message_id} belongs to source path '{source_path}', not '{requested_source_path}'"
+        )));
+    }
+    if *stored_source_id != normalized_source_id {
+        return Err(source_mismatch(format!(
+            "Indexed message {message_id} belongs to source '{stored_source_id}', not '{normalized_source_id}'"
+        )));
+    }
+    let actual_content_sha256: [u8; 32] = Sha256::digest(content.as_bytes()).into();
+    if actual_content_sha256 != expected_content_sha256 {
+        return Err(CliError {
+            code: 3,
+            kind: "stale_reference",
+            message: format!(
+                "Indexed message {message_id} no longer has the expected content digest"
+            ),
+            hint: Some("Search again: the stored message changed since the hit was produced.".to_string()),
+            retryable: false,
+        });
+    }
+
+    let session_sql = "SELECT m.id, m.idx, m.role, m.content \
+         FROM messages m \
+         WHERE m.conversation_id = ?1 AND m.excluded IS NULL \
+         ORDER BY m.idx ASC";
+    let session_rows: Vec<(i64, i64, String, String)> = tx
+        .query_all_map(session_sql, &[ParamValue::from(*conversation_id)], |row| {
+            Ok((
+                row.get_typed(0)?,
+                row.get_typed(1)?,
+                row.get_typed(2)?,
+                row.get_typed(3)?,
+            ))
+        })
+        .map_err(|err| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to read the conversation for message {message_id}: {err}"),
+            hint: None,
+            retryable: false,
+        })?;
+
+    let mut lines: Vec<(usize, String, String)> = Vec::with_capacity(session_rows.len());
+    let mut target_position = None;
+    for (row_id, idx, role, row_content) in &session_rows {
+        let line = usize::try_from(*idx)
+            .ok()
+            .and_then(|idx| idx.checked_add(1))
+            .ok_or_else(|| CliError {
+                code: 9,
+                kind: CliErrorKind::DbError.kind_str(),
+                message: format!("Indexed message {row_id} has an invalid message index {idx}"),
+                hint: Some("Rebuild the index with this cass version.".to_string()),
+                retryable: false,
+            })?;
+        if *row_id == message_id {
+            target_position = Some(lines.len());
+        }
+        lines.push((line, role.clone(), row_content.clone()));
+    }
+    let target_position = target_position.ok_or_else(|| {
+        message_not_found(format!(
+            "Indexed message {message_id} was not found in its conversation"
+        ))
+    })?;
+    tx.commit().map_err(|err| CliError {
+        code: 9,
+        kind: CliErrorKind::DbError.kind_str(),
+        message: format!("Failed to finish the read transaction: {err}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let start = target_position.saturating_sub(context);
+    let end = target_position
+        .saturating_add(context)
+        .saturating_add(1)
+        .min(lines.len());
+    let context_messages: Vec<(usize, String, String, bool)> = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, (line, role, content))| {
+            let is_target = start + offset == target_position;
+            (*line, role.clone(), content.clone(), is_target)
+        })
+        .collect();
+    let target_count = context_messages.iter().filter(|(_, _, _, is_target)| *is_target).count();
+    if target_count != 1 {
+        return Err(CliError {
+            code: 9,
+            kind: CliErrorKind::Unknown.kind_str(),
+            message: format!(
+                "Expand failed to select exactly one target for message {message_id}; selected {target_count}"
+            ),
+            hint: None,
+            retryable: false,
+        });
+    }
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let output: Vec<serde_json::Value> = context_messages
+            .iter()
+            .map(|(line_num, role, content, is_target)| {
+                serde_json::json!({
+                    "line": line_num,
+                    "role": role,
+                    "is_target": is_target,
+                    "content": content,
+                })
+            })
+            .collect();
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(
+                recall_output::RecallTool::Expand,
+                &serde_json::Value::Array(output),
+            );
+        }
+        return output_structured_value(serde_json::Value::Array(output), fmt);
+    }
+
+    println!(
+        "\n📍 Context around message {} in {}\n",
+        message_id,
+        path.display()
+    );
+    println!("{}", "─".repeat(60));
+
+    for (line_num, role, content, is_target) in &context_messages {
+        let preview: String = content.chars().take(300).collect();
+        let marker = if *is_target { ">>>" } else { "   " };
+        let role_icon = match role.as_str() {
+            "user" => "👤",
+            "assistant" => "🤖",
+            _ => "📝",
+        };
+
+        println!(
+            "{} L{:>4} {} {}",
+            marker,
+            line_num,
+            role_icon,
+            role.to_uppercase()
+        );
+        println!("        {}", preview.replace('\n', " "));
+        if content.len() > 300 {
+            println!("        ... ({} more chars)", content.len() - 300);
+        }
+        println!();
+    }
+
+    println!("{}", "─".repeat(60));
+    println!(
+        "Showing messages {} to {} of {} total",
+        start + 1,
+        end,
+        lines.len()
     );
     Ok(())
 }
@@ -98307,6 +99321,26 @@ fn run_timeline(
     // Parse source filter (P3.2)
     let source_filter = source.as_ref().map(|s| SourceFilter::parse(s));
 
+    // 04: resolve explicit times strictly before the database is opened, so an
+    // unparseable value is a usage error instead of being folded into the
+    // default window or masked by a missing database. `--today` keeps its
+    // original priority over explicit values, but it does not excuse a value
+    // that cannot be parsed.
+    let since_ms = match since {
+        Some(raw) => Some(
+            parse_datetime_flexible(raw)
+                .ok_or_else(|| invalid_time_argument("--since", raw, FLEXIBLE_TIME_FORMS))?,
+        ),
+        None => None,
+    };
+    let until_ms = match until {
+        Some(raw) => Some(
+            parse_datetime_flexible(raw)
+                .ok_or_else(|| invalid_time_argument("--until", raw, FLEXIBLE_TIME_FORMS))?,
+        ),
+        None => None,
+    };
+
     let db_path = analytics_db_path(data_dir, db_override.as_ref());
     let conn = open_franken_analytics_db(data_dir, db_override.as_ref())?;
 
@@ -98323,12 +99357,9 @@ fn run_timeline(
         };
         (local_start.timestamp_millis(), now.timestamp_millis())
     } else {
-        let start = since
-            .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp_millis());
-        let end = until
-            .and_then(parse_datetime_flexible)
-            .unwrap_or_else(|| now.timestamp_millis());
+        let start =
+            since_ms.unwrap_or_else(|| (now - chrono::Duration::days(7)).timestamp_millis());
+        let end = until_ms.unwrap_or_else(|| now.timestamp_millis());
         (start, end)
     };
 
@@ -98529,6 +99560,9 @@ fn run_timeline(
                 })
             }
         };
+        if fmt == RobotFormat::Recall {
+            return output_recall_value(recall_output::RecallTool::Timeline, &output);
+        }
         return output_structured_value(output, fmt);
     }
 
