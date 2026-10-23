@@ -506,14 +506,16 @@ fn build_world(fixture: &Fixture) -> World {
 
 // ---------------------------------------------------------------------------
 // Task18a: native full-name MCP calls that carry no captured arguments.
+// Task18e: native bare-name MCP calls that carry no captured arguments.
 //
-// Every value below is a literal fixture in this file. The eight missing-args
-// calls (four per agent) are paired with valid C04 envelopes and omit
-// `input`/`arguments` entirely. The two normal-args searches are the controls
-// that prove the same shape still excludes when arguments exist. The
-// preservation controls (bare name without args, ordinary same-named tool,
-// another server, unpaired result, C07 without a literal) exercise the
-// unchanged rules and must keep their bodies.
+// Every value below is a literal fixture in this file. The eight strong
+// missing-args calls (four per agent), the eight bare missing-args calls
+// (four per agent) and the two normal-args searches are all paired with
+// valid C04 envelopes, so every one of them is excluded. The two
+// preservation controls below -- another server's same-suffixed tool and a
+// complete envelope whose call row is missing -- exercise the unchanged
+// rules and must keep their bodies, as do the ordinary same-named tool and
+// the C07 `exec` without a literal.
 // ---------------------------------------------------------------------------
 
 const NATIVE_CLAUDE_PROSE: &str = "t18a native claude prose stays";
@@ -532,9 +534,15 @@ const NATIVE_CLAUDE_OTHER_MISSING_OUTPUT: &str =
 const NATIVE_CODEX_OTHER_MISSING_OUTPUT: &str = "t18a codex other-server missing args output stays";
 const NATIVE_UNPAIRED_BODY: &str = "t18a unpaired candidate body stays";
 
+/// A C02-legal search hit: all five identity fields, with a 64-character
+/// lowercase digest over the synthetic body. The body stays a literal written
+/// here, never host data.
 fn native_search_value(body: &str) -> Value {
     json!({"hits": [
-        {"source_id": "local", "source_path": "/synthetic/t18a/hit.jsonl", "line_number": 4, "content": body},
+        {"source_id": "local", "source_path": "/synthetic/t18a/hit.jsonl",
+         "message_id": 4, "line_number": 4,
+         "content_sha256": sha256_hex(body.as_bytes()),
+         "content": body},
     ]})
 }
 
@@ -649,34 +657,69 @@ fn write_claude_native_session(
     }));
     excluded.push(("toolu_t18a_c_search", control));
 
-    // Preservation control: a bare name without arguments keeps its result.
-    let bare = wrapper(
-        RecallTool::Search,
-        &native_search_value(NATIVE_CLAUDE_BARE_BODY),
-    );
-    lines.push(json!({
-        "type": "assistant", "timestamp": "2026-01-03T00:00:11.000Z", "uuid": "t18a-a-bare",
-        "message": {"role": "assistant", "content": [
-            {"type": "tool_use", "id": "toolu_t18a_bare_missing", "name": "cass_search"}
-        ]}
-    }));
-    lines.push(json!({
-        "type": "user", "timestamp": "2026-01-03T00:00:12.000Z", "uuid": "t18a-r-bare",
-        "message": {"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "toolu_t18a_bare_missing", "content": bare}
-        ]}
-    }));
+    // Task18e: a bare name without captured arguments is excluded once its
+    // result decodes as a complete C04 envelope for that exact tool. All four
+    // tools are the positive matrix; the old preserved search literal now
+    // carries the same role with a positive expectation.
+    let bare_missing: [(&'static str, &'static str, RecallTool, Value); 4] = [
+        (
+            "toolu_t18a_bare_missing",
+            "cass_search",
+            RecallTool::Search,
+            native_search_value(NATIVE_CLAUDE_BARE_BODY),
+        ),
+        (
+            "toolu_t18e_bare_expand",
+            "cass_expand",
+            RecallTool::Expand,
+            native_expand_value(),
+        ),
+        (
+            "toolu_t18e_bare_sessions",
+            "cass_sessions",
+            RecallTool::Sessions,
+            native_sessions_value(),
+        ),
+        (
+            "toolu_t18e_bare_timeline",
+            "cass_timeline",
+            RecallTool::Timeline,
+            native_timeline_value(),
+        ),
+    ];
+    for (offset, (id, name, tool, value)) in bare_missing.into_iter().enumerate() {
+        let call_sec = 11 + offset * 2;
+        let result_sec = call_sec + 1;
+        lines.push(json!({
+            "type": "assistant",
+            "timestamp": format!("2026-01-03T00:00:{call_sec:02}.000Z"),
+            "uuid": format!("t18e-a-{id}"),
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": name}
+            ]}
+        }));
+        let body = wrapper(tool, &value);
+        lines.push(json!({
+            "type": "user",
+            "timestamp": format!("2026-01-03T00:00:{result_sec:02}.000Z"),
+            "uuid": format!("t18e-r-{id}"),
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": body}
+            ]}
+        }));
+        excluded.push((id, body));
+    }
 
     // Preservation control: an ordinary same-named tool.
     lines.push(json!({
-        "type": "assistant", "timestamp": "2026-01-03T00:00:13.000Z", "uuid": "t18a-a-ordinary",
+        "type": "assistant", "timestamp": "2026-01-03T00:00:19.000Z", "uuid": "t18a-a-ordinary",
         "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_t18a_ordinary", "name": "cass_search",
              "input": {"query": "t18a ordinary query"}}
         ]}
     }));
     lines.push(json!({
-        "type": "user", "timestamp": "2026-01-03T00:00:14.000Z", "uuid": "t18a-r-ordinary",
+        "type": "user", "timestamp": "2026-01-03T00:00:20.000Z", "uuid": "t18a-r-ordinary",
         "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_t18a_ordinary", "content": NATIVE_ORDINARY_OUTPUT}
         ]}
@@ -688,14 +731,14 @@ fn write_claude_native_session(
         &native_search_value(NATIVE_OTHER_SERVER_BODY),
     );
     lines.push(json!({
-        "type": "assistant", "timestamp": "2026-01-03T00:00:15.000Z", "uuid": "t18a-a-other",
+        "type": "assistant", "timestamp": "2026-01-03T00:00:21.000Z", "uuid": "t18a-a-other",
         "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_t18a_other", "name": "mcp__other-mcp__cass_search",
              "input": {"query": "t18a other server query"}}
         ]}
     }));
     lines.push(json!({
-        "type": "user", "timestamp": "2026-01-03T00:00:16.000Z", "uuid": "t18a-r-other",
+        "type": "user", "timestamp": "2026-01-03T00:00:22.000Z", "uuid": "t18a-r-other",
         "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_t18a_other", "content": other}
         ]}
@@ -705,13 +748,13 @@ fn write_claude_native_session(
     // An unknown identity must fall back to the legacy judgment before any
     // argument gate, so this row adds no v2 uncovered count.
     lines.push(json!({
-        "type": "assistant", "timestamp": "2026-01-03T00:00:16.500Z", "uuid": "t18a-a-other-missing",
+        "type": "assistant", "timestamp": "2026-01-03T00:00:22.500Z", "uuid": "t18a-a-other-missing",
         "message": {"role": "assistant", "content": [
             {"type": "tool_use", "id": "toolu_t18a_other_missing", "name": "mcp__other-mcp__cass_search"}
         ]}
     }));
     lines.push(json!({
-        "type": "user", "timestamp": "2026-01-03T00:00:16.750Z", "uuid": "t18a-r-other-missing",
+        "type": "user", "timestamp": "2026-01-03T00:00:22.750Z", "uuid": "t18a-r-other-missing",
         "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_t18a_other_missing",
              "content": NATIVE_CLAUDE_OTHER_MISSING_OUTPUT}
@@ -724,13 +767,13 @@ fn write_claude_native_session(
         &native_search_value(NATIVE_UNPAIRED_BODY),
     );
     lines.push(json!({
-        "type": "user", "timestamp": "2026-01-03T00:00:17.000Z", "uuid": "t18a-u-unpaired",
+        "type": "user", "timestamp": "2026-01-03T00:00:23.000Z", "uuid": "t18a-u-unpaired",
         "message": {"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_t18a_unpaired", "content": unpaired}
         ]}
     }));
     lines.push(json!({
-        "type": "assistant", "timestamp": "2026-01-03T00:00:18.000Z", "uuid": "t18a-a-end",
+        "type": "assistant", "timestamp": "2026-01-03T00:00:24.000Z", "uuid": "t18a-a-end",
         "message": {"role": "assistant", "content": "t18a claude answer"}
     }));
 
@@ -824,33 +867,63 @@ fn write_codex_native_session(
     }));
     excluded.push(("call_t18a_c_search", control));
 
-    // Preservation control: a bare name without arguments keeps its result.
-    let bare = wrapper(
-        RecallTool::Search,
-        &native_search_value(NATIVE_CODEX_BARE_BODY),
-    );
-    lines.push(json!({
-        "timestamp": "2026-01-03T00:00:12.000Z",
-        "type": "response_item",
-        "payload": {"type": "function_call", "id": "fc-t18a-bare",
-                    "name": "cass_search", "call_id": "call_t18a_bare_missing"}
-    }));
-    lines.push(json!({
-        "timestamp": "2026-01-03T00:00:13.000Z",
-        "type": "response_item",
-        "payload": {"type": "function_call_output", "call_id": "call_t18a_bare_missing", "output": bare}
-    }));
+    // Task18e: the same four bare tools as the Claude fixture, here as native
+    // `function_call` rows without `arguments`. Each complete C04 envelope is
+    // excluded; the captured arguments only feed source extraction.
+    let bare_missing: [(&'static str, &'static str, RecallTool, Value); 4] = [
+        (
+            "call_t18a_bare_missing",
+            "cass_search",
+            RecallTool::Search,
+            native_search_value(NATIVE_CODEX_BARE_BODY),
+        ),
+        (
+            "call_t18e_bare_expand",
+            "cass_expand",
+            RecallTool::Expand,
+            native_expand_value(),
+        ),
+        (
+            "call_t18e_bare_sessions",
+            "cass_sessions",
+            RecallTool::Sessions,
+            native_sessions_value(),
+        ),
+        (
+            "call_t18e_bare_timeline",
+            "cass_timeline",
+            RecallTool::Timeline,
+            native_timeline_value(),
+        ),
+    ];
+    for (offset, (id, name, tool, value)) in bare_missing.into_iter().enumerate() {
+        let call_sec = 12 + offset * 2;
+        let result_sec = call_sec + 1;
+        lines.push(json!({
+            "timestamp": format!("2026-01-03T00:00:{call_sec:02}.000Z"),
+            "type": "response_item",
+            "payload": {"type": "function_call", "id": format!("fc-{id}"),
+                        "name": name, "call_id": id}
+        }));
+        let body = wrapper(tool, &value);
+        lines.push(json!({
+            "timestamp": format!("2026-01-03T00:00:{result_sec:02}.000Z"),
+            "type": "response_item",
+            "payload": {"type": "function_call_output", "call_id": id, "output": body}
+        }));
+        excluded.push((id, body));
+    }
 
     // Preservation control: an ordinary same-named tool.
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:14.000Z",
+        "timestamp": "2026-01-03T00:00:20.000Z",
         "type": "response_item",
         "payload": {"type": "function_call", "id": "fc-t18a-ordinary",
                     "name": "cass_search", "arguments": "{\"query\":\"t18a ordinary query\"}",
                     "call_id": "call_t18a_ordinary"}
     }));
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:15.000Z",
+        "timestamp": "2026-01-03T00:00:21.000Z",
         "type": "response_item",
         "payload": {"type": "function_call_output", "call_id": "call_t18a_ordinary",
                     "output": NATIVE_ORDINARY_OUTPUT}
@@ -862,7 +935,7 @@ fn write_codex_native_session(
         &native_search_value(NATIVE_OTHER_SERVER_BODY),
     );
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:16.000Z",
+        "timestamp": "2026-01-03T00:00:22.000Z",
         "type": "response_item",
         "payload": {"type": "function_call", "id": "fc-t18a-other",
                     "name": "mcp__other-mcp__cass_search",
@@ -870,7 +943,7 @@ fn write_codex_native_session(
                     "call_id": "call_t18a_other"}
     }));
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:17.000Z",
+        "timestamp": "2026-01-03T00:00:23.000Z",
         "type": "response_item",
         "payload": {"type": "function_call_output", "call_id": "call_t18a_other", "output": other}
     }));
@@ -879,14 +952,14 @@ fn write_codex_native_session(
     // The unknown identity falls back to the legacy judgment, so this row adds
     // no v2 uncovered count.
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:17.500Z",
+        "timestamp": "2026-01-03T00:00:23.500Z",
         "type": "response_item",
         "payload": {"type": "function_call", "id": "fc-t18a-other-missing",
                     "name": "mcp__other-mcp__cass_search",
                     "call_id": "call_t18a_other_missing"}
     }));
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:17.750Z",
+        "timestamp": "2026-01-03T00:00:23.750Z",
         "type": "response_item",
         "payload": {"type": "function_call_output", "call_id": "call_t18a_other_missing",
                     "output": NATIVE_CODEX_OTHER_MISSING_OUTPUT}
@@ -898,26 +971,26 @@ fn write_codex_native_session(
         &native_search_value(NATIVE_UNPAIRED_BODY),
     );
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:18.000Z",
+        "timestamp": "2026-01-03T00:00:24.000Z",
         "type": "response_item",
         "payload": {"type": "function_call_output", "call_id": "call_t18a_unpaired", "output": unpaired}
     }));
 
     // Preservation control: a C07 `exec` with no literal at all.
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:19.000Z",
+        "timestamp": "2026-01-03T00:00:25.000Z",
         "type": "response_item",
         "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "call_t18a_c07_missing"}
     }));
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:20.000Z",
+        "timestamp": "2026-01-03T00:00:26.000Z",
         "type": "response_item",
         "payload": {"type": "custom_tool_call_output", "call_id": "call_t18a_c07_missing",
                     "output": NATIVE_C07_MISSING_OUTPUT}
     }));
 
     lines.push(json!({
-        "timestamp": "2026-01-03T00:00:21.000Z",
+        "timestamp": "2026-01-03T00:00:27.000Z",
         "type": "response_item",
         "payload": {"type": "message", "id": "t18a-codex-a", "role": "assistant",
                     "content": [{"type": "output_text", "text": "t18a codex answer"}]}
@@ -1314,19 +1387,28 @@ fn mcp_activate_v2_watch_once() {
 
 // ---------------------------------------------------------------------------
 // Task18a: native full-name calls without captured arguments
+// Task18e: native bare-name calls without captured arguments
 // ---------------------------------------------------------------------------
 
-const NATIVE_MARKER_IDS: [&str; 10] = [
+const NATIVE_MARKER_IDS: [&str; 18] = [
     "toolu_t18a_n_search",
     "toolu_t18a_n_expand",
     "toolu_t18a_n_sessions",
     "toolu_t18a_n_timeline",
     "toolu_t18a_c_search",
+    "toolu_t18a_bare_missing",
+    "toolu_t18e_bare_expand",
+    "toolu_t18e_bare_sessions",
+    "toolu_t18e_bare_timeline",
     "call_t18a_n_search",
     "call_t18a_n_expand",
     "call_t18a_n_sessions",
     "call_t18a_n_timeline",
     "call_t18a_c_search",
+    "call_t18a_bare_missing",
+    "call_t18e_bare_expand",
+    "call_t18e_bare_sessions",
+    "call_t18e_bare_timeline",
 ];
 
 /// Every stored marker, decoded with SQLite's own `json()` (`messages.excluded`
@@ -1344,22 +1426,22 @@ fn marker_json(db: &Conn) -> Vec<Value> {
         .collect()
 }
 
-/// The literal uncovered matrix of this case under the original rules: two
-/// ordinary same-named tools (`ambiguous_tool_identity`) and four preserved
-/// candidates (`unpaired_result`: the two bare names without args and the two
-/// unpaired envelopes). The eight missing-args strong results are excluded.
+/// The literal uncovered matrix of this case: two ordinary same-named tools
+/// (`ambiguous_tool_identity`) and two unpaired envelopes
+/// (`unpaired_result`). Under Task18e the two bare names without captured
+/// arguments are positive cases, so they are measured as markers instead.
 /// Neither other-server control adds a count, with or without captured args:
 /// an unknown identity goes back through the legacy judgment before any
 /// argument gate. The C07 control has no Cass evidence and adds nothing.
 fn assert_native_activation_json(report: &Value, label: &str) {
     assert_eq!(
         report["recall_uncovered_total"].as_u64(),
-        Some(6),
-        "{label}: six literal preservation controls are counted: {report}"
+        Some(4),
+        "{label}: four literal preservation controls are counted: {report}"
     );
     assert_eq!(
         report["recall_uncovered_by_reason"],
-        json!({"ambiguous_tool_identity": 2, "unpaired_result": 4}),
+        json!({"ambiguous_tool_identity": 2, "unpaired_result": 2}),
         "{label}: the two conservative reasons only"
     );
     let stats = &report["indexing_stats"];
@@ -1401,8 +1483,8 @@ fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &s
     }
     assert_eq!(
         by_id.len(),
-        10,
-        "{label}: ten supported results are excluded: {:?}",
+        18,
+        "{label}: eighteen supported results are excluded: {:?}",
         by_id.keys().collect::<Vec<_>>()
     );
     for id in NATIVE_MARKER_IDS {
@@ -1435,28 +1517,41 @@ fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &s
         );
     }
 
-    // Source extraction still comes from the result payload alone.
-    assert_eq!(
-        by_id["toolu_t18a_n_search"]["src"]["hits"][0]["source_path"],
-        json!("/synthetic/t18a/hit.jsonl"),
-        "{label}: the claude native search source is read from the envelope"
-    );
-    assert_eq!(
-        by_id["call_t18a_n_search"]["src"]["hits"][0]["source_path"],
-        json!("/synthetic/t18a/hit.jsonl"),
-        "{label}: the codex native search source is read from the envelope"
-    );
-    assert_eq!(
-        by_id["toolu_t18a_n_sessions"]["src"]["sessions"],
-        json!(["/synthetic/t18a/list.jsonl"]),
-        "{label}: sessions source"
-    );
-    assert_eq!(
-        by_id["toolu_t18a_n_timeline"]["src"]["sessions"],
-        json!(["/synthetic/t18a/t.jsonl"]),
-        "{label}: timeline source"
-    );
-    for id in ["toolu_t18a_n_expand", "call_t18a_n_expand"] {
+    // Source extraction still comes from the result payload alone. The bare
+    // rows carry no captured arguments at all, so their sources prove that the
+    // envelope alone is enough.
+    for id in [
+        "toolu_t18a_n_search",
+        "call_t18a_n_search",
+        "toolu_t18a_bare_missing",
+        "call_t18a_bare_missing",
+    ] {
+        assert_eq!(
+            by_id[id]["src"]["hits"][0]["source_path"],
+            json!("/synthetic/t18a/hit.jsonl"),
+            "{label}: the search source is read from the envelope ({id})"
+        );
+    }
+    for id in ["toolu_t18a_n_sessions", "toolu_t18e_bare_sessions"] {
+        assert_eq!(
+            by_id[id]["src"]["sessions"],
+            json!(["/synthetic/t18a/list.jsonl"]),
+            "{label}: sessions source ({id})"
+        );
+    }
+    for id in ["toolu_t18a_n_timeline", "toolu_t18e_bare_timeline"] {
+        assert_eq!(
+            by_id[id]["src"]["sessions"],
+            json!(["/synthetic/t18a/t.jsonl"]),
+            "{label}: timeline source ({id})"
+        );
+    }
+    for id in [
+        "toolu_t18a_n_expand",
+        "call_t18a_n_expand",
+        "toolu_t18e_bare_expand",
+        "call_t18e_bare_expand",
+    ] {
         assert_eq!(
             by_id[id]["src"]["sessions"],
             json!([]),
@@ -1481,8 +1576,8 @@ fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &s
     );
     for (agent, count) in &by_agent {
         assert_eq!(
-            *count, 5,
-            "{label}: five exclusions for {agent}: {by_agent:?}"
+            *count, 9,
+            "{label}: nine exclusions for {agent}: {by_agent:?}"
         );
     }
 
@@ -1507,20 +1602,6 @@ fn assert_native_activation_db(fixture: &Fixture, world: &NativeWorld, label: &s
         );
     }
     for (id, text) in [
-        (
-            "bare claude",
-            wrapper(
-                RecallTool::Search,
-                &native_search_value(NATIVE_CLAUDE_BARE_BODY),
-            ),
-        ),
-        (
-            "bare codex",
-            wrapper(
-                RecallTool::Search,
-                &native_search_value(NATIVE_CODEX_BARE_BODY),
-            ),
-        ),
         (
             "other server",
             wrapper(

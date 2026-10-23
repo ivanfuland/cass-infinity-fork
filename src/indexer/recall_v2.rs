@@ -670,12 +670,13 @@ fn legacy_outcome(
 ///    proven read command still needs the captured args and a uniquely
 ///    locatable result block before it can be excluded;
 /// 3. a recognized Cass candidate that lacks R4 pairing or a uniquely
-///    locatable result block is preserved as `unpaired_result`; a bare
-///    identity also needs captured arguments before it can be excluded — it
-///    must **not** fall back to the legacy R1 rule, whose bare-name alias
-///    would delete an ordinary same-named tool's output. An unrecognized tool
-///    name is never a v2 candidate: it returns to the unchanged legacy
-///    judgment before any argument check;
+///    locatable result block is preserved as `unpaired_result`. Captured
+///    arguments are not an identity proof: they only feed source extraction,
+///    so a bare identity without them still reaches the envelope check in
+///    step 5. A bare identity must **not** fall back to the legacy R1 rule,
+///    whose bare-name alias would delete an ordinary same-named tool's
+///    output. An unrecognized tool name is never a v2 candidate: it returns
+///    to the unchanged legacy judgment before any check;
 /// 4. a strong identity is excluded whatever the output is (damaged output
 ///    is excluded with `src = None` and a bounded `parse_error`). Its exact
 ///    full name proves attribution, so a missing argument capture does not
@@ -749,13 +750,6 @@ pub(crate) fn decide(
         return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
     };
 
-    // Only a bare identity still needs captured arguments before it can be
-    // excluded. The exact full server-namespaced name of a strong identity
-    // proves attribution without them.
-    if matches!(kind, CandidateKind::Bare(_)) && call.args.is_none() {
-        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
-    }
-
     let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
     if target_blocks.is_empty() {
         return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
@@ -787,10 +781,12 @@ pub(crate) fn decide(
             Outcome::Exclude(Exclusion { decision, src, parse_error })
         }
         CandidateKind::Bare(tool) => {
-            let args = call
-                .args
-                .as_ref()
-                .expect("a bare identity only passes the argument gate with args");
+            // Arguments only feed source extraction; the complete C04
+            // envelope below proves the identity. `Null` is the explicit
+            // "no captured arguments" value and `extract_source` reads it as
+            // absent, so an expand invents no source.
+            let absent = Value::Null;
+            let args = call.args.as_ref().unwrap_or(&absent);
             match recall_output::decode(&msg.content, tool) {
                 Ok(value) => {
                     let src = extract_source(tool, &value, args);
@@ -1491,7 +1487,8 @@ mod tests {
     }
 
     /// The same proven pair, but the call row carried no captured arguments at
-    /// all (the native strong-identity samples this ticket fixes).
+    /// all (the native identity samples: strong names from Task18a, bare names
+    /// from Task18e).
     fn fixture_without_args(
         tool_name: &str,
         content: &str,
@@ -1581,14 +1578,128 @@ mod tests {
         );
     }
 
+    // Task18e: a complete C04 envelope proves a bare identity by itself. The
+    // captured call arguments are not an identity proof -- they only feed
+    // source extraction -- so an absent argument capture must not turn a
+    // completed recall into `unpaired_result`. The four tools are the whole
+    // positive matrix, and both supported connectors judge them the same way.
     #[test]
-    fn mcp_v2_native_missing_args_bare_name_still_preserves() {
-        let content = recall_output::encode(RecallTool::Search, &search_value()).expect("encode");
-        let (m, event, ctx) = fixture_without_args("cass_search", &content);
+    fn mcp_v2_native_missing_args_bare_four_tools_exclude_with_c04() {
+        let cases = vec![
+            (RecallTool::Search, "cass_search", search_value(), search_src()),
+            (
+                RecallTool::Expand,
+                "cass_expand",
+                json!([
+                    {"line": 1, "role": "user", "is_target": false, "content": "before"},
+                    {"line": 3, "role": "assistant", "is_target": true, "content": "target"},
+                ]),
+                RecallSrc::default(),
+            ),
+            (
+                RecallTool::Sessions,
+                "cass_sessions",
+                json!({"sessions": [{"source_id": "local", "path": "/srv/sessions/list.jsonl"}]}),
+                RecallSrc {
+                    sessions: vec!["/srv/sessions/list.jsonl".into()],
+                    hits: vec![RecallHit {
+                        source_id: "local".into(),
+                        source_path: "/srv/sessions/list.jsonl".into(),
+                        line_number: None,
+                    }],
+                },
+            ),
+            (
+                RecallTool::Timeline,
+                "cass_timeline",
+                json!({"range": {"start": 1, "end": 2}, "total_sessions": 1,
+                       "groups": {"hour": [{"source_id": "local", "source_path": "/srv/sessions/t.jsonl"}]}}),
+                RecallSrc {
+                    sessions: vec!["/srv/sessions/t.jsonl".into()],
+                    hits: vec![RecallHit {
+                        source_id: "local".into(),
+                        source_path: "/srv/sessions/t.jsonl".into(),
+                        line_number: None,
+                    }],
+                },
+            ),
+        ];
+
+        assert_eq!(cases.len(), 4, "four bare tools are the positive matrix");
+        for agent in ["claude_code", "codex"] {
+            for (tool, tool_name, value, expected_src) in &cases {
+                let wrapper = recall_output::encode(*tool, value).expect("encode");
+                let (m, event, ctx) = fixture_without_args(tool_name, &wrapper);
+                let Outcome::Exclude(exclusion) =
+                    decide(&m, 1, &event, &ctx, agent, &paths_cfg())
+                else {
+                    panic!(
+                        "{agent} {tool:?}: a paired bare identity with a complete C04 envelope \
+                         must exclude without captured arguments"
+                    );
+                };
+                assert_eq!(exclusion.parse_error, None, "{agent} {tool:?}: no parse error");
+                assert_eq!(
+                    exclusion.src.as_ref(),
+                    Some(expected_src),
+                    "{agent} {tool:?}: the source comes from the result alone"
+                );
+                assert_eq!(exclusion.decision.reason, ExclusionReason::CassRecall);
+            }
+        }
+    }
+
+    // Task18e: removing the argument gate only lets a *complete* C04 envelope
+    // prove a bare identity. Every damaged or ambiguous body still stays. The
+    // literal quantities are six non-overlapping counterexamples:
+    //   * 4 x `invalid_recall_format` -- wrong version, wrong tool, mixed
+    //     application text, truncated root;
+    //   * 1 x `ambiguous_tool_identity` -- an ordinary body under a bare name;
+    //   * 1 x `unpaired_result` -- a complete envelope with no R4 pair at all.
+    #[test]
+    fn mcp_v2_native_missing_args_bare_counterexamples_still_preserve() {
+        let invalid = [
+            r#"<cass_recall version="2" tool="cass_search">{"hits":[]}</cass_recall>"#.to_string(),
+            recall_output::encode(RecallTool::Expand, &json!([{"line": 1, "is_target": true}]))
+                .expect("encode"),
+            format!(
+                "prefix {}",
+                recall_output::encode(RecallTool::Search, &json!({"hits": []})).expect("encode")
+            ),
+            r#"<cass_recall version="1" tool="cass_search">{"hits":[]"#.to_string(),
+        ];
+        assert_eq!(invalid.len(), 4, "four damaged wrappers stay preserved");
+        for content in &invalid {
+            let (m, event, ctx) = fixture_without_args("cass_search", content);
+            assert_eq!(
+                decide(&m, 1, &event, &ctx, "codex", &paths_cfg()),
+                Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat)),
+                "a damaged bare envelope stays preserved without arguments: {content}"
+            );
+        }
+
+        let (ordinary, ordinary_event, ordinary_ctx) =
+            fixture_without_args("cass_search", "ordinary tool output");
         assert_eq!(
-            decide(&m, 1, &event, &ctx, "claude_code", &paths_cfg()),
+            decide(&ordinary, 1, &ordinary_event, &ordinary_ctx, "codex", &paths_cfg()),
+            Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
+            "an ordinary body under a bare name is ambiguous, with or without arguments"
+        );
+
+        let complete =
+            recall_output::encode(RecallTool::Search, &json!({"hits": []})).expect("encode");
+        let (unpaired, unpaired_event, _) = fixture_without_args("cass_search", &complete);
+        assert_eq!(
+            decide(
+                &unpaired,
+                1,
+                &unpaired_event,
+                &PairingContext::default(),
+                "codex",
+                &paths_cfg()
+            ),
             Outcome::Preserve(Some(UncoveredReason::UnpairedResult)),
-            "a bare name still needs captured arguments"
+            "a complete envelope without an R4 pair is never excluded"
         );
     }
 
@@ -2095,9 +2206,12 @@ mod tests {
 
     #[test]
     fn mcp_v2_mcp_r4_counterexamples_preserve_instead_of_deleting() {
-        // Missing captured args on a bare identity: attribution is unproven, so
-        // the row is preserved. (A full server-namespaced name is excluded by
-        // its exact identity even without args; that is covered by the
+        // Missing captured args on a bare identity with an ordinary body: the
+        // R4 pair resolves, so what is missing is the C04 wrapper proof, not
+        // the pairing. Task18e keeps this counterexample and only changes its
+        // diagnosed reason from `unpaired_result` to `ambiguous_tool_identity`.
+        // (A full server-namespaced name is excluded by its exact identity
+        // even without args; that is covered by the
         // `mcp_v2_native_strong_missing_args_*` tests.)
         let event = RawEvent { event_key: "ek1".into(), blocks: vec![tool_result_block(0, Some("t1"))] };
         let no_args = PairingContext::build(&[
@@ -2111,7 +2225,7 @@ mod tests {
         let message = msg("tool_result", "body");
         assert_eq!(
             decide(&message, 1, &event, &no_args, "claude_code", &paths_cfg()),
-            Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+            Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity))
         );
 
         // Call id present but the result block carries a different id.
