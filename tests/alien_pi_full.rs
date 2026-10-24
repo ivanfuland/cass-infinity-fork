@@ -1301,6 +1301,54 @@ fn result_row<'a>(run: &'a CaseRun, id: &str) -> &'a RowView {
         .unwrap_or_else(|| panic!("{}: no row for record {id}", run.label()))
 }
 
+fn text_block(text: &str) -> Value {
+    json!([{ "type": "text", "text": text }])
+}
+
+fn set_result_fields(lines: &mut [Value], result: usize, name: Option<&str>, body: Value) {
+    let message = lines[result]["message"]
+        .as_object_mut()
+        .expect("result message");
+    match name {
+        Some(name) => {
+            message.insert("toolName".into(), Value::String(name.to_string()));
+        }
+        None => {
+            message.remove("toolName");
+        }
+    }
+    message.insert("content".into(), body);
+}
+
+/// Turn P01's unique call and result into an ordinary `read` of `path` with
+/// `content` as the result body. With `declaring_user`, the ordinary user
+/// message also carries the same metadata a CASS result would: it must not
+/// work as a full-output declaration.
+fn ordinary_read(lines: &mut [Value], path: &str, content: Value, declaring_user: bool) {
+    let assistant = record_index(lines, "a");
+    let call = lines[assistant]["message"]["content"]
+        .as_array_mut()
+        .expect("assistant content")
+        .iter_mut()
+        .find(|block| block["type"].as_str() == Some("toolCall"))
+        .expect("assistant tool call");
+    call["name"] = Value::String("read".to_string());
+    call["arguments"] = json!({ "path": path });
+    let result = record_index(lines, "r-c1");
+    set_result_fields(lines, result, Some("read"), content);
+    if declaring_user {
+        let user = record_index(lines, "u");
+        let message = lines[user]["message"]
+            .as_object_mut()
+            .expect("user message");
+        message.insert(
+            "toolName".into(),
+            Value::String("mcp__cass_mcp__cass_search".to_string()),
+        );
+        message.insert("details".into(), json!({ "fullOutputPath": path }));
+    }
+}
+
 fn run_p01_derived_variants() {
     let original = fs::read(fixture_file("P01")).expect("read P01");
     let records = session_records(&original);
@@ -1737,6 +1785,144 @@ fn run_p01_derived_variants() {
             row.content,
             body,
             "{}: the ordinary tool's C04 body stays verbatim",
+            run.label()
+        );
+    }
+
+    // 13. Read control: a read of a path no CASS result ever declared is an
+    //     ordinary read even when its body happens to be a complete C04
+    //     envelope. Nothing is excluded and nothing is counted.
+    let bytes = derived_bytes("P01", |lines| {
+        ordinary_read(
+            lines,
+            "/synthetic/unrelated-note.txt",
+            text_block(&body),
+            false,
+        );
+    });
+    let runs = run_derived(
+        "v13_ordinary_read_bound_complete",
+        &bytes,
+        &derived_expected(4, 0, &[], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: an ordinary read is never excluded",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the ordinary read body stays verbatim",
+            run.label()
+        );
+    }
+
+    // 14. The same ordinary read without a result id. A read does not become
+    //     a CASS candidate through its body, so the missing id is not an
+    //     unpaired CASS result either.
+    let bytes = derived_bytes("P01", |lines| {
+        ordinary_read(
+            lines,
+            "/synthetic/unrelated-note.txt",
+            text_block(&body),
+            false,
+        );
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]
+            .as_object_mut()
+            .expect("result message")
+            .remove("toolCallId");
+    });
+    let runs = run_derived(
+        "v14_ordinary_read_missing_id_complete",
+        &bytes,
+        &derived_expected(4, 0, &[], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: an ordinary unbound read is never excluded",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the ordinary read body stays verbatim",
+            run.label()
+        );
+    }
+
+    // 15. The same ordinary read with a text block plus an image. A mixed
+    //     body is not treated as a CASS candidate either.
+    let bytes = derived_bytes("P01", |lines| {
+        ordinary_read(
+            lines,
+            "/synthetic/unrelated-note.txt",
+            json!([
+                { "type": "text", "text": body.clone() },
+                { "type": "image", "data": "synthetic" },
+            ]),
+            false,
+        );
+    });
+    let runs = run_derived(
+        "v15_ordinary_read_mixed_complete",
+        &bytes,
+        &derived_expected(4, 0, &[], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: a mixed ordinary read is never excluded",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the ordinary read text stays verbatim",
+            run.label()
+        );
+    }
+
+    // 16. An ordinary user message carrying `toolName` and
+    //     `details.fullOutputPath` for the read path is not a CASS result
+    //     declaration, so the read stays ordinary and no warning is raised.
+    let bytes = derived_bytes("P01", |lines| {
+        ordinary_read(
+            lines,
+            "/synthetic/unrelated-note.txt",
+            text_block(&body),
+            true,
+        );
+    });
+    let runs = run_derived(
+        "v16_ordinary_read_user_metadata_declaration",
+        &bytes,
+        &derived_expected(4, 0, &[], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: a user metadata field is not a declaration",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the ordinary read body stays verbatim",
+            run.label()
+        );
+        let user = result_row(run, "u");
+        assert_eq!(
+            user.extra["message"]["details"]["fullOutputPath"].as_str(),
+            Some("/synthetic/unrelated-note.txt"),
+            "{}: the user metadata itself is preserved",
             run.label()
         );
     }

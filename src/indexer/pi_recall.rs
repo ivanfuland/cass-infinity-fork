@@ -537,6 +537,12 @@ fn alignment_failure_candidates(blob_path: &Path) -> u64 {
             .enumerate()
             .map(|(idx, raw)| (idx, &raw.value)),
     );
+    let declarations = read_declarations(
+        raw_messages
+            .iter()
+            .enumerate()
+            .map(|(idx, raw)| (idx, &raw.value)),
+    );
     raw_messages
         .iter()
         .enumerate()
@@ -547,6 +553,7 @@ fn alignment_failure_candidates(blob_path: &Path) -> u64 {
                     *idx,
                     &result_body_text(&raw.value),
                     &calls_by_id,
+                    &declarations,
                 )
                 .is_some()
         })
@@ -567,7 +574,8 @@ enum PiCandidateKind {
     Foreign(RecallTool),
     /// A shell call whose own captured command or body identifies CASS.
     Shell,
-    /// A read whose body carries a complete recall envelope.
+    /// A read of a prior CASS result's declared full-output path, carrying a
+    /// complete recall envelope.
     Read,
     /// The result's own name proves nothing, but its id names exactly one
     /// earlier strong CASS call.
@@ -576,11 +584,17 @@ enum PiCandidateKind {
 
 /// The candidate kind of one native result record, or `None` when the record
 /// is not an observable CASS candidate at all.
+///
+/// `declarations` are the earlier native records that declared a CASS
+/// result's full output path. A `read` is not an identity by itself: it is a
+/// candidate only when it is bound to a read call whose path one of those
+/// records declared (see [`read_is_companion_result`]).
 fn identify_candidate(
     raw: &Value,
     result_idx: usize,
     body: &str,
     calls_by_id: &HashMap<String, Vec<CallSite>>,
+    declarations: &[ReadDeclaration],
 ) -> Option<PiCandidateKind> {
     let named = raw
         .pointer("/message/toolName")
@@ -610,8 +624,8 @@ fn identify_candidate(
                 };
             }
             if name == "read" {
-                let declares = RECALL_TOOLS.iter().any(|tool| declares_c04(body, *tool));
-                return if declares {
+                return if read_is_companion_result(raw, result_idx, body, calls_by_id, declarations)
+                {
                     Some(PiCandidateKind::Read)
                 } else {
                     id_only()
@@ -661,6 +675,80 @@ fn raw_binding_call<'a>(
         return None;
     };
     (call.call_idx < result_idx && call.tool_name == name).then_some(call)
+}
+
+/// One earlier native record that declares where a CASS result's full output
+/// was written. Only a real `toolResult` record with one of the four strong
+/// names can declare a path; a user, assistant or unknown-tool record with the
+/// same metadata fields is not a result and declares nothing.
+struct ReadDeclaration {
+    index: usize,
+    path: String,
+}
+
+/// Every earlier native record that declares a CASS `details.fullOutputPath`.
+fn read_declarations<'a>(
+    records: impl Iterator<Item = (usize, &'a Value)>,
+) -> Vec<ReadDeclaration> {
+    records
+        .filter_map(|(index, record)| {
+            if raw_role(record) != Some("toolResult") {
+                return None;
+            }
+            let name = record
+                .pointer("/message/toolName")
+                .and_then(Value::as_str)?;
+            if strong_recall_tool(name).is_none() {
+                return None;
+            }
+            let path = record
+                .pointer("/message/details/fullOutputPath")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())?;
+            Some(ReadDeclaration {
+                index,
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Whether a native `read` result is the companion of a prior CASS result.
+///
+/// All of these facts must hold, and nothing is read from disk:
+///
+/// * the result binds by its own non-empty id to exactly one earlier `read`
+///   call with the exact name (the same rule as every other Pi binding, with
+///   no R4 fallback);
+/// * that call's `arguments.path` is non-empty and equals, byte for byte, a
+///   path declared by an earlier native `toolResult` with a strong name;
+/// * the read body carries a complete C04 envelope.
+fn read_is_companion_result(
+    raw: &Value,
+    result_idx: usize,
+    body: &str,
+    calls_by_id: &HashMap<String, Vec<CallSite>>,
+    declarations: &[ReadDeclaration],
+) -> bool {
+    let Some(call) = raw_binding_call(raw, result_idx, calls_by_id) else {
+        return false;
+    };
+    if call.tool_name != "read" {
+        return false;
+    }
+    let Some(path) = call
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    declarations
+        .iter()
+        .any(|declaration| declaration.index < result_idx && declaration.path == path)
+        && RECALL_TOOLS.iter().any(|tool| declares_c04(body, *tool))
 }
 
 // ============================================================================
@@ -741,6 +829,15 @@ pub(crate) fn cleanup_pi_conversation(
             .enumerate()
             .map(|(idx, message)| (idx, &message.extra)),
     );
+    // The earlier native records that declared a CASS full output path. A
+    // read is a candidate only against one of these; the read output alone is
+    // never evidence that the file belongs to CASS.
+    let declarations = read_declarations(
+        conv.messages
+            .iter()
+            .enumerate()
+            .map(|(idx, message)| (idx, &message.extra)),
+    );
 
     for idx in 0..conv.messages.len() {
         let Some(shape) = facts.result_body_shapes.get(&idx).copied() else {
@@ -751,13 +848,13 @@ pub(crate) fn cleanup_pi_conversation(
 
         let outcome = judge_pi_result(
             &facts,
-            conv,
             &conv.messages[idx],
             idx,
             shape,
             binding,
             &body,
             &calls_by_id,
+            &declarations,
         );
         match outcome {
             Outcome::Exclude(judged) => {
@@ -795,15 +892,16 @@ pub(crate) fn cleanup_pi_conversation(
 /// record with no candidate evidence at all stays untouched and unreported.
 fn judge_pi_result(
     facts: &PiFacts,
-    conversation: &NormalizedConversation,
     message: &NormalizedMessage,
     idx: usize,
     shape: PiResultBodyShape,
     binding: Option<&PiBinding>,
     body: &str,
     calls_by_id: &HashMap<String, Vec<CallSite>>,
+    declarations: &[ReadDeclaration],
 ) -> Outcome {
-    let Some(kind) = identify_candidate(&message.extra, idx, body, calls_by_id) else {
+    let Some(kind) = identify_candidate(&message.extra, idx, body, calls_by_id, declarations)
+    else {
         return Outcome::Preserve(None);
     };
 
@@ -852,14 +950,11 @@ fn judge_pi_result(
             Outcome::Preserve(Some(UncoveredReason::UnsupportedShell))
         }
         PiCandidateKind::Read => {
-            // A read of exactly a prior CASS result's declared full output
-            // may return the same envelope. Nothing is read from disk and no
-            // response is fabricated.
-            if pi_read_is_ambiguous(Some(binding), body, conversation, idx) {
-                Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity))
-            } else {
-                Outcome::Preserve(None)
-            }
+            // Eligibility is already proven: a bound read of a prior CASS
+            // result's declared full output carrying a complete envelope. The
+            // attribution is ambiguous, so the row is preserved and counted.
+            // Nothing is read from disk and no response is fabricated.
+            Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity))
         }
         PiCandidateKind::IdOnly => {
             // The result's id names one earlier strong CASS call, but its own
@@ -905,38 +1000,6 @@ fn pi_judgment_event(event: &RawEvent, binding_id: &str) -> RawEvent {
         }
     }
     judged
-}
-
-/// Whether a bound `read` of exactly a prior CASS result's declared
-/// `details.fullOutputPath` carries a complete recall envelope.
-fn pi_read_is_ambiguous(
-    binding: Option<&PiBinding>,
-    body: &str,
-    conversation: &NormalizedConversation,
-    result_idx: usize,
-) -> bool {
-    let Some(path) = binding
-        .and_then(|binding| binding.arguments.as_ref())
-        .and_then(|args| args.get("path"))
-        .and_then(Value::as_str)
-        .filter(|path| !path.is_empty())
-    else {
-        return false;
-    };
-    let declares = RECALL_TOOLS.iter().any(|tool| declares_c04(body, *tool));
-    declares
-        && conversation.messages[..result_idx].iter().any(|message| {
-            message
-                .extra
-                .pointer("/message/toolName")
-                .and_then(Value::as_str)
-                .is_some_and(|name| strong_recall_tool(name).is_some())
-                && message
-                    .extra
-                    .pointer("/message/details/fullOutputPath")
-                    .and_then(Value::as_str)
-                    == Some(path)
-        })
 }
 
 /// True when the same record carries a copy of the result body outside the
@@ -1234,6 +1297,19 @@ mod tests {
             })
             .expect("assistant toolCall block");
         block["name"] = Value::String(name.to_string());
+    }
+
+    fn set_read_arguments(lines: &mut [Value], assistant: usize, path: &str) {
+        let block = lines[assistant]
+            .pointer_mut("/message/content")
+            .and_then(Value::as_array_mut)
+            .and_then(|blocks| {
+                blocks
+                    .iter_mut()
+                    .find(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
+            })
+            .expect("assistant toolCall block");
+        block["arguments"] = serde_json::json!({ "path": path });
     }
 
     fn set_result_fields(lines: &mut [Value], result: usize, name: Option<&str>, body: Value) {
@@ -1643,15 +1719,24 @@ mod tests {
         _dir: TempDir,
     }
 
-    fn p01_lines() -> Vec<Value> {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl");
+    fn full_fixture_lines(id: &str) -> Vec<Value> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "tests/fixtures/alien_pi_full/2026-10-24T00-00-00_{id}.jsonl"
+        ));
         fs::read_to_string(fixture)
             .unwrap()
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    fn p01_lines() -> Vec<Value> {
+        full_fixture_lines("P01")
+    }
+
+    fn p17_lines() -> Vec<Value> {
+        full_fixture_lines("P17")
     }
 
     fn project_full(tag: &str, lines: &[Value]) -> FullVariant {
@@ -1691,37 +1776,60 @@ mod tests {
     /// line: the result itself leaves the one-to-one mapping while the blob
     /// keeps its valid native record.
     fn unmapped_result(variant: &mut FullVariant) {
-        variant.conversation.messages[2].extra["message"]["content"] =
+        unmap_message(variant, 2);
+    }
+
+    /// Derive one canonical message's extra so it no longer equals any blob
+    /// line while the blob keeps its valid native record.
+    fn unmap_message(variant: &mut FullVariant, idx: usize) {
+        variant.conversation.messages[idx].extra["message"]["content"] =
             Value::String("derived mismatch".to_string());
     }
 
     fn assert_one_unpaired_alignment(variant: &mut FullVariant, label: &str) {
+        assert_alignment_unpaired_at(variant, label, 2, 1);
+    }
+
+    /// One alignment-failure check: the canonical message at `unmapped_idx`
+    /// left the mapping, the whole session stays unchanged, and the raw
+    /// candidates are counted exactly `expected_unpaired` times.
+    fn assert_alignment_unpaired_at(
+        variant: &mut FullVariant,
+        label: &str,
+        unmapped_idx: usize,
+        expected_unpaired: u64,
+    ) {
         let facts = PiFacts::build(&variant.blob, &variant.conversation);
+        let messages = variant.conversation.messages.len();
         assert!(!facts.alignment_ok, "{label}: alignment must fail");
         assert_eq!(
-            facts.events[2].event_key, "",
-            "{label}: the strong result is outside the canonical mapping"
+            facts.events[unmapped_idx].event_key, "",
+            "{label}: the unmapped record is outside the canonical mapping"
         );
         let before = serde_json::to_value(&variant.conversation.messages).unwrap();
 
         let outcome = cleanup_pi_conversation(
             &variant.blob,
             &mut variant.conversation,
-            "derived/P01.jsonl",
+            "derived/full.jsonl",
             false,
         );
 
         assert!(outcome.alignment_failed, "{label}: alignment failure");
-        assert_eq!(outcome.event_count, 4, "{label}: event count");
+        assert_eq!(outcome.event_count, messages, "{label}: event count");
         assert_eq!(
             outcome.excluded,
-            vec![None; 4],
+            vec![None; messages],
             "{label}: an alignment failure excludes nothing"
         );
+        let expected = if expected_unpaired == 0 {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([("unpaired_result".to_string(), expected_unpaired)])
+        };
         assert_eq!(
-            outcome.uncovered_by_reason,
-            BTreeMap::from([("unpaired_result".to_string(), 1)]),
-            "{label}: exactly one raw candidate is counted"
+            outcome.uncovered_by_reason, expected,
+            "{label}: raw candidates are counted once each"
         );
         assert_eq!(
             serde_json::to_value(&variant.conversation.messages).unwrap(),
@@ -1863,5 +1971,85 @@ mod tests {
         let mut variant = project_full("align-wrong-name", &wrong_lines);
         unmapped_result(&mut variant);
         assert_one_unpaired_alignment(&mut variant, "E wrong result name outside the mapping");
+
+        // Sub-case F: an ordinary read of a path no CASS result declared. Its
+        // body is the complete envelope, yet the read is not a CASS companion
+        // and the raw count is zero.
+        let mut read_lines = original.clone();
+        let assistant = role_line(&read_lines, "assistant");
+        let result = role_line(&read_lines, "toolResult");
+        let body = read_lines[result]["message"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        set_call_name(&mut read_lines, assistant, "read");
+        set_read_arguments(&mut read_lines, assistant, "/synthetic/unrelated-note.txt");
+        set_result_fields(&mut read_lines, result, Some("read"), text_block(&body));
+        let mut variant = project_full("align-read-ordinary", &read_lines);
+        unmapped_result(&mut variant);
+        assert_alignment_unpaired_at(&mut variant, "F ordinary read outside the mapping", 2, 0);
+
+        // Sub-case G: the same ordinary read, with the user record carrying
+        // `toolName` and `details.fullOutputPath`. A user message is not a
+        // result and cannot declare the read as a CASS companion.
+        let mut fake_declaration = read_lines.clone();
+        let user = role_line(&fake_declaration, "user");
+        fake_declaration[user]["message"]["toolName"] =
+            Value::String("mcp__cass_mcp__cass_search".to_string());
+        fake_declaration[user]["message"]["details"] = serde_json::json!({
+            "fullOutputPath": "/synthetic/unrelated-note.txt",
+        });
+        let mut variant = project_full("align-read-user-declaration", &fake_declaration);
+        unmapped_result(&mut variant);
+        assert_alignment_unpaired_at(
+            &mut variant,
+            "G user metadata declaration outside the mapping",
+            2,
+            0,
+        );
+
+        // Sub-case H: the real P17 chain. The clean session proves the read of
+        // the declared path and diagnoses it as ambiguous. Once the read
+        // result leaves the mapping, the raw count is the strong CASS result
+        // plus that proven read, and the whole session stays unchanged.
+        let original_p17 = p17_lines();
+        let mut clean = project_full("read-p17-clean", &original_p17);
+        let clean_facts = PiFacts::build(&clean.blob, &clean.conversation);
+        assert!(clean_facts.alignment_ok, "H: P17 projection aligns");
+        assert_eq!(
+            clean_facts.candidate_result_indices,
+            BTreeSet::from([2]),
+            "H: the structural hint sees the strong CASS result"
+        );
+        let mut clean_conversation = clean.conversation;
+        let clean_outcome = cleanup_pi_conversation(
+            &clean.blob,
+            &mut clean_conversation,
+            "derived/full.jsonl",
+            false,
+        );
+        assert_eq!(
+            clean_outcome
+                .excluded
+                .iter()
+                .filter(|marker| marker.is_some())
+                .count(),
+            1,
+            "H: the strong CASS result is the excluded row"
+        );
+        assert_eq!(
+            clean_outcome.uncovered_by_reason,
+            BTreeMap::from([("ambiguous_tool_identity".to_string(), 1)]),
+            "H: the read of the declared path is a proven companion"
+        );
+
+        let mut variant = project_full("read-p17-unmapped", &original_p17);
+        unmap_message(&mut variant, 4);
+        assert_alignment_unpaired_at(
+            &mut variant,
+            "H strong result and proven read outside the mapping",
+            4,
+            2,
+        );
     }
 }
