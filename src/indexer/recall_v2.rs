@@ -28,7 +28,7 @@ use serde_json::Value;
 use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::indexer::exclusion::{
     self, BlockKind, Decision, ExcludedMarker, ExclusionAnchor, ExclusionReason, ExtraFieldMap,
-    PairingContext, RawEvent, RecallHit, RecallSrc,
+    PairedTool, PairingContext, RawEvent, RecallHit, RecallSrc,
 };
 use crate::indexer::redact_secrets::MemoizingRedactor;
 use crate::recall_output::{self, RecallTool};
@@ -611,7 +611,7 @@ fn shell_command_key(tool_name: &str, agent_slug: &str) -> Option<&'static str> 
 /// True when the raw text contains any `cass_recall` opening tag. Used only
 /// to separate "looks like a wrapper but is invalid" from "plain output" for
 /// bare-name candidates; it is never used to extract a payload.
-fn looks_like_recall_wrapper(content: &str) -> bool {
+pub(crate) fn looks_like_recall_wrapper(content: &str) -> bool {
     content.contains("<cass_recall")
 }
 
@@ -657,7 +657,93 @@ fn legacy_outcome(
     }
 }
 
+/// The attribution strength a caller has already established for one direct
+/// tool result. The old v2 entry derives it from its own name table; the Pi
+/// consumer derives it from the captured Pi tool identity. The shared core
+/// below never re-classifies a name, so a caller cannot silently gain or lose
+/// an identity through this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectToolCategory {
+    Strong(RecallTool),
+    Bare(RecallTool),
+}
+
+/// The direct tool-result judgment core, shared by the old v2 entry and the
+/// Pi consumer (ticket 02).
+///
+/// It receives facts, not identity: `msg` is the message whose body is read,
+/// `event` locates the result blocks, `call` supplies the anchor identity and
+/// the argument map, and `category` states the already-proven attribution.
+/// The result-block lookup, the `Decision` construction and the Strong/Bare
+/// outcome rules are identical for both callers, so a later change to one
+/// cannot diverge from the other.
+pub(crate) fn judge_direct_tool_result(
+    msg: &NormalizedMessage,
+    event: &RawEvent,
+    call: &PairedTool,
+    category: DirectToolCategory,
+) -> Outcome {
+    let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
+    if target_blocks.is_empty() {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    }
+
+    let decision = Decision {
+        reason: ExclusionReason::CassRecall,
+        anchor: ExclusionAnchor {
+            tool_call_id: call.tool_call_id.clone(),
+            tool_name: Some(call.tool_name.clone()),
+            paths: None,
+            shell: None,
+        },
+        event_key: event.event_key.clone(),
+        target_blocks,
+    };
+
+    match category {
+        DirectToolCategory::Strong(tool) => {
+            // Arguments only feed source extraction. `Null` is the explicit
+            // "no captured arguments" value and `extract_source` reads it as
+            // absent, so nothing is defaulted or invented.
+            let absent = Value::Null;
+            let args = call.args.as_ref().unwrap_or(&absent);
+            let (src, parse_error) = match parse_result(tool, &msg.content, args) {
+                Ok(src) => (Some(src), None),
+                Err(reason) => (None, Some(reason.to_string())),
+            };
+            Outcome::Exclude(Exclusion {
+                decision,
+                src,
+                parse_error,
+            })
+        }
+        DirectToolCategory::Bare(tool) => {
+            // Arguments only feed source extraction; the complete C04
+            // envelope below proves the identity. `Null` is the explicit
+            // "no captured arguments" value and `extract_source` reads it as
+            // absent, so an expand invents no source.
+            let absent = Value::Null;
+            let args = call.args.as_ref().unwrap_or(&absent);
+            match recall_output::decode(&msg.content, tool) {
+                Ok(value) => {
+                    let src = extract_source(tool, &value, args);
+                    Outcome::Exclude(Exclusion {
+                        decision,
+                        src: Some(src),
+                        parse_error: None,
+                    })
+                }
+                Err(_) if looks_like_recall_wrapper(&msg.content) => {
+                    Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
+                }
+                Err(_) => Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
+            }
+        }
+    }
+}
+
 /// v2 judgment. The signature mirrors the legacy `decide` exactly so a later
+
 /// ingest ticket can swap the call without reshaping its inputs.
 ///
 /// Order is fixed:
@@ -750,55 +836,11 @@ pub(crate) fn decide(
         return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
     };
 
-    let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
-    if target_blocks.is_empty() {
-        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
-    }
-
-    let decision = Decision {
-        reason: ExclusionReason::CassRecall,
-        anchor: ExclusionAnchor {
-            tool_call_id: call.tool_call_id.clone(),
-            tool_name: Some(call.tool_name.clone()),
-            paths: None,
-            shell: None,
-        },
-        event_key: event.event_key.clone(),
-        target_blocks,
+    let category = match kind {
+        CandidateKind::Strong(tool) => DirectToolCategory::Strong(tool),
+        CandidateKind::Bare(tool) => DirectToolCategory::Bare(tool),
     };
-
-    match kind {
-        CandidateKind::Strong(tool) => {
-            // Arguments only feed source extraction. `Null` is the explicit
-            // "no captured arguments" value and `extract_source` reads it as
-            // absent, so nothing is defaulted or invented.
-            let absent = Value::Null;
-            let args = call.args.as_ref().unwrap_or(&absent);
-            let (src, parse_error) = match parse_result(tool, &msg.content, args) {
-                Ok(src) => (Some(src), None),
-                Err(reason) => (None, Some(reason.to_string())),
-            };
-            Outcome::Exclude(Exclusion { decision, src, parse_error })
-        }
-        CandidateKind::Bare(tool) => {
-            // Arguments only feed source extraction; the complete C04
-            // envelope below proves the identity. `Null` is the explicit
-            // "no captured arguments" value and `extract_source` reads it as
-            // absent, so an expand invents no source.
-            let absent = Value::Null;
-            let args = call.args.as_ref().unwrap_or(&absent);
-            match recall_output::decode(&msg.content, tool) {
-                Ok(value) => {
-                    let src = extract_source(tool, &value, args);
-                    Outcome::Exclude(Exclusion { decision, src: Some(src), parse_error: None })
-                }
-                Err(_) if looks_like_recall_wrapper(&msg.content) => {
-                    Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
-                }
-                Err(_) => Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
-            }
-        }
-    }
+    judge_direct_tool_result(msg, event, call, category)
 }
 
 // ============================================================================

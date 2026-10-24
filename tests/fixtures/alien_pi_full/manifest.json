@@ -1,0 +1,224 @@
+{
+  "schema": "cass-alien-pi-full-fixtures/1",
+  "synthetic": true,
+  "cases": [
+    {
+      "id": "P01",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P01.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P02",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P02.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P03",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P03.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P04",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P04.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P05",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P05.jsonl",
+      "expected": {
+        "messages": 5,
+        "recall_excluded": 2,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P06",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P06.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 1,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P07",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P07.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {
+          "unpaired_result": 1
+        },
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P08",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P08.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {
+          "ambiguous_tool_identity": 1
+        },
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P09",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P09.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P10",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P10.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {
+          "unpaired_result": 1
+        },
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P11",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P11.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {
+          "unpaired_result": 1
+        },
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P12",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P12.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 1,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P13",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P13.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {
+          "unpaired_result": 1
+        },
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P14",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P14.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 0,
+        "uncovered": {
+          "unpaired_result": 1
+        },
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P15",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P15.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P16",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P16.jsonl",
+      "expected": {
+        "messages": 4,
+        "recall_excluded": 1,
+        "uncovered": {},
+        "parse_error_markers": 0,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    },
+    {
+      "id": "P17",
+      "file": "fixtures/pi-full/2026-10-24T00-00-00_P17.jsonl",
+      "expected": {
+        "messages": 6,
+        "recall_excluded": 1,
+        "uncovered": {
+          "ambiguous_tool_identity": 1
+        },
+        "parse_error_markers": 1,
+        "ordinary_user": "ordinary synthetic user",
+        "ordinary_final": "ordinary synthetic answer"
+      }
+    }
+  ]
+}

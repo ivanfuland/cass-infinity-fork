@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"synthetic-P13","timestamp":"2026-10-24T00:00:00.000Z","cwd":"/synthetic/alien"}
+{"type":"message","id":"u","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"ordinary synthetic user"}]}}
+{"type":"message","id":"a","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"mcp__cass_mcp__cass_search","arguments":{"query":"synthetic alien"}}]}}
+{"type":"message","id":"r-c1","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"<cass_recall version=\"1\" tool=\"cass_search\">{&quot;query&quot;:&quot;synthetic alien&quot;,&quot;hits&quot;:[{&quot;source_id&quot;:&quot;local&quot;,&quot;source_path&quot;:&quot;/synthetic/alien/session.jsonl&quot;,&quot;line_number&quot;:1,&quot;content&quot;:&quot;synthetic recalled body&quot;}]}</cass_recall>"}],"toolCallId":"c1","isError":false}}
+{"type":"message","id":"z","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ordinary synthetic answer"}]}}

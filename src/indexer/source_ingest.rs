@@ -3648,6 +3648,7 @@ fn safety_pass(
             prepared: crate::indexer::exclusion::PreparedConversation {
                 conv: conversations[idx].clone(),
                 excluded: markers[idx].clone(),
+                recall_uncovered_by_reason: std::collections::BTreeMap::new(),
             },
             claims: item.claims.clone(),
         })
