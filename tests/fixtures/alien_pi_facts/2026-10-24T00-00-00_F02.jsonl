@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"synthetic-F02","timestamp":"2026-10-24T00:00:00.000Z","cwd":"/synthetic/alien"}
+{"type":"message","id":"u","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"ordinary synthetic user"}]}}
+{"type":"message","id":"a","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"mcp__cass_mcp__cass_search","arguments":{"query":"synthetic alien"}}]}}
+{"type":"message","id":"r-c1","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"toolResult","content":[{"type":"text","text":"synthetic tool result"}],"toolCallId":"c1","toolName":"mcp__cass_mcp__cass_search","isError":false}}
+{"type":"message","id":"z","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ordinary synthetic answer"}]}}
