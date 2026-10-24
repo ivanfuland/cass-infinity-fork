@@ -824,24 +824,295 @@ enum ExecTarget {
     Mcp(RecallTool),
 }
 
-/// Split the fixed C07 expression and parse `J` as one JSON object. Any
-/// other JavaScript shape (unquoted keys, variables, templates, loops,
-/// multiple calls/statements, unknown methods) returns `None`.
+/// Split the fixed C07 expression and parse `J`. The `exec_command` branch is
+/// unchanged: exactly `text(await tools.exec_command(J));` with `J` one strict
+/// JSON object. The four MCP methods use the limited literal grammar of
+/// ticket 06: whitespace between the outer tokens, double-quoted JSON strings,
+/// decimal safe integers, booleans, null, arrays, and objects whose keys are
+/// JSON strings or ASCII identifiers, with one optional trailing comma.
+/// Anything else (unquoted CLI keys, variables, templates, spreads, computed
+/// keys, accessors, comments, calls, operators, unknown methods) returns
+/// `None`. Nothing here evaluates JavaScript.
 fn parse_exec_literal(expression: &str) -> Option<(ExecTarget, Value)> {
-    let body = expression.trim().strip_prefix("text(await tools.")?.strip_suffix("));")?;
+    if let Some(input) = exact_exec_command_input(expression) {
+        let value: Value = serde_json::from_str(input).ok()?;
+        return value.is_object().then_some((ExecTarget::Cli, value));
+    }
+    let (tool, args) = parse_mcp_call_literal(expression)?;
+    Some((ExecTarget::Mcp(tool), args))
+}
+
+/// The unchanged C07 `exec_command` form: exactly
+/// `text(await tools.exec_command(J));` with `J` one strict JSON object. The
+/// ticket 06 literal grammar is never applied to this method.
+fn exact_exec_command_input(expression: &str) -> Option<&str> {
+    let body = expression
+        .trim()
+        .strip_prefix("text(await tools.")?
+        .strip_suffix("));")?;
     let open = body.find('(')?;
-    let method = &body[..open];
-    let input = &body[open + 1..];
-    let target = match method {
-        "exec_command" => ExecTarget::Cli,
-        "mcp__cass_mcp__cass_search" => ExecTarget::Mcp(RecallTool::Search),
-        "mcp__cass_mcp__cass_expand" => ExecTarget::Mcp(RecallTool::Expand),
-        "mcp__cass_mcp__cass_sessions" => ExecTarget::Mcp(RecallTool::Sessions),
-        "mcp__cass_mcp__cass_timeline" => ExecTarget::Mcp(RecallTool::Timeline),
+    if &body[..open] != "exec_command" {
+        return None;
+    }
+    Some(&body[open + 1..])
+}
+
+/// The largest magnitude a literal integer argument may carry.
+const MAX_SAFE_LITERAL_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Keys that would reach the JavaScript prototype chain. They are never data,
+/// so a literal that sets one anywhere is refused, including an escaped
+/// spelling that decodes to the same name.
+const PROTOTYPE_KEYS: [&str; 3] = ["__proto__", "prototype", "constructor"];
+
+/// Parse one `text(await tools.mcp__cass_mcp__cass_*(ARGS));` expression.
+/// Leading/trailing whitespace and whitespace between the outer tokens are
+/// allowed; the expression must end at the single closing semicolon.
+fn parse_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)> {
+    let mut parser = LiteralParser::new(expression);
+    parser.skip_whitespace();
+    parser.expect_keyword("text")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    parser.expect_keyword("await")?;
+    parser.skip_whitespace();
+    parser.expect_keyword("tools")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'.')?;
+    parser.skip_whitespace();
+    let tool = match parser.take_identifier()? {
+        "mcp__cass_mcp__cass_search" => RecallTool::Search,
+        "mcp__cass_mcp__cass_expand" => RecallTool::Expand,
+        "mcp__cass_mcp__cass_sessions" => RecallTool::Sessions,
+        "mcp__cass_mcp__cass_timeline" => RecallTool::Timeline,
         _ => return None,
     };
-    let value: Value = serde_json::from_str(input).ok()?;
-    value.is_object().then_some((target, value))
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    let args = parser.parse_value()?;
+    if !args.is_object() {
+        return None;
+    }
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b';')?;
+    parser.skip_whitespace();
+    parser.at_end().then_some((tool, args))
+}
+
+/// A byte-oriented reader for the limited literal grammar above. It only ever
+/// slices at ASCII boundaries: quotes, braces and the fixed outer tokens.
+struct LiteralParser<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> LiteralParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            bytes: text.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Option<()> {
+        if self.peek() != Some(expected) {
+            return None;
+        }
+        self.pos += 1;
+        Some(())
+    }
+
+    fn expect_keyword(&mut self, keyword: &str) -> Option<()> {
+        let end = self.pos.checked_add(keyword.len())?;
+        if self.text.get(self.pos..end)? != keyword {
+            return None;
+        }
+        self.pos = end;
+        Some(())
+    }
+
+    fn take_identifier(&mut self) -> Option<&'a str> {
+        let start = self.pos;
+        if !self.peek().is_some_and(identifier_start) {
+            return None;
+        }
+        self.pos += 1;
+        while self.peek().is_some_and(identifier_continue) {
+            self.pos += 1;
+        }
+        Some(&self.text[start..self.pos])
+    }
+
+    fn parse_value(&mut self) -> Option<Value> {
+        match self.peek()? {
+            b'"' => self.parse_string().map(Value::String),
+            b'{' => self.parse_object(),
+            b'[' => self.parse_array(),
+            b'-' | b'0'..=b'9' => self.parse_integer(),
+            b't' => self.expect_keyword("true").map(|()| Value::Bool(true)),
+            b'f' => self.expect_keyword("false").map(|()| Value::Bool(false)),
+            b'n' => self.expect_keyword("null").map(|()| Value::Null),
+            _ => None,
+        }
+    }
+
+    /// One JSON double-quoted string. The raw slice, escapes included, is
+    /// decoded by `serde_json`; keys are compared after that decode so an
+    /// escaped alias is the same key.
+    fn parse_string(&mut self) -> Option<String> {
+        let start = self.pos;
+        self.expect_byte(b'"')?;
+        loop {
+            match self.peek()? {
+                b'"' => {
+                    self.pos += 1;
+                    return serde_json::from_str(&self.text[start..self.pos]).ok();
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    self.peek()?;
+                    self.pos += 1;
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// A decimal safe integer: no sign but `-`, no leading zero, no negative
+    /// zero, no fraction or exponent, magnitude at most 2^53 - 1.
+    fn parse_integer(&mut self) -> Option<Value> {
+        let negative = self.peek() == Some(b'-');
+        if negative {
+            self.pos += 1;
+        }
+        let digits_start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.pos == digits_start {
+            return None;
+        }
+        let digits = &self.text[digits_start..self.pos];
+        if digits.len() > 1 && digits.starts_with('0') {
+            return None;
+        }
+        if negative && digits == "0" {
+            return None;
+        }
+        if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+            return None;
+        }
+        let magnitude: u64 = digits.parse().ok()?;
+        if magnitude > MAX_SAFE_LITERAL_INTEGER {
+            return None;
+        }
+        if negative {
+            Some(Value::from(-(magnitude as i64)))
+        } else {
+            Some(Value::from(magnitude))
+        }
+    }
+
+    /// One object literal. Keys are double-quoted strings or ASCII
+    /// identifiers. A repeated decoded key, a prototype key, or more than one
+    /// trailing comma is refused.
+    fn parse_object(&mut self) -> Option<Value> {
+        self.expect_byte(b'{')?;
+        let mut members = serde_json::Map::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Some(Value::Object(members));
+        }
+        loop {
+            let key = match self.peek()? {
+                b'"' => self.parse_string()?,
+                _ => self.take_identifier()?.to_string(),
+            };
+            if members.contains_key(&key) || PROTOTYPE_KEYS.contains(&key.as_str()) {
+                return None;
+            }
+            self.skip_whitespace();
+            self.expect_byte(b':')?;
+            self.skip_whitespace();
+            let value = self.parse_value()?;
+            members.insert(key, value);
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                    // One trailing comma is allowed; a second one is not.
+                    if self.peek() == Some(b'}') {
+                        self.pos += 1;
+                        return Some(Value::Object(members));
+                    }
+                }
+                b'}' => {
+                    self.pos += 1;
+                    return Some(Value::Object(members));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// One array literal under the JSON rules: comma separated, no trailing
+    /// comma.
+    fn parse_array(&mut self) -> Option<Value> {
+        self.expect_byte(b'[')?;
+        let mut items = Vec::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Some(Value::Array(items));
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                }
+                b']' => {
+                    self.pos += 1;
+                    return Some(Value::Array(items));
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+fn identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$'
+}
+
+fn identifier_continue(byte: u8) -> bool {
+    identifier_start(byte) || byte.is_ascii_digit()
 }
 
 /// One `input_text` block's text, with no other block type accepted.
@@ -3433,6 +3704,236 @@ mod tests {
 
     fn assert_preserved(outcome: Outcome, reason: UncoveredReason) {
         assert_eq!(outcome, Outcome::Preserve(Some(reason)));
+    }
+
+    // ========================================================================
+    // Ticket 06: the frozen L01-L24 and B01-B20 literal matrix.
+    //
+    // Both fixtures are copied byte-for-byte from the batch roadmap and are
+    // compiled in here, so the assertions cannot drift from the frozen input.
+    // Each case ID appears exactly once; the B cases attach to the test of
+    // their declared `parent_test_case` rather than adding named targets.
+    // ========================================================================
+
+    const ALIEN_LITERALS: &str = include_str!("../../tests/fixtures/alien_codex/literals.json");
+    const ALIEN_LITERAL_BOUNDARIES: &str =
+        include_str!("../../tests/fixtures/alien_codex/literal_boundaries.json");
+
+    fn alien_case(fixture: &str, id: &str) -> Value {
+        let root: Value = serde_json::from_str(fixture).expect("frozen fixture JSON");
+        let matches: Vec<&Value> = root["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .filter(|case| case["id"].as_str() == Some(id))
+            .collect();
+        assert_eq!(matches.len(), 1, "case {id} must appear exactly once");
+        matches[0].clone()
+    }
+
+    fn alien_literal_case(id: &str) -> Value {
+        alien_case(ALIEN_LITERALS, id)
+    }
+
+    fn alien_boundary_case(id: &str) -> Value {
+        alien_case(ALIEN_LITERAL_BOUNDARIES, id)
+    }
+
+    fn recall_tool_method(tool: RecallTool) -> &'static str {
+        match tool {
+            RecallTool::Search => "mcp__cass_mcp__cass_search",
+            RecallTool::Expand => "mcp__cass_mcp__cass_expand",
+            RecallTool::Sessions => "mcp__cass_mcp__cass_sessions",
+            RecallTool::Timeline => "mcp__cass_mcp__cass_timeline",
+        }
+    }
+
+    fn alien_tool_value(tool: RecallTool) -> Value {
+        match tool {
+            RecallTool::Search => search_value(),
+            RecallTool::Expand => expand_value(),
+            RecallTool::Sessions => sessions_value(),
+            RecallTool::Timeline => timeline_value(),
+        }
+    }
+
+    /// Judge one frozen case the way production does. A supported case must
+    /// parse to the exact method and the original argument value, and the
+    /// same expression fed through the existing `exec_fixture` /
+    /// `decide_for_record` path with a complete MCP record must really be
+    /// excluded. An unsupported case must parse to `None` and reach the
+    /// production `unsupported_shell` preserve; a C04 result is supplied so
+    /// the row is a proven candidate, which is the only way that bounded
+    /// reason can be reached.
+    fn assert_alien_literal_case(case: &Value) {
+        let id = case["id"].as_str().expect("case id");
+        let expression = case["expression"].as_str().expect("case expression");
+        let expected = &case["expected"];
+        let supported = expected["supported"].as_bool().expect("case supported");
+        println!("case {id}: supported={supported}");
+
+        if supported {
+            let (target, args) = parse_exec_literal(expression)
+                .unwrap_or_else(|| panic!("{id}: expected a supported literal"));
+            let ExecTarget::Mcp(tool) = target else {
+                panic!("{id}: only the four MCP methods are supported");
+            };
+            let method = expected["method"].as_str().expect("case method");
+            assert_eq!(recall_tool_method(tool), method, "{id}: method");
+            assert_eq!(args, expected["args"], "{id}: original argument value");
+
+            let wrapper = recall_output::encode(tool, &alien_tool_value(tool))
+                .expect("frozen wrapper encodes");
+            let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("{id}: the production path must exclude this literal, got {outcome:?}");
+            };
+            assert!(judged.parse_error.is_none(), "{id}: no parse error");
+            println!("case {id}: excluded through decide_for_record");
+        } else {
+            assert!(
+                parse_exec_literal(expression).is_none(),
+                "{id}: an unsupported literal must not parse"
+            );
+            let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+                .expect("frozen wrapper encodes");
+            let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            println!("case {id}: preserved unsupported_shell");
+        }
+    }
+
+    fn assert_alien_literal_group(id: &str, boundary_ids: &[&str]) {
+        assert_alien_literal_case(&alien_literal_case(id));
+        for boundary_id in boundary_ids {
+            let case = alien_boundary_case(boundary_id);
+            assert_eq!(
+                case["parent_test_case"].as_str(),
+                Some(id),
+                "{boundary_id} must attach to {id}"
+            );
+            assert_alien_literal_case(&case);
+        }
+    }
+
+    #[test]
+    fn alien_codex_literal_l01() {
+        assert_alien_literal_group("L01", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l02() {
+        assert_alien_literal_group("L02", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l03() {
+        assert_alien_literal_group("L03", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l04() {
+        assert_alien_literal_group("L04", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l05() {
+        assert_alien_literal_group("L05", &["B01", "B02", "B03", "B04", "B20"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l06() {
+        assert_alien_literal_group("L06", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l07() {
+        assert_alien_literal_group("L07", &["B12"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l08() {
+        assert_alien_literal_group("L08", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l09() {
+        assert_alien_literal_group("L09", &["B05"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l10() {
+        assert_alien_literal_group("L10", &["B06"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l11() {
+        assert_alien_literal_group("L11", &["B07"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l12() {
+        assert_alien_literal_group("L12", &["B08"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l13() {
+        assert_alien_literal_group("L13", &["B09", "B10", "B11"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l14() {
+        assert_alien_literal_group("L14", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l15() {
+        assert_alien_literal_group("L15", &["B13"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l16() {
+        assert_alien_literal_group("L16", &["B14"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l17() {
+        assert_alien_literal_group("L17", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l18() {
+        assert_alien_literal_group("L18", &["B15"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l19() {
+        assert_alien_literal_group("L19", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l20() {
+        assert_alien_literal_group("L20", &["B16", "B17", "B18"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l21() {
+        assert_alien_literal_group("L21", &["B19"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l22() {
+        assert_alien_literal_group("L22", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l23() {
+        assert_alien_literal_group("L23", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l24() {
+        assert_alien_literal_group("L24", &[]);
     }
 
     /// Task10: the candidate hint separates ordinary `exec` work (a date
