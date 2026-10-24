@@ -1,18 +1,18 @@
-// Dead-code tolerated module-wide: ticket 01 of the `cass-alien-fresh-ingest`
-// batch lands the Pi structural facts ahead of the consumer. The Pi cleanup
-// ticket (02) reads `PiFacts`, its bindings, candidate results and body shapes
-// when it runs the shared v2 recall judgment for `pi_agent`; until then the
-// only readers are this module's own tests.
+// Dead-code tolerated module-wide: the structural facts and the cleanup
+// consumer share helpers whose only caller inside a single build may be the
+// other one. The Pi cleanup ticket (02) consumes `PiFacts`, its bindings,
+// candidate results and body shapes, and runs the shared v2 recall judgment
+// for `pi_agent`; the facts module's own tests remain the second reader.
 #![allow(dead_code)]
 
-//! Ticket 01 (`cass-alien-fresh-ingest`): Pi raw-event facts and unique
-//! tool-call binding.
+//! Tickets 01 and 02 (`cass-alien-fresh-ingest`): Pi raw-event facts, unique
+//! tool-call binding, and the full-cleanup consumer.
 //!
-//! Structural expansion only. This module builds the internal facts that the
-//! later Pi cleanup ticket (02) consumes to run the shared v2 recall judgment
-//! for `pi_agent`. It makes no exclusion decision, adds no CLI/MCP surface,
-//! changes no legacy `PairingContext` branch and does not claim that Pi recall
-//! cleaning is finished.
+//! Ticket 01 builds the structural facts. Ticket 02 judges and clears the
+//! proven CASS recall results of a `pi_agent` conversation through the same
+//! direct-tool core the old v2 entry uses. Neither ticket adds a CLI/MCP
+//! surface, changes a legacy `PairingContext` branch, or opens the old
+//! `cass_supported_agent` gate for Pi.
 //!
 //! The facts are built from two inputs that must describe the same bytes:
 //!
@@ -28,8 +28,15 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::connectors::NormalizedConversation;
-use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+use crate::connectors::{NormalizedConversation, NormalizedMessage};
+use crate::indexer::exclusion::{
+    BlockKind, ExcludedMarker, PairedTool, RawBlock, RawEvent, field_map_for,
+};
+use crate::indexer::recall_v2::{
+    DirectToolCategory, Outcome, UncoveredReason, apply_with_redaction, judge_direct_tool_result,
+    looks_like_recall_wrapper, parse_cli,
+};
+use crate::indexer::redact_secrets::MemoizingRedactor;
 use crate::recall_output::{RecallTool, decode};
 
 /// The four strong Pi tool identities from spec C1. Only the exact full name
@@ -158,39 +165,10 @@ impl PiFacts {
 
         // Every `toolCall` block of every matched assistant message is a
         // candidate call site, with its original block index kept.
-        let mut calls_by_id: HashMap<String, Vec<CallSite>> = HashMap::new();
-        for (idx, raw_idx) in matched.iter().enumerate() {
-            let Some(raw_idx) = raw_idx else { continue };
-            let value = &raw_messages[*raw_idx].value;
-            if raw_role(value) != Some("assistant") {
-                continue;
-            }
-            for (block_idx, block) in content_blocks(value).iter().enumerate() {
-                if block.get("type").and_then(Value::as_str) != Some("toolCall") {
-                    continue;
-                }
-                let Some(call_id) = block
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                else {
-                    continue;
-                };
-                calls_by_id
-                    .entry(call_id.to_string())
-                    .or_default()
-                    .push(CallSite {
-                        call_idx: idx,
-                        call_block_idx: block_idx as u32,
-                        tool_name: block
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: block.get("arguments").cloned(),
-                    });
-            }
-        }
+        let calls_by_id =
+            collect_call_sites(matched.iter().enumerate().filter_map(|(idx, raw_idx)| {
+                raw_idx.map(|raw_idx| (idx, &raw_messages[raw_idx].value))
+            }));
 
         for (result_idx, raw_idx) in matched.iter().enumerate() {
             let Some(raw_idx) = raw_idx else { continue };
@@ -202,33 +180,20 @@ impl PiFacts {
                 .result_body_shapes
                 .insert(result_idx, result_body_shape(value));
 
-            let tool_name = value
-                .pointer("/message/toolName")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty());
             // A structural candidate hint only. The four strong names are the
             // sole strong identity; a bare name or another MCP namespace is a
             // candidate only with the result's own complete C04 envelope, and
             // a result that lost its name stays one only through a unique
             // prior strong CASS call. None of this clears or upgrades an
             // identity, and an unrelated tool is never a candidate.
-            let candidate = match tool_name {
-                Some(name) if strong_recall_tool(name).is_some() => true,
-                Some(name) => bare_recall_tool(name)
-                    .or_else(|| foreign_namespace_recall_tool(name))
-                    .is_some_and(|tool| declares_c04(&result_body_text(value), tool)),
-                None => unique_prior_cass_call(
-                    value
-                        .pointer("/message/toolCallId")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty()),
-                    result_idx,
-                    &calls_by_id,
-                ),
-            };
-            if candidate {
+            if is_recall_candidate(value, result_idx, &calls_by_id) {
                 facts.candidate_result_indices.insert(result_idx);
             }
+
+            let tool_name = value
+                .pointer("/message/toolName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty());
 
             // Binding requires a non-empty id that names exactly one call
             // site, that call strictly before this result, and an exact
@@ -267,6 +232,75 @@ impl PiFacts {
         }
 
         facts
+    }
+}
+
+/// Every `toolCall` block of the given projected assistant messages, keyed by
+/// call id and kept in projection order. `idx` is the projected position the
+/// call site occupies, so a later check can require the call strictly before
+/// its result.
+fn collect_call_sites<'a>(
+    messages: impl Iterator<Item = (usize, &'a Value)>,
+) -> HashMap<String, Vec<CallSite>> {
+    let mut calls_by_id: HashMap<String, Vec<CallSite>> = HashMap::new();
+    for (idx, value) in messages {
+        if raw_role(value) != Some("assistant") {
+            continue;
+        }
+        for (block_idx, block) in content_blocks(value).iter().enumerate() {
+            if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                continue;
+            }
+            let Some(call_id) = block
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            calls_by_id
+                .entry(call_id.to_string())
+                .or_default()
+                .push(CallSite {
+                    call_idx: idx,
+                    call_block_idx: block_idx as u32,
+                    tool_name: block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    arguments: block.get("arguments").cloned(),
+                });
+        }
+    }
+    calls_by_id
+}
+
+/// Whether a result record is an identifiable CASS recall candidate. This is
+/// the same predicate [`PiFacts::build`] records as a hint, exposed for the
+/// alignment-failure count that must read the valid native records directly.
+fn is_recall_candidate(
+    value: &Value,
+    result_idx: usize,
+    calls_by_id: &HashMap<String, Vec<CallSite>>,
+) -> bool {
+    let tool_name = value
+        .pointer("/message/toolName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty());
+    match tool_name {
+        Some(name) if strong_recall_tool(name).is_some() => true,
+        Some(name) => bare_recall_tool(name)
+            .or_else(|| foreign_namespace_recall_tool(name))
+            .is_some_and(|tool| declares_c04(&result_body_text(value), tool)),
+        None => unique_prior_cass_call(
+            value
+                .pointer("/message/toolCallId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty()),
+            result_idx,
+            calls_by_id,
+        ),
     }
 }
 
@@ -483,6 +517,413 @@ fn unique_prior_cass_call(
         return false;
     };
     call.call_idx < result_idx && strong_recall_tool(&call.tool_name).is_some()
+}
+
+/// Every result record of the captured blob that is an identifiable CASS
+/// candidate, counted over the valid native records themselves. Used only
+/// when the canonical projection does not align one-to-one: the canonical
+/// indices are then not trustworthy, so no exclusion is made and each
+/// candidate is diagnosed as unpaired instead.
+fn alignment_failure_candidates(blob_path: &Path) -> u64 {
+    let raw_messages = projected_raw_messages(blob_path);
+    let calls_by_id = collect_call_sites(
+        raw_messages
+            .iter()
+            .enumerate()
+            .map(|(idx, raw)| (idx, &raw.value)),
+    );
+    raw_messages
+        .iter()
+        .enumerate()
+        .filter(|(idx, raw)| {
+            raw_role(&raw.value) == Some("toolResult")
+                && is_recall_candidate(&raw.value, *idx, &calls_by_id)
+        })
+        .count() as u64
+}
+
+// ============================================================================
+// Ticket 02 (`cass-alien-fresh-ingest`): the Pi full-cleanup consumer.
+//
+// The judgment table is fixed by `contracts/t02-task.md`:
+//
+// * the four strong Pi identities are excluded whatever the output is;
+// * a bare or foreign-namespaced name is a candidate only through the
+//   result's own complete C04 envelope;
+// * a result with no usable binding is preserved and counted, never
+//   re-paired through the legacy R4 fallback;
+// * a mixed body, or an unproven copy of the body elsewhere in the same
+//   record, is preserved and counted;
+// * a shell call or a read of a declared full-output path is diagnosed, not
+//   excluded, and nothing is executed or read from disk;
+// * an alignment failure excludes nothing and counts each candidate.
+// ============================================================================
+
+/// The four recall tools, in a fixed order, for "any tool" body checks only.
+const RECALL_TOOLS: [RecallTool; 4] = [
+    RecallTool::Search,
+    RecallTool::Expand,
+    RecallTool::Sessions,
+    RecallTool::Timeline,
+];
+
+/// The result of one Pi cleanup pass.
+#[derive(Debug, Clone)]
+pub(crate) struct PiCleanupOutcome {
+    /// One marker slot per canonical message.
+    pub(crate) excluded: Vec<Option<ExcludedMarker>>,
+    /// Preserved candidates counted by frozen reason string.
+    pub(crate) uncovered_by_reason: BTreeMap<String, u64>,
+    /// True when the canonical messages did not match the projected native
+    /// records one-to-one. The caller records its own align-failure counters
+    /// from this flag; the local reasons above already hold the diagnosis.
+    pub(crate) alignment_failed: bool,
+    /// Canonical event count, for the caller's align-failure detail.
+    pub(crate) event_count: usize,
+}
+
+/// Judge and clear every proven Pi recall result in `conv`.
+///
+/// `blob_path` is the materialized capture blob and `blob_relative_path` is
+/// the mirror-relative path stamped into each marker. The live
+/// `conversation.source_path` is never read.
+pub(crate) fn cleanup_pi_conversation(
+    blob_path: &Path,
+    conv: &mut NormalizedConversation,
+    blob_relative_path: &str,
+    redaction_enabled: bool,
+) -> PiCleanupOutcome {
+    let facts = PiFacts::build(blob_path, conv);
+    let mut uncovered_by_reason: BTreeMap<String, u64> = BTreeMap::new();
+
+    if !facts.alignment_ok {
+        for _ in 0..alignment_failure_candidates(blob_path) {
+            bump(&mut uncovered_by_reason, UncoveredReason::UnpairedResult);
+        }
+        return PiCleanupOutcome {
+            excluded: vec![None; conv.messages.len()],
+            uncovered_by_reason,
+            alignment_failed: true,
+            event_count: facts.events.len(),
+        };
+    }
+
+    let field_map = field_map_for(&conv.agent_slug);
+    let mut redactor = MemoizingRedactor::new();
+    let mut excluded: Vec<Option<ExcludedMarker>> = vec![None; conv.messages.len()];
+
+    for idx in 0..conv.messages.len() {
+        let Some(shape) = facts.result_body_shapes.get(&idx).copied() else {
+            continue;
+        };
+        let body = conv.messages[idx].content.clone();
+        let tool_name = result_tool_name(&conv.messages[idx].extra);
+        let binding = facts.bindings.get(&idx);
+
+        // Pi shell calls are never excluded and never executed. Only a call
+        // whose own captured arguments or result body identifies a real CASS
+        // candidate is diagnosed; an unrelated ordinary call stays silent.
+        if matches!(tool_name, Some("bash" | "codemode")) {
+            if pi_shell_identifies_cass(tool_name, binding, &body) {
+                bump(&mut uncovered_by_reason, UncoveredReason::UnsupportedShell);
+            }
+            continue;
+        }
+        // A read of a path a prior CASS result declared as its full output
+        // may return the same envelope through a different tool. Nothing is
+        // read from disk and no response is fabricated.
+        if tool_name == Some("read") {
+            if pi_read_is_ambiguous(binding, &body, conv, idx) {
+                bump(
+                    &mut uncovered_by_reason,
+                    UncoveredReason::AmbiguousToolIdentity,
+                );
+            }
+            continue;
+        }
+
+        let outcome = judge_pi_result(
+            &facts,
+            &conv.messages[idx],
+            idx,
+            shape,
+            tool_name,
+            binding,
+            &body,
+        );
+        match outcome {
+            Outcome::Exclude(judged) => {
+                let marker = apply_with_redaction(
+                    &mut conv.messages[idx],
+                    &judged,
+                    &mut redactor,
+                    blob_relative_path,
+                    idx as u32,
+                    field_map,
+                    redaction_enabled,
+                );
+                clear_pi_result_body(&mut conv.messages[idx].extra, shape, &marker);
+                excluded[idx] = Some(marker);
+            }
+            Outcome::Preserve(Some(reason)) => bump(&mut uncovered_by_reason, reason),
+            Outcome::Preserve(None) => {}
+        }
+    }
+
+    PiCleanupOutcome {
+        excluded,
+        uncovered_by_reason,
+        alignment_failed: false,
+        event_count: facts.events.len(),
+    }
+}
+
+/// The identity table for one Pi result record.
+fn judge_pi_result(
+    facts: &PiFacts,
+    message: &NormalizedMessage,
+    idx: usize,
+    shape: PiResultBodyShape,
+    tool_name: Option<&str>,
+    binding: Option<&PiBinding>,
+    body: &str,
+) -> Outcome {
+    if let Some(tool) = tool_name.and_then(strong_recall_tool) {
+        // A strong identity is proven by its exact full name. A missing or
+        // ambiguous binding, a mixed body or an unproven copy of the body is
+        // preserved and counted -- never excluded, never re-paired.
+        if binding.is_none() || shape == PiResultBodyShape::Mixed {
+            return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        }
+        if has_unproven_body_copy(&message.extra, body) {
+            return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        }
+        let binding = binding.expect("checked above");
+        return shared_pi_outcome(
+            facts,
+            message,
+            idx,
+            binding,
+            DirectToolCategory::Strong(tool),
+        );
+    }
+
+    if let Some(tool) = tool_name.and_then(bare_recall_tool) {
+        let complete = declares_c04(body, tool);
+        let wrapper_shaped = looks_like_recall_wrapper(body);
+        let Some(binding) = binding else {
+            // A bare name alone proves nothing. It is a candidate only when
+            // the result itself declares the envelope; a damaged envelope
+            // still points at CASS and is counted as unpaired.
+            return if complete || wrapper_shaped {
+                Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+            } else {
+                Outcome::Preserve(None)
+            };
+        };
+        if shape == PiResultBodyShape::Mixed {
+            return if complete {
+                Outcome::Preserve(Some(UncoveredReason::UnpairedResult))
+            } else if wrapper_shaped {
+                Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
+            } else {
+                Outcome::Preserve(None)
+            };
+        }
+        if !complete {
+            return if wrapper_shaped {
+                Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
+            } else {
+                Outcome::Preserve(None)
+            };
+        }
+        if has_unproven_body_copy(&message.extra, body) {
+            return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+        }
+        return shared_pi_outcome(facts, message, idx, binding, DirectToolCategory::Bare(tool));
+    }
+
+    if let Some(tool) = tool_name.and_then(foreign_namespace_recall_tool) {
+        // Another server's same-suffixed name is never a CASS identity. Only
+        // a bound result carrying the complete envelope is ambiguous enough
+        // to report; everything else stays silent.
+        return if binding.is_some() && declares_c04(body, tool) {
+            Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity))
+        } else {
+            Outcome::Preserve(None)
+        };
+    }
+
+    // A result that lost its name stays an observable candidate only through
+    // a unique earlier strong CASS call. There is no Pi R4 fallback.
+    if tool_name.is_none() && facts.candidate_result_indices.contains(&idx) {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    }
+
+    Outcome::Preserve(None)
+}
+
+/// Run the shared direct-tool core for a proven Pi result.
+///
+/// The shared core expects a `ToolResult` block carrying the real binding id;
+/// ticket 01's raw events mark a Pi result's text blocks as `Text`, so the
+/// judgment copy is adjusted here. The persisted row keeps its own `tool`
+/// role: the temporary message is a copy used only for judgment.
+fn shared_pi_outcome(
+    facts: &PiFacts,
+    message: &NormalizedMessage,
+    idx: usize,
+    binding: &PiBinding,
+    category: DirectToolCategory,
+) -> Outcome {
+    let call = PairedTool {
+        tool_call_id: Some(binding.tool_call_id.clone()),
+        tool_name: binding.tool_name.clone(),
+        args: binding.arguments.clone(),
+    };
+    let judgment_event = pi_judgment_event(&facts.events[idx], &binding.tool_call_id);
+    let mut judgment_message = message.clone();
+    judgment_message.role = "tool_result".to_string();
+    judge_direct_tool_result(&judgment_message, &judgment_event, &call, category)
+}
+
+/// The judgment view of one Pi result event: every text block becomes the
+/// bound result block. Nothing else changes, so a target-block list is
+/// exactly the body's original block indices.
+fn pi_judgment_event(event: &RawEvent, binding_id: &str) -> RawEvent {
+    let mut judged = event.clone();
+    for block in &mut judged.blocks {
+        if block.kind == BlockKind::Text {
+            block.kind = BlockKind::ToolResult;
+            block.tool_use_id = Some(binding_id.to_string());
+        }
+    }
+    judged
+}
+
+/// Whether a Pi shell call's own captured arguments or result body identify a
+/// real CASS candidate. `codemode` has no proven argument shape, so only its
+/// body can identify one; neither tool is ever executed.
+fn pi_shell_identifies_cass(
+    tool_name: Option<&str>,
+    binding: Option<&PiBinding>,
+    body: &str,
+) -> bool {
+    if RECALL_TOOLS.iter().any(|tool| declares_c04(body, *tool)) {
+        return true;
+    }
+    tool_name == Some("bash")
+        && binding
+            .and_then(|binding| binding.arguments.as_ref())
+            .and_then(|args| args.get("command"))
+            .and_then(Value::as_str)
+            .is_some_and(|command| !matches!(parse_cli(command), Ok(None)))
+}
+
+/// Whether a bound `read` of exactly a prior CASS result's declared
+/// `details.fullOutputPath` carries a complete recall envelope.
+fn pi_read_is_ambiguous(
+    binding: Option<&PiBinding>,
+    body: &str,
+    conversation: &NormalizedConversation,
+    result_idx: usize,
+) -> bool {
+    let Some(path) = binding
+        .and_then(|binding| binding.arguments.as_ref())
+        .and_then(|args| args.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+    else {
+        return false;
+    };
+    let declares = RECALL_TOOLS.iter().any(|tool| declares_c04(body, *tool));
+    declares
+        && conversation.messages[..result_idx].iter().any(|message| {
+            message
+                .extra
+                .pointer("/message/toolName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| strong_recall_tool(name).is_some())
+                && message
+                    .extra
+                    .pointer("/message/details/fullOutputPath")
+                    .and_then(Value::as_str)
+                    == Some(path)
+        })
+}
+
+/// True when the same record carries an identical copy of the result body
+/// outside `message.content`. The body's attribution is proven only for the
+/// content slot, so a copy elsewhere leaves the whole row preserved.
+fn has_unproven_body_copy(extra: &Value, body: &str) -> bool {
+    if !looks_like_recall_wrapper(body) {
+        return false;
+    }
+    let Some(record) = extra.as_object() else {
+        return false;
+    };
+    record.iter().any(|(key, value)| {
+        if key != "message" {
+            return contains_string(value, body);
+        }
+        let Some(message) = value.as_object() else {
+            return contains_string(value, body);
+        };
+        message
+            .iter()
+            .any(|(key, value)| key != "content" && contains_string(value, body))
+    })
+}
+
+fn contains_string(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(text) => text == needle,
+        Value::Array(items) => items.iter().any(|item| contains_string(item, needle)),
+        Value::Object(map) => map.values().any(|item| contains_string(item, needle)),
+        _ => false,
+    }
+}
+
+/// Replace the proven body with the shared redaction placeholder, keeping
+/// every array index and every non-body field. A mixed body never reaches
+/// here.
+fn clear_pi_result_body(extra: &mut Value, shape: PiResultBodyShape, marker: &ExcludedMarker) {
+    let placeholder = serde_json::json!({
+        "redacted": true,
+        "sha256": marker.sha256,
+        "bytes": marker.bytes,
+    });
+    let Some(content) = extra.pointer_mut("/message/content") else {
+        return;
+    };
+    match shape {
+        PiResultBodyShape::String => *content = placeholder,
+        PiResultBodyShape::TextBlocks => {
+            let Some(blocks) = content.as_array_mut() else {
+                return;
+            };
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(block) = block.as_object_mut()
+                {
+                    block.insert("text".to_string(), placeholder.clone());
+                }
+            }
+        }
+        PiResultBodyShape::Mixed => {}
+    }
+}
+
+fn result_tool_name(raw: &Value) -> Option<&str> {
+    raw.pointer("/message/toolName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+fn bump(uncovered_by_reason: &mut BTreeMap<String, u64>, reason: UncoveredReason) {
+    *uncovered_by_reason
+        .entry(reason.as_str().to_string())
+        .or_insert(0) += 1;
 }
 
 #[cfg(test)]
@@ -1043,5 +1484,76 @@ mod tests {
     #[test]
     fn alien_pi_facts_f12() {
         assert_case("F12");
+    }
+
+    /// Ticket 02: an alignment failure cannot be produced through the real
+    /// lossless CLI (the connector emits every native message record, and the
+    /// canonical extras are that record). This internal test therefore takes
+    /// the real pinned projection of the frozen P01 fixture and derives one
+    /// canonical extra that no longer equals its blob line. The blob itself
+    /// still holds a valid original strong CASS result outside the failed
+    /// mapping, so the whole session must exclude nothing and count each such
+    /// candidate as `unpaired_result`.
+    #[test]
+    fn alien_pi_cleanup_alignment_failure() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".pi/agent/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl");
+        let blob = sessions.join("2026-10-24T00-00-00_P01.jsonl");
+        fs::copy(&fixture, &blob).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let mut conversations = PiAgentConnector::new().scan(&ctx).unwrap();
+        assert_eq!(conversations.len(), 1, "one projected P01 conversation");
+        let mut conversation = conversations.remove(0);
+        assert_eq!(conversation.agent_slug, "pi_agent");
+        assert_eq!(conversation.source_path, blob);
+
+        // The untouched projection aligns one-to-one and holds one strong
+        // candidate, so the failure below is caused by the derived mismatch.
+        let clean = PiFacts::build(&blob, &conversation);
+        assert!(clean.alignment_ok, "P01 projection aligns one-to-one");
+        assert_eq!(clean.events.len(), 4, "P01 has four native message records");
+        assert_eq!(
+            clean.candidate_result_indices,
+            BTreeSet::from([2]),
+            "P01 holds exactly one strong CASS candidate"
+        );
+
+        // Derived extra mismatch, in memory only: the first canonical record
+        // no longer equals any blob line, so the one-to-one mapping fails and
+        // the blob's own strong CASS result stays outside it.
+        conversation.messages[0].extra["message"]["content"] =
+            Value::String("derived mismatch".to_string());
+        let before = serde_json::to_value(&conversation.messages).unwrap();
+
+        let outcome = cleanup_pi_conversation(&blob, &mut conversation, "derived/P01.jsonl", false);
+
+        assert!(
+            outcome.alignment_failed,
+            "a derived extra mismatch must report an alignment failure"
+        );
+        assert_eq!(outcome.event_count, 4, "event count follows the projection");
+        assert_eq!(
+            outcome.excluded,
+            vec![None; 4],
+            "an alignment failure excludes nothing"
+        );
+        assert_eq!(
+            outcome.uncovered_by_reason,
+            BTreeMap::from([("unpaired_result".to_string(), 1)]),
+            "the original strong CASS result is counted as unpaired"
+        );
+        assert_eq!(
+            serde_json::to_value(&conversation.messages).unwrap(),
+            before,
+            "an alignment failure mutates no canonical message"
+        );
     }
 }
