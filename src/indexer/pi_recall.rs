@@ -30,6 +30,7 @@ use serde_json::Value;
 
 use crate::connectors::NormalizedConversation;
 use crate::indexer::exclusion::{BlockKind, RawBlock, RawEvent};
+use crate::recall_output::{RecallTool, decode};
 
 /// The four strong Pi tool identities from spec C1. Only the exact full name
 /// is proof of attribution; an unknown MCP namespace is never treated as a
@@ -73,8 +74,11 @@ pub(crate) struct PiFacts {
     pub(crate) events: Vec<RawEvent>,
     /// Bindings keyed by result message index.
     pub(crate) bindings: BTreeMap<usize, PiBinding>,
-    /// Canonical message indexes of results whose tool name is one of the
-    /// four strong Pi identities.
+    /// Observable candidate hint for results that may be CASS recall output:
+    /// a strong full name, a bare or foreign-namespaced name whose body is a
+    /// complete C04 envelope, or a nameless result tied to exactly one
+    /// earlier strong CASS call. It neither upgrades an identity nor decides
+    /// anything; ticket 02 still judges each candidate itself.
     pub(crate) candidate_result_indices: BTreeSet<usize>,
     /// True when every canonical message was matched one-to-one, in order,
     /// to one projected native message record and no such record was left
@@ -202,7 +206,27 @@ impl PiFacts {
                 .pointer("/message/toolName")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty());
-            if tool_name.is_some_and(|name| PI_STRONG_TOOL_NAMES.contains(&name)) {
+            // A structural candidate hint only. The four strong names are the
+            // sole strong identity; a bare name or another MCP namespace is a
+            // candidate only with the result's own complete C04 envelope, and
+            // a result that lost its name stays one only through a unique
+            // prior strong CASS call. None of this clears or upgrades an
+            // identity, and an unrelated tool is never a candidate.
+            let candidate = match tool_name {
+                Some(name) if strong_recall_tool(name).is_some() => true,
+                Some(name) => bare_recall_tool(name)
+                    .or_else(|| foreign_namespace_recall_tool(name))
+                    .is_some_and(|tool| declares_c04(&result_body_text(value), tool)),
+                None => unique_prior_cass_call(
+                    value
+                        .pointer("/message/toolCallId")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty()),
+                    result_idx,
+                    &calls_by_id,
+                ),
+            };
+            if candidate {
                 facts.candidate_result_indices.insert(result_idx);
             }
 
@@ -318,6 +342,22 @@ fn content_blocks(value: &Value) -> &[Value] {
 /// `pi:line:N` form so a reused native event id cannot join copies across
 /// lines; the original id stays in the raw blob and the message `extra`.
 fn raw_event(raw: &RawMessage) -> RawEvent {
+    // A plain-string body is one logical text block at index 0. Its physical
+    // line, not a synthetic block offset, still names the event.
+    if let Some(Value::String(text)) = raw.value.pointer("/message/content")
+        && !text.trim().is_empty()
+    {
+        return RawEvent {
+            event_key: format!("pi:line:{}", raw.line_no),
+            blocks: vec![RawBlock {
+                index: 0,
+                kind: BlockKind::Text,
+                tool_use_id: None,
+                tool_name: None,
+                args: None,
+            }],
+        };
+    }
     let blocks = content_blocks(&raw.value)
         .iter()
         .enumerate()
@@ -362,6 +402,87 @@ fn result_body_shape(value: &Value) -> PiResultBodyShape {
         }
         _ => PiResultBodyShape::Mixed,
     }
+}
+
+/// The recall tool behind one of the four strong full names. These are the
+/// only names that identify a CASS result on their own.
+fn strong_recall_tool(name: &str) -> Option<RecallTool> {
+    const TOOLS: [RecallTool; 4] = [
+        RecallTool::Search,
+        RecallTool::Expand,
+        RecallTool::Sessions,
+        RecallTool::Timeline,
+    ];
+    let position = PI_STRONG_TOOL_NAMES
+        .iter()
+        .position(|candidate| *candidate == name)?;
+    Some(TOOLS[position])
+}
+
+/// The recall tool behind a bare name such as `cass_search`. A bare name is
+/// not a Pi identity by itself: it becomes a candidate only when the result
+/// body carries the complete C04 envelope for the same tool.
+fn bare_recall_tool(name: &str) -> Option<RecallTool> {
+    const BARE_NAMES: [(&str, RecallTool); 4] = [
+        ("cass_search", RecallTool::Search),
+        ("cass_expand", RecallTool::Expand),
+        ("cass_sessions", RecallTool::Sessions),
+        ("cass_timeline", RecallTool::Timeline),
+    ];
+    BARE_NAMES
+        .iter()
+        .find(|(bare, _)| *bare == name)
+        .map(|(_, tool)| *tool)
+}
+
+/// The recall tool behind a name from another MCP namespace, for example
+/// `mcp__other__cass_search`. The namespace is never treated as a known CASS
+/// server, so this is only a candidate shape: the C04 envelope in the result
+/// itself has to be complete.
+fn foreign_namespace_recall_tool(name: &str) -> Option<RecallTool> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, last) = rest.rsplit_once("__")?;
+    if server.is_empty() || server == "cass_mcp" {
+        return None;
+    }
+    bare_recall_tool(last)
+}
+
+/// True when the body is exactly one complete C04 envelope for `tool`.
+fn declares_c04(body: &str, tool: RecallTool) -> bool {
+    decode(body, tool).is_ok()
+}
+
+/// The text a result carries: a plain string as-is, otherwise its text
+/// blocks in order. Only the C04 envelope check reads this.
+fn result_body_text(value: &Value) -> String {
+    match value.pointer("/message/content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Whether a result that lost its `toolName` still points at exactly one
+/// earlier call of a strong CASS tool. This is candidate evidence only; the
+/// binding itself still requires the result's own non-empty matching name.
+fn unique_prior_cass_call(
+    tool_call_id: Option<&str>,
+    result_idx: usize,
+    calls_by_id: &HashMap<String, Vec<CallSite>>,
+) -> bool {
+    let Some(calls) = tool_call_id.and_then(|id| calls_by_id.get(id)) else {
+        return false;
+    };
+    let [call] = calls.as_slice() else {
+        return false;
+    };
+    call.call_idx < result_idx && strong_recall_tool(&call.tool_name).is_some()
 }
 
 #[cfg(test)]
@@ -434,6 +555,127 @@ mod tests {
 
     fn usize_at(value: &Value) -> usize {
         value.as_u64().unwrap() as usize
+    }
+
+    /// One derived variant of a frozen fixture: the parsed JSONL lines after
+    /// `mutate`, plus the real pinned-connector projection of exactly those
+    /// bytes. Nothing here writes back to `tests/fixtures`.
+    struct Variant {
+        lines: Vec<Value>,
+        conversation: NormalizedConversation,
+        facts: PiFacts,
+        _dir: TempDir,
+    }
+
+    /// The C04 wrapper a Pi result would carry when the tool name alone is
+    /// not a strong identity.
+    const SEARCH_C04: &str =
+        r#"<cass_recall version="1" tool="cass_search">{"hits":[]}</cass_recall>"#;
+
+    fn fixture_lines(id: &str) -> Vec<Value> {
+        let case = case(id);
+        let file_name = Path::new(case["file"].as_str().unwrap())
+            .file_name()
+            .unwrap();
+        fs::read_to_string(fixture_dir().join(file_name))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn project_variant(id: &str, tag: &str, mutate: impl FnOnce(&mut Vec<Value>)) -> Variant {
+        let mut lines = fixture_lines(id);
+        mutate(&mut lines);
+
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join(".pi/agent/sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join(format!("2026-10-24T00-00-00_{tag}.jsonl"));
+        let mut text = lines
+            .iter()
+            .map(|line| serde_json::to_string(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        text.push('\n');
+        fs::write(&file, text).unwrap();
+
+        let ctx = ScanContext::with_roots(
+            dir.path().join("cass-data"),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
+        let mut conversations = PiAgentConnector::new().scan(&ctx).unwrap();
+        assert_eq!(
+            conversations.len(),
+            1,
+            "{tag}: one projected conversation from the derived blob"
+        );
+        let conversation = conversations.remove(0);
+        assert_eq!(
+            conversation.source_path, file,
+            "{tag}: projection reads the derived copy"
+        );
+        let facts = PiFacts::build(&file, &conversation);
+        Variant {
+            lines,
+            conversation,
+            facts,
+            _dir: dir,
+        }
+    }
+
+    fn role_line(lines: &[Value], role: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line.pointer("/message/role").and_then(Value::as_str) == Some(role))
+            .unwrap_or_else(|| panic!("derived blob has no {role} message"))
+    }
+
+    fn set_call_name(lines: &mut [Value], assistant: usize, name: &str) {
+        let block = lines[assistant]
+            .pointer_mut("/message/content")
+            .and_then(Value::as_array_mut)
+            .and_then(|blocks| {
+                blocks
+                    .iter_mut()
+                    .find(|block| block.get("type").and_then(Value::as_str) == Some("toolCall"))
+            })
+            .expect("assistant toolCall block");
+        block["name"] = Value::String(name.to_string());
+    }
+
+    fn set_result_fields(lines: &mut [Value], result: usize, name: Option<&str>, body: Value) {
+        let message = lines[result]["message"].as_object_mut().unwrap();
+        match name {
+            Some(name) => {
+                message.insert("toolName".into(), Value::String(name.to_string()));
+            }
+            None => {
+                message.remove("toolName");
+            }
+        }
+        message.insert("content".into(), body);
+    }
+
+    fn text_block(text: &str) -> Value {
+        serde_json::json!([{ "type": "text", "text": text }])
+    }
+
+    fn derived_extra_matches_blob(variant: &Variant) {
+        assert_eq!(
+            variant.conversation.messages.len(),
+            variant.lines.len() - 1,
+            "derived: one canonical message per blob message line after the session row"
+        );
+        for (idx, message) in variant.conversation.messages.iter().enumerate() {
+            assert_eq!(
+                message.extra,
+                variant.lines[idx + 1],
+                "derived: message {idx} raw extra"
+            );
+        }
     }
 
     fn assert_case(id: &str) {
@@ -606,6 +848,29 @@ mod tests {
     #[test]
     fn alien_pi_facts_f02() {
         assert_case("F02");
+
+        // R1-2 derived: the original strong call and the same ID, but the
+        // result lost its own tool name. No binding may be invented, yet the
+        // result stays an observable CASS candidate.
+        let variant = project_variant("F02", "F02-noname", |lines| {
+            let result = role_line(lines, "toolResult");
+            let body = lines[result]["message"]["content"].clone();
+            set_result_fields(lines, result, None, body);
+        });
+        assert!(
+            !variant.facts.bindings.contains_key(&2),
+            "derived noname: a missing result tool name must not bind"
+        );
+        assert!(
+            variant.facts.candidate_result_indices.contains(&2),
+            "derived noname: a unique prior CASS call keeps the result a candidate"
+        );
+        assert_eq!(
+            variant.facts.result_body_shapes.get(&2),
+            Some(&PiResultBodyShape::TextBlocks),
+            "derived noname: body shape stays text_blocks"
+        );
+        derived_extra_matches_blob(&variant);
     }
 
     #[test]
@@ -651,6 +916,128 @@ mod tests {
     #[test]
     fn alien_pi_facts_f11() {
         assert_case("F11");
+
+        // R1-1 derived: a whole-string result body still has one logical
+        // block at index 0, and binding plus every raw message line survive.
+        let variant = project_variant("F11", "F11-string", |lines| {
+            let result = role_line(lines, "toolResult");
+            let body = lines[result]["message"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            set_result_fields(
+                lines,
+                result,
+                Some("mcp__cass_mcp__cass_search"),
+                Value::String(body),
+            );
+        });
+        assert_eq!(
+            variant.facts.result_body_shapes.get(&2),
+            Some(&PiResultBodyShape::String),
+            "derived string: shape is string"
+        );
+        let string_blocks = &variant.facts.events[2].blocks;
+        assert_eq!(
+            string_blocks.len(),
+            1,
+            "derived string: exactly one logical block"
+        );
+        assert_eq!(
+            string_blocks[0].index, 0,
+            "derived string: logical block index 0"
+        );
+        assert_eq!(
+            string_blocks[0].kind,
+            BlockKind::Text,
+            "derived string: block is text"
+        );
+        let expected = &case("F11")["expected"]["bindings"][0];
+        assert_eq!(
+            variant.facts.bindings.get(&2),
+            Some(&PiBinding {
+                result_idx: 2,
+                call_idx: usize_at(&expected["call_idx"]),
+                call_block_idx: usize_at(&expected["call_block_idx"]) as u32,
+                tool_call_id: expected["tool_call_id"].as_str().unwrap().to_string(),
+                tool_name: "mcp__cass_mcp__cass_search".to_string(),
+                arguments: Some(serde_json::json!({ "query": "synthetic alien" })),
+            }),
+            "derived string: binding unchanged"
+        );
+        derived_extra_matches_blob(&variant);
+
+        // R1-2 derived: a bare name is not a strong identity; only the
+        // result's own complete C04 envelope makes it an observable candidate.
+        let bare = project_variant("F11", "F11-bare", |lines| {
+            let assistant = role_line(lines, "assistant");
+            let result = role_line(lines, "toolResult");
+            set_call_name(lines, assistant, "cass_search");
+            set_result_fields(lines, result, Some("cass_search"), text_block(SEARCH_C04));
+        });
+        assert!(
+            bare.facts.candidate_result_indices.contains(&2),
+            "derived bare: full C04 envelope makes the result a candidate"
+        );
+        assert!(
+            !PI_STRONG_TOOL_NAMES.contains(&"cass_search"),
+            "derived bare: the strong name table is unchanged"
+        );
+        derived_extra_matches_blob(&bare);
+
+        // R1-2 derived: another MCP namespace with the same suffix and a full
+        // C04 envelope is a candidate, still without joining the strong table.
+        let foreign = project_variant("F11", "F11-foreign", |lines| {
+            let assistant = role_line(lines, "assistant");
+            let result = role_line(lines, "toolResult");
+            set_call_name(lines, assistant, "mcp__other__cass_search");
+            set_result_fields(
+                lines,
+                result,
+                Some("mcp__other__cass_search"),
+                text_block(SEARCH_C04),
+            );
+        });
+        assert!(
+            foreign.facts.candidate_result_indices.contains(&2),
+            "derived foreign: full C04 envelope makes the result a candidate"
+        );
+        assert!(
+            !PI_STRONG_TOOL_NAMES.contains(&"mcp__other__cass_search"),
+            "derived foreign: the strong name table is unchanged"
+        );
+        derived_extra_matches_blob(&foreign);
+
+        // R1-2 derived: an unrelated tool is never a CASS candidate, even when
+        // its body carries a complete C04 envelope; its text stays untouched.
+        let ordinary = project_variant("F11", "F11-ordinary", |lines| {
+            let assistant = role_line(lines, "assistant");
+            let result = role_line(lines, "toolResult");
+            set_call_name(lines, assistant, "ordinary_echo");
+            set_result_fields(lines, result, Some("ordinary_echo"), text_block(SEARCH_C04));
+        });
+        assert!(
+            !ordinary.facts.candidate_result_indices.contains(&2),
+            "derived ordinary: an unrelated tool name is not a CASS candidate"
+        );
+        let result_line = role_line(&ordinary.lines, "toolResult");
+        assert_eq!(
+            ordinary.conversation.messages[2].extra, ordinary.lines[result_line],
+            "derived ordinary: raw message line and its C04 body preserved"
+        );
+        assert_eq!(
+            ordinary.facts.events[2]
+                .blocks
+                .iter()
+                .filter(|block| block.kind == BlockKind::Text)
+                .map(|block| block.index)
+                .collect::<Vec<_>>(),
+            vec![0],
+            "derived ordinary: body text preserved at block 0"
+        );
     }
 
     #[test]
