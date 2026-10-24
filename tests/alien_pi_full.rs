@@ -1488,6 +1488,259 @@ fn run_p01_derived_variants() {
         );
     }
 
+    // 6. A foreign-namespaced candidate that lost its result id cannot bind:
+    //    candidate first, so the missing binding is diagnosed instead of the
+    //    whole row staying silent.
+    let bytes = derived_bytes("P01", |lines| {
+        let assistant = record_index(lines, "a");
+        let block = lines[assistant]["message"]["content"]
+            .as_array_mut()
+            .expect("assistant content")
+            .iter_mut()
+            .find(|block| block["type"].as_str() == Some("toolCall"))
+            .expect("assistant tool call");
+        block["name"] = Value::String("mcp__other__cass_search".to_string());
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["toolName"] = Value::String("mcp__other__cass_search".to_string());
+        lines[result]["message"]
+            .as_object_mut()
+            .expect("result message")
+            .remove("toolCallId");
+    });
+    let runs = run_derived(
+        "v06_foreign_missing_result_id",
+        &bytes,
+        &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: an unbound foreign candidate keeps the row",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the unbound foreign body stays verbatim",
+            run.label()
+        );
+    }
+
+    // 7. A result whose own name is non-empty but wrong, tied by its real id
+    //    to exactly one earlier strong CASS call, is still a candidate: it is
+    //    counted rather than silently kept.
+    let bytes = derived_bytes("P01", |lines| {
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["toolName"] = Value::String("ordinary_echo".to_string());
+    });
+    let runs = run_derived(
+        "v07_result_tool_name_mismatch",
+        &bytes,
+        &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: a wrong result name never binds",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the mismatched-name body stays verbatim",
+            run.label()
+        );
+    }
+
+    // 8. The copy can hide in another field of a proven text block. Only the
+    //    block's text leaf is the proven body; the whole content subtree is
+    //    not skipped.
+    let bytes = derived_bytes("P01", |lines| {
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["content"][0]["opaque_copy"] = Value::String(body.clone());
+    });
+    let runs = run_derived(
+        "v08_text_block_metadata_copy",
+        &bytes,
+        &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: a copy in a text block's other field keeps the row",
+            run.label()
+        );
+        assert_eq!(
+            row.extra["message"]["content"][0]["opaque_copy"].as_str(),
+            Some(body.as_str()),
+            "{}: the text-block copy is preserved",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the body stays verbatim next to the text-block copy",
+            run.label()
+        );
+    }
+
+    // 9. Surrounding whitespace does not make a different envelope: the
+    //    complete C04 codec proves the same tool and the same decoded value.
+    let sandwiched = format!("\n{body}\t");
+    let bytes = derived_bytes("P01", |lines| {
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["opaque_copy"] = Value::String(format!("\n{body}\t"));
+    });
+    let runs = run_derived(
+        "v09_outer_whitespace_equivalent_copy",
+        &bytes,
+        &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: a whitespace-wrapped copy keeps the row",
+            run.label()
+        );
+        assert_eq!(
+            row.extra["message"]["opaque_copy"].as_str(),
+            Some(sandwiched.as_str()),
+            "{}: the whitespace-wrapped copy is preserved",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the body stays verbatim next to the whitespace copy",
+            run.label()
+        );
+    }
+
+    // 10. A bare candidate with a mixed body is rejected by shape before any
+    //     format branch: it is kept and counted, never labelled as a damaged
+    //     text envelope.
+    let broken = "<cass_recall version=\"1\" tool=\"cass_search\">{broken</cass_recall>";
+    let bytes = derived_bytes("P01", |lines| {
+        let assistant = record_index(lines, "a");
+        let block = lines[assistant]["message"]["content"]
+            .as_array_mut()
+            .expect("assistant content")
+            .iter_mut()
+            .find(|block| block["type"].as_str() == Some("toolCall"))
+            .expect("assistant tool call");
+        block["name"] = Value::String("cass_search".to_string());
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["toolName"] = Value::String("cass_search".to_string());
+        lines[result]["message"]["content"] = json!([
+            { "type": "text", "text": broken },
+            { "type": "image", "data": "synthetic" },
+        ]);
+    });
+    let runs = run_derived(
+        "v10_bare_mixed_invalid_wrapper",
+        &bytes,
+        &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: a mixed bare candidate keeps the row",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            broken,
+            "{}: the mixed body's text leaf stays verbatim",
+            run.label()
+        );
+        assert_eq!(
+            row.extra["message"]["content"][1]["data"].as_str(),
+            Some("synthetic"),
+            "{}: the non-text block is untouched",
+            run.label()
+        );
+    }
+
+    // 11. A bash result that carries a complete C04 but lost its id cannot
+    //     bind: it is rejected by binding before the shell identity branch.
+    let bytes = derived_bytes("P01", |lines| {
+        let assistant = record_index(lines, "a");
+        let block = lines[assistant]["message"]["content"]
+            .as_array_mut()
+            .expect("assistant content")
+            .iter_mut()
+            .find(|block| block["type"].as_str() == Some("toolCall"))
+            .expect("assistant tool call");
+        block["name"] = Value::String("bash".to_string());
+        block["arguments"] = json!({ "command": "cass search synthetic alien" });
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["toolName"] = Value::String("bash".to_string());
+        lines[result]["message"]["content"] = json!([{ "type": "text", "text": body }]);
+        lines[result]["message"]
+            .as_object_mut()
+            .expect("result message")
+            .remove("toolCallId");
+    });
+    let runs = run_derived(
+        "v11_bash_full_wrapper_missing_id",
+        &bytes,
+        &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: an unbound bash candidate keeps the row",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the bash candidate's body stays verbatim",
+            run.label()
+        );
+    }
+
+    // 12. Control: an ordinary tool keeps zero warnings even when its body
+    //     happens to carry a complete C04 envelope. Only a unique earlier
+    //     strong CASS call could make it a candidate, and there is none.
+    let bytes = derived_bytes("P01", |lines| {
+        let assistant = record_index(lines, "a");
+        let block = lines[assistant]["message"]["content"]
+            .as_array_mut()
+            .expect("assistant content")
+            .iter_mut()
+            .find(|block| block["type"].as_str() == Some("toolCall"))
+            .expect("assistant tool call");
+        block["name"] = Value::String("ordinary_echo".to_string());
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["toolName"] = Value::String("ordinary_echo".to_string());
+    });
+    let runs = run_derived(
+        "v12_ordinary_echo_full_wrapper",
+        &bytes,
+        &derived_expected(4, 0, &[], "ordinary synthetic answer"),
+    );
+    for run in &runs {
+        let row = result_row(run, "r-c1");
+        assert!(
+            row.excluded.is_none(),
+            "{}: an ordinary tool is never excluded",
+            run.label()
+        );
+        assert_eq!(
+            row.content,
+            body,
+            "{}: the ordinary tool's C04 body stays verbatim",
+            run.label()
+        );
+    }
+
     // Each derived run's TempDir is dropped with its `CaseRun`; the artifact
     // evidence above already lives under the run's own directory and nothing
     // here writes back to `tests/fixtures`.
