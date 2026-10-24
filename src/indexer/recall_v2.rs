@@ -860,15 +860,24 @@ fn exact_exec_command_input(expression: &str) -> Option<&str> {
 /// The largest magnitude a literal integer argument may carry.
 const MAX_SAFE_LITERAL_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// The number of nested objects and arrays the old strict JSON path accepted.
+/// `serde_json` refuses the 128th open container, so 127 is the deepest
+/// literal this parser admits. The check runs before the recursive call, so a
+/// deeper input returns `None` instead of exhausting the stack.
+const MAX_LITERAL_DEPTH: usize = 127;
+
 /// Keys that would reach the JavaScript prototype chain. They are never data,
 /// so a literal that sets one anywhere is refused, including an escaped
 /// spelling that decodes to the same name.
 const PROTOTYPE_KEYS: [&str; 3] = ["__proto__", "prototype", "constructor"];
 
 /// Parse one `text(await tools.mcp__cass_mcp__cass_*(ARGS));` expression.
-/// Leading/trailing whitespace and whitespace between the outer tokens are
-/// allowed; the expression must end at the single closing semicolon.
+/// The whole expression is trimmed the way the original function trimmed it,
+/// so Unicode whitespace around the fixed shape is accepted. Separator
+/// whitespace inside the shape stays ASCII, and the expression must end at the
+/// single closing semicolon.
 fn parse_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)> {
+    let expression = expression.trim();
     let mut parser = LiteralParser::new(expression);
     parser.skip_whitespace();
     parser.expect_keyword("text")?;
@@ -891,7 +900,8 @@ fn parse_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)> {
     parser.skip_whitespace();
     parser.expect_byte(b'(')?;
     parser.skip_whitespace();
-    let args = parser.parse_value()?;
+    // The argument object itself is the first nesting level.
+    let args = parser.parse_value(1)?;
     if !args.is_object() {
         return None;
     }
@@ -944,9 +954,19 @@ impl<'a> LiteralParser<'a> {
         Some(())
     }
 
+    /// Match one fixed keyword. The keyword must end at a lexical boundary, so
+    /// `awaittools` does not read as `await` followed by more input.
     fn expect_keyword(&mut self, keyword: &str) -> Option<()> {
         let end = self.pos.checked_add(keyword.len())?;
         if self.text.get(self.pos..end)? != keyword {
+            return None;
+        }
+        if self
+            .bytes
+            .get(end)
+            .copied()
+            .is_some_and(identifier_continue)
+        {
             return None;
         }
         self.pos = end;
@@ -965,11 +985,14 @@ impl<'a> LiteralParser<'a> {
         Some(&self.text[start..self.pos])
     }
 
-    fn parse_value(&mut self) -> Option<Value> {
+    /// `depth` is the nesting level the value would occupy if it is a
+    /// container. The check lives at container entry, before the recursive
+    /// call, so a too-deep literal is refused without growing the stack.
+    fn parse_value(&mut self, depth: usize) -> Option<Value> {
         match self.peek()? {
             b'"' => self.parse_string().map(Value::String),
-            b'{' => self.parse_object(),
-            b'[' => self.parse_array(),
+            b'{' => self.parse_object(depth),
+            b'[' => self.parse_array(depth),
             b'-' | b'0'..=b'9' => self.parse_integer(),
             b't' => self.expect_keyword("true").map(|()| Value::Bool(true)),
             b'f' => self.expect_keyword("false").map(|()| Value::Bool(false)),
@@ -1038,7 +1061,10 @@ impl<'a> LiteralParser<'a> {
     /// One object literal. Keys are double-quoted strings or ASCII
     /// identifiers. A repeated decoded key, a prototype key, or more than one
     /// trailing comma is refused.
-    fn parse_object(&mut self) -> Option<Value> {
+    fn parse_object(&mut self, depth: usize) -> Option<Value> {
+        if depth > MAX_LITERAL_DEPTH {
+            return None;
+        }
         self.expect_byte(b'{')?;
         let mut members = serde_json::Map::new();
         self.skip_whitespace();
@@ -1057,7 +1083,7 @@ impl<'a> LiteralParser<'a> {
             self.skip_whitespace();
             self.expect_byte(b':')?;
             self.skip_whitespace();
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth + 1)?;
             members.insert(key, value);
             self.skip_whitespace();
             match self.peek()? {
@@ -1081,7 +1107,10 @@ impl<'a> LiteralParser<'a> {
 
     /// One array literal under the JSON rules: comma separated, no trailing
     /// comma.
-    fn parse_array(&mut self) -> Option<Value> {
+    fn parse_array(&mut self, depth: usize) -> Option<Value> {
+        if depth > MAX_LITERAL_DEPTH {
+            return None;
+        }
         self.expect_byte(b'[')?;
         let mut items = Vec::new();
         self.skip_whitespace();
@@ -1090,7 +1119,7 @@ impl<'a> LiteralParser<'a> {
             return Some(Value::Array(items));
         }
         loop {
-            items.push(self.parse_value()?);
+            items.push(self.parse_value(depth + 1)?);
             self.skip_whitespace();
             match self.peek()? {
                 b',' => {
@@ -3816,6 +3845,93 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Rework R1: keyword token boundaries, the old outer trim, and the old
+    // strict JSON recursion boundary. Each case stays inside an existing
+    // named test and prints its own R1 label, so the 24 named targets and the
+    // frozen fixture bytes do not change.
+    // ========================================================================
+
+    fn assert_r1_supported(label: &str, expression: &str, tool: RecallTool, expected: Value) {
+        let (target, args) = parse_exec_literal(expression)
+            .unwrap_or_else(|| panic!("{label}: expected a supported literal"));
+        let ExecTarget::Mcp(actual) = target else {
+            panic!("{label}: only the four MCP methods are supported");
+        };
+        assert_eq!(
+            recall_tool_method(actual),
+            recall_tool_method(tool),
+            "{label}: method"
+        );
+        assert_eq!(args, expected, "{label}: original argument value");
+
+        let wrapper =
+            recall_output::encode(tool, &alien_tool_value(tool)).expect("frozen wrapper encodes");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        let Outcome::Exclude(judged) = outcome else {
+            panic!("{label}: the production path must exclude this literal, got {outcome:?}");
+        };
+        assert!(judged.parse_error.is_none(), "{label}: no parse error");
+        println!("case {label}: excluded through decide_for_record");
+    }
+
+    fn assert_r1_unsupported(label: &str, expression: &str) {
+        assert!(
+            parse_exec_literal(expression).is_none(),
+            "{label}: an unsupported literal must not parse"
+        );
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        println!("case {label}: preserved unsupported_shell");
+    }
+
+    fn r1_expression(args: &str) -> String {
+        format!("text(await tools.mcp__cass_mcp__cass_search({args}));")
+    }
+
+    /// `{"query": [[...0...]]}` with `levels` arrays.
+    fn r1_array_args(levels: usize) -> (String, Value) {
+        let args = format!(
+            "{{\"query\":{}{}{}}}",
+            "[".repeat(levels),
+            "0",
+            "]".repeat(levels)
+        );
+        let mut value = json!(0);
+        for _ in 0..levels {
+            value = json!([value]);
+        }
+        (args, json!({"query": value}))
+    }
+
+    /// `{"query": [[...[]...]]}` with `levels` empty arrays.
+    fn r1_empty_array_args(levels: usize) -> (String, Value) {
+        let args = format!("{{\"query\":{}{}}}", "[".repeat(levels), "]".repeat(levels));
+        let mut value = json!([]);
+        for _ in 1..levels {
+            value = json!([value]);
+        }
+        (args, json!({"query": value}))
+    }
+
+    /// `{"query": {"x": {"x": ... 0 ...}}}` with `levels` nested objects
+    /// under `query`.
+    fn r1_object_args(levels: usize) -> (String, Value) {
+        let args = format!(
+            "{{\"query\":{}{}{}}}",
+            "{\"x\":".repeat(levels),
+            "0",
+            "}".repeat(levels)
+        );
+        let mut value = json!(0);
+        for _ in 0..levels {
+            value = json!({"x": value});
+        }
+        (args, json!({"query": value}))
+    }
+
     #[test]
     fn alien_codex_literal_l01() {
         assert_alien_literal_group("L01", &[]);
@@ -3839,11 +3955,65 @@ mod tests {
     #[test]
     fn alien_codex_literal_l05() {
         assert_alien_literal_group("L05", &["B01", "B02", "B03", "B04", "B20"]);
+
+        // R1-3 accepted side: 126 nested containers plus the argument object
+        // is 127, the deepest value the old strict JSON path accepted.
+        let (args, expected) = r1_array_args(126);
+        assert_r1_supported(
+            "R1-3-array-126",
+            &r1_expression(&args),
+            RecallTool::Search,
+            expected,
+        );
+        let (args, expected) = r1_empty_array_args(126);
+        assert_r1_supported(
+            "R1-3-empty-array-126",
+            &r1_expression(&args),
+            RecallTool::Search,
+            expected,
+        );
+        let (args, expected) = r1_object_args(126);
+        assert_r1_supported(
+            "R1-3-object-126",
+            &r1_expression(&args),
+            RecallTool::Search,
+            expected,
+        );
+
+        // R1-3 rejected side: 127 nested containers plus the argument object
+        // is 128, the depth the old strict JSON path refused.
+        let (args, _) = r1_array_args(127);
+        assert_r1_unsupported("R1-3-array-127", &r1_expression(&args));
+        let (args, _) = r1_empty_array_args(127);
+        assert_r1_unsupported("R1-3-empty-array-127", &r1_expression(&args));
+        let (args, _) = r1_object_args(127);
+        assert_r1_unsupported("R1-3-object-127", &r1_expression(&args));
+        // R1-3: refusal happens before the recursion, so a much deeper input
+        // returns `None` instead of exhausting the stack.
+        let (args, _) = r1_array_args(256);
+        assert_r1_unsupported("R1-3-array-256", &r1_expression(&args));
     }
 
     #[test]
     fn alien_codex_literal_l06() {
         assert_alien_literal_group("L06", &[]);
+
+        // R1-2: the old function trimmed the whole expression before matching,
+        // so Unicode whitespace around the fixed shape is accepted again.
+        let nbsp = '\u{00A0}';
+        assert_r1_supported(
+            "R1-2-outer-trim",
+            &format!("{nbsp}{}{nbsp}", r1_expression("{\"query\":\"x\"}")),
+            RecallTool::Search,
+            json!({"query": "x"}),
+        );
+        // R1-2: trimming never reaches the argument values.
+        assert_r1_supported(
+            "R1-2-string-value",
+            &r1_expression("{\"query\":\"a\u{00A0}b\"}"),
+            RecallTool::Search,
+            json!({"query": "a\u{00A0}b"}),
+        );
     }
 
     #[test]
@@ -3924,6 +4094,25 @@ mod tests {
     #[test]
     fn alien_codex_literal_l22() {
         assert_alien_literal_group("L22", &[]);
+
+        // R1-1: a keyword ends at a token boundary. `awaittools` is one
+        // identifier, not `await tools`, so this is not the fixed shape.
+        assert_r1_unsupported(
+            "R1-1-awaittools",
+            "text(awaittools.mcp__cass_mcp__cass_search({\"query\":\"x\"}));",
+        );
+        // R1-1: the same boundary applies to the value keywords.
+        assert_r1_unsupported(
+            "R1-1-trueish",
+            "text(await tools.mcp__cass_mcp__cass_search({\"query\":trueish}));",
+        );
+
+        // R1-2: only the whole expression is trimmed; separator whitespace
+        // inside the fixed shape stays ASCII.
+        assert_r1_unsupported(
+            "R1-2-inner-nbsp",
+            "text(\u{00A0}await tools.mcp__cass_mcp__cass_search({\"query\":\"x\"}));",
+        );
     }
 
     #[test]
