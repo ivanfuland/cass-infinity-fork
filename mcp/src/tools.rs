@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rmcp::model::JsonObject;
+use rmcp::model::{JsonObject, ToolAnnotations};
 use serde_json::{Map, Value};
 
 use crate::runner::ToolError;
@@ -288,6 +288,12 @@ pub fn definitions() -> Vec<rmcp::model::Tool> {
         .map(|tool| {
             rmcp::model::Tool::new(tool.name(), description(tool), schema_for(tool))
                 .with_title(tool.name().to_string())
+                .with_annotations(
+                    ToolAnnotations::new()
+                        .read_only(true)
+                        .destructive(false)
+                        .idempotent(true),
+                )
         })
         .collect()
 }
