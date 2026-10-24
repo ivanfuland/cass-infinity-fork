@@ -1,0 +1,3 @@
+{"type":"session","version":3,"id":"synthetic-F01","timestamp":"2026-10-24T00:00:00.000Z","cwd":"/synthetic/alien"}
+{"type":"message","id":"u","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"ordinary user"}]}}
+{"type":"message","id":"a","timestamp":"2026-10-24T00:00:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"ordinary answer"}]}}

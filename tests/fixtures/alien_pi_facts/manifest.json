@@ -1,0 +1,434 @@
+{
+  "schema": "cass-alien-pi-facts-fixtures/1",
+  "synthetic": true,
+  "baseline": "594e896108d4072abdc32c5e992012ee52f3d605",
+  "cases": [
+    {
+      "id": "F01",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F01.jsonl",
+      "expected": {
+        "message_count": 2,
+        "physical_lines": [
+          2,
+          3
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3"
+        ],
+        "bindings": [],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {},
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {}
+      }
+    },
+    {
+      "id": "F02",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F02.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [
+          {
+            "result_idx": 2,
+            "call_idx": 1,
+            "call_block_idx": 0,
+            "tool_call_id": "c1"
+          }
+        ],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F03",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F03.jsonl",
+      "expected": {
+        "message_count": 5,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5,
+          6
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5",
+          "pi:line:6"
+        ],
+        "bindings": [
+          {
+            "result_idx": 2,
+            "call_idx": 1,
+            "call_block_idx": 1,
+            "tool_call_id": "c2"
+          },
+          {
+            "result_idx": 3,
+            "call_idx": 1,
+            "call_block_idx": 0,
+            "tool_call_id": "c1"
+          }
+        ],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ],
+          "3": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks",
+          "3": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F04",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F04.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [],
+        "unpaired_result_indices": [
+          2
+        ],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F05",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F05.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [],
+        "unpaired_result_indices": [
+          2
+        ],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F06",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F06.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [],
+        "unpaired_result_indices": [
+          2
+        ],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F07",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F07.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [],
+        "unpaired_result_indices": [
+          1
+        ],
+        "result_text_block_indices": {
+          "1": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "1": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F08",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F08.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [],
+        "unpaired_result_indices": [
+          2
+        ],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F09",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F09.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          4,
+          6,
+          7,
+          8
+        ],
+        "event_keys": [
+          "pi:line:4",
+          "pi:line:6",
+          "pi:line:7",
+          "pi:line:8"
+        ],
+        "bindings": [
+          {
+            "result_idx": 2,
+            "call_idx": 1,
+            "call_block_idx": 0,
+            "tool_call_id": "c1"
+          }
+        ],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F10",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F10.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          4,
+          5,
+          6
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:4",
+          "pi:line:5",
+          "pi:line:6"
+        ],
+        "bindings": [
+          {
+            "result_idx": 2,
+            "call_idx": 1,
+            "call_block_idx": 0,
+            "tool_call_id": "c1"
+          }
+        ],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F11",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F11.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [
+          {
+            "result_idx": 2,
+            "call_idx": 1,
+            "call_block_idx": 0,
+            "tool_call_id": "c1"
+          }
+        ],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {
+          "2": [
+            0,
+            1
+          ]
+        },
+        "mixed_result": false,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "text_blocks"
+        }
+      }
+    },
+    {
+      "id": "F12",
+      "file": "fixtures/pi-facts/2026-10-24T00-00-00_F12.jsonl",
+      "expected": {
+        "message_count": 4,
+        "physical_lines": [
+          2,
+          3,
+          4,
+          5
+        ],
+        "event_keys": [
+          "pi:line:2",
+          "pi:line:3",
+          "pi:line:4",
+          "pi:line:5"
+        ],
+        "bindings": [
+          {
+            "result_idx": 2,
+            "call_idx": 1,
+            "call_block_idx": 0,
+            "tool_call_id": "c1"
+          }
+        ],
+        "unpaired_result_indices": [],
+        "result_text_block_indices": {
+          "2": [
+            0
+          ]
+        },
+        "mixed_result": true,
+        "alignment_ok": true,
+        "result_body_shapes": {
+          "2": "mixed"
+        }
+      }
+    }
+  ]
+}

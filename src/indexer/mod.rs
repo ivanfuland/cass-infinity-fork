@@ -1,5 +1,8 @@
 pub mod db_vector_catchup;
 pub mod exclusion;
+/// Ticket 01 (`cass-alien-fresh-ingest`): Pi raw-event facts and unique
+/// tool-call binding, consumed by the Pi cleanup ticket (02).
+pub(crate) mod pi_recall;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
