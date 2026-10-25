@@ -1938,7 +1938,10 @@ fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
     let records = session_records(&original);
     let complete = flatten_text_body(&records[record_index(&records, "r-c1")]);
     for (variant, body) in [
-        ("dsh_plain_body_complete_extra", "malformed strong-identity output"),
+        (
+            "dsh_plain_body_complete_extra",
+            "malformed strong-identity output",
+        ),
         (
             "dsh_damaged_body_complete_extra",
             "Warning: truncated output\n<cass_recall version=\"1\" tool=\"cass_search\">{broken</cass_recall>",
@@ -1955,9 +1958,16 @@ fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
             &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
         ) {
             let row = result_row(&run, "r-c1");
-            assert!(row.excluded.is_none(), "{}: uncertain extra keeps row", run.label());
+            assert!(
+                row.excluded.is_none(),
+                "{}: uncertain extra keeps row",
+                run.label()
+            );
             assert_eq!(row.content, body);
-            assert_eq!(row.extra["message"]["opaque_copy"].as_str(), Some(complete.as_str()));
+            assert_eq!(
+                row.extra["message"]["opaque_copy"].as_str(),
+                Some(complete.as_str())
+            );
         }
     }
 
@@ -1973,7 +1983,10 @@ fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
     for run in run_derived("dsh_different_tool_extra", &bytes, &expected) {
         let row = result_row(&run, "r-c1");
         assert!(row.excluded.is_some());
-        assert_eq!(row.extra["message"]["opaque_copy"].as_str(), Some(other_tool.as_str()));
+        assert_eq!(
+            row.extra["message"]["opaque_copy"].as_str(),
+            Some(other_tool.as_str())
+        );
     }
 }
 
@@ -1983,26 +1996,60 @@ fn alien_pi_full_dsh_missing_result_name_candidates() {
     let records = session_records(&original);
     let complete = flatten_text_body(&records[record_index(&records, "r-c1")]);
     for (variant, call_name, body, candidate) in [
-        ("dsh_bare_missing_name", "cass_search", complete.as_str(), true),
-        ("dsh_foreign_missing_name", "mcp__other__cass_search", complete.as_str(), true),
-        ("dsh_bare_missing_name_plain", "cass_search", "ordinary synthetic tool output", false),
-        ("dsh_foreign_missing_name_plain", "mcp__other__cass_search", "ordinary synthetic tool output", false),
-        ("dsh_unrelated_missing_name", "ordinary_tool", complete.as_str(), false),
+        (
+            "dsh_bare_missing_name",
+            "cass_search",
+            complete.as_str(),
+            true,
+        ),
+        (
+            "dsh_foreign_missing_name",
+            "mcp__other__cass_search",
+            complete.as_str(),
+            true,
+        ),
+        (
+            "dsh_bare_missing_name_plain",
+            "cass_search",
+            "ordinary synthetic tool output",
+            false,
+        ),
+        (
+            "dsh_foreign_missing_name_plain",
+            "mcp__other__cass_search",
+            "ordinary synthetic tool output",
+            false,
+        ),
+        (
+            "dsh_unrelated_missing_name",
+            "ordinary_tool",
+            complete.as_str(),
+            false,
+        ),
     ] {
         let bytes = derived_bytes("P01", |lines| {
             let assistant = record_index(lines, "a");
-            lines[assistant]["message"]["content"][0]["name"] = Value::String(call_name.to_string());
+            lines[assistant]["message"]["content"][0]["name"] =
+                Value::String(call_name.to_string());
             let result = record_index(lines, "r-c1");
             set_result_fields(lines, result, None, text_block(body));
         });
-        let uncovered = if candidate { vec![("unpaired_result", 1)] } else { vec![] };
+        let uncovered = if candidate {
+            vec![("unpaired_result", 1)]
+        } else {
+            vec![]
+        };
         for run in run_derived(
             variant,
             &bytes,
             &derived_expected(4, 0, &uncovered, "ordinary synthetic answer"),
         ) {
             let row = result_row(&run, "r-c1");
-            assert!(row.excluded.is_none(), "{}: missing name never binds", run.label());
+            assert!(
+                row.excluded.is_none(),
+                "{}: missing name never binds",
+                run.label()
+            );
             assert_eq!(row.content, body);
             assert!(row.extra["message"].get("toolName").is_none());
         }

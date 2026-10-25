@@ -1522,7 +1522,10 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
                 pos += end + 4;
             } else if bytes.get(pos..pos + 2) == Some(b"//") {
                 pos += 2;
-                while bytes.get(pos).is_some_and(|byte| !matches!(byte, b'\n' | b'\r')) {
+                while bytes
+                    .get(pos)
+                    .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                {
                     pos += 1;
                 }
             } else {
@@ -6053,7 +6056,10 @@ mod tests {
                 let expression = format!(
                     "const r=await tools.{method}{gap}({{query:\"synthetic\"}});text(r.content.length);"
                 );
-                assert!(parse_exec_literal(&expression).is_none(), "comments stay unsupported");
+                assert!(
+                    parse_exec_literal(&expression).is_none(),
+                    "comments stay unsupported"
+                );
                 let (outcome, _, _) = exec_outcome(&expression, Value::String("partial".into()));
                 assert_preserved(outcome, UncoveredReason::UnsupportedShell);
             }
