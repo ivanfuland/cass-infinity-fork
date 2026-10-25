@@ -301,6 +301,7 @@ fn is_recall_candidate(
             result_idx,
             calls_by_id,
             &result_body_text(value),
+            true,
         ),
     }
 }
@@ -504,14 +505,16 @@ fn result_body_text(value: &Value) -> String {
 }
 
 /// Whether a result that lost its `toolName` still points at exactly one
-/// earlier CASS call. Bare and foreign names also need the corresponding
-/// complete C04 envelope. This is candidate evidence only; the binding itself
-/// still requires the result's own non-empty matching name.
+/// earlier CASS call. Only a missing result name may use a bare or foreign
+/// call with the corresponding complete C04 envelope. This is candidate
+/// evidence only; the binding itself still requires the result's own
+/// non-empty matching name.
 fn unique_prior_cass_call(
     tool_call_id: Option<&str>,
     result_idx: usize,
     calls_by_id: &HashMap<String, Vec<CallSite>>,
     body: &str,
+    result_name_missing: bool,
 ) -> bool {
     let Some(calls) = tool_call_id.and_then(|id| calls_by_id.get(id)) else {
         return false;
@@ -523,9 +526,10 @@ fn unique_prior_cass_call(
         return false;
     }
     strong_recall_tool(&call.tool_name).is_some()
-        || bare_recall_tool(&call.tool_name)
-            .or_else(|| foreign_namespace_recall_tool(&call.tool_name))
-            .is_some_and(|tool| declares_c04(body, tool))
+        || (result_name_missing
+            && bare_recall_tool(&call.tool_name)
+                .or_else(|| foreign_namespace_recall_tool(&call.tool_name))
+                .is_some_and(|tool| declares_c04(body, tool)))
 }
 
 /// Every result record of the captured blob that is an identifiable CASS
@@ -587,7 +591,8 @@ enum PiCandidateKind {
     /// complete recall envelope.
     Read,
     /// The result's own name proves nothing, but its id names exactly one
-    /// earlier strong CASS call.
+    /// earlier strong CASS call, or a missing name has the envelope-backed
+    /// bare/foreign candidate proof.
     IdOnly,
 }
 
@@ -610,8 +615,14 @@ fn identify_candidate(
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
     let id_only = || {
-        unique_prior_cass_call(result_tool_call_id(raw), result_idx, calls_by_id, body)
-            .then_some(PiCandidateKind::IdOnly)
+        unique_prior_cass_call(
+            result_tool_call_id(raw),
+            result_idx,
+            calls_by_id,
+            body,
+            named.is_none(),
+        )
+        .then_some(PiCandidateKind::IdOnly)
     };
     match named {
         Some(name) => {

@@ -1559,11 +1559,15 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
     let bytes = expression.as_bytes();
     let mut pos = 0;
     let mut frames: Vec<Frame> = Vec::new();
-    // True when the previous effective token expects an operand. This is the
-    // one piece of state a plain scan needs to tell a regex literal from a
-    // division sign, so a pattern's `tools.METHOD()` is never read as code.
+    // Expression context distinguishes regex literals from division. Control
+    // headers and statement blocks can end before a new regex statement;
+    // ordinary parenthesized values still end an operand.
     let mut operand_expected = true;
     let mut previous_significant: Option<u8> = None;
+    let mut control_parenthesis_pending = false;
+    let mut control_parentheses = Vec::new();
+    let mut statement_expected = true;
+    let mut statement_braces = Vec::new();
 
     while pos < bytes.len() {
         let byte = bytes[pos];
@@ -1588,15 +1592,25 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
             continue;
         }
 
+        let pending_control = std::mem::take(&mut control_parenthesis_pending);
+        let statement_start = std::mem::replace(&mut statement_expected, false);
         match byte {
-            b' ' | b'\t' | b'\n' | b'\r' => pos += 1,
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                control_parenthesis_pending = pending_control;
+                statement_expected = statement_start;
+                pos += 1;
+            }
             b'/' if bytes.get(pos + 1) == Some(&b'/') => {
+                control_parenthesis_pending = pending_control;
+                statement_expected = statement_start;
                 pos += 2;
                 while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
                     pos += 1;
                 }
             }
             b'/' if bytes.get(pos + 1) == Some(&b'*') => {
+                control_parenthesis_pending = pending_control;
+                statement_expected = statement_start;
                 pos += 2;
                 while pos < bytes.len() {
                     if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
@@ -1660,37 +1674,56 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
                 previous_significant = Some(b'/');
             }
             b'{' => {
+                statement_braces.push(statement_start);
                 if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
                     *depth += 1;
                 }
                 pos += 1;
                 operand_expected = true;
+                statement_expected = statement_start;
                 previous_significant = Some(b'{');
             }
             b'}' => {
                 if matches!(frames.last(), Some(Frame::Interpolation(0))) {
                     frames.pop();
+                    operand_expected = false;
                 } else if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
                     *depth -= 1;
+                    operand_expected = statement_braces.pop().unwrap_or(false);
+                } else {
+                    operand_expected = statement_braces.pop().unwrap_or(false);
                 }
                 pos += 1;
-                operand_expected = false;
+                statement_expected = operand_expected;
                 previous_significant = Some(b'}');
             }
-            b'(' | b'[' => {
+            b'(' => {
+                control_parentheses.push(pending_control);
                 pos += 1;
                 operand_expected = true;
                 previous_significant = Some(byte);
             }
-            b')' | b']' => {
+            b'[' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+            b')' => {
+                pos += 1;
+                operand_expected = control_parentheses.pop().unwrap_or(false);
+                statement_expected = operand_expected;
+                previous_significant = Some(byte);
+            }
+            b']' => {
                 pos += 1;
                 operand_expected = false;
                 previous_significant = Some(byte);
             }
-            b'=' | b':' | b',' | b';' | b'?' | b'+' | b'-' | b'*' | b'%' | b'&' | b'|'
-            | b'^' | b'!' | b'~' | b'<' | b'>' => {
+            b'=' | b':' | b',' | b';' | b'?' | b'+' | b'-' | b'*' | b'%' | b'&' | b'|' | b'^'
+            | b'!' | b'~' | b'<' | b'>' => {
                 pos += 1;
                 operand_expected = true;
+                statement_expected = byte == b';';
                 previous_significant = Some(byte);
             }
             b'.' => {
@@ -1722,6 +1755,10 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
                 {
                     return true;
                 }
+                control_parenthesis_pending = previous_significant != Some(b'.')
+                    && (matches!(word, "if" | "while" | "for" | "with" | "switch" | "catch")
+                        || (pending_control && word == "await"));
+                statement_expected = matches!(word, "else" | "do" | "try" | "finally");
                 operand_expected = matches!(
                     word,
                     "return"
@@ -6078,9 +6115,23 @@ mod tests {
             "text(tools.mcp__cass_mcp__cass_search/* note */);",
             "const f=tools.mcp__cass_mcp__cass_search/* unterminated",
             "const f=tools.mcp__cass_mcp__cass_search// no call",
+            "if (x) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "if ((x)) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "if (x) {} /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "{} /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "while (x) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "for (;x;) /tools.mcp__cass_mcp__cass_search// note\n(y)",
         ] {
             let (outcome, _, _) = exec_outcome(expression, Value::String("partial".into()));
             assert_eq!(outcome, Outcome::Preserve(None), "no call: {expression}");
+        }
+
+        for expression in [
+            "const r=obj.if(x)/await tools.mcp__cass_mcp__cass_search/* note */({query:\"synthetic\"});text(r);",
+            "const r=({x:1})/await tools.mcp__cass_mcp__cass_search/* note */({query:\"synthetic\"});text(r);",
+        ] {
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".into()));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
         }
     }
 }

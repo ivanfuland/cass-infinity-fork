@@ -17,6 +17,7 @@
 //! so the pre-fix red can run this same test source against the frozen old
 //! CLI. Candidate, mutation and restore runs must leave it unset.
 
+use coding_agent_search::recall_output::{self, RecallTool};
 use coding_agent_search::storage::api::Conn;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1937,19 +1938,30 @@ fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
     let original = fs::read(fixture_file("P01")).expect("read P01");
     let records = session_records(&original);
     let complete = flatten_text_body(&records[record_index(&records, "r-c1")]);
-    for (variant, body) in [
+    for (variant, body, string_body) in [
         (
             "dsh_plain_body_complete_extra",
             "malformed strong-identity output",
+            false,
         ),
         (
             "dsh_damaged_body_complete_extra",
             "Warning: truncated output\n<cass_recall version=\"1\" tool=\"cass_search\">{broken</cass_recall>",
+            false,
+        ),
+        (
+            "dsh_plain_string_body_complete_extra",
+            "malformed strong-identity output",
+            true,
         ),
     ] {
         let bytes = derived_bytes("P01", |lines| {
             let result = record_index(lines, "r-c1");
-            lines[result]["message"]["content"] = text_block(body);
+            lines[result]["message"]["content"] = if string_body {
+                Value::String(body.to_string())
+            } else {
+                text_block(body)
+            };
             lines[result]["message"]["opaque_copy"] = Value::String(complete.clone());
         });
         for run in run_derived(
@@ -1972,7 +1984,9 @@ fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
     }
 
     // A complete envelope for a different tool is not a copy of this result.
-    let other_tool = complete.replace("tool=\"cass_search\"", "tool=\"cass_expand\"");
+    let other_tool = recall_output::encode(RecallTool::Expand, &json!([]))
+        .expect("valid complete Expand envelope");
+    assert!(recall_output::decode(&other_tool, RecallTool::Expand).is_ok());
     let bytes = derived_bytes("P01", |lines| {
         let result = record_index(lines, "r-c1");
         lines[result]["message"]["content"] = text_block("malformed strong-identity output");
@@ -1988,6 +2002,28 @@ fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
             Some(other_tool.as_str())
         );
     }
+
+    let mut other_value =
+        recall_output::decode(&complete, RecallTool::Search).expect("valid Search fixture");
+    other_value["hits"][0]["content"] = Value::String("different synthetic body".to_string());
+    let other_recall = recall_output::encode(RecallTool::Search, &other_value)
+        .expect("valid complete Search envelope with a different value");
+    let bytes = derived_bytes("P01", |lines| {
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["opaque_copy"] = Value::String(other_recall.clone());
+    });
+    for run in run_derived(
+        "dsh_complete_body_different_value",
+        &bytes,
+        &derived_expected(4, 1, &[], "ordinary synthetic answer"),
+    ) {
+        let row = result_row(&run, "r-c1");
+        assert!(row.excluded.is_some());
+        assert_eq!(
+            row.extra["message"]["opaque_copy"].as_str(),
+            Some(other_recall.as_str())
+        );
+    }
 }
 
 #[test]
@@ -1995,35 +2031,61 @@ fn alien_pi_full_dsh_missing_result_name_candidates() {
     let original = fs::read(fixture_file("P01")).expect("read P01");
     let records = session_records(&original);
     let complete = flatten_text_body(&records[record_index(&records, "r-c1")]);
-    for (variant, call_name, body, candidate) in [
+    for (variant, call_name, result_name, body, candidate) in [
         (
             "dsh_bare_missing_name",
             "cass_search",
+            None,
             complete.as_str(),
             true,
         ),
         (
             "dsh_foreign_missing_name",
             "mcp__other__cass_search",
+            None,
             complete.as_str(),
             true,
         ),
         (
             "dsh_bare_missing_name_plain",
             "cass_search",
+            None,
             "ordinary synthetic tool output",
             false,
         ),
         (
             "dsh_foreign_missing_name_plain",
             "mcp__other__cass_search",
+            None,
             "ordinary synthetic tool output",
             false,
         ),
         (
             "dsh_unrelated_missing_name",
             "ordinary_tool",
+            None,
             complete.as_str(),
+            false,
+        ),
+        (
+            "dsh_bare_mismatched_name",
+            "cass_search",
+            Some("ordinary_echo"),
+            complete.as_str(),
+            false,
+        ),
+        (
+            "dsh_strong_mismatched_name",
+            "mcp__cass_mcp__cass_search",
+            Some("ordinary_echo"),
+            complete.as_str(),
+            true,
+        ),
+        (
+            "dsh_bare_missing_name_damaged",
+            "cass_search",
+            None,
+            "<cass_recall version=\"1\" tool=\"cass_search\">{broken</cass_recall>",
             false,
         ),
     ] {
@@ -2032,7 +2094,7 @@ fn alien_pi_full_dsh_missing_result_name_candidates() {
             lines[assistant]["message"]["content"][0]["name"] =
                 Value::String(call_name.to_string());
             let result = record_index(lines, "r-c1");
-            set_result_fields(lines, result, None, text_block(body));
+            set_result_fields(lines, result, result_name, text_block(body));
         });
         let uncovered = if candidate {
             vec![("unpaired_result", 1)]
@@ -2051,7 +2113,10 @@ fn alien_pi_full_dsh_missing_result_name_candidates() {
                 run.label()
             );
             assert_eq!(row.content, body);
-            assert!(row.extra["message"].get("toolName").is_none());
+            assert_eq!(
+                row.extra["message"].get("toolName").and_then(Value::as_str),
+                result_name
+            );
         }
     }
 }
