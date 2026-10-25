@@ -1487,7 +1487,8 @@ fn exec_text_names_a_cass_call(expression: &str) -> bool {
 ///
 /// The scan is lexical only. Strings, comments, template text and regex
 /// literals are skipped, and `tools . METHOD (` is recognized with the same
-/// four ASCII separators the literal parser allows. A method reference,
+/// four ASCII separators the literal parser allows. Comments between the
+/// method and its call parenthesis remain candidate evidence only. A method reference,
 /// `typeof tools.METHOD` or a descriptive string has no call parenthesis after
 /// the method, so it never matches. Nothing is executed, evaluated or
 /// rewritten: this answer only decides whether the strict checks after
@@ -1511,6 +1512,25 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
         pos
     }
 
+    fn call_parenthesis_after_trivia(bytes: &[u8], mut pos: usize) -> bool {
+        loop {
+            pos = skip_separators(bytes, pos);
+            if bytes.get(pos..pos + 2) == Some(b"/*") {
+                let Some(end) = bytes[pos + 2..].windows(2).position(|part| part == b"*/") else {
+                    return false;
+                };
+                pos += end + 4;
+            } else if bytes.get(pos..pos + 2) == Some(b"//") {
+                pos += 2;
+                while bytes.get(pos).is_some_and(|byte| !matches!(byte, b'\n' | b'\r')) {
+                    pos += 1;
+                }
+            } else {
+                return bytes.get(pos) == Some(&b'(');
+            }
+        }
+    }
+
     /// `tools <sep> . <sep> METHOD <sep> (` at a complete identifier boundary.
     fn callee_after_tools(bytes: &[u8], pos: usize) -> bool {
         let mut pos = skip_separators(bytes, pos);
@@ -1529,7 +1549,7 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
             let end = pos + method.len();
             bytes.get(pos..end) == Some(method.as_bytes())
                 && !bytes.get(end).copied().is_some_and(identifier_continue)
-                && bytes.get(skip_separators(bytes, end)) == Some(&b'(')
+                && call_parenthesis_after_trivia(bytes, end)
         })
     }
 
@@ -6019,5 +6039,42 @@ mod tests {
     fn alien_codex_const_actual_call_partial() {
         assert_alien_discovery_group(1, 8);
         assert_alien_discovery_newline_regression();
+    }
+
+    #[test]
+    fn alien_codex_call_comments_remain_unsupported_candidates() {
+        for method in [
+            "mcp__cass_mcp__cass_search",
+            "mcp__cass_mcp__cass_expand",
+            "mcp__cass_mcp__cass_sessions",
+            "mcp__cass_mcp__cass_timeline",
+        ] {
+            for gap in ["/* note */", "// note\n", "/* one */ // two\n /* three */"] {
+                let expression = format!(
+                    "const r=await tools.{method}{gap}({{query:\"synthetic\"}});text(r.content.length);"
+                );
+                assert!(parse_exec_literal(&expression).is_none(), "comments stay unsupported");
+                let (outcome, _, _) = exec_outcome(&expression, Value::String("partial".into()));
+                assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            }
+        }
+
+        // Keep the complete-envelope OR route independent from call discovery.
+        let expression = "const r=await tools.mcp__cass_mcp__cass_search/* note */({query:\"synthetic\"});text(r.content.length);";
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).expect("encode");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+
+        for expression in [
+            r#"text("tools.mcp__cass_mcp__cass_search/* note */(");"#,
+            "/* tools.mcp__cass_mcp__cass_search() */ text(1);",
+            "text(typeof tools.mcp__cass_mcp__cass_search/* note */);",
+            "text(tools.mcp__cass_mcp__cass_search/* note */);",
+            "const f=tools.mcp__cass_mcp__cass_search/* unterminated",
+            "const f=tools.mcp__cass_mcp__cass_search// no call",
+        ] {
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".into()));
+            assert_eq!(outcome, Outcome::Preserve(None), "no call: {expression}");
+        }
     }
 }
