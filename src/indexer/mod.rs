@@ -1506,13 +1506,20 @@ impl IndexingProgress {
             .lock()
             .ok()
             .and_then(|value| *value);
-        let (quarantined_conversations, lexical_update_deferred) = self
+        let (
+            quarantined_conversations,
+            lexical_update_deferred,
+            recall_uncovered_total,
+            recall_uncovered_by_reason,
+        ) = self
             .stats
             .lock()
             .map(|stats| {
                 (
                     stats.quarantined_conversations,
                     stats.lexical_update_deferred,
+                    stats.recall_uncovered_total,
+                    stats.recall_uncovered_by_reason.clone(),
                 )
             })
             .unwrap_or_default();
@@ -1552,6 +1559,8 @@ impl IndexingProgress {
             "last_error": last_error,
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
+            "recall_uncovered_total": recall_uncovered_total,
+            "recall_uncovered_by_reason": recall_uncovered_by_reason,
             "rebuild_pipeline": {
                 "queue_depth": rebuild_pipeline_queue_depth,
                 "inflight_message_bytes": rebuild_pipeline_inflight_message_bytes,
@@ -17935,6 +17944,14 @@ fn reindex_paths_with_semantic_delta_and_safety(
     semantic_delta: Option<&mut WatchSemanticDelta>,
     resident_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<usize> {
+    // A callback with no routable work still starts a new diagnostic run.
+    if let Some(progress) = &opts.progress
+        && let Ok(mut stats) = progress.stats.lock()
+    {
+        stats.recall_uncovered_by_reason.clear();
+        stats.recall_uncovered_total = 0;
+    }
+
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
@@ -37465,6 +37482,35 @@ mod tests {
             cycle2_hits, 0,
             "cycle 2 has no anchors; a genuinely per-cycle reset must show 0 here, not cycle 1's leftover count"
         );
+
+        let progress = std::sync::Arc::new(super::IndexingProgress::default());
+        {
+            let mut stats = progress.stats.lock().unwrap();
+            stats
+                .recall_uncovered_by_reason
+                .insert("unpaired_result".to_string(), 7);
+            stats.recall_uncovered_total = 7;
+        }
+        let before = progress.snapshot_json(0);
+        assert_eq!(before["recall_uncovered_total"], 7);
+        assert_eq!(
+            before["recall_uncovered_by_reason"],
+            serde_json::json!({"unpaired_result": 7})
+        );
+        let mut empty_opts = opts(tmp.path().join("unused.jsonl"));
+        empty_opts.progress = Some(progress.clone());
+        assert_eq!(
+            reindex_paths(&empty_opts, Vec::new(), &[], &state, &storage, false).unwrap(),
+            0
+        );
+        {
+            let stats = progress.stats.lock().unwrap();
+            assert_eq!(stats.recall_uncovered_total, 0);
+            assert!(stats.recall_uncovered_by_reason.is_empty());
+        }
+        let after = progress.snapshot_json(0);
+        assert_eq!(after["recall_uncovered_total"], 0);
+        assert_eq!(after["recall_uncovered_by_reason"], serde_json::json!({}));
     }
 
     #[test]
