@@ -1476,18 +1476,263 @@ fn exec_text_names_a_cass_call(expression: &str) -> bool {
                 .is_some_and(cli_names_cass),
         };
     }
-    if [
-        "tools.mcp__cass_mcp__cass_search",
-        "tools.mcp__cass_mcp__cass_expand",
-        "tools.mcp__cass_mcp__cass_sessions",
-        "tools.mcp__cass_mcp__cass_timeline",
-    ]
-    .iter()
-    .any(|method| expression.contains(method))
-    {
+    if script_calls_a_cass_tool(expression) {
         return true;
     }
     json_string_cmd(expression).is_some_and(|command| cli_names_cass(&command))
+}
+
+/// Ticket 07b: does this unsupported script contain a static call to one of
+/// the four Cass MCP reads?
+///
+/// The scan is lexical only. Strings, comments, template text and regex
+/// literals are skipped, and `tools . METHOD (` is recognized with the same
+/// four ASCII separators the literal parser allows. A method reference,
+/// `typeof tools.METHOD` or a descriptive string has no call parenthesis after
+/// the method, so it never matches. Nothing is executed, evaluated or
+/// rewritten: this answer only decides whether the strict checks after
+/// [`exec_recall_candidate_hint`] run, and it never authorizes an exclusion.
+fn script_calls_a_cass_tool(expression: &str) -> bool {
+    /// One level of the explicit stack: template text, or the `{...}` nesting
+    /// of a `${...}` interpolation that returns to code scanning.
+    enum Frame {
+        Template,
+        Interpolation(usize),
+    }
+
+    fn skip_separators(bytes: &[u8], mut pos: usize) -> usize {
+        while bytes
+            .get(pos)
+            .copied()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            pos += 1;
+        }
+        pos
+    }
+
+    /// `tools <sep> . <sep> METHOD <sep> (` at a complete identifier boundary.
+    fn callee_after_tools(bytes: &[u8], pos: usize) -> bool {
+        let mut pos = skip_separators(bytes, pos);
+        if bytes.get(pos) != Some(&b'.') {
+            return false;
+        }
+        pos = skip_separators(bytes, pos + 1);
+        [
+            "mcp__cass_mcp__cass_search",
+            "mcp__cass_mcp__cass_expand",
+            "mcp__cass_mcp__cass_sessions",
+            "mcp__cass_mcp__cass_timeline",
+        ]
+        .iter()
+        .any(|method| {
+            let end = pos + method.len();
+            bytes.get(pos..end) == Some(method.as_bytes())
+                && !bytes.get(end).copied().is_some_and(identifier_continue)
+                && bytes.get(skip_separators(bytes, end)) == Some(&b'(')
+        })
+    }
+
+    let bytes = expression.as_bytes();
+    let mut pos = 0;
+    let mut frames: Vec<Frame> = Vec::new();
+    // True when the previous effective token expects an operand. This is the
+    // one piece of state a plain scan needs to tell a regex literal from a
+    // division sign, so a pattern's `tools.METHOD()` is never read as code.
+    let mut operand_expected = true;
+    let mut previous_significant: Option<u8> = None;
+
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+
+        if matches!(frames.last(), Some(Frame::Template)) {
+            match byte {
+                b'\\' => pos = (pos + 2).min(bytes.len()),
+                b'`' => {
+                    pos += 1;
+                    frames.pop();
+                    operand_expected = false;
+                    previous_significant = Some(b'`');
+                }
+                b'$' if bytes.get(pos + 1) == Some(&b'{') => {
+                    pos += 2;
+                    frames.push(Frame::Interpolation(0));
+                    operand_expected = true;
+                    previous_significant = Some(b'{');
+                }
+                _ => pos += 1,
+            }
+            continue;
+        }
+
+        match byte {
+            b' ' | b'\t' | b'\n' | b'\r' => pos += 1,
+            b'/' if bytes.get(pos + 1) == Some(&b'/') => {
+                pos += 2;
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+            }
+            b'/' if bytes.get(pos + 1) == Some(&b'*') => {
+                pos += 2;
+                while pos < bytes.len() {
+                    if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
+                }
+            }
+            b'"' | b'\'' => {
+                pos += 1;
+                while pos < bytes.len() {
+                    match bytes[pos] {
+                        b'\\' => pos += 2,
+                        closer if closer == byte => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => pos += 1,
+                    }
+                }
+                operand_expected = false;
+                previous_significant = Some(byte);
+            }
+            b'`' => {
+                pos += 1;
+                frames.push(Frame::Template);
+            }
+            b'/' if operand_expected => {
+                // A regex literal: skip escapes and character classes, then
+                // its flags. The pattern is never scanned for method names.
+                pos += 1;
+                let mut in_class = false;
+                while pos < bytes.len() {
+                    match bytes[pos] {
+                        b'\\' => pos += 2,
+                        b'[' if !in_class => {
+                            in_class = true;
+                            pos += 1;
+                        }
+                        b']' if in_class => {
+                            in_class = false;
+                            pos += 1;
+                        }
+                        b'/' if !in_class => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => pos += 1,
+                    }
+                }
+                while bytes.get(pos).copied().is_some_and(identifier_continue) {
+                    pos += 1;
+                }
+                operand_expected = false;
+                previous_significant = Some(b'/');
+            }
+            b'/' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(b'/');
+            }
+            b'{' => {
+                if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
+                    *depth += 1;
+                }
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(b'{');
+            }
+            b'}' => {
+                if matches!(frames.last(), Some(Frame::Interpolation(0))) {
+                    frames.pop();
+                } else if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
+                    *depth -= 1;
+                }
+                pos += 1;
+                operand_expected = false;
+                previous_significant = Some(b'}');
+            }
+            b'(' | b'[' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+            b')' | b']' => {
+                pos += 1;
+                operand_expected = false;
+                previous_significant = Some(byte);
+            }
+            b'=' | b':' | b',' | b';' | b'?' | b'+' | b'-' | b'*' | b'%' | b'&' | b'|'
+            | b'^' | b'!' | b'~' | b'<' | b'>' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+            b'.' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(b'.');
+            }
+            b'0'..=b'9' => {
+                while bytes
+                    .get(pos)
+                    .copied()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+                {
+                    pos += 1;
+                }
+                operand_expected = false;
+                previous_significant = Some(b'0');
+            }
+            byte if identifier_start(byte) => {
+                let start = pos;
+                pos += 1;
+                while bytes.get(pos).copied().is_some_and(identifier_continue) {
+                    pos += 1;
+                }
+                let word = &expression[start..pos];
+                if word == "tools"
+                    && previous_significant != Some(b'.')
+                    && callee_after_tools(bytes, pos)
+                {
+                    return true;
+                }
+                operand_expected = matches!(
+                    word,
+                    "return"
+                        | "throw"
+                        | "case"
+                        | "delete"
+                        | "void"
+                        | "typeof"
+                        | "new"
+                        | "in"
+                        | "of"
+                        | "instanceof"
+                        | "do"
+                        | "else"
+                        | "yield"
+                        | "await"
+                );
+                previous_significant = Some(b'a');
+            }
+            byte if byte >= 0x80 => {
+                // A non-ASCII byte is an opaque part of a value; it is never
+                // sliced, so no UTF-8 boundary can be cut.
+                pos += 1;
+                operand_expected = false;
+                previous_significant = Some(byte);
+            }
+            _ => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+        }
+    }
+    false
 }
 
 /// True when the command head is Cass, whether or not its syntax is one of the
@@ -5635,5 +5880,114 @@ mod tests {
     #[test]
     fn alien_codex_const_k12() {
         assert_alien_const_case(&alien_const_case("K12"));
+    }
+
+    // ========================================================================
+    // Ticket 07b: the frozen D01-D22 discovery-call boundary matrix.
+    //
+    // The fixture is copied byte-for-byte from the batch roadmap. Each case
+    // runs through the existing `exec_fixture` / `decide_for_record` path, so
+    // the assertion covers the whole hint and the strict judgment behind it,
+    // not a helper boolean. The three C04 reverse-side cases (D01, D02, D15)
+    // are executed inside the no-call test: a complete envelope stays
+    // independent evidence even when no static call is proved.
+    // ========================================================================
+
+    const ALIEN_DISCOVERY: &str =
+        include_str!("../../tests/fixtures/alien_codex/discovery.json");
+
+    fn alien_discovery_case(id: &str) -> Value {
+        alien_case(ALIEN_DISCOVERY, id)
+    }
+
+    /// Judge every frozen D case of one group. `expected_calls` is 0 for the
+    /// capture-free group and 1 for the real-call group; the two groups must
+    /// partition all 22 cases exactly once.
+    fn assert_alien_discovery_group(expected_calls: u64, expected_group_len: usize) {
+        let root: Value =
+            serde_json::from_str(ALIEN_DISCOVERY).expect("frozen discovery fixture JSON");
+        let cases = root["cases"].as_array().expect("cases array");
+        let mut judged = 0;
+
+        for case in cases {
+            let calls = case["expected_actual_stub_calls"]
+                .as_u64()
+                .expect("case stub calls");
+            if calls != expected_calls {
+                continue;
+            }
+            judged += 1;
+            let id = case["id"].as_str().expect("case id");
+            let expression = case["expression"].as_str().expect("case expression");
+            let expected_candidate = case["expected_candidate_without_recall"]
+                .as_bool()
+                .expect("case candidate");
+            let expected_reason = case["expected_reason_without_recall"].as_str();
+
+            // No D case is one of the 07a supported const forms, so only the
+            // discovery hint decides what happens here.
+            assert!(
+                parse_exec_literal(expression).is_none(),
+                "{id}: no discovery case is a const literal"
+            );
+
+            // A captured result that only printed a length or a truncation:
+            // no C04 envelope anywhere, so the call evidence has to stand.
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".to_string()));
+            let actual_candidate = outcome != Outcome::Preserve(None);
+            println!(
+                "case {id}: expected_calls={calls} expected_candidate={expected_candidate} \
+                 actual_candidate={actual_candidate} outcome={outcome:?}"
+            );
+
+            assert_eq!(actual_candidate, expected_candidate, "{id}: candidate hint");
+            if expected_candidate {
+                assert_eq!(expected_reason, Some("unsupported_shell"), "{id}: fixture reason");
+                assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            } else {
+                assert_eq!(
+                    outcome,
+                    Outcome::Preserve(None),
+                    "{id}: a discovery-only exec is ordinary work"
+                );
+            }
+        }
+
+        assert_eq!(
+            judged, expected_group_len,
+            "the fixture group must keep its frozen size"
+        );
+    }
+
+    /// D01/D02/D15: no static call is proved, but the result declares a
+    /// complete C04 envelope. The existing output OR-branch is independent
+    /// evidence, and the unsupported expression still preserves.
+    fn assert_alien_discovery_reverse_side() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        for id in ["D01", "D02", "D15"] {
+            let case = alien_discovery_case(id);
+            let expression = case["expression"].as_str().expect("case expression");
+            let (outcome, _, _) =
+                exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            let actual_candidate = outcome != Outcome::Preserve(None);
+            println!(
+                "case {id}+recall: expected_candidate=true \
+                 actual_candidate={actual_candidate} outcome={outcome:?}"
+            );
+            assert!(actual_candidate, "{id}: a complete envelope stands alone");
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn alien_codex_const_discovery_no_call() {
+        assert_alien_discovery_group(0, 14);
+        assert_alien_discovery_reverse_side();
+    }
+
+    #[test]
+    fn alien_codex_const_actual_call_partial() {
+        assert_alien_discovery_group(1, 8);
     }
 }
