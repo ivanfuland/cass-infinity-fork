@@ -20773,16 +20773,18 @@ fn prepare_conversation_for_ingest(
 
     if let Some(record) = &record {
         // Ticket 03 (`cass-alien-fresh-ingest`): the scratch directory name is
-        // part of the reparse contract, not cosmetics. `pi_agent` resolves its
-        // explicit roots with `looks_like_root`, which accepts a path only when
-        // it holds a `sessions` child, its file name contains `pi`, or the path
-        // string itself carries `.pi/agent`, `.omp/agent` or `pi-agent`
-        // (pinned FAD `pi_agent.rs:290-299`). A materialized copy keeps neither
-        // the original root shape nor the original directory name, so with the
-        // plain `cass-reparse-` prefix every Pi session lands outside all
-        // roots, the reparse returns zero conversations, and prepare fails with
-        // `reparse produced no session matching the first parse's agent/
-        // external_id` (exit 9). Naming the scratch dir after the connector
+        // part of the reparse contract, not cosmetics. The materialized copy
+        // keeps the tail of the original path, so a default `$HOME/.pi/agent`
+        // session still lands under a path carrying `.pi/agent` and reparses.
+        // A session under a custom root has no such marker of its own, and the
+        // scratch directory sits above that tail. `pi_agent` resolves explicit
+        // roots with `looks_like_root`, which accepts a path only when it holds
+        // a `sessions` child, its file name contains `pi`, or the path string
+        // carries `.pi/agent`, `.omp/agent` or `pi-agent` (pinned FAD
+        // `pi_agent.rs:290-299`). With the plain `cass-reparse-` prefix such a
+        // session reparsed as zero conversations and prepare failed with exit 9
+        // (`reparse produced no session matching the first parse's agent/
+        // external_id`). Naming the scratch directory after the connector
         // restores the one marker the Pi resolver reads. Other connectors are
         // addressed by their own root rules and keep the plain prefix.
         let scratch = tempfile::Builder::new()

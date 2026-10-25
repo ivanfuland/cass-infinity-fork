@@ -744,6 +744,106 @@ fn mirror_facts(data_dir: &Path, metadata: &Value, label: &str) -> MirrorFacts {
     }
 }
 
+/// A written round's own capture, proved without relying on excluded markers.
+/// The last written stage adds no new marker and the conversation metadata
+/// still names the first capture, so neither can show that round's capture.
+/// The private raw-mirror tree can: every capture lands there as a blob named
+/// by its blake3, whatever the round did to the conversation row.
+#[derive(Debug)]
+struct RoundCapture {
+    stage: String,
+    blob_relative_path: String,
+    blob_sha256: String,
+    blob_blake3: String,
+    blob_size_bytes: u64,
+    matching_blobs: Vec<String>,
+}
+
+impl RoundCapture {
+    fn to_json(&self) -> Value {
+        json!({
+            "stage": self.stage,
+            "blob_relative_path": self.blob_relative_path,
+            "blob_sha256": self.blob_sha256,
+            "blob_blake3": self.blob_blake3,
+            "blob_size_bytes": self.blob_size_bytes,
+            "matching_blobs": self.matching_blobs,
+        })
+    }
+}
+
+/// Every blob under the private raw mirror, as `(path relative to v1, bytes)`.
+fn raw_mirror_blobs(data_dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let root = data_dir.join("raw-mirror").join("v1");
+    let mut out = Vec::new();
+    let mut stack = vec![root.join("blobs")];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let path = entry.expect("read a raw-mirror entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .unwrap_or_else(|err| panic!("read raw-mirror blob {}: {err}", path.display()));
+            let relative = path
+                .strip_prefix(&root)
+                .unwrap_or_else(|err| panic!("blob {} is under v1: {err}", path.display()))
+                .to_string_lossy()
+                .into_owned();
+            out.push((relative, bytes));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// AC2: this round's complete capture is on disk, byte-equal to the frozen
+/// stage bytes and named by its blake3.
+fn round_capture_proof(data_dir: &Path, stage: &str, bytes: &[u8]) -> RoundCapture {
+    let expected_sha256 = sha256_hex(bytes);
+    let expected_blake3 = blake3_hex(bytes);
+    let matching_blobs: Vec<String> = raw_mirror_blobs(data_dir)
+        .into_iter()
+        .filter(|(_, blob_bytes)| blob_bytes == bytes)
+        .map(|(relative, _)| relative)
+        .collect();
+    assert!(
+        !matching_blobs.is_empty(),
+        "{stage}: the round's complete capture blob is on disk (sha256 {expected_sha256}, {} bytes)",
+        bytes.len()
+    );
+    let expected_name = format!("{expected_blake3}.raw");
+    for relative in &matching_blobs {
+        let name = relative.rsplit('/').next().unwrap_or(relative);
+        assert_eq!(
+            name, expected_name,
+            "{stage}: the capture blob {relative} is named by the round's blake3"
+        );
+    }
+    let blob_relative_path = matching_blobs[0].clone();
+    let blob_bytes = read_mirror_blob(data_dir, &blob_relative_path, stage);
+    assert_eq!(
+        blob_bytes, bytes,
+        "{stage}: the recorded capture blob is the round's bytes"
+    );
+    RoundCapture {
+        stage: stage.to_string(),
+        blob_relative_path,
+        blob_sha256: expected_sha256,
+        blob_blake3: expected_blake3,
+        blob_size_bytes: bytes.len() as u64,
+        matching_blobs,
+    }
+}
+
 // ============================================================================
 // One CLI run
 // ============================================================================
@@ -1542,18 +1642,116 @@ fn drive_valid_root(kind: RootKind) {
     let stages = stage_expectations();
     let mut current: Vec<u8> = Vec::new();
     let mut initial_bytes: Vec<u8> = Vec::new();
+    let mut source_mtime_ns: Option<u128> = None;
+    let mut previous_finished_ns: Option<u128> = None;
     let mut stage_records: Vec<Value> = Vec::new();
 
     for (index, expect) in stages.iter().enumerate() {
         let written = WRITTEN_STAGES.contains(&expect.id.as_str());
         let mut waited_ms = 0u128;
         if written {
-            current = frozen_bytes(&inputs, &expect.id);
-            fs::write(&case.source_path, &current).expect("write stage session");
+            let frozen = frozen_bytes(&inputs, &expect.id);
+            if index == 0 {
+                // The first stage creates the file.
+                fs::write(&case.source_path, &frozen).expect("create the stage session");
+            } else {
+                // Later stages append only the new suffix. Read what is on disk,
+                // prove the frozen stage extends it as a prefix, and append the
+                // rest through an append-mode handle.
+                let on_disk = fs::read(&case.source_path).unwrap_or_else(|err| {
+                    panic!("{} {}: read the source: {err}", kind.label(), expect.id)
+                });
+                assert_eq!(
+                    on_disk,
+                    current,
+                    "{} {}: the file on disk still holds the previous stage's complete source",
+                    kind.label(),
+                    expect.id
+                );
+                assert!(
+                    frozen.starts_with(&on_disk),
+                    "{} {}: the frozen stage extends the previous complete source as a prefix",
+                    kind.label(),
+                    expect.id
+                );
+                let suffix = &frozen[on_disk.len()..];
+                assert!(
+                    !suffix.is_empty(),
+                    "{} {}: an appended stage adds at least one byte",
+                    kind.label(),
+                    expect.id
+                );
+                let mut handle = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&case.source_path)
+                    .unwrap_or_else(|err| {
+                        panic!("{} {}: open for append: {err}", kind.label(), expect.id)
+                    });
+                handle.write_all(suffix).unwrap_or_else(|err| {
+                    panic!("{} {}: append the suffix: {err}", kind.label(), expect.id)
+                });
+                handle.flush().unwrap_or_else(|err| {
+                    panic!("{} {}: flush the append: {err}", kind.label(), expect.id)
+                });
+                handle.sync_all().unwrap_or_else(|err| {
+                    panic!("{} {}: sync the append: {err}", kind.label(), expect.id)
+                });
+                drop(handle);
+                let appended = fs::read(&case.source_path).unwrap_or_else(|err| {
+                    panic!(
+                        "{} {}: read back the source: {err}",
+                        kind.label(),
+                        expect.id
+                    )
+                });
+                assert_eq!(
+                    appended,
+                    frozen,
+                    "{} {}: appending the suffix produces exactly the frozen stage bytes",
+                    kind.label(),
+                    expect.id
+                );
+                let appended_mtime = file_mtime_ns(&case.source_path);
+                let finished = previous_finished_ns.unwrap_or_else(|| {
+                    panic!(
+                        "{} {}: an appended stage follows a finished round",
+                        kind.label(),
+                        expect.id
+                    )
+                });
+                assert!(
+                    appended_mtime > finished,
+                    "{} {}: the append mtime is strictly later than the previous round's CLI finish (mtime={appended_mtime}, finished={finished})",
+                    kind.label(),
+                    expect.id
+                );
+            }
+            current = frozen;
+            source_mtime_ns = Some(file_mtime_ns(&case.source_path));
             // Only a freshly written file needs this: the run right after the
             // write still sees its own bytes (its threshold comes from the
             // previous run), and the following run must see it as stale.
             waited_ms = wait_until_old_enough(&case.source_path);
+        } else if index > 0 {
+            // A quiet stage writes nothing: the source bytes and their mtime
+            // must be exactly what the previous stage left.
+            let on_disk = fs::read(&case.source_path).unwrap_or_else(|err| {
+                panic!("{} {}: read the source: {err}", kind.label(), expect.id)
+            });
+            assert_eq!(
+                sha256_hex(&on_disk),
+                sha256_hex(&current),
+                "{} {}: a quiet stage leaves the source bytes unchanged",
+                kind.label(),
+                expect.id
+            );
+            assert_eq!(
+                Some(file_mtime_ns(&case.source_path)),
+                source_mtime_ns,
+                "{} {}: a quiet stage leaves the source mtime unchanged",
+                kind.label(),
+                expect.id
+            );
         }
         if index == 0 {
             initial_bytes = current.clone();
@@ -1623,13 +1821,26 @@ fn drive_valid_root(kind: RootKind) {
             if index == 0 { "inserted" } else { "merged" },
         );
         assert_rows(&run, expect, &current, &initial_bytes, index == 0);
+        // A written round captures this round's complete file; a quiet round
+        // captures nothing and keeps the previous round's proof.
+        let capture = if written {
+            let proof = round_capture_proof(&run.data_dir, &expect.id, &current);
+            write_json(&run.artifact_dir.join("capture.json"), &proof.to_json());
+            Some(proof)
+        } else {
+            None
+        };
+        previous_finished_ns = Some(run.finished_unix_ns);
 
         stage_records.push(json!({
             "stage": expect.id,
             "action": expect.action,
             "written": written,
             "waited_ms": waited_ms.to_string(),
+            "source_sha256": sha256_hex(&current),
+            "source_mtime_ns": source_mtime_ns.map(|mtime| mtime.to_string()),
             "run": run.record(),
+            "round_capture": capture.map(|proof| proof.to_json()),
         }));
     }
 
