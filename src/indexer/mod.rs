@@ -18577,6 +18577,18 @@ fn reindex_paths_with_semantic_delta_and_safety(
                     .saturating_add(chunk_outcome.quarantined_conversations);
                 deferred_conversations =
                     deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
+                // Count only the inputs accepted by this successful chunk,
+                // including re-judged duplicates that add no message rows.
+                if let Some(progress) = &opts.progress
+                    && let Ok(mut stats) = progress.stats.lock()
+                {
+                    accumulate_recall_uncovered(
+                        &mut stats.recall_uncovered_by_reason,
+                        &chunk_outcome.batch_outcome.recall_uncovered_by_reason,
+                    );
+                    stats.recall_uncovered_total =
+                        stats.recall_uncovered_by_reason.values().copied().sum();
+                }
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
