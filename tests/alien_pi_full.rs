@@ -1931,3 +1931,48 @@ fn run_p01_derived_variants() {
     // evidence above already lives under the run's own directory and nothing
     // here writes back to `tests/fixtures`.
 }
+
+#[test]
+fn alien_pi_full_dsh_incomplete_body_full_extra_guard() {
+    let original = fs::read(fixture_file("P01")).expect("read P01");
+    let records = session_records(&original);
+    let complete = flatten_text_body(&records[record_index(&records, "r-c1")]);
+    for (variant, body) in [
+        ("dsh_plain_body_complete_extra", "malformed strong-identity output"),
+        (
+            "dsh_damaged_body_complete_extra",
+            "Warning: truncated output\n<cass_recall version=\"1\" tool=\"cass_search\">{broken</cass_recall>",
+        ),
+    ] {
+        let bytes = derived_bytes("P01", |lines| {
+            let result = record_index(lines, "r-c1");
+            lines[result]["message"]["content"] = text_block(body);
+            lines[result]["message"]["opaque_copy"] = Value::String(complete.clone());
+        });
+        for run in run_derived(
+            variant,
+            &bytes,
+            &derived_expected(4, 0, &[("unpaired_result", 1)], "ordinary synthetic answer"),
+        ) {
+            let row = result_row(&run, "r-c1");
+            assert!(row.excluded.is_none(), "{}: uncertain extra keeps row", run.label());
+            assert_eq!(row.content, body);
+            assert_eq!(row.extra["message"]["opaque_copy"].as_str(), Some(complete.as_str()));
+        }
+    }
+
+    // A complete envelope for a different tool is not a copy of this result.
+    let other_tool = complete.replace("tool=\"cass_search\"", "tool=\"cass_expand\"");
+    let bytes = derived_bytes("P01", |lines| {
+        let result = record_index(lines, "r-c1");
+        lines[result]["message"]["content"] = text_block("malformed strong-identity output");
+        lines[result]["message"]["opaque_copy"] = Value::String(other_tool.clone());
+    });
+    let mut expected = derived_expected(4, 1, &[], "ordinary synthetic answer");
+    expected.parse_error = 1;
+    for run in run_derived("dsh_different_tool_extra", &bytes, &expected) {
+        let row = result_row(&run, "r-c1");
+        assert!(row.excluded.is_some());
+        assert_eq!(row.extra["message"]["opaque_copy"].as_str(), Some(other_tool.as_str()));
+    }
+}

@@ -1011,11 +1011,10 @@ fn pi_judgment_event(event: &RawEvent, binding_id: &str) -> RawEvent {
 ///
 /// A complete C04 envelope is recognized through the shared codec: a copy
 /// must decode for the same tool to the same value. Surrounding whitespace
-/// therefore does not hide a copy.
+/// therefore does not hide a copy. If the body cannot be decoded, a complete
+/// envelope for the same tool elsewhere makes attribution unproven instead.
+/// Plain JSON and other non-envelope metadata do not acquire copy semantics.
 fn has_unproven_body_copy(extra: &Value, body: &str, tool: RecallTool) -> bool {
-    if !looks_like_recall_wrapper(body) {
-        return false;
-    }
     let reference = decode(body, tool).ok();
     let reference = reference.as_ref();
     match extra {
@@ -1093,12 +1092,12 @@ fn value_has_body_copy(
 }
 
 fn is_body_copy(text: &str, body: &str, reference: Option<&Value>, tool: RecallTool) -> bool {
-    if text == body {
+    if looks_like_recall_wrapper(body) && text == body {
         return true;
     }
     match reference {
         Some(expected) => decode(text, tool).ok().as_ref() == Some(expected),
-        None => false,
+        None => decode(text, tool).is_ok(),
     }
 }
 
