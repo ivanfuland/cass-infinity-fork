@@ -1569,7 +1569,7 @@ fn script_calls_a_cass_tool(expression: &str) -> bool {
             b' ' | b'\t' | b'\n' | b'\r' => pos += 1,
             b'/' if bytes.get(pos + 1) == Some(&b'/') => {
                 pos += 2;
-                while pos < bytes.len() && bytes[pos] != b'\n' {
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
                     pos += 1;
                 }
             }
@@ -5980,6 +5980,35 @@ mod tests {
         }
     }
 
+    /// r1 regression: a `//` comment that ended only at LF used to swallow a
+    /// real call that followed an ASCII CR. Both frozen newlines must end the
+    /// comment, so both cases keep the original `unsupported_shell` alert.
+    fn assert_alien_discovery_newline_regression() {
+        let cases = [
+            (
+                "CR01",
+                "// synthetic discovery\rconst r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content.length);",
+            ),
+            (
+                "LF01",
+                "// synthetic discovery\nconst r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content.length);",
+            ),
+        ];
+        for (id, expression) in cases {
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".to_string()));
+            let actual_candidate = outcome != Outcome::Preserve(None);
+            println!(
+                "r1-case {id}: expected_candidate=true actual_candidate={actual_candidate} \
+                 outcome={outcome:?}"
+            );
+            assert!(
+                actual_candidate,
+                "r1-case {id}: the call after the comment must be found"
+            );
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
     #[test]
     fn alien_codex_const_discovery_no_call() {
         assert_alien_discovery_group(0, 14);
@@ -5989,5 +6018,6 @@ mod tests {
     #[test]
     fn alien_codex_const_actual_call_partial() {
         assert_alien_discovery_group(1, 8);
+        assert_alien_discovery_newline_regression();
     }
 }
