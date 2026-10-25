@@ -300,6 +300,7 @@ fn is_recall_candidate(
                 .filter(|id| !id.is_empty()),
             result_idx,
             calls_by_id,
+            &result_body_text(value),
         ),
     }
 }
@@ -503,12 +504,14 @@ fn result_body_text(value: &Value) -> String {
 }
 
 /// Whether a result that lost its `toolName` still points at exactly one
-/// earlier call of a strong CASS tool. This is candidate evidence only; the
-/// binding itself still requires the result's own non-empty matching name.
+/// earlier CASS call. Bare and foreign names also need the corresponding
+/// complete C04 envelope. This is candidate evidence only; the binding itself
+/// still requires the result's own non-empty matching name.
 fn unique_prior_cass_call(
     tool_call_id: Option<&str>,
     result_idx: usize,
     calls_by_id: &HashMap<String, Vec<CallSite>>,
+    body: &str,
 ) -> bool {
     let Some(calls) = tool_call_id.and_then(|id| calls_by_id.get(id)) else {
         return false;
@@ -516,7 +519,13 @@ fn unique_prior_cass_call(
     let [call] = calls.as_slice() else {
         return false;
     };
-    call.call_idx < result_idx && strong_recall_tool(&call.tool_name).is_some()
+    if call.call_idx >= result_idx {
+        return false;
+    }
+    strong_recall_tool(&call.tool_name).is_some()
+        || bare_recall_tool(&call.tool_name)
+            .or_else(|| foreign_namespace_recall_tool(&call.tool_name))
+            .is_some_and(|tool| declares_c04(body, tool))
 }
 
 /// Every result record of the captured blob that is an identifiable CASS
@@ -601,7 +610,7 @@ fn identify_candidate(
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty());
     let id_only = || {
-        unique_prior_cass_call(result_tool_call_id(raw), result_idx, calls_by_id)
+        unique_prior_cass_call(result_tool_call_id(raw), result_idx, calls_by_id, body)
             .then_some(PiCandidateKind::IdOnly)
     };
     match named {
