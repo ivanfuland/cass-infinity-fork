@@ -1,0 +1,25 @@
+{
+  "schema": "cass-alien-pi-stage-inputs/1",
+  "synthetic": true,
+  "canonical_target_relative_path": ".pi/agent/sessions/--synthetic-alien--/2026-10-24T00-00-00_stage-session.jsonl",
+  "inputs": [
+    {
+      "stage": "S0",
+      "file": "fixtures/pi-stages/S0.jsonl",
+      "sha256": "d6d6b54b635a25a06b77a732c3126cd3005134f74134644ee3659927166dad1b",
+      "messages": 4
+    },
+    {
+      "stage": "S2",
+      "file": "fixtures/pi-stages/S2.jsonl",
+      "sha256": "9959e565ec9c92fbea6138400bddc95f564ebae62fcd42a416002c972760ee0e",
+      "messages": 8
+    },
+    {
+      "stage": "S4",
+      "file": "fixtures/pi-stages/S4.jsonl",
+      "sha256": "2b62d2529b9ef4e7ae110faf8348221046243c1bf1f725d0a0927cf353101e7c",
+      "messages": 11
+    }
+  ]
+}
