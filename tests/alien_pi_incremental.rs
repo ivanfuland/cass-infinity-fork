@@ -1985,6 +1985,7 @@ fn assert_pi_path_identity(kind: RootKind) {
     let repeated = format!("sessions/project/sessions/{name}");
     let unicode = format!("项目/分支/{name}");
     let scenarios = [
+        ("linked-data-dir", nested.as_str(), None),
         ("nested-absent", nested.as_str(), None),
         ("nested-empty", nested.as_str(), Some("")),
         ("flat-absent", name, None),
@@ -2005,6 +2006,16 @@ fn assert_pi_path_identity(kind: RootKind) {
             }
             let mut case = CaseEnv::new(kind);
             case.batch = batch;
+            if label == "linked-data-dir" {
+                #[cfg(unix)]
+                {
+                    let alias = case.root.join("data-link");
+                    std::os::unix::fs::symlink(&case.data_dir, &alias).unwrap();
+                    case.data_dir = alias;
+                }
+                #[cfg(not(unix))]
+                continue;
+            }
             let sessions = case.source_path.ancestors().nth(2).unwrap().to_path_buf();
             case.source_path = if label == "direct-agent-root" {
                 let agent = sessions.parent().unwrap();
@@ -2043,7 +2054,7 @@ fn assert_pi_path_identity(kind: RootKind) {
                 .unwrap();
             write_json(
                 &case.artifact_dir.join("identity-input.json"),
-                &json!({"label":label,"batch":batch,"source":case.source_path,
+                &json!({"label":label,"batch":batch,"source":case.source_path,"data_dir":case.data_dir,
                     "expected_external_id":expected_id,"sha256":sha256_hex(&raw)}),
             );
             for (round, full) in [("full-1", true), ("full-2", true), ("incremental", false)] {
