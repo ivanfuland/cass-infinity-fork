@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use coding_agent_search::search::model_api::{
-    ApiConfig, RepresentationRecord, ValidatedProfile,
+    ApiConfig, EndpointConfigIdentity, RepresentationRecord, ValidatedProfile,
 };
 use coding_agent_search::storage::api::{Conn, StorageError, Tx, TxMode, Value};
 use coding_agent_search::storage::api_generation::{
@@ -29,6 +29,7 @@ const EMBED_MODEL: &str = "example/synthetic-embed";
 const EMBED_REVISION: &str = "rev-synthetic-1";
 const ENDPOINT_A: &str = "http://127.0.0.1:9100/v1/embeddings";
 const ENDPOINT_B: &str = "http://127.0.0.1:9200/v1/embeddings";
+const HTTPS_LOOPBACK_ENDPOINT: &str = "https://127.0.0.1:9300/v1/embeddings";
 const CLOUD_ENDPOINT: &str = "https://cloud.example.invalid/v1/embeddings";
 
 /// A synthetic secret. It must never reach a stored record or a rendered
@@ -675,6 +676,222 @@ fn a_self_consistent_record_for_another_space_is_an_identity_mismatch() {
 }
 
 // ---------------------------------------------------------------------------
+// T01-A1: call settings are recorded, not admitted
+// ---------------------------------------------------------------------------
+
+/// A generation created with one set of call settings opens unchanged under
+/// another: only the declared vector space and the pinned provider decide
+/// admission.
+///
+/// Every case is a real `ApiConfig` profile whose call-configuration digest
+/// differs from the base profile's. The stored representation and provenance
+/// records must stay byte-for-byte identical across every case.
+#[test]
+fn call_settings_can_change_without_rewriting_generation_identity() {
+    let fixture = Fixture::new();
+    let conn = fixture.conn();
+    let base = profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[]);
+    let generation_id = fixture.create(&base, 1024, b"fp-call-settings");
+    assert!(fixture.open(generation_id, &base).is_ok());
+
+    let before_representation = meta_value(conn, &representation_meta_key(generation_id));
+    let before_provenance = meta_value(conn, &provenance_meta_key(generation_id));
+    assert!(before_representation.is_some(), "the record must exist");
+    assert!(before_provenance.is_some(), "the record must exist");
+    let before_descriptor_sha256 = RepresentationRecord::decode(
+        before_representation
+            .as_ref()
+            .expect("the record must exist")
+            .as_bytes(),
+    )
+    .expect("the representation record decodes")
+    .descriptor_sha256()
+    .to_string();
+
+    let base_call_digest = EndpointConfigIdentity::from_profile(&base)
+        .expect("the base profile has a call identity")
+        .sha256();
+
+    let credential_env = format!("api_key_env = \"{CREDENTIAL_ENV}\"");
+    let aliases = r#"response_model_aliases = ["alias-a", "alias-b"]"#;
+    let cases: Vec<(&str, ValidatedProfile)> = vec![
+        (
+            "endpoint",
+            profile_for("p1", ENDPOINT_B, EMBED_MODEL, EMBED_REVISION, &[]),
+        ),
+        (
+            "timeout_ms",
+            profile_for(
+                "p1",
+                ENDPOINT_A,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &["timeout_ms = 125000"],
+            ),
+        ),
+        (
+            "connect_timeout_ms",
+            profile_for(
+                "p1",
+                ENDPOINT_A,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &["connect_timeout_ms = 30000"],
+            ),
+        ),
+        (
+            "api_key_env",
+            profile_for(
+                "p1",
+                ENDPOINT_A,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &[credential_env.as_str()],
+            ),
+        ),
+        (
+            "max_response_bytes",
+            profile_for(
+                "p1",
+                ENDPOINT_A,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &["max_response_bytes = 1048576"],
+            ),
+        ),
+        (
+            "models_endpoint",
+            profile_for(
+                "p1",
+                ENDPOINT_A,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &[r#"models_endpoint = "http://127.0.0.1:9100/v1/models""#],
+            ),
+        ),
+        (
+            "send_model",
+            profile_for(
+                "p1",
+                ENDPOINT_A,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &["send_model = false"],
+            ),
+        ),
+        (
+            "response_model_aliases",
+            profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[aliases]),
+        ),
+        (
+            "all of the above together",
+            profile_for(
+                "p1",
+                ENDPOINT_B,
+                EMBED_MODEL,
+                EMBED_REVISION,
+                &[
+                    "timeout_ms = 125000",
+                    "connect_timeout_ms = 30000",
+                    credential_env.as_str(),
+                    "max_response_bytes = 1048576",
+                    r#"models_endpoint = "http://127.0.0.1:9200/v1/models""#,
+                    "send_model = false",
+                    aliases,
+                ],
+            ),
+        ),
+    ];
+
+    for (label, profile) in &cases {
+        let changed = EndpointConfigIdentity::from_profile(profile)
+            .expect("the changed profile has a call identity")
+            .sha256();
+        assert_ne!(
+            changed, base_call_digest,
+            "{label} must really move the call configuration"
+        );
+
+        let verified = fixture
+            .open(generation_id, profile)
+            .unwrap_or_else(|error| panic!("{label} must still open the generation: {error}"));
+        assert_eq!(verified.generation_id(), generation_id, "{label}");
+        assert_eq!(
+            verified.descriptor_sha256(),
+            before_descriptor_sha256.as_str(),
+            "{label} must not change the descriptor digest"
+        );
+        assert_eq!(
+            meta_value(conn, &representation_meta_key(generation_id)),
+            before_representation,
+            "{label} must not rewrite the representation record"
+        );
+        assert_eq!(
+            meta_value(conn, &provenance_meta_key(generation_id)),
+            before_provenance,
+            "{label} must not rewrite the provenance record"
+        );
+    }
+
+    // Scope is a call setting too. Give it its own record on an HTTPS endpoint
+    // so the only difference between the two profiles is `scope` itself.
+    let https_loopback = parse_profile(
+        "p1",
+        &profile_toml(
+            "p1",
+            "openai-embeddings-v1",
+            HTTPS_LOOPBACK_ENDPOINT,
+            "loopback",
+            EMBED_MODEL,
+            EMBED_REVISION,
+            &[r#"normalization = "l2""#],
+        ),
+    );
+    let scope_generation = fixture.create(&https_loopback, 1024, b"fp-scope");
+    let scope_before_representation = meta_value(conn, &representation_meta_key(scope_generation));
+    let scope_before_provenance = meta_value(conn, &provenance_meta_key(scope_generation));
+    let remote_scope = parse_profile(
+        "p1",
+        &profile_toml(
+            "p1",
+            "openai-embeddings-v1",
+            HTTPS_LOOPBACK_ENDPOINT,
+            "remote",
+            EMBED_MODEL,
+            EMBED_REVISION,
+            &[r#"normalization = "l2""#],
+        ),
+    );
+    assert_ne!(
+        EndpointConfigIdentity::from_profile(&remote_scope)
+            .expect("the remote profile has a call identity")
+            .sha256(),
+        EndpointConfigIdentity::from_profile(&https_loopback)
+            .expect("the loopback profile has a call identity")
+            .sha256(),
+        "scope must really move the call configuration"
+    );
+    let verified = fixture
+        .open(scope_generation, &remote_scope)
+        .expect("a scope change must still open the generation");
+    assert_eq!(verified.generation_id(), scope_generation);
+    assert_eq!(
+        meta_value(conn, &representation_meta_key(scope_generation)),
+        scope_before_representation,
+        "scope must not rewrite the representation record"
+    );
+    assert_eq!(
+        meta_value(conn, &provenance_meta_key(scope_generation)),
+        scope_before_provenance,
+        "scope must not rewrite the provenance record"
+    );
+
+    // No case created a second space for the same declaration.
+    assert_eq!(count(conn, "embedding_generations"), 2);
+    assert!(fixture.open(generation_id, &base).is_ok());
+}
+
+// ---------------------------------------------------------------------------
 // Acceptance 4: configuration drift is classified, not guessed
 // ---------------------------------------------------------------------------
 
@@ -705,6 +922,60 @@ fn configuration_drift_is_classified_not_guessed() {
         ApiGenerationErrorCode::IdentityMismatch
     );
 
+    // Same width, same model, a different declared revision.
+    let other_revision = profile_for("p1", ENDPOINT_A, EMBED_MODEL, "rev-synthetic-2", &[]);
+    assert_eq!(
+        fixture.reopen_error(generation_id, &other_revision).code(),
+        ApiGenerationErrorCode::IdentityMismatch
+    );
+
+    // Same width, same model, different document prefix.
+    let document_prefixed = profile_for(
+        "p1",
+        ENDPOINT_A,
+        EMBED_MODEL,
+        EMBED_REVISION,
+        &["document_prefix = \"passage: \""],
+    );
+    assert_eq!(
+        fixture
+            .reopen_error(generation_id, &document_prefixed)
+            .code(),
+        ApiGenerationErrorCode::IdentityMismatch
+    );
+
+    // Same width, same model, a different protocol family.
+    let other_protocol = parse_profile(
+        "p1",
+        &profile_toml(
+            "p1",
+            "openrouter-embeddings-v1",
+            ENDPOINT_A,
+            "loopback",
+            EMBED_MODEL,
+            EMBED_REVISION,
+            &[r#"normalization = "l2""#],
+        ),
+    );
+    assert_eq!(
+        fixture.reopen_error(generation_id, &other_protocol).code(),
+        ApiGenerationErrorCode::IdentityMismatch
+    );
+
+    // An explicit request dimension equal to the archived effective dimension:
+    // the profile is legal, but the stored declaration has no request dimension.
+    let requesting = profile_for(
+        "p1",
+        ENDPOINT_A,
+        EMBED_MODEL,
+        EMBED_REVISION,
+        &["request_dimensions = 1024"],
+    );
+    assert_eq!(
+        fixture.reopen_error(generation_id, &requesting).code(),
+        ApiGenerationErrorCode::IdentityMismatch
+    );
+
     // Same width, different normalization.
     let unnormalized = parse_profile(
         "p1",
@@ -723,15 +994,18 @@ fn configuration_drift_is_classified_not_guessed() {
         ApiGenerationErrorCode::IdentityMismatch
     );
 
-    // A relocation moves the call configuration and nothing else.
+    // A relocation moves only the call configuration. The declared space is
+    // unchanged, so the generation opens and neither record is rewritten.
     let before_representation = meta_value(conn, &representation_meta_key(generation_id));
     let before_provenance = meta_value(conn, &provenance_meta_key(generation_id));
     let relocated = profile_for("p1", ENDPOINT_B, EMBED_MODEL, EMBED_REVISION, &[]);
-    let error = fixture.reopen_error(generation_id, &relocated);
-    assert_eq!(error.code(), ApiGenerationErrorCode::CompatibilityRequired);
-    assert_eq!(error.field(), Some("endpoint_config_sha256"));
+    let verified = fixture
+        .open(generation_id, &relocated)
+        .expect("a relocated call configuration must still open the declared space");
+    assert_eq!(verified.generation_id(), generation_id);
 
-    // The refusal left the row and both records byte-for-byte intact.
+    // The accepted relocation left the row and both records byte-for-byte
+    // intact.
     assert_eq!(
         meta_value(conn, &representation_meta_key(generation_id)),
         before_representation
@@ -777,7 +1051,7 @@ fn a_changed_pinned_provider_needs_re_admission() {
     assert!(fixture.open(generation_id, &providerless).is_ok());
     let error = fixture.reopen_error(generation_id, &pinned);
     assert_eq!(error.code(), ApiGenerationErrorCode::CompatibilityRequired);
-    assert_eq!(error.field(), Some("endpoint_config_sha256"));
+    assert_eq!(error.field(), Some("provider_only"));
 
     // Both records are still exactly what they were.
     assert!(fixture.open(generation_id, &providerless).is_ok());

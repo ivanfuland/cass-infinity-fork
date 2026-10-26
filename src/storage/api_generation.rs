@@ -97,8 +97,8 @@ pub enum ApiGenerationErrorCode {
     UnsupportedVersion,
     /// The stored space differs from the one the running profile describes.
     IdentityMismatch,
-    /// The record's call configuration or provider needs successor-side
-    /// cross-endpoint proof before it may be used.
+    /// The record needs successor-side cross-endpoint proof before it may be
+    /// used.
     CompatibilityRequired,
     /// The record names more contributors than this build can admit.
     UnsupportedContributors,
@@ -1248,10 +1248,13 @@ impl VerifiedPrimaryGeneration {
 /// 4. the stored descriptor still describes the space `profile` describes — a
 ///    changed model, revision, prefix, normalization, protocol, dimension or
 ///    pipeline version is an [`ApiGenerationErrorCode::IdentityMismatch`];
-/// 5. the stored endpoint digest and pinned provider still match the ones
-///    recomputed from `profile` — a relocation or provider change is
-///    [`ApiGenerationErrorCode::CompatibilityRequired`], because the record's
-///    own bytes stay valid and only successor-side admission may clear it.
+/// 5. the stored pinned provider still matches the profile's — a provider
+///    change is [`ApiGenerationErrorCode::CompatibilityRequired`], because the
+///    record's own bytes stay valid and only successor-side admission may clear
+///    it. The stored endpoint digest records how the generation was first
+///    called and takes no part in admission: a relocated endpoint, timeout,
+///    connect timeout, credential variable name, response ceiling or metadata
+///    endpoint still opens the same declared space.
 ///
 /// The read runs inside `tx` so a future batch or activation guard can re-check
 /// identity inside the very transaction that writes. Nothing here writes.
@@ -1519,24 +1522,18 @@ fn check_descriptor_against_profile(
     Ok(())
 }
 
-/// The stored call configuration and provider must still match the profile's.
+/// The stored pinned provider must still match the profile's.
 ///
-/// These are the two facts that move a *call* without moving the *space*: a
-/// relocated endpoint or a changed pinned provider leaves the descriptor intact
-/// but invalidates the record's admission, which only successor-side
-/// cross-endpoint proof may restore.
+/// A provider change moves a *call* without moving the *space*: it leaves the
+/// descriptor intact but invalidates the record's admission, which only
+/// successor-side cross-endpoint proof may restore. The stored endpoint digest
+/// is creation-time evidence only and is deliberately not compared here, so a
+/// relocated endpoint or any other call-setting change still opens the declared
+/// space.
 fn check_contributor_against_profile(
     contributor: &ApiGenerationContributor,
     profile: &ValidatedProfile,
 ) -> Result<(), ApiGenerationError> {
-    let endpoint = EndpointConfigIdentity::from_profile(profile)
-        .map_err(ApiGenerationError::from_config)?;
-    if contributor.endpoint_config_sha256() != endpoint.sha256() {
-        return Err(ApiGenerationError::at(
-            ApiGenerationErrorCode::CompatibilityRequired,
-            "endpoint_config_sha256",
-        ));
-    }
     let provider = profile.embedding().and_then(|detail| detail.provider_only.as_deref());
     if contributor.provider_only() != provider {
         return Err(ApiGenerationError::at(
