@@ -2014,12 +2014,11 @@ fn assert_pi_path_identity(kind: RootKind) {
                 sessions.join(relative)
             };
             fs::create_dir_all(case.source_path.parent().unwrap()).unwrap();
-            let mut lines: Vec<Value> = include_str!(
-                "fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl"
-            )
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
+            let mut lines: Vec<Value> =
+                include_str!("fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl")
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
             let mut header = lines.remove(0);
             assert_eq!(header["type"], "session");
             if let Some(id) = header_id {
@@ -2036,8 +2035,12 @@ fn assert_pi_path_identity(kind: RootKind) {
             fs::write(&case.source_path, &raw).unwrap();
             let expected_id = header_id.filter(|id| !id.is_empty()).unwrap_or(relative);
             let records = session_records(&raw);
-            let user = records[0]["message"]["content"][0]["text"].as_str().unwrap();
-            let answer = records[3]["message"]["content"][0]["text"].as_str().unwrap();
+            let user = records[0]["message"]["content"][0]["text"]
+                .as_str()
+                .unwrap();
+            let answer = records[3]["message"]["content"][0]["text"]
+                .as_str()
+                .unwrap();
             write_json(
                 &case.artifact_dir.join("identity-input.json"),
                 &json!({"label":label,"batch":batch,"source":case.source_path,
@@ -2078,7 +2081,11 @@ fn alien_pi_path_identity_configured_root() {
 
 #[test]
 fn alien_pi_path_identity_same_filename_stays_distinct() {
-    for kind in [RootKind::DefaultHome, RootKind::AgentDirOverride, RootKind::ConfiguredRoot] {
+    for kind in [
+        RootKind::DefaultHome,
+        RootKind::AgentDirOverride,
+        RootKind::ConfiguredRoot,
+    ] {
         for batch in [false, true] {
             let mut case = CaseEnv::new(kind);
             case.batch = batch;
@@ -2087,7 +2094,8 @@ fn alien_pi_path_identity_same_filename_stays_distinct() {
                 .lines()
                 .filter(|line| serde_json::from_str::<Value>(line).unwrap()["type"] != "session")
                 .collect::<Vec<_>>()
-                .join("\n") + "\n";
+                .join("\n")
+                + "\n";
             let filename = "2026-10-26T00-00-00_shared-name.jsonl";
             for project in ["left", "right"] {
                 let file = sessions.join(project).join(filename);
@@ -2102,7 +2110,10 @@ fn alien_pi_path_identity_same_filename_stays_distinct() {
                 assert_eq!(run.db.rows.len(), 8);
                 let mut ids = run.db.external_ids.clone();
                 ids.sort();
-                assert_eq!(ids, [format!("left/{filename}"), format!("right/{filename}")]);
+                assert_eq!(
+                    ids,
+                    [format!("left/{filename}"), format!("right/{filename}")]
+                );
                 assert_eq!(run.db.excluded(), 2);
             }
         }
