@@ -278,6 +278,30 @@ model = "example/rank"
 model_revision = "rev-2"
 ```
 
+#### Relocating the embedding endpoint without a rebuild
+
+The stored declaration and the endpoint call settings are separate. The declaration is the model, the model revision, `query_prefix`, `document_prefix`, the normalization, the protocol, the dimensions, the request dimensions, and the two pipeline versions. The call settings are the endpoint, the scope, the timeouts, `api_key_env`, `max_response_bytes`, `models_endpoint`, `send_model`, and `response_model_aliases`.
+
+- **Opening an existing generation**: an existing generation still opens when its declaration and `provider_only` are unchanged. A change to the call settings alone, such as a new endpoint, a new timeout, or a new key variable name, does not require a rebuild.
+- **Reusing the generation during indexing**: indexing compares the vectors of three fixed probe texts with the stored fingerprint. Each probe must reach a cosine similarity of at least 0.999. The generation is reused only when all three probes pass.
+- **A mismatch under the same declaration**: when the declaration is unchanged and the fingerprint does not pass, cass reports an error that names the cause. Check the embedding service behind the endpoint, or change the real `model` or `model_revision` declaration. cass does not create another generation silently.
+- **Changing `send_model` or `response_model_aliases`**: these two settings are not part of the declaration, so they do not select a generation. Before you change either setting, run one indexing pass with the new configuration. Let queries use that configuration only after the fingerprint passes. The query path does not check the fingerprint, so a wrong value can lower recall even though no stored vector changes. Do not verify with the old configuration and then switch.
+- **Built-in fallback and compatibility proof**: this change keeps the built-in fallback and the compatibility-proof behavior that the paragraph above describes. A transition to a cloud fallback without verified compatibility evidence still reports `CompatibilityRequired`.
+
+To move an existing `local-embed` profile to a LiteLLM gateway, keep the declaration lines and change only the call settings:
+
+```toml
+# Merge these call settings into the existing [profiles.local-embed] table.
+# Keep its model, model_revision, query_prefix, document_prefix,
+# normalization, expected_dimension and request_dimensions lines unchanged.
+
+[profiles.local-embed]
+endpoint = "http://127.0.0.1:18888/v1/embeddings"
+scope = "loopback"
+timeout_ms = 125000
+api_key_env = "EMBED_API_KEY"
+```
+
 #### Semantic Backends
 
 Semantic search computes vector similarity from embeddings produced by the configured HTTP embedding profile. Semantic readiness is reported from the database vector domain by `cass health --json` and `cass status --json`. The former on-device backends — the ONNX/FastEmbed embedders and the deterministic hash embedder — are retired and are no longer production semantic backends. `CASS_SEMANTIC_EMBEDDER` is refused with a migration error.
