@@ -20859,7 +20859,14 @@ fn prepare_conversation_for_ingest(
             } else {
                 root
             };
-            if home.starts_with(scratch.path()) {
+            // Materialization returns canonical paths. Resolve the scratch
+            // root too, so a symlinked data directory does not make a safe
+            // captured path appear to be outside its own scratch directory.
+            let scratch_root = scratch
+                .path()
+                .canonicalize()
+                .map_err(|err| PrepareError(format!("Pi reparse scratch root: {err}")))?;
+            if home.starts_with(&scratch_root) {
                 scan_data_dir = home.to_path_buf();
             }
         }
