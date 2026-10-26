@@ -41318,6 +41318,8 @@ normalization="l2"
 
     #[test]
     fn prepare_pi_capture_uses_only_explicit_scratch_roots() {
+        use crate::connectors::ScanContext;
+
         if !in_isolated_indexer_child("prepare_pi_capture_uses_only_explicit_scratch_roots") {
             return;
         }
