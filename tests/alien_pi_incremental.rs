@@ -1997,6 +1997,12 @@ fn assert_pi_path_identity(kind: RootKind) {
     ];
     for batch in [false, true] {
         for (label, relative, header_id) in scenarios {
+            // Default detection requires an existing sessions directory.
+            // Only configured roots reach reparse without that directory;
+            // changing default detection belongs to the connector project.
+            if label == "direct-agent-root" && kind != RootKind::ConfiguredRoot {
+                continue;
+            }
             let mut case = CaseEnv::new(kind);
             case.batch = batch;
             let sessions = case.source_path.ancestors().nth(2).unwrap().to_path_buf();
@@ -2100,5 +2106,24 @@ fn alien_pi_path_identity_same_filename_stays_distinct() {
                 assert_eq!(run.db.excluded(), 2);
             }
         }
+    }
+}
+
+#[test]
+fn alien_pi_path_identity_undetected_root_is_not_an_ingest_success() {
+    for kind in [RootKind::DefaultHome, RootKind::AgentDirOverride] {
+        let mut case = CaseEnv::new(kind);
+        let sessions = case.source_path.ancestors().nth(2).unwrap().to_path_buf();
+        let agent = sessions.parent().unwrap();
+        fs::rename(&sessions, agent.join("kept-empty-session-layout")).unwrap();
+        case.source_path = agent.join("project/2026-10-26T00-00-00_not-detected.jsonl");
+        fs::create_dir_all(case.source_path.parent().unwrap()).unwrap();
+        let raw = b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"ordinary detection boundary\"}]}}\n";
+        fs::write(&case.source_path, raw).unwrap();
+        let run = run_stage(&case, "not-detected", true, raw, 0);
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.stdout["scan_invocations"], 0);
+        assert_eq!(run.db.conversations, 0);
+        assert!(run.db.rows.is_empty());
     }
 }
