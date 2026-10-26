@@ -477,23 +477,29 @@ impl CaseEnv {
                 );
             }
         }
+        case.record_case();
+        case
+    }
+
+    /// Record the active paths, including scenario-specific overrides made
+    /// after construction. Historical runs keep their original evidence.
+    fn record_case(&self) {
         write_json(
-            &case.artifact_dir.join("case.json"),
+            &self.artifact_dir.join("case.json"),
             &json!({
                 "record": "cass_alien_pi_incremental_case",
-                "label": kind.label(),
-                "root_kind": kind.token(),
-                "root": display_path(&case.root),
-                "home": display_path(&case.home),
-                "config_home": display_path(&case.config_home),
-                "data_dir": display_path(&case.data_dir),
-                "source_path": display_path(&case.source_path),
-                "configured_root": case.configured_root.as_deref().map(display_path),
-                "agent_home": case.agent_home.as_deref().map(display_path),
+                "label": self.kind.label(),
+                "root_kind": self.kind.token(),
+                "root": display_path(&self.root),
+                "home": display_path(&self.home),
+                "config_home": display_path(&self.config_home),
+                "data_dir": display_path(&self.data_dir),
+                "source_path": display_path(&self.source_path),
+                "configured_root": self.configured_root.as_deref().map(display_path),
+                "agent_home": self.agent_home.as_deref().map(display_path),
                 "cass_bin": display_path(&cass_bin()),
             }),
         );
-        case
     }
 
     fn db_path(&self) -> PathBuf {
@@ -925,6 +931,7 @@ fn run_stage(
     current_bytes: &[u8],
     waited_ms: u128,
 ) -> StageRun {
+    case.record_case();
     let label = format!("{} {stage}", case.kind.label());
     let evidence = case.artifact_dir.join(stage);
     fs::create_dir_all(&evidence).expect("create stage evidence dir");
