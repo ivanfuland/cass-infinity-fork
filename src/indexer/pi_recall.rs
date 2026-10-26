@@ -79,6 +79,9 @@ pub(crate) struct PiFacts {
     /// an unmatched position (only possible when `alignment_ok` is false)
     /// carries an empty key and no blocks.
     pub(crate) events: Vec<RawEvent>,
+    /// Native message records projected from the captured blob, independent
+    /// of the number of canonical message slots in `events`.
+    pub(crate) raw_message_count: usize,
     /// Bindings keyed by result message index.
     pub(crate) bindings: BTreeMap<usize, PiBinding>,
     /// Observable candidate hint for results that may be CASS recall output:
@@ -157,6 +160,7 @@ impl PiFacts {
 
         let mut facts = Self {
             events,
+            raw_message_count: raw_messages.len(),
             bindings: BTreeMap::new(),
             candidate_result_indices: BTreeSet::new(),
             alignment_ok,
@@ -807,7 +811,7 @@ pub(crate) struct PiCleanupOutcome {
     /// records one-to-one. The caller records its own align-failure counters
     /// from this flag; the local reasons above already hold the diagnosis.
     pub(crate) alignment_failed: bool,
-    /// Canonical event count, for the caller's align-failure detail.
+    /// Actual projected native record count, for the caller's failure detail.
     pub(crate) event_count: usize,
 }
 
@@ -833,7 +837,7 @@ pub(crate) fn cleanup_pi_conversation(
             excluded: vec![None; conv.messages.len()],
             uncovered_by_reason,
             alignment_failed: true,
-            event_count: facts.events.len(),
+            event_count: facts.raw_message_count,
         };
     }
 
@@ -899,7 +903,7 @@ pub(crate) fn cleanup_pi_conversation(
         excluded,
         uncovered_by_reason,
         alignment_failed: false,
-        event_count: facts.events.len(),
+        event_count: facts.raw_message_count,
     }
 }
 
@@ -1869,30 +1873,56 @@ mod tests {
             let mut lines = p01_lines();
             let mut variant = project_full(case, &lines);
             match case {
-                "drop-canonical" => { variant.conversation.messages.pop(); }
+                "drop-canonical" => {
+                    variant.conversation.messages.pop();
+                }
                 "extra-canonical" => {
                     let mut extra = variant.conversation.messages[0].clone();
                     extra.idx = 4;
                     variant.conversation.messages.push(extra);
                 }
-                "drop-raw" => { lines.remove(1); }
-                "extra-raw" => { lines.push(lines[1].clone()); }
+                "drop-raw" => {
+                    lines.remove(1);
+                }
+                "extra-raw" => {
+                    lines.push(lines[1].clone());
+                }
                 "same-count-mismatch" => unmap_message(&mut variant, 0),
                 _ => unreachable!(),
             }
             if matches!(case, "drop-raw" | "extra-raw") {
-                let text = lines.iter().map(|line| serde_json::to_string(line).unwrap())
-                    .collect::<Vec<_>>().join("\n") + "\n";
+                let text = lines
+                    .iter()
+                    .map(|line| serde_json::to_string(line).unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n";
                 fs::write(&variant.blob, text).unwrap();
             }
             assert_eq!(variant.conversation.messages.len(), canonical_count);
             let before = serde_json::to_value(&variant.conversation.messages).unwrap();
-            let outcome = cleanup_pi_conversation(&variant.blob, &mut variant.conversation, "derived/diagnostic.jsonl", false);
+            let outcome = cleanup_pi_conversation(
+                &variant.blob,
+                &mut variant.conversation,
+                "derived/diagnostic.jsonl",
+                false,
+            );
             assert!(outcome.alignment_failed, "{case}");
-            assert_eq!(outcome.event_count, raw_count, "{case}: actual native record count");
+            assert_eq!(
+                outcome.event_count, raw_count,
+                "{case}: actual native record count"
+            );
             assert_eq!(outcome.excluded, vec![None; canonical_count], "{case}");
-            assert_eq!(outcome.uncovered_by_reason, BTreeMap::from([("unpaired_result".to_string(), 1)]), "{case}");
-            assert_eq!(serde_json::to_value(&variant.conversation.messages).unwrap(), before, "{case}: no cleanup on failed alignment");
+            assert_eq!(
+                outcome.uncovered_by_reason,
+                BTreeMap::from([("unpaired_result".to_string(), 1)]),
+                "{case}"
+            );
+            assert_eq!(
+                serde_json::to_value(&variant.conversation.messages).unwrap(),
+                before,
+                "{case}: no cleanup on failed alignment"
+            );
         }
     }
 
