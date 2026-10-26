@@ -1,0 +1,130 @@
+{
+  "schema": "cass-alien-codex-const-cases/1",
+  "synthetic": true,
+  "cases": [
+    {
+      "id": "K01",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});text(r);",
+      "expected": {
+        "supported": true,
+        "reason": null,
+        "method": "mcp__cass_mcp__cass_search",
+        "args": {
+          "query": "synthetic"
+        }
+      }
+    },
+    {
+      "id": "K02",
+      "expression": " const answer = await tools.mcp__cass_mcp__cass_search({query:\"synthetic\",}); text(answer); ",
+      "expected": {
+        "supported": true,
+        "reason": null,
+        "method": "mcp__cass_mcp__cass_search",
+        "args": {
+          "query": "synthetic"
+        }
+      }
+    },
+    {
+      "id": "K03",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(other);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K04",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});r=other;text(r);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K05",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r);text(r);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K06",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});const s=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K07",
+      "expression": "let r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K08",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})\ntext(r);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K09",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r)",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K10",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K11",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r);;",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    },
+    {
+      "id": "K12",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});log(r);text(r);",
+      "expected": {
+        "supported": false,
+        "reason": "unsupported_shell",
+        "method": null,
+        "args": null
+      }
+    }
+  ]
+}

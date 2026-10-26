@@ -14,7 +14,7 @@
 //! compressed by the time a row exists, R7 note). `apply`/`apply_sibling`
 //! then do the actual content/extra replacement once a [`Decision`] exists.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
@@ -578,6 +578,11 @@ fn codex_events_from_blob(blob_path: &Path) -> std::io::Result<Vec<RawEvent>> {
 pub(crate) struct PreparedConversation {
     pub conv: NormalizedConversation,
     pub excluded: Vec<Option<ExcludedMarker>>,
+    /// Pi-only uncovered diagnostics for this conversation, keyed by the
+    /// frozen reason string. Every other connector and every legacy
+    /// constructor carries an empty map; a non-empty map is produced only by
+    /// the Pi judgment in `pi_recall` and folded into the round's stats once.
+    pub recall_uncovered_by_reason: BTreeMap<String, u64>,
 }
 
 /// Prepare-time failure that must abort ingestion of the whole session

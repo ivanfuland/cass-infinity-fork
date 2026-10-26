@@ -1694,3 +1694,97 @@ fn unknown_tool_is_a_protocol_error() {
         "an unknown tool must not start a subprocess"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 08-AC1: the four recall tools advertise read-only metadata over real HTTP
+// ---------------------------------------------------------------------------
+
+const ALIEN_TOOLS: [&str; 4] = [
+    "cass_search",
+    "cass_expand",
+    "cass_sessions",
+    "cass_timeline",
+];
+
+/// `tools/list` over the real HTTP transport, asserting no subprocess ran.
+fn alien_tools(fixture: &Fixture) -> Vec<Value> {
+    let (server, session) = session_client(fixture);
+    let mut client = Client::new(&server);
+    let value = client.request_2025(&session, "tools/list", json!({}));
+    assert!(
+        fixture.calls().is_empty(),
+        "listing tools must not start a subprocess"
+    );
+    value["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tools/list must return an array: {value}"))
+        .clone()
+}
+
+/// Exactly the original four tools, and the named one carries the frozen
+/// read-only annotations field by field.
+fn assert_alien_readonly(tools: &[Value], name: &str) {
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(
+        names,
+        ALIEN_TOOLS.to_vec(),
+        "the tool set must stay exactly the four recall tools"
+    );
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .unwrap_or_else(|| panic!("tools/list must include {name}: {tools:?}"));
+    let annotations = tool
+        .get("annotations")
+        .unwrap_or_else(|| panic!("{name} must carry annotations: {tool}"));
+    assert_eq!(annotations["readOnlyHint"], true, "{name}");
+    assert_eq!(annotations["destructiveHint"], false, "{name}");
+    assert_eq!(annotations["idempotentHint"], true, "{name}");
+}
+
+#[test]
+fn alien_readonly_search() {
+    let fixture = Fixture::new("alien-readonly-search");
+    let tools = alien_tools(&fixture);
+    assert_alien_readonly(&tools, "cass_search");
+    assert!(
+        fixture.calls().is_empty(),
+        "listing tools must not start a subprocess"
+    );
+}
+
+#[test]
+fn alien_readonly_expand() {
+    let fixture = Fixture::new("alien-readonly-expand");
+    let tools = alien_tools(&fixture);
+    assert_alien_readonly(&tools, "cass_expand");
+    assert!(
+        fixture.calls().is_empty(),
+        "listing tools must not start a subprocess"
+    );
+}
+
+#[test]
+fn alien_readonly_sessions() {
+    let fixture = Fixture::new("alien-readonly-sessions");
+    let tools = alien_tools(&fixture);
+    assert_alien_readonly(&tools, "cass_sessions");
+    assert!(
+        fixture.calls().is_empty(),
+        "listing tools must not start a subprocess"
+    );
+}
+
+#[test]
+fn alien_readonly_timeline() {
+    let fixture = Fixture::new("alien-readonly-timeline");
+    let tools = alien_tools(&fixture);
+    assert_alien_readonly(&tools, "cass_timeline");
+    assert!(
+        fixture.calls().is_empty(),
+        "listing tools must not start a subprocess"
+    );
+}

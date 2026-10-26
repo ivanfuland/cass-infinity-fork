@@ -1,5 +1,8 @@
 pub mod db_vector_catchup;
 pub mod exclusion;
+/// Ticket 01 (`cass-alien-fresh-ingest`): Pi raw-event facts and unique
+/// tool-call binding, consumed by the Pi cleanup ticket (02).
+pub(crate) mod pi_recall;
 pub(crate) mod lexical_generation;
 pub(crate) mod memoization;
 pub(crate) mod parallel_wal_shadow;
@@ -1093,6 +1096,10 @@ struct NonWatchIngestOutcome {
     /// at the run's finalize, together with the connector-level watermark, so
     /// a run that defers conversations does not advance any of them.
     root_outcomes: Vec<RootScanOutcome>,
+    /// Ticket 02 (`cass-alien-fresh-ingest`): Pi uncovered diagnostics summed
+    /// by frozen reason string over this run's successful conversations.
+    /// Empty for every other connector.
+    recall_uncovered_by_reason: BTreeMap<String, u64>,
 }
 
 impl NonWatchIngestOutcome {
@@ -1121,6 +1128,14 @@ impl NonWatchIngestOutcome {
                 let mut outcomes = self.root_outcomes;
                 outcomes.extend(other.root_outcomes);
                 outcomes
+            },
+            recall_uncovered_by_reason: {
+                let mut by_reason = self.recall_uncovered_by_reason;
+                for (reason, count) in other.recall_uncovered_by_reason {
+                    let entry = by_reason.entry(reason).or_insert(0);
+                    *entry = entry.saturating_add(count);
+                }
+                by_reason
             },
         }
     }
@@ -1491,13 +1506,20 @@ impl IndexingProgress {
             .lock()
             .ok()
             .and_then(|value| *value);
-        let (quarantined_conversations, lexical_update_deferred) = self
+        let (
+            quarantined_conversations,
+            lexical_update_deferred,
+            recall_uncovered_total,
+            recall_uncovered_by_reason,
+        ) = self
             .stats
             .lock()
             .map(|stats| {
                 (
                     stats.quarantined_conversations,
                     stats.lexical_update_deferred,
+                    stats.recall_uncovered_total,
+                    stats.recall_uncovered_by_reason.clone(),
                 )
             })
             .unwrap_or_default();
@@ -1537,6 +1559,8 @@ impl IndexingProgress {
             "last_error": last_error,
             "quarantined_conversations": quarantined_conversations,
             "lexical_update_deferred": lexical_update_deferred,
+            "recall_uncovered_total": recall_uncovered_total,
+            "recall_uncovered_by_reason": recall_uncovered_by_reason,
             "rebuild_pipeline": {
                 "queue_depth": rebuild_pipeline_queue_depth,
                 "inflight_message_bytes": rebuild_pipeline_inflight_message_bytes,
@@ -7347,6 +7371,7 @@ fn send_conversation_batches(
             .push(crate::indexer::exclusion::PreparedConversation {
                 conv: conversation,
                 excluded: vec![None; n],
+                recall_uncovered_by_reason: BTreeMap::new(),
             })
             .expect("test batch sender should deliver to in-memory receiver");
     }
@@ -8808,6 +8833,13 @@ fn run_streaming_consumer(
         stats.total_messages = total_messages;
         stats.source_inputs_committed = source_inputs_committed;
         stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
+        // Ticket 02 (`cass-alien-fresh-ingest`): the Pi diagnostics the batch
+        // path carried up are folded once, before the round snapshot. The
+        // source-aware commit origin never enters this carrier.
+        accumulate_recall_uncovered(
+            &mut recall_uncovered_by_reason,
+            &ingest_outcome.recall_uncovered_by_reason,
+        );
         stats.recall_uncovered_by_reason = recall_uncovered_by_reason.clone();
         stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
         stats.quarantined_conversations = stats
@@ -9624,6 +9656,13 @@ fn run_batch_index_with_connector_factories(
         stats.total_messages = total_messages;
         stats.source_inputs_committed = source_inputs_committed;
         stats.source_inputs_pending_recovery = source_inputs_pending_recovery;
+        // Ticket 02 (`cass-alien-fresh-ingest`): the Pi diagnostics the batch
+        // path carried up are folded once, before the round snapshot. The
+        // source-aware commit origin never enters this carrier.
+        accumulate_recall_uncovered(
+            &mut recall_uncovered_by_reason,
+            &ingest_outcome.recall_uncovered_by_reason,
+        );
         stats.recall_uncovered_by_reason = recall_uncovered_by_reason.clone();
         stats.recall_uncovered_total = stats.recall_uncovered_by_reason.values().copied().sum();
         stats.quarantined_conversations = stats
@@ -14384,7 +14423,11 @@ fn ingest_batch(
         .iter()
         .map(|conv| {
             let n = conv.messages.len();
-            crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] }
+            crate::indexer::exclusion::PreparedConversation {
+                conv: conv.clone(),
+                excluded: vec![None; n],
+                recall_uncovered_by_reason: BTreeMap::new(),
+            }
         })
         .collect();
     let outcome = ingest_batch_detailed(
@@ -14469,6 +14512,7 @@ fn ingest_batch_detailed(
         scanned_connectors: BTreeSet::new(),
         scan_had_errors: false,
         skipped_conversations: batch_outcome.skipped_conversations,
+        recall_uncovered_by_reason: batch_outcome.recall_uncovered_by_reason,
         // The legacy batch path keeps its delta where it always has; the
         // source-aware fields belong to the source-aware path.
         ..NonWatchIngestOutcome::default()
@@ -17900,6 +17944,14 @@ fn reindex_paths_with_semantic_delta_and_safety(
     semantic_delta: Option<&mut WatchSemanticDelta>,
     resident_safety: Option<&Arc<source_ingest::FixedSafetyConfig>>,
 ) -> Result<usize> {
+    // A callback with no routable work still starts a new diagnostic run.
+    if let Some(progress) = &opts.progress
+        && let Ok(mut stats) = progress.stats.lock()
+    {
+        stats.recall_uncovered_by_reason.clear();
+        stats.recall_uncovered_total = 0;
+    }
+
     // DO NOT lock storage/index here for the whole duration.
     // We only need them for the ingest phase, not the scan phase.
 
@@ -18542,6 +18594,18 @@ fn reindex_paths_with_semantic_delta_and_safety(
                     .saturating_add(chunk_outcome.quarantined_conversations);
                 deferred_conversations =
                     deferred_conversations.saturating_add(chunk_outcome.deferred_conversations);
+                // Count only the inputs accepted by this successful chunk,
+                // including re-judged duplicates that add no message rows.
+                if let Some(progress) = &opts.progress
+                    && let Ok(mut stats) = progress.stats.lock()
+                {
+                    accumulate_recall_uncovered(
+                        &mut stats.recall_uncovered_by_reason,
+                        &chunk_outcome.batch_outcome.recall_uncovered_by_reason,
+                    );
+                    stats.recall_uncovered_total =
+                        stats.recall_uncovered_by_reason.values().copied().sum();
+                }
                 if let Some(delta) = semantic_delta.as_deref_mut() {
                     delta.extend_from_batch(
                         chunk_outcome.batch_outcome.semantic_delta_inputs,
@@ -20730,18 +20794,82 @@ fn prepare_conversation_for_ingest(
         }
     };
 
-    let mut excluded: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> = vec![None; conv.messages.len()];
+    let mut excluded: Vec<Option<crate::indexer::exclusion::ExcludedMarker>> =
+        vec![None; conv.messages.len()];
+    // Ticket 02 (`cass-alien-fresh-ingest`): Pi uncovered diagnostics for this
+    // one conversation. Every other connector leaves it empty.
+    let mut recall_uncovered: BTreeMap<String, u64> = BTreeMap::new();
 
     if let Some(record) = &record {
+        // Ticket 03 (`cass-alien-fresh-ingest`): the scratch directory name is
+        // part of the reparse contract, not cosmetics. The materialized copy
+        // keeps the tail of the original path, so a default `$HOME/.pi/agent`
+        // session still lands under a path carrying `.pi/agent` and reparses.
+        // A session under a custom root has no such marker of its own, and the
+        // scratch directory sits above that tail. `pi_agent` resolves explicit
+        // roots with `looks_like_root`, which accepts a path only when it holds
+        // a `sessions` child, its file name contains `pi`, or the path string
+        // carries `.pi/agent`, `.omp/agent` or `pi-agent` (pinned FAD
+        // `pi_agent.rs:290-299`). With the plain `cass-reparse-` prefix such a
+        // session reparsed as zero conversations and prepare failed with exit 9
+        // (`reparse produced no session matching the first parse's agent/
+        // external_id`). Naming the scratch directory after the connector
+        // restores the one marker the Pi resolver reads. Other connectors are
+        // addressed by their own root rules and keep the plain prefix.
         let scratch = tempfile::Builder::new()
-            .prefix("cass-reparse-")
+            .prefix(if original_agent_slug == "pi_agent" {
+                "cass-reparse-pi-agent-"
+            } else {
+                "cass-reparse-"
+            })
             .tempdir_in(data_dir)
             .map_err(|e| PrepareError(format!("reparse scratch dir: {e}")))?;
         let materialized = crate::phase3_restore::materialize_capture_to_scratch(data_dir, record, scratch.path())
             .map_err(|e| PrepareError(format!("reparse materialize: {e}")))?;
 
         let scan_root = crate::connectors::ScanRoot::local(materialized.clone());
-        let scan_data_dir = materialized.parent().map(Path::to_path_buf).unwrap_or_else(|| materialized.clone());
+        let mut scan_data_dir = materialized
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| materialized.clone());
+        // A headerless Pi session derives its id from the path below the
+        // first scan's sessions root. The captured layout preserves that
+        // suffix, but scanning only the file's parent drops nested directories.
+        // Use an exact, normal-component suffix only to select the scan root;
+        // the connector still parses the captured bytes and the strict
+        // agent/external_id checks below remain authoritative.
+        if original_agent_slug == "pi_agent"
+            && let Some(relative_id) = original_external_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(Path::new)
+            && relative_id
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && materialized.ends_with(relative_id)
+            && let Some(root) = materialized
+                .ancestors()
+                .nth(relative_id.components().count())
+        {
+            // Pi's own sessions_dir adds a sessions child when one exists.
+            // Start above that directory so repeated sessions components in
+            // the relative id are not stripped a second time.
+            let home = if root.file_name().is_some_and(|name| name == "sessions") {
+                root.parent().unwrap_or(root)
+            } else {
+                root
+            };
+            // Materialization returns canonical paths. Resolve the scratch
+            // root too, so a symlinked data directory does not make a safe
+            // captured path appear to be outside its own scratch directory.
+            let scratch_root = scratch
+                .path()
+                .canonicalize()
+                .map_err(|err| PrepareError(format!("Pi reparse scratch root: {err}")))?;
+            if home.starts_with(&scratch_root) {
+                scan_data_dir = home.to_path_buf();
+            }
+        }
         let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
         let reparsed_conversations =
             connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
@@ -20844,8 +20972,34 @@ fn prepare_conversation_for_ingest(
         let paths_cfg = crate::sources::config::ExcludedContextPaths::load().map_err(|e| {
             PrepareError(format!("excluded_context_paths.toml 加载失败（不回退内置默认清单）: {e:#}"))
         })?;
-        let events = crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
-        let markers = judge_reparsed_conversation(&mut reparsed, &events, &record.blob_relative_path, &paths_cfg);
+        // Ticket 02 (`cass-alien-fresh-ingest`): only `pi_agent` switches to
+        // its own full-cleanup judgment, and its input is the materialized
+        // capture blob -- never the live `source_path`. Every other connector
+        // keeps the unchanged legacy judgment. The config load above still
+        // runs first for both, so a broken config fails the same way.
+        let markers = if reparsed.agent_slug == "pi_agent" {
+            let outcome = crate::indexer::pi_recall::cleanup_pi_conversation(
+                &materialized,
+                &mut reparsed,
+                &record.blob_relative_path,
+                crate::indexer::redact_secrets::redaction_enabled(),
+            );
+            recall_uncovered = outcome.uncovered_by_reason;
+            if outcome.alignment_failed {
+                record_event_align_failed();
+                record_event_align_failure(&reparsed, outcome.event_count);
+            }
+            outcome.excluded
+        } else {
+            let events =
+                crate::indexer::exclusion::events_from_blob(&reparsed.agent_slug, &materialized);
+            judge_reparsed_conversation(
+                &mut reparsed,
+                &events,
+                &record.blob_relative_path,
+                &paths_cfg,
+            )
+        };
 
         conv = reparsed;
         excluded = markers;
@@ -20874,7 +21028,11 @@ fn prepare_conversation_for_ingest(
     }
 
     compact_large_connector_extras(connector_name, &mut conv);
-    Ok(PreparedConversation { conv, excluded })
+    Ok(PreparedConversation {
+        conv,
+        excluded,
+        recall_uncovered_by_reason: recall_uncovered,
+    })
 }
 
 /// restore / oracle 侧的 ③ —— 与上面的 [`prepare_conversation_for_ingest`] 是一对，
@@ -20962,7 +21120,11 @@ pub(crate) fn prepare_conversation_for_restore(
     // 只能有一处定义，否则基线下次加一个键时两处静默分叉。
     attach_raw_mirror_metadata(&mut conv, consumed_manifest);
 
-    Ok(crate::indexer::exclusion::PreparedConversation { conv, excluded })
+    Ok(crate::indexer::exclusion::PreparedConversation {
+        conv,
+        excluded,
+        recall_uncovered_by_reason: BTreeMap::new(),
+    })
 }
 
 fn capture_connector_sources_before_parse(
@@ -21562,7 +21724,7 @@ pub fn apply_workspace_rewrite(conv: &mut NormalizedConversation, root: &ScanRoo
 
 pub mod persist {
     use super::LexicalPopulationStrategy;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::ops::Range;
     use std::path::Path;
     use std::time::Duration;
@@ -21607,6 +21769,10 @@ pub mod persist {
         /// to answer. Filled by both persist paths so the common exit can
         /// emit one line per conversation without knowing which path ran.
         pub per_conversation: Vec<(usize, ScanSessionOutcome)>,
+        /// Ticket 02 (`cass-alien-fresh-ingest`): Pi uncovered diagnostics
+        /// summed by frozen reason string over the conversations of this
+        /// batch that actually succeeded. Empty for every other connector.
+        pub recall_uncovered_by_reason: BTreeMap<String, u64>,
     }
 
     /// PR8 C8: one conversation's ingest result, as reported by the
@@ -21660,10 +21826,34 @@ pub mod persist {
         external_id: Option<&str>,
         source_path: &Path,
         outcome: ScanSessionOutcome,
+        recall_uncovered: Option<&BTreeMap<String, u64>>,
     ) {
         let bytes = std::fs::metadata(source_path)
             .map(|meta| meta.len())
             .unwrap_or(0);
+        // Ticket 02: a Pi line also carries the uncovered diagnostics for
+        // that one conversation. A refused Pi conversation counts zero, and
+        // no other connector's line gains a field.
+        if agent_slug == "pi_agent" {
+            let empty = BTreeMap::new();
+            let uncovered = match outcome {
+                ScanSessionOutcome::Error => &empty,
+                _ => recall_uncovered.unwrap_or(&empty),
+            };
+            let total: u64 = uncovered.values().copied().sum();
+            let by_reason = serde_json::to_string(uncovered).unwrap_or_else(|_| "{}".to_string());
+            tracing::info!(
+                target: "cass::scan_session",
+                agent = %agent_slug,
+                external_id = %external_id.unwrap_or_default(),
+                bytes,
+                outcome = outcome.as_str(),
+                recall_uncovered_total = total,
+                recall_uncovered_by_reason = %by_reason,
+                "scan_session"
+            );
+            return;
+        }
         tracing::info!(
             target: "cass::scan_session",
             agent = %agent_slug,
@@ -21716,6 +21906,10 @@ pub mod persist {
                 }
             }
             self.skipped_conversations.extend(other.skipped_conversations);
+            for (reason, count) in other.recall_uncovered_by_reason {
+                let entry = self.recall_uncovered_by_reason.entry(reason).or_insert(0);
+                *entry = entry.saturating_add(count);
+            }
         }
     }
 
@@ -22613,7 +22807,11 @@ pub mod persist {
         // rather than duplicating `map_to_internal_with_redactor`'s body.
         let n = conv.messages.len();
         map_to_internal_with_redactor(
-            &crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] },
+            &crate::indexer::exclusion::PreparedConversation {
+                conv: conv.clone(),
+                excluded: vec![None; n],
+                recall_uncovered_by_reason: BTreeMap::new(),
+            },
             None,
         )
     }
@@ -22784,7 +22982,11 @@ pub mod persist {
             .iter()
             .map(|conv| {
                 let n = conv.messages.len();
-                crate::indexer::exclusion::PreparedConversation { conv: conv.clone(), excluded: vec![None; n] }
+                crate::indexer::exclusion::PreparedConversation {
+                    conv: conv.clone(),
+                    excluded: vec![None; n],
+                    recall_uncovered_by_reason: BTreeMap::new(),
+                }
             })
             .collect();
         persist_conversations_batched_inner(
@@ -22818,7 +23020,11 @@ pub mod persist {
             .into_iter()
             .map(|conv| {
                 let excluded = vec![None; conv.messages.len()];
-                crate::indexer::exclusion::PreparedConversation { conv, excluded }
+                crate::indexer::exclusion::PreparedConversation {
+                    conv,
+                    excluded,
+                    recall_uncovered_by_reason: BTreeMap::new(),
+                }
             })
             .collect();
         let outcome = persist_conversations_batched_inner(
@@ -22881,7 +23087,7 @@ pub mod persist {
         capture_semantic_delta: bool,
         raw_mirror_data_dir: Option<&Path>,
     ) -> Result<PersistBatchOutcome> {
-        let outcome = persist_conversations_batched_inner_impl(
+        let mut outcome = persist_conversations_batched_inner_impl(
             storage,
             convs,
             lexical_strategy,
@@ -22889,15 +23095,40 @@ pub mod persist {
             capture_semantic_delta,
             raw_mirror_data_dir,
         )?;
-        for (index, result) in &outcome.per_conversation {
-            if let Some(prepared) = convs.get(*index) {
-                emit_scan_session(
-                    &prepared.conv.agent_slug,
-                    prepared.conv.external_id.as_deref(),
-                    &prepared.conv.source_path,
-                    *result,
-                );
+        // Ticket 02 (`cass-alien-fresh-ingest`): the common exit is the only
+        // place both persist paths converge, so the Pi uncovered diagnostics
+        // are folded here exactly once per conversation index. Inserted,
+        // Merged and SkippedDuplicate all count; Error does not. An early
+        // `Err` above, a quarantine or a deferral never reaches this loop.
+        let per_conversation = outcome.per_conversation.clone();
+        let mut folded: BTreeMap<String, u64> = BTreeMap::new();
+        for (index, result) in &per_conversation {
+            let Some(prepared) = convs.get(*index) else {
+                continue;
+            };
+            let uncovered = (prepared.conv.agent_slug == "pi_agent"
+                && *result != ScanSessionOutcome::Error)
+                .then_some(&prepared.recall_uncovered_by_reason);
+            if let Some(uncovered) = uncovered {
+                for (reason, count) in uncovered {
+                    let entry = folded.entry(reason.clone()).or_insert(0);
+                    *entry = entry.saturating_add(*count);
+                }
             }
+            emit_scan_session(
+                &prepared.conv.agent_slug,
+                prepared.conv.external_id.as_deref(),
+                &prepared.conv.source_path,
+                *result,
+                uncovered,
+            );
+        }
+        for (reason, count) in folded {
+            let entry = outcome
+                .recall_uncovered_by_reason
+                .entry(reason)
+                .or_insert(0);
+            *entry = entry.saturating_add(count);
         }
         Ok(outcome)
     }
@@ -23623,7 +23854,11 @@ pub mod persist {
                 .into_iter()
                 .map(|conv| {
                     let n = conv.messages.len();
-                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                    crate::indexer::exclusion::PreparedConversation {
+                        conv,
+                        excluded: vec![None; n],
+                        recall_uncovered_by_reason: BTreeMap::new(),
+                    }
                 })
                 .collect();
 
@@ -23744,7 +23979,11 @@ pub mod persist {
                 .into_iter()
                 .map(|conv| {
                     let n = conv.messages.len();
-                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                    crate::indexer::exclusion::PreparedConversation {
+                        conv,
+                        excluded: vec![None; n],
+                        recall_uncovered_by_reason: BTreeMap::new(),
+                    }
                 })
                 .collect();
 
@@ -23828,7 +24067,11 @@ pub mod persist {
                 .into_iter()
                 .map(|conv| {
                     let n = conv.messages.len();
-                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                    crate::indexer::exclusion::PreparedConversation {
+                        conv,
+                        excluded: vec![None; n],
+                        recall_uncovered_by_reason: BTreeMap::new(),
+                    }
                 })
                 .collect();
 
@@ -24286,7 +24529,11 @@ pub mod persist {
                 .into_iter()
                 .map(|conv| {
                     let n = conv.messages.len();
-                    crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+                    crate::indexer::exclusion::PreparedConversation {
+                        conv,
+                        excluded: vec![None; n],
+                        recall_uncovered_by_reason: BTreeMap::new(),
+                    }
                 })
                 .collect();
 
@@ -29233,7 +29480,11 @@ mod tests {
     /// boundary.
     fn prep_conv(conv: NormalizedConversation) -> crate::indexer::exclusion::PreparedConversation {
         let n = conv.messages.len();
-        crate::indexer::exclusion::PreparedConversation { conv, excluded: vec![None; n] }
+        crate::indexer::exclusion::PreparedConversation {
+            conv,
+            excluded: vec![None; n],
+            recall_uncovered_by_reason: BTreeMap::new(),
+        }
     }
 
     fn seed_lexical_rebuild_fixture(storage: &FrankenStorage) {
@@ -31637,7 +31888,11 @@ mod tests {
         let n = conversation.messages.len();
 
         sender
-            .push(crate::indexer::exclusion::PreparedConversation { conv: conversation, excluded: vec![None; n] })
+            .push(crate::indexer::exclusion::PreparedConversation {
+                conv: conversation,
+                excluded: vec![None; n],
+                recall_uncovered_by_reason: BTreeMap::new(),
+            })
             .expect("oversized conversation should still flush even in tests");
 
         match rx
@@ -31691,7 +31946,11 @@ mod tests {
 
         let n = conversation.messages.len();
         sender
-            .push(crate::indexer::exclusion::PreparedConversation { conv: conversation, excluded: vec![None; n] })
+            .push(crate::indexer::exclusion::PreparedConversation {
+                conv: conversation,
+                excluded: vec![None; n],
+                recall_uncovered_by_reason: BTreeMap::new(),
+            })
             .expect("pending conversation should fit in the streaming budget");
 
         assert_eq!(
@@ -37264,6 +37523,35 @@ mod tests {
             cycle2_hits, 0,
             "cycle 2 has no anchors; a genuinely per-cycle reset must show 0 here, not cycle 1's leftover count"
         );
+
+        let progress = std::sync::Arc::new(super::IndexingProgress::default());
+        {
+            let mut stats = progress.stats.lock().unwrap();
+            stats
+                .recall_uncovered_by_reason
+                .insert("unpaired_result".to_string(), 7);
+            stats.recall_uncovered_total = 7;
+        }
+        let before = progress.snapshot_json(0);
+        assert_eq!(before["recall_uncovered_total"], 7);
+        assert_eq!(
+            before["recall_uncovered_by_reason"],
+            serde_json::json!({"unpaired_result": 7})
+        );
+        let mut empty_opts = opts(tmp.path().join("unused.jsonl"));
+        empty_opts.progress = Some(progress.clone());
+        assert_eq!(
+            reindex_paths(&empty_opts, Vec::new(), &[], &state, &storage, false).unwrap(),
+            0
+        );
+        {
+            let stats = progress.stats.lock().unwrap();
+            assert_eq!(stats.recall_uncovered_total, 0);
+            assert!(stats.recall_uncovered_by_reason.is_empty());
+        }
+        let after = progress.snapshot_json(0);
+        assert_eq!(after["recall_uncovered_total"], 0);
+        assert_eq!(after["recall_uncovered_by_reason"], serde_json::json!({}));
     }
 
     #[test]
@@ -40680,7 +40968,11 @@ normalization="l2"
                         blocks: vec![0],
                     },
                 });
-                convs.push(PreparedConversation { conv, excluded: vec![marker] });
+                convs.push(PreparedConversation {
+                    conv,
+                    excluded: vec![marker],
+                    recall_uncovered_by_reason: BTreeMap::new(),
+                });
             }
 
             // Pin the var for the persist call ONLY, then restore at once:
@@ -41029,6 +41321,115 @@ normalization="l2"
             "error must name the mismatch, got: {}",
             err.0
         );
+    }
+
+    #[test]
+    fn prepare_pi_capture_uses_only_explicit_scratch_roots() {
+        use crate::connectors::ScanContext;
+
+        if !in_isolated_indexer_child("prepare_pi_capture_uses_only_explicit_scratch_roots") {
+            return;
+        }
+        struct CapturedPi {
+            live: PathBuf,
+        }
+        impl Connector for CapturedPi {
+            fn detect(&self) -> DetectionResult {
+                DetectionResult::not_found()
+            }
+            fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
+                assert!(
+                    !ctx.scan_roots.is_empty(),
+                    "reparse must not enable default detection"
+                );
+                let scratch = ctx.scan_roots[0]
+                    .path
+                    .ancestors()
+                    .find(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with("cass-reparse-pi-agent-")
+                        })
+                    })
+                    .expect("Pi scratch ancestor");
+                assert!(ctx.data_dir.starts_with(scratch));
+                assert!(
+                    ctx.scan_roots
+                        .iter()
+                        .all(|root| root.path.starts_with(scratch))
+                );
+                // This runs after capture. A fallback to the live source can
+                // no longer reproduce the captured conversation.
+                std::fs::write(&self.live, "live source changed after capture\n")?;
+                crate::connectors::pi_agent::PiAgentConnector::new().scan(ctx)
+            }
+        }
+        let temp = TempDir::new().unwrap();
+        let agent = temp.path().join(".pi/agent");
+        let source = agent.join("sessions/project/2026-10-26T00-00-00_capture-safety.jsonl");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let raw = include_str!("../../tests/fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl")
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"] != "session"
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&source, &raw).unwrap();
+        let pi = crate::connectors::pi_agent::PiAgentConnector::new();
+        let ctx = ScanContext::with_roots(
+            temp.path().join("first-scan"),
+            vec![ScanRoot::local(agent)],
+            None,
+        );
+        let mut conversations = pi.scan(&ctx).unwrap();
+        assert_eq!(conversations.len(), 1);
+        let conv = conversations.remove(0);
+        let expected_id = Some("project/2026-10-26T00-00-00_capture-safety.jsonl".to_string());
+        assert_eq!(conv.external_id, expected_id);
+        let mut wrong_identity = conv.clone();
+        wrong_identity.external_id = Some("synthetic-wrong-identity".to_string());
+        let data_dir = temp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let prepared = prepare_conversation_for_ingest(
+            &data_dir,
+            "pi_agent",
+            &CapturedPi {
+                live: source.clone(),
+            },
+            &Origin::local(),
+            &IngestIdentity::local(),
+            None,
+            CaptureSourceKind::File(source.clone()),
+            conv,
+        )
+        .expect("captured Pi identity must survive a live-file change");
+        assert_eq!(prepared.conv.external_id, expected_id);
+        assert_eq!(prepared.conv.messages.len(), 4);
+        let blob = prepared
+            .conv
+            .metadata
+            .pointer("/cass/raw_mirror/blob_relative_path")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(data_dir.join("raw-mirror/v1").join(blob)).unwrap(),
+            raw.as_bytes()
+        );
+        std::fs::write(&source, &raw).unwrap();
+        let err = prepare_conversation_for_ingest(
+            &data_dir,
+            "pi_agent",
+            &pi,
+            &Origin::local(),
+            &IngestIdentity::local(),
+            None,
+            CaptureSourceKind::File(source),
+            wrong_identity,
+        )
+        .expect_err("a wrong first-parse Pi identity must still be rejected");
+        assert!(err.0.contains("reparse identity mismatch"), "{}", err.0);
     }
 
     /// R1-N5 (任务书 #118b) positive: the first parse's `workspace` must

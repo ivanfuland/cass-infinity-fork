@@ -28,7 +28,7 @@ use serde_json::Value;
 use crate::connectors::{NormalizedConversation, NormalizedMessage};
 use crate::indexer::exclusion::{
     self, BlockKind, Decision, ExcludedMarker, ExclusionAnchor, ExclusionReason, ExtraFieldMap,
-    PairingContext, RawEvent, RecallHit, RecallSrc,
+    PairedTool, PairingContext, RawEvent, RecallHit, RecallSrc,
 };
 use crate::indexer::redact_secrets::MemoizingRedactor;
 use crate::recall_output::{self, RecallTool};
@@ -611,7 +611,7 @@ fn shell_command_key(tool_name: &str, agent_slug: &str) -> Option<&'static str> 
 /// True when the raw text contains any `cass_recall` opening tag. Used only
 /// to separate "looks like a wrapper but is invalid" from "plain output" for
 /// bare-name candidates; it is never used to extract a payload.
-fn looks_like_recall_wrapper(content: &str) -> bool {
+pub(crate) fn looks_like_recall_wrapper(content: &str) -> bool {
     content.contains("<cass_recall")
 }
 
@@ -657,7 +657,93 @@ fn legacy_outcome(
     }
 }
 
+/// The attribution strength a caller has already established for one direct
+/// tool result. The old v2 entry derives it from its own name table; the Pi
+/// consumer derives it from the captured Pi tool identity. The shared core
+/// below never re-classifies a name, so a caller cannot silently gain or lose
+/// an identity through this boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectToolCategory {
+    Strong(RecallTool),
+    Bare(RecallTool),
+}
+
+/// The direct tool-result judgment core, shared by the old v2 entry and the
+/// Pi consumer (ticket 02).
+///
+/// It receives facts, not identity: `msg` is the message whose body is read,
+/// `event` locates the result blocks, `call` supplies the anchor identity and
+/// the argument map, and `category` states the already-proven attribution.
+/// The result-block lookup, the `Decision` construction and the Strong/Bare
+/// outcome rules are identical for both callers, so a later change to one
+/// cannot diverge from the other.
+pub(crate) fn judge_direct_tool_result(
+    msg: &NormalizedMessage,
+    event: &RawEvent,
+    call: &PairedTool,
+    category: DirectToolCategory,
+) -> Outcome {
+    let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
+    if target_blocks.is_empty() {
+        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
+    }
+
+    let decision = Decision {
+        reason: ExclusionReason::CassRecall,
+        anchor: ExclusionAnchor {
+            tool_call_id: call.tool_call_id.clone(),
+            tool_name: Some(call.tool_name.clone()),
+            paths: None,
+            shell: None,
+        },
+        event_key: event.event_key.clone(),
+        target_blocks,
+    };
+
+    match category {
+        DirectToolCategory::Strong(tool) => {
+            // Arguments only feed source extraction. `Null` is the explicit
+            // "no captured arguments" value and `extract_source` reads it as
+            // absent, so nothing is defaulted or invented.
+            let absent = Value::Null;
+            let args = call.args.as_ref().unwrap_or(&absent);
+            let (src, parse_error) = match parse_result(tool, &msg.content, args) {
+                Ok(src) => (Some(src), None),
+                Err(reason) => (None, Some(reason.to_string())),
+            };
+            Outcome::Exclude(Exclusion {
+                decision,
+                src,
+                parse_error,
+            })
+        }
+        DirectToolCategory::Bare(tool) => {
+            // Arguments only feed source extraction; the complete C04
+            // envelope below proves the identity. `Null` is the explicit
+            // "no captured arguments" value and `extract_source` reads it as
+            // absent, so an expand invents no source.
+            let absent = Value::Null;
+            let args = call.args.as_ref().unwrap_or(&absent);
+            match recall_output::decode(&msg.content, tool) {
+                Ok(value) => {
+                    let src = extract_source(tool, &value, args);
+                    Outcome::Exclude(Exclusion {
+                        decision,
+                        src: Some(src),
+                        parse_error: None,
+                    })
+                }
+                Err(_) if looks_like_recall_wrapper(&msg.content) => {
+                    Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
+                }
+                Err(_) => Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
+            }
+        }
+    }
+}
+
 /// v2 judgment. The signature mirrors the legacy `decide` exactly so a later
+
 /// ingest ticket can swap the call without reshaping its inputs.
 ///
 /// Order is fixed:
@@ -750,55 +836,11 @@ pub(crate) fn decide(
         return legacy_outcome(msg, idx, event, ctx, agent_slug, paths_cfg);
     };
 
-    let target_blocks = exclusion::tool_result_block_indices(event, call.tool_call_id.as_deref());
-    if target_blocks.is_empty() {
-        return Outcome::Preserve(Some(UncoveredReason::UnpairedResult));
-    }
-
-    let decision = Decision {
-        reason: ExclusionReason::CassRecall,
-        anchor: ExclusionAnchor {
-            tool_call_id: call.tool_call_id.clone(),
-            tool_name: Some(call.tool_name.clone()),
-            paths: None,
-            shell: None,
-        },
-        event_key: event.event_key.clone(),
-        target_blocks,
+    let category = match kind {
+        CandidateKind::Strong(tool) => DirectToolCategory::Strong(tool),
+        CandidateKind::Bare(tool) => DirectToolCategory::Bare(tool),
     };
-
-    match kind {
-        CandidateKind::Strong(tool) => {
-            // Arguments only feed source extraction. `Null` is the explicit
-            // "no captured arguments" value and `extract_source` reads it as
-            // absent, so nothing is defaulted or invented.
-            let absent = Value::Null;
-            let args = call.args.as_ref().unwrap_or(&absent);
-            let (src, parse_error) = match parse_result(tool, &msg.content, args) {
-                Ok(src) => (Some(src), None),
-                Err(reason) => (None, Some(reason.to_string())),
-            };
-            Outcome::Exclude(Exclusion { decision, src, parse_error })
-        }
-        CandidateKind::Bare(tool) => {
-            // Arguments only feed source extraction; the complete C04
-            // envelope below proves the identity. `Null` is the explicit
-            // "no captured arguments" value and `extract_source` reads it as
-            // absent, so an expand invents no source.
-            let absent = Value::Null;
-            let args = call.args.as_ref().unwrap_or(&absent);
-            match recall_output::decode(&msg.content, tool) {
-                Ok(value) => {
-                    let src = extract_source(tool, &value, args);
-                    Outcome::Exclude(Exclusion { decision, src: Some(src), parse_error: None })
-                }
-                Err(_) if looks_like_recall_wrapper(&msg.content) => {
-                    Outcome::Preserve(Some(UncoveredReason::InvalidRecallFormat))
-                }
-                Err(_) => Outcome::Preserve(Some(UncoveredReason::AmbiguousToolIdentity)),
-            }
-        }
-    }
+    judge_direct_tool_result(msg, event, call, category)
 }
 
 // ============================================================================
@@ -824,24 +866,444 @@ enum ExecTarget {
     Mcp(RecallTool),
 }
 
-/// Split the fixed C07 expression and parse `J` as one JSON object. Any
-/// other JavaScript shape (unquoted keys, variables, templates, loops,
-/// multiple calls/statements, unknown methods) returns `None`.
+/// Split the fixed C07 expression and parse `J`. The `exec_command` branch is
+/// unchanged: exactly `text(await tools.exec_command(J));` with `J` one strict
+/// JSON object. The four MCP methods use the limited literal grammar of
+/// ticket 06: whitespace between the outer tokens, double-quoted JSON strings,
+/// decimal safe integers, booleans, null, arrays, and objects whose keys are
+/// JSON strings or ASCII identifiers, with one optional trailing comma.
+/// The ticket 07a form binds that same call to one name and prints only that
+/// name: `const IDENT = await tools.METHOD(J); text(IDENT);`.
+/// Anything else (unquoted CLI keys, variables, templates, spreads, computed
+/// keys, accessors, comments, calls, operators, unknown methods) returns
+/// `None`. Nothing here evaluates JavaScript.
 fn parse_exec_literal(expression: &str) -> Option<(ExecTarget, Value)> {
-    let body = expression.trim().strip_prefix("text(await tools.")?.strip_suffix("));")?;
+    if let Some(input) = exact_exec_command_input(expression) {
+        let value: Value = serde_json::from_str(input).ok()?;
+        return value.is_object().then_some((ExecTarget::Cli, value));
+    }
+    if let Some((tool, args)) = parse_mcp_call_literal(expression) {
+        return Some((ExecTarget::Mcp(tool), args));
+    }
+    parse_const_mcp_call_literal(expression).map(|(tool, args)| (ExecTarget::Mcp(tool), args))
+}
+
+/// The unchanged C07 `exec_command` form: exactly
+/// `text(await tools.exec_command(J));` with `J` one strict JSON object. The
+/// ticket 06 literal grammar is never applied to this method.
+fn exact_exec_command_input(expression: &str) -> Option<&str> {
+    let body = expression
+        .trim()
+        .strip_prefix("text(await tools.")?
+        .strip_suffix("));")?;
     let open = body.find('(')?;
-    let method = &body[..open];
-    let input = &body[open + 1..];
-    let target = match method {
-        "exec_command" => ExecTarget::Cli,
-        "mcp__cass_mcp__cass_search" => ExecTarget::Mcp(RecallTool::Search),
-        "mcp__cass_mcp__cass_expand" => ExecTarget::Mcp(RecallTool::Expand),
-        "mcp__cass_mcp__cass_sessions" => ExecTarget::Mcp(RecallTool::Sessions),
-        "mcp__cass_mcp__cass_timeline" => ExecTarget::Mcp(RecallTool::Timeline),
+    if &body[..open] != "exec_command" {
+        return None;
+    }
+    Some(&body[open + 1..])
+}
+
+/// The largest magnitude a literal integer argument may carry.
+const MAX_SAFE_LITERAL_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// The number of nested objects and arrays the old strict JSON path accepted.
+/// `serde_json` refuses the 128th open container, so 127 is the deepest
+/// literal this parser admits. The check runs before the recursive call, so a
+/// deeper input returns `None` instead of exhausting the stack.
+const MAX_LITERAL_DEPTH: usize = 127;
+
+/// Keys that would reach the JavaScript prototype chain. They are never data,
+/// so a literal that sets one anywhere is refused, including an escaped
+/// spelling that decodes to the same name.
+const PROTOTYPE_KEYS: [&str; 3] = ["__proto__", "prototype", "constructor"];
+
+/// Parse one `text(await tools.mcp__cass_mcp__cass_*(ARGS));` expression.
+/// The whole expression is trimmed the way the original function trimmed it,
+/// so Unicode whitespace around the fixed shape is accepted. Separator
+/// whitespace inside the shape stays ASCII, and the expression must end at the
+/// single closing semicolon.
+fn parse_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)> {
+    let expression = expression.trim();
+    let mut parser = LiteralParser::new(expression);
+    parser.skip_whitespace();
+    parser.expect_keyword("text")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    parser.expect_keyword("await")?;
+    parser.skip_whitespace();
+    parser.expect_keyword("tools")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'.')?;
+    parser.skip_whitespace();
+    let tool = match parser.take_identifier()? {
+        "mcp__cass_mcp__cass_search" => RecallTool::Search,
+        "mcp__cass_mcp__cass_expand" => RecallTool::Expand,
+        "mcp__cass_mcp__cass_sessions" => RecallTool::Sessions,
+        "mcp__cass_mcp__cass_timeline" => RecallTool::Timeline,
         _ => return None,
     };
-    let value: Value = serde_json::from_str(input).ok()?;
-    value.is_object().then_some((target, value))
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    // The argument object itself is the first nesting level.
+    let args = parser.parse_value(1)?;
+    if !args.is_object() {
+        return None;
+    }
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b';')?;
+    parser.skip_whitespace();
+    parser.at_end().then_some((tool, args))
+}
+
+/// Binding names the single-`const` form refuses: the keywords, the
+/// strict-mode future reserved words, and the two strict-mode binding
+/// restrictions. `async` is deliberately absent; it is a valid binding name.
+const CONST_REJECTED_BINDINGS: [&str; 48] = [
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+    "implements",
+    "interface",
+    "let",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "static",
+    "arguments",
+    "eval",
+];
+
+/// Parse one `const IDENT = await tools.mcp__cass_mcp__cass_*(ARGS); text(IDENT);`
+/// expression. The whole expression is trimmed the way the original function
+/// trimmed it. The declaration name and the printed name must be the same
+/// identifier, so the value that reaches `text` is the call result and nothing
+/// else. Only one declaration and one print are accepted, both semicolons are
+/// required, and the expression must end there. The argument object reuses the
+/// ticket 06 literal parser unchanged.
+fn parse_const_mcp_call_literal(expression: &str) -> Option<(RecallTool, Value)> {
+    let expression = expression.trim();
+    let mut parser = LiteralParser::new(expression);
+    parser.skip_whitespace();
+    parser.expect_keyword("const")?;
+    parser.skip_whitespace();
+    let binding = parser.take_identifier()?;
+    if CONST_REJECTED_BINDINGS.contains(&binding) {
+        return None;
+    }
+    parser.skip_whitespace();
+    parser.expect_byte(b'=')?;
+    parser.skip_whitespace();
+    parser.expect_keyword("await")?;
+    parser.skip_whitespace();
+    parser.expect_keyword("tools")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'.')?;
+    parser.skip_whitespace();
+    let tool = match parser.take_identifier()? {
+        "mcp__cass_mcp__cass_search" => RecallTool::Search,
+        "mcp__cass_mcp__cass_expand" => RecallTool::Expand,
+        "mcp__cass_mcp__cass_sessions" => RecallTool::Sessions,
+        "mcp__cass_mcp__cass_timeline" => RecallTool::Timeline,
+        _ => return None,
+    };
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    // The argument object itself is the first nesting level.
+    let args = parser.parse_value(1)?;
+    if !args.is_object() {
+        return None;
+    }
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b';')?;
+    parser.skip_whitespace();
+    parser.expect_keyword("text")?;
+    parser.skip_whitespace();
+    parser.expect_byte(b'(')?;
+    parser.skip_whitespace();
+    let printed = parser.take_identifier()?;
+    parser.skip_whitespace();
+    parser.expect_byte(b')')?;
+    parser.skip_whitespace();
+    parser.expect_byte(b';')?;
+    parser.skip_whitespace();
+    if printed != binding || !parser.at_end() {
+        return None;
+    }
+    Some((tool, args))
+}
+
+/// A byte-oriented reader for the limited literal grammar above. It only ever
+/// slices at ASCII boundaries: quotes, braces and the fixed outer tokens.
+struct LiteralParser<'a> {
+    text: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> LiteralParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            bytes: text.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn at_end(&self) -> bool {
+        self.pos == self.bytes.len()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.pos += 1;
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Option<()> {
+        if self.peek() != Some(expected) {
+            return None;
+        }
+        self.pos += 1;
+        Some(())
+    }
+
+    /// Match one fixed keyword. The keyword must end at a lexical boundary, so
+    /// `awaittools` does not read as `await` followed by more input.
+    fn expect_keyword(&mut self, keyword: &str) -> Option<()> {
+        let end = self.pos.checked_add(keyword.len())?;
+        if self.text.get(self.pos..end)? != keyword {
+            return None;
+        }
+        if self
+            .bytes
+            .get(end)
+            .copied()
+            .is_some_and(identifier_continue)
+        {
+            return None;
+        }
+        self.pos = end;
+        Some(())
+    }
+
+    fn take_identifier(&mut self) -> Option<&'a str> {
+        let start = self.pos;
+        if !self.peek().is_some_and(identifier_start) {
+            return None;
+        }
+        self.pos += 1;
+        while self.peek().is_some_and(identifier_continue) {
+            self.pos += 1;
+        }
+        Some(&self.text[start..self.pos])
+    }
+
+    /// `depth` is the nesting level the value would occupy if it is a
+    /// container. The check lives at container entry, before the recursive
+    /// call, so a too-deep literal is refused without growing the stack.
+    fn parse_value(&mut self, depth: usize) -> Option<Value> {
+        match self.peek()? {
+            b'"' => self.parse_string().map(Value::String),
+            b'{' => self.parse_object(depth),
+            b'[' => self.parse_array(depth),
+            b'-' | b'0'..=b'9' => self.parse_integer(),
+            b't' => self.expect_keyword("true").map(|()| Value::Bool(true)),
+            b'f' => self.expect_keyword("false").map(|()| Value::Bool(false)),
+            b'n' => self.expect_keyword("null").map(|()| Value::Null),
+            _ => None,
+        }
+    }
+
+    /// One JSON double-quoted string. The raw slice, escapes included, is
+    /// decoded by `serde_json`; keys are compared after that decode so an
+    /// escaped alias is the same key.
+    fn parse_string(&mut self) -> Option<String> {
+        let start = self.pos;
+        self.expect_byte(b'"')?;
+        loop {
+            match self.peek()? {
+                b'"' => {
+                    self.pos += 1;
+                    return serde_json::from_str(&self.text[start..self.pos]).ok();
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    self.peek()?;
+                    self.pos += 1;
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// A decimal safe integer: no sign but `-`, no leading zero, no negative
+    /// zero, no fraction or exponent, magnitude at most 2^53 - 1.
+    fn parse_integer(&mut self) -> Option<Value> {
+        let negative = self.peek() == Some(b'-');
+        if negative {
+            self.pos += 1;
+        }
+        let digits_start = self.pos;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+        }
+        if self.pos == digits_start {
+            return None;
+        }
+        let digits = &self.text[digits_start..self.pos];
+        if digits.len() > 1 && digits.starts_with('0') {
+            return None;
+        }
+        if negative && digits == "0" {
+            return None;
+        }
+        if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+            return None;
+        }
+        let magnitude: u64 = digits.parse().ok()?;
+        if magnitude > MAX_SAFE_LITERAL_INTEGER {
+            return None;
+        }
+        if negative {
+            Some(Value::from(-(magnitude as i64)))
+        } else {
+            Some(Value::from(magnitude))
+        }
+    }
+
+    /// One object literal. Keys are double-quoted strings or ASCII
+    /// identifiers. A repeated decoded key, a prototype key, or more than one
+    /// trailing comma is refused.
+    fn parse_object(&mut self, depth: usize) -> Option<Value> {
+        if depth > MAX_LITERAL_DEPTH {
+            return None;
+        }
+        self.expect_byte(b'{')?;
+        let mut members = serde_json::Map::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Some(Value::Object(members));
+        }
+        loop {
+            let key = match self.peek()? {
+                b'"' => self.parse_string()?,
+                _ => self.take_identifier()?.to_string(),
+            };
+            if members.contains_key(&key) || PROTOTYPE_KEYS.contains(&key.as_str()) {
+                return None;
+            }
+            self.skip_whitespace();
+            self.expect_byte(b':')?;
+            self.skip_whitespace();
+            let value = self.parse_value(depth + 1)?;
+            members.insert(key, value);
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                    // One trailing comma is allowed; a second one is not.
+                    if self.peek() == Some(b'}') {
+                        self.pos += 1;
+                        return Some(Value::Object(members));
+                    }
+                }
+                b'}' => {
+                    self.pos += 1;
+                    return Some(Value::Object(members));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// One array literal under the JSON rules: comma separated, no trailing
+    /// comma.
+    fn parse_array(&mut self, depth: usize) -> Option<Value> {
+        if depth > MAX_LITERAL_DEPTH {
+            return None;
+        }
+        self.expect_byte(b'[')?;
+        let mut items = Vec::new();
+        self.skip_whitespace();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Some(Value::Array(items));
+        }
+        loop {
+            items.push(self.parse_value(depth + 1)?);
+            self.skip_whitespace();
+            match self.peek()? {
+                b',' => {
+                    self.pos += 1;
+                    self.skip_whitespace();
+                }
+                b']' => {
+                    self.pos += 1;
+                    return Some(Value::Array(items));
+                }
+                _ => return None,
+            }
+        }
+    }
+}
+
+fn identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$'
+}
+
+fn identifier_continue(byte: u8) -> bool {
+    identifier_start(byte) || byte.is_ascii_digit()
 }
 
 /// One `input_text` block's text, with no other block type accepted.
@@ -1014,18 +1476,323 @@ fn exec_text_names_a_cass_call(expression: &str) -> bool {
                 .is_some_and(cli_names_cass),
         };
     }
-    if [
-        "tools.mcp__cass_mcp__cass_search",
-        "tools.mcp__cass_mcp__cass_expand",
-        "tools.mcp__cass_mcp__cass_sessions",
-        "tools.mcp__cass_mcp__cass_timeline",
-    ]
-    .iter()
-    .any(|method| expression.contains(method))
-    {
+    if script_calls_a_cass_tool(expression) {
         return true;
     }
     json_string_cmd(expression).is_some_and(|command| cli_names_cass(&command))
+}
+
+/// Ticket 07b: does this unsupported script contain a static call to one of
+/// the four Cass MCP reads?
+///
+/// The scan is lexical only. Strings, comments, template text and regex
+/// literals are skipped, and `tools . METHOD (` is recognized with the same
+/// four ASCII separators the literal parser allows. Comments between the
+/// method and its call parenthesis remain candidate evidence only. A method reference,
+/// `typeof tools.METHOD` or a descriptive string has no call parenthesis after
+/// the method, so it never matches. Nothing is executed, evaluated or
+/// rewritten: this answer only decides whether the strict checks after
+/// [`exec_recall_candidate_hint`] run, and it never authorizes an exclusion.
+fn script_calls_a_cass_tool(expression: &str) -> bool {
+    /// One level of the explicit stack: template text, or the `{...}` nesting
+    /// of a `${...}` interpolation that returns to code scanning.
+    enum Frame {
+        Template,
+        Interpolation(usize),
+    }
+
+    fn skip_separators(bytes: &[u8], mut pos: usize) -> usize {
+        while bytes
+            .get(pos)
+            .copied()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            pos += 1;
+        }
+        pos
+    }
+
+    fn call_parenthesis_after_trivia(bytes: &[u8], mut pos: usize) -> bool {
+        loop {
+            pos = skip_separators(bytes, pos);
+            if bytes.get(pos..pos + 2) == Some(b"/*") {
+                let Some(end) = bytes[pos + 2..].windows(2).position(|part| part == b"*/") else {
+                    return false;
+                };
+                pos += end + 4;
+            } else if bytes.get(pos..pos + 2) == Some(b"//") {
+                pos += 2;
+                while bytes
+                    .get(pos)
+                    .is_some_and(|byte| !matches!(byte, b'\n' | b'\r'))
+                {
+                    pos += 1;
+                }
+            } else {
+                return bytes.get(pos) == Some(&b'(');
+            }
+        }
+    }
+
+    /// `tools <sep> . <sep> METHOD <sep> (` at a complete identifier boundary.
+    fn callee_after_tools(bytes: &[u8], pos: usize) -> bool {
+        let mut pos = skip_separators(bytes, pos);
+        if bytes.get(pos) != Some(&b'.') {
+            return false;
+        }
+        pos = skip_separators(bytes, pos + 1);
+        [
+            "mcp__cass_mcp__cass_search",
+            "mcp__cass_mcp__cass_expand",
+            "mcp__cass_mcp__cass_sessions",
+            "mcp__cass_mcp__cass_timeline",
+        ]
+        .iter()
+        .any(|method| {
+            let end = pos + method.len();
+            bytes.get(pos..end) == Some(method.as_bytes())
+                && !bytes.get(end).copied().is_some_and(identifier_continue)
+                && call_parenthesis_after_trivia(bytes, end)
+        })
+    }
+
+    let bytes = expression.as_bytes();
+    let mut pos = 0;
+    let mut frames: Vec<Frame> = Vec::new();
+    // Expression context distinguishes regex literals from division. Control
+    // headers and statement blocks can end before a new regex statement;
+    // ordinary parenthesized values still end an operand.
+    let mut operand_expected = true;
+    let mut previous_significant: Option<u8> = None;
+    let mut control_parenthesis_pending = false;
+    let mut control_parentheses = Vec::new();
+    let mut statement_expected = true;
+    let mut statement_braces = Vec::new();
+
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+
+        if matches!(frames.last(), Some(Frame::Template)) {
+            match byte {
+                b'\\' => pos = (pos + 2).min(bytes.len()),
+                b'`' => {
+                    pos += 1;
+                    frames.pop();
+                    operand_expected = false;
+                    previous_significant = Some(b'`');
+                }
+                b'$' if bytes.get(pos + 1) == Some(&b'{') => {
+                    pos += 2;
+                    frames.push(Frame::Interpolation(0));
+                    operand_expected = true;
+                    previous_significant = Some(b'{');
+                }
+                _ => pos += 1,
+            }
+            continue;
+        }
+
+        let pending_control = std::mem::take(&mut control_parenthesis_pending);
+        let statement_start = std::mem::replace(&mut statement_expected, false);
+        match byte {
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                control_parenthesis_pending = pending_control;
+                statement_expected = statement_start;
+                pos += 1;
+            }
+            b'/' if bytes.get(pos + 1) == Some(&b'/') => {
+                control_parenthesis_pending = pending_control;
+                statement_expected = statement_start;
+                pos += 2;
+                while pos < bytes.len() && !matches!(bytes[pos], b'\n' | b'\r') {
+                    pos += 1;
+                }
+            }
+            b'/' if bytes.get(pos + 1) == Some(&b'*') => {
+                control_parenthesis_pending = pending_control;
+                statement_expected = statement_start;
+                pos += 2;
+                while pos < bytes.len() {
+                    if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+                        pos += 2;
+                        break;
+                    }
+                    pos += 1;
+                }
+            }
+            b'"' | b'\'' => {
+                pos += 1;
+                while pos < bytes.len() {
+                    match bytes[pos] {
+                        b'\\' => pos += 2,
+                        closer if closer == byte => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => pos += 1,
+                    }
+                }
+                operand_expected = false;
+                previous_significant = Some(byte);
+            }
+            b'`' => {
+                pos += 1;
+                frames.push(Frame::Template);
+            }
+            b'/' if operand_expected => {
+                // A regex literal: skip escapes and character classes, then
+                // its flags. The pattern is never scanned for method names.
+                pos += 1;
+                let mut in_class = false;
+                while pos < bytes.len() {
+                    match bytes[pos] {
+                        b'\\' => pos += 2,
+                        b'[' if !in_class => {
+                            in_class = true;
+                            pos += 1;
+                        }
+                        b']' if in_class => {
+                            in_class = false;
+                            pos += 1;
+                        }
+                        b'/' if !in_class => {
+                            pos += 1;
+                            break;
+                        }
+                        _ => pos += 1,
+                    }
+                }
+                while bytes.get(pos).copied().is_some_and(identifier_continue) {
+                    pos += 1;
+                }
+                operand_expected = false;
+                previous_significant = Some(b'/');
+            }
+            b'/' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(b'/');
+            }
+            b'{' => {
+                statement_braces.push(statement_start);
+                if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
+                    *depth += 1;
+                }
+                pos += 1;
+                operand_expected = true;
+                statement_expected = statement_start;
+                previous_significant = Some(b'{');
+            }
+            b'}' => {
+                if matches!(frames.last(), Some(Frame::Interpolation(0))) {
+                    frames.pop();
+                    operand_expected = false;
+                } else if let Some(Frame::Interpolation(depth)) = frames.last_mut() {
+                    *depth -= 1;
+                    operand_expected = statement_braces.pop().unwrap_or(false);
+                } else {
+                    operand_expected = statement_braces.pop().unwrap_or(false);
+                }
+                pos += 1;
+                statement_expected = operand_expected;
+                previous_significant = Some(b'}');
+            }
+            b'(' => {
+                control_parentheses.push(pending_control);
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+            b'[' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+            b')' => {
+                pos += 1;
+                operand_expected = control_parentheses.pop().unwrap_or(false);
+                statement_expected = operand_expected;
+                previous_significant = Some(byte);
+            }
+            b']' => {
+                pos += 1;
+                operand_expected = false;
+                previous_significant = Some(byte);
+            }
+            b'=' | b':' | b',' | b';' | b'?' | b'+' | b'-' | b'*' | b'%' | b'&' | b'|' | b'^'
+            | b'!' | b'~' | b'<' | b'>' => {
+                pos += 1;
+                operand_expected = true;
+                statement_expected = byte == b';';
+                previous_significant = Some(byte);
+            }
+            b'.' => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(b'.');
+            }
+            b'0'..=b'9' => {
+                while bytes
+                    .get(pos)
+                    .copied()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+                {
+                    pos += 1;
+                }
+                operand_expected = false;
+                previous_significant = Some(b'0');
+            }
+            byte if identifier_start(byte) => {
+                let start = pos;
+                pos += 1;
+                while bytes.get(pos).copied().is_some_and(identifier_continue) {
+                    pos += 1;
+                }
+                let word = &expression[start..pos];
+                if word == "tools"
+                    && previous_significant != Some(b'.')
+                    && callee_after_tools(bytes, pos)
+                {
+                    return true;
+                }
+                control_parenthesis_pending = previous_significant != Some(b'.')
+                    && (matches!(word, "if" | "while" | "for" | "with" | "switch" | "catch")
+                        || (pending_control && word == "await"));
+                statement_expected = matches!(word, "else" | "do" | "try" | "finally");
+                operand_expected = matches!(
+                    word,
+                    "return"
+                        | "throw"
+                        | "case"
+                        | "delete"
+                        | "void"
+                        | "typeof"
+                        | "new"
+                        | "in"
+                        | "of"
+                        | "instanceof"
+                        | "do"
+                        | "else"
+                        | "yield"
+                        | "await"
+                );
+                previous_significant = Some(b'a');
+            }
+            byte if byte >= 0x80 => {
+                // A non-ASCII byte is an opaque part of a value; it is never
+                // sliced, so no UTF-8 boundary can be cut.
+                pos += 1;
+                operand_expected = false;
+                previous_significant = Some(byte);
+            }
+            _ => {
+                pos += 1;
+                operand_expected = true;
+                previous_significant = Some(byte);
+            }
+        }
+    }
+    false
 }
 
 /// True when the command head is Cass, whether or not its syntax is one of the
@@ -3435,6 +4202,396 @@ mod tests {
         assert_eq!(outcome, Outcome::Preserve(Some(reason)));
     }
 
+    // ========================================================================
+    // Ticket 06: the frozen L01-L24 and B01-B20 literal matrix.
+    //
+    // Both fixtures are copied byte-for-byte from the batch roadmap and are
+    // compiled in here, so the assertions cannot drift from the frozen input.
+    // Each case ID appears exactly once; the B cases attach to the test of
+    // their declared `parent_test_case` rather than adding named targets.
+    // ========================================================================
+
+    const ALIEN_LITERALS: &str = include_str!("../../tests/fixtures/alien_codex/literals.json");
+    const ALIEN_LITERAL_BOUNDARIES: &str =
+        include_str!("../../tests/fixtures/alien_codex/literal_boundaries.json");
+
+    fn alien_case(fixture: &str, id: &str) -> Value {
+        let root: Value = serde_json::from_str(fixture).expect("frozen fixture JSON");
+        let matches: Vec<&Value> = root["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .filter(|case| case["id"].as_str() == Some(id))
+            .collect();
+        assert_eq!(matches.len(), 1, "case {id} must appear exactly once");
+        matches[0].clone()
+    }
+
+    fn alien_literal_case(id: &str) -> Value {
+        alien_case(ALIEN_LITERALS, id)
+    }
+
+    fn alien_boundary_case(id: &str) -> Value {
+        alien_case(ALIEN_LITERAL_BOUNDARIES, id)
+    }
+
+    fn recall_tool_method(tool: RecallTool) -> &'static str {
+        match tool {
+            RecallTool::Search => "mcp__cass_mcp__cass_search",
+            RecallTool::Expand => "mcp__cass_mcp__cass_expand",
+            RecallTool::Sessions => "mcp__cass_mcp__cass_sessions",
+            RecallTool::Timeline => "mcp__cass_mcp__cass_timeline",
+        }
+    }
+
+    fn alien_tool_value(tool: RecallTool) -> Value {
+        match tool {
+            RecallTool::Search => search_value(),
+            RecallTool::Expand => expand_value(),
+            RecallTool::Sessions => sessions_value(),
+            RecallTool::Timeline => timeline_value(),
+        }
+    }
+
+    /// Judge one frozen case the way production does. A supported case must
+    /// parse to the exact method and the original argument value, and the
+    /// same expression fed through the existing `exec_fixture` /
+    /// `decide_for_record` path with a complete MCP record must really be
+    /// excluded. An unsupported case must parse to `None` and reach the
+    /// production `unsupported_shell` preserve; a C04 result is supplied so
+    /// the row is a proven candidate, which is the only way that bounded
+    /// reason can be reached.
+    fn assert_alien_literal_case(case: &Value) {
+        let id = case["id"].as_str().expect("case id");
+        let expression = case["expression"].as_str().expect("case expression");
+        let expected = &case["expected"];
+        let supported = expected["supported"].as_bool().expect("case supported");
+        println!("case {id}: supported={supported}");
+
+        if supported {
+            let (target, args) = parse_exec_literal(expression)
+                .unwrap_or_else(|| panic!("{id}: expected a supported literal"));
+            let ExecTarget::Mcp(tool) = target else {
+                panic!("{id}: only the four MCP methods are supported");
+            };
+            let method = expected["method"].as_str().expect("case method");
+            assert_eq!(recall_tool_method(tool), method, "{id}: method");
+            assert_eq!(args, expected["args"], "{id}: original argument value");
+
+            let wrapper = recall_output::encode(tool, &alien_tool_value(tool))
+                .expect("frozen wrapper encodes");
+            let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("{id}: the production path must exclude this literal, got {outcome:?}");
+            };
+            assert!(judged.parse_error.is_none(), "{id}: no parse error");
+            println!("case {id}: excluded through decide_for_record");
+        } else {
+            assert!(
+                parse_exec_literal(expression).is_none(),
+                "{id}: an unsupported literal must not parse"
+            );
+            let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+                .expect("frozen wrapper encodes");
+            let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            println!("case {id}: preserved unsupported_shell");
+        }
+    }
+
+    fn assert_alien_literal_group(id: &str, boundary_ids: &[&str]) {
+        assert_alien_literal_case(&alien_literal_case(id));
+        for boundary_id in boundary_ids {
+            let case = alien_boundary_case(boundary_id);
+            assert_eq!(
+                case["parent_test_case"].as_str(),
+                Some(id),
+                "{boundary_id} must attach to {id}"
+            );
+            assert_alien_literal_case(&case);
+        }
+    }
+
+    // ========================================================================
+    // Rework R1: keyword token boundaries, the old outer trim, and the old
+    // strict JSON recursion boundary. Each case stays inside an existing
+    // named test and prints its own R1 label, so the 24 named targets and the
+    // frozen fixture bytes do not change.
+    // ========================================================================
+
+    fn assert_r1_supported(label: &str, expression: &str, tool: RecallTool, expected: Value) {
+        let (target, args) = parse_exec_literal(expression)
+            .unwrap_or_else(|| panic!("{label}: expected a supported literal"));
+        let ExecTarget::Mcp(actual) = target else {
+            panic!("{label}: only the four MCP methods are supported");
+        };
+        assert_eq!(
+            recall_tool_method(actual),
+            recall_tool_method(tool),
+            "{label}: method"
+        );
+        assert_eq!(args, expected, "{label}: original argument value");
+
+        let wrapper =
+            recall_output::encode(tool, &alien_tool_value(tool)).expect("frozen wrapper encodes");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        let Outcome::Exclude(judged) = outcome else {
+            panic!("{label}: the production path must exclude this literal, got {outcome:?}");
+        };
+        assert!(judged.parse_error.is_none(), "{label}: no parse error");
+        println!("case {label}: excluded through decide_for_record");
+    }
+
+    fn assert_r1_unsupported(label: &str, expression: &str) {
+        assert!(
+            parse_exec_literal(expression).is_none(),
+            "{label}: an unsupported literal must not parse"
+        );
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        println!("case {label}: preserved unsupported_shell");
+    }
+
+    fn r1_expression(args: &str) -> String {
+        format!("text(await tools.mcp__cass_mcp__cass_search({args}));")
+    }
+
+    /// `{"query": [[...0...]]}` with `levels` arrays.
+    fn r1_array_args(levels: usize) -> (String, Value) {
+        let args = format!(
+            "{{\"query\":{}{}{}}}",
+            "[".repeat(levels),
+            "0",
+            "]".repeat(levels)
+        );
+        let mut value = json!(0);
+        for _ in 0..levels {
+            value = json!([value]);
+        }
+        (args, json!({"query": value}))
+    }
+
+    /// `{"query": [[...[]...]]}` with `levels` empty arrays.
+    fn r1_empty_array_args(levels: usize) -> (String, Value) {
+        let args = format!("{{\"query\":{}{}}}", "[".repeat(levels), "]".repeat(levels));
+        let mut value = json!([]);
+        for _ in 1..levels {
+            value = json!([value]);
+        }
+        (args, json!({"query": value}))
+    }
+
+    /// `{"query": {"x": {"x": ... 0 ...}}}` with `levels` nested objects
+    /// under `query`.
+    fn r1_object_args(levels: usize) -> (String, Value) {
+        let args = format!(
+            "{{\"query\":{}{}{}}}",
+            "{\"x\":".repeat(levels),
+            "0",
+            "}".repeat(levels)
+        );
+        let mut value = json!(0);
+        for _ in 0..levels {
+            value = json!({"x": value});
+        }
+        (args, json!({"query": value}))
+    }
+
+    #[test]
+    fn alien_codex_literal_l01() {
+        assert_alien_literal_group("L01", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l02() {
+        assert_alien_literal_group("L02", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l03() {
+        assert_alien_literal_group("L03", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l04() {
+        assert_alien_literal_group("L04", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l05() {
+        assert_alien_literal_group("L05", &["B01", "B02", "B03", "B04", "B20"]);
+
+        // R1-3 accepted side: 126 nested containers plus the argument object
+        // is 127, the deepest value the old strict JSON path accepted.
+        let (args, expected) = r1_array_args(126);
+        assert_r1_supported(
+            "R1-3-array-126",
+            &r1_expression(&args),
+            RecallTool::Search,
+            expected,
+        );
+        let (args, expected) = r1_empty_array_args(126);
+        assert_r1_supported(
+            "R1-3-empty-array-126",
+            &r1_expression(&args),
+            RecallTool::Search,
+            expected,
+        );
+        let (args, expected) = r1_object_args(126);
+        assert_r1_supported(
+            "R1-3-object-126",
+            &r1_expression(&args),
+            RecallTool::Search,
+            expected,
+        );
+
+        // R1-3 rejected side: 127 nested containers plus the argument object
+        // is 128, the depth the old strict JSON path refused.
+        let (args, _) = r1_array_args(127);
+        assert_r1_unsupported("R1-3-array-127", &r1_expression(&args));
+        let (args, _) = r1_empty_array_args(127);
+        assert_r1_unsupported("R1-3-empty-array-127", &r1_expression(&args));
+        let (args, _) = r1_object_args(127);
+        assert_r1_unsupported("R1-3-object-127", &r1_expression(&args));
+        // R1-3: refusal happens before the recursion, so a much deeper input
+        // returns `None` instead of exhausting the stack.
+        let (args, _) = r1_array_args(256);
+        assert_r1_unsupported("R1-3-array-256", &r1_expression(&args));
+    }
+
+    #[test]
+    fn alien_codex_literal_l06() {
+        assert_alien_literal_group("L06", &[]);
+
+        // R1-2: the old function trimmed the whole expression before matching,
+        // so Unicode whitespace around the fixed shape is accepted again.
+        let nbsp = '\u{00A0}';
+        assert_r1_supported(
+            "R1-2-outer-trim",
+            &format!("{nbsp}{}{nbsp}", r1_expression("{\"query\":\"x\"}")),
+            RecallTool::Search,
+            json!({"query": "x"}),
+        );
+        // R1-2: trimming never reaches the argument values.
+        assert_r1_supported(
+            "R1-2-string-value",
+            &r1_expression("{\"query\":\"a\u{00A0}b\"}"),
+            RecallTool::Search,
+            json!({"query": "a\u{00A0}b"}),
+        );
+    }
+
+    #[test]
+    fn alien_codex_literal_l07() {
+        assert_alien_literal_group("L07", &["B12"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l08() {
+        assert_alien_literal_group("L08", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l09() {
+        assert_alien_literal_group("L09", &["B05"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l10() {
+        assert_alien_literal_group("L10", &["B06"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l11() {
+        assert_alien_literal_group("L11", &["B07"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l12() {
+        assert_alien_literal_group("L12", &["B08"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l13() {
+        assert_alien_literal_group("L13", &["B09", "B10", "B11"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l14() {
+        assert_alien_literal_group("L14", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l15() {
+        assert_alien_literal_group("L15", &["B13"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l16() {
+        assert_alien_literal_group("L16", &["B14"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l17() {
+        assert_alien_literal_group("L17", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l18() {
+        assert_alien_literal_group("L18", &["B15"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l19() {
+        assert_alien_literal_group("L19", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l20() {
+        assert_alien_literal_group("L20", &["B16", "B17", "B18"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l21() {
+        assert_alien_literal_group("L21", &["B19"]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l22() {
+        assert_alien_literal_group("L22", &[]);
+
+        // R1-1: a keyword ends at a token boundary. `awaittools` is one
+        // identifier, not `await tools`, so this is not the fixed shape.
+        assert_r1_unsupported(
+            "R1-1-awaittools",
+            "text(awaittools.mcp__cass_mcp__cass_search({\"query\":\"x\"}));",
+        );
+        // R1-1: the same boundary applies to the value keywords.
+        assert_r1_unsupported(
+            "R1-1-trueish",
+            "text(await tools.mcp__cass_mcp__cass_search({\"query\":trueish}));",
+        );
+
+        // R1-2: only the whole expression is trimmed; separator whitespace
+        // inside the fixed shape stays ASCII.
+        assert_r1_unsupported(
+            "R1-2-inner-nbsp",
+            "text(\u{00A0}await tools.mcp__cass_mcp__cass_search({\"query\":\"x\"}));",
+        );
+    }
+
+    #[test]
+    fn alien_codex_literal_l23() {
+        assert_alien_literal_group("L23", &[]);
+    }
+
+    #[test]
+    fn alien_codex_literal_l24() {
+        assert_alien_literal_group("L24", &[]);
+    }
+
     /// Task10: the candidate hint separates ordinary `exec` work (a date
     /// literal, a local script) from a recognized Cass call, using literal
     /// evidence only.
@@ -4357,5 +5514,624 @@ mod tests {
         );
         assert_eq!(marker.rule_version, 2);
         assert_eq!(read_message.content, "");
+    }
+
+    // ========================================================================
+    // Ticket 07a: the frozen K01-K12 single-`const` binding matrix.
+    //
+    // The fixture is copied byte-for-byte from the batch roadmap and compiled
+    // in here, so the assertions cannot drift from the frozen input. Derived
+    // boundaries stay inside K01/K02 and print their own stable labels, so
+    // the named interface stays at twelve targets.
+    // ========================================================================
+
+    const ALIEN_CONST: &str = include_str!("../../tests/fixtures/alien_codex/const.json");
+
+    fn alien_const_case(id: &str) -> Value {
+        alien_case(ALIEN_CONST, id)
+    }
+
+    /// One supported `const` form for the given method and argument value.
+    fn const_expression(method: &str, args: &Value) -> String {
+        format!("const r=await tools.{method}({args});text(r);")
+    }
+
+    /// The 48 binding names the frozen identifier table refuses: the keywords,
+    /// the strict-mode future reserved words, and the two strict-mode binding
+    /// restrictions. `async` is deliberately absent; it is a valid binding.
+    const CONST_REJECTED_BINDINGS: [&str; 48] = [
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        "implements",
+        "interface",
+        "let",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "static",
+        "arguments",
+        "eval",
+    ];
+
+    /// Judge one frozen K case the way production does. A supported case must
+    /// parse to the exact method and argument value, and the same expression
+    /// fed through the existing `exec_fixture` / `decide_for_record` path with
+    /// a complete MCP record must really be excluded. An unsupported case must
+    /// parse to `None` and reach the production `unsupported_shell` preserve.
+    fn assert_alien_const_case(case: &Value) {
+        let id = case["id"].as_str().expect("case id");
+        let expression = case["expression"].as_str().expect("case expression");
+        let expected = &case["expected"];
+        let supported = expected["supported"].as_bool().expect("case supported");
+        println!("case {id}: supported={supported}");
+
+        if supported {
+            let (target, args) = parse_exec_literal(expression)
+                .unwrap_or_else(|| panic!("{id}: expected a supported const literal"));
+            let ExecTarget::Mcp(tool) = target else {
+                panic!("{id}: only the four MCP methods are supported");
+            };
+            let method = expected["method"].as_str().expect("case method");
+            assert_eq!(recall_tool_method(tool), method, "{id}: method");
+            assert_eq!(args, expected["args"], "{id}: original argument value");
+
+            let wrapper = recall_output::encode(tool, &alien_tool_value(tool))
+                .expect("frozen wrapper encodes");
+            let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            let Outcome::Exclude(judged) = outcome else {
+                panic!("{id}: the production path must exclude this literal, got {outcome:?}");
+            };
+            assert!(judged.parse_error.is_none(), "{id}: no parse error");
+            println!("case {id}: excluded through decide_for_record");
+        } else {
+            assert!(
+                parse_exec_literal(expression).is_none(),
+                "{id}: an unsupported const literal must not parse"
+            );
+            let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+                .expect("frozen wrapper encodes");
+            let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            println!("case {id}: preserved unsupported_shell");
+        }
+    }
+
+    fn assert_const_supported(label: &str, expression: &str, tool: RecallTool, expected: &Value) {
+        let (target, args) = parse_exec_literal(expression)
+            .unwrap_or_else(|| panic!("{label}: expected a supported const literal"));
+        let ExecTarget::Mcp(actual) = target else {
+            panic!("{label}: only the four MCP methods are supported");
+        };
+        assert_eq!(
+            recall_tool_method(actual),
+            recall_tool_method(tool),
+            "{label}: method"
+        );
+        assert_eq!(&args, expected, "{label}: original argument value");
+        let wrapper =
+            recall_output::encode(tool, &alien_tool_value(tool)).expect("frozen wrapper encodes");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        let Outcome::Exclude(judged) = outcome else {
+            panic!("{label}: the production path must exclude this literal, got {outcome:?}");
+        };
+        assert!(judged.parse_error.is_none(), "{label}: no parse error");
+        println!("const-case {label}: supported, excluded through decide_for_record");
+    }
+
+    fn assert_const_unsupported(label: &str, expression: &str) {
+        assert!(
+            parse_exec_literal(expression).is_none(),
+            "{label}: must stay unsupported"
+        );
+        println!("const-case {label}: unsupported as expected");
+    }
+
+    /// One `exec` Codex pair whose raw result record is supplied verbatim, so a
+    /// single native field can change without touching the expression.
+    fn const_negative_outcome(expression: &str, raw_record: Value) -> Outcome {
+        let call_id = "call-t07";
+        let output = raw_record["payload"]["output"].clone();
+        let call = codex_call_row(expression, Some(call_id), "custom_tool_call");
+        let result = codex_result_row(&output, &raw_record);
+        let conv = codex_conversation(vec![call, result]);
+        let events = vec![
+            RawEvent {
+                event_key: "line:1".into(),
+                blocks: vec![RawBlock {
+                    index: 0,
+                    kind: BlockKind::ToolUse,
+                    tool_use_id: Some(call_id.into()),
+                    tool_name: Some("exec".into()),
+                    args: Some(Value::String(expression.into())),
+                }],
+            },
+            RawEvent {
+                event_key: "line:2".into(),
+                blocks: vec![tool_result_block(0, Some(call_id))],
+            },
+        ];
+        let ctx = PairingContext::build(&crate::indexer::build_pairing_candidates(&conv));
+        decide_for_record(&conv, 1, &events[1], &ctx, &paths_cfg(), &raw_record)
+    }
+
+    #[test]
+    fn alien_codex_const_k01() {
+        assert_alien_const_case(&alien_const_case("K01"));
+
+        // The same shape reaches all four frozen methods with the first legal
+        // argument value of each from the 06 fixture, and each still excludes
+        // through the matching C04 envelope.
+        for (literal_id, tool) in [
+            ("L01", RecallTool::Search),
+            ("L02", RecallTool::Expand),
+            ("L03", RecallTool::Sessions),
+            ("L04", RecallTool::Timeline),
+        ] {
+            let case = alien_literal_case(literal_id);
+            let method = case["expected"]["method"].as_str().expect("literal method");
+            let args = case["expected"]["args"].clone();
+            assert_eq!(
+                recall_tool_method(tool),
+                method,
+                "{literal_id}: method pairing"
+            );
+            let expression = const_expression(method, &args);
+            assert_const_supported(&format!("K01/method-{method}"), &expression, tool, &args);
+        }
+
+        // The six allowed binding names from the frozen identifier table.
+        for binding in ["r", "answer", "_", "$r", "async", "answer9"] {
+            let expression = format!(
+                "const {binding}=await tools.mcp__cass_mcp__cass_search({{\"query\":\"synthetic\"}});text({binding});"
+            );
+            assert_const_supported(
+                &format!("K01/binding-{binding}"),
+                &expression,
+                RecallTool::Search,
+                &json!({"query": "synthetic"}),
+            );
+        }
+
+        // The outer trim keeps the 06 Unicode behaviour.
+        let trimmed = format!(
+            "\u{2003}const r=await tools.mcp__cass_mcp__cass_search({{\"query\":\"synthetic\"}});text(r);\u{2003}"
+        );
+        assert_const_supported(
+            "K01/outer-unicode-trim",
+            &trimmed,
+            RecallTool::Search,
+            &json!({"query": "synthetic"}),
+        );
+
+        // The binding-name table never reaches object keys: the const form
+        // parses the same reserved-word keys to the same Value as the 06 form.
+        let direct = "text(await tools.mcp__cass_mcp__cass_search({query:\"synthetic\",default:null,public:true}));";
+        let expected = parse_mcp_call_literal(direct)
+            .expect("06 accepts the reserved-word keys as object keys")
+            .1;
+        let keyed = "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\",default:null,public:true});text(r);";
+        let (target, args) =
+            parse_exec_literal(keyed).expect("the const form accepts the same object keys");
+        let ExecTarget::Mcp(tool) = target else {
+            panic!("K01/object-reserved-keys: MCP only");
+        };
+        assert_eq!(tool, RecallTool::Search, "K01/object-reserved-keys: method");
+        assert_eq!(
+            args, expected,
+            "K01/object-reserved-keys: same Value as the 06 form"
+        );
+        println!("const-case K01/object-reserved-keys: same Value as the 06 direct form");
+
+        // The five fixed negative sides keep their original reason. Each uses
+        // the same legal const expression and changes one native field only,
+        // so a syntax failure could never stand in for the native check.
+        let expression = alien_const_case("K01")["expression"]
+            .as_str()
+            .expect("case expression")
+            .to_string();
+        assert!(
+            parse_exec_literal(&expression).is_some(),
+            "K01/negative-sides: the expression stays supported"
+        );
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        let output = mcp_output(&mcp_application(&wrapper));
+
+        let mismatch = result_raw_record(Some("call-other"), &output, "custom_tool_call_output");
+        assert_preserved(
+            const_negative_outcome(&expression, mismatch),
+            UncoveredReason::UnpairedResult,
+        );
+        println!("const-case K01/negative-call-id: unpaired_result as expected");
+
+        let partial_app = json!({
+            "content": [{"type": "text", "text": wrapper}],
+            "resultType": "partial",
+        });
+        let partial = result_raw_record(
+            Some("call-t07"),
+            &mcp_output(&partial_app),
+            "custom_tool_call_output",
+        );
+        assert_preserved(
+            const_negative_outcome(&expression, partial),
+            UncoveredReason::UnsupportedShell,
+        );
+        println!("const-case K01/negative-result-type: unsupported_shell as expected");
+
+        let application = mcp_application(&wrapper).to_string();
+        let double = json!([
+            {"type": "input_text", "text": application},
+            {"type": "input_text", "text": application},
+        ]);
+        let two_blocks = result_raw_record(Some("call-t07"), &double, "custom_tool_call_output");
+        assert_preserved(
+            const_negative_outcome(&expression, two_blocks),
+            UncoveredReason::UnsupportedShell,
+        );
+        println!("const-case K01/negative-two-blocks: unsupported_shell as expected");
+
+        let extra_app = json!({
+            "content": [{"type": "text", "text": wrapper}],
+            "serverInfo": {"name": "synthetic"},
+        });
+        let extra = result_raw_record(
+            Some("call-t07"),
+            &mcp_output(&extra_app),
+            "custom_tool_call_output",
+        );
+        assert_preserved(
+            const_negative_outcome(&expression, extra),
+            UncoveredReason::UnsupportedShell,
+        );
+        println!("const-case K01/negative-extra-field: unsupported_shell as expected");
+
+        let truncated = "<cass_recall version=\"1\" tool=\"cass_search\">{\"hits\": []}";
+        let broken = result_raw_record(
+            Some("call-t07"),
+            &mcp_output(&mcp_application(truncated)),
+            "custom_tool_call_output",
+        );
+        assert_preserved(
+            const_negative_outcome(&expression, broken),
+            UncoveredReason::InvalidRecallFormat,
+        );
+        println!("const-case K01/negative-broken-c04: invalid_recall_format as expected");
+    }
+
+    #[test]
+    fn alien_codex_const_k02() {
+        assert_alien_const_case(&alien_const_case("K02"));
+
+        for binding in CONST_REJECTED_BINDINGS {
+            let expression = format!(
+                "const {binding}=await tools.mcp__cass_mcp__cass_search({{\"query\":\"synthetic\"}});text({binding});"
+            );
+            assert_const_unsupported(&format!("K02/binding-{binding}"), &expression);
+        }
+
+        // Unicode and escaped identifiers are not ASCII identifiers.
+        for (label, binding) in [("unicode", "é"), ("escaped", "\\u0072")] {
+            let expression = format!(
+                "const {binding}=await tools.mcp__cass_mcp__cass_search({{\"query\":\"synthetic\"}});text({binding});"
+            );
+            assert_const_unsupported(&format!("K02/ident-{label}"), &expression);
+        }
+
+        // Token gluing on either side of a keyword is not the keyword.
+        for (label, expression) in [
+            (
+                "constx",
+                "constx r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});text(r);".to_string(),
+            ),
+            (
+                "awaittools",
+                "const r=awaittools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});text(r);".to_string(),
+            ),
+            (
+                "textual",
+                "const r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});textual(r);".to_string(),
+            ),
+        ] {
+            assert_const_unsupported(&format!("K02/token-{label}"), &expression);
+        }
+
+        // Both semicolons are required and no code may follow the print.
+        for (label, expression) in [
+            (
+                "missing-declaration-semicolon",
+                "const r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"})\ntext(r);",
+            ),
+            (
+                "missing-print-semicolon",
+                "const r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});text(r)",
+            ),
+            (
+                "trailing-code",
+                "const r=await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"});text(r);+1",
+            ),
+        ] {
+            assert_const_unsupported(&format!("K02/semicolon-{label}"), expression);
+        }
+    }
+
+    #[test]
+    fn alien_codex_const_k03() {
+        assert_alien_const_case(&alien_const_case("K03"));
+    }
+
+    #[test]
+    fn alien_codex_const_k04() {
+        assert_alien_const_case(&alien_const_case("K04"));
+    }
+
+    #[test]
+    fn alien_codex_const_k05() {
+        assert_alien_const_case(&alien_const_case("K05"));
+    }
+
+    #[test]
+    fn alien_codex_const_k06() {
+        assert_alien_const_case(&alien_const_case("K06"));
+    }
+
+    #[test]
+    fn alien_codex_const_k07() {
+        assert_alien_const_case(&alien_const_case("K07"));
+    }
+
+    #[test]
+    fn alien_codex_const_k08() {
+        assert_alien_const_case(&alien_const_case("K08"));
+    }
+
+    #[test]
+    fn alien_codex_const_k09() {
+        assert_alien_const_case(&alien_const_case("K09"));
+    }
+
+    #[test]
+    fn alien_codex_const_k10() {
+        assert_alien_const_case(&alien_const_case("K10"));
+    }
+
+    #[test]
+    fn alien_codex_const_k11() {
+        assert_alien_const_case(&alien_const_case("K11"));
+    }
+
+    #[test]
+    fn alien_codex_const_k12() {
+        assert_alien_const_case(&alien_const_case("K12"));
+    }
+
+    // ========================================================================
+    // Ticket 07b: the frozen D01-D22 discovery-call boundary matrix.
+    //
+    // The fixture is copied byte-for-byte from the batch roadmap. Each case
+    // runs through the existing `exec_fixture` / `decide_for_record` path, so
+    // the assertion covers the whole hint and the strict judgment behind it,
+    // not a helper boolean. The three C04 reverse-side cases (D01, D02, D15)
+    // are executed inside the no-call test: a complete envelope stays
+    // independent evidence even when no static call is proved.
+    // ========================================================================
+
+    const ALIEN_DISCOVERY: &str =
+        include_str!("../../tests/fixtures/alien_codex/discovery.json");
+
+    fn alien_discovery_case(id: &str) -> Value {
+        alien_case(ALIEN_DISCOVERY, id)
+    }
+
+    /// Judge every frozen D case of one group. `expected_calls` is 0 for the
+    /// capture-free group and 1 for the real-call group; the two groups must
+    /// partition all 22 cases exactly once.
+    fn assert_alien_discovery_group(expected_calls: u64, expected_group_len: usize) {
+        let root: Value =
+            serde_json::from_str(ALIEN_DISCOVERY).expect("frozen discovery fixture JSON");
+        let cases = root["cases"].as_array().expect("cases array");
+        let mut judged = 0;
+
+        for case in cases {
+            let calls = case["expected_actual_stub_calls"]
+                .as_u64()
+                .expect("case stub calls");
+            if calls != expected_calls {
+                continue;
+            }
+            judged += 1;
+            let id = case["id"].as_str().expect("case id");
+            let expression = case["expression"].as_str().expect("case expression");
+            let expected_candidate = case["expected_candidate_without_recall"]
+                .as_bool()
+                .expect("case candidate");
+            let expected_reason = case["expected_reason_without_recall"].as_str();
+
+            // No D case is one of the 07a supported const forms, so only the
+            // discovery hint decides what happens here.
+            assert!(
+                parse_exec_literal(expression).is_none(),
+                "{id}: no discovery case is a const literal"
+            );
+
+            // A captured result that only printed a length or a truncation:
+            // no C04 envelope anywhere, so the call evidence has to stand.
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".to_string()));
+            let actual_candidate = outcome != Outcome::Preserve(None);
+            println!(
+                "case {id}: expected_calls={calls} expected_candidate={expected_candidate} \
+                 actual_candidate={actual_candidate} outcome={outcome:?}"
+            );
+
+            assert_eq!(actual_candidate, expected_candidate, "{id}: candidate hint");
+            if expected_candidate {
+                assert_eq!(expected_reason, Some("unsupported_shell"), "{id}: fixture reason");
+                assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            } else {
+                assert_eq!(
+                    outcome,
+                    Outcome::Preserve(None),
+                    "{id}: a discovery-only exec is ordinary work"
+                );
+            }
+        }
+
+        assert_eq!(
+            judged, expected_group_len,
+            "the fixture group must keep its frozen size"
+        );
+    }
+
+    /// D01/D02/D15: no static call is proved, but the result declares a
+    /// complete C04 envelope. The existing output OR-branch is independent
+    /// evidence, and the unsupported expression still preserves.
+    fn assert_alien_discovery_reverse_side() {
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value())
+            .expect("frozen wrapper encodes");
+        for id in ["D01", "D02", "D15"] {
+            let case = alien_discovery_case(id);
+            let expression = case["expression"].as_str().expect("case expression");
+            let (outcome, _, _) =
+                exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+            let actual_candidate = outcome != Outcome::Preserve(None);
+            println!(
+                "case {id}+recall: expected_candidate=true \
+                 actual_candidate={actual_candidate} outcome={outcome:?}"
+            );
+            assert!(actual_candidate, "{id}: a complete envelope stands alone");
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    /// r1 regression: a `//` comment that ended only at LF used to swallow a
+    /// real call that followed an ASCII CR. Both frozen newlines must end the
+    /// comment, so both cases keep the original `unsupported_shell` alert.
+    fn assert_alien_discovery_newline_regression() {
+        let cases = [
+            (
+                "CR01",
+                "// synthetic discovery\rconst r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content.length);",
+            ),
+            (
+                "LF01",
+                "// synthetic discovery\nconst r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content.length);",
+            ),
+        ];
+        for (id, expression) in cases {
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".to_string()));
+            let actual_candidate = outcome != Outcome::Preserve(None);
+            println!(
+                "r1-case {id}: expected_candidate=true actual_candidate={actual_candidate} \
+                 outcome={outcome:?}"
+            );
+            assert!(
+                actual_candidate,
+                "r1-case {id}: the call after the comment must be found"
+            );
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
+    }
+
+    #[test]
+    fn alien_codex_const_discovery_no_call() {
+        assert_alien_discovery_group(0, 14);
+        assert_alien_discovery_reverse_side();
+    }
+
+    #[test]
+    fn alien_codex_const_actual_call_partial() {
+        assert_alien_discovery_group(1, 8);
+        assert_alien_discovery_newline_regression();
+    }
+
+    #[test]
+    fn alien_codex_call_comments_remain_unsupported_candidates() {
+        for method in [
+            "mcp__cass_mcp__cass_search",
+            "mcp__cass_mcp__cass_expand",
+            "mcp__cass_mcp__cass_sessions",
+            "mcp__cass_mcp__cass_timeline",
+        ] {
+            for gap in ["/* note */", "// note\n", "/* one */ // two\n /* three */"] {
+                let expression = format!(
+                    "const r=await tools.{method}{gap}({{query:\"synthetic\"}});text(r.content.length);"
+                );
+                assert!(
+                    parse_exec_literal(&expression).is_none(),
+                    "comments stay unsupported"
+                );
+                let (outcome, _, _) = exec_outcome(&expression, Value::String("partial".into()));
+                assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+            }
+        }
+
+        // Keep the complete-envelope OR route independent from call discovery.
+        let expression = "const r=await tools.mcp__cass_mcp__cass_search/* note */({query:\"synthetic\"});text(r.content.length);";
+        let wrapper = recall_output::encode(RecallTool::Search, &search_value()).expect("encode");
+        let (outcome, _, _) = exec_outcome(expression, mcp_output(&mcp_application(&wrapper)));
+        assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+
+        for expression in [
+            r#"text("tools.mcp__cass_mcp__cass_search/* note */(");"#,
+            "/* tools.mcp__cass_mcp__cass_search() */ text(1);",
+            "text(typeof tools.mcp__cass_mcp__cass_search/* note */);",
+            "text(tools.mcp__cass_mcp__cass_search/* note */);",
+            "const f=tools.mcp__cass_mcp__cass_search/* unterminated",
+            "const f=tools.mcp__cass_mcp__cass_search// no call",
+            "if (x) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "if ((x)) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "if (x) {} /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "{} /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "while (x) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+            "for (;x;) /tools.mcp__cass_mcp__cass_search// note\n(y)",
+        ] {
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".into()));
+            assert_eq!(outcome, Outcome::Preserve(None), "no call: {expression}");
+        }
+
+        for expression in [
+            "const r=obj.if(x)/await tools.mcp__cass_mcp__cass_search/* note */({query:\"synthetic\"});text(r);",
+            "const r=({x:1})/await tools.mcp__cass_mcp__cass_search/* note */({query:\"synthetic\"});text(r);",
+        ] {
+            let (outcome, _, _) = exec_outcome(expression, Value::String("partial".into()));
+            assert_preserved(outcome, UncoveredReason::UnsupportedShell);
+        }
     }
 }

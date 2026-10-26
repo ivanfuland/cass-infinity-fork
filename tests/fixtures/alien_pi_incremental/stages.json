@@ -1,0 +1,56 @@
+{
+  "schema": "cass-alien-pi-stages/1",
+  "synthetic": true,
+  "stages": [
+    {
+      "id": "S0",
+      "action": "初始全量",
+      "db_messages": 4,
+      "db_recall_excluded": 1,
+      "uncovered_total": 0,
+      "uncovered_by_reason": {}
+    },
+    {
+      "id": "S1",
+      "action": "无修改默认增量",
+      "db_messages": 4,
+      "db_recall_excluded": 1,
+      "uncovered_total": 0,
+      "uncovered_by_reason": {}
+    },
+    {
+      "id": "S2",
+      "action": "追加有效一轮四消息",
+      "db_messages": 8,
+      "db_recall_excluded": 2,
+      "uncovered_total": 0,
+      "uncovered_by_reason": {}
+    },
+    {
+      "id": "S3",
+      "action": "无修改默认增量",
+      "db_messages": 8,
+      "db_recall_excluded": 2,
+      "uncovered_total": 0,
+      "uncovered_by_reason": {}
+    },
+    {
+      "id": "S4",
+      "action": "追加错 ID 调用/结果/结束答复三消息",
+      "db_messages": 11,
+      "db_recall_excluded": 2,
+      "uncovered_total": 1,
+      "uncovered_by_reason": {
+        "unpaired_result": 1
+      }
+    },
+    {
+      "id": "S5",
+      "action": "无修改默认增量",
+      "db_messages": 11,
+      "db_recall_excluded": 2,
+      "uncovered_total": 0,
+      "uncovered_by_reason": {}
+    }
+  ]
+}

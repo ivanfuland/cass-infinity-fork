@@ -1,0 +1,196 @@
+{
+  "schema": "cass-alien-codex-discovery-cases/1",
+  "synthetic": true,
+  "scope": "only original07-AC2 diagnostic boundaries, not deletion authority or supported-expression grammar",
+  "cases": [
+    {
+      "id": "D01",
+      "expression": "text(ALL_TOOLS.filter(t=>t.name.includes(\"cass\")));",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D02",
+      "expression": "text(typeof tools.mcp__cass_mcp__cass_search);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D03",
+      "expression": "text(typeof ( tools.mcp__cass_mcp__cass_expand ));",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D04",
+      "expression": "text(\"tools.mcp__cass_mcp__cass_search({query:\\\"synthetic\\\"})\");",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D05",
+      "expression": "text({description:\"tools.mcp__cass_mcp__cass_expand({source_path:\\\"/synthetic\\\"})\"});",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D06",
+      "expression": "const descriptor={name:\"mcp__cass_mcp__cass_search\",description:\"tools.mcp__cass_mcp__cass_search({})\"};text(descriptor);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D07",
+      "expression": "// tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})\ntext(\"synthetic discovery\");",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D08",
+      "expression": "/* tools.mcp__cass_mcp__cass_search({query:\"synthetic\"}) */ text(ALL_TOOLS.length);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D09",
+      "expression": "text(/tools.mcp__cass_mcp__cass_search()/.source);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D10",
+      "expression": "const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content[0].text.length);",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D11",
+      "expression": "text((await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})).content[0].text.slice(0,1));",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D12",
+      "expression": "text(typeof tools.mcp__cass_mcp__cass_search);const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D13",
+      "expression": "text((await tools . mcp__cass_mcp__cass_search ({query:\"synthetic\"})).content.length);",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D14",
+      "expression": "text(`synthetic ${(await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})).content.length}`);",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D15",
+      "expression": "text(`tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})`);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D16",
+      "expression": "const n=12/(await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})).content.length;text(n);",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D17",
+      "expression": "const regex=/tools.mcp__cass_mcp__cass_search()/;const r=await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"});text(r.content.length);",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    },
+    {
+      "id": "D18",
+      "expression": "const descriptor=tools.mcp__cass_mcp__cass_search;text(typeof descriptor);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D19",
+      "expression": "const descriptor={method:tools.mcp__cass_mcp__cass_search};text(typeof descriptor.method);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D20",
+      "expression": "text('tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})');",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D21",
+      "expression": "text(typeof tools . mcp__cass_mcp__cass_timeline);",
+      "expected_actual_stub_calls": 0,
+      "expected_candidate_without_recall": false,
+      "expected_reason_without_recall": null,
+      "expected_excluded": false
+    },
+    {
+      "id": "D22",
+      "expression": "text(typeof (await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"})));",
+      "expected_actual_stub_calls": 1,
+      "expected_candidate_without_recall": true,
+      "expected_reason_without_recall": "unsupported_shell",
+      "expected_excluded": false
+    }
+  ],
+  "result_declaration_override": {
+    "cases": [
+      "D01",
+      "D02",
+      "D15"
+    ],
+    "without_actual_call_but_complete_recall_output": {
+      "candidate": true,
+      "preserved_reason": "unsupported_shell",
+      "excluded": false
+    },
+    "meaning": "existing output C04 proof remains independent OR even when static call proof is absent"
+  }
+}

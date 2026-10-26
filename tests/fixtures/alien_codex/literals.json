@@ -1,0 +1,263 @@
+{
+  "schema": "cass-alien-codex-literal-cases/1",
+  "synthetic": true,
+  "scope": "parser-only; not native server calls",
+  "cases": [
+    {
+      "id": "L01",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:\"synthetic\"}));",
+      "expected": {
+        "supported": true,
+        "args": {
+          "query": "synthetic"
+        },
+        "method": "mcp__cass_mcp__cass_search",
+        "reason": null
+      }
+    },
+    {
+      "id": "L02",
+      "expression": "text(await tools.mcp__cass_mcp__cass_expand({query:\"synthetic\"}));",
+      "expected": {
+        "supported": true,
+        "args": {
+          "query": "synthetic"
+        },
+        "method": "mcp__cass_mcp__cass_expand",
+        "reason": null
+      }
+    },
+    {
+      "id": "L03",
+      "expression": "text(await tools.mcp__cass_mcp__cass_sessions({query:\"synthetic\"}));",
+      "expected": {
+        "supported": true,
+        "args": {
+          "query": "synthetic"
+        },
+        "method": "mcp__cass_mcp__cass_sessions",
+        "reason": null
+      }
+    },
+    {
+      "id": "L04",
+      "expression": "text(await tools.mcp__cass_mcp__cass_timeline({query:\"synthetic\"}));",
+      "expected": {
+        "supported": true,
+        "args": {
+          "query": "synthetic"
+        },
+        "method": "mcp__cass_mcp__cass_timeline",
+        "reason": null
+      }
+    },
+    {
+      "id": "L05",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:\"你好 \\\"quoted\\\"\",agent:[\"codex\",\"pi_agent\"],}));",
+      "expected": {
+        "supported": true,
+        "args": {
+          "query": "你好 \"quoted\"",
+          "agent": [
+            "codex",
+            "pi_agent"
+          ]
+        },
+        "method": "mcp__cass_mcp__cass_search",
+        "reason": null
+      }
+    },
+    {
+      "id": "L06",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({\"query\":\"synthetic\"}));",
+      "expected": {
+        "supported": true,
+        "args": {
+          "query": "synthetic"
+        },
+        "method": "mcp__cass_mcp__cass_search",
+        "reason": null
+      }
+    },
+    {
+      "id": "L07",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:\"a\",query:\"b\"}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L08",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:\"a\",\"qu\\u0065ry\":\"b\"}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L09",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({message_id:9007199254740993}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L10",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({limit:1e1}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L11",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({limit:1.5}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L12",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({limit:-0}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L13",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({__proto__:{query:\"x\"}}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L14",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({...other}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L15",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({[\"query\"]:\"x\"}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L16",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:'x'}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L17",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:`x`}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L18",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:other}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L19",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:\"a\"+\"b\"}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L20",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:()=>1}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L21",
+      "expression": "text(await tools.mcp__cass_mcp__cass_search({query:\"x\"}))",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L22",
+      "expression": "text(await tools.mcp__other__cass_search({query:\"x\"}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L23",
+      "expression": "text(await tools.exec_command({cmd:\"cass search x --recall\"}));",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    },
+    {
+      "id": "L24",
+      "expression": "const r=await tools.exec_command({\"cmd\":\"cass search x --recall\"});text(r);",
+      "expected": {
+        "supported": false,
+        "args": null,
+        "method": null,
+        "reason": "unsupported_shell"
+      }
+    }
+  ]
+}
