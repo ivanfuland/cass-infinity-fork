@@ -349,6 +349,7 @@ struct CaseEnv {
     tmp: PathBuf,
     cwd: PathBuf,
     data_dir: PathBuf,
+    data_dir_argument: Option<PathBuf>,
     /// The session file the stages write, or the missing root's path.
     source_path: PathBuf,
     /// The root named in `sources.toml`, for the configured kinds.
@@ -459,6 +460,7 @@ impl CaseEnv {
             tmp,
             cwd,
             data_dir,
+            data_dir_argument: None,
             source_path,
             configured_root,
             agent_home,
@@ -494,12 +496,17 @@ impl CaseEnv {
                 "home": display_path(&self.home),
                 "config_home": display_path(&self.config_home),
                 "data_dir": display_path(&self.data_dir),
+                "data_dir_arg": display_path(self.data_dir_arg()),
                 "source_path": display_path(&self.source_path),
                 "configured_root": self.configured_root.as_deref().map(display_path),
                 "agent_home": self.agent_home.as_deref().map(display_path),
                 "cass_bin": display_path(&cass_bin()),
             }),
         );
+    }
+
+    fn data_dir_arg(&self) -> &Path {
+        self.data_dir_argument.as_deref().unwrap_or(&self.data_dir)
     }
 
     fn db_path(&self) -> PathBuf {
@@ -964,7 +971,7 @@ fn run_stage(
         argv.push("--full".into());
     }
     argv.push("--data-dir".into());
-    argv.push(display_path(&case.data_dir));
+    argv.push(display_path(case.data_dir_arg()));
     argv.push("--json".into());
     argv.push("--robot-trace-ingest".into());
 
@@ -1993,6 +2000,7 @@ fn assert_pi_path_identity(kind: RootKind) {
     let unicode = format!("项目/分支/{name}");
     let scenarios = [
         ("linked-data-dir", nested.as_str(), None),
+        ("relative-data-dir", nested.as_str(), None),
         ("nested-absent", nested.as_str(), None),
         ("nested-empty", nested.as_str(), Some("")),
         ("flat-absent", name, None),
@@ -2013,6 +2021,9 @@ fn assert_pi_path_identity(kind: RootKind) {
             }
             let mut case = CaseEnv::new(kind);
             case.batch = batch;
+            if label == "relative-data-dir" {
+                case.data_dir_argument = Some(PathBuf::from("../data"));
+            }
             if label == "linked-data-dir" {
                 #[cfg(unix)]
                 {
@@ -2061,7 +2072,7 @@ fn assert_pi_path_identity(kind: RootKind) {
                 .unwrap();
             write_json(
                 &case.artifact_dir.join("identity-input.json"),
-                &json!({"label":label,"batch":batch,"source":case.source_path,"data_dir":case.data_dir,
+                &json!({"label":label,"batch":batch,"source":case.source_path,"data_dir":case.data_dir,"data_dir_arg":case.data_dir_arg(),
                     "expected_external_id":expected_id,"sha256":sha256_hex(&raw)}),
             );
             for (round, full) in [("full-1", true), ("full-2", true), ("incremental", false)] {
