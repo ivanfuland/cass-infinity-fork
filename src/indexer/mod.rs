@@ -20828,7 +20828,10 @@ fn prepare_conversation_for_ingest(
             .map_err(|e| PrepareError(format!("reparse materialize: {e}")))?;
 
         let scan_root = crate::connectors::ScanRoot::local(materialized.clone());
-        let mut scan_data_dir = materialized.parent().map(Path::to_path_buf).unwrap_or_else(|| materialized.clone());
+        let mut scan_data_dir = materialized
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| materialized.clone());
         // A headerless Pi session derives its id from the path below the
         // first scan's sessions root. The captured layout preserves that
         // suffix, but scanning only the file's parent drops nested directories.
@@ -20836,10 +20839,17 @@ fn prepare_conversation_for_ingest(
         // the connector still parses the captured bytes and the strict
         // agent/external_id checks below remain authoritative.
         if original_agent_slug == "pi_agent"
-            && let Some(relative_id) = original_external_id.as_deref().filter(|id| !id.is_empty()).map(Path::new)
-            && relative_id.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            && let Some(relative_id) = original_external_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map(Path::new)
+            && relative_id
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
             && materialized.ends_with(relative_id)
-            && let Some(root) = materialized.ancestors().nth(relative_id.components().count())
+            && let Some(root) = materialized
+                .ancestors()
+                .nth(relative_id.components().count())
         {
             // Pi's own sessions_dir adds a sessions child when one exists.
             // Start above that directory so repeated sessions components in
@@ -41319,12 +41329,25 @@ normalization="l2"
                 DetectionResult::not_found()
             }
             fn scan(&self, ctx: &ScanContext) -> anyhow::Result<Vec<NormalizedConversation>> {
-                assert!(!ctx.scan_roots.is_empty(), "reparse must not enable default detection");
-                let scratch = ctx.scan_roots[0].path.ancestors().find(|path| {
-                    path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("cass-reparse-pi-agent-"))
-                }).expect("Pi scratch ancestor");
+                assert!(
+                    !ctx.scan_roots.is_empty(),
+                    "reparse must not enable default detection"
+                );
+                let scratch = ctx.scan_roots[0]
+                    .path
+                    .ancestors()
+                    .find(|path| {
+                        path.file_name().is_some_and(|name| {
+                            name.to_string_lossy().starts_with("cass-reparse-pi-agent-")
+                        })
+                    })
+                    .expect("Pi scratch ancestor");
                 assert!(ctx.data_dir.starts_with(scratch));
-                assert!(ctx.scan_roots.iter().all(|root| root.path.starts_with(scratch)));
+                assert!(
+                    ctx.scan_roots
+                        .iter()
+                        .all(|root| root.path.starts_with(scratch))
+                );
                 // This runs after capture. A fallback to the live source can
                 // no longer reproduce the captured conversation.
                 std::fs::write(&self.live, "live source changed after capture\n")?;
@@ -41337,11 +41360,19 @@ normalization="l2"
         std::fs::create_dir_all(source.parent().unwrap()).unwrap();
         let raw = include_str!("../../tests/fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl")
             .lines()
-            .filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["type"] != "session")
-            .collect::<Vec<_>>().join("\n") + "\n";
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"] != "session"
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
         std::fs::write(&source, &raw).unwrap();
         let pi = crate::connectors::pi_agent::PiAgentConnector::new();
-        let ctx = ScanContext::with_roots(temp.path().join("first-scan"), vec![ScanRoot::local(agent)], None);
+        let ctx = ScanContext::with_roots(
+            temp.path().join("first-scan"),
+            vec![ScanRoot::local(agent)],
+            None,
+        );
         let mut conversations = pi.scan(&ctx).unwrap();
         assert_eq!(conversations.len(), 1);
         let conv = conversations.remove(0);
@@ -41352,19 +41383,43 @@ normalization="l2"
         let data_dir = temp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let prepared = prepare_conversation_for_ingest(
-            &data_dir, "pi_agent", &CapturedPi { live: source.clone() },
-            &Origin::local(), &IngestIdentity::local(), None,
-            CaptureSourceKind::File(source.clone()), conv,
-        ).expect("captured Pi identity must survive a live-file change");
+            &data_dir,
+            "pi_agent",
+            &CapturedPi {
+                live: source.clone(),
+            },
+            &Origin::local(),
+            &IngestIdentity::local(),
+            None,
+            CaptureSourceKind::File(source.clone()),
+            conv,
+        )
+        .expect("captured Pi identity must survive a live-file change");
         assert_eq!(prepared.conv.external_id, expected_id);
         assert_eq!(prepared.conv.messages.len(), 4);
-        let blob = prepared.conv.metadata.pointer("/cass/raw_mirror/blob_relative_path").unwrap().as_str().unwrap();
-        assert_eq!(std::fs::read(data_dir.join("raw-mirror/v1").join(blob)).unwrap(), raw.as_bytes());
+        let blob = prepared
+            .conv
+            .metadata
+            .pointer("/cass/raw_mirror/blob_relative_path")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(data_dir.join("raw-mirror/v1").join(blob)).unwrap(),
+            raw.as_bytes()
+        );
         std::fs::write(&source, &raw).unwrap();
         let err = prepare_conversation_for_ingest(
-            &data_dir, "pi_agent", &pi, &Origin::local(), &IngestIdentity::local(), None,
-            CaptureSourceKind::File(source), wrong_identity,
-        ).expect_err("a wrong first-parse Pi identity must still be rejected");
+            &data_dir,
+            "pi_agent",
+            &pi,
+            &Origin::local(),
+            &IngestIdentity::local(),
+            None,
+            CaptureSourceKind::File(source),
+            wrong_identity,
+        )
+        .expect_err("a wrong first-parse Pi identity must still be rejected");
         assert!(err.0.contains("reparse identity mismatch"), "{}", err.0);
     }
 
