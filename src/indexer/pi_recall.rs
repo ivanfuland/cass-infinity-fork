@@ -1857,6 +1857,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn alien_pi_cleanup_alignment_reports_native_record_count() {
+        for (case, raw_count, canonical_count) in [
+            ("drop-canonical", 4, 3),
+            ("extra-canonical", 4, 5),
+            ("drop-raw", 3, 4),
+            ("extra-raw", 5, 4),
+            ("same-count-mismatch", 4, 4),
+        ] {
+            let mut lines = p01_lines();
+            let mut variant = project_full(case, &lines);
+            match case {
+                "drop-canonical" => { variant.conversation.messages.pop(); }
+                "extra-canonical" => {
+                    let mut extra = variant.conversation.messages[0].clone();
+                    extra.idx = 4;
+                    variant.conversation.messages.push(extra);
+                }
+                "drop-raw" => { lines.remove(1); }
+                "extra-raw" => { lines.push(lines[1].clone()); }
+                "same-count-mismatch" => unmap_message(&mut variant, 0),
+                _ => unreachable!(),
+            }
+            if matches!(case, "drop-raw" | "extra-raw") {
+                let text = lines.iter().map(|line| serde_json::to_string(line).unwrap())
+                    .collect::<Vec<_>>().join("\n") + "\n";
+                fs::write(&variant.blob, text).unwrap();
+            }
+            assert_eq!(variant.conversation.messages.len(), canonical_count);
+            let before = serde_json::to_value(&variant.conversation.messages).unwrap();
+            let outcome = cleanup_pi_conversation(&variant.blob, &mut variant.conversation, "derived/diagnostic.jsonl", false);
+            assert!(outcome.alignment_failed, "{case}");
+            assert_eq!(outcome.event_count, raw_count, "{case}: actual native record count");
+            assert_eq!(outcome.excluded, vec![None; canonical_count], "{case}");
+            assert_eq!(outcome.uncovered_by_reason, BTreeMap::from([("unpaired_result".to_string(), 1)]), "{case}");
+            assert_eq!(serde_json::to_value(&variant.conversation.messages).unwrap(), before, "{case}: no cleanup on failed alignment");
+        }
+    }
+
     /// Ticket 02: an alignment failure cannot be produced through the real
     /// lossless CLI (the connector emits every native message record, and the
     /// canonical extras are that record). This internal test therefore takes
