@@ -339,6 +339,7 @@ impl RootKind {
 /// One private HOME / config / data-dir set, kept on disk as evidence.
 struct CaseEnv {
     kind: RootKind,
+    batch: bool,
     /// Kept (never dropped) so the case tree survives as evidence.
     root: PathBuf,
     home: PathBuf,
@@ -450,6 +451,7 @@ impl CaseEnv {
 
         let case = Self {
             kind,
+            batch: false,
             home,
             config_home,
             cache_home,
@@ -515,6 +517,7 @@ impl CaseEnv {
             // otherwise be the only thing in this run that could touch the
             // network.
             .env("CASS_SKIP_UPDATE", "1")
+            .env("CASS_STREAMING_INDEX", if self.batch { "0" } else { "1" })
             .current_dir(&self.cwd);
         if let Some(agent_home) = &self.agent_home {
             cmd.env("PI_CODING_AGENT_DIR", agent_home);
@@ -532,6 +535,10 @@ impl CaseEnv {
         env.insert("XDG_CACHE_HOME".into(), display_path(&self.cache_home));
         env.insert("TMPDIR".into(), display_path(&self.tmp));
         env.insert("CASS_SKIP_UPDATE".into(), "1".into());
+        env.insert(
+            "CASS_STREAMING_INDEX".into(),
+            if self.batch { "0" } else { "1" }.into(),
+        );
         if let Some(agent_home) = &self.agent_home {
             env.insert("PI_CODING_AGENT_DIR".into(), display_path(agent_home));
         }
@@ -1968,4 +1975,130 @@ fn alien_pi_incremental_configured_missing_root() {
             "stages": [run.record()],
         }),
     );
+}
+
+/// Preserve the connector's public identity contract across capture/reparse.
+/// All inputs derive from P01; no frozen fixture or process environment changes.
+fn assert_pi_path_identity(kind: RootKind) {
+    let name = "2026-10-26T00-00-00_identity.jsonl";
+    let nested = format!("project/branch/{name}");
+    let repeated = format!("sessions/project/sessions/{name}");
+    let unicode = format!("项目/分支/{name}");
+    let scenarios = [
+        ("nested-absent", nested.as_str(), None),
+        ("nested-empty", nested.as_str(), Some("")),
+        ("flat-absent", name, None),
+        ("repeated-sessions", repeated.as_str(), None),
+        ("unicode", unicode.as_str(), None),
+        ("header", nested.as_str(), Some("synthetic-header-id")),
+        ("path-header", nested.as_str(), Some("../synthetic/header")),
+        ("matching-header", nested.as_str(), Some(nested.as_str())),
+        ("direct-agent-root", nested.as_str(), None),
+    ];
+    for batch in [false, true] {
+        for (label, relative, header_id) in scenarios {
+            let mut case = CaseEnv::new(kind);
+            case.batch = batch;
+            let sessions = case.source_path.ancestors().nth(2).unwrap().to_path_buf();
+            case.source_path = if label == "direct-agent-root" {
+                let agent = sessions.parent().unwrap();
+                fs::rename(&sessions, agent.join("kept-empty-session-layout")).unwrap();
+                agent.join(relative)
+            } else {
+                sessions.join(relative)
+            };
+            fs::create_dir_all(case.source_path.parent().unwrap()).unwrap();
+            let mut lines: Vec<Value> = include_str!(
+                "fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl"
+            )
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+            let mut header = lines.remove(0);
+            assert_eq!(header["type"], "session");
+            if let Some(id) = header_id {
+                header["id"] = json!(id);
+                lines.insert(0, header);
+            }
+            let mut raw = lines
+                .iter()
+                .map(|line| serde_json::to_string(line).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n");
+            raw.push('\n');
+            let raw = raw.into_bytes();
+            fs::write(&case.source_path, &raw).unwrap();
+            let expected_id = header_id.filter(|id| !id.is_empty()).unwrap_or(relative);
+            let records = session_records(&raw);
+            let user = records[0]["message"]["content"][0]["text"].as_str().unwrap();
+            let answer = records[3]["message"]["content"][0]["text"].as_str().unwrap();
+            write_json(
+                &case.artifact_dir.join("identity-input.json"),
+                &json!({"label":label,"batch":batch,"source":case.source_path,
+                    "expected_external_id":expected_id,"sha256":sha256_hex(&raw)}),
+            );
+            for (round, full) in [("full-1", true), ("full-2", true), ("incremental", false)] {
+                let run = run_stage(&case, round, full, &raw, 0);
+                assert_eq!(run.exit_code, Some(0), "{label} {round}: {}", run.stderr);
+                assert_eq!(run.stdout["success"], true, "{label} {round}");
+                assert_eq!(run.db.conversations, 1, "{label} {round}");
+                assert_eq!(run.db.external_ids, [expected_id], "{label} {round}");
+                assert_eq!(run.db.source_paths, [display_path(&case.source_path)]);
+                assert_eq!(run.db.rows.len(), 4, "{label} {round}");
+                assert_eq!(run.db.excluded(), 1, "{label} {round}");
+                assert_eq!(run.db.rows[0].content, user);
+                assert_eq!(run.db.rows[3].content, answer);
+                assert!(run.db.rows[2].content.is_empty());
+                assert_eq!(run.mirror.as_ref().unwrap().blob_bytes, raw);
+            }
+        }
+    }
+}
+
+#[test]
+fn alien_pi_path_identity_default_home() {
+    assert_pi_path_identity(RootKind::DefaultHome);
+}
+
+#[test]
+fn alien_pi_path_identity_agent_dir_override() {
+    assert_pi_path_identity(RootKind::AgentDirOverride);
+}
+
+#[test]
+fn alien_pi_path_identity_configured_root() {
+    assert_pi_path_identity(RootKind::ConfiguredRoot);
+}
+
+#[test]
+fn alien_pi_path_identity_same_filename_stays_distinct() {
+    for kind in [RootKind::DefaultHome, RootKind::AgentDirOverride, RootKind::ConfiguredRoot] {
+        for batch in [false, true] {
+            let mut case = CaseEnv::new(kind);
+            case.batch = batch;
+            let sessions = case.source_path.ancestors().nth(2).unwrap().to_path_buf();
+            let raw = include_str!("fixtures/alien_pi_full/2026-10-24T00-00-00_P01.jsonl")
+                .lines()
+                .filter(|line| serde_json::from_str::<Value>(line).unwrap()["type"] != "session")
+                .collect::<Vec<_>>()
+                .join("\n") + "\n";
+            let filename = "2026-10-26T00-00-00_shared-name.jsonl";
+            for project in ["left", "right"] {
+                let file = sessions.join(project).join(filename);
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(file, &raw).unwrap();
+            }
+            case.source_path = sessions.join("left").join(filename);
+            for (round, full) in [("full", true), ("incremental", false)] {
+                let run = run_stage(&case, round, full, raw.as_bytes(), 0);
+                assert_eq!(run.exit_code, Some(0), "{}", run.stderr);
+                assert_eq!(run.db.conversations, 2);
+                assert_eq!(run.db.rows.len(), 8);
+                let mut ids = run.db.external_ids.clone();
+                ids.sort();
+                assert_eq!(ids, [format!("left/{filename}"), format!("right/{filename}")]);
+                assert_eq!(run.db.excluded(), 2);
+            }
+        }
+    }
 }
