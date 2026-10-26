@@ -20828,7 +20828,31 @@ fn prepare_conversation_for_ingest(
             .map_err(|e| PrepareError(format!("reparse materialize: {e}")))?;
 
         let scan_root = crate::connectors::ScanRoot::local(materialized.clone());
-        let scan_data_dir = materialized.parent().map(Path::to_path_buf).unwrap_or_else(|| materialized.clone());
+        let mut scan_data_dir = materialized.parent().map(Path::to_path_buf).unwrap_or_else(|| materialized.clone());
+        // A headerless Pi session derives its id from the path below the
+        // first scan's sessions root. The captured layout preserves that
+        // suffix, but scanning only the file's parent drops nested directories.
+        // Use an exact, normal-component suffix only to select the scan root;
+        // the connector still parses the captured bytes and the strict
+        // agent/external_id checks below remain authoritative.
+        if original_agent_slug == "pi_agent"
+            && let Some(relative_id) = original_external_id.as_deref().filter(|id| !id.is_empty()).map(Path::new)
+            && relative_id.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            && materialized.ends_with(relative_id)
+            && let Some(root) = materialized.ancestors().nth(relative_id.components().count())
+        {
+            // Pi's own sessions_dir adds a sessions child when one exists.
+            // Start above that directory so repeated sessions components in
+            // the relative id are not stripped a second time.
+            let home = if root.file_name().is_some_and(|name| name == "sessions") {
+                root.parent().unwrap_or(root)
+            } else {
+                root
+            };
+            if home.starts_with(scratch.path()) {
+                scan_data_dir = home.to_path_buf();
+            }
+        }
         let ctx = crate::connectors::ScanContext::with_roots(scan_data_dir, vec![scan_root], None);
         let reparsed_conversations =
             connector.scan(&ctx).map_err(|e| PrepareError(format!("reparse scan failed: {e:#}")))?;
