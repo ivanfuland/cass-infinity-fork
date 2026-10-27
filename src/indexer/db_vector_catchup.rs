@@ -4880,6 +4880,29 @@ mod api_endpoint_relocation_tests {
         (call, profile)
     }
 
+    /// The original service's document vector for `text`: deterministic,
+    /// distinct per text, and inside the unit quantizer's component range.
+    fn original_document_vector(text: &str) -> Vec<f32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        (0..DIM)
+            .map(|index| {
+                let mut hasher = DefaultHasher::new();
+                text.hash(&mut hasher);
+                index.hash(&mut hasher);
+                (1.0 + (hasher.finish() % 1000) as f32 / 1000.0) * 0.5
+            })
+            .collect()
+    }
+
+    /// The same declared model behind a new backend returns each sentinel
+    /// `0.03` normalized units off the stored `[1, 0]`: cosine
+    /// `1 / sqrt(1 + 0.03^2)` = 0.9995503..., inside `[0.999, 0.9999)`.
+    fn approximate_sentinel_vector() -> Vec<f32> {
+        let norm = (1.0f32 + 0.03 * 0.03).sqrt();
+        vec![1.0 / norm, 0.03 / norm]
+    }
+
     struct Fixture {
         storage: FrankenStorage,
         profile: ValidatedProfile,
@@ -4890,6 +4913,10 @@ mod api_endpoint_relocation_tests {
 
     impl Fixture {
         fn new() -> (tempfile::TempDir, Fixture) {
+            Fixture::with_contents(&["first message", "second message", "third message"])
+        }
+
+        fn with_contents(contents: &[&str]) -> (tempfile::TempDir, Fixture) {
             let dir = tempfile::tempdir().expect("create scratch dir");
             let storage =
                 FrankenStorage::open(&dir.path().join("agent_search.db")).expect("open storage");
@@ -4902,7 +4929,7 @@ mod api_endpoint_relocation_tests {
                     kind: AgentKind::Cli,
                 })
                 .expect("ensure agent");
-            let messages: Vec<Message> = ["first message", "second message", "third message"]
+            let messages: Vec<Message> = contents
                 .iter()
                 .enumerate()
                 .map(|(idx, text)| Message {
@@ -4944,7 +4971,11 @@ mod api_endpoint_relocation_tests {
                     row.get_typed::<i64>(0)
                 })
                 .expect("read message ids");
-            assert_eq!(message_ids.len(), 3, "fixture must carry three messages");
+            assert_eq!(
+                message_ids.len(),
+                contents.len(),
+                "fixture must carry one message per requested content"
+            );
             let conversation_id = storage
                 .raw()
                 .query_row_map("SELECT MIN(conversation_id) FROM messages", &[], |row| {
@@ -5070,6 +5101,84 @@ mod api_endpoint_relocation_tests {
                 TS,
                 &self.expected(),
             )
+        }
+
+        /// Replace the synthetic one-byte chunk rows with the generation's real
+        /// expected chunks: real spans, real content hashes, embeddings from
+        /// [`original_document_vector`], and matching vec0 + int8 rows. Returns
+        /// the number of chunks seeded.
+        fn seed_real_chunks(&self, generation_id: i64) -> usize {
+            use crate::search::eligibility::{expected_chunks, normalized_for_chunks};
+
+            let messages: Vec<(i64, i64, String, String)> = self
+                .storage
+                .raw()
+                .query_all_map(
+                    "SELECT id, conversation_id, role, content FROM messages ORDER BY id",
+                    &[],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                        ))
+                    },
+                )
+                .expect("read fixture messages");
+            let mut planned = Vec::new();
+            for (message_id, conversation_id, role, content) in messages {
+                let normalized = normalized_for_chunks(&content);
+                for chunk in expected_chunks(message_id, conversation_id, &role, &content) {
+                    let embedding =
+                        original_document_vector(&normalized[chunk.byte_start..chunk.byte_end]);
+                    planned.push(ChunkRow {
+                        generation_id,
+                        message_id,
+                        conversation_id,
+                        chunk_idx: chunk.chunk_idx,
+                        byte_start: chunk.byte_start,
+                        byte_end: chunk.byte_end,
+                        content_hash: chunk.content_hash,
+                        norm: schema::l2_norm(&embedding) as f32,
+                        embedding,
+                        created_at_ms: TS,
+                    });
+                }
+            }
+            let chunk_ids = self
+                .storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let mut ids = Vec::new();
+                    for row in &planned {
+                        ids.push(schema::insert_chunk_row_in_tx(tx, row)?);
+                    }
+                    Ok::<Vec<i64>, StorageError>(ids)
+                })
+                .expect("seed real chunk rows");
+            vector_domain::create_vec0_table_for_generation(
+                self.storage.raw(),
+                generation_id,
+                DIM as i64,
+            )
+            .expect("create vec0 table");
+            let blobs: Vec<Vec<u8>> = planned
+                .iter()
+                .map(|row| schema::f32_vector_to_le_blob(&row.embedding))
+                .collect();
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let rows: Vec<(i64, &[u8])> = chunk_ids
+                        .iter()
+                        .zip(blobs.iter())
+                        .map(|(id, blob)| (*id, blob.as_slice()))
+                        .collect();
+                    vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &rows)
+                })
+                .expect("seed vec0 rows");
+            planned.len()
         }
     }
 
@@ -5296,6 +5405,76 @@ mod api_endpoint_relocation_tests {
             state(&fixture.storage, &[existing]),
             before,
             "no generation, chunk, hole or vec0 row may be written"
+        );
+    }
+
+    /// AC3's audit half: a real generation with real chunks, audited by an
+    /// embedder whose sentinels come back approximately, must report
+    /// `fingerprint_ok = true` -- and that verdict must come from ⑪ itself,
+    /// not from the rest of the audit happening to be clean.
+    #[test]
+    fn api_relocation_audit_accepts_approximate_fingerprint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::search::frankensearch_types::cosine_similarity;
+        use crate::search::generation_fingerprint::FINGERPRINT_SENTINELS;
+
+        let (_dir, fixture) = Fixture::with_contents(&[
+            "first message has plenty of real content to embed and chunk",
+            "second message has plenty of real content to embed and chunk",
+        ]);
+        let generation_id = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(generation_id, true);
+        let chunks = fixture.seed_real_chunks(generation_id);
+        assert_eq!(chunks, 2, "the fixture must carry two real chunks");
+
+        let sentinel_cosine = cosine_similarity(&[1.0, 0.0], &approximate_sentinel_vector());
+        assert!(
+            (0.999..0.9999).contains(&sentinel_cosine),
+            "the fixture cosine {sentinel_cosine} must sit strictly between 0.999 and 0.9999"
+        );
+
+        let sentinel_calls = AtomicUsize::new(0);
+        let embed = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
+            if texts.len() == FINGERPRINT_SENTINELS.len()
+                && texts
+                    .iter()
+                    .zip(FINGERPRINT_SENTINELS.iter())
+                    .all(|(left, right)| left == right)
+            {
+                sentinel_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(FINGERPRINT_SENTINELS
+                    .iter()
+                    .map(|_| approximate_sentinel_vector())
+                    .collect());
+            }
+            Ok(texts
+                .iter()
+                .map(|text| original_document_vector(text))
+                .collect())
+        };
+
+        let report = super::run_activation_audit(
+            &fixture.storage,
+            generation_id,
+            10,
+            fixture.message_ids.first().copied(),
+            Some(&embed),
+            10,
+            1,
+        )
+        .expect("the activation audit runs");
+        assert!(
+            report.fingerprint_ok,
+            "⑪ must accept an approximate cross-backend fingerprint inside [0.999, 0.9999): {report:?}"
+        );
+        assert!(
+            sentinel_calls.load(Ordering::SeqCst) > 0,
+            "⑪ must really re-embed the sentinels; a clean report without that call proves nothing"
+        );
+        assert!(
+            report.passed,
+            "the real-chunk generation must be otherwise clean so ⑪ is judged on its own: {report:?}"
         );
     }
 }
