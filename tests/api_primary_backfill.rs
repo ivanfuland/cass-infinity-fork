@@ -20,11 +20,19 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+// The shared fingerprint comparator lives in the crate-private
+// `search::frankensearch_types` module, which an integration test cannot reach.
+// `bakeoff::cosine_similarity` is the crate's public cosine with the same
+// formula; the lib test inside `db_vector_catchup` uses the shared comparator
+// itself.
+use coding_agent_search::bakeoff::cosine_similarity;
 use coding_agent_search::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
 use coding_agent_search::search::eligibility::{expected_chunks, normalized_for_chunks};
 use coding_agent_search::search::model_api::{ApiConfig, ProfileKind, ValidatedProfile};
 use coding_agent_search::storage::api::{StorageError, TxMode, Value};
-use coding_agent_search::storage::api_generation::{open_api_generation, representation_meta_key};
+use coding_agent_search::storage::api_generation::{
+    open_api_generation, provenance_meta_key, representation_meta_key,
+};
 use coding_agent_search::storage::sqlite::FrankenStorage;
 
 const EMBED_MODEL: &str = "example/synthetic-embed";
@@ -1449,7 +1457,7 @@ fn an_identity_match_with_a_bad_record_is_refused_despite_a_fingerprint_mismatch
 }
 
 #[test]
-fn an_identity_match_with_a_drifted_fingerprint_and_a_sound_record_builds_a_parallel_generation() {
+fn an_identity_match_with_a_drifted_fingerprint_and_a_sound_record_is_refused() {
     let (_dir, data_dir) = scratch();
     let storage = build_db(
         &data_dir,
@@ -1481,21 +1489,51 @@ fn an_identity_match_with_a_drifted_fingerprint_and_a_sound_record_builds_a_para
     let first = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
     let first_generation = first["generation_id"].as_i64().expect("generation id");
 
-    // The record stays sound; only the served weights changed.
+    // The record stays sound; only the served weights changed. A candidate
+    // that carries this exact API identity but not this probe's fingerprint
+    // is refused instead of being papered over by a silently built parallel
+    // generation.
     drift.store(11, Ordering::SeqCst);
-    let second = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
-    let second_generation = second["generation_id"].as_i64().expect("generation id");
-    assert_ne!(second_generation, first_generation);
-    assert_eq!(second["reused_existing_generation"], false);
-    assert_eq!(generation_count(&storage), 2);
+    let output = run_backfill(&data_dir, &config_path, Some("local8"), &[]);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(
+        !output.status.success(),
+        "a drifted fingerprint on a sound candidate must be refused"
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(output.status.code(), Some(5));
+    let envelope = error_envelope(&output);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(envelope["error"]["code"], 5);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("fingerprint")),
+        "the refusal must name the fingerprint rule: {envelope}"
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        generation_count(&storage),
+        1,
+        "a refused drift must not build a parallel generation"
+    );
     let profile = parse_profile(&text, "local8");
-    assert!(profile_reopens(&storage, first_generation, &profile));
-    assert!(profile_reopens(&storage, second_generation, &profile));
-    assert_eq!(active_generation(&storage), Some(second_generation));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(
+        profile_reopens(&storage, first_generation, &profile),
+        "the original generation must stay intact"
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        active_generation(&storage),
+        Some(first_generation),
+        "the original generation must stay active"
+    );
 }
 
 #[test]
-fn a_relocated_endpoint_is_refused_for_an_existing_generation() {
+fn a_relocated_endpoint_reuses_an_existing_generation() {
     let (_dir, data_dir) = scratch();
     let storage = build_db(
         &data_dir,
@@ -1517,9 +1555,19 @@ fn a_relocated_endpoint_is_refused_for_an_existing_generation() {
     fs::write(&config_path, &text).expect("write config");
     let first = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
     let generation_id = first["generation_id"].as_i64().expect("generation id");
+    let chunks_before = message_chunks(&storage, generation_id);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(chunks_before >= 1);
 
-    // The same model, revision and width, but a different endpoint.
+    // The same model, revision and width, but a different endpoint. The call
+    // settings moved; the declared vector space did not, and the endpoint still
+    // returns the same vectors, so the generation is admitted and reused.
     let moved = Stub::start(healthy_responder(8, 0));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_ne!(
+        stub.addr, moved.addr,
+        "the relocated endpoint must be a different port"
+    );
     let moved_config = data_dir.join("models-moved.toml");
     let moved_text = config_text(
         "local8",
@@ -1534,19 +1582,262 @@ fn a_relocated_endpoint_is_refused_for_an_existing_generation() {
     );
     fs::write(&moved_config, &moved_text).expect("write moved config");
 
-    let output = run_backfill(&data_dir, &moved_config, Some("local8"), &[]);
-    assert!(
-        !output.status.success(),
-        "a relocated endpoint needs admission proof this build does not have"
-    );
-    assert_eq!(output.status.code(), Some(5));
+    let second = assert_success(&run_backfill(&data_dir, &moved_config, Some("local8"), &[]));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["status"], "published");
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["generation_id"].as_i64(), Some(generation_id));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["reused_existing_generation"], true);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["activated"], true);
     assert_eq!(
         generation_count(&storage),
         1,
         "a relocation must not silently build a replacement generation"
     );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        message_chunks(&storage, generation_id),
+        chunks_before,
+        "a reuse must not rewrite the chunk set"
+    );
     let profile = parse_profile(&text, "local8");
     assert!(profile_reopens(&storage, generation_id, &profile));
+}
+
+/// Scale `vector` to unit length.
+fn normalize_vector(vector: &[f64]) -> Vec<f64> {
+    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+    vector.iter().map(|value| value / norm).collect()
+}
+
+/// The same served model behind a relocated backend: `original` moved
+/// `0.03 * norm(original)` along a direction orthogonal to its first two
+/// components. The cosine with `original` is exactly `1 / sqrt(1 + 0.03^2)` =
+/// 0.9995503..., inside the `[0.999, 0.9999)` window the cross-backend rule
+/// admits and below the retired `0.9999` threshold.
+fn approximate_vector(original: &[f64]) -> Vec<f64> {
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(
+        original[0] != 0.0 || original[1] != 0.0,
+        "the fixture needs a non-zero first pair to build an orthogonal direction"
+    );
+    let mut direction = vec![0.0f64; original.len()];
+    direction[0] = -original[1];
+    direction[1] = original[0];
+    let direction = normalize_vector(&direction);
+    let norm = original
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    let moved: Vec<f64> = original
+        .iter()
+        .zip(&direction)
+        .map(|(value, axis)| value + 0.03 * norm * axis)
+        .collect();
+    normalize_vector(&moved)
+}
+
+fn as_f32(vector: &[f64]) -> Vec<f32> {
+    vector.iter().map(|value| *value as f32).collect()
+}
+
+/// A relocated endpoint of the same declared model: documents come back
+/// byte-for-byte as before, and only the three fingerprint sentinels come back
+/// approximately re-embedded.
+fn relocated_approximate_responder(
+    dim: usize,
+) -> impl Fn(&RecordedRequest, usize) -> (u16, String) {
+    move |request, _index| {
+        let inputs = request.inputs();
+        let sentinel_inputs: Vec<String> = SENTINELS
+            .iter()
+            .map(|sentinel| format!("{DOCUMENT_PREFIX}{sentinel}"))
+            .collect();
+        let model = request
+            .body_json()
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(EMBED_MODEL)
+            .to_string();
+        let data: Vec<serde_json::Value> = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let original = vector_for(text, dim, 0);
+                let embedding = if sentinel_inputs.iter().any(|wire| wire == text) {
+                    approximate_vector(&original)
+                } else {
+                    original
+                };
+                serde_json::json!({
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": embedding,
+                })
+            })
+            .collect();
+        let body = serde_json::json!({
+            "object": "list",
+            "data": data,
+            "model": model,
+            "usage": {"prompt_tokens": inputs.len(), "total_tokens": inputs.len()},
+        });
+        (200, body.to_string())
+    }
+}
+
+/// One meta record's raw stored text.
+fn meta_text(storage: &FrankenStorage, key: &str) -> String {
+    storage
+        .raw()
+        .query_row_map(
+            "SELECT value FROM meta WHERE key = ?1",
+            &[Value::Text(key.to_string())],
+            |row| row.get_typed::<String>(0),
+        )
+        .expect("read meta value")
+}
+
+fn fingerprint_blob(storage: &FrankenStorage, generation_id: i64) -> Vec<u8> {
+    storage
+        .raw()
+        .query_row_map(
+            "SELECT fingerprint FROM embedding_generations WHERE id = ?1",
+            &[Value::Integer(generation_id)],
+            |row| row.get_typed::<Vec<u8>>(0),
+        )
+        .expect("read generation fingerprint")
+}
+
+#[test]
+fn a_relocated_endpoint_with_approximate_fingerprint_reuses_and_passes_audit() {
+    let (_dir, data_dir) = scratch();
+    let storage = build_db(
+        &data_dir,
+        &["a single message that is long enough to chunk once"],
+    );
+    let stub = Stub::start(healthy_responder(8, 0));
+    let config_path = data_dir.join("models.toml");
+    let text = config_text(
+        "local8",
+        &embedding_profile_block(
+            "local8",
+            &stub.endpoint(),
+            EMBED_MODEL,
+            EMBED_REVISION,
+            64,
+            "",
+        ),
+    );
+    fs::write(&config_path, &text).expect("write config");
+    let first = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
+    let generation_id = first["generation_id"].as_i64().expect("generation id");
+    let chunks_before = message_chunks(&storage, generation_id);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(chunks_before >= 1);
+    let fingerprint_before = fingerprint_blob(&storage, generation_id);
+    let representation_before = meta_text(&storage, &representation_meta_key(generation_id));
+    let provenance_before = meta_text(&storage, &provenance_meta_key(generation_id));
+
+    // Pin the fixture's real cosine through the product's own comparison, one
+    // sentinel at a time, before asking the CLI anything.
+    for sentinel in SENTINELS {
+        // ubs:ignore[rust.perf.string-alloc-in-loop] -- Small synthetic fixture.
+        let wire = format!("{DOCUMENT_PREFIX}{sentinel}");
+        let original = vector_for(&wire, 8, 0);
+        let approximate = approximate_vector(&original);
+        let cosine = cosine_similarity(&as_f32(&original), &as_f32(&approximate));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            (0.999..0.9999).contains(&cosine),
+            "the relocated fixture for {sentinel:?} must sit strictly between 0.999 and 0.9999, got {cosine}"
+        );
+    }
+
+    // The same model and revision at a different port: documents come back
+    // unchanged, the sentinels only approximately.
+    let moved = Stub::start(relocated_approximate_responder(8));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_ne!(
+        stub.addr, moved.addr,
+        "the relocated endpoint must be a different port"
+    );
+    let moved_config = data_dir.join("models-moved-approximate.toml");
+    let moved_text = config_text(
+        "local8",
+        &embedding_profile_block(
+            "local8",
+            &moved.endpoint(),
+            EMBED_MODEL,
+            EMBED_REVISION,
+            64,
+            "",
+        ),
+    );
+    fs::write(&moved_config, &moved_text).expect("write moved config");
+
+    let second = assert_success(&run_backfill(&data_dir, &moved_config, Some("local8"), &[]));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["status"], "published");
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["generation_id"].as_i64(), Some(generation_id));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["reused_existing_generation"], true);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(second["activated"], true);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(generation_count(&storage), 1);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        message_chunks(&storage, generation_id),
+        chunks_before,
+        "a reuse must not rewrite the chunk set"
+    );
+
+    // Every stored record byte is untouched: the fingerprint BLOB and both meta
+    // texts are compared as the stored bytes they are, never re-serialized.
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        fingerprint_blob(&storage, generation_id),
+        fingerprint_before,
+        "reuse must not rewrite the stored fingerprint"
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        meta_text(&storage, &representation_meta_key(generation_id)).as_bytes(),
+        representation_before.as_bytes(),
+        "reuse must not rewrite the representation record"
+    );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert_eq!(
+        meta_text(&storage, &provenance_meta_key(generation_id)).as_bytes(),
+        provenance_before.as_bytes(),
+        "reuse must not rewrite the provenance record"
+    );
+
+    let model_api = &second["model_api"];
+    let audit_calls = model_api["audit_calls"].as_array().expect("audit calls");
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+    assert!(
+        !audit_calls.is_empty(),
+        "a run that activates must run audit ⑪ and record its requests: {model_api}"
+    );
+    let (_, _, audit_requests) = phase_requests(&moved, &second);
+    let audit_inputs: Vec<String> = audit_requests
+        .iter()
+        .flat_map(RecordedRequest::inputs)
+        .collect();
+    for sentinel in SENTINELS {
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            // ubs:ignore[rust.perf.string-alloc-in-loop] -- Small synthetic fixture.
+            audit_inputs.contains(&format!("{DOCUMENT_PREFIX}{sentinel}")),
+            "the audit must re-embed the sentinel {sentinel:?} against the relocated endpoint"
+        );
+    }
 }
 
 #[test]

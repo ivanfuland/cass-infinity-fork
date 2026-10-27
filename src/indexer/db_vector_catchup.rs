@@ -1865,12 +1865,16 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
 /// The lookup and the verification share one transaction with the create, so a
 /// candidate can never be reused without its two meta records and its row having
 /// been reopened against the running profile in the same snapshot. A row that
-/// carries this exact API identity but whose records are missing, malformed or
-/// described by a moved endpoint is refused outright rather than papered over by
-/// quietly creating a replacement — the successor's admission is what clears
-/// that, not this ticket. A legacy (non-API) row is never an API candidate, so a
-/// previous Infinity generation keeps its active pointer while a new API
-/// candidate is built beside it.
+/// carries this exact API identity but whose records are missing or malformed is
+/// refused outright rather than papered over by quietly creating a replacement.
+/// A sound candidate whose stored fingerprint does not match this run's probe is
+/// refused the same way: its vectors already belong to a set of served weights
+/// this run would not reproduce, so the operator either fixes the embedding
+/// service or changes the `model`/`model_revision` declaration -- and that
+/// declaration change is what legitimately selects another generation. Only an
+/// archive with no candidate at all creates one. A legacy (non-API) row is never
+/// an API candidate, so a previous Infinity generation keeps its active pointer
+/// while a new API candidate is built beside it.
 const ACTIVE_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
          WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
            AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
@@ -1898,6 +1902,7 @@ fn find_or_create_api_generation(
         .map_err(|_| anyhow!("api dimension {dimension} does not fit in i64"))?;
 
     conn.with_tx(TxMode::Immediate, |tx| {
+        let mut openable_candidate: Option<i64> = None;
         for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
             let candidate = tx.query_opt_map(
                 sql,
@@ -1919,14 +1924,27 @@ fn find_or_create_api_generation(
             // — never bypassed by a fingerprint mismatch that would quietly
             // build a replacement beside it.
             call.route().open_generation(tx, candidate_id)?;
+            openable_candidate = Some(candidate_id);
             if fingerprint_matches(&stored_fingerprint, fingerprint, dimension) {
                 return Ok((candidate_id, true, 0u64));
             }
-            // The record is sound but the served weights differ from this run's
-            // probe, so the existing fingerprint rule says build a new
-            // generation beside this one rather than reuse vectors that belong
-            // to another fingerprint. Keep looking: a pending candidate from the
-            // current service instance may still match.
+            // The record is sound, so the stored fingerprint is the stored
+            // space's own claim, and this run's probe does not belong to it.
+            // Keep looking -- a pending candidate from the current service
+            // instance may still match -- and refuse below if none does.
+        }
+
+        if let Some(candidate_id) = openable_candidate {
+            // Building a second generation here would silently split one
+            // declared space across two sets of served weights.
+            return Err(StorageError::Other {
+                code: None,
+                detail: format!(
+                    "fingerprint mismatch: generation {candidate_id} declares this API space but its \
+                     stored fingerprint does not match this run's probe; check the embedding service \
+                     or change the declared model/model_revision"
+                ),
+            });
         }
 
         let producers = call.probe_writers();
@@ -4517,8 +4535,10 @@ mod api03g_sync_preflight_tests {
     use crate::search::model_api::primary_embedding::PrimaryEmbeddingCall;
     use crate::search::model_api::test_support::{HttpFixture, Reply, TlsFixture};
     use crate::search::model_api::{ApiClient, EnvCredentialResolver};
-    use crate::storage::api::{StorageError, TxMode};
-    use crate::storage::api_generation::create_api_generation;
+    use crate::storage::api::{StorageError, TxMode, Value};
+    use crate::storage::api_generation::{
+        create_api_generation, create_api_generation_with_producers,
+    };
     use crate::storage::sqlite::FrankenStorage;
 
     use super::{probe_api_backfill, probe_api_preflight, run_api_primary_catchup_backfill};
@@ -4541,6 +4561,43 @@ mod api03g_sync_preflight_tests {
                 |row| row.get_typed::<String>(0),
             )
             .expect("read generations")
+    }
+
+    /// Every column of every generation row, read as stored. `SELECT *` keeps
+    /// the nullable `activated_at`, the `fingerprint` BLOB and every other field
+    /// exact, so a before/after comparison cannot hide a changed column.
+    fn generation_snapshot(storage: &FrankenStorage) -> Vec<Vec<Value>> {
+        let columns = storage
+            .raw()
+            .query_all_map("PRAGMA table_info(embedding_generations)", &[], |_row| {
+                Ok(())
+            })
+            .expect("read the generation column count")
+            .len();
+        storage
+            .raw()
+            .query_all_map(
+                "SELECT * FROM embedding_generations ORDER BY id",
+                &[],
+                |row| {
+                    (0..columns)
+                        .map(|index| row.get_value(index))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .expect("read generations")
+    }
+
+    /// Every meta key and its stored value, in key order.
+    fn meta_rows(storage: &FrankenStorage) -> Vec<Vec<Value>> {
+        storage
+            .raw()
+            .query_all_map("SELECT key, value FROM meta ORDER BY key", &[], |row| {
+                (0..2)
+                    .map(|index| row.get_value(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read meta")
     }
 
     fn seed_messages(storage: &FrankenStorage, texts: &[&str]) {
@@ -4674,19 +4731,42 @@ mod api03g_sync_preflight_tests {
 
         let root = tempfile::tempdir().expect("tempdir");
         let db_path = root.path().join("db.sqlite");
-        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        // A real proof-backed history: a generation built through the older
+        // backup while an older proof declared that fallback. Its anchor and its
+        // producer both live on endpoints the current route's proof never saw.
+        let (older_config, older_proof) = fallback_fixture(
+            "http://127.0.0.1:1/embedding",
+            "https://example.invalid/embedding",
+        );
+        let older_primary = older_config
+            .profile("primary")
+            .expect("older primary")
+            .clone();
+        let older_backup = older_config
+            .profile("backup")
+            .expect("older backup")
+            .clone();
         {
             let writer = FrankenStorage::open(&db_path).expect("create the archive");
             writer
                 .raw()
                 .with_tx(TxMode::Immediate, |tx| {
-                    create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+                    create_api_generation_with_producers(
+                        tx,
+                        &older_primary,
+                        2,
+                        &[1; 24],
+                        1,
+                        std::slice::from_ref(&older_backup),
+                        &older_proof,
+                    )
+                    .map_err(StorageError::from)
                 })
                 .expect("seed an uncovered historical generation");
             writer.close().expect("close the writer");
         }
         let storage = readonly(&db_path);
-        let before = generation_rows(&storage);
+        let before = generation_snapshot(&storage);
 
         let error = match probe_api_preflight(Some(&storage), &call) {
             Ok(_) => panic!("an uncovered historical generation must be refused"),
@@ -4703,7 +4783,85 @@ mod api03g_sync_preflight_tests {
         );
         assert_eq!(primary.hits(), 0, "no request may be sent for a refused admission");
         assert_eq!(backup.fixture().hits(), 0);
-        assert_eq!(generation_rows(&storage), before);
+        assert_eq!(generation_snapshot(&storage), before);
+    }
+
+    /// A pure-primary history carries no cross-endpoint proof, so the relocated
+    /// endpoint is still the same declared space: the preflight must admit it,
+    /// measure the live dimension through the declared backup, and change neither
+    /// the generation row nor any meta byte.
+    #[test]
+    fn pure_primary_history_reaches_the_relocated_endpoint_and_writes_nothing() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(has_proof, "the relocated route carries its own proof");
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        {
+            let writer = FrankenStorage::open(&db_path).expect("create the archive");
+            writer
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+                })
+                .expect("seed a pure-primary historical generation");
+            writer.close().expect("close the writer");
+        }
+        let storage = readonly(&db_path);
+        let before_rows = generation_snapshot(&storage);
+        let before_meta = meta_rows(&storage);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            before_rows.len(),
+            1,
+            "the fixture must hold one generation: {before_rows:?}"
+        );
+
+        let probe = match probe_api_preflight(Some(&storage), &call) {
+            Ok(probe) => probe,
+            Err(error) => {
+                panic!("a pure-primary history must be admitted by the relocated endpoint: {error}")
+            }
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(probe.dimension, 2);
+
+        let calls = call.probe_calls();
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            calls.len(),
+            2,
+            "one primary attempt, then one backup attempt: {calls:?}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[0].profile_id, "primary");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[0].http_status, Some(503));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[1].profile_id, "backup");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[1].http_status, Some(200));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(primary.hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(backup.fixture().hits(), 1);
+
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            generation_snapshot(&storage),
+            before_rows,
+            "a probe may not touch the generation"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            meta_rows(&storage),
+            before_meta,
+            "a probe may not rewrite any meta record"
+        );
     }
 
     /// The risk lead, measured on **one** pair of endpoints: build a generation
@@ -4785,5 +4943,705 @@ mod api03g_sync_preflight_tests {
             "a refused preflight may not send anything, on either endpoint"
         );
         assert_eq!(generation_rows(&storage), before);
+    }
+}
+
+/// T03 (spec C3/C4, AC4): an existing same-declaration API candidate whose
+/// stored fingerprint does not match this run's probe refuses the build
+/// instead of quietly creating a parallel generation beside it.
+///
+/// Every case drives the real [`find_or_create_api_generation`] against a real
+/// `FrankenStorage`. The frozen call is built from a legal loopback profile and
+/// never reaches the network: the fingerprints are supplied directly, so no
+/// probe request is made. Each test uses its own tempdir and owns no process
+/// environment, so the cases are safe under default parallelism.
+#[cfg(all(test, not(windows)))]
+mod api_endpoint_relocation_tests {
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::search::eligibility::ExpectedChunk;
+    use crate::search::model_api::{
+        ApiClient, ApiConfig, EnvCredentialResolver, PrimaryEmbeddingCall,
+        RepresentationDescriptor, ValidatedProfile,
+    };
+    use crate::storage::api::{StorageError, TxMode, params};
+    use crate::storage::api_generation::{create_api_generation, representation_meta_key};
+    use crate::storage::schema::{self, ChunkRow};
+    use crate::storage::sqlite::FrankenStorage;
+    use crate::storage::vector_domain;
+
+    use super::find_or_create_api_generation;
+
+    const DIM: usize = 2;
+    const TS: i64 = 1_770_600_000_000;
+
+    /// Three segments of the same two-wide vector. Two fingerprints built from
+    /// `[1,0]` and `[0,1]` have per-segment cosine 0, far below the 0.999 rule
+    /// the production lookup applies.
+    fn fingerprint(segment: [f32; 2]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(3 * DIM * 4);
+        for _ in 0..3 {
+            out.extend_from_slice(&schema::f32_vector_to_le_blob(&segment));
+        }
+        out
+    }
+
+    fn old_fingerprint() -> Vec<u8> {
+        fingerprint([1.0, 0.0])
+    }
+
+    fn drifted_fingerprint() -> Vec<u8> {
+        fingerprint([0.0, 1.0])
+    }
+
+    fn profile_text() -> String {
+        "version = 1\ndefault_embedding = \"local2\"\n\n\
+         [profiles.local2]\n\
+         kind = \"embedding\"\n\
+         protocol = \"openai-embeddings-v1\"\n\
+         endpoint = \"http://127.0.0.1:9/v1/embeddings\"\n\
+         scope = \"loopback\"\n\
+         model = \"example/synthetic-embed\"\n\
+         model_revision = \"rev-synthetic-1\"\n\
+         normalization = \"l2\"\n\
+         document_prefix = \"DOC>>\"\n\
+         max_batch = 2\n"
+            .to_string()
+    }
+
+    /// A frozen primary built from a legal loopback profile. Nothing here sends
+    /// a request: the lookup under test receives its fingerprint as an
+    /// argument, and the open path only reads stored records.
+    fn frozen_call() -> (PrimaryEmbeddingCall, ValidatedProfile) {
+        let config = ApiConfig::parse_toml(&profile_text()).expect("parse loopback config");
+        let profile = config.profile("local2").expect("profile present").clone();
+        let client = ApiClient::new(config, Box::new(EnvCredentialResolver));
+        let call = PrimaryEmbeddingCall::new(client, profile.clone(), false)
+            .expect("freeze the loopback primary");
+        (call, profile)
+    }
+
+    /// The original service's document vector for `text`: deterministic,
+    /// distinct per text, and inside the unit quantizer's component range.
+    fn original_document_vector(text: &str) -> Vec<f32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        (0..DIM)
+            .map(|index| {
+                let mut hasher = DefaultHasher::new();
+                text.hash(&mut hasher);
+                index.hash(&mut hasher);
+                (1.0 + (hasher.finish() % 1000) as f32 / 1000.0) * 0.5
+            })
+            .collect()
+    }
+
+    /// The same declared model behind a new backend returns each sentinel
+    /// `0.03` normalized units off the stored `[1, 0]`: cosine
+    /// `1 / sqrt(1 + 0.03^2)` = 0.9995503..., inside `[0.999, 0.9999)`.
+    fn approximate_sentinel_vector() -> Vec<f32> {
+        let norm = (1.0f32 + 0.03 * 0.03).sqrt();
+        vec![1.0 / norm, 0.03 / norm]
+    }
+
+    struct Fixture {
+        storage: FrankenStorage,
+        profile: ValidatedProfile,
+        call: PrimaryEmbeddingCall,
+        message_ids: Vec<i64>,
+        conversation_id: i64,
+    }
+
+    impl Fixture {
+        fn new() -> (tempfile::TempDir, Fixture) {
+            Fixture::with_contents(&["first message", "second message", "third message"])
+        }
+
+        fn with_contents(contents: &[&str]) -> (tempfile::TempDir, Fixture) {
+            let dir = tempfile::tempdir().expect("create scratch dir");
+            let storage =
+                FrankenStorage::open(&dir.path().join("agent_search.db")).expect("open storage");
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "claude_code".into(),
+                    name: "fixture".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .expect("ensure agent");
+            let messages: Vec<Message> = contents
+                .iter()
+                .enumerate()
+                .map(|(idx, text)| Message {
+                    excluded: None,
+                    id: None,
+                    idx: idx as i64,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(TS + idx as i64),
+                    content: (*text).into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                })
+                .collect();
+            storage
+                .insert_conversation_tree(
+                    agent,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "claude_code".into(),
+                        workspace: None,
+                        external_id: Some("t03-relocation".into()),
+                        title: Some("t03 relocation".into()),
+                        source_path: "/fixtures/t03-relocation.jsonl".into(),
+                        started_at: Some(TS),
+                        ended_at: Some(TS + 2),
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages,
+                        source_id: "local".into(),
+                        origin_host: None,
+                    },
+                )
+                .expect("insert fixture conversation");
+            let message_ids = storage
+                .raw()
+                .query_all_map("SELECT id FROM messages ORDER BY id", &[], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("read message ids");
+            // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+            assert_eq!(
+                message_ids.len(),
+                contents.len(),
+                "fixture must carry one message per requested content"
+            );
+            let conversation_id = storage
+                .raw()
+                .query_row_map("SELECT MIN(conversation_id) FROM messages", &[], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("read conversation id");
+            let (call, profile) = frozen_call();
+            (
+                dir,
+                Fixture {
+                    storage,
+                    profile,
+                    call,
+                    message_ids,
+                    conversation_id,
+                },
+            )
+        }
+
+        fn expected(&self) -> Vec<ExpectedChunk> {
+            self.message_ids
+                .iter()
+                .map(|message_id| ExpectedChunk {
+                    message_id: *message_id,
+                    conversation_id: self.conversation_id,
+                    chunk_idx: 0,
+                    byte_start: 0,
+                    byte_end: 1,
+                    content_hash: format!("h{message_id}"),
+                })
+                .collect()
+        }
+
+        fn create_generation(&self, fingerprint: &[u8]) -> i64 {
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    create_api_generation(tx, &self.profile, DIM as u64, fingerprint, TS)
+                        .map_err(StorageError::from)
+                })
+                .expect("create api generation")
+        }
+
+        fn set_status(&self, generation_id: i64, active: bool) {
+            let (is_active, audit_status) = if active {
+                (1i64, "passed")
+            } else {
+                (0i64, "pending")
+            };
+            self.storage
+                .raw()
+                .execute(
+                    "UPDATE embedding_generations SET is_active = ?1, audit_status = ?2 WHERE id = ?3",
+                    &params![is_active, audit_status, generation_id],
+                )
+                .expect("set generation status");
+        }
+
+        /// Give `generation_id` the non-empty legacy state the ticket asks for:
+        /// three chunk rows, their three `vec0` rows and three holes.
+        fn seed_rows(&self, generation_id: i64) {
+            let conversation_id = self.conversation_id;
+            let message_ids = self.message_ids.clone();
+            let chunk_ids = self
+                .storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let mut ids = Vec::new();
+                    for message_id in &message_ids {
+                        ids.push(schema::insert_chunk_row_in_tx(
+                            tx,
+                            &ChunkRow {
+                                generation_id,
+                                message_id: *message_id,
+                                conversation_id,
+                                chunk_idx: 0,
+                                byte_start: 0,
+                                byte_end: 1,
+                                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Small synthetic fixture.
+                                content_hash: format!("h{message_id}"),
+                                embedding: vec![1.0, 0.0],
+                                norm: 1.0,
+                                created_at_ms: TS,
+                            },
+                        )?);
+                    }
+                    Ok::<Vec<i64>, StorageError>(ids)
+                })
+                .expect("seed chunk rows");
+            vector_domain::create_vec0_table_for_generation(
+                self.storage.raw(),
+                generation_id,
+                DIM as i64,
+            )
+            .expect("create vec0 table");
+            let blob = schema::f32_vector_to_le_blob(&[1.0, 0.0]);
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let rows: Vec<(i64, &[u8])> =
+                        chunk_ids.iter().map(|id| (*id, blob.as_slice())).collect();
+                    vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &rows)
+                })
+                .expect("seed vec0 rows");
+            let holes: Vec<(i64, u32)> = message_ids.iter().map(|id| (*id, 0u32)).collect();
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    schema::seed_chunk_holes(tx, generation_id, &holes, TS, "generation_seed")
+                })
+                .expect("seed chunk holes");
+        }
+
+        fn run(&self, fingerprint: &[u8]) -> anyhow::Result<(i64, bool, u64)> {
+            let descriptor = RepresentationDescriptor::from_profile(&self.profile, DIM as u64)
+                .expect("descriptor");
+            find_or_create_api_generation(
+                self.storage.raw(),
+                &self.call,
+                DIM,
+                descriptor.canonicalize_version(),
+                descriptor.chunking_version(),
+                fingerprint,
+                TS,
+                &self.expected(),
+            )
+        }
+
+        /// Replace the synthetic one-byte chunk rows with the generation's real
+        /// expected chunks: real spans, real content hashes, embeddings from
+        /// [`original_document_vector`], and matching vec0 + int8 rows. Returns
+        /// the number of chunks seeded.
+        fn seed_real_chunks(&self, generation_id: i64) -> usize {
+            use crate::search::eligibility::{expected_chunks, normalized_for_chunks};
+
+            let messages: Vec<(i64, i64, String, String)> = self
+                .storage
+                .raw()
+                .query_all_map(
+                    "SELECT id, conversation_id, role, content FROM messages ORDER BY id",
+                    &[],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                        ))
+                    },
+                )
+                .expect("read fixture messages");
+            let mut planned = Vec::new();
+            for (message_id, conversation_id, role, content) in messages {
+                let normalized = normalized_for_chunks(&content);
+                for chunk in expected_chunks(message_id, conversation_id, &role, &content) {
+                    let embedding =
+                        original_document_vector(&normalized[chunk.byte_start..chunk.byte_end]);
+                    planned.push(ChunkRow {
+                        generation_id,
+                        message_id,
+                        conversation_id,
+                        chunk_idx: chunk.chunk_idx,
+                        byte_start: chunk.byte_start,
+                        byte_end: chunk.byte_end,
+                        content_hash: chunk.content_hash,
+                        norm: schema::l2_norm(&embedding) as f32,
+                        embedding,
+                        created_at_ms: TS,
+                    });
+                }
+            }
+            let chunk_ids = self
+                .storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let mut ids = Vec::new();
+                    for row in &planned {
+                        ids.push(schema::insert_chunk_row_in_tx(tx, row)?);
+                    }
+                    Ok::<Vec<i64>, StorageError>(ids)
+                })
+                .expect("seed real chunk rows");
+            vector_domain::create_vec0_table_for_generation(
+                self.storage.raw(),
+                generation_id,
+                DIM as i64,
+            )
+            .expect("create vec0 table");
+            let blobs: Vec<Vec<u8>> = planned
+                .iter()
+                .map(|row| schema::f32_vector_to_le_blob(&row.embedding))
+                .collect();
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let rows: Vec<(i64, &[u8])> = chunk_ids
+                        .iter()
+                        .zip(blobs.iter())
+                        .map(|(id, blob)| (*id, blob.as_slice()))
+                        .collect();
+                    vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &rows)
+                })
+                .expect("seed vec0 rows");
+            planned.len()
+        }
+    }
+
+    /// The complete persisted state a refusal must leave untouched: whole rows,
+    /// not counts alone, so deleting and re-inserting the same number of rows
+    /// cannot pass.
+    #[derive(Debug, PartialEq, Eq)]
+    struct State {
+        generations: String,
+        chunks: String,
+        holes: String,
+        vec0: Vec<(i64, i64)>,
+    }
+
+    fn state(storage: &FrankenStorage, generation_ids: &[i64]) -> State {
+        let rows = |sql: &str| {
+            storage
+                .raw()
+                .query_all_map(sql, &[], |row| row.get_typed::<String>(0))
+                .expect("read state rows")
+                .join(";")
+        };
+        State {
+            generations: rows(
+                "SELECT id || '|' || embedder_id || '|' || dim || '|' || is_active || '|' \
+                 || audit_status || '|' || canonicalize_version || '|' \
+                 || chunking_policy_version || '|' || hex(fingerprint) || '|' || vector_revision \
+                 FROM embedding_generations ORDER BY id",
+            ),
+            chunks: rows(
+                "SELECT chunk_id || '|' || generation_id || '|' || message_id || '|' \
+                 || chunk_idx || '|' || content_hash || '|' || hex(embedding) \
+                 FROM message_chunks ORDER BY chunk_id",
+            ),
+            holes: rows(
+                "SELECT generation_id || '|' || message_id || '|' || chunk_idx || '|' || reason \
+                 FROM chunk_holes ORDER BY generation_id, message_id, chunk_idx",
+            ),
+            vec0: generation_ids
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        vector_domain::count_vec0_rows_for_generation(storage.raw(), *id)
+                            .expect("count vec0 rows"),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_non_empty(legacy: &State) {
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            !legacy.generations.is_empty(),
+            "fixture must have a generation row"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(!legacy.chunks.is_empty(), "fixture must have chunk rows");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(!legacy.holes.is_empty(), "fixture must have hole rows");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            legacy.vec0.iter().all(|(_, rows)| *rows == 3),
+            "fixture must have three vec0 rows per generation: {legacy:?}"
+        );
+    }
+
+    fn refusal(error: anyhow::Error) {
+        let message = format!("{error:#}");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            message.contains("fingerprint"),
+            "the refusal must name the fingerprint rule: {message}"
+        );
+    }
+
+    #[test]
+    fn an_active_candidate_with_a_drifted_fingerprint_is_refused() {
+        let (_dir, fixture) = Fixture::new();
+        let existing = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(existing, true);
+        fixture.seed_rows(existing);
+        let before = state(&fixture.storage, &[existing]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&drifted_fingerprint())
+            .expect_err("a drifted fingerprint on the only active candidate must be refused");
+        refusal(error);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            state(&fixture.storage, &[existing]),
+            before,
+            "a refusal must not change generations, chunks, holes or vec0 rows"
+        );
+    }
+
+    #[test]
+    fn a_pending_candidate_with_a_drifted_fingerprint_is_refused() {
+        let (_dir, fixture) = Fixture::new();
+        let existing = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(existing, false);
+        fixture.seed_rows(existing);
+        let before = state(&fixture.storage, &[existing]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&drifted_fingerprint())
+            .expect_err("a drifted fingerprint on the only pending candidate must be refused");
+        refusal(error);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(state(&fixture.storage, &[existing]), before);
+    }
+
+    #[test]
+    fn drifted_active_and_pending_candidates_are_both_refused() {
+        let (_dir, fixture) = Fixture::new();
+        let active = fixture.create_generation(&drifted_fingerprint());
+        fixture.set_status(active, true);
+        fixture.seed_rows(active);
+        let pending = fixture.create_generation(&drifted_fingerprint());
+        fixture.set_status(pending, false);
+        fixture.seed_rows(pending);
+        let before = state(&fixture.storage, &[active, pending]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&old_fingerprint())
+            .expect_err("one drifted candidate must not excuse another drifted one");
+        refusal(error);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            state(&fixture.storage, &[active, pending]),
+            before,
+            "no candidate may be rewritten when every openable one drifts"
+        );
+    }
+
+    #[test]
+    fn a_drifted_active_candidate_still_reuses_a_matching_pending_generation() {
+        let (_dir, fixture) = Fixture::new();
+        let active = fixture.create_generation(&drifted_fingerprint());
+        fixture.set_status(active, true);
+        fixture.seed_rows(active);
+        let pending = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(pending, false);
+        fixture.seed_rows(pending);
+        let before = state(&fixture.storage, &[active, pending]);
+        assert_non_empty(&before);
+
+        let (generation_id, reused, holes) = fixture
+            .run(&old_fingerprint())
+            .expect("a matching pending candidate must still be reused");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            generation_id, pending,
+            "the matching pending generation is the answer"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(reused, "a reused generation must report itself as reused");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(holes, 0, "reuse seeds no new holes");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            state(&fixture.storage, &[active, pending]),
+            before,
+            "reuse writes nothing"
+        );
+    }
+
+    #[test]
+    fn no_candidate_still_creates_one_generation_and_seeds_holes() {
+        let (_dir, fixture) = Fixture::new();
+        let (generation_id, reused, holes) = fixture
+            .run(&old_fingerprint())
+            .expect("an empty archive still creates its first generation");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(!reused, "a created generation is not a reuse");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(holes, 3, "three expected chunks seed three holes");
+        let count = |sql: &str| {
+            fixture
+                .storage
+                .raw()
+                .query_row_map(sql, &[], |row| row.get_typed::<i64>(0))
+                .expect("count rows")
+        };
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            count("SELECT COUNT(*) FROM message_chunks"),
+            0,
+            "creation writes no chunk rows before the drain"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = {generation_id}"
+            )),
+            3,
+            "one hole per expected chunk, all on the created generation"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(count("SELECT COUNT(*) FROM embedding_generations"), 1);
+    }
+
+    #[test]
+    fn a_broken_candidate_record_is_refused_without_creating_a_generation() {
+        let (_dir, fixture) = Fixture::new();
+        let existing = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(existing, true);
+        fixture.seed_rows(existing);
+        // Remove the representation record the identity depends on. The
+        // fingerprint check runs only after the record guard, so this refusal
+        // must carry the record's own classification and never fall through to
+        // the fingerprint rule or to a replacement generation.
+        fixture
+            .storage
+            .raw()
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                &params![representation_meta_key(existing)],
+            )
+            .expect("delete representation record");
+        let before = state(&fixture.storage, &[existing]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&drifted_fingerprint())
+            .expect_err("a candidate whose record is gone must be refused");
+        let message = format!("{error:#}");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            message.contains("InvalidRecord"),
+            "the record guard's own classification must survive: {message}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            !message.contains("fingerprint"),
+            "the fingerprint rule must not be reached past a broken record: {message}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            state(&fixture.storage, &[existing]),
+            before,
+            "no generation, chunk, hole or vec0 row may be written"
+        );
+    }
+
+    /// AC3's audit half: a real generation with real chunks, audited by an
+    /// embedder whose sentinels come back approximately, must report
+    /// `fingerprint_ok = true` -- and that verdict must come from ⑪ itself,
+    /// not from the rest of the audit happening to be clean.
+    #[test]
+    fn api_relocation_audit_accepts_approximate_fingerprint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::search::frankensearch_types::cosine_similarity;
+        use crate::search::generation_fingerprint::FINGERPRINT_SENTINELS;
+
+        let (_dir, fixture) = Fixture::with_contents(&[
+            "first message has plenty of real content to embed and chunk",
+            "second message has plenty of real content to embed and chunk",
+        ]);
+        let generation_id = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(generation_id, true);
+        let chunks = fixture.seed_real_chunks(generation_id);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(chunks, 2, "the fixture must carry two real chunks");
+
+        let sentinel_cosine = cosine_similarity(&[1.0, 0.0], &approximate_sentinel_vector());
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            (0.999..0.9999).contains(&sentinel_cosine),
+            "the fixture cosine {sentinel_cosine} must sit strictly between 0.999 and 0.9999"
+        );
+
+        let sentinel_calls = AtomicUsize::new(0);
+        let embed = |texts: &[&str]| -> std::result::Result<Vec<Vec<f32>>, String> {
+            if texts.len() == FINGERPRINT_SENTINELS.len()
+                && texts
+                    .iter()
+                    .zip(FINGERPRINT_SENTINELS.iter())
+                    .all(|(left, right)| left == right)
+            {
+                sentinel_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(FINGERPRINT_SENTINELS
+                    .iter()
+                    .map(|_| approximate_sentinel_vector())
+                    .collect());
+            }
+            Ok(texts
+                .iter()
+                .map(|text| original_document_vector(text))
+                .collect())
+        };
+
+        let report = super::run_activation_audit(
+            &fixture.storage,
+            generation_id,
+            10,
+            fixture.message_ids.first().copied(),
+            Some(&embed),
+            10,
+            1,
+        )
+        .expect("the activation audit runs");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            report.fingerprint_ok,
+            "⑪ must accept an approximate cross-backend fingerprint inside [0.999, 0.9999): {report:?}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            sentinel_calls.load(Ordering::SeqCst) > 0,
+            "⑪ must really re-embed the sentinels; a clean report without that call proves nothing"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert!(
+            report.passed,
+            "the real-chunk generation must be otherwise clean so ⑪ is judged on its own: {report:?}"
+        );
     }
 }

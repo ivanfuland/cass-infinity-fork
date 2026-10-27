@@ -798,11 +798,11 @@ mod page_writer_tests {
     #[cfg(not(windows))]
     #[test]
     fn historical_producer_missing_from_proof_blocks_probe_before_any_http() {
-        use super::super::compatibility_bundle::tests::{fallback_fixture, migration_fixture};
+        use super::super::compatibility_bundle::tests::fallback_fixture;
         use super::super::test_support::TlsFixture;
-        use crate::storage::api::{TxMode, StorageError};
-        use crate::storage::api_generation::create_api_generation;
         use crate::indexer::db_vector_catchup::probe_api_backfill;
+        use crate::storage::api::{StorageError, TxMode};
+        use crate::storage::api_generation::create_api_generation_with_producers;
         let primary = HttpFixture::start(vec![Reply::status(503)]);
         let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
         let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
@@ -813,10 +813,39 @@ mod page_writer_tests {
         call.route.proof = Some(std::sync::Arc::new(proof));
         let root = tempfile::tempdir().unwrap();
         let storage = crate::storage::sqlite::FrankenStorage::open(&root.path().join("db.sqlite")).unwrap();
-        let (_, old) = migration_fixture(&[1,2], 1, None);
-        storage.raw().with_tx(TxMode::Immediate, |tx| create_api_generation(tx, &old[0], 2, &[1;24], 1)
-            .map_err(StorageError::from)).unwrap();
-        let error = probe_api_backfill(&storage, &call).err().expect("uncovered historical endpoint");
+        // A real proof-backed history: the generation was built through the older
+        // backup under an older proof that declared that fallback. Both its anchor
+        // and its producer stay outside this route's proof.
+        let (older_config, older_proof) = fallback_fixture(
+            "http://127.0.0.1:1/embedding",
+            "https://example.invalid/embedding",
+        );
+        let older_primary = older_config
+            .profile("primary")
+            .expect("older primary")
+            .clone();
+        let older_backup = older_config
+            .profile("backup")
+            .expect("older backup")
+            .clone();
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                create_api_generation_with_producers(
+                    tx,
+                    &older_primary,
+                    2,
+                    &[1; 24],
+                    1,
+                    std::slice::from_ref(&older_backup),
+                    &older_proof,
+                )
+                .map_err(StorageError::from)
+            })
+            .unwrap();
+        let error = probe_api_backfill(&storage, &call)
+            .err()
+            .expect("uncovered historical endpoint");
         assert!(error.to_string().contains("CompatibilityRequired"));
         assert!(call.probe_calls().is_empty());
         assert_eq!(primary.hits(), 0);
@@ -831,6 +860,127 @@ mod page_writer_tests {
         assert_eq!(primary.hits(), 1);
         assert_eq!(backup.fixture().hits(), 1);
         assert_eq!(call.embed_documents(&["stale state"]).unwrap_err(), PrimaryEmbedFailure::ProbeMissing);
+    }
+
+    /// Every column of every generation row and every meta key/value pair, read
+    /// as stored: `SELECT *` keeps the nullable `activated_at` and the
+    /// `fingerprint` BLOB exact, so no changed field can hide behind a projection.
+    fn archive_snapshot(
+        storage: &crate::storage::sqlite::FrankenStorage,
+    ) -> (
+        Vec<Vec<crate::storage::api::Value>>,
+        Vec<Vec<crate::storage::api::Value>>,
+    ) {
+        let columns = storage
+            .raw()
+            .query_all_map("PRAGMA table_info(embedding_generations)", &[], |_row| {
+                Ok(())
+            })
+            .expect("read the generation column count")
+            .len();
+        let generations = storage
+            .raw()
+            .query_all_map(
+                "SELECT * FROM embedding_generations ORDER BY id",
+                &[],
+                |row| {
+                    (0..columns)
+                        .map(|index| row.get_value(index))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .expect("read generations");
+        let meta = storage
+            .raw()
+            .query_all_map("SELECT key, value FROM meta ORDER BY key", &[], |row| {
+                (0..2)
+                    .map(|index| row.get_value(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read meta");
+        (generations, meta)
+    }
+
+    /// A pure-primary history declares the same space as the relocated endpoint,
+    /// so the backfill probe must be admitted through that endpoint and leave
+    /// every recorded generation and meta byte exactly as it was.
+    #[cfg(not(windows))]
+    #[test]
+    fn pure_primary_history_is_admitted_by_the_relocated_endpoint() {
+        use super::super::compatibility_bundle::tests::{fallback_fixture, migration_fixture};
+        use super::super::test_support::TlsFixture;
+        use crate::indexer::db_vector_catchup::probe_api_backfill;
+        use crate::storage::api::{StorageError, TxMode};
+        use crate::storage::api_generation::create_api_generation;
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (config, proof) = fallback_fixture(&primary.base(), &backup.base());
+        let profile = config.profile("primary").unwrap().clone();
+        let client = ApiClient::new_with_test_root(
+            config,
+            Box::new(super::super::EnvCredentialResolver),
+            backup.ca_pem().to_vec(),
+        );
+        let mut call = PrimaryEmbeddingCall::new(client, profile, true).unwrap();
+        call.route.proof_sha256 = Some(proof.digest().into());
+        call.route.proof = Some(std::sync::Arc::new(proof));
+        let root = tempfile::tempdir().unwrap();
+        let storage =
+            crate::storage::sqlite::FrankenStorage::open(&root.path().join("db.sqlite")).unwrap();
+        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        storage
+            .raw()
+            .with_tx(TxMode::Immediate, |tx| {
+                create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+            })
+            .unwrap();
+        let before = archive_snapshot(&storage);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            before.0.len(),
+            1,
+            "the fixture must hold one generation: {:?}",
+            before.0
+        );
+        let probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| {
+            panic!("a pure-primary history must be admitted by the relocated endpoint: {error}")
+        });
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(probe.dimension, 2);
+        let calls = call.probe_calls();
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            calls.len(),
+            2,
+            "one primary attempt, then one backup attempt: {calls:?}"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[0].profile_id, "primary");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[0].http_status, Some(503));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[1].profile_id, "backup");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(calls[1].http_status, Some(200));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(primary.hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(backup.fixture().hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            call.probe_writers()
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backup"],
+            "the admitted probe must be produced by the declared backup"
+        );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
+        assert_eq!(
+            archive_snapshot(&storage),
+            before,
+            "a probe may not change any recorded byte"
+        );
     }
 
     #[test]
