@@ -1449,7 +1449,7 @@ fn an_identity_match_with_a_bad_record_is_refused_despite_a_fingerprint_mismatch
 }
 
 #[test]
-fn an_identity_match_with_a_drifted_fingerprint_and_a_sound_record_builds_a_parallel_generation() {
+fn an_identity_match_with_a_drifted_fingerprint_and_a_sound_record_is_refused() {
     let (_dir, data_dir) = scratch();
     let storage = build_db(
         &data_dir,
@@ -1481,17 +1481,40 @@ fn an_identity_match_with_a_drifted_fingerprint_and_a_sound_record_builds_a_para
     let first = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
     let first_generation = first["generation_id"].as_i64().expect("generation id");
 
-    // The record stays sound; only the served weights changed.
+    // The record stays sound; only the served weights changed. A candidate
+    // that carries this exact API identity but not this probe's fingerprint
+    // is refused instead of being papered over by a silently built parallel
+    // generation.
     drift.store(11, Ordering::SeqCst);
-    let second = assert_success(&run_backfill(&data_dir, &config_path, Some("local8"), &[]));
-    let second_generation = second["generation_id"].as_i64().expect("generation id");
-    assert_ne!(second_generation, first_generation);
-    assert_eq!(second["reused_existing_generation"], false);
-    assert_eq!(generation_count(&storage), 2);
+    let output = run_backfill(&data_dir, &config_path, Some("local8"), &[]);
+    assert!(
+        !output.status.success(),
+        "a drifted fingerprint on a sound candidate must be refused"
+    );
+    assert_eq!(output.status.code(), Some(5));
+    let envelope = error_envelope(&output);
+    assert_eq!(envelope["error"]["code"], 5);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("fingerprint")),
+        "the refusal must name the fingerprint rule: {envelope}"
+    );
+    assert_eq!(
+        generation_count(&storage),
+        1,
+        "a refused drift must not build a parallel generation"
+    );
     let profile = parse_profile(&text, "local8");
-    assert!(profile_reopens(&storage, first_generation, &profile));
-    assert!(profile_reopens(&storage, second_generation, &profile));
-    assert_eq!(active_generation(&storage), Some(second_generation));
+    assert!(
+        profile_reopens(&storage, first_generation, &profile),
+        "the original generation must stay intact"
+    );
+    assert_eq!(
+        active_generation(&storage),
+        Some(first_generation),
+        "the original generation must stay active"
+    );
 }
 
 #[test]

@@ -1865,12 +1865,16 @@ impl CatchupEngine for ApiPrimaryCatchupEngine<'_> {
 /// The lookup and the verification share one transaction with the create, so a
 /// candidate can never be reused without its two meta records and its row having
 /// been reopened against the running profile in the same snapshot. A row that
-/// carries this exact API identity but whose records are missing, malformed or
-/// described by a moved endpoint is refused outright rather than papered over by
-/// quietly creating a replacement — the successor's admission is what clears
-/// that, not this ticket. A legacy (non-API) row is never an API candidate, so a
-/// previous Infinity generation keeps its active pointer while a new API
-/// candidate is built beside it.
+/// carries this exact API identity but whose records are missing or malformed is
+/// refused outright rather than papered over by quietly creating a replacement.
+/// A sound candidate whose stored fingerprint does not match this run's probe is
+/// refused the same way: its vectors already belong to a set of served weights
+/// this run would not reproduce, so the operator either fixes the embedding
+/// service or changes the `model`/`model_revision` declaration -- and that
+/// declaration change is what legitimately selects another generation. Only an
+/// archive with no candidate at all creates one. A legacy (non-API) row is never
+/// an API candidate, so a previous Infinity generation keeps its active pointer
+/// while a new API candidate is built beside it.
 const ACTIVE_CANDIDATE_SQL: &str = "SELECT id, fingerprint FROM embedding_generations \
          WHERE embedder_id = ?1 AND dim = ?2 AND canonicalize_version = ?3 \
            AND chunking_policy_version = ?4 AND is_active = 1 AND audit_status != 'failed' \
@@ -1898,6 +1902,7 @@ fn find_or_create_api_generation(
         .map_err(|_| anyhow!("api dimension {dimension} does not fit in i64"))?;
 
     conn.with_tx(TxMode::Immediate, |tx| {
+        let mut openable_candidate: Option<i64> = None;
         for sql in [ACTIVE_CANDIDATE_SQL, PENDING_CANDIDATE_SQL] {
             let candidate = tx.query_opt_map(
                 sql,
@@ -1919,14 +1924,27 @@ fn find_or_create_api_generation(
             // — never bypassed by a fingerprint mismatch that would quietly
             // build a replacement beside it.
             call.route().open_generation(tx, candidate_id)?;
+            openable_candidate = Some(candidate_id);
             if fingerprint_matches(&stored_fingerprint, fingerprint, dimension) {
                 return Ok((candidate_id, true, 0u64));
             }
-            // The record is sound but the served weights differ from this run's
-            // probe, so the existing fingerprint rule says build a new
-            // generation beside this one rather than reuse vectors that belong
-            // to another fingerprint. Keep looking: a pending candidate from the
-            // current service instance may still match.
+            // The record is sound, so the stored fingerprint is the stored
+            // space's own claim, and this run's probe does not belong to it.
+            // Keep looking -- a pending candidate from the current service
+            // instance may still match -- and refuse below if none does.
+        }
+
+        if let Some(candidate_id) = openable_candidate {
+            // Building a second generation here would silently split one
+            // declared space across two sets of served weights.
+            return Err(StorageError::Other {
+                code: None,
+                detail: format!(
+                    "fingerprint mismatch: generation {candidate_id} declares this API space but its \
+                     stored fingerprint does not match this run's probe; check the embedding service \
+                     or change the declared model/model_revision"
+                ),
+            });
         }
 
         let producers = call.probe_writers();
@@ -4785,5 +4803,499 @@ mod api03g_sync_preflight_tests {
             "a refused preflight may not send anything, on either endpoint"
         );
         assert_eq!(generation_rows(&storage), before);
+    }
+}
+
+/// T03 (spec C3/C4, AC4): an existing same-declaration API candidate whose
+/// stored fingerprint does not match this run's probe refuses the build
+/// instead of quietly creating a parallel generation beside it.
+///
+/// Every case drives the real [`find_or_create_api_generation`] against a real
+/// `FrankenStorage`. The frozen call is built from a legal loopback profile and
+/// never reaches the network: the fingerprints are supplied directly, so no
+/// probe request is made. Each test uses its own tempdir and owns no process
+/// environment, so the cases are safe under default parallelism.
+#[cfg(all(test, not(windows)))]
+mod api_endpoint_relocation_tests {
+    use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+    use crate::search::eligibility::ExpectedChunk;
+    use crate::search::model_api::{
+        ApiClient, ApiConfig, EnvCredentialResolver, PrimaryEmbeddingCall, RepresentationDescriptor,
+        ValidatedProfile,
+    };
+    use crate::storage::api::{StorageError, TxMode, params};
+    use crate::storage::api_generation::{create_api_generation, representation_meta_key};
+    use crate::storage::schema::{self, ChunkRow};
+    use crate::storage::sqlite::FrankenStorage;
+    use crate::storage::vector_domain;
+
+    use super::find_or_create_api_generation;
+
+    const DIM: usize = 2;
+    const TS: i64 = 1_770_600_000_000;
+
+    /// Three segments of the same two-wide vector. Two fingerprints built from
+    /// `[1,0]` and `[0,1]` have per-segment cosine 0, far below the 0.999 rule
+    /// the production lookup applies.
+    fn fingerprint(segment: [f32; 2]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(3 * DIM * 4);
+        for _ in 0..3 {
+            out.extend_from_slice(&schema::f32_vector_to_le_blob(&segment));
+        }
+        out
+    }
+
+    fn old_fingerprint() -> Vec<u8> {
+        fingerprint([1.0, 0.0])
+    }
+
+    fn drifted_fingerprint() -> Vec<u8> {
+        fingerprint([0.0, 1.0])
+    }
+
+    fn profile_text() -> String {
+        "version = 1\ndefault_embedding = \"local2\"\n\n\
+         [profiles.local2]\n\
+         kind = \"embedding\"\n\
+         protocol = \"openai-embeddings-v1\"\n\
+         endpoint = \"http://127.0.0.1:9/v1/embeddings\"\n\
+         scope = \"loopback\"\n\
+         model = \"example/synthetic-embed\"\n\
+         model_revision = \"rev-synthetic-1\"\n\
+         normalization = \"l2\"\n\
+         document_prefix = \"DOC>>\"\n\
+         max_batch = 2\n"
+            .to_string()
+    }
+
+    /// A frozen primary built from a legal loopback profile. Nothing here sends
+    /// a request: the lookup under test receives its fingerprint as an
+    /// argument, and the open path only reads stored records.
+    fn frozen_call() -> (PrimaryEmbeddingCall, ValidatedProfile) {
+        let config = ApiConfig::parse_toml(&profile_text()).expect("parse loopback config");
+        let profile = config.profile("local2").expect("profile present").clone();
+        let client = ApiClient::new(config, Box::new(EnvCredentialResolver));
+        let call = PrimaryEmbeddingCall::new(client, profile.clone(), false)
+            .expect("freeze the loopback primary");
+        (call, profile)
+    }
+
+    struct Fixture {
+        storage: FrankenStorage,
+        profile: ValidatedProfile,
+        call: PrimaryEmbeddingCall,
+        message_ids: Vec<i64>,
+        conversation_id: i64,
+    }
+
+    impl Fixture {
+        fn new() -> (tempfile::TempDir, Fixture) {
+            let dir = tempfile::tempdir().expect("create scratch dir");
+            let storage =
+                FrankenStorage::open(&dir.path().join("agent_search.db")).expect("open storage");
+            let agent = storage
+                .ensure_agent(&Agent {
+                    id: None,
+                    slug: "claude_code".into(),
+                    name: "fixture".into(),
+                    version: None,
+                    kind: AgentKind::Cli,
+                })
+                .expect("ensure agent");
+            let messages: Vec<Message> = ["first message", "second message", "third message"]
+                .iter()
+                .enumerate()
+                .map(|(idx, text)| Message {
+                    excluded: None,
+                    id: None,
+                    idx: idx as i64,
+                    role: MessageRole::User,
+                    author: None,
+                    created_at: Some(TS + idx as i64),
+                    content: (*text).into(),
+                    extra_json: serde_json::Value::Null,
+                    snippets: vec![],
+                })
+                .collect();
+            storage
+                .insert_conversation_tree(
+                    agent,
+                    None,
+                    &Conversation {
+                        id: None,
+                        agent_slug: "claude_code".into(),
+                        workspace: None,
+                        external_id: Some("t03-relocation".into()),
+                        title: Some("t03 relocation".into()),
+                        source_path: "/fixtures/t03-relocation.jsonl".into(),
+                        started_at: Some(TS),
+                        ended_at: Some(TS + 2),
+                        approx_tokens: None,
+                        metadata_json: serde_json::Value::Null,
+                        messages,
+                        source_id: "local".into(),
+                        origin_host: None,
+                    },
+                )
+                .expect("insert fixture conversation");
+            let message_ids = storage
+                .raw()
+                .query_all_map("SELECT id FROM messages ORDER BY id", &[], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("read message ids");
+            assert_eq!(message_ids.len(), 3, "fixture must carry three messages");
+            let conversation_id = storage
+                .raw()
+                .query_row_map("SELECT MIN(conversation_id) FROM messages", &[], |row| {
+                    row.get_typed::<i64>(0)
+                })
+                .expect("read conversation id");
+            let (call, profile) = frozen_call();
+            (
+                dir,
+                Fixture {
+                    storage,
+                    profile,
+                    call,
+                    message_ids,
+                    conversation_id,
+                },
+            )
+        }
+
+        fn expected(&self) -> Vec<ExpectedChunk> {
+            self.message_ids
+                .iter()
+                .map(|message_id| ExpectedChunk {
+                    message_id: *message_id,
+                    conversation_id: self.conversation_id,
+                    chunk_idx: 0,
+                    byte_start: 0,
+                    byte_end: 1,
+                    content_hash: format!("h{message_id}"),
+                })
+                .collect()
+        }
+
+        fn create_generation(&self, fingerprint: &[u8]) -> i64 {
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    create_api_generation(tx, &self.profile, DIM as u64, fingerprint, TS)
+                        .map_err(StorageError::from)
+                })
+                .expect("create api generation")
+        }
+
+        fn set_status(&self, generation_id: i64, active: bool) {
+            let (is_active, audit_status) = if active {
+                (1i64, "passed")
+            } else {
+                (0i64, "pending")
+            };
+            self.storage
+                .raw()
+                .execute(
+                    "UPDATE embedding_generations SET is_active = ?1, audit_status = ?2 WHERE id = ?3",
+                    &params![is_active, audit_status, generation_id],
+                )
+                .expect("set generation status");
+        }
+
+        /// Give `generation_id` the non-empty legacy state the ticket asks for:
+        /// three chunk rows, their three `vec0` rows and three holes.
+        fn seed_rows(&self, generation_id: i64) {
+            let conversation_id = self.conversation_id;
+            let message_ids = self.message_ids.clone();
+            let chunk_ids = self
+                .storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let mut ids = Vec::new();
+                    for message_id in &message_ids {
+                        ids.push(schema::insert_chunk_row_in_tx(
+                            tx,
+                            &ChunkRow {
+                                generation_id,
+                                message_id: *message_id,
+                                conversation_id,
+                                chunk_idx: 0,
+                                byte_start: 0,
+                                byte_end: 1,
+                                content_hash: format!("h{message_id}"),
+                                embedding: vec![1.0, 0.0],
+                                norm: 1.0,
+                                created_at_ms: TS,
+                            },
+                        )?);
+                    }
+                    Ok::<Vec<i64>, StorageError>(ids)
+                })
+                .expect("seed chunk rows");
+            vector_domain::create_vec0_table_for_generation(
+                self.storage.raw(),
+                generation_id,
+                DIM as i64,
+            )
+            .expect("create vec0 table");
+            let blob = schema::f32_vector_to_le_blob(&[1.0, 0.0]);
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    let rows: Vec<(i64, &[u8])> =
+                        chunk_ids.iter().map(|id| (*id, blob.as_slice())).collect();
+                    vector_domain::insert_vec0_rows_in_tx(tx, generation_id, &rows)
+                })
+                .expect("seed vec0 rows");
+            let holes: Vec<(i64, u32)> = message_ids.iter().map(|id| (*id, 0u32)).collect();
+            self.storage
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    schema::seed_chunk_holes(tx, generation_id, &holes, TS, "generation_seed")
+                })
+                .expect("seed chunk holes");
+        }
+
+        fn run(&self, fingerprint: &[u8]) -> anyhow::Result<(i64, bool, u64)> {
+            let descriptor = RepresentationDescriptor::from_profile(&self.profile, DIM as u64)
+                .expect("descriptor");
+            find_or_create_api_generation(
+                self.storage.raw(),
+                &self.call,
+                DIM,
+                descriptor.canonicalize_version(),
+                descriptor.chunking_version(),
+                fingerprint,
+                TS,
+                &self.expected(),
+            )
+        }
+    }
+
+    /// The complete persisted state a refusal must leave untouched: whole rows,
+    /// not counts alone, so deleting and re-inserting the same number of rows
+    /// cannot pass.
+    #[derive(Debug, PartialEq, Eq)]
+    struct State {
+        generations: String,
+        chunks: String,
+        holes: String,
+        vec0: Vec<(i64, i64)>,
+    }
+
+    fn state(storage: &FrankenStorage, generation_ids: &[i64]) -> State {
+        let rows = |sql: &str| {
+            storage
+                .raw()
+                .query_all_map(sql, &[], |row| row.get_typed::<String>(0))
+                .expect("read state rows")
+                .join(";")
+        };
+        State {
+            generations: rows(
+                "SELECT id || '|' || embedder_id || '|' || dim || '|' || is_active || '|' \
+                 || audit_status || '|' || canonicalize_version || '|' \
+                 || chunking_policy_version || '|' || hex(fingerprint) || '|' || vector_revision \
+                 FROM embedding_generations ORDER BY id",
+            ),
+            chunks: rows(
+                "SELECT chunk_id || '|' || generation_id || '|' || message_id || '|' \
+                 || chunk_idx || '|' || content_hash || '|' || hex(embedding) \
+                 FROM message_chunks ORDER BY chunk_id",
+            ),
+            holes: rows(
+                "SELECT generation_id || '|' || message_id || '|' || chunk_idx || '|' || reason \
+                 FROM chunk_holes ORDER BY generation_id, message_id, chunk_idx",
+            ),
+            vec0: generation_ids
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        vector_domain::count_vec0_rows_for_generation(storage.raw(), *id)
+                            .expect("count vec0 rows"),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn assert_non_empty(legacy: &State) {
+        assert!(
+            !legacy.generations.is_empty(),
+            "fixture must have a generation row"
+        );
+        assert!(!legacy.chunks.is_empty(), "fixture must have chunk rows");
+        assert!(!legacy.holes.is_empty(), "fixture must have hole rows");
+        assert!(
+            legacy.vec0.iter().all(|(_, rows)| *rows == 3),
+            "fixture must have three vec0 rows per generation: {legacy:?}"
+        );
+    }
+
+    fn refusal(error: anyhow::Error) {
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("fingerprint"),
+            "the refusal must name the fingerprint rule: {message}"
+        );
+    }
+
+    #[test]
+    fn an_active_candidate_with_a_drifted_fingerprint_is_refused() {
+        let (_dir, fixture) = Fixture::new();
+        let existing = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(existing, true);
+        fixture.seed_rows(existing);
+        let before = state(&fixture.storage, &[existing]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&drifted_fingerprint())
+            .expect_err("a drifted fingerprint on the only active candidate must be refused");
+        refusal(error);
+        assert_eq!(
+            state(&fixture.storage, &[existing]),
+            before,
+            "a refusal must not change generations, chunks, holes or vec0 rows"
+        );
+    }
+
+    #[test]
+    fn a_pending_candidate_with_a_drifted_fingerprint_is_refused() {
+        let (_dir, fixture) = Fixture::new();
+        let existing = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(existing, false);
+        fixture.seed_rows(existing);
+        let before = state(&fixture.storage, &[existing]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&drifted_fingerprint())
+            .expect_err("a drifted fingerprint on the only pending candidate must be refused");
+        refusal(error);
+        assert_eq!(state(&fixture.storage, &[existing]), before);
+    }
+
+    #[test]
+    fn drifted_active_and_pending_candidates_are_both_refused() {
+        let (_dir, fixture) = Fixture::new();
+        let active = fixture.create_generation(&drifted_fingerprint());
+        fixture.set_status(active, true);
+        fixture.seed_rows(active);
+        let pending = fixture.create_generation(&drifted_fingerprint());
+        fixture.set_status(pending, false);
+        fixture.seed_rows(pending);
+        let before = state(&fixture.storage, &[active, pending]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&old_fingerprint())
+            .expect_err("one drifted candidate must not excuse another drifted one");
+        refusal(error);
+        assert_eq!(
+            state(&fixture.storage, &[active, pending]),
+            before,
+            "no candidate may be rewritten when every openable one drifts"
+        );
+    }
+
+    #[test]
+    fn a_drifted_active_candidate_still_reuses_a_matching_pending_generation() {
+        let (_dir, fixture) = Fixture::new();
+        let active = fixture.create_generation(&drifted_fingerprint());
+        fixture.set_status(active, true);
+        fixture.seed_rows(active);
+        let pending = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(pending, false);
+        fixture.seed_rows(pending);
+        let before = state(&fixture.storage, &[active, pending]);
+        assert_non_empty(&before);
+
+        let (generation_id, reused, holes) = fixture
+            .run(&old_fingerprint())
+            .expect("a matching pending candidate must still be reused");
+        assert_eq!(
+            generation_id, pending,
+            "the matching pending generation is the answer"
+        );
+        assert!(reused, "a reused generation must report itself as reused");
+        assert_eq!(holes, 0, "reuse seeds no new holes");
+        assert_eq!(
+            state(&fixture.storage, &[active, pending]),
+            before,
+            "reuse writes nothing"
+        );
+    }
+
+    #[test]
+    fn no_candidate_still_creates_one_generation_and_seeds_holes() {
+        let (_dir, fixture) = Fixture::new();
+        let (generation_id, reused, holes) = fixture
+            .run(&old_fingerprint())
+            .expect("an empty archive still creates its first generation");
+        assert!(!reused, "a created generation is not a reuse");
+        assert_eq!(holes, 3, "three expected chunks seed three holes");
+        let count = |sql: &str| {
+            fixture
+                .storage
+                .raw()
+                .query_row_map(sql, &[], |row| row.get_typed::<i64>(0))
+                .expect("count rows")
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM message_chunks"),
+            0,
+            "creation writes no chunk rows before the drain"
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = {generation_id}"
+            )),
+            3,
+            "one hole per expected chunk, all on the created generation"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM embedding_generations"), 1);
+    }
+
+    #[test]
+    fn a_broken_candidate_record_is_refused_without_creating_a_generation() {
+        let (_dir, fixture) = Fixture::new();
+        let existing = fixture.create_generation(&old_fingerprint());
+        fixture.set_status(existing, true);
+        fixture.seed_rows(existing);
+        // Remove the representation record the identity depends on. The
+        // fingerprint check runs only after the record guard, so this refusal
+        // must carry the record's own classification and never fall through to
+        // the fingerprint rule or to a replacement generation.
+        fixture
+            .storage
+            .raw()
+            .execute(
+                "DELETE FROM meta WHERE key = ?1",
+                &params![representation_meta_key(existing)],
+            )
+            .expect("delete representation record");
+        let before = state(&fixture.storage, &[existing]);
+        assert_non_empty(&before);
+
+        let error = fixture
+            .run(&drifted_fingerprint())
+            .expect_err("a candidate whose record is gone must be refused");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("InvalidRecord"),
+            "the record guard's own classification must survive: {message}"
+        );
+        assert!(
+            !message.contains("fingerprint"),
+            "the fingerprint rule must not be reached past a broken record: {message}"
+        );
+        assert_eq!(
+            state(&fixture.storage, &[existing]),
+            before,
+            "no generation, chunk, hole or vec0 row may be written"
+        );
     }
 }
