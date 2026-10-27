@@ -4535,8 +4535,10 @@ mod api03g_sync_preflight_tests {
     use crate::search::model_api::primary_embedding::PrimaryEmbeddingCall;
     use crate::search::model_api::test_support::{HttpFixture, Reply, TlsFixture};
     use crate::search::model_api::{ApiClient, EnvCredentialResolver};
-    use crate::storage::api::{StorageError, TxMode};
-    use crate::storage::api_generation::create_api_generation;
+    use crate::storage::api::{StorageError, TxMode, Value};
+    use crate::storage::api_generation::{
+        create_api_generation, create_api_generation_with_producers,
+    };
     use crate::storage::sqlite::FrankenStorage;
 
     use super::{probe_api_backfill, probe_api_preflight, run_api_primary_catchup_backfill};
@@ -4559,6 +4561,43 @@ mod api03g_sync_preflight_tests {
                 |row| row.get_typed::<String>(0),
             )
             .expect("read generations")
+    }
+
+    /// Every column of every generation row, read as stored. `SELECT *` keeps
+    /// the nullable `activated_at`, the `fingerprint` BLOB and every other field
+    /// exact, so a before/after comparison cannot hide a changed column.
+    fn generation_snapshot(storage: &FrankenStorage) -> Vec<Vec<Value>> {
+        let columns = storage
+            .raw()
+            .query_all_map("PRAGMA table_info(embedding_generations)", &[], |_row| {
+                Ok(())
+            })
+            .expect("read the generation column count")
+            .len();
+        storage
+            .raw()
+            .query_all_map(
+                "SELECT * FROM embedding_generations ORDER BY id",
+                &[],
+                |row| {
+                    (0..columns)
+                        .map(|index| row.get_value(index))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .expect("read generations")
+    }
+
+    /// Every meta key and its stored value, in key order.
+    fn meta_rows(storage: &FrankenStorage) -> Vec<Vec<Value>> {
+        storage
+            .raw()
+            .query_all_map("SELECT key, value FROM meta ORDER BY key", &[], |row| {
+                (0..2)
+                    .map(|index| row.get_value(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("read meta")
     }
 
     fn seed_messages(storage: &FrankenStorage, texts: &[&str]) {
@@ -4692,19 +4731,42 @@ mod api03g_sync_preflight_tests {
 
         let root = tempfile::tempdir().expect("tempdir");
         let db_path = root.path().join("db.sqlite");
-        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        // A real proof-backed history: a generation built through the older
+        // backup while an older proof declared that fallback. Its anchor and its
+        // producer both live on endpoints the current route's proof never saw.
+        let (older_config, older_proof) = fallback_fixture(
+            "http://127.0.0.1:1/embedding",
+            "https://example.invalid/embedding",
+        );
+        let older_primary = older_config
+            .profile("primary")
+            .expect("older primary")
+            .clone();
+        let older_backup = older_config
+            .profile("backup")
+            .expect("older backup")
+            .clone();
         {
             let writer = FrankenStorage::open(&db_path).expect("create the archive");
             writer
                 .raw()
                 .with_tx(TxMode::Immediate, |tx| {
-                    create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+                    create_api_generation_with_producers(
+                        tx,
+                        &older_primary,
+                        2,
+                        &[1; 24],
+                        1,
+                        std::slice::from_ref(&older_backup),
+                        &older_proof,
+                    )
+                    .map_err(StorageError::from)
                 })
                 .expect("seed an uncovered historical generation");
             writer.close().expect("close the writer");
         }
         let storage = readonly(&db_path);
-        let before = generation_rows(&storage);
+        let before = generation_snapshot(&storage);
 
         let error = match probe_api_preflight(Some(&storage), &call) {
             Ok(_) => panic!("an uncovered historical generation must be refused"),
@@ -4721,7 +4783,73 @@ mod api03g_sync_preflight_tests {
         );
         assert_eq!(primary.hits(), 0, "no request may be sent for a refused admission");
         assert_eq!(backup.fixture().hits(), 0);
-        assert_eq!(generation_rows(&storage), before);
+        assert_eq!(generation_snapshot(&storage), before);
+    }
+
+    /// A pure-primary history carries no cross-endpoint proof, so the relocated
+    /// endpoint is still the same declared space: the preflight must admit it,
+    /// measure the live dimension through the declared backup, and change neither
+    /// the generation row nor any meta byte.
+    #[test]
+    fn pure_primary_history_reaches_the_relocated_endpoint_and_writes_nothing() {
+        let primary = HttpFixture::start(vec![Reply::status(503)]);
+        let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
+        let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        assert!(has_proof, "the relocated route carries its own proof");
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let db_path = root.path().join("db.sqlite");
+        let (_, older) = migration_fixture(&[1, 2], 1, None);
+        {
+            let writer = FrankenStorage::open(&db_path).expect("create the archive");
+            writer
+                .raw()
+                .with_tx(TxMode::Immediate, |tx| {
+                    create_api_generation(tx, &older[0], 2, &[1; 24], 1).map_err(StorageError::from)
+                })
+                .expect("seed a pure-primary historical generation");
+            writer.close().expect("close the writer");
+        }
+        let storage = readonly(&db_path);
+        let before_rows = generation_snapshot(&storage);
+        let before_meta = meta_rows(&storage);
+        assert_eq!(
+            before_rows.len(),
+            1,
+            "the fixture must hold one generation: {before_rows:?}"
+        );
+
+        let probe = match probe_api_preflight(Some(&storage), &call) {
+            Ok(probe) => probe,
+            Err(error) => {
+                panic!("a pure-primary history must be admitted by the relocated endpoint: {error}")
+            }
+        };
+        assert_eq!(probe.dimension, 2);
+
+        let calls = call.probe_calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one primary attempt, then one backup attempt: {calls:?}"
+        );
+        assert_eq!(calls[0].profile_id, "primary");
+        assert_eq!(calls[0].http_status, Some(503));
+        assert_eq!(calls[1].profile_id, "backup");
+        assert_eq!(calls[1].http_status, Some(200));
+        assert_eq!(primary.hits(), 1);
+        assert_eq!(backup.fixture().hits(), 1);
+
+        assert_eq!(
+            generation_snapshot(&storage),
+            before_rows,
+            "a probe may not touch the generation"
+        );
+        assert_eq!(
+            meta_rows(&storage),
+            before_meta,
+            "a probe may not rewrite any meta record"
+        );
     }
 
     /// The risk lead, measured on **one** pair of endpoints: build a generation
@@ -4820,8 +4948,8 @@ mod api_endpoint_relocation_tests {
     use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
     use crate::search::eligibility::ExpectedChunk;
     use crate::search::model_api::{
-        ApiClient, ApiConfig, EnvCredentialResolver, PrimaryEmbeddingCall, RepresentationDescriptor,
-        ValidatedProfile,
+        ApiClient, ApiConfig, EnvCredentialResolver, PrimaryEmbeddingCall,
+        RepresentationDescriptor, ValidatedProfile,
     };
     use crate::storage::api::{StorageError, TxMode, params};
     use crate::storage::api_generation::{create_api_generation, representation_meta_key};
