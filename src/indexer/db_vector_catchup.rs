@@ -4795,6 +4795,7 @@ mod api03g_sync_preflight_tests {
         let primary = HttpFixture::start(vec![Reply::status(503)]);
         let backup = TlsFixture::start(vec![Reply::Embeddings(2)]);
         let (call, has_proof) = fallback_call(&primary.base(), &backup, true);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(has_proof, "the relocated route carries its own proof");
 
         let root = tempfile::tempdir().expect("tempdir");
@@ -4813,6 +4814,7 @@ mod api03g_sync_preflight_tests {
         let storage = readonly(&db_path);
         let before_rows = generation_snapshot(&storage);
         let before_meta = meta_rows(&storage);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             before_rows.len(),
             1,
@@ -4825,26 +4827,36 @@ mod api03g_sync_preflight_tests {
                 panic!("a pure-primary history must be admitted by the relocated endpoint: {error}")
             }
         };
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(probe.dimension, 2);
 
         let calls = call.probe_calls();
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             calls.len(),
             2,
             "one primary attempt, then one backup attempt: {calls:?}"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[0].profile_id, "primary");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[0].http_status, Some(503));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[1].profile_id, "backup");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[1].http_status, Some(200));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(primary.hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(backup.fixture().hits(), 1);
 
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             generation_snapshot(&storage),
             before_rows,
             "a probe may not touch the generation"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             meta_rows(&storage),
             before_meta,
@@ -5099,6 +5111,7 @@ mod api_endpoint_relocation_tests {
                     row.get_typed::<i64>(0)
                 })
                 .expect("read message ids");
+            // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
             assert_eq!(
                 message_ids.len(),
                 contents.len(),
@@ -5182,6 +5195,7 @@ mod api_endpoint_relocation_tests {
                                 chunk_idx: 0,
                                 byte_start: 0,
                                 byte_end: 1,
+                                // ubs:ignore[rust.perf.string-alloc-in-loop] -- Small synthetic fixture.
                                 content_hash: format!("h{message_id}"),
                                 embedding: vec![1.0, 0.0],
                                 norm: 1.0,
@@ -5359,12 +5373,16 @@ mod api_endpoint_relocation_tests {
     }
 
     fn assert_non_empty(legacy: &State) {
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             !legacy.generations.is_empty(),
             "fixture must have a generation row"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(!legacy.chunks.is_empty(), "fixture must have chunk rows");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(!legacy.holes.is_empty(), "fixture must have hole rows");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             legacy.vec0.iter().all(|(_, rows)| *rows == 3),
             "fixture must have three vec0 rows per generation: {legacy:?}"
@@ -5373,6 +5391,7 @@ mod api_endpoint_relocation_tests {
 
     fn refusal(error: anyhow::Error) {
         let message = format!("{error:#}");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             message.contains("fingerprint"),
             "the refusal must name the fingerprint rule: {message}"
@@ -5392,6 +5411,7 @@ mod api_endpoint_relocation_tests {
             .run(&drifted_fingerprint())
             .expect_err("a drifted fingerprint on the only active candidate must be refused");
         refusal(error);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             state(&fixture.storage, &[existing]),
             before,
@@ -5412,6 +5432,7 @@ mod api_endpoint_relocation_tests {
             .run(&drifted_fingerprint())
             .expect_err("a drifted fingerprint on the only pending candidate must be refused");
         refusal(error);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(state(&fixture.storage, &[existing]), before);
     }
 
@@ -5431,6 +5452,7 @@ mod api_endpoint_relocation_tests {
             .run(&old_fingerprint())
             .expect_err("one drifted candidate must not excuse another drifted one");
         refusal(error);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             state(&fixture.storage, &[active, pending]),
             before,
@@ -5453,12 +5475,16 @@ mod api_endpoint_relocation_tests {
         let (generation_id, reused, holes) = fixture
             .run(&old_fingerprint())
             .expect("a matching pending candidate must still be reused");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             generation_id, pending,
             "the matching pending generation is the answer"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(reused, "a reused generation must report itself as reused");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(holes, 0, "reuse seeds no new holes");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             state(&fixture.storage, &[active, pending]),
             before,
@@ -5472,7 +5498,9 @@ mod api_endpoint_relocation_tests {
         let (generation_id, reused, holes) = fixture
             .run(&old_fingerprint())
             .expect("an empty archive still creates its first generation");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(!reused, "a created generation is not a reuse");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(holes, 3, "three expected chunks seed three holes");
         let count = |sql: &str| {
             fixture
@@ -5481,11 +5509,13 @@ mod api_endpoint_relocation_tests {
                 .query_row_map(sql, &[], |row| row.get_typed::<i64>(0))
                 .expect("count rows")
         };
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             count("SELECT COUNT(*) FROM message_chunks"),
             0,
             "creation writes no chunk rows before the drain"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             count(&format!(
                 "SELECT COUNT(*) FROM chunk_holes WHERE generation_id = {generation_id}"
@@ -5493,6 +5523,7 @@ mod api_endpoint_relocation_tests {
             3,
             "one hole per expected chunk, all on the created generation"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(count("SELECT COUNT(*) FROM embedding_generations"), 1);
     }
 
@@ -5521,14 +5552,17 @@ mod api_endpoint_relocation_tests {
             .run(&drifted_fingerprint())
             .expect_err("a candidate whose record is gone must be refused");
         let message = format!("{error:#}");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             message.contains("InvalidRecord"),
             "the record guard's own classification must survive: {message}"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             !message.contains("fingerprint"),
             "the fingerprint rule must not be reached past a broken record: {message}"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             state(&fixture.storage, &[existing]),
             before,
@@ -5554,9 +5588,11 @@ mod api_endpoint_relocation_tests {
         let generation_id = fixture.create_generation(&old_fingerprint());
         fixture.set_status(generation_id, true);
         let chunks = fixture.seed_real_chunks(generation_id);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(chunks, 2, "the fixture must carry two real chunks");
 
         let sentinel_cosine = cosine_similarity(&[1.0, 0.0], &approximate_sentinel_vector());
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             (0.999..0.9999).contains(&sentinel_cosine),
             "the fixture cosine {sentinel_cosine} must sit strictly between 0.999 and 0.9999"
@@ -5592,14 +5628,17 @@ mod api_endpoint_relocation_tests {
             1,
         )
         .expect("the activation audit runs");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             report.fingerprint_ok,
             "⑪ must accept an approximate cross-backend fingerprint inside [0.999, 0.9999): {report:?}"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             sentinel_calls.load(Ordering::SeqCst) > 0,
             "⑪ must really re-embed the sentinels; a clean report without that call proves nothing"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             report.passed,
             "the real-chunk generation must be otherwise clean so ⑪ is judged on its own: {report:?}"

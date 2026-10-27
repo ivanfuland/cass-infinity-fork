@@ -692,11 +692,14 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
     let conn = fixture.conn();
     let base = profile_for("p1", ENDPOINT_A, EMBED_MODEL, EMBED_REVISION, &[]);
     let generation_id = fixture.create(&base, 1024, b"fp-call-settings");
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert!(fixture.open(generation_id, &base).is_ok());
 
     let before_representation = meta_value(conn, &representation_meta_key(generation_id));
     let before_provenance = meta_value(conn, &provenance_meta_key(generation_id));
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert!(before_representation.is_some(), "the record must exist");
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert!(before_provenance.is_some(), "the record must exist");
     let before_descriptor_sha256 = RepresentationRecord::decode(
         before_representation
@@ -807,6 +810,7 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
         let changed = EndpointConfigIdentity::from_profile(profile)
             .expect("the changed profile has a call identity")
             .sha256();
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_ne!(
             changed, base_call_digest,
             "{label} must really move the call configuration"
@@ -815,17 +819,21 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
         let verified = fixture
             .open(generation_id, profile)
             .unwrap_or_else(|error| panic!("{label} must still open the generation: {error}"));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(verified.generation_id(), generation_id, "{label}");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             verified.descriptor_sha256(),
             before_descriptor_sha256.as_str(),
             "{label} must not change the descriptor digest"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             meta_value(conn, &representation_meta_key(generation_id)),
             before_representation,
             "{label} must not rewrite the representation record"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             meta_value(conn, &provenance_meta_key(generation_id)),
             before_provenance,
@@ -862,6 +870,7 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
             &[r#"normalization = "l2""#],
         ),
     );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert_ne!(
         EndpointConfigIdentity::from_profile(&remote_scope)
             .expect("the remote profile has a call identity")
@@ -874,12 +883,15 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
     let verified = fixture
         .open(scope_generation, &remote_scope)
         .expect("a scope change must still open the generation");
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert_eq!(verified.generation_id(), scope_generation);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert_eq!(
         meta_value(conn, &representation_meta_key(scope_generation)),
         scope_before_representation,
         "scope must not rewrite the representation record"
     );
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert_eq!(
         meta_value(conn, &provenance_meta_key(scope_generation)),
         scope_before_provenance,
@@ -887,7 +899,9 @@ fn call_settings_can_change_without_rewriting_generation_identity() {
     );
 
     // No case created a second space for the same declaration.
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert_eq!(count(conn, "embedding_generations"), 2);
+    // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
     assert!(fixture.open(generation_id, &base).is_ok());
 }
 

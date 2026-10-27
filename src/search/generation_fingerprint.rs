@@ -111,6 +111,7 @@ mod tests {
         // asking the product function anything -- otherwise a change to the
         // cosine implementation could silently move the fixture too.
         let cosine = cosine_similarity(&stored_sentinel, &approximate);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             (0.999..0.9999).contains(&cosine),
             "fixture cosine {cosine} must sit strictly between 0.999 and 0.9999"
@@ -127,6 +128,7 @@ mod tests {
                     fresh.extend_from_slice(&f32_vector_to_le_blob(&stored_sentinel));
                 }
             }
+            // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
             assert!(
                 fingerprint_matches(&stored, &fresh, dim),
                 "sentinel position {position} at cosine {cosine} must match a cross-backend re-embedding"
@@ -143,6 +145,7 @@ mod tests {
         let drift: Vec<f32> = vec![1.0, 0.05];
 
         let cosine = cosine_similarity(&stored_sentinel, &drift);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert!(
             (0.99..0.999).contains(&cosine),
             "fixture cosine {cosine} must sit strictly between 0.99 and 0.999"
@@ -159,6 +162,7 @@ mod tests {
                     fresh.extend_from_slice(&f32_vector_to_le_blob(&stored_sentinel));
                 }
             }
+            // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
             assert!(
                 !fingerprint_matches(&stored, &fresh, dim),
                 "sentinel position {position} at cosine {cosine} is below the tolerance and must not match"

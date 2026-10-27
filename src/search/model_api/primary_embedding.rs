@@ -935,6 +935,7 @@ mod page_writer_tests {
             })
             .unwrap();
         let before = archive_snapshot(&storage);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             before.0.len(),
             1,
@@ -944,19 +945,28 @@ mod page_writer_tests {
         let probe = probe_api_backfill(&storage, &call).unwrap_or_else(|error| {
             panic!("a pure-primary history must be admitted by the relocated endpoint: {error}")
         });
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(probe.dimension, 2);
         let calls = call.probe_calls();
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             calls.len(),
             2,
             "one primary attempt, then one backup attempt: {calls:?}"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[0].profile_id, "primary");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[0].http_status, Some(503));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[1].profile_id, "backup");
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(calls[1].http_status, Some(200));
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(primary.hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(backup.fixture().hits(), 1);
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             call.probe_writers()
                 .iter()
@@ -965,6 +975,7 @@ mod page_writer_tests {
             vec!["backup"],
             "the admitted probe must be produced by the declared backup"
         );
+        // ubs:ignore[rust.panic.assert-macros] -- Required regression test assertion.
         assert_eq!(
             archive_snapshot(&storage),
             before,
